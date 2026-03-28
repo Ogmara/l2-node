@@ -1,0 +1,88 @@
+# Ogmara L2 Node — Example Configuration
+#
+# Copy to ogmara.toml and edit for your setup.
+# Generate a default config with: ogmara-node init
+
+[node]
+data_dir = "./data"
+
+[network]
+listen_port = 41720
+bootstrap_nodes = []
+max_peers = 50
+enable_mdns = true
+
+[klever]
+# Klever node/API URLs — configure for testnet or mainnet
+# Testnet example: "https://node.testnet.klever.org"
+# Mainnet example: "https://node.mainnet.klever.org"
+node_url = ""
+api_url = ""
+contract_address = ""
+scan_interval_ms = 3000
+
+[ipfs]
+api_url = "http://127.0.0.1:5001"
+gateway_url = "http://127.0.0.1:8080"
+max_upload_size_mb = 50
+auto_thumbnail = true
+
+[api]
+# Set to "0.0.0.0" to accept connections from all interfaces
+listen_addr = "127.0.0.1"
+listen_port = 41721
+cors_origins = ["http://localhost:*"]
+rate_limit_per_ip = 100
+
+[api.admin]
+enabled = true
+dashboard = true
+
+[storage]
+engine = "rocksdb"
+max_db_size_gb = 50
+pinned_channels = []
+
+[cache]
+ttl_seconds = 86400
+max_size_mb = 1024
+auto_pin_on_interaction = true
+
+[push_gateway]
+enabled = false
+url = ""
+auth_token = ""
+
+[logging]
+level = "info"
+format = "json"
+
+[alerts]
+enabled = false
+
+[alerts.telegram]
+enabled = false
+bot_token = ""
+chat_id = ""
+
+[alerts.discord]
+enabled = false
+webhook_url = ""
+
+[alerts.webhook]
+enabled = false
+url = ""
+
+[alerts.thresholds]
+klever_disconnect_seconds = 60
+ipfs_disconnect_seconds = 30
+min_peers = 3
+max_disk_usage_percent = 90
+max_memory_usage_percent = 85
+anchor_overdue_multiplier = 2.0
+sc_sync_max_lag_blocks = 100
+rate_limit_alert_per_min = 100
+failed_sig_alert_per_min = 50
+
+[alerts.cooldown]
+seconds = 300

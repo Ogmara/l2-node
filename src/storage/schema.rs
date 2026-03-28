@@ -1,0 +1,138 @@
+//! Column family definitions and key encoding for RocksDB.
+//!
+//! Each column family is a separate key-value namespace (spec 3.5).
+
+/// Column family names for RocksDB (spec 3.5).
+pub mod cf {
+    /// msg_id → Envelope (serialized MessagePack)
+    pub const MESSAGES: &str = "messages";
+    /// (channel_id, lamport_ts, msg_id) → () — ordered channel message index
+    pub const CHANNEL_MSGS: &str = "channel_msgs";
+    /// (conversation_id, timestamp, msg_id) → () — DM index per conversation
+    pub const DM_MESSAGES: &str = "dm_messages";
+    /// (user_address, last_activity_ts, conversation_id) → () — user's DM list
+    pub const DM_CONVERSATIONS: &str = "dm_conversations";
+    /// (timestamp, msg_id) → () — global news feed index
+    pub const NEWS_FEED: &str = "news_feed";
+    /// (tag, timestamp, msg_id) → () — tag-based news index
+    pub const NEWS_BY_TAG: &str = "news_by_tag";
+    /// (author, timestamp, msg_id) → () — author's posts
+    pub const NEWS_BY_AUTHOR: &str = "news_by_author";
+    /// klever_address → UserProfile (serialized)
+    pub const USERS: &str = "users";
+    /// channel_id → ChannelMetadata (serialized)
+    pub const CHANNELS: &str = "channels";
+    /// (user_address, device_pub_key) → Delegation (serialized)
+    pub const DELEGATIONS: &str = "delegations";
+    /// block_height → StateAnchor (serialized)
+    pub const STATE_ANCHORS: &str = "state_anchors";
+    /// node_id → NodeAnnouncement (serialized)
+    pub const PEER_DIRECTORY: &str = "peer_directory";
+    /// (source, id, timestamp) → Envelope — LRU cache of fetched content
+    pub const CONTENT_CACHE: &str = "content_cache";
+    /// key → value — cursor positions, node config, etc.
+    pub const NODE_STATE: &str = "node_state";
+
+    /// All column family names for database initialization.
+    pub const ALL: &[&str] = &[
+        MESSAGES,
+        CHANNEL_MSGS,
+        DM_MESSAGES,
+        DM_CONVERSATIONS,
+        NEWS_FEED,
+        NEWS_BY_TAG,
+        NEWS_BY_AUTHOR,
+        USERS,
+        CHANNELS,
+        DELEGATIONS,
+        STATE_ANCHORS,
+        PEER_DIRECTORY,
+        CONTENT_CACHE,
+        NODE_STATE,
+    ];
+}
+
+/// Well-known keys in the NODE_STATE column family.
+pub mod state_keys {
+    /// Last processed Klever block height (u64 big-endian).
+    pub const CHAIN_CURSOR: &[u8] = b"chain_cursor";
+    /// Node's Ed25519 signing key (32 bytes).
+    pub const NODE_PRIVATE_KEY: &[u8] = b"node_private_key";
+    /// Local Lamport clock counter (u64 big-endian).
+    pub const LAMPORT_COUNTER: &[u8] = b"lamport_counter";
+}
+
+/// Encode a channel message index key: (channel_id, lamport_ts, msg_id).
+///
+/// Uses big-endian encoding for natural sort order.
+pub fn encode_channel_msg_key(channel_id: u64, lamport_ts: u64, msg_id: &[u8; 32]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(8 + 8 + 32);
+    key.extend_from_slice(&channel_id.to_be_bytes());
+    key.extend_from_slice(&lamport_ts.to_be_bytes());
+    key.extend_from_slice(msg_id);
+    key
+}
+
+/// Encode a DM message index key: (conversation_id, timestamp, msg_id).
+pub fn encode_dm_msg_key(conversation_id: &[u8; 32], timestamp: u64, msg_id: &[u8; 32]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(32 + 8 + 32);
+    key.extend_from_slice(conversation_id);
+    key.extend_from_slice(&timestamp.to_be_bytes());
+    key.extend_from_slice(msg_id);
+    key
+}
+
+/// Encode a DM conversation list key: (user_address_bytes, last_activity_ts, conversation_id).
+pub fn encode_dm_conversation_key(
+    user_address: &[u8],
+    last_activity_ts: u64,
+    conversation_id: &[u8; 32],
+) -> Vec<u8> {
+    let mut key = Vec::with_capacity(user_address.len() + 8 + 32);
+    key.extend_from_slice(user_address);
+    // Negate timestamp for reverse-chronological order (most recent first)
+    key.extend_from_slice(&(!last_activity_ts).to_be_bytes());
+    key.extend_from_slice(conversation_id);
+    key
+}
+
+/// Encode a news feed index key: (timestamp, msg_id).
+pub fn encode_news_key(timestamp: u64, msg_id: &[u8; 32]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(8 + 32);
+    // Negate timestamp for reverse-chronological order
+    key.extend_from_slice(&(!timestamp).to_be_bytes());
+    key.extend_from_slice(msg_id);
+    key
+}
+
+/// Encode a news-by-tag index key: (tag, timestamp, msg_id).
+pub fn encode_news_by_tag_key(tag: &str, timestamp: u64, msg_id: &[u8; 32]) -> Vec<u8> {
+    let tag_bytes = tag.as_bytes();
+    let mut key = Vec::with_capacity(2 + tag_bytes.len() + 8 + 32);
+    // Length-prefix the tag for clean key boundaries
+    key.extend_from_slice(&(tag_bytes.len() as u16).to_be_bytes());
+    key.extend_from_slice(tag_bytes);
+    key.extend_from_slice(&(!timestamp).to_be_bytes());
+    key.extend_from_slice(msg_id);
+    key
+}
+
+/// Encode a news-by-author index key: (author_address, timestamp, msg_id).
+pub fn encode_news_by_author_key(author: &str, timestamp: u64, msg_id: &[u8; 32]) -> Vec<u8> {
+    let author_bytes = author.as_bytes();
+    let mut key = Vec::with_capacity(author_bytes.len() + 1 + 8 + 32);
+    key.extend_from_slice(author_bytes);
+    key.push(0xFF); // separator
+    key.extend_from_slice(&(!timestamp).to_be_bytes());
+    key.extend_from_slice(msg_id);
+    key
+}
+
+/// Encode a delegation key: (user_address, device_pub_key_hex).
+pub fn encode_delegation_key(user_address: &str, device_pub_key: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(user_address.len() + 1 + device_pub_key.len());
+    key.extend_from_slice(user_address.as_bytes());
+    key.push(0xFF); // separator
+    key.extend_from_slice(device_pub_key.as_bytes());
+    key
+}
