@@ -33,8 +33,13 @@ sha2 = "0.10"                # SHA-256 for HKDF / Merkle tree
 # Storage
 rocksdb = "0.24"
 
-# Networking (Phase 2 — declared now for types)
-# libp2p = { version = "0.56", features = [...] }
+# Networking
+libp2p = { version = "0.56", features = [
+    "gossipsub", "kad", "mdns", "quic", "tcp",
+    "noise", "yamux", "identify", "request-response",
+    "tokio", "ed25519", "macros", "cbor",
+] }
+futures = "0.3"
 
 # HTTP framework (Phase 4 — declared now for compilation)
 # axum = "0.8"

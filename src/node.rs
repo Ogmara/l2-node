@@ -124,16 +124,46 @@ impl Node {
         let _ = self.shutdown_tx.send(());
     }
 
+    /// Convert the node's Ed25519 signing key to a libp2p identity keypair.
+    pub fn libp2p_keypair(&self) -> Result<libp2p::identity::Keypair> {
+        let secret_bytes = self.signing_key.to_bytes();
+        let libp2p_key = libp2p::identity::ed25519::Keypair::try_from_bytes(
+            &mut [secret_bytes, *self.signing_key.verifying_key().as_bytes()].concat(),
+        )
+        .context("converting Ed25519 key to libp2p keypair")?;
+        Ok(libp2p::identity::Keypair::from(libp2p_key))
+    }
+
     /// Run the node until shutdown is signaled.
     ///
-    /// Starts all components and waits for a shutdown signal (Ctrl+C or explicit).
+    /// Starts the network layer, message router, and all background tasks.
     pub async fn run(&self) -> Result<()> {
         info!(node_id = %self.node_id, "Starting Ogmara L2 node");
+
+        // Start the network service
+        let keypair = self.libp2p_keypair()?;
+        let mut network = crate::network::NetworkService::new(
+            &self.config,
+            self.storage.clone(),
+            keypair,
+        )
+        .await
+        .context("starting network service")?;
+
+        info!(
+            peer_id = %network.local_peer_id(),
+            "Network service started"
+        );
+
+        // Subscribe to pinned channels
+        for &channel_id in &self.config.storage.pinned_channels {
+            network.subscribe_channel(channel_id);
+        }
 
         // Persist Lamport counter periodically
         let storage = self.storage.clone();
         let lamport = self.lamport_counter.clone();
-        let mut shutdown_rx = self.shutdown_rx();
+        let mut lamport_shutdown_rx = self.shutdown_rx();
 
         let lamport_task = tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
@@ -145,9 +175,15 @@ impl Node {
                             warn!(error = %e, "Failed to persist Lamport counter");
                         }
                     }
-                    _ = shutdown_rx.recv() => break,
+                    _ = lamport_shutdown_rx.recv() => break,
                 }
             }
+        });
+
+        // Run network event loop in a task
+        let network_shutdown_rx = self.shutdown_rx();
+        let network_task = tokio::spawn(async move {
+            network.run(network_shutdown_rx).await;
         });
 
         // Wait for shutdown signal (Ctrl+C)
@@ -168,6 +204,7 @@ impl Node {
         self.storage.set_lamport_counter(val)?;
 
         lamport_task.abort();
+        network_task.abort();
 
         info!("Node stopped");
         Ok(())
