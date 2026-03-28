@@ -8,6 +8,7 @@
 
 pub mod admin;
 pub mod auth;
+pub mod dashboard;
 pub mod routes;
 pub mod state;
 pub mod websocket;
@@ -94,14 +95,22 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
 
     // Admin routes (localhost-only via middleware)
     let admin_routes = if config.api.admin.enabled {
-        Router::new()
+        let mut routes = Router::new()
             .route("/admin/peers", get(admin::list_peers))
             .route("/admin/storage/stats", get(admin::storage_stats))
             .route("/admin/peers/ban", post(admin::ban_peer))
             .route("/admin/channels/pin", post(admin::pin_channel))
             .route("/admin/state/latest", get(admin::state_latest))
-            .route("/admin/state/anchor", post(admin::trigger_anchor))
-            .layer(middleware::from_fn(admin::localhost_only))
+            .route("/admin/state/anchor", post(admin::trigger_anchor));
+
+        // Dashboard (if enabled in config)
+        if config.api.admin.dashboard {
+            routes = routes
+                .route("/admin/dashboard", get(dashboard::dashboard_page))
+                .route("/admin/dashboard/ws", get(dashboard::dashboard_ws));
+        }
+
+        routes.layer(middleware::from_fn(admin::localhost_only))
     } else {
         Router::new()
     };

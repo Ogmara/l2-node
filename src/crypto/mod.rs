@@ -8,6 +8,7 @@
 //! Also provides Keccak-256 hashing, bech32 address encoding, and
 //! X25519 key derivation for DM encryption.
 
+pub mod merkle;
 pub mod signing;
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
