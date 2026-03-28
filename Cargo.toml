@@ -1,0 +1,71 @@
+[package]
+name = "ogmara-node"
+version = "0.1.0"
+edition = "2021"
+authors = ["Ogmara Contributors"]
+license = "MIT"
+description = "Ogmara L2 network node — decentralized chat and news on Klever blockchain"
+publish = false
+
+[[bin]]
+name = "ogmara-node"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.50", features = ["full"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+rmp-serde = "1.3"            # MessagePack
+
+# Cryptography (same as Klever's kos-rs)
+ed25519-dalek = { version = "2.2", features = ["rand_core"] }
+sha3 = "0.10"                # Keccak-256
+bech32 = "0.11"              # klv1... address encoding
+rand = "0.8"                 # Key generation (0.8 aligns with ed25519-dalek's rand_core 0.6)
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+aes-gcm = "0.10"             # AES-256-GCM for DM encryption
+hkdf = "0.12"
+sha2 = "0.10"                # SHA-256 for HKDF / Merkle tree
+
+# Storage
+rocksdb = "0.24"
+
+# Networking (Phase 2 — declared now for types)
+# libp2p = { version = "0.56", features = [...] }
+
+# HTTP framework (Phase 4 — declared now for compilation)
+# axum = "0.8"
+# tower = "0.5"
+# tower-http = { version = "0.6", features = ["cors", "trace"] }
+# tokio-tungstenite = "0.29"
+
+# HTTP client (for Klever RPC + IPFS API)
+reqwest = { version = "0.13", features = ["json"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Configuration
+toml = "1.1"
+
+# CLI
+clap = { version = "4.6", features = ["derive"] }
+
+# Utilities
+hex = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
+bytes = "1.11"
+dashmap = "6.1"
+bs58 = "0.5"
+
+[dev-dependencies]
+tokio = { version = "1.50", features = ["test-util", "macros"] }
+tempfile = "3"
