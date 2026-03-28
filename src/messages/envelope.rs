@@ -67,13 +67,17 @@ impl Envelope {
         self.msg_type as u8
     }
 
-    /// Validate basic envelope structure (signature length, version).
+    /// Validate basic envelope structure (signature length, version, relay_path).
     pub fn validate_structure(&self) -> Result<(), &'static str> {
         if self.signature.len() != 64 {
             return Err("signature must be exactly 64 bytes");
         }
         if self.version == 0 {
             return Err("version must be > 0");
+        }
+        // Limit relay path to prevent amplification
+        if self.relay_path.len() > 64 {
+            return Err("relay_path exceeds maximum length");
         }
         Ok(())
     }
