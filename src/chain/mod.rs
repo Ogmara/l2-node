@@ -1,3 +1,5 @@
-//! Klever blockchain chain scanner — monitors SC events.
-//!
-//! Phase 3: To be implemented.
+//! Klever blockchain chain scanner — monitors SC events and builds local state.
+
+pub mod parser;
+pub mod scanner;
+pub mod types;

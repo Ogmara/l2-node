@@ -186,6 +186,29 @@ impl Node {
             network.run(network_shutdown_rx).await;
         });
 
+        // Start chain scanner
+        let chain_config = self.config.klever.clone();
+        let chain_storage = self.storage.clone();
+        let chain_shutdown_rx = self.shutdown_rx();
+        let chain_task = tokio::spawn(async move {
+            match crate::chain::scanner::ChainScanner::new(chain_config, chain_storage) {
+                Ok(mut scanner) => scanner.run(chain_shutdown_rx).await,
+                Err(e) => warn!(error = %e, "Failed to start chain scanner"),
+            }
+        });
+
+        // IPFS health check (non-blocking)
+        match crate::ipfs::client::IpfsClient::new(&self.config.ipfs) {
+            Ok(ipfs) => {
+                match ipfs.health_check().await {
+                    Ok(true) => info!("IPFS node connected"),
+                    Ok(false) => warn!("IPFS node not reachable at {}", self.config.ipfs.api_url),
+                    Err(e) => warn!(error = %e, "IPFS health check failed"),
+                }
+            }
+            Err(e) => warn!(error = %e, "Failed to create IPFS client"),
+        }
+
         // Wait for shutdown signal (Ctrl+C)
         let mut shutdown_rx = self.shutdown_rx();
         tokio::select! {
@@ -205,6 +228,7 @@ impl Node {
 
         lamport_task.abort();
         network_task.abort();
+        chain_task.abort();
 
         info!("Node stopped");
         Ok(())
