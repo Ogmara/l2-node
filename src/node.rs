@@ -209,6 +209,24 @@ impl Node {
             Err(e) => warn!(error = %e, "Failed to create IPFS client"),
         }
 
+        // Start REST/WS API server
+        let api_router = crate::messages::router::MessageRouter::new(
+            self.storage.clone(),
+            self.config.api.rate_limit_per_ip,
+        );
+        let app_state = Arc::new(crate::api::state::AppState::new(
+            self.storage.clone(),
+            api_router,
+            self.node_id.clone(),
+        ));
+        let api_config = self.config.clone();
+        let api_shutdown_rx = self.shutdown_rx();
+        let api_task = tokio::spawn(async move {
+            if let Err(e) = crate::api::start_api_server(&api_config, app_state, api_shutdown_rx).await {
+                tracing::error!(error = %e, "API server error");
+            }
+        });
+
         // Wait for shutdown signal (Ctrl+C)
         let mut shutdown_rx = self.shutdown_rx();
         tokio::select! {
@@ -229,6 +247,7 @@ impl Node {
         lamport_task.abort();
         network_task.abort();
         chain_task.abort();
+        api_task.abort();
 
         info!("Node stopped");
         Ok(())

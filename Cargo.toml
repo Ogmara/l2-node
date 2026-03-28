@@ -41,11 +41,11 @@ libp2p = { version = "0.56", features = [
 ] }
 futures = "0.3"
 
-# HTTP framework (Phase 4 — declared now for compilation)
-# axum = "0.8"
-# tower = "0.5"
-# tower-http = { version = "0.6", features = ["cors", "trace"] }
-# tokio-tungstenite = "0.29"
+# HTTP framework
+axum = { version = "0.8", features = ["ws"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+base64 = "0.22"
 
 # HTTP client (for Klever RPC + IPFS API)
 reqwest = { version = "0.13", features = ["json", "multipart"] }
