@@ -215,6 +215,119 @@ impl Storage {
             _ => Ok(0),
         }
     }
+
+    // --- Social graph (follows) ---
+
+    /// Record a follow relationship and update counts.
+    pub fn follow(&self, follower: &str, followed: &str) -> Result<()> {
+        let follow_key = super::schema::encode_follow_key(follower, followed);
+        let reverse_key = super::schema::encode_follow_key(followed, follower);
+
+        // Check if already following (idempotent)
+        if self.exists_cf(cf::FOLLOWS, &follow_key)? {
+            return Ok(());
+        }
+
+        self.put_cf(cf::FOLLOWS, &follow_key, &[])?;
+        self.put_cf(cf::FOLLOWERS, &reverse_key, &[])?;
+
+        // Update counts
+        let (mut following_count, follower_count) = self.get_follower_counts(follower)?;
+        following_count += 1;
+        self.set_follower_counts(follower, following_count, follower_count)?;
+
+        let (following_count2, mut follower_count2) = self.get_follower_counts(followed)?;
+        follower_count2 += 1;
+        self.set_follower_counts(followed, following_count2, follower_count2)?;
+
+        Ok(())
+    }
+
+    /// Remove a follow relationship and update counts.
+    pub fn unfollow(&self, follower: &str, followed: &str) -> Result<()> {
+        let follow_key = super::schema::encode_follow_key(follower, followed);
+        let reverse_key = super::schema::encode_follow_key(followed, follower);
+
+        // Check if actually following (idempotent)
+        if !self.exists_cf(cf::FOLLOWS, &follow_key)? {
+            return Ok(());
+        }
+
+        self.delete_cf(cf::FOLLOWS, &follow_key)?;
+        self.delete_cf(cf::FOLLOWERS, &reverse_key)?;
+
+        // Update counts
+        let (mut following_count, follower_count) = self.get_follower_counts(follower)?;
+        following_count = following_count.saturating_sub(1);
+        self.set_follower_counts(follower, following_count, follower_count)?;
+
+        let (following_count2, mut follower_count2) = self.get_follower_counts(followed)?;
+        follower_count2 = follower_count2.saturating_sub(1);
+        self.set_follower_counts(followed, following_count2, follower_count2)?;
+
+        Ok(())
+    }
+
+    /// Check if follower is following followed.
+    pub fn is_following(&self, follower: &str, followed: &str) -> Result<bool> {
+        let key = super::schema::encode_follow_key(follower, followed);
+        self.exists_cf(cf::FOLLOWS, &key)
+    }
+
+    /// Get follower counts for an address: (following_count, follower_count).
+    pub fn get_follower_counts(&self, address: &str) -> Result<(u64, u64)> {
+        match self.get_cf(cf::FOLLOWER_COUNTS, address.as_bytes())? {
+            Some(bytes) if bytes.len() == 16 => {
+                let following = u64::from_be_bytes(bytes[0..8].try_into().unwrap());
+                let followers = u64::from_be_bytes(bytes[8..16].try_into().unwrap());
+                Ok((following, followers))
+            }
+            _ => Ok((0, 0)),
+        }
+    }
+
+    fn set_follower_counts(
+        &self,
+        address: &str,
+        following: u64,
+        followers: u64,
+    ) -> Result<()> {
+        let mut bytes = Vec::with_capacity(16);
+        bytes.extend_from_slice(&following.to_be_bytes());
+        bytes.extend_from_slice(&followers.to_be_bytes());
+        self.put_cf(cf::FOLLOWER_COUNTS, address.as_bytes(), &bytes)
+    }
+
+    /// Get list of addresses that `address` follows.
+    pub fn get_following(&self, address: &str, limit: usize) -> Result<Vec<String>> {
+        let mut prefix = Vec::with_capacity(address.len() + 1);
+        prefix.extend_from_slice(address.as_bytes());
+        prefix.push(0xFF);
+        let entries = self.prefix_iter_cf(cf::FOLLOWS, &prefix, limit)?;
+        Ok(entries
+            .into_iter()
+            .filter_map(|(key, _)| {
+                // Key: follower_bytes + 0xFF + followed_bytes
+                let sep = key.iter().position(|&b| b == 0xFF)?;
+                String::from_utf8(key[sep + 1..].to_vec()).ok()
+            })
+            .collect())
+    }
+
+    /// Get list of addresses that follow `address`.
+    pub fn get_followers(&self, address: &str, limit: usize) -> Result<Vec<String>> {
+        let mut prefix = Vec::with_capacity(address.len() + 1);
+        prefix.extend_from_slice(address.as_bytes());
+        prefix.push(0xFF);
+        let entries = self.prefix_iter_cf(cf::FOLLOWERS, &prefix, limit)?;
+        Ok(entries
+            .into_iter()
+            .filter_map(|(key, _)| {
+                let sep = key.iter().position(|&b| b == 0xFF)?;
+                String::from_utf8(key[sep + 1..].to_vec()).ok()
+            })
+            .collect())
+    }
 }
 
 /// Get number of CPUs for RocksDB parallelism.

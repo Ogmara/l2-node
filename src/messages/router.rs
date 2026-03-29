@@ -253,6 +253,12 @@ impl MessageRouter {
                 DeserializedPayload::DeviceDelegation(ref p) => {
                     validation::validate_device_delegation(p)
                 }
+                DeserializedPayload::Follow(ref p) => {
+                    validation::validate_follow(&envelope.author, p)
+                }
+                DeserializedPayload::Unfollow(ref p) => {
+                    validation::validate_unfollow(&envelope.author, p)
+                }
                 // Types with no specific validation rules
                 _ => Ok(()),
             },
@@ -320,6 +326,20 @@ impl MessageRouter {
                         self.storage
                             .put_cf(schema::cf::NEWS_BY_TAG, &tag_key, &[])?;
                     }
+                }
+            }
+            MessageType::Follow => {
+                if let Ok(payload) =
+                    rmp_serde::from_slice::<FollowPayload>(&envelope.payload)
+                {
+                    self.storage.follow(&envelope.author, &payload.target)?;
+                }
+            }
+            MessageType::Unfollow => {
+                if let Ok(payload) =
+                    rmp_serde::from_slice::<UnfollowPayload>(&envelope.payload)
+                {
+                    self.storage.unfollow(&envelope.author, &payload.target)?;
                 }
             }
             _ => {}

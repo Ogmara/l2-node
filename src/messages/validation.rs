@@ -227,3 +227,31 @@ pub fn validate_device_delegation(p: &DeviceDelegationPayload) -> Result<(), Val
     }
     Ok(())
 }
+
+/// Validate a follow payload.
+pub fn validate_follow(author: &str, p: &FollowPayload) -> Result<(), ValidationError> {
+    if p.target.is_empty() {
+        return Err(ValidationError("target must not be empty".into()));
+    }
+    if author == p.target {
+        return Err(ValidationError("cannot follow yourself".into()));
+    }
+    if !p.target.starts_with("klv1") {
+        return Err(ValidationError("target must be a valid Klever address".into()));
+    }
+    Ok(())
+}
+
+/// Validate an unfollow payload.
+pub fn validate_unfollow(author: &str, p: &UnfollowPayload) -> Result<(), ValidationError> {
+    if p.target.is_empty() {
+        return Err(ValidationError("target must not be empty".into()));
+    }
+    if author == p.target {
+        return Err(ValidationError("cannot unfollow yourself".into()));
+    }
+    if !p.target.starts_with("klv1") {
+        return Err(ValidationError("target must be a valid Klever address".into()));
+    }
+    Ok(())
+}

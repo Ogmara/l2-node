@@ -79,6 +79,8 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
             get(routes::get_channel_messages),
         )
         .route("/api/v1/users/{address}", get(routes::get_user))
+        .route("/api/v1/users/{address}/followers", get(routes::get_followers))
+        .route("/api/v1/users/{address}/following", get(routes::get_following))
         .route("/api/v1/news", get(routes::list_news));
 
     // Authenticated routes (Klever wallet signature required)
@@ -86,6 +88,8 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
         .route("/api/v1/messages", post(routes::post_message))
         .route("/api/v1/profile", put(routes::update_profile))
         .route("/api/v1/dm/{address}", post(routes::send_dm))
+        .route("/api/v1/users/{address}/follow", post(routes::follow_user).delete(routes::unfollow_user))
+        .route("/api/v1/feed", get(routes::personal_feed))
         .layer(middleware::from_fn(auth::auth_middleware));
 
     // WebSocket routes
