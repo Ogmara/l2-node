@@ -20,6 +20,8 @@ use super::state::AppState;
 /// Metrics payload pushed to the dashboard WebSocket every 2 seconds (spec 4.5.2).
 #[derive(Debug, Serialize)]
 pub struct DashboardMetrics {
+    pub node_version: &'static str,
+    pub protocol_version: u8,
     pub uptime_seconds: u64,
     pub peers_connected: u32,
     pub messages_total: u64,
@@ -85,6 +87,8 @@ fn collect_metrics(state: &AppState) -> DashboardMetrics {
     let last_block = state.storage.get_chain_cursor().unwrap_or(0);
 
     DashboardMetrics {
+        node_version: env!("CARGO_PKG_VERSION"),
+        protocol_version: crate::messages::envelope::PROTOCOL_VERSION,
         uptime_seconds: uptime,
         peers_connected: state.peer_count(),
         messages_total: 0,  // TODO: track in storage counter
@@ -135,7 +139,7 @@ h1 { font-size: 1.5em; margin-bottom: 20px; color: var(--accent); }
 </head>
 <body>
 <div id="conn-status"><span class="status err" id="ws-dot"></span><span id="ws-text">Connecting...</span></div>
-<h1>Ogmara Node Dashboard</h1>
+<h1>Ogmara Node Dashboard <span id="version" style="font-size:0.5em;opacity:0.5"></span></h1>
 <div class="grid">
   <div class="card"><h2>Uptime</h2><div class="metric green" id="uptime">--</div></div>
   <div class="card"><h2>Peers</h2><div class="metric" id="peers">--</div></div>
@@ -158,6 +162,7 @@ function connect() {
   ws.onclose = () => { document.getElementById('ws-dot').className='status err'; document.getElementById('ws-text').textContent='Disconnected'; setTimeout(connect, 3000); };
   ws.onmessage = (e) => {
     const msg = JSON.parse(e.data); if (msg.type !== 'metrics') return; const d = msg.data;
+    document.getElementById('version').textContent = 'v' + d.node_version + ' (protocol ' + d.protocol_version + ')';
     document.getElementById('uptime').textContent = fmtTime(d.uptime_seconds);
     document.getElementById('peers').textContent = d.peers_connected;
     document.getElementById('messages').textContent = fmt(d.messages_total);

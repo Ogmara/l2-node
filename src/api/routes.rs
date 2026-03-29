@@ -83,7 +83,7 @@ pub async fn network_stats(Extension(state): Extension<Arc<AppState>>) -> Json<S
         total_channels: 0,
         total_users: 0,
         uptime_seconds: uptime,
-        protocol_version: 1,
+        protocol_version: crate::messages::envelope::PROTOCOL_VERSION,
     })
 }
 
