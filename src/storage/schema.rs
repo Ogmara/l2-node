@@ -33,6 +33,13 @@ pub mod cf {
     /// key → value — cursor positions, node config, etc.
     pub const NODE_STATE: &str = "node_state";
 
+    /// (follower_address, followed_address) → () — who you follow
+    pub const FOLLOWS: &str = "follows";
+    /// (followed_address, follower_address) → () — who follows you (reverse index)
+    pub const FOLLOWERS: &str = "followers";
+    /// address → (following_count: u64, follower_count: u64) — cached counts
+    pub const FOLLOWER_COUNTS: &str = "follower_counts";
+
     /// All column family names for database initialization.
     pub const ALL: &[&str] = &[
         MESSAGES,
@@ -49,6 +56,9 @@ pub mod cf {
         PEER_DIRECTORY,
         CONTENT_CACHE,
         NODE_STATE,
+        FOLLOWS,
+        FOLLOWERS,
+        FOLLOWER_COUNTS,
     ];
 }
 
@@ -134,5 +144,14 @@ pub fn encode_delegation_key(user_address: &str, device_pub_key: &str) -> Vec<u8
     key.extend_from_slice(user_address.as_bytes());
     key.push(0xFF); // separator
     key.extend_from_slice(device_pub_key.as_bytes());
+    key
+}
+
+/// Encode a follow key: (follower, followed) separated by 0xFF.
+pub fn encode_follow_key(follower: &str, followed: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(follower.len() + 1 + followed.len());
+    key.extend_from_slice(follower.as_bytes());
+    key.push(0xFF);
+    key.extend_from_slice(followed.as_bytes());
     key
 }

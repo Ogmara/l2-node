@@ -251,6 +251,56 @@ pub async fn list_news(
     }
 }
 
+// --- Social endpoints (public) ---
+
+/// GET /api/v1/users/:address/followers
+pub async fn get_followers(
+    Extension(state): Extension<Arc<AppState>>,
+    Path(address): Path<String>,
+    Query(params): Query<PaginationParams>,
+) -> impl IntoResponse {
+    let limit = params.limit.unwrap_or(50).min(200) as usize;
+    match state.storage.get_followers(&address, limit) {
+        Ok(followers) => {
+            let (_, follower_count) = state.storage.get_follower_counts(&address).unwrap_or((0, 0));
+            Json(serde_json::json!({
+                "followers": followers,
+                "total": follower_count,
+                "page": params.page.unwrap_or(1),
+            }))
+            .into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Storage error in API handler");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
+        }
+    }
+}
+
+/// GET /api/v1/users/:address/following
+pub async fn get_following(
+    Extension(state): Extension<Arc<AppState>>,
+    Path(address): Path<String>,
+    Query(params): Query<PaginationParams>,
+) -> impl IntoResponse {
+    let limit = params.limit.unwrap_or(50).min(200) as usize;
+    match state.storage.get_following(&address, limit) {
+        Ok(following) => {
+            let (following_count, _) = state.storage.get_follower_counts(&address).unwrap_or((0, 0));
+            Json(serde_json::json!({
+                "following": following,
+                "total": following_count,
+                "page": params.page.unwrap_or(1),
+            }))
+            .into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Storage error in API handler");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
+        }
+    }
+}
+
 // --- Authenticated endpoint handlers ---
 
 /// POST /api/v1/messages — submit a signed message envelope
@@ -319,4 +369,114 @@ pub async fn send_dm(
             (StatusCode::BAD_REQUEST, reason).into_response()
         }
     }
+}
+
+/// POST /api/v1/users/:address/follow — follow a user (signed envelope)
+pub async fn follow_user(
+    Extension(state): Extension<Arc<AppState>>,
+    Extension(_auth_user): Extension<AuthUser>,
+    Path(_address): Path<String>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    use crate::messages::router::RouteResult;
+
+    match state.router.process_message(&body) {
+        RouteResult::Accepted { .. } => Json(OkResponse { ok: true }).into_response(),
+        RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
+        RouteResult::Rejected(reason) => {
+            (StatusCode::BAD_REQUEST, reason).into_response()
+        }
+    }
+}
+
+/// DELETE /api/v1/users/:address/follow — unfollow a user (signed envelope)
+pub async fn unfollow_user(
+    Extension(state): Extension<Arc<AppState>>,
+    Extension(_auth_user): Extension<AuthUser>,
+    Path(_address): Path<String>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    use crate::messages::router::RouteResult;
+
+    match state.router.process_message(&body) {
+        RouteResult::Accepted { .. } => Json(OkResponse { ok: true }).into_response(),
+        RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
+        RouteResult::Rejected(reason) => {
+            (StatusCode::BAD_REQUEST, reason).into_response()
+        }
+    }
+}
+
+/// GET /api/v1/feed — personal news feed (posts from followed users)
+pub async fn personal_feed(
+    Extension(state): Extension<Arc<AppState>>,
+    Extension(auth_user): Extension<AuthUser>,
+    Query(params): Query<PaginationParams>,
+) -> impl IntoResponse {
+    let limit = params.limit.unwrap_or(20).min(100) as usize;
+
+    let following = match state.storage.get_following(&auth_user.address, 1000) {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::error!(error = %e, "Storage error in feed handler");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response();
+        }
+    };
+
+    if following.is_empty() {
+        return Json(serde_json::json!({
+            "posts": [],
+            "total": 0,
+            "page": params.page.unwrap_or(1),
+        }))
+        .into_response();
+    }
+
+    // Collect posts from each followed user
+    let mut all_posts: Vec<(u64, Vec<u8>)> = Vec::new();
+    for author in &following {
+        let mut author_prefix = Vec::with_capacity(author.len() + 1);
+        author_prefix.extend_from_slice(author.as_bytes());
+        author_prefix.push(0xFF);
+
+        if let Ok(entries) = state.storage.prefix_iter_cf(
+            crate::storage::schema::cf::NEWS_BY_AUTHOR,
+            &author_prefix,
+            limit,
+        ) {
+            for (key, _) in entries {
+                let suffix_start = author.len() + 1;
+                if key.len() >= suffix_start + 40 {
+                    let msg_id: [u8; 32] =
+                        key[suffix_start + 8..suffix_start + 40].try_into().unwrap_or([0u8; 32]);
+                    let neg_ts: [u8; 8] =
+                        key[suffix_start..suffix_start + 8].try_into().unwrap_or([0u8; 8]);
+                    let timestamp = !u64::from_be_bytes(neg_ts);
+                    if let Ok(Some(env_bytes)) = state.storage.get_message(&msg_id) {
+                        all_posts.push((timestamp, env_bytes));
+                    }
+                }
+            }
+        }
+    }
+
+    // Sort newest first, apply limit
+    all_posts.sort_by(|a, b| b.0.cmp(&a.0));
+    all_posts.truncate(limit);
+
+    let posts: Vec<serde_json::Value> = all_posts
+        .iter()
+        .filter_map(|(_, bytes)| {
+            rmp_serde::from_slice::<crate::messages::envelope::Envelope>(bytes)
+                .ok()
+                .and_then(|env| serde_json::to_value(&env).ok())
+        })
+        .collect();
+
+    Json(serde_json::json!({
+        "posts": posts,
+        "total": posts.len(),
+        "page": params.page.unwrap_or(1),
+    }))
+    .into_response()
 }

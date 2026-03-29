@@ -38,6 +38,8 @@ pub enum MessageType {
     DeviceDelegation = 0x31,
     DeviceRevocation = 0x32,
     SettingsSync = 0x33,
+    Follow = 0x34,
+    Unfollow = 0x35,
 
     // Moderation
     Report = 0x40,
@@ -80,6 +82,8 @@ impl MessageType {
             0x31 => Some(Self::DeviceDelegation),
             0x32 => Some(Self::DeviceRevocation),
             0x33 => Some(Self::SettingsSync),
+            0x34 => Some(Self::Follow),
+            0x35 => Some(Self::Unfollow),
             0x40 => Some(Self::Report),
             0x41 => Some(Self::CounterVote),
             0x42 => Some(Self::ChannelMute),
@@ -384,6 +388,20 @@ pub struct SettingsSyncPayload {
     pub key_epoch: u64,
 }
 
+// --- Social Payloads (Follow/Unfollow) ---
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FollowPayload {
+    /// Klever address of the user to follow.
+    pub target: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnfollowPayload {
+    /// Klever address of the user to unfollow.
+    pub target: String,
+}
+
 // --- Moderation Payloads (spec 3.10) ---
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -484,6 +502,7 @@ pub enum ContentRequestType {
     NewsPosts = 0x03,
     NewsPostsByTag = 0x04,
     UserPosts = 0x05,
+    PersonalFeed = 0x06,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -529,6 +548,8 @@ pub fn deserialize_payload(
         MessageType::DeviceDelegation => Ok(DeserializedPayload::DeviceDelegation(rmp_serde::from_slice(payload_bytes)?)),
         MessageType::DeviceRevocation => Ok(DeserializedPayload::DeviceRevocation(rmp_serde::from_slice(payload_bytes)?)),
         MessageType::SettingsSync => Ok(DeserializedPayload::SettingsSync(rmp_serde::from_slice(payload_bytes)?)),
+        MessageType::Follow => Ok(DeserializedPayload::Follow(rmp_serde::from_slice(payload_bytes)?)),
+        MessageType::Unfollow => Ok(DeserializedPayload::Unfollow(rmp_serde::from_slice(payload_bytes)?)),
         MessageType::Report => Ok(DeserializedPayload::Report(rmp_serde::from_slice(payload_bytes)?)),
         MessageType::CounterVote => Ok(DeserializedPayload::CounterVote(rmp_serde::from_slice(payload_bytes)?)),
         MessageType::ChannelMute => Ok(DeserializedPayload::ChannelMute(rmp_serde::from_slice(payload_bytes)?)),
@@ -558,6 +579,8 @@ pub enum DeserializedPayload {
     DeviceDelegation(DeviceDelegationPayload),
     DeviceRevocation(DeviceRevocationPayload),
     SettingsSync(SettingsSyncPayload),
+    Follow(FollowPayload),
+    Unfollow(UnfollowPayload),
     Report(ReportPayload),
     CounterVote(CounterVotePayload),
     ChannelMute(ChannelMutePayload),
