@@ -5,6 +5,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use rocksdb::{ColumnFamilyDescriptor, DBWithThreadMode, MultiThreaded, Options, WriteBatch};
@@ -13,6 +14,31 @@ use super::schema::cf;
 
 /// Type alias for the multi-threaded RocksDB instance.
 pub type RocksDb = DBWithThreadMode<MultiThreaded>;
+
+/// Anchor verification status for a node.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AnchorStatus {
+    pub verified: bool,
+    pub level: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_anchor_age_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anchoring_since: Option<u64>,
+    pub total_anchors: u64,
+}
+
+/// Self anchor status for the /network/stats endpoint.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SelfAnchorStatus {
+    pub is_anchorer: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_anchor_height: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_anchor_age_seconds: Option<u64>,
+    pub total_anchors: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anchoring_since: Option<u64>,
+}
 
 /// Wrapper around RocksDB with typed column family access.
 #[derive(Clone)]
@@ -593,6 +619,188 @@ impl Storage {
         let prefix = channel_id.to_be_bytes();
         let entries = self.prefix_iter_cf(cf::CHANNEL_PINS, &prefix, 11)?;
         Ok(entries.len() as u32)
+    }
+
+    // --- Anchor Verification ---
+
+    /// Compute the anchor verification status for a given node.
+    ///
+    /// Levels:
+    /// - "active": anchored consistently (at least 1 per 24h window) for 7+ days
+    /// - "verified": anchored at least once in the last 24h
+    /// - "none": no recent anchors
+    pub fn compute_anchor_status(&self, node_id: &str) -> Result<AnchorStatus> {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let mut prefix = Vec::with_capacity(node_id.len() + 1);
+        prefix.extend_from_slice(node_id.as_bytes());
+        prefix.push(0xFF);
+
+        // Fetch recent anchors for this node (200 covers 7+ days of hourly anchoring)
+        let seven_days_ms = 7 * 24 * 60 * 60 * 1000u64;
+        let cutoff = now_ms.saturating_sub(seven_days_ms);
+
+        let entries = self.prefix_iter_cf(cf::ANCHOR_BY_NODE, &prefix, 200)?;
+
+        if entries.is_empty() {
+            return Ok(AnchorStatus {
+                verified: false,
+                level: "none".to_string(),
+                last_anchor_age_seconds: None,
+                anchoring_since: None,
+                total_anchors: 0,
+            });
+        }
+
+        // Parse timestamps from keys and filter recent ones
+        let mut timestamps: Vec<u64> = Vec::new();
+        let mut all_count = 0u64;
+        let mut earliest: Option<u64> = None;
+
+        for (key, _) in &entries {
+            if key.len() > prefix.len() + 7 {
+                let ts_start = key.len() - 8;
+                let mut ts_bytes = [0u8; 8];
+                ts_bytes.copy_from_slice(&key[ts_start..]);
+                let ts = u64::from_be_bytes(ts_bytes);
+                all_count += 1;
+                if earliest.is_none() || ts < earliest.unwrap() {
+                    earliest = Some(ts);
+                }
+                if ts >= cutoff {
+                    timestamps.push(ts);
+                }
+            }
+        }
+
+        if timestamps.is_empty() {
+            return Ok(AnchorStatus {
+                verified: false,
+                level: "none".to_string(),
+                last_anchor_age_seconds: None,
+                anchoring_since: earliest,
+                total_anchors: all_count,
+            });
+        }
+
+        timestamps.sort_unstable();
+        let most_recent = *timestamps.last().unwrap();
+        let age_secs = now_ms.saturating_sub(most_recent) / 1000;
+
+        let twenty_four_hours_ms = 24 * 60 * 60 * 1000u64;
+
+        // Check if anchored in last 24h
+        if age_secs > 24 * 60 * 60 {
+            return Ok(AnchorStatus {
+                verified: false,
+                level: "none".to_string(),
+                last_anchor_age_seconds: Some(age_secs),
+                anchoring_since: earliest,
+                total_anchors: all_count,
+            });
+        }
+
+        // Check if consistently anchored for 7+ days
+        // Need at least one anchor per 24h window across all 7 days
+        let mut level = "verified".to_string();
+        if timestamps.len() >= 7 {
+            let seven_days_ago = now_ms.saturating_sub(seven_days_ms);
+            if *timestamps.first().unwrap() <= seven_days_ago + twenty_four_hours_ms {
+                // Check each 24h window
+                let mut all_days_covered = true;
+                for day in 0..7 {
+                    let window_start = now_ms.saturating_sub((day + 1) as u64 * twenty_four_hours_ms);
+                    let window_end = now_ms.saturating_sub(day as u64 * twenty_four_hours_ms);
+                    let has_anchor = timestamps.iter().any(|&ts| ts >= window_start && ts < window_end);
+                    if !has_anchor {
+                        all_days_covered = false;
+                        break;
+                    }
+                }
+                if all_days_covered {
+                    level = "active".to_string();
+                }
+            }
+        }
+
+        Ok(AnchorStatus {
+            verified: true,
+            level,
+            last_anchor_age_seconds: Some(age_secs),
+            anchoring_since: earliest,
+            total_anchors: all_count,
+        })
+    }
+
+    /// Get the self anchor status for this node (used in /network/stats).
+    ///
+    /// Uses the ANCHOR_BY_NODE index to query only this node's anchors,
+    /// then looks up the most recent STATE_ANCHORS entry for block height.
+    pub fn get_self_anchor_status(&self, node_id: &str) -> Result<SelfAnchorStatus> {
+        let mut prefix = Vec::with_capacity(node_id.len() + 1);
+        prefix.extend_from_slice(node_id.as_bytes());
+        prefix.push(0xFF);
+
+        let entries = self.prefix_iter_cf(cf::ANCHOR_BY_NODE, &prefix, 200)?;
+        let total = entries.len() as u64;
+
+        if entries.is_empty() {
+            return Ok(SelfAnchorStatus {
+                is_anchorer: false,
+                last_anchor_height: None,
+                last_anchor_age_seconds: None,
+                total_anchors: 0,
+                anchoring_since: None,
+            });
+        }
+
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        // Extract timestamps from keys and block heights from values
+        let mut earliest_ts: Option<u64> = None;
+        let mut latest_ts: u64 = 0;
+        let mut latest_height: u64 = 0;
+
+        for (key, value) in &entries {
+            if key.len() >= prefix.len() + 8 {
+                let ts_start = key.len() - 8;
+                let mut ts_bytes = [0u8; 8];
+                ts_bytes.copy_from_slice(&key[ts_start..]);
+                let ts = u64::from_be_bytes(ts_bytes);
+
+                if earliest_ts.is_none() || ts < earliest_ts.unwrap() {
+                    earliest_ts = Some(ts);
+                }
+                if ts > latest_ts {
+                    latest_ts = ts;
+                    if value.len() == 8 {
+                        let mut h = [0u8; 8];
+                        h.copy_from_slice(value);
+                        latest_height = u64::from_be_bytes(h);
+                    }
+                }
+            }
+        }
+
+        let last_age = if latest_ts > 0 {
+            Some(now_ms.saturating_sub(latest_ts) / 1000)
+        } else {
+            None
+        };
+
+        Ok(SelfAnchorStatus {
+            is_anchorer: total > 0,
+            last_anchor_height: if latest_height > 0 { Some(latest_height) } else { None },
+            last_anchor_age_seconds: last_age,
+            total_anchors: total,
+            anchoring_since: earliest_ts,
+        })
     }
 }
 

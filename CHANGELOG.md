@@ -5,6 +5,26 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-03-30
+
+### Added
+
+- **Node Anchor Verification** — nodes that anchor L2 state on-chain are now
+  tracked with verification levels (`active`, `verified`, `none`)
+- `ANCHOR_BY_NODE` column family — reverse index of anchors by submitting node
+  for efficient per-node anchor history queries
+- `compute_anchor_status()` — determines verification level based on anchor
+  consistency over the last 7 days
+- `get_self_anchor_status()` — reports this node's own anchoring activity
+- `GET /api/v1/network/stats` now includes `anchor_status` object with
+  `is_anchorer`, `last_anchor_height`, `last_anchor_age_seconds`,
+  `total_anchors`, `anchoring_since`
+- `GET /api/v1/network/nodes` — new endpoint listing all known peers with
+  per-node `anchor_status` (verified, level, last_anchor_age_seconds,
+  anchoring_since)
+- Chain scanner now writes anchor-by-node reverse index when processing
+  `stateAnchored` events
+
 ## [0.2.0] - 2026-03-30
 
 ### Security
