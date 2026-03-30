@@ -27,11 +27,25 @@ pub enum MessageType {
     ChannelJoin = 0x12,
     ChannelLeave = 0x13,
 
+    // Channel Administration
+    ChannelAddModerator = 0x14,
+    ChannelRemoveModerator = 0x15,
+    ChannelKick = 0x16,
+    ChannelBan = 0x17,
+    ChannelUnban = 0x18,
+    ChannelPinMessage = 0x19,
+    ChannelUnpinMessage = 0x1A,
+    ChannelInvite = 0x1B,
+
     // News / Posts
     NewsPost = 0x20,
     NewsEdit = 0x21,
     NewsDelete = 0x22,
     NewsComment = 0x23,
+
+    // News Engagement
+    NewsReaction = 0x24,
+    NewsRepost = 0x25,
 
     // Profile & Identity
     ProfileUpdate = 0x30,
@@ -74,10 +88,20 @@ impl MessageType {
             0x11 => Some(Self::ChannelUpdate),
             0x12 => Some(Self::ChannelJoin),
             0x13 => Some(Self::ChannelLeave),
+            0x14 => Some(Self::ChannelAddModerator),
+            0x15 => Some(Self::ChannelRemoveModerator),
+            0x16 => Some(Self::ChannelKick),
+            0x17 => Some(Self::ChannelBan),
+            0x18 => Some(Self::ChannelUnban),
+            0x19 => Some(Self::ChannelPinMessage),
+            0x1A => Some(Self::ChannelUnpinMessage),
+            0x1B => Some(Self::ChannelInvite),
             0x20 => Some(Self::NewsPost),
             0x21 => Some(Self::NewsEdit),
             0x22 => Some(Self::NewsDelete),
             0x23 => Some(Self::NewsComment),
+            0x24 => Some(Self::NewsReaction),
+            0x25 => Some(Self::NewsRepost),
             0x30 => Some(Self::ProfileUpdate),
             0x31 => Some(Self::DeviceDelegation),
             0x32 => Some(Self::DeviceRevocation),
@@ -273,12 +297,21 @@ pub struct ChannelCreatePayload {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelUpdatePayload {
-    /// Must be channel admin/creator.
+    /// Must be channel admin/creator or mod with can_edit_info.
     pub channel_id: u64,
     pub display_name: Option<String>,
     pub description: Option<String>,
     pub content_rating: Option<ContentRating>,
     pub moderation: Option<ModerationPolicy>,
+    /// Channel avatar/logo IPFS CID.
+    pub logo_cid: Option<String>,
+    /// Channel banner image IPFS CID.
+    pub banner_cid: Option<String>,
+    /// External website URL, max 256 chars.
+    pub website_url: Option<String>,
+    /// Channel topic tags, max 5.
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -289,6 +322,90 @@ pub struct ChannelJoinPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelLeavePayload {
     pub channel_id: u64,
+}
+
+// --- Channel Administration Payloads (spec 3.9) ---
+
+/// Permissions granted to a channel moderator.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModeratorPermissions {
+    pub can_mute: bool,
+    pub can_kick: bool,
+    pub can_ban: bool,
+    pub can_pin: bool,
+    pub can_edit_info: bool,
+    pub can_delete_msgs: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelAddModeratorPayload {
+    pub channel_id: u64,
+    /// User to promote.
+    pub target_user: String,
+    pub permissions: ModeratorPermissions,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelRemoveModeratorPayload {
+    pub channel_id: u64,
+    /// User to demote.
+    pub target_user: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelKickPayload {
+    pub channel_id: u64,
+    pub target_user: String,
+    /// Max 256 chars.
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelBanPayload {
+    pub channel_id: u64,
+    pub target_user: String,
+    /// Max 256 chars.
+    pub reason: Option<String>,
+    /// 0 = permanent.
+    pub duration_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelUnbanPayload {
+    pub channel_id: u64,
+    pub target_user: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelPinMessagePayload {
+    pub channel_id: u64,
+    pub msg_id: [u8; 32],
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelUnpinMessagePayload {
+    pub channel_id: u64,
+    pub msg_id: [u8; 32],
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelInvitePayload {
+    pub channel_id: u64,
+    /// User to invite.
+    pub target_user: String,
+}
+
+// --- News Engagement Payloads ---
+
+/// Repost of a news post (with optional quote comment).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewsRepostPayload {
+    /// msg_id of the original news post.
+    pub original_id: [u8; 32],
+    /// Author of the original post.
+    pub original_author: String,
+    /// Optional "quote repost" comment, max 512 chars.
+    pub comment: Option<String>,
 }
 
 // --- Edit, Delete, Reaction Payloads (spec 3.7) ---
@@ -534,7 +651,7 @@ pub fn deserialize_payload(
         MessageType::ChatDelete | MessageType::DirectMessageDelete | MessageType::NewsDelete => {
             Ok(DeserializedPayload::Delete(rmp_serde::from_slice(payload_bytes)?))
         }
-        MessageType::ChatReaction | MessageType::DirectMessageReaction => {
+        MessageType::ChatReaction | MessageType::DirectMessageReaction | MessageType::NewsReaction => {
             Ok(DeserializedPayload::Reaction(rmp_serde::from_slice(payload_bytes)?))
         }
         MessageType::DirectMessage => Ok(DeserializedPayload::DirectMessage(rmp_serde::from_slice(payload_bytes)?)),
@@ -542,6 +659,15 @@ pub fn deserialize_payload(
         MessageType::ChannelUpdate => Ok(DeserializedPayload::ChannelUpdate(rmp_serde::from_slice(payload_bytes)?)),
         MessageType::ChannelJoin => Ok(DeserializedPayload::ChannelJoin(rmp_serde::from_slice(payload_bytes)?)),
         MessageType::ChannelLeave => Ok(DeserializedPayload::ChannelLeave(rmp_serde::from_slice(payload_bytes)?)),
+        MessageType::ChannelAddModerator => Ok(DeserializedPayload::ChannelAddModerator(rmp_serde::from_slice(payload_bytes)?)),
+        MessageType::ChannelRemoveModerator => Ok(DeserializedPayload::ChannelRemoveModerator(rmp_serde::from_slice(payload_bytes)?)),
+        MessageType::ChannelKick => Ok(DeserializedPayload::ChannelKick(rmp_serde::from_slice(payload_bytes)?)),
+        MessageType::ChannelBan => Ok(DeserializedPayload::ChannelBan(rmp_serde::from_slice(payload_bytes)?)),
+        MessageType::ChannelUnban => Ok(DeserializedPayload::ChannelUnban(rmp_serde::from_slice(payload_bytes)?)),
+        MessageType::ChannelPinMessage => Ok(DeserializedPayload::ChannelPinMessage(rmp_serde::from_slice(payload_bytes)?)),
+        MessageType::ChannelUnpinMessage => Ok(DeserializedPayload::ChannelUnpinMessage(rmp_serde::from_slice(payload_bytes)?)),
+        MessageType::ChannelInvite => Ok(DeserializedPayload::ChannelInvite(rmp_serde::from_slice(payload_bytes)?)),
+        MessageType::NewsRepost => Ok(DeserializedPayload::NewsRepost(rmp_serde::from_slice(payload_bytes)?)),
         MessageType::NewsPost => Ok(DeserializedPayload::NewsPost(rmp_serde::from_slice(payload_bytes)?)),
         MessageType::NewsComment => Ok(DeserializedPayload::NewsComment(rmp_serde::from_slice(payload_bytes)?)),
         MessageType::ProfileUpdate => Ok(DeserializedPayload::ProfileUpdate(rmp_serde::from_slice(payload_bytes)?)),
@@ -568,10 +694,19 @@ pub enum DeserializedPayload {
     DirectMessage(DirectMessagePayload),
     NewsPost(NewsPostPayload),
     NewsComment(NewsCommentPayload),
+    NewsRepost(NewsRepostPayload),
     ChannelCreate(ChannelCreatePayload),
     ChannelUpdate(ChannelUpdatePayload),
     ChannelJoin(ChannelJoinPayload),
     ChannelLeave(ChannelLeavePayload),
+    ChannelAddModerator(ChannelAddModeratorPayload),
+    ChannelRemoveModerator(ChannelRemoveModeratorPayload),
+    ChannelKick(ChannelKickPayload),
+    ChannelBan(ChannelBanPayload),
+    ChannelUnban(ChannelUnbanPayload),
+    ChannelPinMessage(ChannelPinMessagePayload),
+    ChannelUnpinMessage(ChannelUnpinMessagePayload),
+    ChannelInvite(ChannelInvitePayload),
     Edit(EditPayload),
     Delete(DeletePayload),
     Reaction(ReactionPayload),

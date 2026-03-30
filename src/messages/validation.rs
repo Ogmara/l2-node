@@ -32,6 +32,18 @@ pub const MAX_TAG_LENGTH: usize = 64;
 pub const MAX_MENTIONS: usize = 50;
 /// Maximum attachments per message.
 pub const MAX_ATTACHMENTS: usize = 20;
+/// Maximum reason length for kicks/bans (256 chars).
+pub const MAX_REASON: usize = 256;
+/// Maximum repost comment length (512 chars).
+pub const MAX_REPOST_COMMENT: usize = 512;
+/// Maximum website URL length (256 chars).
+pub const MAX_WEBSITE_URL: usize = 256;
+/// Maximum content request limit (per spec 5.5.2).
+pub const MAX_CONTENT_REQUEST_LIMIT: u32 = 500;
+/// Maximum channel tags.
+pub const MAX_CHANNEL_TAGS: usize = 5;
+/// Maximum pinned messages per channel.
+pub const MAX_PINS_PER_CHANNEL: usize = 10;
 
 /// Validation error with a human-readable message.
 #[derive(Debug, Clone)]
@@ -160,6 +172,21 @@ pub fn validate_channel_update(p: &ChannelUpdatePayload) -> Result<(), Validatio
             return Err(ValidationError("description too long".into()));
         }
     }
+    if let Some(ref url) = p.website_url {
+        if url.len() > MAX_WEBSITE_URL {
+            return Err(ValidationError("website_url too long".into()));
+        }
+    }
+    if let Some(ref tags) = p.tags {
+        if tags.len() > MAX_CHANNEL_TAGS {
+            return Err(ValidationError("too many channel tags (max 5)".into()));
+        }
+        for tag in tags {
+            if tag.len() > MAX_TAG_LENGTH {
+                return Err(ValidationError("channel tag too long".into()));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -252,6 +279,138 @@ pub fn validate_unfollow(author: &str, p: &UnfollowPayload) -> Result<(), Valida
     }
     if !p.target.starts_with("klv1") {
         return Err(ValidationError("target must be a valid Klever address".into()));
+    }
+    Ok(())
+}
+
+// --- Channel Administration validation ---
+
+/// Validate a channel add moderator payload.
+pub fn validate_channel_add_moderator(p: &ChannelAddModeratorPayload) -> Result<(), ValidationError> {
+    if p.channel_id == 0 {
+        return Err(ValidationError("channel_id must be > 0".into()));
+    }
+    if p.target_user.is_empty() || !p.target_user.starts_with("klv1") {
+        return Err(ValidationError("target_user must be a valid Klever address".into()));
+    }
+    Ok(())
+}
+
+/// Validate a channel remove moderator payload.
+pub fn validate_channel_remove_moderator(p: &ChannelRemoveModeratorPayload) -> Result<(), ValidationError> {
+    if p.channel_id == 0 {
+        return Err(ValidationError("channel_id must be > 0".into()));
+    }
+    if p.target_user.is_empty() || !p.target_user.starts_with("klv1") {
+        return Err(ValidationError("target_user must be a valid Klever address".into()));
+    }
+    Ok(())
+}
+
+/// Validate a channel kick payload.
+pub fn validate_channel_kick(p: &ChannelKickPayload) -> Result<(), ValidationError> {
+    if p.channel_id == 0 {
+        return Err(ValidationError("channel_id must be > 0".into()));
+    }
+    if p.target_user.is_empty() || !p.target_user.starts_with("klv1") {
+        return Err(ValidationError("target_user must be a valid Klever address".into()));
+    }
+    if let Some(ref reason) = p.reason {
+        if reason.len() > MAX_REASON {
+            return Err(ValidationError("reason too long".into()));
+        }
+    }
+    Ok(())
+}
+
+/// Validate a channel ban payload.
+pub fn validate_channel_ban(p: &ChannelBanPayload) -> Result<(), ValidationError> {
+    if p.channel_id == 0 {
+        return Err(ValidationError("channel_id must be > 0".into()));
+    }
+    if p.target_user.is_empty() || !p.target_user.starts_with("klv1") {
+        return Err(ValidationError("target_user must be a valid Klever address".into()));
+    }
+    // Ban reason is required per spec section 2.6
+    match p.reason {
+        None => return Err(ValidationError("ban reason is required".into())),
+        Some(ref reason) if reason.is_empty() => {
+            return Err(ValidationError("ban reason must not be empty".into()));
+        }
+        Some(ref reason) if reason.len() > MAX_REASON => {
+            return Err(ValidationError("reason too long".into()));
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Validate a channel unban payload.
+pub fn validate_channel_unban(p: &ChannelUnbanPayload) -> Result<(), ValidationError> {
+    if p.channel_id == 0 {
+        return Err(ValidationError("channel_id must be > 0".into()));
+    }
+    if p.target_user.is_empty() || !p.target_user.starts_with("klv1") {
+        return Err(ValidationError("target_user must be a valid Klever address".into()));
+    }
+    Ok(())
+}
+
+/// Validate a channel pin message payload.
+pub fn validate_channel_pin(p: &ChannelPinMessagePayload) -> Result<(), ValidationError> {
+    if p.channel_id == 0 {
+        return Err(ValidationError("channel_id must be > 0".into()));
+    }
+    Ok(())
+}
+
+/// Validate a channel unpin message payload.
+pub fn validate_channel_unpin(p: &ChannelUnpinMessagePayload) -> Result<(), ValidationError> {
+    if p.channel_id == 0 {
+        return Err(ValidationError("channel_id must be > 0".into()));
+    }
+    Ok(())
+}
+
+/// Validate a channel invite payload.
+pub fn validate_channel_invite(p: &ChannelInvitePayload) -> Result<(), ValidationError> {
+    if p.channel_id == 0 {
+        return Err(ValidationError("channel_id must be > 0".into()));
+    }
+    if p.target_user.is_empty() || !p.target_user.starts_with("klv1") {
+        return Err(ValidationError("target_user must be a valid Klever address".into()));
+    }
+    Ok(())
+}
+
+/// Validate a content request payload.
+pub fn validate_content_request(p: &ContentRequest) -> Result<(), ValidationError> {
+    if p.limit > MAX_CONTENT_REQUEST_LIMIT {
+        return Err(ValidationError(format!(
+            "content request limit too large: {} > {}",
+            p.limit, MAX_CONTENT_REQUEST_LIMIT
+        )));
+    }
+    if p.limit == 0 {
+        return Err(ValidationError("content request limit must be > 0".into()));
+    }
+    Ok(())
+}
+
+// --- News Engagement validation ---
+
+/// Validate a news repost payload.
+pub fn validate_news_repost(author: &str, p: &NewsRepostPayload) -> Result<(), ValidationError> {
+    if p.original_author.is_empty() || !p.original_author.starts_with("klv1") {
+        return Err(ValidationError("original_author must be a valid Klever address".into()));
+    }
+    if author == p.original_author {
+        return Err(ValidationError("cannot repost your own post".into()));
+    }
+    if let Some(ref comment) = p.comment {
+        if comment.len() > MAX_REPOST_COMMENT {
+            return Err(ValidationError("repost comment too long (max 512)".into()));
+        }
     }
     Ok(())
 }

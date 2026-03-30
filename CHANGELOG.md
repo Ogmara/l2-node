@@ -5,6 +5,55 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-03-30
+
+### Security
+- Authorization guard for all channel admin operations (add/remove mod, kick, ban, pin, invite)
+  - Creator-only actions enforced (moderator management)
+  - Per-permission checks for moderators (can_kick, can_ban, can_pin, etc.)
+  - Cannot kick/ban the channel creator
+- Ban enforcement in message pipeline — banned users rejected from channel-scoped messages
+- Ban expiration enforcement — temporary bans auto-expire on read and in pipeline
+- Per-action-type rate limiting (7 categories per spec Part 5) replacing flat counter
+- Rate limiter memory cleanup (evicts expired entries)
+- Atomic WriteBatch for follow/unfollow, reaction toggle, repost count updates
+- Proper error propagation replacing `unwrap_or_default()` on serialization
+- Ban list endpoint moved behind authentication (moderator/creator only)
+- Ban reason now required per spec section 2.6
+- Monotonic pin sequence to prevent pin_order collisions
+- ContentRequest.limit capped to 500 per spec
+- Feed endpoint fan-out capped to 200 followed users
+- Bookmark removal uses O(1) reverse index instead of O(N) scan
+
+### Added
+- **News Engagement**
+  - NewsReaction (0x24) and NewsRepost (0x25) message types
+  - ReactionPayload reuse for news reactions (like, dislike, love, fire, funny)
+  - NewsRepostPayload with optional quote comment (max 512 chars)
+  - Storage: news_reactions, reaction_counts, reposts, repost_counts, bookmarks CFs
+  - API: GET/POST news reactions, GET/POST reposts, GET/POST/DELETE bookmarks
+  - Toggle-based reaction counting with cached counts
+  - Repost idempotency (can't repost same post twice, can't repost own post)
+
+- **Channel Administration**
+  - 8 new message types: ChannelAddModerator (0x14), ChannelRemoveModerator (0x15),
+    ChannelKick (0x16), ChannelBan (0x17), ChannelUnban (0x18), ChannelPinMessage (0x19),
+    ChannelUnpinMessage (0x1A), ChannelInvite (0x1B)
+  - ModeratorPermissions struct (can_mute, can_kick, can_ban, can_pin, can_edit_info, can_delete_msgs)
+  - Storage: channel_moderators, channel_bans, channel_pins, channel_members, channel_invites CFs
+  - API: Full CRUD for moderators, bans, pins, invites, member listing
+  - Pin message FIFO (max 10 per channel, oldest removed when limit exceeded)
+  - Ban records with duration, reason, banned_by tracking
+
+- **Channel Update Extensions**
+  - logo_cid, banner_cid, website_url, tags fields on ChannelUpdatePayload
+  - Validation for website_url (max 256), tags (max 5, each max 64 chars)
+
+- **Validation**
+  - Full validation for all 10 new message types
+  - Address format checks (klv1 prefix) on all target_user fields
+  - Reason length limits (max 256) for kick/ban payloads
+
 ## [0.1.0] - 2026-03-29
 
 ### Added
