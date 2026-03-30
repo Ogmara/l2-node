@@ -49,6 +49,17 @@ pub struct StatsResponse {
     pub total_users: u64,
     pub uptime_seconds: u64,
     pub protocol_version: u8,
+    pub anchor_status: crate::storage::rocks::SelfAnchorStatus,
+}
+
+#[derive(Serialize)]
+struct NodeEntry {
+    node_id: String,
+    api_endpoint: Option<String>,
+    channels: Vec<u64>,
+    user_count: u32,
+    last_seen: u64,
+    anchor_status: crate::storage::rocks::AnchorStatus,
 }
 
 #[derive(Serialize)]
@@ -75,6 +86,15 @@ pub async fn health(Extension(state): Extension<Arc<AppState>>) -> Json<HealthRe
 /// GET /api/v1/network/stats
 pub async fn network_stats(Extension(state): Extension<Arc<AppState>>) -> Json<StatsResponse> {
     let uptime = state.started_at.elapsed().as_secs();
+    let anchor_status = state.storage.get_self_anchor_status(&state.node_id).unwrap_or_else(|_| {
+        crate::storage::rocks::SelfAnchorStatus {
+            is_anchorer: false,
+            last_anchor_height: None,
+            last_anchor_age_seconds: None,
+            total_anchors: 0,
+            anchoring_since: None,
+        }
+    });
     Json(StatsResponse {
         node_id: state.node_id.clone(),
         peers: state.peer_count(),
@@ -83,7 +103,64 @@ pub async fn network_stats(Extension(state): Extension<Arc<AppState>>) -> Json<S
         total_users: 0,
         uptime_seconds: uptime,
         protocol_version: crate::messages::envelope::PROTOCOL_VERSION,
+        anchor_status,
     })
+}
+
+/// GET /api/v1/network/nodes
+pub async fn network_nodes(
+    Extension(state): Extension<Arc<AppState>>,
+    Query(params): Query<PaginationParams>,
+) -> impl IntoResponse {
+    let limit = params.limit.unwrap_or(100).min(500) as usize;
+
+    match state.storage.prefix_iter_cf(cf::PEER_DIRECTORY, &[], limit) {
+        Ok(entries) => {
+            let nodes: Vec<NodeEntry> = entries
+                .into_iter()
+                .filter_map(|(_, v)| {
+                    let ann: serde_json::Value = serde_json::from_slice(&v).ok()?;
+                    let node_id = ann.get("node_id")?.as_str()?.to_string();
+                    let api_endpoint = ann.get("api_endpoint").and_then(|v| v.as_str()).map(String::from);
+                    let channels: Vec<u64> = ann.get("channels")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| arr.iter().filter_map(|v| v.as_u64()).collect())
+                        .unwrap_or_default();
+                    let user_count = ann.get("user_count").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                    let last_seen = ann.get("last_seen").and_then(|v| v.as_u64()).unwrap_or(0);
+
+                    let anchor_status = state.storage.compute_anchor_status(&node_id).unwrap_or_else(|_| {
+                        crate::storage::rocks::AnchorStatus {
+                            verified: false,
+                            level: "none".to_string(),
+                            last_anchor_age_seconds: None,
+                            anchoring_since: None,
+                            total_anchors: 0,
+                        }
+                    });
+
+                    Some(NodeEntry {
+                        node_id,
+                        api_endpoint,
+                        channels,
+                        user_count,
+                        last_seen,
+                        anchor_status,
+                    })
+                })
+                .collect();
+            let total = nodes.len();
+            Json(serde_json::json!({
+                "nodes": nodes,
+                "total": total,
+                "page": params.page.unwrap_or(1),
+            })).into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Storage error listing nodes");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
+        }
+    }
 }
 
 /// GET /api/v1/channels

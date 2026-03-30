@@ -72,6 +72,7 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
     let public_routes = Router::new()
         .route("/api/v1/health", get(routes::health))
         .route("/api/v1/network/stats", get(routes::network_stats))
+        .route("/api/v1/network/nodes", get(routes::network_nodes))
         .route("/api/v1/channels", get(routes::list_channels))
         .route("/api/v1/channels/{channel_id}", get(routes::get_channel))
         .route(

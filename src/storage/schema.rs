@@ -66,6 +66,9 @@ pub mod cf {
     /// (channel_id, address) → InviteRecord (serialized: invited_by, timestamp)
     pub const CHANNEL_INVITES: &str = "channel_invites";
 
+    /// (node_id, timestamp) → block_height — anchors indexed by submitting node
+    pub const ANCHOR_BY_NODE: &str = "anchor_by_node";
+
     /// All column family names for database initialization.
     pub const ALL: &[&str] = &[
         MESSAGES,
@@ -95,6 +98,7 @@ pub mod cf {
         CHANNEL_PINS,
         CHANNEL_MEMBERS,
         CHANNEL_INVITES,
+        ANCHOR_BY_NODE,
     ];
 }
 
@@ -275,5 +279,15 @@ pub fn encode_channel_invite_key(channel_id: u64, address: &str) -> Vec<u8> {
     let mut key = Vec::with_capacity(8 + address.len());
     key.extend_from_slice(&channel_id.to_be_bytes());
     key.extend_from_slice(address.as_bytes());
+    key
+}
+
+/// Encode an anchor-by-node key: (node_id, timestamp).
+pub fn encode_anchor_by_node_key(node_id: &str, timestamp: u64) -> Vec<u8> {
+    let id_bytes = node_id.as_bytes();
+    let mut key = Vec::with_capacity(id_bytes.len() + 1 + 8);
+    key.extend_from_slice(id_bytes);
+    key.push(0xFF); // separator
+    key.extend_from_slice(&timestamp.to_be_bytes());
     key
 }

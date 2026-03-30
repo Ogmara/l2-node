@@ -343,6 +343,18 @@ impl ChainScanner {
                 let bytes = serde_json::to_vec(&record)?;
                 self.storage
                     .put_cf(cf::STATE_ANCHORS, &block_height.to_be_bytes(), &bytes)?;
+
+                // Write anchor-by-node reverse index for verification badges
+                let anchor_node_key = crate::storage::schema::encode_anchor_by_node_key(
+                    &record.node_id,
+                    record.anchored_at,
+                );
+                self.storage.put_cf(
+                    cf::ANCHOR_BY_NODE,
+                    &anchor_node_key,
+                    &block_height.to_be_bytes(),
+                )?;
+
                 debug!(block_height, "State anchor recorded");
             }
 
