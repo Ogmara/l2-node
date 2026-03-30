@@ -29,7 +29,7 @@ use super::envelope::{Envelope, MAX_TIMESTAMP_DRIFT_MS};
 use super::types::*;
 use super::validation;
 
-/// Per-user rate limit counters.
+/// Per-user, per-category rate limit counters.
 struct RateLimitEntry {
     /// Message count in the current window.
     count: u32,
@@ -37,13 +37,61 @@ struct RateLimitEntry {
     window_start: u64,
 }
 
+/// Rate limit categories with per-spec limits (spec Part 5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum RateCategory {
+    ChatMessages,      // 30 per minute
+    NewsPost,          // 5 per hour
+    Reaction,          // 60 per minute (chat + news reactions)
+    Repost,            // 10 per hour
+    ChannelAdmin,      // 30 per hour (kick/ban/mute)
+    ModeratorChange,   // 10 per day
+    ChannelInvite,     // 20 per hour
+    PinUnpin,          // 20 per hour
+    Other,             // fallback: 100 per minute
+}
+
+impl RateCategory {
+    /// (max_count, window_ms) per category.
+    fn limits(self) -> (u32, u64) {
+        match self {
+            Self::ChatMessages => (30, 60_000),
+            Self::NewsPost => (5, 3_600_000),
+            Self::Reaction => (60, 60_000),
+            Self::Repost => (10, 3_600_000),
+            Self::ChannelAdmin => (30, 3_600_000),
+            Self::ModeratorChange => (10, 86_400_000),
+            Self::ChannelInvite => (20, 3_600_000),
+            Self::PinUnpin => (20, 3_600_000),
+            Self::Other => (100, 60_000),
+        }
+    }
+
+    fn from_msg_type(msg_type: MessageType) -> Self {
+        match msg_type {
+            MessageType::ChatMessage | MessageType::ChatEdit | MessageType::ChatDelete
+            | MessageType::DirectMessage | MessageType::DirectMessageEdit
+            | MessageType::DirectMessageDelete => Self::ChatMessages,
+            MessageType::NewsPost | MessageType::NewsEdit | MessageType::NewsDelete
+            | MessageType::NewsComment => Self::NewsPost,
+            MessageType::ChatReaction | MessageType::DirectMessageReaction
+            | MessageType::NewsReaction => Self::Reaction,
+            MessageType::NewsRepost => Self::Repost,
+            MessageType::ChannelKick | MessageType::ChannelBan
+            | MessageType::ChannelUnban | MessageType::ChannelMute => Self::ChannelAdmin,
+            MessageType::ChannelAddModerator | MessageType::ChannelRemoveModerator => Self::ModeratorChange,
+            MessageType::ChannelInvite => Self::ChannelInvite,
+            MessageType::ChannelPinMessage | MessageType::ChannelUnpinMessage => Self::PinUnpin,
+            _ => Self::Other,
+        }
+    }
+}
+
 /// The message router processes incoming messages through the full pipeline.
 pub struct MessageRouter {
     storage: Storage,
-    /// Per-user rate limit counters (address → entry).
+    /// Per-user, per-category rate limit counters: "(address:category)" → entry.
     rate_limits: DashMap<String, RateLimitEntry>,
-    /// Messages per minute limit per user.
-    rate_limit_per_minute: u32,
 }
 
 /// Result of processing a message through the router.
@@ -61,11 +109,10 @@ pub enum RouteResult {
 }
 
 impl MessageRouter {
-    pub fn new(storage: Storage, rate_limit_per_minute: u32) -> Self {
+    pub fn new(storage: Storage, _rate_limit_per_minute: u32) -> Self {
         Self {
             storage,
             rate_limits: DashMap::new(),
-            rate_limit_per_minute,
         }
     }
 
@@ -115,16 +162,27 @@ impl MessageRouter {
             ));
         }
 
-        // Step 6: Check rate limits
+        // Step 6: Check per-action-type rate limits (spec Part 5)
         if envelope.msg_type.requires_registration() {
-            if self.is_rate_limited(&envelope.author, now_ms) {
-                return RouteResult::Rejected("rate limited".into());
+            let category = RateCategory::from_msg_type(envelope.msg_type);
+            if self.is_rate_limited(&envelope.author, category, now_ms) {
+                return RouteResult::Rejected(format!("rate limited ({:?})", category));
             }
         }
 
         // Step 7: Validate payload (type-specific rules)
         if let Err(e) = self.validate_payload(&envelope) {
             return RouteResult::Rejected(format!("payload validation failed: {}", e));
+        }
+
+        // Step 7b: Check ban enforcement — banned users cannot post to channels
+        if let Err(e) = self.check_channel_ban(&envelope) {
+            return RouteResult::Rejected(format!("banned: {}", e));
+        }
+
+        // Step 7c: Authorize channel admin operations
+        if let Err(e) = self.authorize_channel_action(&envelope) {
+            return RouteResult::Rejected(format!("unauthorized: {}", e));
         }
 
         // Step 8: Store message
@@ -215,26 +273,41 @@ impl MessageRouter {
         Ok(())
     }
 
-    /// Check if a user is rate-limited.
-    fn is_rate_limited(&self, author: &str, now_ms: u64) -> bool {
-        let window_ms = 60_000u64; // 1 minute window
+    /// Check if a user is rate-limited for a specific action category.
+    fn is_rate_limited(&self, author: &str, category: RateCategory, now_ms: u64) -> bool {
+        let (max_count, window_ms) = category.limits();
+        let key = format!("{}:{:?}", author, category);
 
         let mut entry = self
             .rate_limits
-            .entry(author.to_string())
+            .entry(key)
             .or_insert(RateLimitEntry {
                 count: 0,
                 window_start: now_ms,
             });
 
         // Reset window if expired
-        if now_ms - entry.window_start > window_ms {
+        if now_ms.saturating_sub(entry.window_start) > window_ms {
             entry.count = 0;
             entry.window_start = now_ms;
         }
 
         entry.count += 1;
-        entry.count > self.rate_limit_per_minute
+        entry.count > max_count
+    }
+
+    /// Evict expired rate limit entries to prevent unbounded memory growth.
+    /// Should be called periodically (e.g., every few minutes).
+    pub fn cleanup_rate_limits(&self) {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        // Use the largest window (86_400_000ms = 1 day) as the eviction threshold
+        self.rate_limits.retain(|_, entry| {
+            now_ms.saturating_sub(entry.window_start) < 86_400_000
+        });
     }
 
     /// Validate the payload based on message type.
@@ -259,13 +332,246 @@ impl MessageRouter {
                 DeserializedPayload::Unfollow(ref p) => {
                     validation::validate_unfollow(&envelope.author, p)
                 }
-                // Types with no specific validation rules
+                DeserializedPayload::ChannelAddModerator(ref p) => {
+                    validation::validate_channel_add_moderator(p)
+                }
+                DeserializedPayload::ChannelRemoveModerator(ref p) => {
+                    validation::validate_channel_remove_moderator(p)
+                }
+                DeserializedPayload::ChannelKick(ref p) => {
+                    validation::validate_channel_kick(p)
+                }
+                DeserializedPayload::ChannelBan(ref p) => {
+                    validation::validate_channel_ban(p)
+                }
+                DeserializedPayload::ChannelUnban(ref p) => {
+                    validation::validate_channel_unban(p)
+                }
+                DeserializedPayload::ChannelPinMessage(ref p) => {
+                    validation::validate_channel_pin(p)
+                }
+                DeserializedPayload::ChannelUnpinMessage(ref p) => {
+                    validation::validate_channel_unpin(p)
+                }
+                DeserializedPayload::ChannelInvite(ref p) => {
+                    validation::validate_channel_invite(p)
+                }
+                DeserializedPayload::NewsRepost(ref p) => {
+                    validation::validate_news_repost(&envelope.author, p)
+                }
+                DeserializedPayload::ContentRequest(ref p) => {
+                    validation::validate_content_request(p)
+                }
+                // Types with no specific validation rules (NewsReaction uses existing validate_reaction)
                 _ => Ok(()),
             },
             Err(e) => Err(validation::ValidationError(format!(
                 "payload deserialization failed: {}",
                 e
             ))),
+        }
+    }
+
+    /// Check if the author is banned from the target channel.
+    /// Rejects channel-scoped messages from banned users.
+    /// Also enforces ban expiration: expired bans are cleaned up on read.
+    fn check_channel_ban(&self, envelope: &Envelope) -> Result<(), String> {
+        let channel_id = match self.extract_channel_id(envelope) {
+            Some(id) => id,
+            None => return Ok(()), // not a channel-scoped message
+        };
+
+        let ban_key = schema::encode_channel_ban_key(channel_id, &envelope.author);
+        match self.storage.get_cf(schema::cf::CHANNEL_BANS, &ban_key) {
+            Ok(Some(data)) => {
+                // Check if ban has expired
+                if let Ok(record) = serde_json::from_slice::<serde_json::Value>(&data) {
+                    let duration = record.get("duration_secs")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    if duration > 0 {
+                        let banned_at = record.get("banned_at")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        let now_ms = envelope.timestamp;
+                        let elapsed_secs = (now_ms.saturating_sub(banned_at)) / 1000;
+                        if elapsed_secs >= duration {
+                            // Ban expired — clean up and allow
+                            let _ = self.storage.delete_cf(schema::cf::CHANNEL_BANS, &ban_key);
+                            return Ok(());
+                        }
+                    }
+                }
+                Err(format!("user is banned from channel {}", channel_id))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Authorize channel admin operations per spec section 2.6.
+    /// Verifies the sender has the required role/permissions.
+    fn authorize_channel_action(&self, envelope: &Envelope) -> Result<(), String> {
+        match envelope.msg_type {
+            // Creator-only actions
+            MessageType::ChannelAddModerator | MessageType::ChannelRemoveModerator => {
+                let channel_id = self.extract_channel_id(envelope).unwrap_or(0);
+                if !self.is_channel_creator(channel_id, &envelope.author)? {
+                    return Err("only the channel creator can manage moderators".into());
+                }
+                // Cannot remove self (creator)
+                if envelope.msg_type == MessageType::ChannelRemoveModerator {
+                    if let Ok(p) = rmp_serde::from_slice::<ChannelRemoveModeratorPayload>(&envelope.payload) {
+                        if p.target_user == envelope.author {
+                            return Err("cannot remove yourself as moderator".into());
+                        }
+                    }
+                }
+                Ok(())
+            }
+            // Creator + mods with can_kick
+            MessageType::ChannelKick => {
+                let channel_id = self.extract_channel_id(envelope).unwrap_or(0);
+                if let Ok(p) = rmp_serde::from_slice::<ChannelKickPayload>(&envelope.payload) {
+                    // Cannot kick the creator
+                    if self.is_channel_creator(channel_id, &p.target_user)? {
+                        return Err("cannot kick the channel creator".into());
+                    }
+                }
+                self.require_mod_permission(channel_id, &envelope.author, "can_kick")
+            }
+            // Creator + mods with can_ban
+            MessageType::ChannelBan => {
+                let channel_id = self.extract_channel_id(envelope).unwrap_or(0);
+                if let Ok(p) = rmp_serde::from_slice::<ChannelBanPayload>(&envelope.payload) {
+                    if self.is_channel_creator(channel_id, &p.target_user)? {
+                        return Err("cannot ban the channel creator".into());
+                    }
+                }
+                self.require_mod_permission(channel_id, &envelope.author, "can_ban")
+            }
+            MessageType::ChannelUnban => {
+                let channel_id = self.extract_channel_id(envelope).unwrap_or(0);
+                self.require_mod_permission(channel_id, &envelope.author, "can_ban")
+            }
+            // Creator + mods with can_pin
+            MessageType::ChannelPinMessage | MessageType::ChannelUnpinMessage => {
+                let channel_id = self.extract_channel_id(envelope).unwrap_or(0);
+                self.require_mod_permission(channel_id, &envelope.author, "can_pin")
+            }
+            // Creator + any moderator
+            MessageType::ChannelInvite => {
+                let channel_id = self.extract_channel_id(envelope).unwrap_or(0);
+                if self.is_channel_creator(channel_id, &envelope.author)? {
+                    return Ok(());
+                }
+                if self.storage.is_channel_moderator(channel_id, &envelope.author)
+                    .unwrap_or(false)
+                {
+                    return Ok(());
+                }
+                Err("only creator or moderators can invite users".into())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Extract the channel_id from channel-scoped message payloads.
+    fn extract_channel_id(&self, envelope: &Envelope) -> Option<u64> {
+        match envelope.msg_type {
+            MessageType::ChatMessage => {
+                rmp_serde::from_slice::<ChatMessagePayload>(&envelope.payload)
+                    .ok().map(|p| p.channel_id)
+            }
+            MessageType::ChatReaction => {
+                rmp_serde::from_slice::<ReactionPayload>(&envelope.payload)
+                    .ok().and_then(|p| p.channel_id)
+            }
+            MessageType::ChannelAddModerator => {
+                rmp_serde::from_slice::<ChannelAddModeratorPayload>(&envelope.payload)
+                    .ok().map(|p| p.channel_id)
+            }
+            MessageType::ChannelRemoveModerator => {
+                rmp_serde::from_slice::<ChannelRemoveModeratorPayload>(&envelope.payload)
+                    .ok().map(|p| p.channel_id)
+            }
+            MessageType::ChannelKick => {
+                rmp_serde::from_slice::<ChannelKickPayload>(&envelope.payload)
+                    .ok().map(|p| p.channel_id)
+            }
+            MessageType::ChannelBan => {
+                rmp_serde::from_slice::<ChannelBanPayload>(&envelope.payload)
+                    .ok().map(|p| p.channel_id)
+            }
+            MessageType::ChannelUnban => {
+                rmp_serde::from_slice::<ChannelUnbanPayload>(&envelope.payload)
+                    .ok().map(|p| p.channel_id)
+            }
+            MessageType::ChannelPinMessage => {
+                rmp_serde::from_slice::<ChannelPinMessagePayload>(&envelope.payload)
+                    .ok().map(|p| p.channel_id)
+            }
+            MessageType::ChannelUnpinMessage => {
+                rmp_serde::from_slice::<ChannelUnpinMessagePayload>(&envelope.payload)
+                    .ok().map(|p| p.channel_id)
+            }
+            MessageType::ChannelInvite => {
+                rmp_serde::from_slice::<ChannelInvitePayload>(&envelope.payload)
+                    .ok().map(|p| p.channel_id)
+            }
+            MessageType::ChannelUpdate => {
+                rmp_serde::from_slice::<ChannelUpdatePayload>(&envelope.payload)
+                    .ok().map(|p| p.channel_id)
+            }
+            _ => None,
+        }
+    }
+
+    /// Check if address is the channel creator by looking up channel metadata.
+    fn is_channel_creator(&self, channel_id: u64, address: &str) -> Result<bool, String> {
+        match self.storage.get_cf(schema::cf::CHANNELS, &channel_id.to_be_bytes()) {
+            Ok(Some(data)) => {
+                if let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&data) {
+                    Ok(meta.get("creator").and_then(|v| v.as_str()) == Some(address))
+                } else {
+                    Ok(false)
+                }
+            }
+            Ok(None) => Err(format!("channel {} not found", channel_id)),
+            Err(e) => Err(format!("storage error: {}", e)),
+        }
+    }
+
+    /// Check if the user is the creator or a moderator with the required permission.
+    fn require_mod_permission(
+        &self,
+        channel_id: u64,
+        author: &str,
+        permission: &str,
+    ) -> Result<(), String> {
+        // Creator has all permissions
+        if self.is_channel_creator(channel_id, author)? {
+            return Ok(());
+        }
+
+        // Check moderator permissions
+        let mod_key = schema::encode_channel_moderator_key(channel_id, author);
+        match self.storage.get_cf(schema::cf::CHANNEL_MODERATORS, &mod_key) {
+            Ok(Some(data)) => {
+                if let Ok(perms) = serde_json::from_slice::<serde_json::Value>(&data) {
+                    let has_perm = perms.get(permission)
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    if has_perm {
+                        Ok(())
+                    } else {
+                        Err(format!("moderator lacks '{}' permission", permission))
+                    }
+                } else {
+                    Err("corrupt moderator permissions".into())
+                }
+            }
+            Ok(None) => Err("not a moderator of this channel".into()),
+            Err(e) => Err(format!("storage error: {}", e)),
         }
     }
 
@@ -340,6 +646,199 @@ impl MessageRouter {
                     rmp_serde::from_slice::<UnfollowPayload>(&envelope.payload)
                 {
                     self.storage.unfollow(&envelope.author, &payload.target)?;
+                }
+            }
+            MessageType::NewsReaction => {
+                if let Ok(payload) =
+                    rmp_serde::from_slice::<ReactionPayload>(&envelope.payload)
+                {
+                    self.storage.toggle_news_reaction(
+                        &payload.target_id,
+                        &payload.emoji,
+                        &envelope.author,
+                        payload.remove,
+                    )?;
+                }
+            }
+            MessageType::NewsRepost => {
+                if let Ok(payload) =
+                    rmp_serde::from_slice::<NewsRepostPayload>(&envelope.payload)
+                {
+                    self.storage.add_repost(
+                        &payload.original_id,
+                        &envelope.author,
+                        &envelope.msg_id,
+                    )?;
+                    // Also index the repost in the global news feed
+                    let key =
+                        schema::encode_news_key(envelope.timestamp, &envelope.msg_id);
+                    self.storage
+                        .put_cf(schema::cf::NEWS_FEED, &key, &[])?;
+                }
+            }
+            MessageType::ChannelAddModerator => {
+                if let Ok(payload) =
+                    rmp_serde::from_slice::<ChannelAddModeratorPayload>(&envelope.payload)
+                {
+                    let key = schema::encode_channel_moderator_key(
+                        payload.channel_id,
+                        &payload.target_user,
+                    );
+                    let perms = serde_json::to_vec(&payload.permissions)
+                        .context("serializing moderator permissions")?;
+                    self.storage
+                        .put_cf(schema::cf::CHANNEL_MODERATORS, &key, &perms)?;
+                }
+            }
+            MessageType::ChannelRemoveModerator => {
+                if let Ok(payload) =
+                    rmp_serde::from_slice::<ChannelRemoveModeratorPayload>(&envelope.payload)
+                {
+                    let key = schema::encode_channel_moderator_key(
+                        payload.channel_id,
+                        &payload.target_user,
+                    );
+                    self.storage
+                        .delete_cf(schema::cf::CHANNEL_MODERATORS, &key)?;
+                }
+            }
+            MessageType::ChannelKick => {
+                if let Ok(payload) =
+                    rmp_serde::from_slice::<ChannelKickPayload>(&envelope.payload)
+                {
+                    let key = schema::encode_channel_member_key(
+                        payload.channel_id,
+                        &payload.target_user,
+                    );
+                    self.storage
+                        .delete_cf(schema::cf::CHANNEL_MEMBERS, &key)?;
+                }
+            }
+            MessageType::ChannelBan => {
+                if let Ok(payload) =
+                    rmp_serde::from_slice::<ChannelBanPayload>(&envelope.payload)
+                {
+                    // Remove from members
+                    let member_key = schema::encode_channel_member_key(
+                        payload.channel_id,
+                        &payload.target_user,
+                    );
+                    self.storage
+                        .delete_cf(schema::cf::CHANNEL_MEMBERS, &member_key)?;
+
+                    // Add to bans
+                    let ban_key = schema::encode_channel_ban_key(
+                        payload.channel_id,
+                        &payload.target_user,
+                    );
+                    let record = serde_json::json!({
+                        "reason": payload.reason,
+                        "duration_secs": payload.duration_secs,
+                        "banned_at": envelope.timestamp,
+                        "banned_by": envelope.author,
+                    });
+                    let record_bytes = serde_json::to_vec(&record)
+                        .context("serializing ban record")?;
+                    self.storage.put_cf(
+                        schema::cf::CHANNEL_BANS,
+                        &ban_key,
+                        &record_bytes,
+                    )?;
+                }
+            }
+            MessageType::ChannelUnban => {
+                if let Ok(payload) =
+                    rmp_serde::from_slice::<ChannelUnbanPayload>(&envelope.payload)
+                {
+                    let key = schema::encode_channel_ban_key(
+                        payload.channel_id,
+                        &payload.target_user,
+                    );
+                    self.storage
+                        .delete_cf(schema::cf::CHANNEL_BANS, &key)?;
+                }
+            }
+            MessageType::ChannelPinMessage => {
+                if let Ok(payload) =
+                    rmp_serde::from_slice::<ChannelPinMessagePayload>(&envelope.payload)
+                {
+                    let pin_count = self.storage.get_pin_count(payload.channel_id)?;
+                    // If max 10 pins, FIFO — remove oldest if at limit
+                    if pin_count >= 10 {
+                        let prefix = payload.channel_id.to_be_bytes();
+                        if let Ok(entries) = self.storage.prefix_iter_cf(
+                            schema::cf::CHANNEL_PINS,
+                            &prefix,
+                            1,
+                        ) {
+                            if let Some((oldest_key, _)) = entries.first() {
+                                self.storage
+                                    .delete_cf(schema::cf::CHANNEL_PINS, oldest_key)?;
+                            }
+                        }
+                    }
+                    // Use monotonically increasing sequence to avoid pin_order collisions
+                    let seq_key = format!("pin_seq:{}", payload.channel_id);
+                    let next_seq = match self.storage.get_cf(schema::cf::NODE_STATE, seq_key.as_bytes())? {
+                        Some(bytes) if bytes.len() == 4 => {
+                            u32::from_be_bytes(bytes.try_into().unwrap_or([0; 4])) + 1
+                        }
+                        _ => 0,
+                    };
+                    self.storage.put_cf(schema::cf::NODE_STATE, seq_key.as_bytes(), &next_seq.to_be_bytes())?;
+                    let key = schema::encode_channel_pin_key(
+                        payload.channel_id,
+                        next_seq,
+                        &payload.msg_id,
+                    );
+                    self.storage
+                        .put_cf(schema::cf::CHANNEL_PINS, &key, &[])?;
+                }
+            }
+            MessageType::ChannelUnpinMessage => {
+                if let Ok(payload) =
+                    rmp_serde::from_slice::<ChannelUnpinMessagePayload>(&envelope.payload)
+                {
+                    // Scan for the pinned msg_id and remove it
+                    let prefix = payload.channel_id.to_be_bytes();
+                    if let Ok(entries) = self.storage.prefix_iter_cf(
+                        schema::cf::CHANNEL_PINS,
+                        &prefix,
+                        10,
+                    ) {
+                        for (key, _) in entries {
+                            if key.len() >= 44 {
+                                let stored_id: [u8; 32] =
+                                    key[12..44].try_into().unwrap_or([0u8; 32]);
+                                if stored_id == payload.msg_id {
+                                    self.storage
+                                        .delete_cf(schema::cf::CHANNEL_PINS, &key)?;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            MessageType::ChannelInvite => {
+                if let Ok(payload) =
+                    rmp_serde::from_slice::<ChannelInvitePayload>(&envelope.payload)
+                {
+                    let key = schema::encode_channel_invite_key(
+                        payload.channel_id,
+                        &payload.target_user,
+                    );
+                    let record = serde_json::json!({
+                        "invited_by": envelope.author,
+                        "timestamp": envelope.timestamp,
+                    });
+                    let record_bytes = serde_json::to_vec(&record)
+                        .context("serializing invite record")?;
+                    self.storage.put_cf(
+                        schema::cf::CHANNEL_INVITES,
+                        &key,
+                        &record_bytes,
+                    )?;
                 }
             }
             _ => {}

@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use axum::middleware;
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use axum::Router;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
@@ -81,8 +81,23 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
         .route("/api/v1/users/{address}", get(routes::get_user))
         .route("/api/v1/users/{address}/followers", get(routes::get_followers))
         .route("/api/v1/users/{address}/following", get(routes::get_following))
-        .route("/api/v1/news", get(routes::list_news));
-
+        .route("/api/v1/news", get(routes::list_news))
+        .route(
+            "/api/v1/news/{msg_id}/reactions",
+            get(routes::get_news_reactions),
+        )
+        .route(
+            "/api/v1/news/{msg_id}/reposts",
+            get(routes::get_news_reposts),
+        )
+        .route(
+            "/api/v1/channels/{channel_id}/members",
+            get(routes::get_channel_members),
+        )
+        .route(
+            "/api/v1/channels/{channel_id}/pins",
+            get(routes::get_channel_pins),
+        )
     // Authenticated routes (Klever wallet signature required)
     let auth_routes = Router::new()
         .route("/api/v1/messages", post(routes::post_message))
@@ -90,6 +105,51 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
         .route("/api/v1/dm/{address}", post(routes::send_dm))
         .route("/api/v1/users/{address}/follow", post(routes::follow_user).delete(routes::unfollow_user))
         .route("/api/v1/feed", get(routes::personal_feed))
+        // News engagement
+        .route(
+            "/api/v1/news/{msg_id}/react",
+            post(routes::react_to_news),
+        )
+        .route(
+            "/api/v1/news/{msg_id}/repost",
+            post(routes::repost_news),
+        )
+        // Bookmarks
+        .route("/api/v1/bookmarks", get(routes::list_bookmarks))
+        .route(
+            "/api/v1/bookmarks/{msg_id}",
+            post(routes::save_bookmark).delete(routes::remove_bookmark),
+        )
+        // Channel bans (auth-gated — moderator/creator only, per spec)
+        .route(
+            "/api/v1/channels/{channel_id}/bans",
+            get(routes::get_channel_bans),
+        )
+        // Channel administration
+        .route(
+            "/api/v1/channels/{channel_id}/moderators",
+            post(routes::add_moderator),
+        )
+        .route(
+            "/api/v1/channels/{channel_id}/moderators/{address}",
+            delete(routes::remove_moderator),
+        )
+        .route(
+            "/api/v1/channels/{channel_id}/kick/{address}",
+            post(routes::kick_user),
+        )
+        .route(
+            "/api/v1/channels/{channel_id}/ban/{address}",
+            post(routes::ban_user).delete(routes::unban_user),
+        )
+        .route(
+            "/api/v1/channels/{channel_id}/pin/{msg_id}",
+            post(routes::pin_message).delete(routes::unpin_message),
+        )
+        .route(
+            "/api/v1/channels/{channel_id}/invite/{address}",
+            post(routes::invite_user),
+        )
         .layer(middleware::from_fn(auth::auth_middleware));
 
     // WebSocket routes

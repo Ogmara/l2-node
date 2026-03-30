@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use rocksdb::{ColumnFamilyDescriptor, DBWithThreadMode, MultiThreaded, Options};
+use rocksdb::{ColumnFamilyDescriptor, DBWithThreadMode, MultiThreaded, Options, WriteBatch};
 
 use super::schema::cf;
 
@@ -90,6 +90,20 @@ impl Storage {
     /// Check if a key exists in a column family (without reading the value).
     pub fn exists_cf(&self, cf_name: &str, key: &[u8]) -> Result<bool> {
         Ok(self.get_cf(cf_name, key)?.is_some())
+    }
+
+    /// Execute a write batch atomically across multiple column families.
+    pub fn write_batch(&self, batch: WriteBatch) -> Result<()> {
+        self.db
+            .write(batch)
+            .context("executing write batch")
+    }
+
+    /// Get a column family handle for use in WriteBatch operations.
+    pub fn cf_handle(&self, cf_name: &str) -> Result<&rocksdb::ColumnFamily> {
+        self.db
+            .cf_handle(cf_name)
+            .with_context(|| format!("column family '{}' not found", cf_name))
     }
 
     /// Iterate over a column family with a key prefix.
@@ -218,54 +232,76 @@ impl Storage {
 
     // --- Social graph (follows) ---
 
-    /// Record a follow relationship and update counts.
+    /// Record a follow relationship and update counts atomically via WriteBatch.
     pub fn follow(&self, follower: &str, followed: &str) -> Result<()> {
         let follow_key = super::schema::encode_follow_key(follower, followed);
-        let reverse_key = super::schema::encode_follow_key(followed, follower);
 
         // Check if already following (idempotent)
         if self.exists_cf(cf::FOLLOWS, &follow_key)? {
             return Ok(());
         }
 
-        self.put_cf(cf::FOLLOWS, &follow_key, &[])?;
-        self.put_cf(cf::FOLLOWERS, &reverse_key, &[])?;
-
-        // Update counts
+        let reverse_key = super::schema::encode_follow_key(followed, follower);
         let (mut following_count, follower_count) = self.get_follower_counts(follower)?;
         following_count += 1;
-        self.set_follower_counts(follower, following_count, follower_count)?;
-
         let (following_count2, mut follower_count2) = self.get_follower_counts(followed)?;
         follower_count2 += 1;
-        self.set_follower_counts(followed, following_count2, follower_count2)?;
 
-        Ok(())
+        let mut batch = WriteBatch::default();
+        let follows_cf = self.cf_handle(cf::FOLLOWS)?;
+        let followers_cf = self.cf_handle(cf::FOLLOWERS)?;
+        let counts_cf = self.cf_handle(cf::FOLLOWER_COUNTS)?;
+
+        batch.put_cf(follows_cf, &follow_key, &[]);
+        batch.put_cf(followers_cf, &reverse_key, &[]);
+
+        let mut bytes1 = Vec::with_capacity(16);
+        bytes1.extend_from_slice(&following_count.to_be_bytes());
+        bytes1.extend_from_slice(&follower_count.to_be_bytes());
+        batch.put_cf(counts_cf, follower.as_bytes(), &bytes1);
+
+        let mut bytes2 = Vec::with_capacity(16);
+        bytes2.extend_from_slice(&following_count2.to_be_bytes());
+        bytes2.extend_from_slice(&follower_count2.to_be_bytes());
+        batch.put_cf(counts_cf, followed.as_bytes(), &bytes2);
+
+        self.write_batch(batch)
     }
 
-    /// Remove a follow relationship and update counts.
+    /// Remove a follow relationship and update counts atomically via WriteBatch.
     pub fn unfollow(&self, follower: &str, followed: &str) -> Result<()> {
         let follow_key = super::schema::encode_follow_key(follower, followed);
-        let reverse_key = super::schema::encode_follow_key(followed, follower);
 
         // Check if actually following (idempotent)
         if !self.exists_cf(cf::FOLLOWS, &follow_key)? {
             return Ok(());
         }
 
-        self.delete_cf(cf::FOLLOWS, &follow_key)?;
-        self.delete_cf(cf::FOLLOWERS, &reverse_key)?;
-
-        // Update counts
+        let reverse_key = super::schema::encode_follow_key(followed, follower);
         let (mut following_count, follower_count) = self.get_follower_counts(follower)?;
         following_count = following_count.saturating_sub(1);
-        self.set_follower_counts(follower, following_count, follower_count)?;
-
         let (following_count2, mut follower_count2) = self.get_follower_counts(followed)?;
         follower_count2 = follower_count2.saturating_sub(1);
-        self.set_follower_counts(followed, following_count2, follower_count2)?;
 
-        Ok(())
+        let mut batch = WriteBatch::default();
+        let follows_cf = self.cf_handle(cf::FOLLOWS)?;
+        let followers_cf = self.cf_handle(cf::FOLLOWERS)?;
+        let counts_cf = self.cf_handle(cf::FOLLOWER_COUNTS)?;
+
+        batch.delete_cf(follows_cf, &follow_key);
+        batch.delete_cf(followers_cf, &reverse_key);
+
+        let mut bytes1 = Vec::with_capacity(16);
+        bytes1.extend_from_slice(&following_count.to_be_bytes());
+        bytes1.extend_from_slice(&follower_count.to_be_bytes());
+        batch.put_cf(counts_cf, follower.as_bytes(), &bytes1);
+
+        let mut bytes2 = Vec::with_capacity(16);
+        bytes2.extend_from_slice(&following_count2.to_be_bytes());
+        bytes2.extend_from_slice(&follower_count2.to_be_bytes());
+        batch.put_cf(counts_cf, followed.as_bytes(), &bytes2);
+
+        self.write_batch(batch)
     }
 
     /// Check if follower is following followed.
@@ -327,6 +363,236 @@ impl Storage {
                 String::from_utf8(key[sep + 1..].to_vec()).ok()
             })
             .collect())
+    }
+
+    // --- News Reactions ---
+
+    /// Add or remove a reaction on a news post, updating cached counts atomically.
+    pub fn toggle_news_reaction(
+        &self,
+        msg_id: &[u8; 32],
+        emoji: &str,
+        author: &str,
+        remove: bool,
+    ) -> Result<()> {
+        use super::schema;
+        let reaction_key = schema::encode_news_reaction_key(msg_id, emoji, author);
+        let count_key = schema::encode_reaction_count_key(msg_id, emoji);
+
+        let exists = self.exists_cf(cf::NEWS_REACTIONS, &reaction_key)?;
+
+        let mut batch = WriteBatch::default();
+        let reactions_cf = self.cf_handle(cf::NEWS_REACTIONS)?;
+        let counts_cf = self.cf_handle(cf::REACTION_COUNTS)?;
+
+        if remove {
+            if !exists {
+                return Ok(());
+            }
+            batch.delete_cf(reactions_cf, &reaction_key);
+            let count = self.get_reaction_count(msg_id, emoji)?.saturating_sub(1);
+            batch.put_cf(counts_cf, &count_key, &count.to_be_bytes());
+        } else {
+            if exists {
+                return Ok(()); // already reacted
+            }
+            batch.put_cf(reactions_cf, &reaction_key, &[]);
+            let count = self.get_reaction_count(msg_id, emoji)? + 1;
+            batch.put_cf(counts_cf, &count_key, &count.to_be_bytes());
+        }
+        self.write_batch(batch)
+    }
+
+    /// Get the reaction count for a specific emoji on a post.
+    pub fn get_reaction_count(&self, msg_id: &[u8; 32], emoji: &str) -> Result<u64> {
+        let key = super::schema::encode_reaction_count_key(msg_id, emoji);
+        match self.get_cf(cf::REACTION_COUNTS, &key)? {
+            Some(bytes) if bytes.len() == 8 => {
+                Ok(u64::from_be_bytes(bytes.try_into().unwrap()))
+            }
+            _ => Ok(0),
+        }
+    }
+
+    /// Check if a user has reacted with a specific emoji on a post.
+    pub fn has_user_reacted(
+        &self,
+        msg_id: &[u8; 32],
+        emoji: &str,
+        author: &str,
+    ) -> Result<bool> {
+        let key = super::schema::encode_news_reaction_key(msg_id, emoji, author);
+        self.exists_cf(cf::NEWS_REACTIONS, &key)
+    }
+
+    /// Get all reactions for a news post with counts.
+    pub fn get_news_reactions(
+        &self,
+        msg_id: &[u8; 32],
+    ) -> Result<Vec<(String, u64)>> {
+        let prefix = msg_id.to_vec();
+        let entries = self.prefix_iter_cf(cf::REACTION_COUNTS, &prefix, 100)?;
+        Ok(entries
+            .into_iter()
+            .filter_map(|(key, value)| {
+                if key.len() > 32 && value.len() == 8 {
+                    let emoji = String::from_utf8(key[32..].to_vec()).ok()?;
+                    let count = u64::from_be_bytes(value.try_into().ok()?);
+                    if count > 0 {
+                        Some((emoji, count))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect())
+    }
+
+    // --- Reposts ---
+
+    /// Record a repost and update the count atomically.
+    pub fn add_repost(
+        &self,
+        original_id: &[u8; 32],
+        reposter: &str,
+        repost_msg_id: &[u8; 32],
+    ) -> Result<()> {
+        let key = super::schema::encode_repost_key(original_id, reposter);
+        if self.exists_cf(cf::REPOSTS, &key)? {
+            return Ok(()); // idempotent
+        }
+
+        let count = self.get_repost_count(original_id)? + 1;
+        let mut batch = WriteBatch::default();
+        let reposts_cf = self.cf_handle(cf::REPOSTS)?;
+        let counts_cf = self.cf_handle(cf::REPOST_COUNTS)?;
+
+        batch.put_cf(reposts_cf, &key, repost_msg_id);
+        batch.put_cf(counts_cf, original_id, &count.to_be_bytes());
+        self.write_batch(batch)
+    }
+
+    /// Get repost count for a post.
+    pub fn get_repost_count(&self, msg_id: &[u8; 32]) -> Result<u64> {
+        match self.get_cf(cf::REPOST_COUNTS, msg_id)? {
+            Some(bytes) if bytes.len() == 8 => {
+                Ok(u64::from_be_bytes(bytes.try_into().unwrap()))
+            }
+            _ => Ok(0),
+        }
+    }
+
+    // --- Bookmarks ---
+
+    /// Save a post to the user's bookmarks.
+    /// Stores both the ordered key (for listing) and a reverse index (for O(1) removal).
+    pub fn add_bookmark(
+        &self,
+        user_address: &str,
+        msg_id: &[u8; 32],
+        timestamp: u64,
+    ) -> Result<()> {
+        let key = super::schema::encode_bookmark_key(user_address, timestamp, msg_id);
+        // Store reverse index: NODE_STATE "bm:{user}:{msg_id_hex}" -> bookmark key
+        let reverse_key = format!("bm:{}:{}", user_address, hex::encode(msg_id));
+        let mut batch = WriteBatch::default();
+        let bookmarks_cf = self.cf_handle(cf::BOOKMARKS)?;
+        let state_cf = self.cf_handle(cf::NODE_STATE)?;
+        batch.put_cf(bookmarks_cf, &key, &[]);
+        batch.put_cf(state_cf, reverse_key.as_bytes(), &key);
+        self.write_batch(batch)
+    }
+
+    /// Remove a post from the user's bookmarks using the reverse index (O(1)).
+    pub fn remove_bookmark(
+        &self,
+        user_address: &str,
+        msg_id: &[u8; 32],
+    ) -> Result<bool> {
+        let reverse_key = format!("bm:{}:{}", user_address, hex::encode(msg_id));
+        match self.get_cf(cf::NODE_STATE, reverse_key.as_bytes())? {
+            Some(bookmark_key) => {
+                let mut batch = WriteBatch::default();
+                let bookmarks_cf = self.cf_handle(cf::BOOKMARKS)?;
+                let state_cf = self.cf_handle(cf::NODE_STATE)?;
+                batch.delete_cf(bookmarks_cf, &bookmark_key);
+                batch.delete_cf(state_cf, reverse_key.as_bytes());
+                self.write_batch(batch)?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// List the user's bookmarks (returns msg_ids).
+    pub fn list_bookmarks(
+        &self,
+        user_address: &str,
+        limit: usize,
+    ) -> Result<Vec<[u8; 32]>> {
+        let mut prefix = Vec::with_capacity(user_address.len() + 1);
+        prefix.extend_from_slice(user_address.as_bytes());
+        prefix.push(0xFF);
+        let entries = self.prefix_iter_cf(cf::BOOKMARKS, &prefix, limit)?;
+        Ok(entries
+            .into_iter()
+            .filter_map(|(key, _)| {
+                if key.len() >= prefix.len() + 8 + 32 {
+                    let msg_id: [u8; 32] = key[key.len() - 32..].try_into().ok()?;
+                    Some(msg_id)
+                } else {
+                    None
+                }
+            })
+            .collect())
+    }
+
+    // --- Channel Administration ---
+
+    /// Check if a user is a moderator of a channel.
+    pub fn is_channel_moderator(&self, channel_id: u64, address: &str) -> Result<bool> {
+        let key = super::schema::encode_channel_moderator_key(channel_id, address);
+        self.exists_cf(cf::CHANNEL_MODERATORS, &key)
+    }
+
+    /// Check if a user is banned from a channel, respecting ban expiration.
+    pub fn is_channel_banned(&self, channel_id: u64, address: &str) -> Result<bool> {
+        let key = super::schema::encode_channel_ban_key(channel_id, address);
+        match self.get_cf(cf::CHANNEL_BANS, &key)? {
+            Some(data) => {
+                if let Ok(record) = serde_json::from_slice::<serde_json::Value>(&data) {
+                    let duration = record.get("duration_secs")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    if duration > 0 {
+                        let banned_at = record.get("banned_at")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64;
+                        let elapsed_secs = now_ms.saturating_sub(banned_at) / 1000;
+                        if elapsed_secs >= duration {
+                            // Ban expired — clean up
+                            let _ = self.delete_cf(cf::CHANNEL_BANS, &key);
+                            return Ok(false);
+                        }
+                    }
+                }
+                Ok(true) // permanent ban or not yet expired
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Get pinned message count for a channel.
+    pub fn get_pin_count(&self, channel_id: u64) -> Result<u32> {
+        let prefix = channel_id.to_be_bytes();
+        let entries = self.prefix_iter_cf(cf::CHANNEL_PINS, &prefix, 11)?;
+        Ok(entries.len() as u32)
     }
 }
 

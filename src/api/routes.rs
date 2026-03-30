@@ -12,7 +12,6 @@ use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
-use crate::storage::rocks::Storage;
 use crate::storage::schema::cf;
 
 use super::auth::AuthUser;
@@ -120,7 +119,7 @@ pub async fn list_channels(
     }
 }
 
-/// GET /api/v1/channels/:channel_id
+/// GET /api/v1/channels/:channel_id — extended response with moderators, pins, member_count
 pub async fn get_channel(
     Extension(state): Extension<Arc<AppState>>,
     Path(channel_id): Path<u64>,
@@ -130,7 +129,53 @@ pub async fn get_channel(
         .get_cf(cf::CHANNELS, &channel_id.to_be_bytes())
     {
         Ok(Some(data)) => match serde_json::from_slice::<serde_json::Value>(&data) {
-            Ok(channel) => Json(serde_json::json!({ "channel": channel })).into_response(),
+            Ok(channel) => {
+                // Fetch moderator list
+                let prefix = channel_id.to_be_bytes();
+                let moderators: Vec<String> = state.storage
+                    .prefix_iter_cf(cf::CHANNEL_MODERATORS, &prefix, 100)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|(key, _)| {
+                        if key.len() > 8 {
+                            String::from_utf8(key[8..].to_vec()).ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                // Fetch pinned messages
+                let pinned: Vec<serde_json::Value> = state.storage
+                    .prefix_iter_cf(cf::CHANNEL_PINS, &prefix, 10)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|(key, _)| {
+                        if key.len() >= 44 {
+                            let msg_id: [u8; 32] = key[12..44].try_into().ok()?;
+                            let bytes = state.storage.get_message(&msg_id).ok()??;
+                            let env = rmp_serde::from_slice::<crate::messages::envelope::Envelope>(&bytes).ok()?;
+                            serde_json::to_value(&env).ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                // Fetch member count
+                let member_count = state.storage
+                    .prefix_iter_cf(cf::CHANNEL_MEMBERS, &prefix, 10000)
+                    .map(|e| e.len() as u64)
+                    .unwrap_or(0);
+
+                Json(serde_json::json!({
+                    "channel": channel,
+                    "moderators": moderators,
+                    "pinned_messages": pinned,
+                    "member_count": member_count,
+                    "moderator_count": moderators.len(),
+                })).into_response()
+            }
             Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "corrupt channel data").into_response(),
         },
         Ok(None) => (StatusCode::NOT_FOUND, "channel not found").into_response(),
@@ -229,7 +274,19 @@ pub async fn list_news(
                             crate::messages::envelope::Envelope,
                         >(&envelope_bytes)
                         {
-                            posts.push(serde_json::to_value(&envelope).unwrap_or_default());
+                            let mut post = serde_json::to_value(&envelope).unwrap_or_default();
+                            // Enrich with engagement counts per spec
+                            if let serde_json::Value::Object(ref mut map) = post {
+                                let reactions = state.storage.get_news_reactions(&msg_id).unwrap_or_default();
+                                let reaction_counts: serde_json::Map<String, serde_json::Value> = reactions
+                                    .into_iter()
+                                    .map(|(e, c)| (e, serde_json::json!(c)))
+                                    .collect();
+                                map.insert("reaction_counts".into(), serde_json::json!(reaction_counts));
+                                map.insert("repost_count".into(),
+                                    serde_json::json!(state.storage.get_repost_count(&msg_id).unwrap_or(0)));
+                            }
+                            posts.push(post);
                         }
                     }
                 }
@@ -407,6 +464,501 @@ pub async fn unfollow_user(
     }
 }
 
+// --- News Engagement endpoints ---
+
+/// GET /api/v1/news/:msg_id/reactions
+/// Supports optional auth header to include `user_reacted` per spec.
+pub async fn get_news_reactions(
+    Extension(state): Extension<Arc<AppState>>,
+    auth_user: Option<Extension<AuthUser>>,
+    Path(msg_id_hex): Path<String>,
+) -> impl IntoResponse {
+    let msg_id = match hex::decode(&msg_id_hex) {
+        Ok(bytes) if bytes.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&bytes);
+            arr
+        }
+        _ => return (StatusCode::BAD_REQUEST, "invalid msg_id").into_response(),
+    };
+
+    let caller_address = auth_user.map(|a| a.0.address.clone());
+
+    match state.storage.get_news_reactions(&msg_id) {
+        Ok(reactions) => {
+            let map: serde_json::Map<String, serde_json::Value> = reactions
+                .into_iter()
+                .map(|(emoji, count)| {
+                    let mut entry = serde_json::json!({ "count": count });
+                    if let Some(ref addr) = caller_address {
+                        let reacted = state.storage
+                            .has_user_reacted(&msg_id, &emoji, addr)
+                            .unwrap_or(false);
+                        entry["user_reacted"] = serde_json::json!(reacted);
+                    }
+                    (emoji, entry)
+                })
+                .collect();
+            Json(serde_json::json!({ "reactions": map })).into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Storage error in get_news_reactions");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
+        }
+    }
+}
+
+/// POST /api/v1/news/:msg_id/react — react to a news post (authenticated)
+pub async fn react_to_news(
+    Extension(state): Extension<Arc<AppState>>,
+    Extension(_auth_user): Extension<AuthUser>,
+    Path(_msg_id_hex): Path<String>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    use crate::messages::router::RouteResult;
+
+    match state.router.process_message(&body) {
+        RouteResult::Accepted { .. } => Json(OkResponse { ok: true }).into_response(),
+        RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
+        RouteResult::Rejected(reason) => {
+            (StatusCode::BAD_REQUEST, reason).into_response()
+        }
+    }
+}
+
+/// POST /api/v1/news/:msg_id/repost — repost a news post (authenticated)
+pub async fn repost_news(
+    Extension(state): Extension<Arc<AppState>>,
+    Extension(_auth_user): Extension<AuthUser>,
+    Path(_msg_id_hex): Path<String>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    use crate::messages::router::RouteResult;
+
+    match state.router.process_message(&body) {
+        RouteResult::Accepted { msg_id, .. } => {
+            Json(MessageResponse {
+                msg_id: hex::encode(msg_id),
+            })
+            .into_response()
+        }
+        RouteResult::Duplicate => {
+            (StatusCode::CONFLICT, "already reposted").into_response()
+        }
+        RouteResult::Rejected(reason) => {
+            (StatusCode::BAD_REQUEST, reason).into_response()
+        }
+    }
+}
+
+/// GET /api/v1/news/:msg_id/reposts
+pub async fn get_news_reposts(
+    Extension(state): Extension<Arc<AppState>>,
+    Path(msg_id_hex): Path<String>,
+    Query(params): Query<PaginationParams>,
+) -> impl IntoResponse {
+    let msg_id = match hex::decode(&msg_id_hex) {
+        Ok(bytes) if bytes.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&bytes);
+            arr
+        }
+        _ => return (StatusCode::BAD_REQUEST, "invalid msg_id").into_response(),
+    };
+
+    let limit = params.limit.unwrap_or(20).min(100) as usize;
+    let prefix = msg_id.to_vec();
+
+    match state
+        .storage
+        .prefix_iter_cf(cf::REPOSTS, &prefix, limit)
+    {
+        Ok(entries) => {
+            let reposters: Vec<String> = entries
+                .into_iter()
+                .filter_map(|(key, _)| {
+                    if key.len() > 32 {
+                        String::from_utf8(key[32..].to_vec()).ok()
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let total = state.storage.get_repost_count(&msg_id).unwrap_or(0);
+            Json(serde_json::json!({
+                "reposters": reposters,
+                "total": total,
+            }))
+            .into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Storage error in get_news_reposts");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
+        }
+    }
+}
+
+// --- Bookmark endpoints ---
+
+/// GET /api/v1/bookmarks — list bookmarked posts (authenticated)
+pub async fn list_bookmarks(
+    Extension(state): Extension<Arc<AppState>>,
+    Extension(auth_user): Extension<AuthUser>,
+    Query(params): Query<PaginationParams>,
+) -> impl IntoResponse {
+    let limit = params.limit.unwrap_or(20).min(100) as usize;
+
+    match state.storage.list_bookmarks(&auth_user.address, limit) {
+        Ok(msg_ids) => {
+            let mut bookmarks = Vec::with_capacity(msg_ids.len());
+            for msg_id in &msg_ids {
+                if let Ok(Some(envelope_bytes)) = state.storage.get_message(msg_id) {
+                    if let Ok(envelope) = rmp_serde::from_slice::<
+                        crate::messages::envelope::Envelope,
+                    >(&envelope_bytes)
+                    {
+                        bookmarks.push(serde_json::to_value(&envelope).unwrap_or_default());
+                    }
+                }
+            }
+            let total = bookmarks.len();
+            Json(serde_json::json!({
+                "bookmarks": bookmarks,
+                "total": total,
+            }))
+            .into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Storage error in list_bookmarks");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
+        }
+    }
+}
+
+/// POST /api/v1/bookmarks/:msg_id — save a post (authenticated)
+pub async fn save_bookmark(
+    Extension(state): Extension<Arc<AppState>>,
+    Extension(auth_user): Extension<AuthUser>,
+    Path(msg_id_hex): Path<String>,
+) -> impl IntoResponse {
+    let msg_id = match hex::decode(&msg_id_hex) {
+        Ok(bytes) if bytes.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&bytes);
+            arr
+        }
+        _ => return (StatusCode::BAD_REQUEST, "invalid msg_id").into_response(),
+    };
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    match state.storage.add_bookmark(&auth_user.address, &msg_id, now) {
+        Ok(()) => Json(OkResponse { ok: true }).into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "Storage error in save_bookmark");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
+        }
+    }
+}
+
+/// DELETE /api/v1/bookmarks/:msg_id — unsave a post (authenticated)
+pub async fn remove_bookmark(
+    Extension(state): Extension<Arc<AppState>>,
+    Extension(auth_user): Extension<AuthUser>,
+    Path(msg_id_hex): Path<String>,
+) -> impl IntoResponse {
+    let msg_id = match hex::decode(&msg_id_hex) {
+        Ok(bytes) if bytes.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&bytes);
+            arr
+        }
+        _ => return (StatusCode::BAD_REQUEST, "invalid msg_id").into_response(),
+    };
+
+    match state.storage.remove_bookmark(&auth_user.address, &msg_id) {
+        Ok(_) => Json(OkResponse { ok: true }).into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "Storage error in remove_bookmark");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
+        }
+    }
+}
+
+// --- Channel Administration endpoints ---
+
+/// GET /api/v1/channels/:channel_id/members
+pub async fn get_channel_members(
+    Extension(state): Extension<Arc<AppState>>,
+    Path(channel_id): Path<u64>,
+    Query(params): Query<PaginationParams>,
+) -> impl IntoResponse {
+    let limit = params.limit.unwrap_or(50).min(200) as usize;
+    let prefix = channel_id.to_be_bytes();
+
+    match state
+        .storage
+        .prefix_iter_cf(cf::CHANNEL_MEMBERS, &prefix, limit)
+    {
+        Ok(entries) => {
+            let members: Vec<serde_json::Value> = entries
+                .into_iter()
+                .filter_map(|(key, value)| {
+                    if key.len() > 8 {
+                        let address = String::from_utf8(key[8..].to_vec()).ok()?;
+                        let record: serde_json::Value =
+                            serde_json::from_slice(&value).unwrap_or_default();
+                        Some(serde_json::json!({
+                            "address": address,
+                            "role": record.get("role").unwrap_or(&serde_json::json!("member")),
+                            "joined_at": record.get("joined_at").unwrap_or(&serde_json::json!(0)),
+                        }))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let total = members.len();
+            Json(serde_json::json!({
+                "members": members,
+                "total": total,
+            }))
+            .into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Storage error in get_channel_members");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
+        }
+    }
+}
+
+/// GET /api/v1/channels/:channel_id/pins
+pub async fn get_channel_pins(
+    Extension(state): Extension<Arc<AppState>>,
+    Path(channel_id): Path<u64>,
+) -> impl IntoResponse {
+    let prefix = channel_id.to_be_bytes();
+
+    match state
+        .storage
+        .prefix_iter_cf(cf::CHANNEL_PINS, &prefix, 10)
+    {
+        Ok(entries) => {
+            let mut pinned_messages = Vec::with_capacity(entries.len());
+            for (key, _) in &entries {
+                // Key: channel_id(8) + pin_order(4) + msg_id(32)
+                if key.len() >= 44 {
+                    let msg_id: [u8; 32] = key[12..44].try_into().unwrap_or([0u8; 32]);
+                    if let Ok(Some(envelope_bytes)) = state.storage.get_message(&msg_id) {
+                        if let Ok(envelope) = rmp_serde::from_slice::<
+                            crate::messages::envelope::Envelope,
+                        >(&envelope_bytes)
+                        {
+                            pinned_messages
+                                .push(serde_json::to_value(&envelope).unwrap_or_default());
+                        }
+                    }
+                }
+            }
+            Json(serde_json::json!({
+                "pinned_messages": pinned_messages,
+            }))
+            .into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Storage error in get_channel_pins");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
+        }
+    }
+}
+
+/// GET /api/v1/channels/:channel_id/bans
+pub async fn get_channel_bans(
+    Extension(state): Extension<Arc<AppState>>,
+    Path(channel_id): Path<u64>,
+) -> impl IntoResponse {
+    let prefix = channel_id.to_be_bytes();
+
+    match state
+        .storage
+        .prefix_iter_cf(cf::CHANNEL_BANS, &prefix, 200)
+    {
+        Ok(entries) => {
+            let bans: Vec<serde_json::Value> = entries
+                .into_iter()
+                .filter_map(|(key, value)| {
+                    if key.len() > 8 {
+                        let address = String::from_utf8(key[8..].to_vec()).ok()?;
+                        let record: serde_json::Value =
+                            serde_json::from_slice(&value).unwrap_or_default();
+                        Some(serde_json::json!({
+                            "address": address,
+                            "reason": record.get("reason"),
+                            "duration_secs": record.get("duration_secs"),
+                            "banned_at": record.get("banned_at"),
+                            "banned_by": record.get("banned_by"),
+                        }))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            Json(serde_json::json!({ "bans": bans })).into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Storage error in get_channel_bans");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
+        }
+    }
+}
+
+/// POST /api/v1/channels/:channel_id/moderators — add moderator (authenticated, creator only)
+pub async fn add_moderator(
+    Extension(state): Extension<Arc<AppState>>,
+    Extension(_auth_user): Extension<AuthUser>,
+    Path(_channel_id): Path<u64>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    use crate::messages::router::RouteResult;
+
+    match state.router.process_message(&body) {
+        RouteResult::Accepted { .. } => Json(OkResponse { ok: true }).into_response(),
+        RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
+        RouteResult::Rejected(reason) => {
+            (StatusCode::BAD_REQUEST, reason).into_response()
+        }
+    }
+}
+
+/// DELETE /api/v1/channels/:channel_id/moderators/:address — remove moderator (authenticated)
+pub async fn remove_moderator(
+    Extension(state): Extension<Arc<AppState>>,
+    Extension(_auth_user): Extension<AuthUser>,
+    Path((_channel_id, _address)): Path<(u64, String)>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    use crate::messages::router::RouteResult;
+
+    match state.router.process_message(&body) {
+        RouteResult::Accepted { .. } => Json(OkResponse { ok: true }).into_response(),
+        RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
+        RouteResult::Rejected(reason) => {
+            (StatusCode::BAD_REQUEST, reason).into_response()
+        }
+    }
+}
+
+/// POST /api/v1/channels/:channel_id/kick/:address — kick user (authenticated)
+pub async fn kick_user(
+    Extension(state): Extension<Arc<AppState>>,
+    Extension(_auth_user): Extension<AuthUser>,
+    Path((_channel_id, _address)): Path<(u64, String)>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    use crate::messages::router::RouteResult;
+
+    match state.router.process_message(&body) {
+        RouteResult::Accepted { .. } => Json(OkResponse { ok: true }).into_response(),
+        RouteResult::Rejected(reason) => {
+            (StatusCode::BAD_REQUEST, reason).into_response()
+        }
+        RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
+    }
+}
+
+/// POST /api/v1/channels/:channel_id/ban/:address — ban user (authenticated)
+pub async fn ban_user(
+    Extension(state): Extension<Arc<AppState>>,
+    Extension(_auth_user): Extension<AuthUser>,
+    Path((_channel_id, _address)): Path<(u64, String)>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    use crate::messages::router::RouteResult;
+
+    match state.router.process_message(&body) {
+        RouteResult::Accepted { .. } => Json(OkResponse { ok: true }).into_response(),
+        RouteResult::Rejected(reason) => {
+            (StatusCode::BAD_REQUEST, reason).into_response()
+        }
+        RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
+    }
+}
+
+/// DELETE /api/v1/channels/:channel_id/ban/:address — unban user (authenticated)
+pub async fn unban_user(
+    Extension(state): Extension<Arc<AppState>>,
+    Extension(_auth_user): Extension<AuthUser>,
+    Path((_channel_id, _address)): Path<(u64, String)>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    use crate::messages::router::RouteResult;
+
+    match state.router.process_message(&body) {
+        RouteResult::Accepted { .. } => Json(OkResponse { ok: true }).into_response(),
+        RouteResult::Rejected(reason) => {
+            (StatusCode::BAD_REQUEST, reason).into_response()
+        }
+        RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
+    }
+}
+
+/// POST /api/v1/channels/:channel_id/pin/:msg_id — pin message (authenticated)
+pub async fn pin_message(
+    Extension(state): Extension<Arc<AppState>>,
+    Extension(_auth_user): Extension<AuthUser>,
+    Path((_channel_id, _msg_id)): Path<(u64, String)>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    use crate::messages::router::RouteResult;
+
+    match state.router.process_message(&body) {
+        RouteResult::Accepted { .. } => Json(OkResponse { ok: true }).into_response(),
+        RouteResult::Rejected(reason) => {
+            (StatusCode::BAD_REQUEST, reason).into_response()
+        }
+        RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
+    }
+}
+
+/// DELETE /api/v1/channels/:channel_id/pin/:msg_id — unpin message (authenticated)
+pub async fn unpin_message(
+    Extension(state): Extension<Arc<AppState>>,
+    Extension(_auth_user): Extension<AuthUser>,
+    Path((_channel_id, _msg_id)): Path<(u64, String)>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    use crate::messages::router::RouteResult;
+
+    match state.router.process_message(&body) {
+        RouteResult::Accepted { .. } => Json(OkResponse { ok: true }).into_response(),
+        RouteResult::Rejected(reason) => {
+            (StatusCode::BAD_REQUEST, reason).into_response()
+        }
+        RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
+    }
+}
+
+/// POST /api/v1/channels/:channel_id/invite/:address — invite user (authenticated)
+pub async fn invite_user(
+    Extension(state): Extension<Arc<AppState>>,
+    Extension(_auth_user): Extension<AuthUser>,
+    Path((_channel_id, _address)): Path<(u64, String)>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    use crate::messages::router::RouteResult;
+
+    match state.router.process_message(&body) {
+        RouteResult::Accepted { .. } => Json(OkResponse { ok: true }).into_response(),
+        RouteResult::Rejected(reason) => {
+            (StatusCode::BAD_REQUEST, reason).into_response()
+        }
+        RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
+    }
+}
+
 /// GET /api/v1/feed — personal news feed (posts from followed users)
 pub async fn personal_feed(
     Extension(state): Extension<Arc<AppState>>,
@@ -415,7 +967,8 @@ pub async fn personal_feed(
 ) -> impl IntoResponse {
     let limit = params.limit.unwrap_or(20).min(100) as usize;
 
-    let following = match state.storage.get_following(&auth_user.address, 1000) {
+    // Cap following fan-out to 200 to prevent O(N*M) DDoS (audit W1/W6)
+    let following = match state.storage.get_following(&auth_user.address, 200) {
         Ok(f) => f,
         Err(e) => {
             tracing::error!(error = %e, "Storage error in feed handler");

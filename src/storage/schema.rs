@@ -40,6 +40,32 @@ pub mod cf {
     /// address → (following_count: u64, follower_count: u64) — cached counts
     pub const FOLLOWER_COUNTS: &str = "follower_counts";
 
+    // --- News Engagement ---
+
+    /// (msg_id, emoji, author) → () — individual reactions on news posts
+    pub const NEWS_REACTIONS: &str = "news_reactions";
+    /// (msg_id, emoji) → u64 — cached reaction counts per post per emoji
+    pub const REACTION_COUNTS: &str = "reaction_counts";
+    /// (original_id, reposter_address) → repost_msg_id — who reposted what
+    pub const REPOSTS: &str = "reposts";
+    /// msg_id → u64 — cached repost count per post
+    pub const REPOST_COUNTS: &str = "repost_counts";
+    /// (user_address, timestamp, msg_id) → () — user's saved posts, ordered by save time
+    pub const BOOKMARKS: &str = "bookmarks";
+
+    // --- Channel Administration ---
+
+    /// (channel_id, address) → ModeratorPermissions (serialized)
+    pub const CHANNEL_MODERATORS: &str = "channel_moderators";
+    /// (channel_id, address) → BanRecord (serialized: reason, duration, banned_at, banned_by)
+    pub const CHANNEL_BANS: &str = "channel_bans";
+    /// (channel_id, pin_order, msg_id) → () — max 10 pins per channel
+    pub const CHANNEL_PINS: &str = "channel_pins";
+    /// (channel_id, address) → MemberRecord (serialized: joined_at, role)
+    pub const CHANNEL_MEMBERS: &str = "channel_members";
+    /// (channel_id, address) → InviteRecord (serialized: invited_by, timestamp)
+    pub const CHANNEL_INVITES: &str = "channel_invites";
+
     /// All column family names for database initialization.
     pub const ALL: &[&str] = &[
         MESSAGES,
@@ -59,6 +85,16 @@ pub mod cf {
         FOLLOWS,
         FOLLOWERS,
         FOLLOWER_COUNTS,
+        NEWS_REACTIONS,
+        REACTION_COUNTS,
+        REPOSTS,
+        REPOST_COUNTS,
+        BOOKMARKS,
+        CHANNEL_MODERATORS,
+        CHANNEL_BANS,
+        CHANNEL_PINS,
+        CHANNEL_MEMBERS,
+        CHANNEL_INVITES,
     ];
 }
 
@@ -153,5 +189,91 @@ pub fn encode_follow_key(follower: &str, followed: &str) -> Vec<u8> {
     key.extend_from_slice(follower.as_bytes());
     key.push(0xFF);
     key.extend_from_slice(followed.as_bytes());
+    key
+}
+
+// --- News Engagement key encoding ---
+
+/// Encode a news reaction key: (msg_id, emoji, author).
+pub fn encode_news_reaction_key(msg_id: &[u8; 32], emoji: &str, author: &str) -> Vec<u8> {
+    let emoji_bytes = emoji.as_bytes();
+    let author_bytes = author.as_bytes();
+    let mut key = Vec::with_capacity(32 + 2 + emoji_bytes.len() + 1 + author_bytes.len());
+    key.extend_from_slice(msg_id);
+    key.extend_from_slice(&(emoji_bytes.len() as u16).to_be_bytes());
+    key.extend_from_slice(emoji_bytes);
+    key.push(0xFF);
+    key.extend_from_slice(author_bytes);
+    key
+}
+
+/// Encode a reaction count key: (msg_id, emoji).
+pub fn encode_reaction_count_key(msg_id: &[u8; 32], emoji: &str) -> Vec<u8> {
+    let emoji_bytes = emoji.as_bytes();
+    let mut key = Vec::with_capacity(32 + emoji_bytes.len());
+    key.extend_from_slice(msg_id);
+    key.extend_from_slice(emoji_bytes);
+    key
+}
+
+/// Encode a repost key: (original_id, reposter_address).
+pub fn encode_repost_key(original_id: &[u8; 32], reposter: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(32 + reposter.len());
+    key.extend_from_slice(original_id);
+    key.extend_from_slice(reposter.as_bytes());
+    key
+}
+
+/// Encode a bookmark key: (user_address, timestamp, msg_id).
+pub fn encode_bookmark_key(user_address: &str, timestamp: u64, msg_id: &[u8; 32]) -> Vec<u8> {
+    let addr_bytes = user_address.as_bytes();
+    let mut key = Vec::with_capacity(addr_bytes.len() + 1 + 8 + 32);
+    key.extend_from_slice(addr_bytes);
+    key.push(0xFF);
+    key.extend_from_slice(&(!timestamp).to_be_bytes()); // newest first
+    key.extend_from_slice(msg_id);
+    key
+}
+
+// --- Channel Administration key encoding ---
+
+/// Encode a channel moderator key: (channel_id, address).
+pub fn encode_channel_moderator_key(channel_id: u64, address: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(8 + address.len());
+    key.extend_from_slice(&channel_id.to_be_bytes());
+    key.extend_from_slice(address.as_bytes());
+    key
+}
+
+/// Encode a channel ban key: (channel_id, address).
+pub fn encode_channel_ban_key(channel_id: u64, address: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(8 + address.len());
+    key.extend_from_slice(&channel_id.to_be_bytes());
+    key.extend_from_slice(address.as_bytes());
+    key
+}
+
+/// Encode a channel pin key: (channel_id, pin_order).
+pub fn encode_channel_pin_key(channel_id: u64, pin_order: u32, msg_id: &[u8; 32]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(8 + 4 + 32);
+    key.extend_from_slice(&channel_id.to_be_bytes());
+    key.extend_from_slice(&pin_order.to_be_bytes());
+    key.extend_from_slice(msg_id);
+    key
+}
+
+/// Encode a channel member key: (channel_id, address).
+pub fn encode_channel_member_key(channel_id: u64, address: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(8 + address.len());
+    key.extend_from_slice(&channel_id.to_be_bytes());
+    key.extend_from_slice(address.as_bytes());
+    key
+}
+
+/// Encode a channel invite key: (channel_id, address).
+pub fn encode_channel_invite_key(channel_id: u64, address: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(8 + address.len());
+    key.extend_from_slice(&channel_id.to_be_bytes());
+    key.extend_from_slice(address.as_bytes());
     key
 }
