@@ -70,6 +70,10 @@ impl Storage {
                 {
                     cf_opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(8));
                 }
+                // NEWS_COMMENTS is keyed by (post_id[32], timestamp[8], msg_id[32])
+                if *name == cf::NEWS_COMMENTS {
+                    cf_opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(32));
+                }
                 ColumnFamilyDescriptor::new(*name, cf_opts)
             })
             .collect();
@@ -195,13 +199,23 @@ impl Storage {
         Ok(results)
     }
 
-    /// Store a message envelope and update all relevant indexes.
+    /// Store a message envelope and atomically increment the message counter.
+    ///
+    /// Uses a WriteBatch to ensure the message and its counter update are
+    /// written together, preventing counter drift on partial failure.
     pub fn store_message(
         &self,
         msg_id: &[u8; 32],
         envelope_bytes: &[u8],
     ) -> Result<()> {
-        self.put_cf(cf::MESSAGES, msg_id, envelope_bytes)
+        let messages_cf = self.cf_handle(cf::MESSAGES)?;
+        let state_cf = self.cf_handle(cf::NODE_STATE)?;
+        let new_count = self.get_stat(super::schema::state_keys::TOTAL_MESSAGES)? + 1;
+
+        let mut batch = WriteBatch::default();
+        batch.put_cf(messages_cf, msg_id, envelope_bytes);
+        batch.put_cf(state_cf, super::schema::state_keys::TOTAL_MESSAGES, &new_count.to_be_bytes());
+        self.write_batch(batch)
     }
 
     /// Get a message envelope by its ID.
@@ -619,6 +633,100 @@ impl Storage {
         let prefix = channel_id.to_be_bytes();
         let entries = self.prefix_iter_cf(cf::CHANNEL_PINS, &prefix, 11)?;
         Ok(entries.len() as u32)
+    }
+
+    // --- Network Stats Counters ---
+
+    /// Read a u64 stat counter from NODE_STATE.
+    pub fn get_stat(&self, key: &[u8]) -> Result<u64> {
+        match self.get_cf(cf::NODE_STATE, key)? {
+            Some(bytes) if bytes.len() == 8 => {
+                Ok(u64::from_be_bytes(bytes.try_into().unwrap()))
+            }
+            _ => Ok(0),
+        }
+    }
+
+    /// Increment a u64 stat counter in NODE_STATE by 1.
+    pub fn increment_stat(&self, key: &[u8]) -> Result<u64> {
+        let new_val = self.get_stat(key)? + 1;
+        self.put_cf(cf::NODE_STATE, key, &new_val.to_be_bytes())?;
+        Ok(new_val)
+    }
+
+    /// Rebuild stat counters by scanning existing data.
+    /// Called once on startup when counters are zero but data exists.
+    pub fn rebuild_stat_counters(&self) -> Result<()> {
+        use tracing::info;
+
+        // Count messages
+        let msg_cf = self.db.cf_handle(cf::MESSAGES)
+            .context("MESSAGES cf not found")?;
+        let mut msg_count = 0u64;
+        let mut iter = self.db.raw_iterator_cf(&msg_cf);
+        iter.seek_to_first();
+        while iter.valid() {
+            msg_count += 1;
+            iter.next();
+        }
+        if msg_count > 0 {
+            self.put_cf(
+                cf::NODE_STATE,
+                super::schema::state_keys::TOTAL_MESSAGES,
+                &msg_count.to_be_bytes(),
+            )?;
+        }
+
+        // Count users
+        let user_cf = self.db.cf_handle(cf::USERS)
+            .context("USERS cf not found")?;
+        let mut user_count = 0u64;
+        let mut iter = self.db.raw_iterator_cf(&user_cf);
+        iter.seek_to_first();
+        while iter.valid() {
+            user_count += 1;
+            iter.next();
+        }
+        if user_count > 0 {
+            self.put_cf(
+                cf::NODE_STATE,
+                super::schema::state_keys::TOTAL_USERS,
+                &user_count.to_be_bytes(),
+            )?;
+        }
+
+        // Count channels
+        let ch_cf = self.db.cf_handle(cf::CHANNELS)
+            .context("CHANNELS cf not found")?;
+        let mut ch_count = 0u64;
+        let mut iter = self.db.raw_iterator_cf(&ch_cf);
+        iter.seek_to_first();
+        while iter.valid() {
+            ch_count += 1;
+            iter.next();
+        }
+        if ch_count > 0 {
+            self.put_cf(
+                cf::NODE_STATE,
+                super::schema::state_keys::TOTAL_CHANNELS,
+                &ch_count.to_be_bytes(),
+            )?;
+        }
+
+        info!(
+            messages = msg_count,
+            users = user_count,
+            channels = ch_count,
+            "Stat counters rebuilt from existing data"
+        );
+
+        Ok(())
+    }
+
+    /// Get the comment count for a news post by prefix-scanning NEWS_COMMENTS.
+    pub fn get_comment_count(&self, post_id: &[u8; 32]) -> Result<u64> {
+        let entries = self.prefix_iter_cf(cf::NEWS_COMMENTS, post_id, 10_000)?;
+        Ok(entries.len() as u64)
     }
 
     // --- Anchor Verification ---

@@ -185,7 +185,7 @@ impl MessageRouter {
             return RouteResult::Rejected(format!("unauthorized: {}", e));
         }
 
-        // Step 8: Store message
+        // Step 8: Store message (atomically increments total_messages counter)
         if let Err(e) = self.storage.store_message(&envelope.msg_id, raw_bytes) {
             return RouteResult::Rejected(format!("storage error: {}", e));
         }
@@ -839,6 +839,19 @@ impl MessageRouter {
                         &key,
                         &record_bytes,
                     )?;
+                }
+            }
+            MessageType::NewsComment => {
+                if let Ok(payload) =
+                    rmp_serde::from_slice::<NewsCommentPayload>(&envelope.payload)
+                {
+                    let key = schema::encode_news_comment_key(
+                        &payload.post_id,
+                        envelope.timestamp,
+                        &envelope.msg_id,
+                    );
+                    self.storage
+                        .put_cf(schema::cf::NEWS_COMMENTS, &key, &[])?;
                 }
             }
             _ => {}

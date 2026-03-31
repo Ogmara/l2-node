@@ -69,6 +69,9 @@ pub mod cf {
     /// (node_id, timestamp) → block_height — anchors indexed by submitting node
     pub const ANCHOR_BY_NODE: &str = "anchor_by_node";
 
+    /// (post_id, timestamp, msg_id) → () — comments indexed by parent news post
+    pub const NEWS_COMMENTS: &str = "news_comments";
+
     /// All column family names for database initialization.
     pub const ALL: &[&str] = &[
         MESSAGES,
@@ -99,6 +102,7 @@ pub mod cf {
         CHANNEL_MEMBERS,
         CHANNEL_INVITES,
         ANCHOR_BY_NODE,
+        NEWS_COMMENTS,
     ];
 }
 
@@ -110,6 +114,12 @@ pub mod state_keys {
     pub const NODE_PRIVATE_KEY: &[u8] = b"node_private_key";
     /// Local Lamport clock counter (u64 big-endian).
     pub const LAMPORT_COUNTER: &[u8] = b"lamport_counter";
+    /// Total stored messages counter (u64 big-endian).
+    pub const TOTAL_MESSAGES: &[u8] = b"stat_total_messages";
+    /// Total registered users counter (u64 big-endian).
+    pub const TOTAL_USERS: &[u8] = b"stat_total_users";
+    /// Total channels counter (u64 big-endian).
+    pub const TOTAL_CHANNELS: &[u8] = b"stat_total_channels";
 }
 
 /// Encode a channel message index key: (channel_id, lamport_ts, msg_id).
@@ -289,5 +299,14 @@ pub fn encode_anchor_by_node_key(node_id: &str, timestamp: u64) -> Vec<u8> {
     key.extend_from_slice(id_bytes);
     key.push(0xFF); // separator
     key.extend_from_slice(&timestamp.to_be_bytes());
+    key
+}
+
+/// Encode a news comment index key: (post_id, timestamp, msg_id).
+pub fn encode_news_comment_key(post_id: &[u8; 32], timestamp: u64, msg_id: &[u8; 32]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(32 + 8 + 32);
+    key.extend_from_slice(post_id);
+    key.extend_from_slice(&timestamp.to_be_bytes());
+    key.extend_from_slice(msg_id);
     key
 }
