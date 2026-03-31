@@ -575,6 +575,63 @@ impl MessageRouter {
         }
     }
 
+    /// Add a member to a channel (idempotent — skips if already member).
+    /// Updates the member_count in channel metadata.
+    fn add_channel_member(&self, channel_id: u64, address: &str, timestamp: u64, role: &str) -> Result<bool> {
+        // Check channel exists
+        let channel_key = channel_id.to_be_bytes();
+        let channel_data = self.storage.get_cf(schema::cf::CHANNELS, &channel_key)?;
+        if channel_data.is_none() {
+            return Ok(false); // channel doesn't exist
+        }
+
+        let member_key = schema::encode_channel_member_key(channel_id, address);
+        if self.storage.get_cf(schema::cf::CHANNEL_MEMBERS, &member_key)?.is_some() {
+            return Ok(false); // already a member
+        }
+
+        let record = serde_json::json!({
+            "joined_at": timestamp,
+            "role": role,
+        });
+        let record_bytes = serde_json::to_vec(&record)
+            .context("serializing member record")?;
+        self.storage.put_cf(schema::cf::CHANNEL_MEMBERS, &member_key, &record_bytes)?;
+
+        // Update member_count in channel metadata
+        if let Some(data) = channel_data {
+            if let Ok(mut meta) = serde_json::from_slice::<serde_json::Value>(&data) {
+                let count = meta.get("member_count").and_then(|v| v.as_u64()).unwrap_or(0);
+                meta["member_count"] = serde_json::json!(count + 1);
+                if let Ok(bytes) = serde_json::to_vec(&meta) {
+                    let _ = self.storage.put_cf(schema::cf::CHANNELS, &channel_key, &bytes);
+                }
+            }
+        }
+
+        Ok(true)
+    }
+
+    /// Remove a member from a channel. Updates member_count.
+    fn remove_channel_member(&self, channel_id: u64, address: &str) -> Result<()> {
+        let member_key = schema::encode_channel_member_key(channel_id, address);
+        self.storage.delete_cf(schema::cf::CHANNEL_MEMBERS, &member_key)?;
+
+        // Decrement member_count in channel metadata
+        let channel_key = channel_id.to_be_bytes();
+        if let Some(data) = self.storage.get_cf(schema::cf::CHANNELS, &channel_key)? {
+            if let Ok(mut meta) = serde_json::from_slice::<serde_json::Value>(&data) {
+                let count = meta.get("member_count").and_then(|v| v.as_u64()).unwrap_or(1);
+                meta["member_count"] = serde_json::json!(count.saturating_sub(1));
+                if let Ok(bytes) = serde_json::to_vec(&meta) {
+                    let _ = self.storage.put_cf(schema::cf::CHANNELS, &channel_key, &bytes);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Update storage indexes based on message type.
     fn update_indexes(&self, envelope: &Envelope) -> Result<()> {
         match envelope.msg_type {
@@ -591,6 +648,14 @@ impl MessageRouter {
                         .put_cf(schema::cf::CHANNEL_MSGS, &key, &[])?;
                     self.storage
                         .increment_stat(schema::state_keys::TOTAL_CHANNEL_MESSAGES)?;
+
+                    // Auto-add author as channel member on first message
+                    let _ = self.add_channel_member(
+                        payload.channel_id,
+                        &envelope.author,
+                        envelope.timestamp,
+                        "member",
+                    );
                 }
             }
             MessageType::DirectMessage => {
@@ -650,6 +715,79 @@ impl MessageRouter {
                     rmp_serde::from_slice::<UnfollowPayload>(&envelope.payload)
                 {
                     self.storage.unfollow(&envelope.author, &payload.target)?;
+                }
+            }
+            MessageType::ChannelCreate => {
+                if let Ok(payload) =
+                    rmp_serde::from_slice::<ChannelCreatePayload>(&envelope.payload)
+                {
+                    // Store channel metadata (member_count starts at 0, add_channel_member increments)
+                    let meta = serde_json::json!({
+                        "channel_id": payload.channel_id,
+                        "slug": payload.slug,
+                        "channel_type": payload.channel_type,
+                        "creator": envelope.author,
+                        "created_at": envelope.timestamp,
+                        "display_name": payload.display_name,
+                        "description": payload.description,
+                        "member_count": 0,
+                    });
+                    let meta_bytes = serde_json::to_vec(&meta)
+                        .context("serializing channel metadata")?;
+                    self.storage.put_cf(
+                        schema::cf::CHANNELS,
+                        &payload.channel_id.to_be_bytes(),
+                        &meta_bytes,
+                    )?;
+                    self.storage
+                        .increment_stat(schema::state_keys::TOTAL_CHANNELS)?;
+
+                    // Add creator as first member (increments member_count to 1)
+                    let _ = self.add_channel_member(
+                        payload.channel_id,
+                        &envelope.author,
+                        envelope.timestamp,
+                        "creator",
+                    );
+                }
+            }
+            MessageType::ChannelJoin => {
+                if let Ok(payload) =
+                    rmp_serde::from_slice::<ChannelJoinPayload>(&envelope.payload)
+                {
+                    // Validates channel exists and is idempotent (skips if already member)
+                    let _ = self.add_channel_member(
+                        payload.channel_id,
+                        &envelope.author,
+                        envelope.timestamp,
+                        "member",
+                    );
+                }
+            }
+            // TODO: Add ChannelDelete support — when creator deletes a channel:
+            // 1. Remove all members from CHANNEL_MEMBERS
+            // 2. Remove channel metadata from CHANNELS
+            // 3. Decrement TOTAL_CHANNELS
+            // 4. Optionally: remove all channel messages from CHANNEL_MSGS
+            // Requires adding MessageType::ChannelDelete (or use ChannelUpdate with deleted flag)
+            MessageType::ChannelLeave => {
+                if let Ok(payload) =
+                    rmp_serde::from_slice::<ChannelLeavePayload>(&envelope.payload)
+                {
+                    self.remove_channel_member(payload.channel_id, &envelope.author)?;
+                }
+            }
+            MessageType::NewsComment => {
+                if let Ok(payload) =
+                    rmp_serde::from_slice::<NewsCommentPayload>(&envelope.payload)
+                {
+                    let key = schema::encode_news_comment_key(
+                        &payload.post_id,
+                        envelope.timestamp,
+                        &envelope.msg_id,
+                    );
+                    self.storage
+                        .put_cf(schema::cf::NEWS_COMMENTS, &key, &[])?;
                 }
             }
             MessageType::NewsReaction => {
@@ -712,25 +850,15 @@ impl MessageRouter {
                 if let Ok(payload) =
                     rmp_serde::from_slice::<ChannelKickPayload>(&envelope.payload)
                 {
-                    let key = schema::encode_channel_member_key(
-                        payload.channel_id,
-                        &payload.target_user,
-                    );
-                    self.storage
-                        .delete_cf(schema::cf::CHANNEL_MEMBERS, &key)?;
+                    self.remove_channel_member(payload.channel_id, &payload.target_user)?;
                 }
             }
             MessageType::ChannelBan => {
                 if let Ok(payload) =
                     rmp_serde::from_slice::<ChannelBanPayload>(&envelope.payload)
                 {
-                    // Remove from members
-                    let member_key = schema::encode_channel_member_key(
-                        payload.channel_id,
-                        &payload.target_user,
-                    );
-                    self.storage
-                        .delete_cf(schema::cf::CHANNEL_MEMBERS, &member_key)?;
+                    // Remove from members (updates member_count)
+                    self.remove_channel_member(payload.channel_id, &payload.target_user)?;
 
                     // Add to bans
                     let ban_key = schema::encode_channel_ban_key(
