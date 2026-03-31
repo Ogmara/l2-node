@@ -5,6 +5,32 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-03-31
+
+### Added
+
+- **Live Network Stats** — `GET /api/v1/network/stats` now returns real counts
+  for `total_messages`, `total_users`, and `total_channels` instead of hardcoded
+  zeros, making the website status bar reflect actual network state
+- Stat counter keys in `NODE_STATE` column family (`stat_total_messages`,
+  `stat_total_users`, `stat_total_channels`) with `get_stat()` and
+  `increment_stat()` storage methods
+- Automatic counter rebuild on startup — scans existing `MESSAGES`, `USERS`,
+  and `CHANNELS` column families when counters are zero (handles upgrade from
+  pre-stats versions)
+- `NEWS_COMMENTS` column family — indexes comments by parent post
+  `(post_id, timestamp, msg_id)` for efficient comment retrieval
+- `NewsComment` messages now indexed in `update_indexes()` (previously fell
+  through to the catchall and were invisible to queries)
+- `encode_news_comment_key()` key encoding function
+- `get_comment_count()` method on `Storage` for per-post comment counts
+
+### Fixed
+
+- Website status bar showing `0 Users`, `0 Messages`, `0 Channels` despite
+  having stored content — stats endpoint was returning hardcoded zeros
+- `NewsComment` messages stored but never indexed, making them unqueryable
+
 ## [0.3.0] - 2026-03-30
 
 ### Added

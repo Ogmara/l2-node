@@ -95,12 +95,17 @@ pub async fn network_stats(Extension(state): Extension<Arc<AppState>>) -> Json<S
             anchoring_since: None,
         }
     });
+    use crate::storage::schema::state_keys;
+    let total_messages = state.storage.get_stat(state_keys::TOTAL_MESSAGES).unwrap_or(0);
+    let total_users = state.storage.get_stat(state_keys::TOTAL_USERS).unwrap_or(0);
+    let total_channels = state.storage.get_stat(state_keys::TOTAL_CHANNELS).unwrap_or(0);
+
     Json(StatsResponse {
         node_id: state.node_id.clone(),
         peers: state.peer_count(),
-        total_messages: 0, // TODO: track in storage
-        total_channels: 0,
-        total_users: 0,
+        total_messages,
+        total_channels,
+        total_users,
         uptime_seconds: uptime,
         protocol_version: crate::messages::envelope::PROTOCOL_VERSION,
         anchor_status,

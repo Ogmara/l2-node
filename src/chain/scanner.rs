@@ -215,6 +215,8 @@ impl ChainScanner {
                 public_key,
                 timestamp,
             } => {
+                // Only increment counter for genuinely new users (idempotent on re-scan)
+                let is_new = !self.storage.exists_cf(cf::USERS, address.as_bytes())?;
                 let record = UserRecord {
                     address: address.clone(),
                     public_key,
@@ -226,6 +228,11 @@ impl ChainScanner {
                 let bytes = serde_json::to_vec(&record)?;
                 self.storage
                     .put_cf(cf::USERS, address.as_bytes(), &bytes)?;
+                if is_new {
+                    self.storage.increment_stat(
+                        crate::storage::schema::state_keys::TOTAL_USERS,
+                    )?;
+                }
                 info!(address = %address, "User registered (on-chain)");
             }
 
@@ -252,6 +259,8 @@ impl ChainScanner {
                 channel_type,
                 timestamp,
             } => {
+                // Only increment counter for genuinely new channels (idempotent on re-scan)
+                let is_new = !self.storage.exists_cf(cf::CHANNELS, &channel_id.to_be_bytes())?;
                 let record = ChannelRecord {
                     channel_id,
                     slug,
@@ -265,6 +274,11 @@ impl ChainScanner {
                 let bytes = serde_json::to_vec(&record)?;
                 self.storage
                     .put_cf(cf::CHANNELS, &channel_id.to_be_bytes(), &bytes)?;
+                if is_new {
+                    self.storage.increment_stat(
+                        crate::storage::schema::state_keys::TOTAL_CHANNELS,
+                    )?;
+                }
                 info!(channel_id, "Channel created (on-chain)");
             }
 

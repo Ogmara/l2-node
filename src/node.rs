@@ -59,6 +59,17 @@ impl Node {
         let signing_key = load_or_generate_key(&storage)?;
         let node_id = compute_node_id(&signing_key);
 
+        // Rebuild stat counters if they're zero but data exists
+        // (handles first upgrade from pre-stats versions)
+        let has_counters = storage.get_stat(state_keys::TOTAL_MESSAGES)? > 0
+            || storage.get_stat(state_keys::TOTAL_USERS)? > 0
+            || storage.get_stat(state_keys::TOTAL_CHANNELS)? > 0;
+        if !has_counters {
+            if let Err(e) = storage.rebuild_stat_counters() {
+                warn!(error = %e, "Failed to rebuild stat counters");
+            }
+        }
+
         // Load Lamport counter from storage
         let lamport_value = storage.get_lamport_counter()?;
         let lamport_counter = Arc::new(AtomicU64::new(lamport_value));
