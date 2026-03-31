@@ -116,10 +116,16 @@ pub mod state_keys {
     pub const LAMPORT_COUNTER: &[u8] = b"lamport_counter";
     /// Total stored messages counter (u64 big-endian).
     pub const TOTAL_MESSAGES: &[u8] = b"stat_total_messages";
+    /// Total news feed messages counter (u64 big-endian).
+    pub const TOTAL_NEWS_MESSAGES: &[u8] = b"stat_total_news_messages";
+    /// Total channel chat messages counter (u64 big-endian).
+    pub const TOTAL_CHANNEL_MESSAGES: &[u8] = b"stat_total_channel_messages";
     /// Total registered users counter (u64 big-endian).
     pub const TOTAL_USERS: &[u8] = b"stat_total_users";
     /// Total channels counter (u64 big-endian).
     pub const TOTAL_CHANNELS: &[u8] = b"stat_total_channels";
+    /// Sentinel: set to 1 after split counters are rebuilt (prevents repeated rebuilds).
+    pub const COUNTERS_V2: &[u8] = b"stat_counters_v2";
 }
 
 /// Encode a channel message index key: (channel_id, lamport_ts, msg_id).

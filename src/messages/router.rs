@@ -589,6 +589,8 @@ impl MessageRouter {
                     );
                     self.storage
                         .put_cf(schema::cf::CHANNEL_MSGS, &key, &[])?;
+                    self.storage
+                        .increment_stat(schema::state_keys::TOTAL_CHANNEL_MESSAGES)?;
                 }
             }
             MessageType::DirectMessage => {
@@ -609,6 +611,8 @@ impl MessageRouter {
                     schema::encode_news_key(envelope.timestamp, &envelope.msg_id);
                 self.storage
                     .put_cf(schema::cf::NEWS_FEED, &key, &[])?;
+                self.storage
+                    .increment_stat(schema::state_keys::TOTAL_NEWS_MESSAGES)?;
 
                 // Index by author
                 let author_key = schema::encode_news_by_author_key(
@@ -674,6 +678,8 @@ impl MessageRouter {
                         schema::encode_news_key(envelope.timestamp, &envelope.msg_id);
                     self.storage
                         .put_cf(schema::cf::NEWS_FEED, &key, &[])?;
+                    self.storage
+                        .increment_stat(schema::state_keys::TOTAL_NEWS_MESSAGES)?;
                 }
             }
             MessageType::ChannelAddModerator => {

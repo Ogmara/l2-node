@@ -677,6 +677,42 @@ impl Storage {
             )?;
         }
 
+        // Count news messages (from NEWS_FEED index)
+        let news_cf = self.db.cf_handle(cf::NEWS_FEED)
+            .context("NEWS_FEED cf not found")?;
+        let mut news_count = 0u64;
+        let mut iter = self.db.raw_iterator_cf(&news_cf);
+        iter.seek_to_first();
+        while iter.valid() {
+            news_count += 1;
+            iter.next();
+        }
+        if news_count > 0 {
+            self.put_cf(
+                cf::NODE_STATE,
+                super::schema::state_keys::TOTAL_NEWS_MESSAGES,
+                &news_count.to_be_bytes(),
+            )?;
+        }
+
+        // Count channel messages (from CHANNEL_MSGS index)
+        let ch_msg_cf = self.db.cf_handle(cf::CHANNEL_MSGS)
+            .context("CHANNEL_MSGS cf not found")?;
+        let mut ch_msg_count = 0u64;
+        let mut iter = self.db.raw_iterator_cf(&ch_msg_cf);
+        iter.seek_to_first();
+        while iter.valid() {
+            ch_msg_count += 1;
+            iter.next();
+        }
+        if ch_msg_count > 0 {
+            self.put_cf(
+                cf::NODE_STATE,
+                super::schema::state_keys::TOTAL_CHANNEL_MESSAGES,
+                &ch_msg_count.to_be_bytes(),
+            )?;
+        }
+
         // Count users
         let user_cf = self.db.cf_handle(cf::USERS)
             .context("USERS cf not found")?;
@@ -715,10 +751,19 @@ impl Storage {
 
         info!(
             messages = msg_count,
+            news_messages = news_count,
+            channel_messages = ch_msg_count,
             users = user_count,
             channels = ch_count,
             "Stat counters rebuilt from existing data"
         );
+
+        // Write sentinel so we don't rebuild on every startup
+        self.put_cf(
+            cf::NODE_STATE,
+            super::schema::state_keys::COUNTERS_V2,
+            &1u64.to_be_bytes(),
+        )?;
 
         Ok(())
     }

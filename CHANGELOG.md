@@ -5,6 +5,17 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] - 2026-03-31
+
+### Added
+
+- **Split message counters** — `total_news_messages` and `total_channel_messages`
+  fields in `/api/v1/network/stats` response, replacing the single combined
+  `total_messages` count (which is still available for backwards compatibility)
+- **Counter migration** — existing nodes automatically rebuild the new split
+  counters from NEWS_FEED and CHANNEL_MSGS indexes on first startup after
+  upgrade, with a `COUNTERS_V2` sentinel to prevent repeated rebuilds
+
 ## [0.5.0] - 2026-03-31
 
 ### Changed

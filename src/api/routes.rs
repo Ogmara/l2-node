@@ -45,6 +45,8 @@ pub struct StatsResponse {
     pub node_id: String,
     pub peers: u32,
     pub total_messages: u64,
+    pub total_news_messages: u64,
+    pub total_channel_messages: u64,
     pub total_channels: u64,
     pub total_users: u64,
     pub uptime_seconds: u64,
@@ -97,6 +99,8 @@ pub async fn network_stats(Extension(state): Extension<Arc<AppState>>) -> Json<S
     });
     use crate::storage::schema::state_keys;
     let total_messages = state.storage.get_stat(state_keys::TOTAL_MESSAGES).unwrap_or(0);
+    let total_news_messages = state.storage.get_stat(state_keys::TOTAL_NEWS_MESSAGES).unwrap_or(0);
+    let total_channel_messages = state.storage.get_stat(state_keys::TOTAL_CHANNEL_MESSAGES).unwrap_or(0);
     let total_users = state.storage.get_stat(state_keys::TOTAL_USERS).unwrap_or(0);
     let total_channels = state.storage.get_stat(state_keys::TOTAL_CHANNELS).unwrap_or(0);
 
@@ -104,6 +108,8 @@ pub async fn network_stats(Extension(state): Extension<Arc<AppState>>) -> Json<S
         node_id: state.node_id.clone(),
         peers: state.peer_count(),
         total_messages,
+        total_news_messages,
+        total_channel_messages,
         total_channels,
         total_users,
         uptime_seconds: uptime,
