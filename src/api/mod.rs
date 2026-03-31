@@ -98,7 +98,8 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
         .route(
             "/api/v1/channels/{channel_id}/pins",
             get(routes::get_channel_pins),
-        )
+        );
+
     // Authenticated routes (Klever wallet signature required)
     let auth_routes = Router::new()
         .route("/api/v1/messages", post(routes::post_message))
