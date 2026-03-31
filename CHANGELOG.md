@@ -5,6 +5,24 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.2] - 2026-03-31
+
+### Added
+- **Auto channel membership** — users are automatically added as channel
+  members when they send their first ChatMessage to a channel. Previously
+  member_count was always 0 because no join mechanism existed.
+- **ChannelCreate handler** — `update_indexes` now processes ChannelCreate
+  envelopes: stores channel metadata, adds creator as first member,
+  increments total_channels counter
+- **ChannelJoin/Leave handlers** — adds/removes members from the
+  CHANNEL_MEMBERS column family
+- **NewsComment indexing** — comments are now indexed in NEWS_COMMENTS
+  CF by (post_id, timestamp, msg_id) for future retrieval
+
+### Security
+- Channel member check uses `get_cf` before adding to prevent duplicate
+  entries (idempotent on repeated messages)
+
 ## [0.5.1] - 2026-03-31
 
 ### Added
