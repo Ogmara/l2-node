@@ -61,10 +61,8 @@ impl Node {
 
         // Rebuild stat counters if they're zero but data exists
         // (handles first upgrade from pre-stats versions)
-        let has_counters = storage.get_stat(state_keys::TOTAL_MESSAGES)? > 0
-            || storage.get_stat(state_keys::TOTAL_USERS)? > 0
-            || storage.get_stat(state_keys::TOTAL_CHANNELS)? > 0;
-        if !has_counters {
+        let has_v2_counters = storage.get_stat(state_keys::COUNTERS_V2)? > 0;
+        if !has_v2_counters {
             if let Err(e) = storage.rebuild_stat_counters() {
                 warn!(error = %e, "Failed to rebuild stat counters");
             }
