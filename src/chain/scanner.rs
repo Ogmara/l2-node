@@ -89,7 +89,6 @@ impl ChainScanner {
 
     /// Poll for new blocks since the last cursor position.
     async fn poll_blocks(&mut self) -> Result<()> {
-        // Get the latest block height from Klever
         let latest = self.get_latest_block_height().await?;
 
         if latest <= self.last_block {
@@ -102,19 +101,16 @@ impl ChainScanner {
             "Scanning blocks"
         );
 
-        // Process blocks in batches (don't try to fetch too many at once)
-        let batch_size = 10u64;
+        // Process blocks in batches — scan wide ranges per API call
+        let batch_size = 500u64;
         let mut current = self.last_block + 1;
 
         while current <= latest {
             let end = (current + batch_size - 1).min(latest);
 
-            for height in current..=end {
-                if let Err(e) = self.process_block(height).await {
-                    warn!(block = height, error = %e, "Failed to process block");
-                    // Don't advance cursor past failed block
-                    return Ok(());
-                }
+            if let Err(e) = self.process_block_range(current, end).await {
+                warn!(from = current, to = end, error = %e, "Failed to process block range");
+                return Ok(());
             }
 
             // Update cursor after successful batch
@@ -126,80 +122,117 @@ impl ChainScanner {
         Ok(())
     }
 
-    /// Get the latest block height from Klever RPC.
+    /// Get the latest block height from the Klever API.
+    ///
+    /// Uses the API block list endpoint (not the node status endpoint)
+    /// to avoid aggressive rate limiting on node.testnet.klever.org.
     async fn get_latest_block_height(&self) -> Result<u64> {
-        let url = format!("{}/node/status", self.config.node_url);
-        let resp: serde_json::Value = self
+        let url = format!("{}/v1.0/block/list?limit=1", self.config.api_url);
+
+        let response = self
             .http
             .get(&url)
             .send()
             .await
-            .context("fetching node status")?
-            .json()
-            .await
-            .context("parsing node status")?;
+            .context("fetching block list")?;
 
-        // Klever node status returns block height in data.chainStatistics.liveTxCount
-        // or data.chainStatistics.currentBlockNonce — exact path depends on API version
+        let status = response.status();
+        let text = response.text().await.context("reading block list body")?;
+
+        if !status.is_success() {
+            anyhow::bail!(
+                "block list HTTP {}: {}",
+                status,
+                &text[..text.len().min(200)]
+            );
+        }
+
+        let resp: serde_json::Value =
+            serde_json::from_str(&text).context("parsing block list JSON")?;
+
         let height = resp
-            .pointer("/data/chainStatistics/currentBlockNonce")
-            .or_else(|| resp.pointer("/data/overview/currentBlockNonce"))
+            .pointer("/data/blocks/0/nonce")
             .and_then(|v| v.as_u64())
-            .context("extracting block height from node status")?;
+            .context("extracting block height from API")?;
 
         Ok(height)
     }
 
-    /// Process a single block — fetch transactions and filter for Ogmara SC events.
-    async fn process_block(&self, height: u64) -> Result<()> {
+    /// Process a range of blocks — fetch transactions and filter for Ogmara SC events.
+    async fn process_block_range(&self, start: u64, end: u64) -> Result<()> {
         let url = format!(
-            "{}/transaction/list?status=success&page=1&limit=100&startBlock={}&endBlock={}",
-            self.config.api_url, height, height
+            "{}/v1.0/transaction/list?status=success&page=1&limit=100&startBlock={}&endBlock={}",
+            self.config.api_url, start, end
         );
 
-        let resp: serde_json::Value = self
+        let response = self
             .http
             .get(&url)
             .send()
             .await
-            .context("fetching block transactions")?
-            .json()
-            .await
-            .context("parsing block transactions")?;
+            .context("fetching block transactions")?;
+
+        let status = response.status();
+        let text = response.text().await.context("reading transactions body")?;
+
+        if !status.is_success() {
+            anyhow::bail!(
+                "transaction list HTTP {}: {}",
+                status,
+                &text[..text.len().min(200)]
+            );
+        }
+
+        let resp: serde_json::Value =
+            serde_json::from_str(&text).context("parsing block transactions JSON")?;
 
         // Extract transactions array
         let txs = match resp.pointer("/data/transactions") {
             Some(serde_json::Value::Array(arr)) => arr,
-            _ => return Ok(()), // No transactions in this block
+            _ => return Ok(()), // No transactions in this range
         };
 
         for tx_value in txs {
-            // Check if this transaction targets our contract
             let tx: KleverTransaction = match serde_json::from_value(tx_value.clone()) {
                 Ok(tx) => tx,
                 Err(_) => continue,
             };
 
-            // Filter for successful transactions with receipts
+            // Filter for successful SC invoke transactions targeting our contract
             if tx.status != "success" {
                 continue;
             }
 
-            for receipt in &tx.receipts {
-                // Only process receipts from our contract
-                if receipt.contract != self.config.contract_address {
-                    continue;
-                }
+            let contract_address = tx
+                .contract
+                .first()
+                .map(|c| c.parameter.address.as_str())
+                .unwrap_or("");
 
-                if let Some(event) = parser::parse_receipt(receipt) {
-                    if let Err(e) = self.handle_event(event).await {
-                        warn!(
-                            block = height,
-                            tx = %tx.hash,
-                            error = %e,
-                            "Failed to handle SC event"
-                        );
+            if contract_address != self.config.contract_address {
+                continue;
+            }
+
+            // Decode the SC function call from the data field
+            // data[0] is hex-encoded "functionName@arg1@arg2"
+            let call_data = match tx.data.first() {
+                Some(hex_data) => {
+                    match hex::decode(hex_data) {
+                        Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+                        Err(_) => continue,
                     }
+                }
+                None => continue,
+            };
+
+            if let Some(event) = parser::parse_sc_call(&call_data, &tx.sender, tx.timestamp) {
+                if let Err(e) = self.handle_event(event).await {
+                    warn!(
+                        block = start,
+                        tx = %tx.hash,
+                        error = %e,
+                        "Failed to handle SC event"
+                    );
                 }
             }
         }
@@ -253,12 +286,20 @@ impl ChainScanner {
             }
 
             ScEvent::ChannelCreated {
-                channel_id,
+                channel_id: _,
                 creator,
                 slug,
                 channel_type,
                 timestamp,
             } => {
+                // Resolve the actual channel_id from the SC via getChannelBySlug view query
+                let channel_id = match self.query_channel_id_by_slug(&slug).await {
+                    Ok(id) => id,
+                    Err(e) => {
+                        warn!(slug = %slug, error = %e, "Failed to resolve channel_id — skipping");
+                        return Ok(());
+                    }
+                };
                 // Only increment counter for genuinely new channels (idempotent on re-scan)
                 let is_new = !self.storage.exists_cf(cf::CHANNELS, &channel_id.to_be_bytes())?;
                 let record = ChannelRecord {
@@ -279,7 +320,7 @@ impl ChainScanner {
                         crate::storage::schema::state_keys::TOTAL_CHANNELS,
                     )?;
                 }
-                info!(channel_id, "Channel created (on-chain)");
+                info!(channel_id, slug = %record.slug, "Channel created (on-chain)");
             }
 
             ScEvent::ChannelTransferred {
@@ -372,7 +413,9 @@ impl ChainScanner {
                 debug!(block_height, "State anchor recorded");
             }
 
-            ScEvent::TipSent { sender, recipient, amount, .. } => {
+            ScEvent::TipSent {
+                sender, recipient, amount, ..
+            } => {
                 debug!(
                     sender = %sender,
                     recipient = %recipient,
@@ -384,5 +427,47 @@ impl ChainScanner {
         }
 
         Ok(())
+    }
+
+    /// Query the SC for a channel's ID by its slug via the VM hex endpoint.
+    async fn query_channel_id_by_slug(&self, slug: &str) -> Result<u64> {
+        let slug_hex = hex::encode(slug);
+        let url = format!("{}/vm/hex", self.config.node_url);
+
+        let body = serde_json::json!({
+            "scAddress": self.config.contract_address,
+            "funcName": "getChannelBySlug",
+            "args": [slug_hex]
+        });
+
+        let resp: serde_json::Value = self
+            .http
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .context("querying getChannelBySlug")?
+            .json()
+            .await
+            .context("parsing getChannelBySlug response")?;
+
+        let hex_data = resp
+            .pointer("/data/data")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        if hex_data.is_empty() {
+            anyhow::bail!("getChannelBySlug returned empty for slug '{}'", slug);
+        }
+
+        // Decode variable-length big-endian u64
+        let bytes = hex::decode(hex_data)
+            .context("decoding channel ID hex")?;
+        if bytes.len() > 8 {
+            anyhow::bail!("channel ID too large: {} bytes", bytes.len());
+        }
+        let mut padded = [0u8; 8];
+        padded[8 - bytes.len()..].copy_from_slice(&bytes);
+        Ok(u64::from_be_bytes(padded))
     }
 }

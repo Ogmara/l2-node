@@ -130,46 +130,48 @@ pub struct StateAnchorRecord {
     pub anchored_at: u64,
 }
 
-/// A Klever block with transaction data (simplified for scanning).
-#[derive(Debug, Clone, Deserialize)]
-pub struct KleverBlock {
-    #[serde(default)]
-    pub number: u64,
-    #[serde(default)]
-    pub timestamp: u64,
-    #[serde(default)]
-    pub transactions: Vec<KleverTransaction>,
-}
-
-/// A Klever transaction referencing the Ogmara contract.
+/// A Klever transaction from the API transaction list.
+///
+/// The Klever API returns SC calls with the function name and arguments
+/// hex-encoded in the `data` field, and the contract address in
+/// `contract[0].parameter.address`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct KleverTransaction {
     #[serde(default)]
     pub hash: String,
     #[serde(default)]
     pub sender: String,
-    #[serde(default, rename = "status")]
-    pub status: String,
-    /// Smart contract receipts containing events.
     #[serde(default)]
-    pub receipts: Vec<KleverReceipt>,
+    pub status: String,
+    #[serde(default, rename = "blockNum")]
+    pub block_num: u64,
+    #[serde(default)]
+    pub timestamp: u64,
+    /// SC call data: hex-encoded "functionName@arg1@arg2".
+    #[serde(default)]
+    pub data: Vec<String>,
+    /// Contract invocation details.
+    #[serde(default)]
+    pub contract: Vec<KleverContractCall>,
 }
 
-/// A receipt from a smart contract call containing event data.
+/// A contract call entry within a Klever transaction.
 #[derive(Debug, Clone, Deserialize)]
-pub struct KleverReceipt {
+pub struct KleverContractCall {
+    /// Transaction type (63 = SmartContract).
     #[serde(default, rename = "type")]
-    pub receipt_type: String,
-    /// Contract address that emitted this receipt.
+    pub tx_type: u32,
     #[serde(default)]
-    pub contract: String,
-    /// Event identifier (e.g., "userRegistered").
-    #[serde(default, rename = "eventIdentifier")]
-    pub event_identifier: String,
-    /// Event topics (indexed fields, hex-encoded).
+    pub parameter: KleverContractParam,
+}
+
+/// Parameters of a contract call.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct KleverContractParam {
+    /// Target contract address (klv1...).
     #[serde(default)]
-    pub topics: Vec<String>,
-    /// Event data (non-indexed fields, hex-encoded).
-    #[serde(default)]
-    pub data: Option<String>,
+    pub address: String,
+    /// "SCDeploy", "SCInvoke", etc.
+    #[serde(default, rename = "type")]
+    pub call_type: String,
 }

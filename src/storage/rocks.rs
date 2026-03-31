@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use rocksdb::{ColumnFamilyDescriptor, DBWithThreadMode, MultiThreaded, Options, WriteBatch};
+use rocksdb::{BoundColumnFamily, ColumnFamilyDescriptor, DBWithThreadMode, MultiThreaded, Options, WriteBatch};
 
 use super::schema::cf;
 
@@ -130,7 +130,7 @@ impl Storage {
     }
 
     /// Get a column family handle for use in WriteBatch operations.
-    pub fn cf_handle(&self, cf_name: &str) -> Result<&rocksdb::ColumnFamily> {
+    pub fn cf_handle(&self, cf_name: &str) -> Result<Arc<BoundColumnFamily<'_>>> {
         self.db
             .cf_handle(cf_name)
             .with_context(|| format!("column family '{}' not found", cf_name))
@@ -213,8 +213,8 @@ impl Storage {
         let new_count = self.get_stat(super::schema::state_keys::TOTAL_MESSAGES)? + 1;
 
         let mut batch = WriteBatch::default();
-        batch.put_cf(messages_cf, msg_id, envelope_bytes);
-        batch.put_cf(state_cf, super::schema::state_keys::TOTAL_MESSAGES, &new_count.to_be_bytes());
+        batch.put_cf(&messages_cf, msg_id, envelope_bytes);
+        batch.put_cf(&state_cf, super::schema::state_keys::TOTAL_MESSAGES, &new_count.to_be_bytes());
         self.write_batch(batch)
     }
 
@@ -292,18 +292,18 @@ impl Storage {
         let followers_cf = self.cf_handle(cf::FOLLOWERS)?;
         let counts_cf = self.cf_handle(cf::FOLLOWER_COUNTS)?;
 
-        batch.put_cf(follows_cf, &follow_key, &[]);
-        batch.put_cf(followers_cf, &reverse_key, &[]);
+        batch.put_cf(&follows_cf, &follow_key, &[]);
+        batch.put_cf(&followers_cf, &reverse_key, &[]);
 
         let mut bytes1 = Vec::with_capacity(16);
         bytes1.extend_from_slice(&following_count.to_be_bytes());
         bytes1.extend_from_slice(&follower_count.to_be_bytes());
-        batch.put_cf(counts_cf, follower.as_bytes(), &bytes1);
+        batch.put_cf(&counts_cf, follower.as_bytes(), &bytes1);
 
         let mut bytes2 = Vec::with_capacity(16);
         bytes2.extend_from_slice(&following_count2.to_be_bytes());
         bytes2.extend_from_slice(&follower_count2.to_be_bytes());
-        batch.put_cf(counts_cf, followed.as_bytes(), &bytes2);
+        batch.put_cf(&counts_cf, followed.as_bytes(), &bytes2);
 
         self.write_batch(batch)
     }
@@ -328,18 +328,18 @@ impl Storage {
         let followers_cf = self.cf_handle(cf::FOLLOWERS)?;
         let counts_cf = self.cf_handle(cf::FOLLOWER_COUNTS)?;
 
-        batch.delete_cf(follows_cf, &follow_key);
-        batch.delete_cf(followers_cf, &reverse_key);
+        batch.delete_cf(&follows_cf, &follow_key);
+        batch.delete_cf(&followers_cf, &reverse_key);
 
         let mut bytes1 = Vec::with_capacity(16);
         bytes1.extend_from_slice(&following_count.to_be_bytes());
         bytes1.extend_from_slice(&follower_count.to_be_bytes());
-        batch.put_cf(counts_cf, follower.as_bytes(), &bytes1);
+        batch.put_cf(&counts_cf, follower.as_bytes(), &bytes1);
 
         let mut bytes2 = Vec::with_capacity(16);
         bytes2.extend_from_slice(&following_count2.to_be_bytes());
         bytes2.extend_from_slice(&follower_count2.to_be_bytes());
-        batch.put_cf(counts_cf, followed.as_bytes(), &bytes2);
+        batch.put_cf(&counts_cf, followed.as_bytes(), &bytes2);
 
         self.write_batch(batch)
     }
@@ -429,16 +429,16 @@ impl Storage {
             if !exists {
                 return Ok(());
             }
-            batch.delete_cf(reactions_cf, &reaction_key);
+            batch.delete_cf(&reactions_cf, &reaction_key);
             let count = self.get_reaction_count(msg_id, emoji)?.saturating_sub(1);
-            batch.put_cf(counts_cf, &count_key, &count.to_be_bytes());
+            batch.put_cf(&counts_cf, &count_key, &count.to_be_bytes());
         } else {
             if exists {
                 return Ok(()); // already reacted
             }
-            batch.put_cf(reactions_cf, &reaction_key, &[]);
+            batch.put_cf(&reactions_cf, &reaction_key, &[]);
             let count = self.get_reaction_count(msg_id, emoji)? + 1;
-            batch.put_cf(counts_cf, &count_key, &count.to_be_bytes());
+            batch.put_cf(&counts_cf, &count_key, &count.to_be_bytes());
         }
         self.write_batch(batch)
     }
@@ -509,8 +509,8 @@ impl Storage {
         let reposts_cf = self.cf_handle(cf::REPOSTS)?;
         let counts_cf = self.cf_handle(cf::REPOST_COUNTS)?;
 
-        batch.put_cf(reposts_cf, &key, repost_msg_id);
-        batch.put_cf(counts_cf, original_id, &count.to_be_bytes());
+        batch.put_cf(&reposts_cf, &key, repost_msg_id);
+        batch.put_cf(&counts_cf, original_id, &count.to_be_bytes());
         self.write_batch(batch)
     }
 
@@ -540,8 +540,8 @@ impl Storage {
         let mut batch = WriteBatch::default();
         let bookmarks_cf = self.cf_handle(cf::BOOKMARKS)?;
         let state_cf = self.cf_handle(cf::NODE_STATE)?;
-        batch.put_cf(bookmarks_cf, &key, &[]);
-        batch.put_cf(state_cf, reverse_key.as_bytes(), &key);
+        batch.put_cf(&bookmarks_cf, &key, &[]);
+        batch.put_cf(&state_cf, reverse_key.as_bytes(), &key);
         self.write_batch(batch)
     }
 
@@ -557,8 +557,8 @@ impl Storage {
                 let mut batch = WriteBatch::default();
                 let bookmarks_cf = self.cf_handle(cf::BOOKMARKS)?;
                 let state_cf = self.cf_handle(cf::NODE_STATE)?;
-                batch.delete_cf(bookmarks_cf, &bookmark_key);
-                batch.delete_cf(state_cf, reverse_key.as_bytes());
+                batch.delete_cf(&bookmarks_cf, &bookmark_key);
+                batch.delete_cf(&state_cf, reverse_key.as_bytes());
                 self.write_batch(batch)?;
                 Ok(true)
             }

@@ -5,6 +5,36 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-03-31
+
+### Changed
+
+- **Chain scanner: batch block scanning** — scans 500 blocks per API call
+  instead of one-by-one, reducing API requests by 500x and avoiding Klever
+  testnet rate limits
+- **Chain scanner: use API for block height** — switched from
+  `node_url/node/status` (aggressive rate limiting) to
+  `api_url/v1.0/block/list?limit=1` for latest block height
+- **Chain scanner: parse SC calls from transaction data** — Klever API
+  receipts don't contain SC event identifiers. Rewrote scanner to match
+  transactions by `contract[0].parameter.address` and decode function
+  calls from the hex-encoded `data[0]` field (`functionName@arg1@arg2`)
+- **Parser rewrite** — `parse_receipt()` replaced with `parse_sc_call()`
+  that decodes SC function names and arguments directly from transaction
+  data instead of receipt topics
+- **Channel ID resolution** — `createChannel` events now resolved via
+  `getChannelBySlug` SC view query since the channel ID isn't in the
+  call data
+
+### Fixed
+
+- Missing semicolon after `public_routes` chain in API router setup
+- RocksDB `cf_handle` return type updated to `Arc<BoundColumnFamily>`
+  for compatibility with newer `rocksdb` crate versions
+- All `WriteBatch` operations now pass `&cf_handle` references correctly
+- `KleverTransaction` struct updated to match actual Klever API response
+  format (contract array with parameter.address, data array with hex calls)
+
 ## [0.4.0] - 2026-03-31
 
 ### Added
