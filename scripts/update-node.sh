@@ -74,7 +74,8 @@ VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
 log "Building ogmara-node v${VERSION} (${BUILD_PROFILE})..."
 
 # Build as repo user (owns the source and cargo cache)
-sudo -u "$REPO_USER" cargo build --release 2>&1 | tail -5
+# Source the Rust environment since cargo isn't in root's PATH
+sudo -u "$REPO_USER" bash -c 'source "$HOME/.cargo/env" && cargo build --release' 2>&1 | tail -5
 BUILD_EXIT=${PIPESTATUS[0]}
 
 if [[ $BUILD_EXIT -ne 0 ]]; then
