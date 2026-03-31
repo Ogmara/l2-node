@@ -87,7 +87,11 @@ BINARY="$REPO_DIR/target/${BUILD_PROFILE}/${BINARY_NAME}"
 
 log "Build successful: $(ls -lh "$BINARY" | awk '{print $5}')"
 
-# --- Step 3: Install ---
+# --- Step 3: Stop, install, restart ---
+# Must stop before overwriting — Linux returns "Text file busy" on running binaries
+log "Stopping ${SERVICE_NAME}..."
+systemctl stop "$SERVICE_NAME"
+
 # Save old binary for rollback
 if [[ -f "$INSTALL_PATH" ]]; then
     OLD_VERSION=$("$INSTALL_PATH" --version 2>/dev/null || echo "unknown")
@@ -101,9 +105,9 @@ chmod +x "$INSTALL_PATH"
 INSTALLED_VERSION=$("$INSTALL_PATH" --version 2>/dev/null || echo "v${VERSION}")
 log "Installed: ${INSTALLED_VERSION}"
 
-# --- Step 4: Restart ---
-log "Restarting ${SERVICE_NAME}..."
-systemctl restart "$SERVICE_NAME"
+# --- Step 4: Start ---
+log "Starting ${SERVICE_NAME}..."
+systemctl start "$SERVICE_NAME"
 
 # Wait briefly for startup
 sleep 2
