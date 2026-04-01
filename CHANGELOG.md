@@ -5,6 +5,15 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.4] - 2026-04-01
+
+### Added
+- **Channel read state** — new `CHANNEL_READ_STATE` column family stores
+  per-user per-channel read cursors (wall-clock timestamps).
+- `POST /api/v1/channels/{channel_id}/read` — mark channel as read.
+- `GET /api/v1/channels/unread` — get unread message counts per channel,
+  comparing envelope timestamps against the read cursor. Capped at 99.
+
 ## [0.6.3] - 2026-04-01
 
 ### Fixed
