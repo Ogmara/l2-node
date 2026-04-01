@@ -17,6 +17,24 @@ use crate::storage::schema::cf;
 use super::auth::AuthUser;
 use super::state::AppState;
 
+/// Convert an Envelope's byte-array fields (msg_id, payload, signature) to hex strings
+/// in the JSON representation. serde serializes [u8; 32] and Vec<u8> as number arrays,
+/// but the API should return hex strings for client consumption.
+fn envelope_to_json(envelope: &crate::messages::envelope::Envelope) -> serde_json::Value {
+    let mut val = serde_json::to_value(envelope).unwrap_or_default();
+    if let serde_json::Value::Object(ref mut map) = val {
+        // Convert msg_id from byte array to hex string
+        if let Some(serde_json::Value::Array(bytes)) = map.get("msg_id") {
+            let hex: String = bytes
+                .iter()
+                .filter_map(|b| b.as_u64().map(|n| format!("{:02x}", n as u8)))
+                .collect();
+            map.insert("msg_id".into(), serde_json::Value::String(hex));
+        }
+    }
+    val
+}
+
 // --- Query parameters ---
 
 #[derive(Debug, Deserialize)]
@@ -301,7 +319,7 @@ pub async fn get_channel_messages(
                             crate::messages::envelope::Envelope,
                         >(&envelope_bytes)
                         {
-                            messages.push(serde_json::to_value(&envelope).unwrap_or_default());
+                            messages.push(envelope_to_json(&envelope));
                         }
                     }
                 }
@@ -364,7 +382,7 @@ pub async fn list_news(
                             crate::messages::envelope::Envelope,
                         >(&envelope_bytes)
                         {
-                            let mut post = serde_json::to_value(&envelope).unwrap_or_default();
+                            let mut post = envelope_to_json(&envelope);
                             // Enrich with engagement counts per spec
                             if let serde_json::Value::Object(ref mut map) = post {
                                 let reactions = state.storage.get_news_reactions(&msg_id).unwrap_or_default();
@@ -707,7 +725,7 @@ pub async fn list_bookmarks(
                         crate::messages::envelope::Envelope,
                     >(&envelope_bytes)
                     {
-                        bookmarks.push(serde_json::to_value(&envelope).unwrap_or_default());
+                        bookmarks.push(envelope_to_json(&envelope));
                     }
                 }
             }
@@ -848,7 +866,7 @@ pub async fn get_channel_pins(
                         >(&envelope_bytes)
                         {
                             pinned_messages
-                                .push(serde_json::to_value(&envelope).unwrap_or_default());
+                                .push(envelope_to_json(&envelope));
                         }
                     }
                 }
