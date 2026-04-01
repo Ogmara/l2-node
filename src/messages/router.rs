@@ -988,6 +988,57 @@ impl MessageRouter {
                         .put_cf(schema::cf::NEWS_COMMENTS, &key, &[])?;
                 }
             }
+            MessageType::ProfileUpdate => {
+                if let Ok(payload) =
+                    rmp_serde::from_slice::<ProfileUpdatePayload>(&envelope.payload)
+                {
+                    let is_new = !self
+                        .storage
+                        .exists_cf(schema::cf::USERS, envelope.author.as_bytes())?;
+
+                    // Load existing user record or create a new one
+                    let mut record = match self
+                        .storage
+                        .get_cf(schema::cf::USERS, envelope.author.as_bytes())?
+                    {
+                        Some(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)
+                            .unwrap_or_else(|_| serde_json::json!({})),
+                        None => serde_json::json!({
+                            "address": envelope.author,
+                            "public_key": "",
+                            "registered_at": envelope.timestamp,
+                        }),
+                    };
+
+                    // Merge profile fields
+                    if let serde_json::Value::Object(ref mut map) = record {
+                        if let Some(name) = &payload.display_name {
+                            map.insert("display_name".into(), serde_json::json!(name));
+                        }
+                        if let Some(avatar) = &payload.avatar_cid {
+                            map.insert("avatar_cid".into(), serde_json::json!(avatar));
+                        }
+                        if let Some(bio) = &payload.bio {
+                            map.insert("bio".into(), serde_json::json!(bio));
+                        }
+                    }
+
+                    let bytes = serde_json::to_vec(&record)
+                        .context("serializing user record")?;
+                    self.storage.put_cf(
+                        schema::cf::USERS,
+                        envelope.author.as_bytes(),
+                        &bytes,
+                    )?;
+
+                    if is_new {
+                        self.storage
+                            .increment_stat(schema::state_keys::TOTAL_USERS)?;
+                    }
+
+                    tracing::info!(address = %envelope.author, "Profile updated");
+                }
+            }
             _ => {}
         }
 
