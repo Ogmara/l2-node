@@ -7,7 +7,12 @@
 //!
 //! Auth string: "ogmara-auth:{timestamp}:{method}:{path}"
 //! Signed using Klever message signing format (protocol spec 4.1.1).
+//!
+//! After signature verification, the middleware resolves the signing address
+//! (device key) to its owning wallet address via the IdentityResolver.
+//! If no mapping exists, the signing address IS the wallet (built-in wallet mode).
 
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::Request;
@@ -18,19 +23,34 @@ use axum::response::{IntoResponse, Response};
 use crate::crypto;
 use crate::crypto::signing;
 
+use super::state::AppState;
+
 /// Maximum age for an auth header timestamp (60 seconds).
 const MAX_AUTH_AGE_MS: u64 = 60_000;
 
-/// Authenticated user info extracted from headers.
+/// Authenticated user info extracted from headers and identity resolution.
 #[derive(Debug, Clone)]
 pub struct AuthUser {
-    /// Klever address of the authenticated user.
+    /// Resolved wallet address — the user's on-chain identity.
+    /// All storage/indexing uses this address.
     pub address: String,
+    /// The device key address that signed this request (klv1...).
+    /// May be the same as `address` for built-in wallets.
+    pub signing_address: String,
 }
 
-/// Axum middleware that verifies Klever wallet signature auth headers.
+/// Axum middleware that verifies Klever wallet signature auth headers
+/// and resolves the signing device to its owning wallet.
 pub async fn auth_middleware(mut req: Request, next: Next) -> Response {
-    match extract_and_verify(&req) {
+    // Extract AppState for identity resolution
+    let app_state = match req.extensions().get::<Arc<AppState>>() {
+        Some(state) => state.clone(),
+        None => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "missing app state").into_response();
+        }
+    };
+
+    match extract_and_verify(&req, &app_state) {
         Ok(user) => {
             req.extensions_mut().insert(user);
             next.run(req).await
@@ -39,8 +59,8 @@ pub async fn auth_middleware(mut req: Request, next: Next) -> Response {
     }
 }
 
-/// Extract and verify auth headers from the request.
-fn extract_and_verify(req: &Request) -> Result<AuthUser, String> {
+/// Extract and verify auth headers, then resolve device → wallet.
+fn extract_and_verify(req: &Request, app_state: &AppState) -> Result<AuthUser, String> {
     let headers = req.headers();
 
     // Extract required headers
@@ -96,9 +116,9 @@ fn extract_and_verify(req: &Request) -> Result<AuthUser, String> {
 
     // Resolve the verifying key from the Klever address
     let verifying_key = crypto::address_to_verifying_key(address)
-        .map_err(|e| format!("invalid address: {}", e))?;
+        .map_err(|_| "invalid address".to_string())?;
 
-    // Build the auth string and verify
+    // Build the auth string and verify signature against the device key
     let method = req.method().as_str();
     let path = req.uri().path();
 
@@ -115,7 +135,23 @@ fn extract_and_verify(req: &Request) -> Result<AuthUser, String> {
             "signature verification failed".to_string()
         })?;
 
+    // Resolve device address → wallet address.
+    // If no mapping exists, the signing address IS the wallet (built-in wallet mode).
+    let signing_address = address.to_string();
+    let resolved_address = app_state
+        .identity
+        .resolve(address)
+        .map_err(|e| {
+            tracing::error!(
+                signing_address = %address,
+                error = %e,
+                "Identity resolution failed"
+            );
+            "identity resolution error".to_string()
+        })?;
+
     Ok(AuthUser {
-        address: address.to_string(),
+        address: resolved_address,
+        signing_address,
     })
 }

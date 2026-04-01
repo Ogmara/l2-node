@@ -22,6 +22,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
 use crate::messages::router::{MessageRouter, RouteResult};
+use crate::storage::identity::IdentityResolver;
 use crate::storage::rocks::Storage;
 
 use self::behaviour::{OgmaraBehaviour, OgmaraBehaviourEvent};
@@ -44,6 +45,7 @@ impl NetworkService {
     pub async fn new(
         config: &Config,
         storage: Storage,
+        identity: IdentityResolver,
         keypair: libp2p::identity::Keypair,
     ) -> Result<Self> {
         let mut swarm = behaviour::build_swarm(config, keypair)
@@ -97,8 +99,8 @@ impl NetworkService {
         let mut topics = TopicManager::new();
         topics.subscribe_defaults(&mut swarm);
 
-        // Create message router with rate limiting
-        let router = MessageRouter::new(storage.clone(), config.api.rate_limit_per_ip);
+        // Create message router with rate limiting and identity resolution
+        let router = MessageRouter::new(storage.clone(), identity, config.api.rate_limit_per_ip);
 
         Ok(Self {
             swarm,

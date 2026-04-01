@@ -7,6 +7,7 @@ use tokio::sync::broadcast;
 
 use crate::ipfs::client::IpfsClient;
 use crate::messages::router::MessageRouter;
+use crate::storage::identity::IdentityResolver;
 use crate::storage::rocks::Storage;
 
 /// Shared state accessible to all API handlers.
@@ -29,6 +30,8 @@ pub struct AppState {
     pub contract_address: String,
     /// IPFS client for media upload/retrieval (None if IPFS not configured).
     pub ipfs: Option<IpfsClient>,
+    /// Device-to-wallet identity resolver (cached lookups).
+    pub identity: IdentityResolver,
 }
 
 impl AppState {
@@ -39,6 +42,7 @@ impl AppState {
         klever_network: String,
         contract_address: String,
         ipfs: Option<IpfsClient>,
+        identity: IdentityResolver,
     ) -> Self {
         let (ws_broadcast, _) = broadcast::channel(1024);
         Self {
@@ -51,6 +55,7 @@ impl AppState {
             klever_network,
             contract_address,
             ipfs,
+            identity,
         }
     }
 

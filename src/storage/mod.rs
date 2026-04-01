@@ -2,5 +2,6 @@
 //!
 //! Uses column families (spec 3.5) for efficient namespaced key-value storage.
 
+pub mod identity;
 pub mod rocks;
 pub mod schema;

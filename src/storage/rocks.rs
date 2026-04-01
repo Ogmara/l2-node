@@ -10,10 +10,28 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use rocksdb::{BoundColumnFamily, ColumnFamilyDescriptor, DBWithThreadMode, MultiThreaded, Options, WriteBatch};
 
-use super::schema::cf;
+use super::schema::{cf, encode_wallet_device_key};
 
 /// Type alias for the multi-threaded RocksDB instance.
 pub type RocksDb = DBWithThreadMode<MultiThreaded>;
+
+/// A device registration claim proving a wallet authorized a device key.
+///
+/// The wallet signs a claim string binding the device to the wallet address.
+/// Claim format: `"ogmara-device-claim:{device_pubkey_hex}:{wallet_address}:{timestamp}"`
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DeviceClaim {
+    /// The device's klv1... address (derived from device Ed25519 key).
+    pub device_address: String,
+    /// The wallet's klv1... address that authorized this device.
+    pub wallet_address: String,
+    /// Hex-encoded device public key (used in the claim string).
+    pub device_pubkey_hex: String,
+    /// Wallet signature over the claim string (hex-encoded).
+    pub wallet_signature: String,
+    /// Unix timestamp (ms) when the claim was created.
+    pub registered_at: u64,
+}
 
 /// Anchor verification status for a node.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -954,6 +972,102 @@ impl Storage {
             total_anchors: total,
             anchoring_since: earliest_ts,
         })
+    }
+
+    // --- Device-to-Wallet Identity Mapping ---
+
+    /// Register a device key as belonging to a wallet.
+    ///
+    /// Atomically writes both the forward map (device → wallet) and the reverse
+    /// index (wallet+device → claim). Idempotent: re-registering the same
+    /// device-wallet pair updates the claim in place.
+    pub fn register_device(&self, claim: &DeviceClaim) -> Result<()> {
+        let claim_bytes = rmp_serde::to_vec(claim)
+            .context("serializing DeviceClaim")?;
+
+        let device_key = claim.device_address.as_bytes();
+        let wallet_device_key =
+            encode_wallet_device_key(&claim.wallet_address, &claim.device_address);
+
+        let map_cf = self.cf_handle(cf::DEVICE_WALLET_MAP)?;
+        let devices_cf = self.cf_handle(cf::WALLET_DEVICES)?;
+
+        let mut batch = WriteBatch::default();
+        // Forward: device_address → wallet_address
+        batch.put_cf(&map_cf, device_key, claim.wallet_address.as_bytes());
+        // Reverse: (wallet_address, 0xFF, device_address) → DeviceClaim
+        batch.put_cf(&devices_cf, &wallet_device_key, &claim_bytes);
+        self.write_batch(batch)
+    }
+
+    /// Revoke a device registration.
+    ///
+    /// Removes both the forward and reverse mappings. Returns `true` if the
+    /// device was registered (and is now removed), `false` if it wasn't found.
+    ///
+    /// Note: the read-then-delete is not fully atomic (TOCTOU). The API layer
+    /// (Phase 3) serializes revocations per wallet via auth, making concurrent
+    /// register+revoke for the same device by different wallets impossible.
+    pub fn revoke_device(&self, device_address: &str, wallet_address: &str) -> Result<bool> {
+        let device_key = device_address.as_bytes();
+        // Verify this device is actually mapped to this wallet
+        match self.get_cf(cf::DEVICE_WALLET_MAP, device_key)? {
+            Some(stored_wallet) => {
+                if stored_wallet != wallet_address.as_bytes() {
+                    return Ok(false); // device belongs to a different wallet
+                }
+            }
+            None => return Ok(false), // device not registered
+        }
+
+        let wallet_device_key = encode_wallet_device_key(wallet_address, device_address);
+
+        let map_cf = self.cf_handle(cf::DEVICE_WALLET_MAP)?;
+        let devices_cf = self.cf_handle(cf::WALLET_DEVICES)?;
+
+        let mut batch = WriteBatch::default();
+        batch.delete_cf(&map_cf, device_key);
+        batch.delete_cf(&devices_cf, &wallet_device_key);
+        self.write_batch(batch)?;
+        Ok(true)
+    }
+
+    /// Resolve a device address to its owning wallet address.
+    ///
+    /// Returns `None` if no mapping exists (device key IS the wallet in
+    /// built-in wallet mode — caller handles fallback).
+    pub fn resolve_wallet(&self, device_address: &str) -> Result<Option<String>> {
+        match self.get_cf(cf::DEVICE_WALLET_MAP, device_address.as_bytes())? {
+            Some(bytes) => {
+                let wallet = String::from_utf8(bytes)
+                    .context("invalid UTF-8 in stored wallet address")?;
+                Ok(Some(wallet))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// List all devices registered to a wallet address.
+    ///
+    /// Returns the stored `DeviceClaim` for each device, ordered by key.
+    pub fn list_devices(&self, wallet_address: &str) -> Result<Vec<DeviceClaim>> {
+        let prefix = {
+            let mut p = Vec::with_capacity(wallet_address.len() + 1);
+            p.extend_from_slice(wallet_address.as_bytes());
+            p.push(0xFF);
+            p
+        };
+
+        let entries = self.prefix_iter_cf(cf::WALLET_DEVICES, &prefix, 50)?;
+        let mut claims = Vec::with_capacity(entries.len());
+
+        for (_key, value) in entries {
+            let claim: DeviceClaim = rmp_serde::from_slice(&value)
+                .context("deserializing DeviceClaim")?;
+            claims.push(claim);
+        }
+
+        Ok(claims)
     }
 }
 
