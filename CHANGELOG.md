@@ -5,6 +5,15 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.1] - 2026-04-01
+
+### Added
+- **GET /api/v1/news/{msg_id}** — single news post endpoint returning the
+  full post with engagement counts and a list of comments, enabling the
+  web app's thread view.
+- `comment_count` field in the `GET /api/v1/news` list response, allowing
+  the feed to show how many comments each post has.
+
 ## [0.6.0] - 2026-04-01
 
 ### Added
