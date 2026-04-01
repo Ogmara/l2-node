@@ -103,7 +103,17 @@ fn extract_and_verify(req: &Request) -> Result<AuthUser, String> {
     let path = req.uri().path();
 
     signing::verify_auth_header(&verifying_key, timestamp, method, path, &signature)
-        .map_err(|_| "signature verification failed")?;
+        .map_err(|e| {
+            tracing::warn!(
+                address = %address,
+                method = %method,
+                path = %path,
+                timestamp = %timestamp,
+                error = %e,
+                "Auth signature verification failed"
+            );
+            "signature verification failed".to_string()
+        })?;
 
     Ok(AuthUser {
         address: address.to_string(),
