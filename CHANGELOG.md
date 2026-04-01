@@ -5,6 +5,39 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-04-01
+
+### Added
+- **Device-to-wallet identity mapping** (Phase 1: storage layer) — enables
+  multi-device support where multiple device keys map to a single wallet address.
+  New `DEVICE_WALLET_MAP` and `WALLET_DEVICES` column families in RocksDB.
+  Storage methods: `register_device`, `revoke_device`, `resolve_wallet`, `list_devices`.
+- **IdentityResolver** — in-memory DashMap cache backed by RocksDB for O(1)
+  device→wallet resolution on hot paths. Bounded positive-only caching (50K max),
+  cache warming at startup, structured logging for data corruption detection.
+- 7 unit tests covering registration, resolution, revocation, multi-device,
+  cache warming, and idempotent registration.
+- **Auth middleware identity resolution** (Phase 2) — after signature verification,
+  the middleware resolves device key → wallet address via IdentityResolver.
+  `AuthUser` now has `address` (resolved wallet) and `signing_address` (device key).
+  Fallback: if no mapping, device key IS the wallet (built-in wallet mode).
+  Identity resolver warmed on node startup.
+- **Device registration API** (Phase 3) — three new authenticated endpoints:
+  `POST /api/v1/devices/register` (wallet-signed claim verification, max 10
+  devices per wallet, caller binding), `DELETE /api/v1/devices/{device_address}`
+  (wallet-owned revocation, sibling devices can manage each other),
+  `GET /api/v1/devices` (list registered devices for authenticated wallet).
+- **Message router identity resolution** (Phase 4) — after signature verification,
+  `envelope.author` (device key) is resolved to wallet address via IdentityResolver.
+  All storage/indexing, rate limiting, ban checks, and authorization use the
+  resolved wallet identity. Signature verification still uses the device key.
+
+### Fixed
+- Ban expiration check now uses server wall-clock time instead of sender's
+  claimed timestamp (prevents ban evasion via timestamp manipulation).
+- Removed duplicate `NewsComment` match arm in `update_indexes`.
+- Rate limiter counter uses `saturating_add` to prevent u32 overflow.
+
 ## [0.5.8] - 2026-04-01
 
 ### Changed

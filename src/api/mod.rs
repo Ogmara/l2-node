@@ -154,6 +154,13 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
             post(routes::invite_user),
         )
         .route("/api/v1/media/upload", post(routes::upload_media))
+        // Device identity management
+        .route("/api/v1/devices/register", post(routes::register_device))
+        .route(
+            "/api/v1/devices/{device_address}",
+            delete(routes::revoke_device),
+        )
+        .route("/api/v1/devices", get(routes::list_devices))
         .layer(middleware::from_fn(auth::auth_middleware));
 
     // WebSocket routes

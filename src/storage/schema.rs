@@ -72,6 +72,13 @@ pub mod cf {
     /// (post_id, timestamp, msg_id) → () — comments indexed by parent news post
     pub const NEWS_COMMENTS: &str = "news_comments";
 
+    // --- Device-to-Wallet Identity Mapping ---
+
+    /// device_address → wallet_address — resolves device key to owning wallet
+    pub const DEVICE_WALLET_MAP: &str = "device_wallet_map";
+    /// (wallet_address, 0xFF, device_address) → DeviceClaim (serialized) — wallet's registered devices
+    pub const WALLET_DEVICES: &str = "wallet_devices";
+
     /// All column family names for database initialization.
     pub const ALL: &[&str] = &[
         MESSAGES,
@@ -103,6 +110,8 @@ pub mod cf {
         CHANNEL_INVITES,
         ANCHOR_BY_NODE,
         NEWS_COMMENTS,
+        DEVICE_WALLET_MAP,
+        WALLET_DEVICES,
     ];
 }
 
@@ -314,5 +323,18 @@ pub fn encode_news_comment_key(post_id: &[u8; 32], timestamp: u64, msg_id: &[u8;
     key.extend_from_slice(post_id);
     key.extend_from_slice(&timestamp.to_be_bytes());
     key.extend_from_slice(msg_id);
+    key
+}
+
+// --- Device-to-Wallet Identity Mapping key encoding ---
+
+/// Encode a wallet devices key: (wallet_address, 0xFF, device_address).
+///
+/// Prefix iteration on wallet_address bytes returns all devices for that wallet.
+pub fn encode_wallet_device_key(wallet_address: &str, device_address: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(wallet_address.len() + 1 + device_address.len());
+    key.extend_from_slice(wallet_address.as_bytes());
+    key.push(0xFF); // separator
+    key.extend_from_slice(device_address.as_bytes());
     key
 }

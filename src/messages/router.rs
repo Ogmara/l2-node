@@ -21,6 +21,7 @@ use tracing::{debug, warn};
 
 use crate::crypto;
 use crate::crypto::signing;
+use crate::storage::identity::IdentityResolver;
 use crate::storage::rocks::Storage;
 use crate::storage::schema;
 use ed25519_dalek;
@@ -90,6 +91,8 @@ impl RateCategory {
 /// The message router processes incoming messages through the full pipeline.
 pub struct MessageRouter {
     storage: Storage,
+    /// Device-to-wallet identity resolver.
+    identity: IdentityResolver,
     /// Per-user, per-category rate limit counters: "(address:category)" → entry.
     rate_limits: DashMap<String, RateLimitEntry>,
 }
@@ -109,9 +112,10 @@ pub enum RouteResult {
 }
 
 impl MessageRouter {
-    pub fn new(storage: Storage, _rate_limit_per_minute: u32) -> Self {
+    pub fn new(storage: Storage, identity: IdentityResolver, _rate_limit_per_minute: u32) -> Self {
         Self {
             storage,
+            identity,
             rate_limits: DashMap::new(),
         }
     }
@@ -144,10 +148,19 @@ impl MessageRouter {
             return RouteResult::Rejected(format!("invalid msg_id: {}", e));
         }
 
-        // Step 4b: Verify Ed25519 signature
+        // Step 4b: Verify Ed25519 signature (against device/signing key)
         if let Err(e) = self.verify_signature(&envelope) {
             return RouteResult::Rejected(format!("signature verification failed: {}", e));
         }
+
+        // Step 4c: Resolve device key → wallet address for all subsequent operations.
+        // Signature verification used envelope.author (device key) directly.
+        // From here on, `resolved_author` is the wallet identity used for
+        // storage, indexing, rate limiting, and authorization.
+        let resolved_author = match self.identity.resolve(&envelope.author) {
+            Ok(addr) => addr,
+            Err(e) => return RouteResult::Rejected(format!("identity resolution failed: {}", e)),
+        };
 
         // Step 5: Verify timestamp (±5 min drift)
         let now_ms = SystemTime::now()
@@ -162,26 +175,26 @@ impl MessageRouter {
             ));
         }
 
-        // Step 6: Check per-action-type rate limits (spec Part 5)
+        // Step 6: Rate limit by wallet address (not device key)
         if envelope.msg_type.requires_registration() {
             let category = RateCategory::from_msg_type(envelope.msg_type);
-            if self.is_rate_limited(&envelope.author, category, now_ms) {
+            if self.is_rate_limited(&resolved_author, category, now_ms) {
                 return RouteResult::Rejected(format!("rate limited ({:?})", category));
             }
         }
 
-        // Step 7: Validate payload (type-specific rules)
-        if let Err(e) = self.validate_payload(&envelope) {
+        // Step 7: Validate payload (type-specific rules — uses resolved author)
+        if let Err(e) = self.validate_payload(&envelope, &resolved_author) {
             return RouteResult::Rejected(format!("payload validation failed: {}", e));
         }
 
         // Step 7b: Check ban enforcement — banned users cannot post to channels
-        if let Err(e) = self.check_channel_ban(&envelope) {
+        if let Err(e) = self.check_channel_ban(&envelope, &resolved_author) {
             return RouteResult::Rejected(format!("banned: {}", e));
         }
 
         // Step 7c: Authorize channel admin operations
-        if let Err(e) = self.authorize_channel_action(&envelope) {
+        if let Err(e) = self.authorize_channel_action(&envelope, &resolved_author) {
             return RouteResult::Rejected(format!("unauthorized: {}", e));
         }
 
@@ -190,15 +203,16 @@ impl MessageRouter {
             return RouteResult::Rejected(format!("storage error: {}", e));
         }
 
-        // Step 8b: Update indexes based on message type
-        if let Err(e) = self.update_indexes(&envelope) {
+        // Step 8b: Update indexes using resolved wallet address
+        if let Err(e) = self.update_indexes(&envelope, &resolved_author) {
             warn!(error = %e, "Failed to update indexes (message still stored)");
         }
 
         debug!(
             msg_id = %hex::encode(envelope.msg_id),
             msg_type = ?envelope.msg_type,
-            author = %envelope.author,
+            signing_key = %envelope.author,
+            author = %resolved_author,
             "Message routed successfully"
         );
 
@@ -292,7 +306,7 @@ impl MessageRouter {
             entry.window_start = now_ms;
         }
 
-        entry.count += 1;
+        entry.count = entry.count.saturating_add(1);
         entry.count > max_count
     }
 
@@ -311,7 +325,7 @@ impl MessageRouter {
     }
 
     /// Validate the payload based on message type.
-    fn validate_payload(&self, envelope: &Envelope) -> Result<(), validation::ValidationError> {
+    fn validate_payload(&self, envelope: &Envelope, resolved_author: &str) -> Result<(), validation::ValidationError> {
         match deserialize_payload(envelope.msg_type, &envelope.payload) {
             Ok(payload) => match payload {
                 DeserializedPayload::ChatMessage(ref p) => validation::validate_chat_message(p),
@@ -327,10 +341,10 @@ impl MessageRouter {
                     validation::validate_device_delegation(p)
                 }
                 DeserializedPayload::Follow(ref p) => {
-                    validation::validate_follow(&envelope.author, p)
+                    validation::validate_follow(resolved_author, p)
                 }
                 DeserializedPayload::Unfollow(ref p) => {
-                    validation::validate_unfollow(&envelope.author, p)
+                    validation::validate_unfollow(resolved_author, p)
                 }
                 DeserializedPayload::ChannelAddModerator(ref p) => {
                     validation::validate_channel_add_moderator(p)
@@ -357,7 +371,7 @@ impl MessageRouter {
                     validation::validate_channel_invite(p)
                 }
                 DeserializedPayload::NewsRepost(ref p) => {
-                    validation::validate_news_repost(&envelope.author, p)
+                    validation::validate_news_repost(resolved_author, p)
                 }
                 DeserializedPayload::ContentRequest(ref p) => {
                     validation::validate_content_request(p)
@@ -375,13 +389,13 @@ impl MessageRouter {
     /// Check if the author is banned from the target channel.
     /// Rejects channel-scoped messages from banned users.
     /// Also enforces ban expiration: expired bans are cleaned up on read.
-    fn check_channel_ban(&self, envelope: &Envelope) -> Result<(), String> {
+    fn check_channel_ban(&self, envelope: &Envelope, resolved_author: &str) -> Result<(), String> {
         let channel_id = match self.extract_channel_id(envelope) {
             Some(id) => id,
             None => return Ok(()), // not a channel-scoped message
         };
 
-        let ban_key = schema::encode_channel_ban_key(channel_id, &envelope.author);
+        let ban_key = schema::encode_channel_ban_key(channel_id, resolved_author);
         match self.storage.get_cf(schema::cf::CHANNEL_BANS, &ban_key) {
             Ok(Some(data)) => {
                 // Check if ban has expired
@@ -393,7 +407,10 @@ impl MessageRouter {
                         let banned_at = record.get("banned_at")
                             .and_then(|v| v.as_u64())
                             .unwrap_or(0);
-                        let now_ms = envelope.timestamp;
+                        let now_ms = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64;
                         let elapsed_secs = (now_ms.saturating_sub(banned_at)) / 1000;
                         if elapsed_secs >= duration {
                             // Ban expired — clean up and allow
@@ -410,18 +427,19 @@ impl MessageRouter {
 
     /// Authorize channel admin operations per spec section 2.6.
     /// Verifies the sender has the required role/permissions.
-    fn authorize_channel_action(&self, envelope: &Envelope) -> Result<(), String> {
+    /// Uses `resolved_author` (wallet address) for all permission checks.
+    fn authorize_channel_action(&self, envelope: &Envelope, resolved_author: &str) -> Result<(), String> {
         match envelope.msg_type {
             // Creator-only actions
             MessageType::ChannelAddModerator | MessageType::ChannelRemoveModerator => {
                 let channel_id = self.extract_channel_id(envelope).unwrap_or(0);
-                if !self.is_channel_creator(channel_id, &envelope.author)? {
+                if !self.is_channel_creator(channel_id, resolved_author)? {
                     return Err("only the channel creator can manage moderators".into());
                 }
                 // Cannot remove self (creator)
                 if envelope.msg_type == MessageType::ChannelRemoveModerator {
                     if let Ok(p) = rmp_serde::from_slice::<ChannelRemoveModeratorPayload>(&envelope.payload) {
-                        if p.target_user == envelope.author {
+                        if p.target_user == resolved_author {
                             return Err("cannot remove yourself as moderator".into());
                         }
                     }
@@ -437,7 +455,7 @@ impl MessageRouter {
                         return Err("cannot kick the channel creator".into());
                     }
                 }
-                self.require_mod_permission(channel_id, &envelope.author, "can_kick")
+                self.require_mod_permission(channel_id, resolved_author, "can_kick")
             }
             // Creator + mods with can_ban
             MessageType::ChannelBan => {
@@ -447,24 +465,24 @@ impl MessageRouter {
                         return Err("cannot ban the channel creator".into());
                     }
                 }
-                self.require_mod_permission(channel_id, &envelope.author, "can_ban")
+                self.require_mod_permission(channel_id, resolved_author, "can_ban")
             }
             MessageType::ChannelUnban => {
                 let channel_id = self.extract_channel_id(envelope).unwrap_or(0);
-                self.require_mod_permission(channel_id, &envelope.author, "can_ban")
+                self.require_mod_permission(channel_id, resolved_author, "can_ban")
             }
             // Creator + mods with can_pin
             MessageType::ChannelPinMessage | MessageType::ChannelUnpinMessage => {
                 let channel_id = self.extract_channel_id(envelope).unwrap_or(0);
-                self.require_mod_permission(channel_id, &envelope.author, "can_pin")
+                self.require_mod_permission(channel_id, resolved_author, "can_pin")
             }
             // Creator + any moderator
             MessageType::ChannelInvite => {
                 let channel_id = self.extract_channel_id(envelope).unwrap_or(0);
-                if self.is_channel_creator(channel_id, &envelope.author)? {
+                if self.is_channel_creator(channel_id, resolved_author)? {
                     return Ok(());
                 }
-                if self.storage.is_channel_moderator(channel_id, &envelope.author)
+                if self.storage.is_channel_moderator(channel_id, resolved_author)
                     .unwrap_or(false)
                 {
                     return Ok(());
@@ -633,7 +651,7 @@ impl MessageRouter {
     }
 
     /// Update storage indexes based on message type.
-    fn update_indexes(&self, envelope: &Envelope) -> Result<()> {
+    fn update_indexes(&self, envelope: &Envelope, resolved_author: &str) -> Result<()> {
         match envelope.msg_type {
             MessageType::ChatMessage => {
                 if let Ok(payload) =
@@ -652,7 +670,7 @@ impl MessageRouter {
                     // Auto-add author as channel member on first message
                     let _ = self.add_channel_member(
                         payload.channel_id,
-                        &envelope.author,
+                        resolved_author,
                         envelope.timestamp,
                         "member",
                     );
@@ -679,9 +697,9 @@ impl MessageRouter {
                 self.storage
                     .increment_stat(schema::state_keys::TOTAL_NEWS_MESSAGES)?;
 
-                // Index by author
+                // Index by author (resolved wallet address)
                 let author_key = schema::encode_news_by_author_key(
-                    &envelope.author,
+                    resolved_author,
                     envelope.timestamp,
                     &envelope.msg_id,
                 );
@@ -707,14 +725,14 @@ impl MessageRouter {
                 if let Ok(payload) =
                     rmp_serde::from_slice::<FollowPayload>(&envelope.payload)
                 {
-                    self.storage.follow(&envelope.author, &payload.target)?;
+                    self.storage.follow(resolved_author, &payload.target)?;
                 }
             }
             MessageType::Unfollow => {
                 if let Ok(payload) =
                     rmp_serde::from_slice::<UnfollowPayload>(&envelope.payload)
                 {
-                    self.storage.unfollow(&envelope.author, &payload.target)?;
+                    self.storage.unfollow(resolved_author, &payload.target)?;
                 }
             }
             MessageType::ChannelCreate => {
@@ -726,7 +744,7 @@ impl MessageRouter {
                         "channel_id": payload.channel_id,
                         "slug": payload.slug,
                         "channel_type": payload.channel_type,
-                        "creator": envelope.author,
+                        "creator": resolved_author,
                         "created_at": envelope.timestamp,
                         "display_name": payload.display_name,
                         "description": payload.description,
@@ -745,7 +763,7 @@ impl MessageRouter {
                     // Add creator as first member (increments member_count to 1)
                     let _ = self.add_channel_member(
                         payload.channel_id,
-                        &envelope.author,
+                        resolved_author,
                         envelope.timestamp,
                         "creator",
                     );
@@ -758,7 +776,7 @@ impl MessageRouter {
                     // Validates channel exists and is idempotent (skips if already member)
                     let _ = self.add_channel_member(
                         payload.channel_id,
-                        &envelope.author,
+                        resolved_author,
                         envelope.timestamp,
                         "member",
                     );
@@ -774,7 +792,7 @@ impl MessageRouter {
                 if let Ok(payload) =
                     rmp_serde::from_slice::<ChannelLeavePayload>(&envelope.payload)
                 {
-                    self.remove_channel_member(payload.channel_id, &envelope.author)?;
+                    self.remove_channel_member(payload.channel_id, resolved_author)?;
                 }
             }
             MessageType::NewsComment => {
@@ -797,7 +815,7 @@ impl MessageRouter {
                     self.storage.toggle_news_reaction(
                         &payload.target_id,
                         &payload.emoji,
-                        &envelope.author,
+                        resolved_author,
                         payload.remove,
                     )?;
                 }
@@ -808,7 +826,7 @@ impl MessageRouter {
                 {
                     self.storage.add_repost(
                         &payload.original_id,
-                        &envelope.author,
+                        resolved_author,
                         &envelope.msg_id,
                     )?;
                     // Also index the repost in the global news feed
@@ -869,7 +887,7 @@ impl MessageRouter {
                         "reason": payload.reason,
                         "duration_secs": payload.duration_secs,
                         "banned_at": envelope.timestamp,
-                        "banned_by": envelope.author,
+                        "banned_by": resolved_author,
                     });
                     let record_bytes = serde_json::to_vec(&record)
                         .context("serializing ban record")?;
@@ -963,7 +981,7 @@ impl MessageRouter {
                         &payload.target_user,
                     );
                     let record = serde_json::json!({
-                        "invited_by": envelope.author,
+                        "invited_by": resolved_author,
                         "timestamp": envelope.timestamp,
                     });
                     let record_bytes = serde_json::to_vec(&record)
@@ -975,36 +993,23 @@ impl MessageRouter {
                     )?;
                 }
             }
-            MessageType::NewsComment => {
-                if let Ok(payload) =
-                    rmp_serde::from_slice::<NewsCommentPayload>(&envelope.payload)
-                {
-                    let key = schema::encode_news_comment_key(
-                        &payload.post_id,
-                        envelope.timestamp,
-                        &envelope.msg_id,
-                    );
-                    self.storage
-                        .put_cf(schema::cf::NEWS_COMMENTS, &key, &[])?;
-                }
-            }
             MessageType::ProfileUpdate => {
                 if let Ok(payload) =
                     rmp_serde::from_slice::<ProfileUpdatePayload>(&envelope.payload)
                 {
                     let is_new = !self
                         .storage
-                        .exists_cf(schema::cf::USERS, envelope.author.as_bytes())?;
+                        .exists_cf(schema::cf::USERS, resolved_author.as_bytes())?;
 
                     // Load existing user record or create a new one
                     let mut record = match self
                         .storage
-                        .get_cf(schema::cf::USERS, envelope.author.as_bytes())?
+                        .get_cf(schema::cf::USERS, resolved_author.as_bytes())?
                     {
                         Some(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)
                             .unwrap_or_else(|_| serde_json::json!({})),
                         None => serde_json::json!({
-                            "address": envelope.author,
+                            "address": resolved_author,
                             "public_key": "",
                             "registered_at": envelope.timestamp,
                         }),
@@ -1027,7 +1032,7 @@ impl MessageRouter {
                         .context("serializing user record")?;
                     self.storage.put_cf(
                         schema::cf::USERS,
-                        envelope.author.as_bytes(),
+                        resolved_author.as_bytes(),
                         &bytes,
                     )?;
 
@@ -1036,7 +1041,7 @@ impl MessageRouter {
                             .increment_stat(schema::state_keys::TOTAL_USERS)?;
                     }
 
-                    tracing::info!(address = %envelope.author, "Profile updated");
+                    tracing::info!(address = %resolved_author, "Profile updated");
                 }
             }
             _ => {}

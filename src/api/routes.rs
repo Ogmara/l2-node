@@ -1227,6 +1227,232 @@ pub async fn get_media(
     }
 }
 
+// --- Device Registration Endpoints ---
+
+/// Maximum allowed clock skew for device claim timestamps (5 minutes).
+const MAX_CLAIM_AGE_MS: u64 = 300_000;
+
+/// Maximum devices per wallet (prevents abuse).
+const MAX_DEVICES_PER_WALLET: usize = 10;
+
+/// Request body for device registration.
+#[derive(Debug, Deserialize)]
+pub struct RegisterDeviceRequest {
+    /// Hex-encoded device Ed25519 public key (64 hex chars = 32 bytes).
+    pub device_pubkey_hex: String,
+    /// Wallet address that authorized this device (klv1...).
+    pub wallet_address: String,
+    /// Wallet signature over the claim string (hex-encoded, 128 hex chars = 64 bytes).
+    pub wallet_signature: String,
+    /// Unix timestamp (ms) from the claim string.
+    pub timestamp: u64,
+}
+
+/// POST /api/v1/devices/register — register a device key under a wallet.
+///
+/// Verifies the wallet-signed claim:
+///   claim = "ogmara-device-claim:{device_pubkey_hex}:{wallet_address}:{timestamp}"
+///   signed by wallet key using Klever message signing format.
+pub async fn register_device(
+    Extension(state): Extension<Arc<AppState>>,
+    Extension(auth_user): Extension<AuthUser>,
+    Json(body): Json<RegisterDeviceRequest>,
+) -> impl IntoResponse {
+    // Normalize hex to lowercase for canonical storage
+    let device_pubkey_hex = body.device_pubkey_hex.to_ascii_lowercase();
+
+    // Validate device pubkey hex format (must be 64 hex chars = 32 bytes)
+    if device_pubkey_hex.len() != 64 {
+        return (StatusCode::BAD_REQUEST, "device_pubkey_hex must be 64 hex characters").into_response();
+    }
+    let device_pubkey_bytes = match hex::decode(&device_pubkey_hex) {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => return (StatusCode::BAD_REQUEST, "invalid device_pubkey_hex").into_response(),
+    };
+
+    // Derive the device's klv1... address from the public key
+    let device_verifying_key = match ed25519_dalek::VerifyingKey::from_bytes(&device_pubkey_bytes) {
+        Ok(k) => k,
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid Ed25519 public key").into_response(),
+    };
+    let device_address = match crate::crypto::pubkey_to_address(&device_verifying_key) {
+        Ok(a) => a,
+        Err(_) => return (StatusCode::BAD_REQUEST, "failed to derive device address").into_response(),
+    };
+
+    // Validate wallet address format
+    if crate::crypto::address_to_verifying_key(&body.wallet_address).is_err() {
+        return (StatusCode::BAD_REQUEST, "invalid wallet_address").into_response();
+    }
+
+    // Caller must be either the device being registered or the owning wallet.
+    // This prevents relaying intercepted signed claims.
+    if auth_user.signing_address != device_address && auth_user.address != body.wallet_address {
+        return (StatusCode::FORBIDDEN, "caller must be the device or owning wallet").into_response();
+    }
+
+    // Check timestamp freshness
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let age = now_ms.abs_diff(body.timestamp);
+    if age > MAX_CLAIM_AGE_MS {
+        return (StatusCode::BAD_REQUEST, "claim timestamp expired or too far in future").into_response();
+    }
+
+    // Build the claim string and verify the wallet signature.
+    // Uses the original (non-normalized) hex from the request, since the wallet
+    // signed this exact string. Signature verification must match what was signed.
+    let claim_string = format!(
+        "ogmara-device-claim:{}:{}:{}",
+        body.device_pubkey_hex, body.wallet_address, body.timestamp
+    );
+
+    let sig_bytes = match hex::decode(&body.wallet_signature) {
+        Ok(b) if b.len() == 64 => b,
+        _ => return (StatusCode::BAD_REQUEST, "invalid wallet_signature hex").into_response(),
+    };
+    let signature = match ed25519_dalek::Signature::from_slice(&sig_bytes) {
+        Ok(s) => s,
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid signature bytes").into_response(),
+    };
+
+    let wallet_verifying_key = match crate::crypto::address_to_verifying_key(&body.wallet_address) {
+        Ok(k) => k,
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid wallet_address").into_response(),
+    };
+
+    // Verify using Klever message signing format (same as wallet UIs use)
+    if let Err(_) = crate::crypto::signing::verify_klever_message(
+        &wallet_verifying_key,
+        claim_string.as_bytes(),
+        &signature,
+    ) {
+        return (StatusCode::UNAUTHORIZED, "wallet signature verification failed").into_response();
+    }
+
+    // Check device limit per wallet
+    match state.identity.list_devices(&body.wallet_address) {
+        Ok(existing) => {
+            let is_update = existing.iter().any(|c| c.device_address == device_address);
+            if !is_update && existing.len() >= MAX_DEVICES_PER_WALLET {
+                return (
+                    StatusCode::CONFLICT,
+                    "maximum devices per wallet reached",
+                ).into_response();
+            }
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to list devices");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+        }
+    }
+
+    // Store the claim (with normalized lowercase hex for consistency)
+    let claim = crate::storage::rocks::DeviceClaim {
+        device_address: device_address.clone(),
+        wallet_address: body.wallet_address.clone(),
+        device_pubkey_hex,
+        wallet_signature: body.wallet_signature,
+        registered_at: body.timestamp,
+    };
+
+    match state.identity.register_device(&claim) {
+        Ok(()) => {
+            tracing::info!(
+                device = %device_address,
+                wallet = %body.wallet_address,
+                registered_by = %auth_user.signing_address,
+                "Device registered"
+            );
+            Json(serde_json::json!({
+                "ok": true,
+                "device_address": device_address,
+                "wallet_address": body.wallet_address,
+            }))
+            .into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to register device");
+            (StatusCode::INTERNAL_SERVER_ERROR, "registration failed").into_response()
+        }
+    }
+}
+
+/// DELETE /api/v1/devices/{device_address} — revoke a device registration.
+///
+/// Only the owning wallet can revoke a device. The authenticated user's
+/// resolved wallet address must match the device's registered wallet.
+///
+/// By design, any device registered to the wallet can revoke sibling devices
+/// (since auth resolves device → wallet). This enables device management from
+/// any active device without requiring the wallet key directly.
+pub async fn revoke_device(
+    Extension(state): Extension<Arc<AppState>>,
+    Extension(auth_user): Extension<AuthUser>,
+    Path(device_address): Path<String>,
+) -> impl IntoResponse {
+    // Validate device address format
+    if crate::crypto::address_to_verifying_key(&device_address).is_err() {
+        return (StatusCode::BAD_REQUEST, "invalid device address").into_response();
+    }
+
+    // The authenticated wallet must own this device
+    match state.identity.revoke_device(&device_address, &auth_user.address) {
+        Ok(true) => {
+            tracing::info!(
+                device = %device_address,
+                wallet = %auth_user.address,
+                "Device revoked"
+            );
+            Json(serde_json::json!({ "ok": true, "device_address": device_address })).into_response()
+        }
+        Ok(false) => {
+            (StatusCode::NOT_FOUND, "device not registered to this wallet").into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to revoke device");
+            (StatusCode::INTERNAL_SERVER_ERROR, "revocation failed").into_response()
+        }
+    }
+}
+
+/// GET /api/v1/devices — list devices registered to the authenticated wallet.
+pub async fn list_devices(
+    Extension(state): Extension<Arc<AppState>>,
+    Extension(auth_user): Extension<AuthUser>,
+) -> impl IntoResponse {
+    match state.identity.list_devices(&auth_user.address) {
+        Ok(devices) => {
+            let device_list: Vec<serde_json::Value> = devices
+                .iter()
+                .map(|d| {
+                    serde_json::json!({
+                        "device_address": d.device_address,
+                        "device_pubkey_hex": d.device_pubkey_hex,
+                        "registered_at": d.registered_at,
+                    })
+                })
+                .collect();
+            Json(serde_json::json!({
+                "wallet_address": auth_user.address,
+                "devices": device_list,
+                "total": device_list.len(),
+            }))
+            .into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to list devices");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+        }
+    }
+}
+
 /// Basic content type detection from file magic bytes.
 fn detect_content_type(data: &[u8]) -> String {
     if data.starts_with(b"\x89PNG") {

@@ -149,11 +149,20 @@ impl Node {
     pub async fn run(&self) -> Result<()> {
         info!(node_id = %self.node_id, "Starting Ogmara L2 node");
 
+        // Initialize identity resolver (device → wallet mapping cache)
+        let identity = crate::storage::identity::IdentityResolver::new(self.storage.clone());
+        match identity.warm_cache() {
+            Ok(count) if count > 0 => info!(count, "Identity cache warmed"),
+            Ok(_) => {}
+            Err(e) => warn!(error = %e, "Failed to warm identity cache"),
+        }
+
         // Start the network service
         let keypair = self.libp2p_keypair()?;
         let mut network = crate::network::NetworkService::new(
             &self.config,
             self.storage.clone(),
+            identity.clone(),
             keypair,
         )
         .await
@@ -233,6 +242,7 @@ impl Node {
         // Start REST/WS API server
         let api_router = crate::messages::router::MessageRouter::new(
             self.storage.clone(),
+            identity.clone(),
             self.config.api.rate_limit_per_ip,
         );
         // Derive Klever network name from configured node URL
@@ -243,6 +253,7 @@ impl Node {
         } else {
             "mainnet".to_string()
         };
+
         let app_state = Arc::new(crate::api::state::AppState::new(
             self.storage.clone(),
             api_router,
@@ -250,6 +261,7 @@ impl Node {
             klever_network,
             self.config.klever.contract_address.clone(),
             ipfs_client,
+            identity.clone(),
         ));
         let api_config = self.config.clone();
         let api_shutdown_rx = self.shutdown_rx();
