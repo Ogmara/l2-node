@@ -183,13 +183,13 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
         Router::new()
     };
 
-    // Compose all routes with body size limit (1 MB)
+    // Compose all routes with body size limit (10 MB for media uploads)
     Router::new()
         .merge(public_routes)
         .merge(auth_routes)
         .merge(ws_routes)
         .merge(admin_routes)
-        .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024))
+        .layer(axum::extract::DefaultBodyLimit::max(10 * 1024 * 1024))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .layer(axum::Extension(app_state))
