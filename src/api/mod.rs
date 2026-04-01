@@ -98,7 +98,8 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
         .route(
             "/api/v1/channels/{channel_id}/pins",
             get(routes::get_channel_pins),
-        );
+        )
+        .route("/api/v1/media/{cid}", get(routes::get_media));
 
     // Authenticated routes (Klever wallet signature required)
     let auth_routes = Router::new()
@@ -152,6 +153,7 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
             "/api/v1/channels/{channel_id}/invite/{address}",
             post(routes::invite_user),
         )
+        .route("/api/v1/media/upload", post(routes::upload_media))
         .layer(middleware::from_fn(auth::auth_middleware));
 
     // WebSocket routes

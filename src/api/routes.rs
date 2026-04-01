@@ -6,8 +6,8 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::extract::{Extension, Path, Query};
-use axum::http::StatusCode;
+use axum::extract::{Extension, Multipart, Path, Query};
+use axum::http::{header, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
@@ -1142,4 +1142,100 @@ pub async fn personal_feed(
         "page": params.page.unwrap_or(1),
     }))
     .into_response()
+}
+
+// --- Media endpoints ---
+
+/// POST /api/v1/media/upload — upload a file to IPFS (authenticated).
+pub async fn upload_media(
+    Extension(state): Extension<Arc<AppState>>,
+    Extension(_auth_user): Extension<AuthUser>,
+    mut multipart: Multipart,
+) -> impl IntoResponse {
+    let ipfs = match &state.ipfs {
+        Some(c) => c,
+        None => return (StatusCode::SERVICE_UNAVAILABLE, "IPFS not configured").into_response(),
+    };
+
+    // Extract the first file field from the multipart form
+    let field = match multipart.next_field().await {
+        Ok(Some(f)) => f,
+        Ok(None) => return (StatusCode::BAD_REQUEST, "no file in request").into_response(),
+        Err(e) => {
+            tracing::warn!(error = %e, "multipart parse error");
+            return (StatusCode::BAD_REQUEST, "invalid multipart data").into_response();
+        }
+    };
+
+    let filename = field.file_name().map(|s| s.to_string());
+    let content_type = field.content_type().unwrap_or("application/octet-stream").to_string();
+
+    let data = match field.bytes().await {
+        Ok(b) => b.to_vec(),
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to read upload body");
+            return (StatusCode::BAD_REQUEST, "failed to read file data").into_response();
+        }
+    };
+
+    match ipfs.upload(data, filename, &content_type).await {
+        Ok(result) => Json(serde_json::json!({
+            "cid": result.cid,
+            "size": result.size,
+            "mime_type": result.mime_type,
+        }))
+        .into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "IPFS upload failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("upload failed: {e}")).into_response()
+        }
+    }
+}
+
+/// GET /api/v1/media/:cid — retrieve media from IPFS (public).
+pub async fn get_media(
+    Extension(state): Extension<Arc<AppState>>,
+    Path(cid): Path<String>,
+) -> impl IntoResponse {
+    let ipfs = match &state.ipfs {
+        Some(c) => c,
+        None => return (StatusCode::SERVICE_UNAVAILABLE, "IPFS not configured").into_response(),
+    };
+
+    match ipfs.get(&cid).await {
+        Ok(data) => {
+            // Detect content type from first bytes (basic magic number detection)
+            let content_type = detect_content_type(&data);
+            (
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, content_type),
+                    (header::CACHE_CONTROL, "public, max-age=31536000, immutable".to_string()),
+                ],
+                data,
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::warn!(cid = %cid, error = %e, "IPFS retrieval failed");
+            (StatusCode::NOT_FOUND, "media not found").into_response()
+        }
+    }
+}
+
+/// Basic content type detection from file magic bytes.
+fn detect_content_type(data: &[u8]) -> String {
+    if data.starts_with(b"\x89PNG") {
+        "image/png".to_string()
+    } else if data.starts_with(b"\xFF\xD8\xFF") {
+        "image/jpeg".to_string()
+    } else if data.starts_with(b"GIF8") {
+        "image/gif".to_string()
+    } else if data.len() >= 12 && &data[0..4] == b"RIFF" && &data[8..12] == b"WEBP" {
+        "image/webp".to_string()
+    } else if data.starts_with(b"%PDF") {
+        "application/pdf".to_string()
+    } else {
+        "application/octet-stream".to_string()
+    }
 }

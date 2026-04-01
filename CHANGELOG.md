@@ -5,6 +5,17 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.5] - 2026-04-01
+
+### Added
+- **Media upload endpoint** — `POST /api/v1/media/upload` accepts multipart
+  file uploads, validates MIME type and size, and stores on IPFS via Kubo.
+  Returns `{ cid, size, mime_type }`. Requires authentication.
+- **Media retrieval endpoint** — `GET /api/v1/media/:cid` fetches content
+  from IPFS by CID. Public, with immutable cache headers. Detects content
+  type from magic bytes (PNG, JPEG, GIF, WebP, PDF).
+- IPFS client now stored in AppState and shared with API handlers.
+
 ## [0.5.4] - 2026-04-01
 
 ### Added
