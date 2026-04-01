@@ -5,6 +5,30 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-04-01
+
+### Added
+- **Direct Messaging endpoints** — full DM retrieval and read-state tracking:
+  - `GET /api/v1/dm/conversations` — list DM conversations with peer address,
+    last message preview, timestamp, and unread count. Paginated, deduplicated.
+  - `GET /api/v1/dm/{address}/messages` — retrieve messages in a DM conversation.
+    Computes conversation_id from auth user + path address.
+  - `POST /api/v1/dm/{address}/read` — mark DM conversation as read (wall-clock cursor).
+  - `GET /api/v1/dm/unread` — get unread DM counts per conversation, capped at 99.
+- `DM_READ_STATE` column family — per-user per-conversation read cursors.
+- `compute_conversation_id` — Keccak-256 of lexicographically sorted wallet addresses.
+- `validate_direct_message` — validates recipient address, sender != recipient,
+  content length, and conversation_id correctness.
+- DM conversation index writes in `update_indexes` — both sender and recipient
+  get entries in `DM_CONVERSATIONS` with the peer address stored as value.
+
+### Fixed
+- **DM_MESSAGES prefix extractor** — changed from 8 bytes to 32 bytes to match
+  the conversation_id key prefix. Previous value caused incorrect bloom filter behavior.
+- **DM_CONVERSATIONS prefix extractor** — changed from 8 bytes to 44 bytes to match
+  klv1 bech32 address length.
+- Address validation on DM GET endpoints — rejects non-klv1 or wrong-length addresses.
+
 ## [0.6.4] - 2026-04-01
 
 ### Added

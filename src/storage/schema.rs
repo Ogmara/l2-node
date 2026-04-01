@@ -82,6 +82,9 @@ pub mod cf {
     /// (wallet_address, 0xFF, channel_id_be8) → last_read_ts (u64 BE) — per-user per-channel read cursor
     pub const CHANNEL_READ_STATE: &str = "channel_read_state";
 
+    /// (wallet_address, 0xFF, conversation_id) → last_read_ts (u64 BE) — per-user per-DM read cursor
+    pub const DM_READ_STATE: &str = "dm_read_state";
+
     /// All column family names for database initialization.
     pub const ALL: &[&str] = &[
         MESSAGES,
@@ -116,6 +119,7 @@ pub mod cf {
         DEVICE_WALLET_MAP,
         WALLET_DEVICES,
         CHANNEL_READ_STATE,
+        DM_READ_STATE,
     ];
 }
 
@@ -351,5 +355,16 @@ pub fn encode_channel_read_key(wallet_address: &str, channel_id: u64) -> Vec<u8>
     key.extend_from_slice(wallet_address.as_bytes());
     key.push(0xFF);
     key.extend_from_slice(&channel_id.to_be_bytes());
+    key
+}
+
+// --- DM Read State key encoding ---
+
+/// Encode a DM read state key: (wallet_address, 0xFF, conversation_id).
+pub fn encode_dm_read_key(wallet_address: &str, conversation_id: &[u8; 32]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(wallet_address.len() + 1 + 32);
+    key.extend_from_slice(wallet_address.as_bytes());
+    key.push(0xFF);
+    key.extend_from_slice(conversation_id);
     key
 }

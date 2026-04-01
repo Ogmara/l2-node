@@ -397,6 +397,44 @@ pub fn validate_content_request(p: &ContentRequest) -> Result<(), ValidationErro
     Ok(())
 }
 
+// --- Direct Message validation ---
+
+/// Maximum DM content length (10,000 bytes).
+pub const MAX_DM_CONTENT: usize = 10_000;
+
+/// Validate a direct message payload.
+pub fn validate_direct_message(
+    author: &str,
+    p: &DirectMessagePayload,
+) -> Result<(), ValidationError> {
+    if p.recipient.is_empty() || !p.recipient.starts_with("klv1") {
+        return Err(ValidationError(
+            "recipient must be a valid Klever address".into(),
+        ));
+    }
+    if author == p.recipient {
+        return Err(ValidationError("cannot send a DM to yourself".into()));
+    }
+    if p.content.is_empty() {
+        return Err(ValidationError("content must not be empty".into()));
+    }
+    if p.content.len() > MAX_DM_CONTENT {
+        return Err(ValidationError(format!(
+            "content too long: {} > {}",
+            p.content.len(),
+            MAX_DM_CONTENT
+        )));
+    }
+    // Verify conversation_id matches the expected value
+    let expected = crate::crypto::compute_conversation_id(author, &p.recipient);
+    if p.conversation_id != expected {
+        return Err(ValidationError(
+            "conversation_id does not match sender/recipient".into(),
+        ));
+    }
+    Ok(())
+}
+
 // --- News Engagement validation ---
 
 /// Validate a news repost payload.

@@ -82,15 +82,19 @@ impl Storage {
             .map(|name| {
                 let mut cf_opts = Options::default();
                 // Use prefix bloom filters for index CFs
-                if *name == cf::CHANNEL_MSGS
-                    || *name == cf::DM_MESSAGES
-                    || *name == cf::DM_CONVERSATIONS
-                {
+                if *name == cf::CHANNEL_MSGS {
+                    // Key: (channel_id:8, lamport_ts:8, msg_id:32) — prefix by channel_id
                     cf_opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(8));
                 }
-                // NEWS_COMMENTS is keyed by (post_id[32], timestamp[8], msg_id[32])
-                if *name == cf::NEWS_COMMENTS {
+                if *name == cf::DM_MESSAGES || *name == cf::NEWS_COMMENTS {
+                    // DM_MESSAGES key: (conversation_id:32, timestamp:8, msg_id:32)
+                    // NEWS_COMMENTS key: (post_id:32, timestamp:8, msg_id:32)
                     cf_opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(32));
+                }
+                if *name == cf::DM_CONVERSATIONS {
+                    // Key: (wallet_address:44, !timestamp:8, conversation_id:32)
+                    // All klv1 bech32 addresses are exactly 44 characters
+                    cf_opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(44));
                 }
                 ColumnFamilyDescriptor::new(*name, cf_opts)
             })
