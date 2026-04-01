@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use tokio::sync::broadcast;
 
+use crate::ipfs::client::IpfsClient;
 use crate::messages::router::MessageRouter;
 use crate::storage::rocks::Storage;
 
@@ -26,6 +27,8 @@ pub struct AppState {
     pub klever_network: String,
     /// Ogmara KApp smart contract address (from config).
     pub contract_address: String,
+    /// IPFS client for media upload/retrieval (None if IPFS not configured).
+    pub ipfs: Option<IpfsClient>,
 }
 
 impl AppState {
@@ -35,6 +38,7 @@ impl AppState {
         node_id: String,
         klever_network: String,
         contract_address: String,
+        ipfs: Option<IpfsClient>,
     ) -> Self {
         let (ws_broadcast, _) = broadcast::channel(1024);
         Self {
@@ -46,6 +50,7 @@ impl AppState {
             ws_broadcast,
             klever_network,
             contract_address,
+            ipfs,
         }
     }
 

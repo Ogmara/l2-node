@@ -206,17 +206,29 @@ impl Node {
             }
         });
 
-        // IPFS health check (non-blocking)
-        match crate::ipfs::client::IpfsClient::new(&self.config.ipfs) {
+        // IPFS client (stored for API media endpoints)
+        let ipfs_client = match crate::ipfs::client::IpfsClient::new(&self.config.ipfs) {
             Ok(ipfs) => {
                 match ipfs.health_check().await {
-                    Ok(true) => info!("IPFS node connected"),
-                    Ok(false) => warn!("IPFS node not reachable at {}", self.config.ipfs.api_url),
-                    Err(e) => warn!(error = %e, "IPFS health check failed"),
+                    Ok(true) => {
+                        info!("IPFS node connected");
+                        Some(ipfs)
+                    }
+                    Ok(false) => {
+                        warn!("IPFS node not reachable at {}", self.config.ipfs.api_url);
+                        Some(ipfs) // keep client — node may come online later
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "IPFS health check failed");
+                        Some(ipfs)
+                    }
                 }
             }
-            Err(e) => warn!(error = %e, "Failed to create IPFS client"),
-        }
+            Err(e) => {
+                warn!(error = %e, "Failed to create IPFS client");
+                None
+            }
+        };
 
         // Start REST/WS API server
         let api_router = crate::messages::router::MessageRouter::new(
@@ -237,6 +249,7 @@ impl Node {
             self.node_id.clone(),
             klever_network,
             self.config.klever.contract_address.clone(),
+            ipfs_client,
         ));
         let api_config = self.config.clone();
         let api_shutdown_rx = self.shutdown_rx();
