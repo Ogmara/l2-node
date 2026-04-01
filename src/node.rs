@@ -236,6 +236,7 @@ impl Node {
             api_router,
             self.node_id.clone(),
             klever_network,
+            self.config.klever.contract_address.clone(),
         ));
         let api_config = self.config.clone();
         let api_shutdown_rx = self.shutdown_rx();

@@ -24,6 +24,8 @@ pub struct AppState {
     pub ws_broadcast: broadcast::Sender<String>,
     /// Klever network name ("testnet" or "mainnet"), derived from config.
     pub klever_network: String,
+    /// Ogmara KApp smart contract address (from config).
+    pub contract_address: String,
 }
 
 impl AppState {
@@ -32,6 +34,7 @@ impl AppState {
         router: MessageRouter,
         node_id: String,
         klever_network: String,
+        contract_address: String,
     ) -> Self {
         let (ws_broadcast, _) = broadcast::channel(1024);
         Self {
@@ -42,6 +45,7 @@ impl AppState {
             peers: AtomicU32::new(0),
             ws_broadcast,
             klever_network,
+            contract_address,
         }
     }
 
