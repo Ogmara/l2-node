@@ -82,6 +82,22 @@ pub fn generate_keypair() -> SigningKey {
     SigningKey::generate(&mut rand::rngs::OsRng)
 }
 
+/// Compute a deterministic DM conversation ID from two Klever addresses.
+///
+/// Sorts the addresses lexicographically and hashes them with Keccak-256.
+/// Both the Rust and TypeScript implementations must produce identical output.
+pub fn compute_conversation_id(addr_a: &str, addr_b: &str) -> [u8; 32] {
+    let (first, second) = if addr_a <= addr_b {
+        (addr_a, addr_b)
+    } else {
+        (addr_b, addr_a)
+    };
+    let mut data = Vec::with_capacity(first.len() + second.len());
+    data.extend_from_slice(first.as_bytes());
+    data.extend_from_slice(second.as_bytes());
+    keccak256(&data)
+}
+
 /// Compute the message ID: Keccak-256(author_address_bytes + payload_bytes + timestamp_bytes).
 pub fn compute_msg_id(author_pubkey: &[u8; 32], payload_bytes: &[u8], timestamp: u64) -> [u8; 32] {
     let mut data = Vec::with_capacity(32 + payload_bytes.len() + 8);

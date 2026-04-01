@@ -376,6 +376,9 @@ impl MessageRouter {
                 DeserializedPayload::ContentRequest(ref p) => {
                     validation::validate_content_request(p)
                 }
+                DeserializedPayload::DirectMessage(ref p) => {
+                    validation::validate_direct_message(resolved_author, p)
+                }
                 // Types with no specific validation rules (NewsReaction uses existing validate_reaction)
                 _ => Ok(()),
             },
@@ -680,13 +683,39 @@ impl MessageRouter {
                 if let Ok(payload) =
                     rmp_serde::from_slice::<DirectMessagePayload>(&envelope.payload)
                 {
-                    let key = schema::encode_dm_msg_key(
+                    // 1. Index the message by conversation
+                    let msg_key = schema::encode_dm_msg_key(
                         &payload.conversation_id,
                         envelope.timestamp,
                         &envelope.msg_id,
                     );
                     self.storage
-                        .put_cf(schema::cf::DM_MESSAGES, &key, &[])?;
+                        .put_cf(schema::cf::DM_MESSAGES, &msg_key, &[])?;
+
+                    // 2. Update conversation index for BOTH participants
+                    // Sender's entry: value = recipient address (the peer)
+                    let sender_conv_key = schema::encode_dm_conversation_key(
+                        resolved_author.as_bytes(),
+                        envelope.timestamp,
+                        &payload.conversation_id,
+                    );
+                    self.storage.put_cf(
+                        schema::cf::DM_CONVERSATIONS,
+                        &sender_conv_key,
+                        payload.recipient.as_bytes(),
+                    )?;
+
+                    // Recipient's entry: value = sender address (the peer)
+                    let recipient_conv_key = schema::encode_dm_conversation_key(
+                        payload.recipient.as_bytes(),
+                        envelope.timestamp,
+                        &payload.conversation_id,
+                    );
+                    self.storage.put_cf(
+                        schema::cf::DM_CONVERSATIONS,
+                        &recipient_conv_key,
+                        resolved_author.as_bytes(),
+                    )?;
                 }
             }
             MessageType::NewsPost => {

@@ -634,6 +634,308 @@ pub async fn send_dm(
     }
 }
 
+/// GET /api/v1/dm/conversations — list DM conversations for the authenticated user.
+pub async fn get_dm_conversations(
+    Extension(state): Extension<Arc<AppState>>,
+    Extension(auth_user): Extension<AuthUser>,
+    Query(params): Query<PaginationParams>,
+) -> impl IntoResponse {
+    let page = params.page.unwrap_or(1).max(1) as usize;
+    let limit = params.limit.unwrap_or(20).min(100) as usize;
+    let offset = (page - 1) * limit;
+
+    let prefix = auth_user.address.as_bytes().to_vec();
+    // Fetch enough entries to cover duplicates (each message creates a new entry per conversation).
+    // We fetch a generous amount and deduplicate before paginating.
+    let max_raw_entries = 2000;
+
+    match state
+        .storage
+        .prefix_iter_cf(cf::DM_CONVERSATIONS, &prefix, max_raw_entries)
+    {
+        Ok(entries) => {
+            // Deduplicate first: keep only the newest entry per conversation_id
+            // (entries are in reverse-chronological order due to !timestamp, so first seen = newest)
+            let mut seen_conversations = std::collections::HashSet::new();
+            let mut unique_entries = Vec::new();
+            let addr_len = auth_user.address.len();
+
+            for (key, value) in entries {
+                if key.len() < addr_len + 8 + 32 {
+                    continue;
+                }
+                let conversation_id: [u8; 32] =
+                    key[addr_len + 8..addr_len + 40].try_into().unwrap_or([0u8; 32]);
+                if seen_conversations.insert(conversation_id) {
+                    unique_entries.push((key, value));
+                }
+            }
+
+            let total = unique_entries.len();
+            let page_entries: Vec<_> = unique_entries.into_iter().skip(offset).take(limit).collect();
+
+            let mut conversations = Vec::with_capacity(page_entries.len());
+
+            for (key, value) in &page_entries {
+                // Key layout: (wallet_address:44, !timestamp:8, conversation_id:32)
+                if key.len() < addr_len + 8 + 32 {
+                    continue;
+                }
+                let negated_ts_bytes: [u8; 8] =
+                    key[addr_len..addr_len + 8].try_into().unwrap_or([0u8; 8]);
+                let last_activity_ts = !u64::from_be_bytes(negated_ts_bytes);
+                let conversation_id: [u8; 32] =
+                    key[addr_len + 8..addr_len + 40].try_into().unwrap_or([0u8; 32]);
+
+                // Value stores the peer address
+                let peer = String::from_utf8_lossy(value).to_string();
+
+                // Fetch last message preview from DM_MESSAGES
+                let mut last_message_preview = String::new();
+                // Fetch enough messages to find the newest (prefix_iter returns ascending order)
+                if let Ok(msgs) = state
+                    .storage
+                    .prefix_iter_cf(cf::DM_MESSAGES, &conversation_id, 500)
+                {
+                    if let Some((msg_key, _)) = msgs.last() {
+                        if msg_key.len() >= 72 {
+                            let msg_id: [u8; 32] =
+                                msg_key[40..72].try_into().unwrap_or([0u8; 32]);
+                            if let Ok(Some(env_bytes)) = state.storage.get_message(&msg_id) {
+                                if let Ok(env) = rmp_serde::from_slice::<
+                                    crate::messages::envelope::Envelope,
+                                >(&env_bytes)
+                                {
+                                    // Try to extract content preview from payload
+                                    if let Ok(payload) = rmp_serde::from_slice::<
+                                        crate::messages::types::DirectMessagePayload,
+                                    >(&env.payload)
+                                    {
+                                        let text =
+                                            String::from_utf8_lossy(&payload.content);
+                                        // Truncate to 100 chars for preview (char-safe boundary)
+                                        last_message_preview = if text.chars().count() > 100 {
+                                            let truncated: String = text.chars().take(97).collect();
+                                            format!("{truncated}...")
+                                        } else {
+                                            text.to_string()
+                                        };
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Get unread count from DM_READ_STATE
+                let read_key = crate::storage::schema::encode_dm_read_key(
+                    &auth_user.address,
+                    &conversation_id,
+                );
+                let last_read_ts =
+                    match state.storage.get_cf(cf::DM_READ_STATE, &read_key) {
+                        Ok(Some(bytes)) if bytes.len() == 8 => {
+                            u64::from_be_bytes(bytes.try_into().unwrap_or([0u8; 8]))
+                        }
+                        _ => 0,
+                    };
+
+                let mut unread_count = 0u64;
+                if let Ok(msgs) =
+                    state
+                        .storage
+                        .prefix_iter_cf(cf::DM_MESSAGES, &conversation_id, 100)
+                {
+                    for (msg_key, _) in &msgs {
+                        if msg_key.len() >= 40 {
+                            let ts_bytes: [u8; 8] =
+                                msg_key[32..40].try_into().unwrap_or([0u8; 8]);
+                            let msg_ts = u64::from_be_bytes(ts_bytes);
+                            if msg_ts > last_read_ts {
+                                unread_count += 1;
+                            }
+                        }
+                    }
+                }
+
+                conversations.push(serde_json::json!({
+                    "conversation_id": hex::encode(conversation_id),
+                    "peer": peer,
+                    "last_message_at": last_activity_ts,
+                    "last_message_preview": last_message_preview,
+                    "unread_count": unread_count.min(99),
+                }));
+            }
+
+            Json(serde_json::json!({
+                "conversations": conversations,
+                "total": total,
+            }))
+            .into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to list DM conversations");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+        }
+    }
+}
+
+/// GET /api/v1/dm/:address/messages — retrieve DM messages with a specific user.
+pub async fn get_dm_messages(
+    Extension(state): Extension<Arc<AppState>>,
+    Extension(auth_user): Extension<AuthUser>,
+    Path(address): Path<String>,
+    Query(params): Query<MessageParams>,
+) -> impl IntoResponse {
+    if !address.starts_with("klv1") || address.len() != 44 {
+        return (StatusCode::BAD_REQUEST, "invalid Klever address").into_response();
+    }
+    let limit = params.limit.unwrap_or(50).min(500) as usize;
+
+    // Compute conversation_id from auth user + path address
+    let conversation_id =
+        crate::crypto::compute_conversation_id(&auth_user.address, &address);
+
+    match state
+        .storage
+        .prefix_iter_cf(cf::DM_MESSAGES, &conversation_id, limit)
+    {
+        Ok(entries) => {
+            let mut messages = Vec::with_capacity(entries.len());
+            for (key, _) in &entries {
+                // Key: (conversation_id:32, timestamp:8, msg_id:32)
+                if key.len() >= 72 {
+                    let msg_id: [u8; 32] = key[40..72].try_into().unwrap_or([0u8; 32]);
+                    if let Ok(Some(envelope_bytes)) = state.storage.get_message(&msg_id) {
+                        if let Ok(envelope) = rmp_serde::from_slice::<
+                            crate::messages::envelope::Envelope,
+                        >(&envelope_bytes)
+                        {
+                            messages.push(envelope_to_json(&envelope, &state.identity));
+                        }
+                    }
+                }
+            }
+            let has_more = entries.len() == limit;
+            Json(serde_json::json!({
+                "messages": messages,
+                "has_more": has_more,
+            }))
+            .into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to get DM messages");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+        }
+    }
+}
+
+/// POST /api/v1/dm/:address/read — mark a DM conversation as read.
+pub async fn mark_dm_read(
+    Extension(state): Extension<Arc<AppState>>,
+    Extension(auth_user): Extension<AuthUser>,
+    Path(address): Path<String>,
+) -> impl IntoResponse {
+    if !address.starts_with("klv1") || address.len() != 44 {
+        return (StatusCode::BAD_REQUEST, "invalid Klever address").into_response();
+    }
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    let conversation_id =
+        crate::crypto::compute_conversation_id(&auth_user.address, &address);
+    let key = crate::storage::schema::encode_dm_read_key(
+        &auth_user.address,
+        &conversation_id,
+    );
+
+    match state
+        .storage
+        .put_cf(cf::DM_READ_STATE, &key, &now_ms.to_be_bytes())
+    {
+        Ok(()) => Json(OkResponse { ok: true }).into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to mark DM read");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+        }
+    }
+}
+
+/// GET /api/v1/dm/unread — get unread DM counts per conversation.
+pub async fn get_dm_unread_counts(
+    Extension(state): Extension<Arc<AppState>>,
+    Extension(auth_user): Extension<AuthUser>,
+) -> impl IntoResponse {
+    // Get all conversations for this user
+    let prefix = auth_user.address.as_bytes().to_vec();
+    let conversations = match state
+        .storage
+        .prefix_iter_cf(cf::DM_CONVERSATIONS, &prefix, 200)
+    {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to list DM conversations for unread");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+        }
+    };
+
+    let mut unread: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+    let mut seen_conversations = std::collections::HashSet::new();
+    let addr_len = auth_user.address.len();
+
+    for (key, _) in &conversations {
+        if key.len() < addr_len + 8 + 32 {
+            continue;
+        }
+        let conversation_id: [u8; 32] =
+            key[addr_len + 8..addr_len + 40].try_into().unwrap_or([0u8; 32]);
+
+        if !seen_conversations.insert(conversation_id) {
+            continue;
+        }
+
+        // Get read cursor
+        let read_key = crate::storage::schema::encode_dm_read_key(
+            &auth_user.address,
+            &conversation_id,
+        );
+        let last_read_ts = match state.storage.get_cf(cf::DM_READ_STATE, &read_key) {
+            Ok(Some(bytes)) if bytes.len() == 8 => {
+                u64::from_be_bytes(bytes.try_into().unwrap_or([0u8; 8]))
+            }
+            _ => 0,
+        };
+
+        // Count unread messages
+        if let Ok(msgs) = state
+            .storage
+            .prefix_iter_cf(cf::DM_MESSAGES, &conversation_id, 100)
+        {
+            let mut count = 0u64;
+            for (msg_key, _) in &msgs {
+                if msg_key.len() >= 40 {
+                    let ts_bytes: [u8; 8] =
+                        msg_key[32..40].try_into().unwrap_or([0u8; 8]);
+                    let msg_ts = u64::from_be_bytes(ts_bytes);
+                    if msg_ts > last_read_ts {
+                        count += 1;
+                    }
+                }
+            }
+            if count > 0 {
+                unread.insert(
+                    hex::encode(conversation_id),
+                    serde_json::json!(count.min(99)),
+                );
+            }
+        }
+    }
+
+    Json(serde_json::json!({ "unread": unread })).into_response()
+}
+
 /// POST /api/v1/users/:address/follow — follow a user (signed envelope)
 pub async fn follow_user(
     Extension(state): Extension<Arc<AppState>>,
