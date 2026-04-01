@@ -83,6 +83,7 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
         .route("/api/v1/users/{address}/followers", get(routes::get_followers))
         .route("/api/v1/users/{address}/following", get(routes::get_following))
         .route("/api/v1/news", get(routes::list_news))
+        .route("/api/v1/news/{msg_id}", get(routes::get_news_post))
         .route(
             "/api/v1/news/{msg_id}/reactions",
             get(routes::get_news_reactions),

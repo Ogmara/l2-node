@@ -395,6 +395,8 @@ pub async fn list_news(
                                 map.insert("reaction_counts".into(), serde_json::json!(reaction_counts));
                                 map.insert("repost_count".into(),
                                     serde_json::json!(state.storage.get_repost_count(&msg_id).unwrap_or(0)));
+                                map.insert("comment_count".into(),
+                                    serde_json::json!(state.storage.get_comment_count(&msg_id).unwrap_or(0)));
                             }
                             posts.push(post);
                         }
@@ -416,6 +418,85 @@ pub async fn list_news(
             }
         }
     }
+}
+
+/// GET /api/v1/news/{msg_id} — single news post with comments.
+pub async fn get_news_post(
+    Extension(state): Extension<Arc<AppState>>,
+    Path(msg_id_hex): Path<String>,
+) -> impl IntoResponse {
+    let msg_id = match hex::decode(&msg_id_hex) {
+        Ok(bytes) if bytes.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&bytes);
+            arr
+        }
+        _ => return (StatusCode::BAD_REQUEST, "invalid msg_id").into_response(),
+    };
+
+    // Fetch the post envelope
+    let envelope_bytes = match state.storage.get_message(&msg_id) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return (StatusCode::NOT_FOUND, "post not found").into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "Storage error fetching news post");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response();
+        }
+    };
+
+    let envelope = match rmp_serde::from_slice::<crate::messages::envelope::Envelope>(&envelope_bytes) {
+        Ok(env) => env,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "corrupt envelope").into_response(),
+    };
+
+    let mut post = envelope_to_json(&envelope);
+
+    // Enrich with engagement counts
+    if let serde_json::Value::Object(ref mut map) = post {
+        let reactions = state.storage.get_news_reactions(&msg_id).unwrap_or_default();
+        let reaction_counts: serde_json::Map<String, serde_json::Value> = reactions
+            .into_iter()
+            .map(|(e, c)| (e, serde_json::json!(c)))
+            .collect();
+        map.insert("reaction_counts".into(), serde_json::json!(reaction_counts));
+        map.insert(
+            "repost_count".into(),
+            serde_json::json!(state.storage.get_repost_count(&msg_id).unwrap_or(0)),
+        );
+        map.insert(
+            "comment_count".into(),
+            serde_json::json!(state.storage.get_comment_count(&msg_id).unwrap_or(0)),
+        );
+    }
+
+    // Fetch comments (prefix scan NEWS_COMMENTS by post_id)
+    let comments = match state.storage.prefix_iter_cf(cf::NEWS_COMMENTS, &msg_id, 200) {
+        Ok(entries) => {
+            let mut result = Vec::with_capacity(entries.len());
+            for (key, _) in &entries {
+                // Key: (post_id[32], timestamp[8], msg_id[32])
+                if key.len() >= 72 {
+                    let comment_id: [u8; 32] = key[40..72].try_into().unwrap_or([0u8; 32]);
+                    if let Ok(Some(comment_bytes)) = state.storage.get_message(&comment_id) {
+                        if let Ok(comment_env) = rmp_serde::from_slice::<
+                            crate::messages::envelope::Envelope,
+                        >(&comment_bytes)
+                        {
+                            result.push(envelope_to_json(&comment_env));
+                        }
+                    }
+                }
+            }
+            result
+        }
+        Err(_) => Vec::new(),
+    };
+
+    Json(serde_json::json!({
+        "post": post,
+        "comments": comments,
+    }))
+    .into_response()
 }
 
 // --- Social endpoints (public) ---
