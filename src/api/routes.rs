@@ -1149,7 +1149,7 @@ pub async fn personal_feed(
 /// POST /api/v1/media/upload — upload a file to IPFS (authenticated).
 pub async fn upload_media(
     Extension(state): Extension<Arc<AppState>>,
-    Extension(_auth_user): Extension<AuthUser>,
+    Extension(auth_user): Extension<AuthUser>,
     mut multipart: Multipart,
 ) -> impl IntoResponse {
     let ipfs = match &state.ipfs {
@@ -1179,15 +1179,18 @@ pub async fn upload_media(
     };
 
     match ipfs.upload(data, filename, &content_type).await {
-        Ok(result) => Json(serde_json::json!({
-            "cid": result.cid,
-            "size": result.size,
-            "mime_type": result.mime_type,
-        }))
-        .into_response(),
+        Ok(result) => {
+            tracing::info!(cid = %result.cid, user = %auth_user.address, size = result.size, "Media uploaded");
+            Json(serde_json::json!({
+                "cid": result.cid,
+                "size": result.size,
+                "mime_type": result.mime_type,
+            }))
+            .into_response()
+        }
         Err(e) => {
-            tracing::error!(error = %e, "IPFS upload failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("upload failed: {e}")).into_response()
+            tracing::error!(user = %auth_user.address, error = %e, "IPFS upload failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "upload failed").into_response()
         }
     }
 }
@@ -1211,6 +1214,7 @@ pub async fn get_media(
                 [
                     (header::CONTENT_TYPE, content_type),
                     (header::CACHE_CONTROL, "public, max-age=31536000, immutable".to_string()),
+                    (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
                 ],
                 data,
             )
