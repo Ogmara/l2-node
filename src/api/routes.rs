@@ -20,7 +20,15 @@ use super::state::AppState;
 /// Convert an Envelope's byte-array fields (msg_id, payload, signature) to hex strings
 /// in the JSON representation. serde serializes [u8; 32] and Vec<u8> as number arrays,
 /// but the API should return hex strings for client consumption.
-fn envelope_to_json(envelope: &crate::messages::envelope::Envelope) -> serde_json::Value {
+/// Convert an envelope to JSON, resolving the author to the wallet address.
+///
+/// The envelope stores the signing key (device key) as `author`, but clients
+/// should always see the wallet address. The identity resolver maps device keys
+/// to wallet addresses; for built-in wallets the address is unchanged.
+fn envelope_to_json(
+    envelope: &crate::messages::envelope::Envelope,
+    identity: &crate::storage::identity::IdentityResolver,
+) -> serde_json::Value {
     let mut val = serde_json::to_value(envelope).unwrap_or_default();
     if let serde_json::Value::Object(ref mut map) = val {
         // Convert msg_id from byte array to hex string
@@ -30,6 +38,11 @@ fn envelope_to_json(envelope: &crate::messages::envelope::Envelope) -> serde_jso
                 .filter_map(|b| b.as_u64().map(|n| format!("{:02x}", n as u8)))
                 .collect();
             map.insert("msg_id".into(), serde_json::Value::String(hex));
+        }
+        // Resolve device key → wallet address
+        match identity.resolve(&envelope.author) {
+            Ok(wallet) => { map.insert("author".into(), serde_json::Value::String(wallet)); }
+            Err(e) => { tracing::warn!(author = %envelope.author, error = %e, "Identity resolution failed in API response"); }
         }
     }
     val
@@ -321,7 +334,7 @@ pub async fn get_channel_messages(
                             crate::messages::envelope::Envelope,
                         >(&envelope_bytes)
                         {
-                            messages.push(envelope_to_json(&envelope));
+                            messages.push(envelope_to_json(&envelope, &state.identity));
                         }
                     }
                 }
@@ -347,7 +360,9 @@ pub async fn get_user(
     Extension(state): Extension<Arc<AppState>>,
     Path(address): Path<String>,
 ) -> impl IntoResponse {
-    match state.storage.get_cf(cf::USERS, address.as_bytes()) {
+    // Resolve device key → wallet address so lookups by device key find the right profile
+    let resolved = state.identity.resolve(&address).unwrap_or_else(|_| address.clone());
+    match state.storage.get_cf(cf::USERS, resolved.as_bytes()) {
         Ok(Some(data)) => match serde_json::from_slice::<serde_json::Value>(&data) {
             Ok(user) => Json(serde_json::json!({ "user": user })).into_response(),
             Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "corrupt user data").into_response(),
@@ -384,7 +399,7 @@ pub async fn list_news(
                             crate::messages::envelope::Envelope,
                         >(&envelope_bytes)
                         {
-                            let mut post = envelope_to_json(&envelope);
+                            let mut post = envelope_to_json(&envelope, &state.identity);
                             // Enrich with engagement counts per spec
                             if let serde_json::Value::Object(ref mut map) = post {
                                 let reactions = state.storage.get_news_reactions(&msg_id).unwrap_or_default();
@@ -449,7 +464,7 @@ pub async fn get_news_post(
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "corrupt envelope").into_response(),
     };
 
-    let mut post = envelope_to_json(&envelope);
+    let mut post = envelope_to_json(&envelope, &state.identity);
 
     // Enrich with engagement counts
     if let serde_json::Value::Object(ref mut map) = post {
@@ -482,7 +497,7 @@ pub async fn get_news_post(
                             crate::messages::envelope::Envelope,
                         >(&comment_bytes)
                         {
-                            result.push(envelope_to_json(&comment_env));
+                            result.push(envelope_to_json(&comment_env, &state.identity));
                         }
                     }
                 }
@@ -808,7 +823,7 @@ pub async fn list_bookmarks(
                         crate::messages::envelope::Envelope,
                     >(&envelope_bytes)
                     {
-                        bookmarks.push(envelope_to_json(&envelope));
+                        bookmarks.push(envelope_to_json(&envelope, &state.identity));
                     }
                 }
             }
@@ -949,7 +964,7 @@ pub async fn get_channel_pins(
                         >(&envelope_bytes)
                         {
                             pinned_messages
-                                .push(envelope_to_json(&envelope));
+                                .push(envelope_to_json(&envelope, &state.identity));
                         }
                     }
                 }

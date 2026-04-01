@@ -5,6 +5,18 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.2] - 2026-04-01
+
+### Changed
+- **API responses now return wallet addresses as author** — `envelope_to_json`
+  resolves device keys to wallet addresses via the IdentityResolver. Clients
+  always see the canonical wallet identity, never ephemeral device keys.
+- `GET /api/v1/users/:address` now resolves device addresses to wallet
+  addresses before profile lookup, so lookups by device key find the correct
+  profile stored under the wallet address.
+- `comment_count` added to `GET /api/v1/news` list response.
+- Identity resolution errors are now logged instead of silently ignored.
+
 ## [0.6.1] - 2026-04-01
 
 ### Added
