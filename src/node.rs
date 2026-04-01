@@ -223,10 +223,19 @@ impl Node {
             self.storage.clone(),
             self.config.api.rate_limit_per_ip,
         );
+        // Derive Klever network name from configured node URL
+        let klever_network = if self.config.klever.node_url.contains("testnet") {
+            "testnet".to_string()
+        } else if self.config.klever.node_url.is_empty() {
+            "unknown".to_string()
+        } else {
+            "mainnet".to_string()
+        };
         let app_state = Arc::new(crate::api::state::AppState::new(
             self.storage.clone(),
             api_router,
             self.node_id.clone(),
+            klever_network,
         ));
         let api_config = self.config.clone();
         let api_shutdown_rx = self.shutdown_rx();

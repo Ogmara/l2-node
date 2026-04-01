@@ -22,6 +22,8 @@ pub struct AppState {
     peers: AtomicU32,
     /// Broadcast channel for forwarding messages to WebSocket clients.
     pub ws_broadcast: broadcast::Sender<String>,
+    /// Klever network name ("testnet" or "mainnet"), derived from config.
+    pub klever_network: String,
 }
 
 impl AppState {
@@ -29,6 +31,7 @@ impl AppState {
         storage: Storage,
         router: MessageRouter,
         node_id: String,
+        klever_network: String,
     ) -> Self {
         let (ws_broadcast, _) = broadcast::channel(1024);
         Self {
@@ -38,6 +41,7 @@ impl AppState {
             started_at: Instant::now(),
             peers: AtomicU32::new(0),
             ws_broadcast,
+            klever_network,
         }
     }
 
