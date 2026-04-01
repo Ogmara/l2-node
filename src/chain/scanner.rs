@@ -248,25 +248,35 @@ impl ChainScanner {
                 public_key,
                 timestamp,
             } => {
-                // Only increment counter for genuinely new users (idempotent on re-scan)
-                let is_new = !self.storage.exists_cf(cf::USERS, address.as_bytes())?;
-                let record = UserRecord {
-                    address: address.clone(),
-                    public_key,
-                    registered_at: timestamp,
-                    display_name: None,
-                    avatar_cid: None,
-                    bio: None,
-                };
-                let bytes = serde_json::to_vec(&record)?;
-                self.storage
-                    .put_cf(cf::USERS, address.as_bytes(), &bytes)?;
-                if is_new {
+                // Merge with existing record to preserve profile data (display_name, avatar, bio).
+                // The chain scanner may re-process blocks, so this must be idempotent.
+                if let Some(existing) = self.storage.get_cf(cf::USERS, address.as_bytes())? {
+                    // Record exists — only update registration fields, preserve profile
+                    let mut record: UserRecord = serde_json::from_slice(&existing)?;
+                    record.public_key = public_key;
+                    record.registered_at = timestamp;
+                    let bytes = serde_json::to_vec(&record)?;
+                    self.storage
+                        .put_cf(cf::USERS, address.as_bytes(), &bytes)?;
+                    info!(address = %address, "User registration updated (on-chain, preserved profile)");
+                } else {
+                    // New user — create fresh record
+                    let record = UserRecord {
+                        address: address.clone(),
+                        public_key,
+                        registered_at: timestamp,
+                        display_name: None,
+                        avatar_cid: None,
+                        bio: None,
+                    };
+                    let bytes = serde_json::to_vec(&record)?;
+                    self.storage
+                        .put_cf(cf::USERS, address.as_bytes(), &bytes)?;
                     self.storage.increment_stat(
                         crate::storage::schema::state_keys::TOTAL_USERS,
                     )?;
+                    info!(address = %address, "User registered (on-chain)");
                 }
-                info!(address = %address, "User registered (on-chain)");
             }
 
             ScEvent::PublicKeyUpdated {
