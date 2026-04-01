@@ -43,6 +43,7 @@ pub struct HealthResponse {
 #[derive(Serialize)]
 pub struct StatsResponse {
     pub node_id: String,
+    pub network: String,
     pub peers: u32,
     pub total_messages: u64,
     pub total_news_messages: u64,
@@ -106,6 +107,7 @@ pub async fn network_stats(Extension(state): Extension<Arc<AppState>>) -> Json<S
 
     Json(StatsResponse {
         node_id: state.node_id.clone(),
+        network: state.klever_network.clone(),
         peers: state.peer_count(),
         total_messages,
         total_news_messages,
