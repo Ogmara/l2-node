@@ -124,6 +124,12 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
             "/api/v1/bookmarks/{msg_id}",
             post(routes::save_bookmark).delete(routes::remove_bookmark),
         )
+        // Channel read state
+        .route(
+            "/api/v1/channels/{channel_id}/read",
+            post(routes::mark_channel_read),
+        )
+        .route("/api/v1/channels/unread", get(routes::get_unread_counts))
         // Channel bans (auth-gated — moderator/creator only, per spec)
         .route(
             "/api/v1/channels/{channel_id}/bans",

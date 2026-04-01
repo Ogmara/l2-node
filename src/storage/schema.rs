@@ -79,6 +79,9 @@ pub mod cf {
     /// (wallet_address, 0xFF, device_address) → DeviceClaim (serialized) — wallet's registered devices
     pub const WALLET_DEVICES: &str = "wallet_devices";
 
+    /// (wallet_address, 0xFF, channel_id_be8) → last_read_ts (u64 BE) — per-user per-channel read cursor
+    pub const CHANNEL_READ_STATE: &str = "channel_read_state";
+
     /// All column family names for database initialization.
     pub const ALL: &[&str] = &[
         MESSAGES,
@@ -112,6 +115,7 @@ pub mod cf {
         NEWS_COMMENTS,
         DEVICE_WALLET_MAP,
         WALLET_DEVICES,
+        CHANNEL_READ_STATE,
     ];
 }
 
@@ -336,5 +340,16 @@ pub fn encode_wallet_device_key(wallet_address: &str, device_address: &str) -> V
     key.extend_from_slice(wallet_address.as_bytes());
     key.push(0xFF); // separator
     key.extend_from_slice(device_address.as_bytes());
+    key
+}
+
+// --- Channel Read State key encoding ---
+
+/// Encode a channel read state key: (wallet_address, 0xFF, channel_id_be8).
+pub fn encode_channel_read_key(wallet_address: &str, channel_id: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(wallet_address.len() + 1 + 8);
+    key.extend_from_slice(wallet_address.as_bytes());
+    key.push(0xFF);
+    key.extend_from_slice(&channel_id.to_be_bytes());
     key
 }

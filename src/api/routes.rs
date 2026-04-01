@@ -1549,6 +1549,92 @@ pub async fn list_devices(
     }
 }
 
+// --- Channel Read State ---
+
+/// POST /api/v1/channels/{channel_id}/read — mark a channel as read.
+///
+/// Stores the current wall-clock timestamp as the read cursor.
+/// The unread counter compares message lamport_ts (which mirrors wall clock)
+/// against this cursor.
+pub async fn mark_channel_read(
+    Extension(state): Extension<Arc<AppState>>,
+    Extension(auth_user): Extension<AuthUser>,
+    Path(channel_id): Path<u64>,
+) -> impl IntoResponse {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    let key = crate::storage::schema::encode_channel_read_key(&auth_user.address, channel_id);
+    match state.storage.put_cf(cf::CHANNEL_READ_STATE, &key, &now_ms.to_be_bytes()) {
+        Ok(()) => Json(OkResponse { ok: true }).into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to mark channel read");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+        }
+    }
+}
+
+/// GET /api/v1/channels/unread — get unread message counts for all channels.
+///
+/// For each channel, compares the user's read cursor (last_read_ts) against
+/// the latest messages in that channel.
+pub async fn get_unread_counts(
+    Extension(state): Extension<Arc<AppState>>,
+    Extension(auth_user): Extension<AuthUser>,
+) -> impl IntoResponse {
+    // Get all channels
+    let channels = match state.storage.prefix_iter_cf(cf::CHANNELS, &[], 100) {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to list channels for unread");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+        }
+    };
+
+    let mut unread: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+
+    for (key, _) in &channels {
+        // Channel keys are channel_id as u64 BE bytes
+        if key.len() < 8 { continue; }
+        let channel_id = u64::from_be_bytes(key[..8].try_into().unwrap_or([0u8; 8]));
+
+        // Get the user's read cursor for this channel
+        let read_key = crate::storage::schema::encode_channel_read_key(&auth_user.address, channel_id);
+        let last_read_ts = match state.storage.get_cf(cf::CHANNEL_READ_STATE, &read_key) {
+            Ok(Some(bytes)) if bytes.len() == 8 => {
+                u64::from_be_bytes(bytes.try_into().unwrap_or([0u8; 8]))
+            }
+            _ => 0, // Never read — everything is unread
+        };
+
+        // Count messages newer than last_read_ts by checking envelope timestamps
+        let prefix = channel_id.to_be_bytes();
+        if let Ok(msgs) = state.storage.prefix_iter_cf(cf::CHANNEL_MSGS, &prefix, 100) {
+            let mut count = 0u64;
+            for (msg_key, _) in &msgs {
+                // Key: (channel_id:8, lamport_ts:8, msg_id:32)
+                if msg_key.len() >= 48 {
+                    let msg_id: [u8; 32] = msg_key[16..48].try_into().unwrap_or([0u8; 32]);
+                    if let Ok(Some(env_bytes)) = state.storage.get_message(&msg_id) {
+                        if let Ok(env) = rmp_serde::from_slice::<crate::messages::envelope::Envelope>(&env_bytes) {
+                            if env.timestamp > last_read_ts {
+                                count += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            if count > 0 {
+                unread.insert(channel_id.to_string(), serde_json::json!(count.min(99)));
+            }
+        }
+    }
+
+    Json(serde_json::json!({ "unread": unread })).into_response()
+}
+
 /// Basic content type detection from file magic bytes.
 fn detect_content_type(data: &[u8]) -> String {
     if data.starts_with(b"\x89PNG") {
