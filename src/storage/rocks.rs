@@ -676,6 +676,13 @@ impl Storage {
         Ok(new_val)
     }
 
+    /// Decrement a u64 stat counter, saturating at zero.
+    pub fn decrement_stat(&self, key: &[u8]) -> Result<u64> {
+        let new_val = self.get_stat(key)?.saturating_sub(1);
+        self.put_cf(cf::NODE_STATE, key, &new_val.to_be_bytes())?;
+        Ok(new_val)
+    }
+
     /// Rebuild stat counters by scanning existing data.
     /// Called once on startup when counters are zero but data exists.
     pub fn rebuild_stat_counters(&self) -> Result<()> {

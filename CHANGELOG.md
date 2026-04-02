@@ -5,6 +5,24 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.3] - 2026-04-02
+
+### Fixed
+- **Channel deletion resurrection bug** — chain scanner unconditionally re-created
+  deleted channels from on-chain `ChannelCreated` events. Added `DELETED_CHANNELS`
+  tombstone column family; scanner now skips tombstoned channel IDs.
+- **Incomplete channel cleanup** — `delete_channel` handler now also removes
+  moderator records from `CHANNEL_MODERATORS` and decrements `TOTAL_CHANNELS`.
+- **Non-atomic deletion** — tombstone write + channel metadata delete now use
+  `WriteBatch` for crash-safe atomicity.
+- **Silent error swallowing** — cleanup operations now log warnings on failure
+  instead of discarding errors with `let _ =`.
+
+### Added
+- `DELETED_CHANNELS` column family — tombstone set (channel_id → deletion timestamp)
+  prevents chain scanner from resurrecting intentionally deleted channels.
+- `Storage::decrement_stat()` — saturating decrement for u64 stat counters.
+
 ## [0.7.0] - 2026-04-01
 
 ### Added

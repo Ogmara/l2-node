@@ -310,8 +310,17 @@ impl ChainScanner {
                         return Ok(());
                     }
                 };
+
+                let channel_key = channel_id.to_be_bytes();
+
+                // Skip channels that were intentionally deleted (tombstone check)
+                if self.storage.exists_cf(cf::DELETED_CHANNELS, &channel_key)? {
+                    tracing::trace!(channel_id, "Skipping deleted channel (tombstone exists)");
+                    return Ok(());
+                }
+
                 // Only increment counter for genuinely new channels (idempotent on re-scan)
-                let is_new = !self.storage.exists_cf(cf::CHANNELS, &channel_id.to_be_bytes())?;
+                let is_new = !self.storage.exists_cf(cf::CHANNELS, &channel_key)?;
                 let record = ChannelRecord {
                     channel_id,
                     slug,
@@ -324,7 +333,7 @@ impl ChainScanner {
                 };
                 let bytes = serde_json::to_vec(&record)?;
                 self.storage
-                    .put_cf(cf::CHANNELS, &channel_id.to_be_bytes(), &bytes)?;
+                    .put_cf(cf::CHANNELS, &channel_key, &bytes)?;
                 if is_new {
                     self.storage.increment_stat(
                         crate::storage::schema::state_keys::TOTAL_CHANNELS,
