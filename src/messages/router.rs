@@ -500,6 +500,45 @@ impl MessageRouter {
                 let channel_id = self.extract_channel_id(envelope).unwrap_or(0);
                 self.require_mod_permission(channel_id, resolved_author, "can_pin")
             }
+            // Creator + mods with can_mute
+            MessageType::ChannelMute => {
+                let channel_id = self.extract_channel_id(envelope).unwrap_or(0);
+                if let Ok(p) = rmp_serde::from_slice::<ChannelMutePayload>(&envelope.payload) {
+                    if self.is_channel_creator(channel_id, &p.target_user)? {
+                        return Err("cannot mute the channel creator".into());
+                    }
+                }
+                self.require_mod_permission(channel_id, resolved_author, "can_mute")
+            }
+            // Creator + mods with can_edit_info
+            MessageType::ChannelUpdate => {
+                let channel_id = self.extract_channel_id(envelope).unwrap_or(0);
+                self.require_mod_permission(channel_id, resolved_author, "can_edit_info")
+            }
+            // Private channel join: require an invite
+            MessageType::ChannelJoin => {
+                if let Ok(p) = rmp_serde::from_slice::<ChannelJoinPayload>(&envelope.payload) {
+                    // Check if channel is private (type 2)
+                    if let Ok(Some(data)) = self.storage.get_cf(
+                        schema::cf::CHANNELS, &p.channel_id.to_be_bytes(),
+                    ) {
+                        if let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&data) {
+                            if meta.get("channel_type").and_then(|v| v.as_u64()) == Some(2) {
+                                // Private channel: check for invite
+                                let invite_key = schema::encode_channel_invite_key(
+                                    p.channel_id, resolved_author,
+                                );
+                                if !self.storage.exists_cf(schema::cf::CHANNEL_INVITES, &invite_key)
+                                    .unwrap_or(false)
+                                {
+                                    return Err("private channel: invite required".into());
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            }
             // Creator + any moderator
             MessageType::ChannelInvite => {
                 let channel_id = self.extract_channel_id(envelope).unwrap_or(0);
@@ -562,6 +601,10 @@ impl MessageRouter {
             }
             MessageType::ChannelUpdate => {
                 rmp_serde::from_slice::<ChannelUpdatePayload>(&envelope.payload)
+                    .ok().map(|p| p.channel_id)
+            }
+            MessageType::ChannelMute => {
+                rmp_serde::from_slice::<ChannelMutePayload>(&envelope.payload)
                     .ok().map(|p| p.channel_id)
             }
             _ => None,
