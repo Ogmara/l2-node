@@ -797,6 +797,47 @@ impl Storage {
         Ok(())
     }
 
+    /// Normalize channel_type from string enum names to u8 integers.
+    /// Runs once on startup; idempotent.
+    pub fn normalize_channel_types(&self) -> Result<()> {
+        use tracing::info;
+
+        let type_map: &[(&str, u8)] = &[
+            ("Public", 0),
+            ("ReadPublic", 1),
+            ("Private", 2),
+        ];
+
+        let entries = self.prefix_iter_cf(cf::CHANNELS, &[], 10_000)?;
+        let mut fixed = 0u32;
+
+        for (key, value) in &entries {
+            if let Ok(mut meta) = serde_json::from_slice::<serde_json::Value>(value) {
+                if let Some(serde_json::Value::String(s)) = meta.get("channel_type") {
+                    if let Some(&(_, num)) = type_map.iter().find(|&&(name, _)| name == s) {
+                        meta["channel_type"] = serde_json::json!(num);
+                        if let Ok(bytes) = serde_json::to_vec(&meta) {
+                            self.put_cf(cf::CHANNELS, key, &bytes)?;
+                            fixed += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        if fixed > 0 {
+            info!(fixed, "Normalized channel_type values from string to u8");
+        }
+
+        self.put_cf(
+            cf::NODE_STATE,
+            super::schema::state_keys::CHANNEL_TYPE_NORMALIZED,
+            &1u64.to_be_bytes(),
+        )?;
+
+        Ok(())
+    }
+
     /// Get the comment count for a news post by prefix-scanning NEWS_COMMENTS.
     pub fn get_comment_count(&self, post_id: &[u8; 32]) -> Result<u64> {
         let entries = self.prefix_iter_cf(cf::NEWS_COMMENTS, post_id, 10_000)?;

@@ -68,6 +68,14 @@ impl Node {
             }
         }
 
+        // Normalize channel_type values from string to u8 (one-time migration)
+        let ct_normalized = storage.get_stat(state_keys::CHANNEL_TYPE_NORMALIZED)? > 0;
+        if !ct_normalized {
+            if let Err(e) = storage.normalize_channel_types() {
+                warn!(error = %e, "Failed to normalize channel_type values");
+            }
+        }
+
         // Load Lamport counter from storage
         let lamport_value = storage.get_lamport_counter()?;
         let lamport_counter = Arc::new(AtomicU64::new(lamport_value));
