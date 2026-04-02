@@ -83,9 +83,6 @@ pub fn validate_chat_message(p: &ChatMessagePayload) -> Result<(), ValidationErr
 
 /// Validate a news post payload.
 pub fn validate_news_post(p: &NewsPostPayload) -> Result<(), ValidationError> {
-    if p.title.is_empty() {
-        return Err(ValidationError("title must not be empty".into()));
-    }
     if p.title.len() > MAX_NEWS_TITLE {
         return Err(ValidationError("title too long".into()));
     }
