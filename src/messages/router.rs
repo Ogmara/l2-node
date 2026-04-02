@@ -828,13 +828,20 @@ impl MessageRouter {
                 if let Ok(payload) =
                     rmp_serde::from_slice::<NewsCommentPayload>(&envelope.payload)
                 {
-                    let key = schema::encode_news_comment_key(
+                    // Index under parent post for threaded retrieval
+                    let comment_key = schema::encode_news_comment_key(
                         &payload.post_id,
                         envelope.timestamp,
                         &envelope.msg_id,
                     );
                     self.storage
-                        .put_cf(schema::cf::NEWS_COMMENTS, &key, &[])?;
+                        .put_cf(schema::cf::NEWS_COMMENTS, &comment_key, &[])?;
+
+                    // Also index in NEWS_FEED so comments appear in the timeline
+                    let feed_key =
+                        schema::encode_news_key(envelope.timestamp, &envelope.msg_id);
+                    self.storage
+                        .put_cf(schema::cf::NEWS_FEED, &feed_key, &[])?;
                 }
             }
             MessageType::NewsReaction => {
