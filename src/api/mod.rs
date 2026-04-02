@@ -106,6 +106,7 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
     let auth_routes = Router::new()
         .route("/api/v1/messages", post(routes::post_message))
         .route("/api/v1/profile", put(routes::update_profile))
+        .route("/api/v1/channels", post(routes::post_message))
         .route("/api/v1/dm/conversations", get(routes::get_dm_conversations))
         .route("/api/v1/dm/unread", get(routes::get_dm_unread_counts))
         .route("/api/v1/dm/{address}", post(routes::send_dm))
