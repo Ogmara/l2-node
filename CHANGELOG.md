@@ -5,6 +5,17 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.6] - 2026-04-02
+
+### Added
+- **Device-signed registration fallback** — `POST /api/v1/devices/register`
+  now accepts device-signed claims (in addition to wallet-signed). When the
+  wallet signature fails verification, the server checks if the claim was
+  signed by the device key itself. Requires: caller must be the device (auth
+  headers), and wallet must be a registered on-chain user (USERS CF).
+  Enables K5 mobile browser device registration where `signMessage` is
+  unavailable.
+
 ## [0.9.5] - 2026-04-02
 
 ### Fixed
