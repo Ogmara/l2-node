@@ -838,6 +838,83 @@ impl Storage {
         Ok(())
     }
 
+    /// Backfill DEVICE_WALLET_MAP from existing DELEGATIONS entries.
+    /// The chain scanner stored delegations but missed writing the identity map.
+    /// Runs once on startup; idempotent.
+    pub fn backfill_delegation_map(&self) -> Result<()> {
+        use tracing::info;
+
+        let entries = self.prefix_iter_cf(cf::DELEGATIONS, &[], 10_000)?;
+        let mut created = 0u32;
+
+        for (_key, value) in &entries {
+            let record: serde_json::Value = match serde_json::from_slice(value) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            let user = match record.get("user_address").and_then(|v| v.as_str()) {
+                Some(u) => u,
+                None => continue,
+            };
+            let device_pub_hex = match record.get("device_pub_key").and_then(|v| v.as_str()) {
+                Some(d) => d,
+                None => continue,
+            };
+            let active = record.get("active").and_then(|v| v.as_bool()).unwrap_or(true);
+            if !active { continue; }
+
+            // Convert hex pubkey → klv1 address
+            let pubkey_bytes = match hex::decode(device_pub_hex) {
+                Ok(b) if b.len() == 32 => b,
+                _ => continue,
+            };
+            let vk = match ed25519_dalek::VerifyingKey::from_bytes(
+                &<[u8; 32]>::try_from(pubkey_bytes.as_slice()).unwrap(),
+            ) {
+                Ok(vk) => vk,
+                Err(_) => continue,
+            };
+            let device_address = match crate::crypto::pubkey_to_address(&vk) {
+                Ok(a) => a,
+                Err(_) => continue,
+            };
+
+            // Skip if already mapped
+            if self.exists_cf(cf::DEVICE_WALLET_MAP, device_address.as_bytes())? {
+                continue;
+            }
+
+            // Write forward map: device_address → wallet_address
+            self.put_cf(cf::DEVICE_WALLET_MAP, device_address.as_bytes(), user.as_bytes())?;
+
+            // Write reverse map: (wallet, 0xFF, device) → claim
+            let wd_key = super::schema::encode_wallet_device_key(user, &device_address);
+            let claim = serde_json::json!({
+                "device_address": device_address,
+                "wallet_address": user,
+                "created_at": record.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0),
+            });
+            if let Ok(claim_bytes) = serde_json::to_vec(&claim) {
+                self.put_cf(cf::WALLET_DEVICES, &wd_key, &claim_bytes)?;
+            }
+
+            created += 1;
+        }
+
+        if created > 0 {
+            info!(created, "Backfilled DEVICE_WALLET_MAP from DELEGATIONS");
+        }
+
+        self.put_cf(
+            cf::NODE_STATE,
+            super::schema::state_keys::DELEGATION_MAP_BACKFILLED,
+            &1u64.to_be_bytes(),
+        )?;
+
+        Ok(())
+    }
+
     /// Get the comment count for a news post by prefix-scanning NEWS_COMMENTS.
     pub fn get_comment_count(&self, post_id: &[u8; 32]) -> Result<u64> {
         let entries = self.prefix_iter_cf(cf::NEWS_COMMENTS, post_id, 10_000)?;

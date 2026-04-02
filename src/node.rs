@@ -76,6 +76,14 @@ impl Node {
             }
         }
 
+        // Backfill DEVICE_WALLET_MAP from DELEGATIONS (one-time migration)
+        let dm_backfilled = storage.get_stat(state_keys::DELEGATION_MAP_BACKFILLED)? > 0;
+        if !dm_backfilled {
+            if let Err(e) = storage.backfill_delegation_map() {
+                warn!(error = %e, "Failed to backfill delegation map");
+            }
+        }
+
         // Load Lamport counter from storage
         let lamport_value = storage.get_lamport_counter()?;
         let lamport_counter = Arc::new(AtomicU64::new(lamport_value));
