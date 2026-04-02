@@ -150,6 +150,8 @@ pub mod state_keys {
     pub const COUNTERS_V2: &[u8] = b"stat_counters_v2";
     /// Sentinel: set to 1 after channel_type values are normalized from strings to u8.
     pub const CHANNEL_TYPE_NORMALIZED: &[u8] = b"migration_channel_type_normalized";
+    /// Sentinel: set to 1 after DELEGATIONS are backfilled into DEVICE_WALLET_MAP.
+    pub const DELEGATION_MAP_BACKFILLED: &[u8] = b"migration_delegation_map_backfilled";
 }
 
 /// Encode a channel message index key: (channel_id, lamport_ts, msg_id).

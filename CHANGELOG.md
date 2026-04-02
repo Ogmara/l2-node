@@ -5,6 +5,17 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.5] - 2026-04-02
+
+### Fixed
+- **Startup migration: backfill DEVICE_WALLET_MAP from DELEGATIONS** — v0.9.4
+  fixed the scanner for new delegations, but existing delegations (already
+  processed before the fix) were never backfilled. This one-time startup
+  migration reads all active entries from `DELEGATIONS`, converts hex pubkeys
+  to klv1 addresses, and creates the missing `DEVICE_WALLET_MAP` + `WALLET_DEVICES`
+  entries. Fixes K5 wallet users unable to see private channels, DMs, or
+  bookmarks on the web app opened in K5 browser.
+
 ## [0.9.4] - 2026-04-02
 
 ### Fixed
