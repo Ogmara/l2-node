@@ -407,6 +407,18 @@ pub async fn list_news(
                                     .map(|s| s == "NewsComment")
                                     .unwrap_or(false);
 
+                                // Enrich all feed items with engagement counts
+                                let reactions = state.storage.get_news_reactions(&msg_id).unwrap_or_default();
+                                let reaction_counts: serde_json::Map<String, serde_json::Value> = reactions
+                                    .into_iter()
+                                    .map(|(e, c)| (e, serde_json::json!(c)))
+                                    .collect();
+                                map.insert("reaction_counts".into(), serde_json::json!(reaction_counts));
+                                map.insert("repost_count".into(),
+                                    serde_json::json!(state.storage.get_repost_count(&msg_id).unwrap_or(0)));
+                                map.insert("comment_count".into(),
+                                    serde_json::json!(state.storage.get_comment_count(&msg_id).unwrap_or(0)));
+
                                 if is_comment {
                                     // Enrich with parent post context
                                     if let Ok(payload) = rmp_serde::from_slice::<
@@ -435,18 +447,6 @@ pub async fn list_news(
                                             }
                                         }
                                     }
-                                } else {
-                                    // Regular post: enrich with engagement counts
-                                    let reactions = state.storage.get_news_reactions(&msg_id).unwrap_or_default();
-                                    let reaction_counts: serde_json::Map<String, serde_json::Value> = reactions
-                                        .into_iter()
-                                        .map(|(e, c)| (e, serde_json::json!(c)))
-                                        .collect();
-                                    map.insert("reaction_counts".into(), serde_json::json!(reaction_counts));
-                                    map.insert("repost_count".into(),
-                                        serde_json::json!(state.storage.get_repost_count(&msg_id).unwrap_or(0)));
-                                    map.insert("comment_count".into(),
-                                        serde_json::json!(state.storage.get_comment_count(&msg_id).unwrap_or(0)));
                                 }
                             }
                             posts.push(post);
