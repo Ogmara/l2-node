@@ -5,6 +5,23 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.3] - 2026-04-02
+
+### Security
+- **Private channel members/pins leak** — `GET /channels/:id/members` and
+  `GET /channels/:id/pins` were fully public endpoints with no access control.
+  Anyone could enumerate members and read pinned content of private channels.
+  Now gated behind optional auth with `require_channel_access()` check.
+- **Unread counts leaked private channels** — `GET /channels/unread` returned
+  counts for all channels, revealing private channel IDs and activity to any
+  authenticated user. Now filters out private channels the user isn't a member of.
+
+### Changed
+- Extracted `is_private_channel()` and `require_channel_access()` helpers to
+  centralize the dual-format channel_type check across all endpoints.
+- Moved `/channels/:id/members` and `/channels/:id/pins` from public routes
+  to optional-auth routes.
+
 ## [0.9.2] - 2026-04-02
 
 ### Security

@@ -82,14 +82,6 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
             "/api/v1/news/{msg_id}/reposts",
             get(routes::get_news_reposts),
         )
-        .route(
-            "/api/v1/channels/{channel_id}/members",
-            get(routes::get_channel_members),
-        )
-        .route(
-            "/api/v1/channels/{channel_id}/pins",
-            get(routes::get_channel_pins),
-        )
         .route("/api/v1/media/{cid}", get(routes::get_media));
 
     // Routes that optionally benefit from auth (e.g. filtering private channels)
@@ -99,6 +91,14 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
         .route(
             "/api/v1/channels/{channel_id}/messages",
             get(routes::get_channel_messages),
+        )
+        .route(
+            "/api/v1/channels/{channel_id}/members",
+            get(routes::get_channel_members),
+        )
+        .route(
+            "/api/v1/channels/{channel_id}/pins",
+            get(routes::get_channel_pins),
         )
         .route(
             "/api/v1/news/{msg_id}/reactions",

@@ -233,12 +233,7 @@ pub async fn list_channels(
                 .iter()
                 .filter_map(|(_, v)| serde_json::from_slice::<serde_json::Value>(v).ok())
                 .filter(|ch| {
-                    let is_private = match ch.get("channel_type") {
-                        Some(serde_json::Value::Number(n)) => n.as_u64() == Some(2),
-                        Some(serde_json::Value::String(s)) => s == "Private",
-                        _ => false,
-                    };
-                    if !is_private {
+                    if !is_private_channel(ch) {
                         return true;
                     }
                     // Private: only show if caller is a member
@@ -265,6 +260,16 @@ pub async fn list_channels(
     }
 }
 
+/// Check if a channel's metadata indicates it is private (type 2).
+/// Handles both integer and legacy string representations.
+fn is_private_channel(channel_meta: &serde_json::Value) -> bool {
+    match channel_meta.get("channel_type") {
+        Some(serde_json::Value::Number(n)) => n.as_u64() == Some(2),
+        Some(serde_json::Value::String(s)) => s == "Private",
+        _ => false,
+    }
+}
+
 /// Check if the caller has access to a private channel.
 /// Returns true if the channel is public/read-public, or if the caller is a member.
 fn check_channel_access(
@@ -273,17 +278,33 @@ fn check_channel_access(
     channel_id: u64,
     caller: Option<&str>,
 ) -> bool {
-    let is_private = match channel_meta.get("channel_type") {
-        Some(serde_json::Value::Number(n)) => n.as_u64() == Some(2),
-        Some(serde_json::Value::String(s)) => s == "Private",
-        _ => false,
-    };
-    if !is_private {
+    if !is_private_channel(channel_meta) {
         return true; // public or read-public
     }
     let Some(addr) = caller else { return false };
     let member_key = crate::storage::schema::encode_channel_member_key(channel_id, addr);
     state.storage.exists_cf(cf::CHANNEL_MEMBERS, &member_key).unwrap_or(false)
+}
+
+/// Fetch channel metadata and check private channel access in one step.
+/// Returns Ok(()) if access is allowed, Err(Response) if denied or not found.
+fn require_channel_access(
+    state: &AppState,
+    channel_id: u64,
+    caller: Option<&str>,
+) -> Result<(), axum::response::Response> {
+    match state.storage.get_cf(cf::CHANNELS, &channel_id.to_be_bytes()) {
+        Ok(Some(data)) => {
+            if let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&data) {
+                if !check_channel_access(state, &meta, channel_id, caller) {
+                    return Err((StatusCode::NOT_FOUND, "channel not found").into_response());
+                }
+            }
+            Ok(())
+        }
+        Ok(None) => Err((StatusCode::NOT_FOUND, "channel not found").into_response()),
+        Err(_) => Err((StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()),
+    }
 }
 
 /// GET /api/v1/channels/:channel_id — extended response with moderators, pins, member_count
@@ -1385,9 +1406,15 @@ pub async fn remove_bookmark(
 /// GET /api/v1/channels/:channel_id/members
 pub async fn get_channel_members(
     Extension(state): Extension<Arc<AppState>>,
+    auth_user: Option<Extension<AuthUser>>,
     Path(channel_id): Path<u64>,
     Query(params): Query<PaginationParams>,
 ) -> impl IntoResponse {
+    let caller = auth_user.as_ref().map(|u| u.address.as_str());
+    if let Err(resp) = require_channel_access(&state, channel_id, caller) {
+        return resp;
+    }
+
     let limit = params.limit.unwrap_or(50).min(200) as usize;
     let prefix = channel_id.to_be_bytes();
 
@@ -1430,8 +1457,14 @@ pub async fn get_channel_members(
 /// GET /api/v1/channels/:channel_id/pins
 pub async fn get_channel_pins(
     Extension(state): Extension<Arc<AppState>>,
+    auth_user: Option<Extension<AuthUser>>,
     Path(channel_id): Path<u64>,
 ) -> impl IntoResponse {
+    let caller = auth_user.as_ref().map(|u| u.address.as_str());
+    if let Err(resp) = require_channel_access(&state, channel_id, caller) {
+        return resp;
+    }
+
     let prefix = channel_id.to_be_bytes();
 
     match state
@@ -2118,10 +2151,17 @@ pub async fn get_unread_counts(
 
     let mut unread: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
 
-    for (key, _) in &channels {
+    for (key, value) in &channels {
         // Channel keys are channel_id as u64 BE bytes
         if key.len() < 8 { continue; }
         let channel_id = u64::from_be_bytes(key[..8].try_into().unwrap_or([0u8; 8]));
+
+        // Skip private channels the user isn't a member of
+        if let Ok(meta) = serde_json::from_slice::<serde_json::Value>(value) {
+            if !check_channel_access(&state, &meta, channel_id, Some(&auth_user.address)) {
+                continue;
+            }
+        }
 
         // Get the user's read cursor for this channel
         let read_key = crate::storage::schema::encode_channel_read_key(&auth_user.address, channel_id);
