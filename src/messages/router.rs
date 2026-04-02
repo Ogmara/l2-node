@@ -523,7 +523,12 @@ impl MessageRouter {
                         schema::cf::CHANNELS, &p.channel_id.to_be_bytes(),
                     ) {
                         if let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&data) {
-                            if meta.get("channel_type").and_then(|v| v.as_u64()) == Some(2) {
+                            let is_private = match meta.get("channel_type") {
+                                Some(serde_json::Value::Number(n)) => n.as_u64() == Some(2),
+                                Some(serde_json::Value::String(s)) => s == "Private",
+                                _ => false,
+                            };
+                            if is_private {
                                 // Private channel: check for invite
                                 let invite_key = schema::encode_channel_invite_key(
                                     p.channel_id, resolved_author,
@@ -836,7 +841,7 @@ impl MessageRouter {
                     let meta = serde_json::json!({
                         "channel_id": payload.channel_id,
                         "slug": payload.slug,
-                        "channel_type": payload.channel_type,
+                        "channel_type": payload.channel_type as u8,
                         "creator": resolved_author,
                         "created_at": envelope.timestamp,
                         "display_name": payload.display_name,

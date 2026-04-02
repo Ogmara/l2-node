@@ -5,6 +5,21 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.2] - 2026-04-02
+
+### Security
+- **Router invite check bypassed for L2-created private channels** — the
+  `ChannelJoin` authorization only checked `channel_type == 2` (integer), but
+  L2-created channels stored it as `"Private"` (string). Users could join
+  private channels without an invite. Now checks both forms.
+
+### Fixed
+- **channel_type serialization normalized** — router now stores `channel_type`
+  as `u8` integer (matching the chain scanner) instead of serde enum string.
+- **Startup migration** — one-time migration normalizes existing string
+  `channel_type` values (`"Public"`, `"ReadPublic"`, `"Private"`) to integers
+  (0, 1, 2) in the `CHANNELS` column family. Runs automatically on first boot.
+
 ## [0.9.1] - 2026-04-02
 
 ### Fixed
