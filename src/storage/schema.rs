@@ -85,6 +85,10 @@ pub mod cf {
     /// (wallet_address, 0xFF, conversation_id) → last_read_ts (u64 BE) — per-user per-DM read cursor
     pub const DM_READ_STATE: &str = "dm_read_state";
 
+    /// channel_id (8 bytes BE) → deletion timestamp (u64 BE) — tombstone for deleted channels.
+    /// Prevents chain scanner from re-creating channels that were intentionally deleted.
+    pub const DELETED_CHANNELS: &str = "deleted_channels";
+
     /// All column family names for database initialization.
     pub const ALL: &[&str] = &[
         MESSAGES,
@@ -120,6 +124,7 @@ pub mod cf {
         WALLET_DEVICES,
         CHANNEL_READ_STATE,
         DM_READ_STATE,
+        DELETED_CHANNELS,
     ];
 }
 

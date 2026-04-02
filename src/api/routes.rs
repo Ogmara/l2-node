@@ -12,6 +12,8 @@ use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
+use rocksdb::WriteBatch;
+
 use crate::storage::schema::cf;
 
 use super::auth::AuthUser;
@@ -655,35 +657,59 @@ pub async fn delete_channel(
         }
     }
 
-    // Delete channel metadata
-    let _ = state.storage.delete_cf(cf::CHANNELS, &channel_key);
+    // Atomically write tombstone + delete channel metadata
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
 
-    // Delete all members
-    if let Ok(members) = state.storage.prefix_iter_cf(cf::CHANNEL_MEMBERS, &channel_key, 10_000) {
-        for (key, _) in &members {
-            let _ = state.storage.delete_cf(cf::CHANNEL_MEMBERS, key);
+    let mut batch = WriteBatch::default();
+    match (
+        state.storage.cf_handle(cf::DELETED_CHANNELS),
+        state.storage.cf_handle(cf::CHANNELS),
+    ) {
+        (Ok(tombstone_cf), Ok(channels_cf)) => {
+            batch.put_cf(&tombstone_cf, &channel_key, &now.to_be_bytes());
+            batch.delete_cf(&channels_cf, &channel_key);
+            if let Err(e) = state.storage.write_batch(batch) {
+                tracing::error!(channel_id, error = %e, "Failed to write channel deletion batch");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "deletion failed").into_response();
+            }
+        }
+        _ => {
+            tracing::error!(channel_id, "Missing column families for channel deletion");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
         }
     }
 
-    // Delete all bans
-    if let Ok(bans) = state.storage.prefix_iter_cf(cf::CHANNEL_BANS, &channel_key, 10_000) {
-        for (key, _) in &bans {
-            let _ = state.storage.delete_cf(cf::CHANNEL_BANS, key);
+    // Bulk cleanup — tombstone already prevents resurrection, so partial failure is safe
+    let cleanup_cfs: &[(&str, usize)] = &[
+        (cf::CHANNEL_MEMBERS, 10_000),
+        (cf::CHANNEL_MODERATORS, 10_000),
+        (cf::CHANNEL_BANS, 10_000),
+        (cf::CHANNEL_PINS, 100),
+        (cf::CHANNEL_INVITES, 10_000),
+    ];
+    for &(cf_name, limit) in cleanup_cfs {
+        match state.storage.prefix_iter_cf(cf_name, &channel_key, limit) {
+            Ok(entries) => {
+                for (key, _) in &entries {
+                    if let Err(e) = state.storage.delete_cf(cf_name, key) {
+                        tracing::warn!(channel_id, cf = cf_name, error = %e, "Failed to delete entry during channel cleanup");
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(channel_id, cf = cf_name, error = %e, "Failed to iterate during channel cleanup");
+            }
         }
     }
 
-    // Delete all pins
-    if let Ok(pins) = state.storage.prefix_iter_cf(cf::CHANNEL_PINS, &channel_key, 100) {
-        for (key, _) in &pins {
-            let _ = state.storage.delete_cf(cf::CHANNEL_PINS, key);
-        }
-    }
-
-    // Delete all invites
-    if let Ok(invites) = state.storage.prefix_iter_cf(cf::CHANNEL_INVITES, &channel_key, 10_000) {
-        for (key, _) in &invites {
-            let _ = state.storage.delete_cf(cf::CHANNEL_INVITES, key);
-        }
+    // Decrement total channels counter
+    if let Err(e) = state.storage.decrement_stat(
+        crate::storage::schema::state_keys::TOTAL_CHANNELS,
+    ) {
+        tracing::warn!(channel_id, error = %e, "Failed to decrement TOTAL_CHANNELS");
     }
 
     tracing::info!(channel_id, creator = %auth_user.address, "Channel deleted");
