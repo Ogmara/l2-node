@@ -202,13 +202,78 @@ pub fn validate_profile_update(p: &ProfileUpdatePayload) -> Result<(), Validatio
     Ok(())
 }
 
-/// Validate an edit payload.
+/// Validate an edit payload (generic — applies to all edit types).
 pub fn validate_edit(p: &EditPayload) -> Result<(), ValidationError> {
     if p.content.is_empty() {
         return Err(ValidationError("content must not be empty".into()));
     }
     if p.content.len() > MAX_NEWS_CONTENT {
         return Err(ValidationError("content too long".into()));
+    }
+    Ok(())
+}
+
+/// Validate a chat edit payload — content not empty, within chat length limits.
+pub fn validate_chat_edit(p: &EditPayload) -> Result<(), ValidationError> {
+    if p.content.is_empty() {
+        return Err(ValidationError("content must not be empty".into()));
+    }
+    if p.content.len() > MAX_CHAT_CONTENT {
+        return Err(ValidationError(format!(
+            "content too long: {} > {}",
+            p.content.len(),
+            MAX_CHAT_CONTENT
+        )));
+    }
+    Ok(())
+}
+
+/// Validate a chat delete payload — target_id must not be zero.
+pub fn validate_chat_delete(p: &DeletePayload) -> Result<(), ValidationError> {
+    if p.target_id == [0u8; 32] {
+        return Err(ValidationError("target_id must not be zero".into()));
+    }
+    Ok(())
+}
+
+/// Validate a DM edit payload — content not empty, within chat length limits.
+pub fn validate_dm_edit(p: &EditPayload) -> Result<(), ValidationError> {
+    if p.content.is_empty() {
+        return Err(ValidationError("content must not be empty".into()));
+    }
+    if p.content.len() > MAX_CHAT_CONTENT {
+        return Err(ValidationError(format!(
+            "content too long: {} > {}",
+            p.content.len(),
+            MAX_CHAT_CONTENT
+        )));
+    }
+    Ok(())
+}
+
+/// Validate a DM delete payload — target_id must not be zero.
+pub fn validate_dm_delete(p: &DeletePayload) -> Result<(), ValidationError> {
+    if p.target_id == [0u8; 32] {
+        return Err(ValidationError("target_id must not be zero".into()));
+    }
+    Ok(())
+}
+
+/// Validate a news edit payload — content not empty, within news length limits.
+pub fn validate_news_edit(p: &EditPayload) -> Result<(), ValidationError> {
+    if p.content.is_empty() {
+        return Err(ValidationError("content must not be empty".into()));
+    }
+    if p.content.len() > MAX_NEWS_CONTENT {
+        return Err(ValidationError("content too long".into()));
+    }
+    Ok(())
+}
+
+/// Validate a news delete payload — target_id must not be zero.
+pub fn validate_news_delete(p: &DeletePayload) -> Result<(), ValidationError> {
+    if p.target_id == [0u8; 32] {
+        return Err(ValidationError("target_id must not be zero".into()));
     }
     Ok(())
 }
@@ -390,6 +455,101 @@ pub fn validate_content_request(p: &ContentRequest) -> Result<(), ValidationErro
     }
     if p.limit == 0 {
         return Err(ValidationError("content request limit must be > 0".into()));
+    }
+    Ok(())
+}
+
+// --- Moderation validation ---
+
+/// Maximum mute duration: 1 year in seconds.
+pub const MAX_MUTE_DURATION_SECS: u64 = 365 * 24 * 3600;
+
+/// Validate a counter-vote payload.
+pub fn validate_counter_vote(p: &CounterVotePayload) -> Result<(), ValidationError> {
+    if p.target_id == [0u8; 32] {
+        return Err(ValidationError("target_id must not be zero".into()));
+    }
+    Ok(())
+}
+
+/// Validate a channel mute payload.
+pub fn validate_channel_mute(p: &ChannelMutePayload) -> Result<(), ValidationError> {
+    if p.channel_id == 0 {
+        return Err(ValidationError("channel_id must be > 0".into()));
+    }
+    if p.target_user.is_empty() || !p.target_user.starts_with("klv1") {
+        return Err(ValidationError(
+            "target_user must be a valid Klever address".into(),
+        ));
+    }
+    // duration_secs == 0 means permanent, otherwise cap at 1 year
+    if p.duration_secs > MAX_MUTE_DURATION_SECS {
+        return Err(ValidationError(format!(
+            "mute duration too long: {} > {} seconds",
+            p.duration_secs, MAX_MUTE_DURATION_SECS
+        )));
+    }
+    if let Some(ref reason) = p.reason {
+        if reason.len() > MAX_REASON {
+            return Err(ValidationError("reason too long".into()));
+        }
+    }
+    Ok(())
+}
+
+// --- Account/Device Message validation ---
+
+/// Maximum encrypted settings size: 1 MB.
+pub const MAX_SETTINGS_SIZE: usize = 1_048_576;
+
+/// Validate a settings sync payload.
+pub fn validate_settings_sync(p: &SettingsSyncPayload) -> Result<(), ValidationError> {
+    if p.encrypted_settings.is_empty() {
+        return Err(ValidationError("encrypted_settings must not be empty".into()));
+    }
+    if p.encrypted_settings.len() > MAX_SETTINGS_SIZE {
+        return Err(ValidationError(format!(
+            "encrypted_settings too large: {} > {} bytes",
+            p.encrypted_settings.len(),
+            MAX_SETTINGS_SIZE
+        )));
+    }
+    Ok(())
+}
+
+/// Validate a device revocation payload.
+pub fn validate_device_revocation(p: &DeviceRevocationPayload) -> Result<(), ValidationError> {
+    // 32-byte Ed25519 public key, hex-encoded = 64 chars
+    if p.device_pub_key.len() != 64 {
+        return Err(ValidationError("device_pub_key must be 64 hex chars".into()));
+    }
+    if hex::decode(&p.device_pub_key).is_err() {
+        return Err(ValidationError("device_pub_key must be valid hex".into()));
+    }
+    Ok(())
+}
+
+/// Validate a deletion request payload.
+pub fn validate_deletion_request(p: &DeletionRequestPayload) -> Result<(), ValidationError> {
+    match p.delete_type {
+        DeletionType::SingleMessage => {
+            match p.target_id {
+                None => return Err(ValidationError(
+                    "target_id is required for SingleMessage deletion".into(),
+                )),
+                Some(id) if id == [0u8; 32] => return Err(ValidationError(
+                    "target_id must not be zero".into(),
+                )),
+                _ => {}
+            }
+        }
+        DeletionType::AllUserContent => {
+            if p.target_id.is_some() {
+                return Err(ValidationError(
+                    "target_id must be None for AllUserContent deletion".into(),
+                ));
+            }
+        }
     }
     Ok(())
 }

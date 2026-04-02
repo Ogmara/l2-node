@@ -89,6 +89,39 @@ pub mod cf {
     /// Prevents chain scanner from re-creating channels that were intentionally deleted.
     pub const DELETED_CHANNELS: &str = "deleted_channels";
 
+    // --- Edit/Delete Tracking ---
+
+    /// msg_id (32 bytes) → DeletionRecord JSON (deleted_by, deleted_at, msg_type)
+    /// Soft-delete markers — content persists in storage but is hidden in API responses.
+    pub const DELETION_MARKERS: &str = "deletion_markers";
+    /// (original_msg_id:32, edit_timestamp:8) → edit_msg_id (32 bytes)
+    /// Edit chain: tracks successive edits to a message.
+    pub const EDIT_HISTORY: &str = "edit_history";
+
+    // --- Chat Reactions ---
+
+    /// (msg_id:32, emoji_len:2, emoji, 0xFF, author) → () — individual reactions on channel messages
+    pub const CHAT_REACTIONS: &str = "chat_reactions";
+    /// (msg_id:32, emoji) → u64 — cached reaction counts per channel message
+    pub const CHAT_REACTION_COUNTS: &str = "chat_reaction_counts";
+
+    // --- Moderation ---
+
+    /// (target_id:32, reporter_address) → ReportRecord JSON (reason, details, timestamp)
+    pub const REPORTS: &str = "reports";
+    /// (target_id:32, voter_address) → timestamp (u64 BE) — counter-votes on reports
+    pub const COUNTER_VOTES: &str = "counter_votes";
+    /// (channel_id:8, target_address) → MuteRecord JSON (muted_by, duration_secs, muted_at, reason)
+    pub const CHANNEL_MUTES: &str = "channel_mutes";
+
+    // --- Cross-Device Sync ---
+
+    /// wallet_address bytes → encrypted settings blob (SettingsSyncPayload serialized)
+    pub const SETTINGS_SYNC: &str = "settings_sync";
+    /// (target_address, !timestamp:8, notification_id:32) → Notification JSON
+    /// Reverse-chronological order. 30-day retention.
+    pub const NOTIFICATIONS: &str = "notifications";
+
     /// All column family names for database initialization.
     pub const ALL: &[&str] = &[
         MESSAGES,
@@ -125,6 +158,15 @@ pub mod cf {
         CHANNEL_READ_STATE,
         DM_READ_STATE,
         DELETED_CHANNELS,
+        DELETION_MARKERS,
+        EDIT_HISTORY,
+        CHAT_REACTIONS,
+        CHAT_REACTION_COUNTS,
+        REPORTS,
+        COUNTER_VOTES,
+        CHANNEL_MUTES,
+        SETTINGS_SYNC,
+        NOTIFICATIONS,
     ];
 }
 
@@ -375,5 +417,79 @@ pub fn encode_dm_read_key(wallet_address: &str, conversation_id: &[u8; 32]) -> V
     key.extend_from_slice(wallet_address.as_bytes());
     key.push(0xFF);
     key.extend_from_slice(conversation_id);
+    key
+}
+
+// --- Edit/Delete key encoding ---
+
+/// Encode an edit history key: (original_msg_id, edit_timestamp).
+pub fn encode_edit_history_key(original_msg_id: &[u8; 32], edit_timestamp: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(32 + 8);
+    key.extend_from_slice(original_msg_id);
+    key.extend_from_slice(&edit_timestamp.to_be_bytes());
+    key
+}
+
+// --- Chat Reaction key encoding ---
+
+/// Encode a chat reaction key: (msg_id, emoji, author). Mirrors news reaction format.
+pub fn encode_chat_reaction_key(msg_id: &[u8; 32], emoji: &str, author: &str) -> Vec<u8> {
+    let emoji_bytes = emoji.as_bytes();
+    let author_bytes = author.as_bytes();
+    let mut key = Vec::with_capacity(32 + 2 + emoji_bytes.len() + 1 + author_bytes.len());
+    key.extend_from_slice(msg_id);
+    key.extend_from_slice(&(emoji_bytes.len() as u16).to_be_bytes());
+    key.extend_from_slice(emoji_bytes);
+    key.push(0xFF);
+    key.extend_from_slice(author_bytes);
+    key
+}
+
+/// Encode a chat reaction count key: (msg_id, emoji).
+pub fn encode_chat_reaction_count_key(msg_id: &[u8; 32], emoji: &str) -> Vec<u8> {
+    let emoji_bytes = emoji.as_bytes();
+    let mut key = Vec::with_capacity(32 + emoji_bytes.len());
+    key.extend_from_slice(msg_id);
+    key.extend_from_slice(emoji_bytes);
+    key
+}
+
+// --- Moderation key encoding ---
+
+/// Encode a report key: (target_id, reporter_address).
+pub fn encode_report_key(target_id: &[u8; 32], reporter: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(32 + reporter.len());
+    key.extend_from_slice(target_id);
+    key.extend_from_slice(reporter.as_bytes());
+    key
+}
+
+/// Encode a counter-vote key: (target_id, voter_address).
+pub fn encode_counter_vote_key(target_id: &[u8; 32], voter: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(32 + voter.len());
+    key.extend_from_slice(target_id);
+    key.extend_from_slice(voter.as_bytes());
+    key
+}
+
+/// Encode a channel mute key: (channel_id, target_address).
+pub fn encode_channel_mute_key(channel_id: u64, address: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(8 + address.len());
+    key.extend_from_slice(&channel_id.to_be_bytes());
+    key.extend_from_slice(address.as_bytes());
+    key
+}
+
+// --- Notification key encoding ---
+
+/// Encode a notification key: (target_address, !timestamp, notification_id).
+/// Negated timestamp for reverse-chronological order (newest first).
+pub fn encode_notification_key(target_address: &str, timestamp: u64, notification_id: &[u8; 32]) -> Vec<u8> {
+    let addr_bytes = target_address.as_bytes();
+    let mut key = Vec::with_capacity(addr_bytes.len() + 1 + 8 + 32);
+    key.extend_from_slice(addr_bytes);
+    key.push(0xFF);
+    key.extend_from_slice(&(!timestamp).to_be_bytes()); // newest first
+    key.extend_from_slice(notification_id);
     key
 }

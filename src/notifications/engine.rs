@@ -12,6 +12,7 @@ use tracing::{debug, warn};
 
 use crate::messages::envelope::Envelope;
 use crate::messages::types::{ChatMessagePayload, MessageType, NewsCommentPayload};
+use crate::storage::rocks::Storage;
 
 /// A notification to deliver to a user.
 #[derive(Debug, Clone, Serialize)]
@@ -50,6 +51,8 @@ pub struct NotificationEngine {
     push_gateway_token: Option<String>,
     /// HTTP client for push gateway.
     http: reqwest::Client,
+    /// Persistent storage for notification history retrieval via API.
+    storage: Option<Storage>,
 }
 
 impl NotificationEngine {
@@ -64,7 +67,16 @@ impl NotificationEngine {
             push_gateway_url,
             push_gateway_token,
             http: reqwest::Client::new(),
+            storage: None,
         }
+    }
+
+    /// Set the storage backend for persisting notifications.
+    ///
+    /// When set, every delivered notification is also written to disk so it
+    /// can be retrieved later via the `GET /api/v1/notifications` endpoint.
+    pub fn set_storage(&mut self, storage: Storage) {
+        self.storage = Some(storage);
     }
 
     /// Register a locally connected user for mention notifications.
@@ -128,18 +140,42 @@ impl NotificationEngine {
                     timestamp: envelope.timestamp,
                 };
 
-                self.deliver(notification).await;
+                self.deliver(mentioned_address, &envelope.msg_id, notification).await;
             }
         }
     }
 
-    /// Deliver a notification via WebSocket broadcast and push gateway.
-    async fn deliver(&self, notification: Notification) {
+    /// Deliver a notification via WebSocket broadcast, push gateway, and persistent storage.
+    ///
+    /// `target_address` is the klv1 address of the notification recipient.
+    /// `notification_id` is the 32-byte msg_id used as a unique notification key.
+    async fn deliver(&self, target_address: &str, notification_id: &[u8; 32], notification: Notification) {
         debug!(
             to = ?notification.notification_type,
             msg_id = %notification.msg_id,
             "Delivering notification"
         );
+
+        // Persist to storage (if configured) so the GET /api/v1/notifications
+        // endpoint can retrieve historical notifications.
+        if let Some(ref storage) = self.storage {
+            let notification_json = serde_json::json!({
+                "notification_type": notification.notification_type,
+                "msg_id": notification.msg_id,
+                "author": notification.author,
+                "channel_id": notification.channel_id,
+                "preview": notification.preview,
+                "timestamp": notification.timestamp,
+            });
+            if let Err(e) = storage.store_notification(
+                target_address,
+                notification_id,
+                notification.timestamp,
+                &notification_json,
+            ) {
+                warn!(error = %e, "Failed to persist notification to storage");
+            }
+        }
 
         // WebSocket broadcast
         let ws_msg = serde_json::json!({

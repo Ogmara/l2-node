@@ -50,6 +50,61 @@ fn envelope_to_json(
     val
 }
 
+/// Enrich a message JSON value with deletion and edit status from storage.
+///
+/// Checks the storage layer for soft-deletion markers and edit history,
+/// adding `deleted`, `deleted_at`, `edited`, and `last_edited_at` fields
+/// as appropriate. Deleted messages have their `payload` field blanked.
+fn enrich_message_json(msg: &mut serde_json::Value, storage: &crate::storage::rocks::Storage) {
+    let msg_id_bytes: Option<[u8; 32]> = msg
+        .get("msg_id")
+        .and_then(|v| v.as_str())
+        .and_then(|hex_str| {
+            let bytes = hex::decode(hex_str).ok()?;
+            if bytes.len() == 32 {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&bytes);
+                Some(arr)
+            } else {
+                None
+            }
+        });
+
+    let msg_id = match msg_id_bytes {
+        Some(id) => id,
+        None => return,
+    };
+
+    // Check deletion status
+    if let Ok(true) = storage.is_deleted(&msg_id) {
+        if let serde_json::Value::Object(ref mut map) = msg {
+            map.insert("deleted".into(), serde_json::json!(true));
+            // Try to extract deleted_at timestamp from the marker
+            if let Ok(Some(marker_bytes)) = storage.get_cf(cf::DELETION_MARKERS, &msg_id) {
+                if let Ok(marker) = serde_json::from_slice::<serde_json::Value>(&marker_bytes) {
+                    if let Some(ts) = marker.get("deleted_at").and_then(|v| v.as_u64()) {
+                        map.insert("deleted_at".into(), serde_json::json!(ts));
+                    }
+                }
+            }
+            // Blank the payload — content is hidden but metadata remains
+            map.insert("payload".into(), serde_json::Value::Null);
+        }
+    }
+
+    // Check edit status
+    if let Ok(true) = storage.is_edited(&msg_id) {
+        if let serde_json::Value::Object(ref mut map) = msg {
+            map.insert("edited".into(), serde_json::json!(true));
+            if let Ok(edits) = storage.get_edit_history(&msg_id) {
+                if let Some((last_ts, _)) = edits.last() {
+                    map.insert("last_edited_at".into(), serde_json::json!(last_ts));
+                }
+            }
+        }
+    }
+}
+
 // --- Query parameters ---
 
 #[derive(Debug, Deserialize)]
@@ -62,6 +117,17 @@ pub struct PaginationParams {
 pub struct MessageParams {
     pub before: Option<String>,
     pub limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct NotificationParams {
+    pub since: Option<u64>,
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ModerationReportParams {
+    pub target: String,
 }
 
 // --- Response types ---
@@ -415,7 +481,17 @@ pub async fn get_channel_messages(
                             crate::messages::envelope::Envelope,
                         >(&envelope_bytes)
                         {
-                            messages.push(envelope_to_json(&envelope, &state.identity));
+                            let mut msg = envelope_to_json(&envelope, &state.identity);
+                            enrich_message_json(&mut msg, &state.storage);
+                            // Check if the message author is muted in this channel
+                            if let Some(author) = msg.get("author").and_then(|v| v.as_str()) {
+                                if state.storage.is_channel_muted(channel_id, author).unwrap_or(false) {
+                                    if let serde_json::Value::Object(ref mut map) = msg {
+                                        map.insert("muted".into(), serde_json::json!(true));
+                                    }
+                                }
+                            }
+                            messages.push(msg);
                         }
                     }
                 }
@@ -530,6 +606,7 @@ pub async fn list_news(
                                     }
                                 }
                             }
+                            enrich_message_json(&mut post, &state.storage);
                             posts.push(post);
                         }
                     }
@@ -600,6 +677,7 @@ pub async fn get_news_post(
             serde_json::json!(state.storage.get_comment_count(&msg_id).unwrap_or(0)),
         );
     }
+    enrich_message_json(&mut post, &state.storage);
 
     // Fetch comments (prefix scan NEWS_COMMENTS by post_id)
     let comments = match state.storage.prefix_iter_cf(cf::NEWS_COMMENTS, &msg_id, 200) {
@@ -614,7 +692,9 @@ pub async fn get_news_post(
                             crate::messages::envelope::Envelope,
                         >(&comment_bytes)
                         {
-                            result.push(envelope_to_json(&comment_env, &state.identity));
+                            let mut comment = envelope_to_json(&comment_env, &state.identity);
+                            enrich_message_json(&mut comment, &state.storage);
+                            result.push(comment);
                         }
                     }
                 }
@@ -696,6 +776,47 @@ pub async fn post_message(
             Json(MessageResponse {
                 msg_id: hex::encode(msg_id),
             })
+            .into_response()
+        }
+        RouteResult::Duplicate => {
+            (StatusCode::CONFLICT, "message already exists").into_response()
+        }
+        RouteResult::Rejected(reason) => {
+            (StatusCode::BAD_REQUEST, reason).into_response()
+        }
+    }
+}
+
+/// POST /api/v1/channels — create a channel via a ChannelCreate envelope.
+///
+/// Processes the message like `post_message` but also extracts the
+/// `channel_id` from the `ChannelCreatePayload` so the response includes
+/// it alongside the `msg_id`.
+pub async fn create_channel(
+    Extension(state): Extension<Arc<AppState>>,
+    Extension(_auth_user): Extension<AuthUser>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    use crate::messages::envelope::Envelope;
+    use crate::messages::router::RouteResult;
+    use crate::messages::types::ChannelCreatePayload;
+
+    match state.router.process_message(&body) {
+        RouteResult::Accepted { msg_id, .. } => {
+            // Try to extract channel_id from the envelope payload
+            let channel_id = rmp_serde::from_slice::<Envelope>(&body)
+                .ok()
+                .and_then(|env| {
+                    rmp_serde::from_slice::<ChannelCreatePayload>(&env.payload)
+                        .ok()
+                        .map(|p| p.channel_id)
+                });
+
+            Json(serde_json::json!({
+                "ok": true,
+                "msg_id": hex::encode(msg_id),
+                "channel_id": channel_id,
+            }))
             .into_response()
         }
         RouteResult::Duplicate => {
@@ -1016,7 +1137,9 @@ pub async fn get_dm_messages(
                             crate::messages::envelope::Envelope,
                         >(&envelope_bytes)
                         {
-                            messages.push(envelope_to_json(&envelope, &state.identity));
+                            let mut msg = envelope_to_json(&envelope, &state.identity);
+                            enrich_message_json(&mut msg, &state.storage);
+                            messages.push(msg);
                         }
                     }
                 }
@@ -1330,7 +1453,9 @@ pub async fn list_bookmarks(
                         crate::messages::envelope::Envelope,
                     >(&envelope_bytes)
                     {
-                        bookmarks.push(envelope_to_json(&envelope, &state.identity));
+                        let mut bm = envelope_to_json(&envelope, &state.identity);
+                        enrich_message_json(&mut bm, &state.storage);
+                        bookmarks.push(bm);
                     }
                 }
             }
@@ -1482,8 +1607,9 @@ pub async fn get_channel_pins(
                             crate::messages::envelope::Envelope,
                         >(&envelope_bytes)
                         {
-                            pinned_messages
-                                .push(envelope_to_json(&envelope, &state.identity));
+                            let mut pin = envelope_to_json(&envelope, &state.identity);
+                            enrich_message_json(&mut pin, &state.storage);
+                            pinned_messages.push(pin);
                         }
                     }
                 }
@@ -1747,7 +1873,11 @@ pub async fn personal_feed(
         .filter_map(|(_, bytes)| {
             rmp_serde::from_slice::<crate::messages::envelope::Envelope>(bytes)
                 .ok()
-                .and_then(|env| serde_json::to_value(&env).ok())
+                .map(|env| {
+                    let mut post = envelope_to_json(&env, &state.identity);
+                    enrich_message_json(&mut post, &state.storage);
+                    post
+                })
         })
         .collect();
 
@@ -2227,6 +2357,279 @@ pub async fn get_unread_counts(
     Json(serde_json::json!({ "unread": unread })).into_response()
 }
 
+/// GET /api/v1/account/export — download all user data as a text file (authenticated)
+pub async fn export_account(
+    Extension(state): Extension<Arc<AppState>>,
+    Extension(auth_user): Extension<AuthUser>,
+) -> impl IntoResponse {
+    let address = &auth_user.address;
+    let now = {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        let secs = ts.as_secs();
+        let days_since_epoch = secs / 86400;
+        let time_of_day = secs % 86400;
+        let hours = time_of_day / 3600;
+        let minutes = (time_of_day % 3600) / 60;
+        let seconds = time_of_day % 60;
+        let (year, month, day) = days_to_ymd(days_since_epoch as i64);
+        format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+            year, month, day, hours, minutes, seconds
+        )
+    };
+    let date_short = &now[..10]; // YYYY-MM-DD
+
+    let mut out = String::with_capacity(64 * 1024);
+    out.push_str("=== OGMARA ACCOUNT EXPORT ===\n");
+    out.push_str(&format!("Date: {}\n", now));
+    out.push_str(&format!("Wallet: {}\n", address));
+
+    // --- Profile ---
+    out.push_str("\n=== PROFILE ===\n");
+    match state.storage.get_cf(cf::USERS, address.as_bytes()) {
+        Ok(Some(data)) => match serde_json::from_slice::<serde_json::Value>(&data) {
+            Ok(profile) => {
+                out.push_str(&serde_json::to_string_pretty(&profile).unwrap_or_default());
+                out.push('\n');
+            }
+            Err(_) => out.push_str("[corrupt data]\n"),
+        },
+        Ok(None) => out.push_str("[no profile]\n"),
+        Err(e) => out.push_str(&format!("[error: {}]\n", e)),
+    }
+
+    // --- News Posts ---
+    let news_limit = 10_000;
+    let mut news_prefix = Vec::with_capacity(address.len() + 1);
+    news_prefix.extend_from_slice(address.as_bytes());
+    news_prefix.push(0xFF);
+
+    let news_entries = state
+        .storage
+        .prefix_iter_cf(cf::NEWS_BY_AUTHOR, &news_prefix, news_limit)
+        .unwrap_or_default();
+    out.push_str(&format!("\n=== NEWS POSTS ({}) ===\n", news_entries.len()));
+    for (key, _) in &news_entries {
+        // Key: (author, 0xFF, !timestamp:8, msg_id:32)
+        if key.len() >= news_prefix.len() + 8 + 32 {
+            let msg_id: [u8; 32] = match key[key.len() - 32..].try_into() {
+                Ok(id) => id,
+                Err(_) => continue,
+            };
+            if let Ok(Some(envelope_bytes)) = state.storage.get_message(&msg_id) {
+                if let Ok(envelope) = rmp_serde::from_slice::<
+                    crate::messages::envelope::Envelope,
+                >(&envelope_bytes)
+                {
+                    let json = envelope_to_json(&envelope, &state.identity);
+                    out.push_str(&serde_json::to_string(&json).unwrap_or_default());
+                    out.push('\n');
+                }
+            }
+        }
+    }
+
+    // --- Channel Memberships ---
+    let channels = state
+        .storage
+        .prefix_iter_cf(cf::CHANNELS, &[], 10_000)
+        .unwrap_or_default();
+    let mut memberships = Vec::new();
+    for (key, value) in &channels {
+        if key.len() < 8 {
+            continue;
+        }
+        let channel_id = u64::from_be_bytes(key[..8].try_into().unwrap_or([0u8; 8]));
+        let member_key =
+            crate::storage::schema::encode_channel_member_key(channel_id, address);
+        if state
+            .storage
+            .exists_cf(cf::CHANNEL_MEMBERS, &member_key)
+            .unwrap_or(false)
+        {
+            let slug = serde_json::from_slice::<serde_json::Value>(value)
+                .ok()
+                .and_then(|v| v.get("slug").and_then(|s| s.as_str()).map(String::from))
+                .unwrap_or_default();
+
+            let (role, joined_at) = state
+                .storage
+                .get_cf(cf::CHANNEL_MEMBERS, &member_key)
+                .ok()
+                .flatten()
+                .and_then(|data| serde_json::from_slice::<serde_json::Value>(&data).ok())
+                .map(|v| {
+                    let role = v
+                        .get("role")
+                        .and_then(|r| r.as_str())
+                        .unwrap_or("member")
+                        .to_string();
+                    let joined = v
+                        .get("joined_at")
+                        .and_then(|j| j.as_u64())
+                        .unwrap_or(0);
+                    (role, joined)
+                })
+                .unwrap_or_else(|| ("member".to_string(), 0));
+
+            memberships.push(format!(
+                "channel_id={}, slug={}, role={}, joined_at={}",
+                channel_id, slug, role, joined_at
+            ));
+        }
+    }
+    out.push_str(&format!(
+        "\n=== CHANNEL MEMBERSHIPS ({}) ===\n",
+        memberships.len()
+    ));
+    for m in &memberships {
+        out.push_str(m);
+        out.push('\n');
+    }
+
+    // --- Bookmarks ---
+    let bookmarks = state
+        .storage
+        .list_bookmarks(address, 10_000)
+        .unwrap_or_default();
+    out.push_str(&format!("\n=== BOOKMARKS ({}) ===\n", bookmarks.len()));
+    for msg_id in &bookmarks {
+        out.push_str(&hex::encode(msg_id));
+        out.push('\n');
+    }
+
+    // --- DM Conversations ---
+    let dm_prefix = address.as_bytes().to_vec();
+    let dm_entries = state
+        .storage
+        .prefix_iter_cf(cf::DM_CONVERSATIONS, &dm_prefix, 2000)
+        .unwrap_or_default();
+
+    let addr_len = address.len();
+    let mut seen_convos = std::collections::HashSet::new();
+    let mut dm_lines = Vec::new();
+
+    for (key, value) in &dm_entries {
+        if key.len() < addr_len + 8 + 32 {
+            continue;
+        }
+        let conversation_id: [u8; 32] =
+            match key[addr_len + 8..addr_len + 40].try_into() {
+                Ok(id) => id,
+                Err(_) => continue,
+            };
+        if !seen_convos.insert(conversation_id) {
+            continue;
+        }
+
+        let conv_id_hex = hex::encode(conversation_id);
+        let peer = serde_json::from_slice::<serde_json::Value>(value)
+            .ok()
+            .and_then(|v| v.get("peer").and_then(|p| p.as_str()).map(String::from))
+            .unwrap_or_else(|| "unknown".to_string());
+
+        let msg_count = state
+            .storage
+            .prefix_iter_cf(cf::DM_MESSAGES, &conversation_id, 1000)
+            .map(|entries| entries.len())
+            .unwrap_or(0);
+
+        dm_lines.push(format!(
+            "conversation_id={}, peer={}, message_count={}",
+            conv_id_hex, peer, msg_count
+        ));
+    }
+
+    out.push_str(&format!(
+        "\n=== DM CONVERSATIONS ({}) ===\n",
+        dm_lines.len()
+    ));
+    for line in &dm_lines {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push_str("Note: DM content is encrypted and exported as ciphertext.\n");
+
+    // --- Following ---
+    let following = state
+        .storage
+        .get_following(address, 10_000)
+        .unwrap_or_default();
+    out.push_str(&format!("\n=== FOLLOWING ({}) ===\n", following.len()));
+    for addr in &following {
+        out.push_str(addr);
+        out.push('\n');
+    }
+
+    // --- Followers ---
+    let followers = state
+        .storage
+        .get_followers(address, 10_000)
+        .unwrap_or_default();
+    out.push_str(&format!("\n=== FOLLOWERS ({}) ===\n", followers.len()));
+    for addr in &followers {
+        out.push_str(addr);
+        out.push('\n');
+    }
+
+    // --- Settings (encrypted) ---
+    out.push_str("\n=== SETTINGS (encrypted) ===\n");
+    match state.storage.get_settings(address) {
+        Ok(Some(blob)) => {
+            out.push_str(&hex::encode(&blob));
+            out.push('\n');
+        }
+        Ok(None) => out.push_str("[no settings]\n"),
+        Err(e) => out.push_str(&format!("[error: {}]\n", e)),
+    }
+
+    out.push_str("\n=== END OF EXPORT ===\n");
+
+    // Build address short form for filename (first 10 chars + last 4)
+    let addr_short = if address.len() > 14 {
+        format!(
+            "{}..{}",
+            &address[..10],
+            &address[address.len() - 4..]
+        )
+    } else {
+        address.clone()
+    };
+
+    let filename = format!("ogmara-export-{}-{}.txt", addr_short, date_short);
+
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "text/plain; charset=utf-8".to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{}\"", filename),
+            ),
+        ],
+        out,
+    )
+        .into_response()
+}
+
+/// Convert days since Unix epoch to (year, month, day).
+fn days_to_ymd(days: i64) -> (i64, i64, i64) {
+    // Algorithm from http://howardhinnant.github.io/date_algorithms.html
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
 /// Basic content type detection from file magic bytes.
 fn detect_content_type(data: &[u8]) -> String {
     if data.starts_with(b"\x89PNG") {
@@ -2242,4 +2645,295 @@ fn detect_content_type(data: &[u8]) -> String {
     } else {
         "application/octet-stream".to_string()
     }
+}
+
+// ---------------------------------------------------------------------------
+// User posts, notifications, and moderation endpoints
+// ---------------------------------------------------------------------------
+
+/// GET /api/v1/users/{address}/posts — list news posts by a specific author.
+///
+/// Public endpoint. Returns paginated posts in reverse-chronological order,
+/// enriched with reaction counts, comment count, repost count, and
+/// edit/deletion status — mirroring the `list_news` enrichment pattern.
+pub async fn get_user_posts(
+    Extension(state): Extension<Arc<AppState>>,
+    Path(address): Path<String>,
+    Query(params): Query<PaginationParams>,
+) -> impl IntoResponse {
+    // Validate klv1 address format
+    if !address.starts_with("klv1") || address.len() < 44 {
+        return (StatusCode::BAD_REQUEST, "invalid klv1 address").into_response();
+    }
+
+    let limit = params.limit.unwrap_or(20).min(100) as usize;
+    let page = params.page.unwrap_or(1);
+
+    // Resolve to wallet address for consistent lookup
+    let resolved = state.identity.resolve(&address).unwrap_or_else(|_| address.clone());
+
+    // Prefix scan NEWS_BY_AUTHOR: key = author + 0xFF + !timestamp + msg_id
+    let mut prefix = Vec::with_capacity(resolved.len() + 1);
+    prefix.extend_from_slice(resolved.as_bytes());
+    prefix.push(0xFF);
+
+    // Skip entries for pagination (page-based offset)
+    let skip = ((page.saturating_sub(1)) as usize) * limit;
+    let fetch_limit = skip + limit;
+
+    match state.storage.prefix_iter_cf(cf::NEWS_BY_AUTHOR, &prefix, fetch_limit) {
+        Ok(entries) => {
+            let mut posts = Vec::with_capacity(limit);
+            for (key, _) in entries.into_iter().skip(skip) {
+                // Key layout: author_bytes + 0xFF + !timestamp(8) + msg_id(32)
+                if key.len() < prefix.len() + 8 + 32 {
+                    continue;
+                }
+                let msg_id_start = key.len() - 32;
+                let msg_id: [u8; 32] = match key[msg_id_start..].try_into() {
+                    Ok(id) => id,
+                    Err(_) => continue,
+                };
+
+                // Fetch envelope
+                let envelope_bytes = match state.storage.get_message(&msg_id) {
+                    Ok(Some(bytes)) => bytes,
+                    _ => continue,
+                };
+                let envelope = match rmp_serde::from_slice::<
+                    crate::messages::envelope::Envelope,
+                >(&envelope_bytes) {
+                    Ok(env) => env,
+                    Err(_) => continue,
+                };
+
+                let mut post = envelope_to_json(&envelope, &state.identity);
+                enrich_message_json(&mut post, &state.storage);
+                if let serde_json::Value::Object(ref mut map) = post {
+                    // Enrich with engagement counts
+                    let reactions = state.storage.get_news_reactions(&msg_id).unwrap_or_default();
+                    let reaction_counts: serde_json::Map<String, serde_json::Value> = reactions
+                        .into_iter()
+                        .map(|(e, c)| (e, serde_json::json!(c)))
+                        .collect();
+                    map.insert("reaction_counts".into(), serde_json::json!(reaction_counts));
+                    map.insert(
+                        "repost_count".into(),
+                        serde_json::json!(state.storage.get_repost_count(&msg_id).unwrap_or(0)),
+                    );
+                    map.insert(
+                        "comment_count".into(),
+                        serde_json::json!(state.storage.get_comment_count(&msg_id).unwrap_or(0)),
+                    );
+                }
+                posts.push(post);
+            }
+
+            let total = posts.len();
+            Json(serde_json::json!({
+                "posts": posts,
+                "total": total,
+                "page": page,
+            }))
+            .into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Storage error in get_user_posts");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
+        }
+    }
+}
+
+/// GET /api/v1/notifications — list notifications for the authenticated user.
+///
+/// Authenticated endpoint. Returns notifications in reverse-chronological
+/// order, optionally filtered by a `since` timestamp.
+pub async fn get_notifications(
+    Extension(state): Extension<Arc<AppState>>,
+    Extension(auth_user): Extension<AuthUser>,
+    Query(params): Query<NotificationParams>,
+) -> impl IntoResponse {
+    let limit = params.limit.unwrap_or(50).min(200) as usize;
+    let since = params.since;
+
+    match state.storage.get_notifications(&auth_user.address, since, limit) {
+        Ok(notifications) => {
+            let total = notifications.len();
+            Json(serde_json::json!({
+                "notifications": notifications,
+                "total": total,
+            }))
+            .into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Storage error in get_notifications");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
+        }
+    }
+}
+
+/// GET /api/v1/moderation/reports — view reports and counter-votes for a target.
+///
+/// Public endpoint for transparency. Requires `?target=<msg_id_hex>`.
+/// Returns reports, counter-vote count, and a simplified moderation score.
+pub async fn get_moderation_reports(
+    Extension(state): Extension<Arc<AppState>>,
+    Query(params): Query<ModerationReportParams>,
+) -> impl IntoResponse {
+    // Decode the target msg_id from hex
+    let target_id = match hex::decode(&params.target) {
+        Ok(bytes) if bytes.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&bytes);
+            arr
+        }
+        _ => return (StatusCode::BAD_REQUEST, "invalid target msg_id hex").into_response(),
+    };
+
+    // Fetch reports
+    let reports = match state.storage.get_reports(&target_id) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error = %e, "Storage error in get_moderation_reports");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response();
+        }
+    };
+
+    // Fetch counter-vote count
+    let counter_votes = state.storage.get_counter_vote_count(&target_id).unwrap_or(0);
+
+    // Compute simplified moderation score:
+    // reports weigh negative, counter-votes weigh positive
+    let report_count = reports.len() as i64;
+    let score = report_count * -1 + counter_votes as i64;
+
+    Json(serde_json::json!({
+        "target": params.target,
+        "reports": reports,
+        "counter_votes": counter_votes,
+        "score": score,
+    }))
+    .into_response()
+}
+
+/// GET /api/v1/moderation/user/{address} — user moderation reputation summary.
+///
+/// Public endpoint. Returns a reputation profile including report counts,
+/// counter-vote counts, account age, and a computed trust score.
+pub async fn get_user_moderation(
+    Extension(state): Extension<Arc<AppState>>,
+    Path(address): Path<String>,
+) -> impl IntoResponse {
+    // Validate klv1 address format
+    if !address.starts_with("klv1") || address.len() < 44 {
+        return (StatusCode::BAD_REQUEST, "invalid klv1 address").into_response();
+    }
+
+    let resolved = state.identity.resolve(&address).unwrap_or_else(|_| address.clone());
+
+    // Account age: look up user profile for registration timestamp
+    let account_age_days = match state.storage.get_cf(cf::USERS, resolved.as_bytes()) {
+        Ok(Some(data)) => {
+            if let Ok(profile) = serde_json::from_slice::<serde_json::Value>(&data) {
+                let registered_at = profile
+                    .get("registered_at")
+                    .and_then(|v| v.as_u64())
+                    .or_else(|| profile.get("created_at").and_then(|v| v.as_u64()))
+                    .unwrap_or(0);
+                if registered_at > 0 {
+                    let now_ms = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    // registered_at is in milliseconds
+                    now_ms.saturating_sub(registered_at) / (1000 * 60 * 60 * 24)
+                } else {
+                    0
+                }
+            } else {
+                0
+            }
+        }
+        _ => 0,
+    };
+
+    // Scan REPORTS to count reports filed BY this user and AGAINST this user's content.
+    // REPORTS key: (target_id:32, reporter_address) → ReportRecord JSON
+    // We need to scan all reports — this is expensive but bounded by total report count.
+    let all_reports = state.storage.prefix_iter_cf(cf::REPORTS, &[], 10_000).unwrap_or_default();
+
+    let mut total_reports_filed: u64 = 0;
+    let mut total_reports_received: u64 = 0;
+    let mut targets_with_reports: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+
+    for (key, value) in &all_reports {
+        if key.len() <= 32 {
+            continue;
+        }
+        let target_id: [u8; 32] = match key[..32].try_into() {
+            Ok(id) => id,
+            Err(_) => continue,
+        };
+        let reporter_address = String::from_utf8_lossy(&key[32..]);
+
+        // Count reports filed by this user
+        if reporter_address == resolved {
+            total_reports_filed += 1;
+        }
+
+        // Check if the report target is authored by this user
+        if let Ok(record) = serde_json::from_slice::<serde_json::Value>(value) {
+            // The report record may contain the target author, but more reliably
+            // we check the target message's envelope
+            if !targets_with_reports.contains(&target_id) {
+                if let Ok(Some(env_bytes)) = state.storage.get_message(&target_id) {
+                    if let Ok(env) = rmp_serde::from_slice::<crate::messages::envelope::Envelope>(&env_bytes) {
+                        let msg_author = state.identity.resolve(&env.author).unwrap_or_else(|_| env.author.clone());
+                        if msg_author == resolved {
+                            targets_with_reports.insert(target_id);
+                        }
+                    }
+                }
+            }
+            // If we already know this target belongs to the user, count this report
+            if targets_with_reports.contains(&target_id) {
+                total_reports_received += 1;
+                let _ = record; // suppress unused warning
+            }
+        }
+    }
+
+    // Count counter-votes on reports targeting this user's content
+    let mut counter_votes_received: u64 = 0;
+    for target_id in &targets_with_reports {
+        counter_votes_received += state.storage.get_counter_vote_count(target_id).unwrap_or(0);
+    }
+
+    // Compute trust score:
+    // - account_age component: min(1.0, age_days / 365) * 0.3
+    // - report ratio component: (1.0 - reports_received_ratio) * 0.4
+    //   where ratio = reports_received / max(1, total content by user) — approximate with reports_received / max(1, reports_received + 10)
+    // - counter-vote component: counter_votes / max(1, reports_received) capped at 1.0, * 0.3
+    let age_component = (account_age_days as f64 / 365.0).min(1.0) * 0.3;
+    let reports_ratio = total_reports_received as f64 / (total_reports_received as f64 + 10.0).max(1.0);
+    let report_component = (1.0 - reports_ratio) * 0.4;
+    let cv_ratio = if total_reports_received > 0 {
+        (counter_votes_received as f64 / total_reports_received as f64).min(1.0)
+    } else {
+        1.0 // no reports = full counter-vote score
+    };
+    let cv_component = cv_ratio * 0.3;
+    let trust_score = (age_component + report_component + cv_component).min(1.0);
+
+    Json(serde_json::json!({
+        "address": resolved,
+        "reputation": {
+            "account_age_days": account_age_days,
+            "trust_score": (trust_score * 1000.0).round() / 1000.0,
+            "total_reports_filed": total_reports_filed,
+            "total_reports_received": total_reports_received,
+            "counter_votes_received": counter_votes_received,
+        },
+    }))
+    .into_response()
 }
