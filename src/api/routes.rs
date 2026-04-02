@@ -233,12 +233,15 @@ pub async fn list_channels(
                 .iter()
                 .filter_map(|(_, v)| serde_json::from_slice::<serde_json::Value>(v).ok())
                 .filter(|ch| {
-                    let ch_type = ch.get("channel_type").and_then(|v| v.as_u64()).unwrap_or(0);
-                    // Public (0) and read-public (1) are visible to everyone
-                    if ch_type != 2 {
+                    let is_private = match ch.get("channel_type") {
+                        Some(serde_json::Value::Number(n)) => n.as_u64() == Some(2),
+                        Some(serde_json::Value::String(s)) => s == "Private",
+                        _ => false,
+                    };
+                    if !is_private {
                         return true;
                     }
-                    // Private (2): only show if caller is a member
+                    // Private: only show if caller is a member
                     let Some(addr) = caller else { return false };
                     let Some(id) = ch.get("channel_id").and_then(|v| v.as_u64()) else { return false };
                     let member_key = crate::storage::schema::encode_channel_member_key(id, addr);
@@ -270,8 +273,12 @@ fn check_channel_access(
     channel_id: u64,
     caller: Option<&str>,
 ) -> bool {
-    let ch_type = channel_meta.get("channel_type").and_then(|v| v.as_u64()).unwrap_or(0);
-    if ch_type != 2 {
+    let is_private = match channel_meta.get("channel_type") {
+        Some(serde_json::Value::Number(n)) => n.as_u64() == Some(2),
+        Some(serde_json::Value::String(s)) => s == "Private",
+        _ => false,
+    };
+    if !is_private {
         return true; // public or read-public
     }
     let Some(addr) = caller else { return false };
