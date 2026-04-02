@@ -1222,6 +1222,46 @@ impl MessageRouter {
                     )?;
                 }
             }
+            MessageType::ChannelUpdate => {
+                if let Ok(payload) =
+                    rmp_serde::from_slice::<ChannelUpdatePayload>(&envelope.payload)
+                {
+                    tracing::debug!(
+                        channel_id = payload.channel_id,
+                        author = %resolved_author,
+                        has_name = payload.display_name.is_some(),
+                        has_desc = payload.description.is_some(),
+                        "Processing ChannelUpdate"
+                    );
+                    // Merge updated fields into existing channel metadata
+                    let key = payload.channel_id.to_be_bytes();
+                    if let Ok(Some(existing)) = self.storage.get_cf(schema::cf::CHANNELS, &key) {
+                        if let Ok(mut meta) = serde_json::from_slice::<serde_json::Value>(&existing) {
+                            if let Some(name) = &payload.display_name {
+                                meta["display_name"] = serde_json::Value::String(name.clone());
+                            }
+                            if let Some(desc) = &payload.description {
+                                meta["description"] = serde_json::Value::String(desc.clone());
+                            }
+                            if let Some(logo) = &payload.logo_cid {
+                                meta["logo_cid"] = serde_json::Value::String(logo.clone());
+                            }
+                            if let Some(banner) = &payload.banner_cid {
+                                meta["banner_cid"] = serde_json::Value::String(banner.clone());
+                            }
+                            if let Some(url) = &payload.website_url {
+                                meta["website_url"] = serde_json::Value::String(url.clone());
+                            }
+                            if let Some(tags) = &payload.tags {
+                                meta["tags"] = serde_json::json!(tags);
+                            }
+                            let meta_bytes = serde_json::to_vec(&meta)
+                                .context("serializing updated channel metadata")?;
+                            self.storage.put_cf(schema::cf::CHANNELS, &key, &meta_bytes)?;
+                        }
+                    }
+                }
+            }
             MessageType::ChatEdit => {
                 if let Ok(payload) =
                     rmp_serde::from_slice::<EditPayload>(&envelope.payload)

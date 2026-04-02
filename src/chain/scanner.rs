@@ -321,15 +321,37 @@ impl ChainScanner {
 
                 // Only increment counter for genuinely new channels (idempotent on re-scan)
                 let is_new = !self.storage.exists_cf(cf::CHANNELS, &channel_key)?;
+
+                // If L2 ChannelCreate envelope already stored metadata (with display_name
+                // and description), preserve those fields. The chain scanner only knows
+                // what's on-chain (slug, type, creator), not the L2-only fields.
+                let (display_name, description, member_count) = if !is_new {
+                    if let Ok(Some(existing)) = self.storage.get_cf(cf::CHANNELS, &channel_key) {
+                        if let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&existing) {
+                            (
+                                meta.get("display_name").and_then(|v| v.as_str()).map(String::from),
+                                meta.get("description").and_then(|v| v.as_str()).map(String::from),
+                                meta.get("member_count").and_then(|v| v.as_u64()).unwrap_or(0),
+                            )
+                        } else {
+                            (None, None, 0)
+                        }
+                    } else {
+                        (None, None, 0)
+                    }
+                } else {
+                    (None, None, 0)
+                };
+
                 let record = ChannelRecord {
                     channel_id,
                     slug,
                     creator,
                     channel_type,
                     created_at: timestamp,
-                    display_name: None,
-                    description: None,
-                    member_count: 0,
+                    display_name,
+                    description,
+                    member_count,
                 };
                 let bytes = serde_json::to_vec(&record)?;
                 self.storage
