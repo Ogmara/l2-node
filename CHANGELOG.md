@@ -5,6 +5,14 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.1] - 2026-04-02
+
+### Fixed
+- **Private channel filter bypassed** — `channel_type` is stored as `"Private"`
+  (string) by the message router but as `2` (integer) by the chain scanner.
+  The privacy check only matched the integer form, so router-created private
+  channels passed through the filter. Now checks both representations.
+
 ## [0.9.0] - 2026-04-02
 
 ### Security
