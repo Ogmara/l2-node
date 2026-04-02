@@ -921,6 +921,367 @@ impl Storage {
         Ok(entries.len() as u64)
     }
 
+    // --- Deletion Markers ---
+
+    /// Store a soft-delete marker for a message.
+    ///
+    /// Records who deleted the message and when, without removing the actual
+    /// content from storage. API responses filter out soft-deleted messages.
+    pub fn store_deletion_marker(
+        &self,
+        msg_id: &[u8; 32],
+        deleted_by: &str,
+        deleted_at: u64,
+    ) -> Result<()> {
+        let value = serde_json::to_vec(&serde_json::json!({
+            "deleted_by": deleted_by,
+            "deleted_at": deleted_at,
+        }))?;
+        self.put_cf(cf::DELETION_MARKERS, msg_id, &value)
+    }
+
+    /// Check if a message has been soft-deleted.
+    pub fn is_deleted(&self, msg_id: &[u8; 32]) -> Result<bool> {
+        self.exists_cf(cf::DELETION_MARKERS, msg_id)
+    }
+
+    // --- Edit History ---
+
+    /// Store an edit record linking an original message to its replacement.
+    ///
+    /// The edit chain is ordered by `edit_timestamp`, allowing retrieval of
+    /// the full edit history in chronological order.
+    pub fn store_edit(
+        &self,
+        original_msg_id: &[u8; 32],
+        edit_timestamp: u64,
+        edit_msg_id: &[u8; 32],
+    ) -> Result<()> {
+        use super::schema;
+        let key = schema::encode_edit_history_key(original_msg_id, edit_timestamp);
+        self.put_cf(cf::EDIT_HISTORY, &key, edit_msg_id)
+    }
+
+    /// Get the edit history for a message (returns edit_msg_ids in chronological order).
+    pub fn get_edit_history(
+        &self,
+        original_msg_id: &[u8; 32],
+    ) -> Result<Vec<(u64, [u8; 32])>> {
+        let entries = self.prefix_iter_cf(cf::EDIT_HISTORY, original_msg_id, 100)?;
+        Ok(entries
+            .into_iter()
+            .filter_map(|(key, value)| {
+                // Key layout: original_msg_id(32) + edit_timestamp(8)
+                if key.len() == 40 && value.len() == 32 {
+                    let ts = u64::from_be_bytes(key[32..40].try_into().ok()?);
+                    let edit_id: [u8; 32] = value.try_into().ok()?;
+                    Some((ts, edit_id))
+                } else {
+                    None
+                }
+            })
+            .collect())
+    }
+
+    /// Check if a message has been edited.
+    pub fn is_edited(&self, msg_id: &[u8; 32]) -> Result<bool> {
+        let entries = self.prefix_iter_cf(cf::EDIT_HISTORY, msg_id, 1)?;
+        Ok(!entries.is_empty())
+    }
+
+    // --- Chat Reactions ---
+
+    /// Add or remove a reaction on a channel chat message, updating cached counts atomically.
+    ///
+    /// Mirrors [`toggle_news_reaction`] but operates on the CHAT_REACTIONS
+    /// and CHAT_REACTION_COUNTS column families.
+    pub fn toggle_chat_reaction(
+        &self,
+        msg_id: &[u8; 32],
+        emoji: &str,
+        author: &str,
+        remove: bool,
+    ) -> Result<()> {
+        use super::schema;
+        let reaction_key = schema::encode_chat_reaction_key(msg_id, emoji, author);
+        let count_key = schema::encode_chat_reaction_count_key(msg_id, emoji);
+
+        let exists = self.exists_cf(cf::CHAT_REACTIONS, &reaction_key)?;
+
+        let mut batch = WriteBatch::default();
+        let reactions_cf = self.cf_handle(cf::CHAT_REACTIONS)?;
+        let counts_cf = self.cf_handle(cf::CHAT_REACTION_COUNTS)?;
+
+        if remove {
+            if !exists {
+                return Ok(());
+            }
+            batch.delete_cf(&reactions_cf, &reaction_key);
+            let count = self.get_chat_reaction_count(msg_id, emoji)?.saturating_sub(1);
+            batch.put_cf(&counts_cf, &count_key, &count.to_be_bytes());
+        } else {
+            if exists {
+                return Ok(()); // already reacted
+            }
+            batch.put_cf(&reactions_cf, &reaction_key, &[]);
+            let count = self.get_chat_reaction_count(msg_id, emoji)? + 1;
+            batch.put_cf(&counts_cf, &count_key, &count.to_be_bytes());
+        }
+        self.write_batch(batch)
+    }
+
+    /// Get the reaction count for a specific emoji on a channel chat message.
+    pub fn get_chat_reaction_count(&self, msg_id: &[u8; 32], emoji: &str) -> Result<u64> {
+        let key = super::schema::encode_chat_reaction_count_key(msg_id, emoji);
+        match self.get_cf(cf::CHAT_REACTION_COUNTS, &key)? {
+            Some(bytes) if bytes.len() == 8 => {
+                Ok(u64::from_be_bytes(bytes.try_into().unwrap()))
+            }
+            _ => Ok(0),
+        }
+    }
+
+    /// Get all reactions for a channel chat message with counts.
+    pub fn get_chat_reactions(
+        &self,
+        msg_id: &[u8; 32],
+    ) -> Result<Vec<(String, u64)>> {
+        let prefix = msg_id.to_vec();
+        let entries = self.prefix_iter_cf(cf::CHAT_REACTION_COUNTS, &prefix, 100)?;
+        Ok(entries
+            .into_iter()
+            .filter_map(|(key, value)| {
+                if key.len() > 32 && value.len() == 8 {
+                    let emoji = String::from_utf8(key[32..].to_vec()).ok()?;
+                    let count = u64::from_be_bytes(value.try_into().ok()?);
+                    if count > 0 {
+                        Some((emoji, count))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect())
+    }
+
+    // --- Moderation ---
+
+    /// Store a report against a message or user.
+    ///
+    /// Each reporter can only submit one report per target (keyed by target + reporter).
+    pub fn store_report(
+        &self,
+        target_id: &[u8; 32],
+        reporter: &str,
+        reason: &str,
+        details: &str,
+        timestamp: u64,
+    ) -> Result<()> {
+        use super::schema;
+        let key = schema::encode_report_key(target_id, reporter);
+        let value = serde_json::to_vec(&serde_json::json!({
+            "reporter": reporter,
+            "reason": reason,
+            "details": details,
+            "timestamp": timestamp,
+        }))?;
+        self.put_cf(cf::REPORTS, &key, &value)
+    }
+
+    /// Get all reports for a target (message or user).
+    pub fn get_reports(&self, target_id: &[u8; 32]) -> Result<Vec<serde_json::Value>> {
+        let entries = self.prefix_iter_cf(cf::REPORTS, target_id, 1000)?;
+        Ok(entries
+            .into_iter()
+            .filter_map(|(_, value)| serde_json::from_slice(&value).ok())
+            .collect())
+    }
+
+    /// Store a counter-vote on a report, indicating community disagreement.
+    pub fn store_counter_vote(
+        &self,
+        target_id: &[u8; 32],
+        voter: &str,
+        timestamp: u64,
+    ) -> Result<()> {
+        use super::schema;
+        let key = schema::encode_counter_vote_key(target_id, voter);
+        self.put_cf(cf::COUNTER_VOTES, &key, &timestamp.to_be_bytes())
+    }
+
+    /// Get the counter-vote count for a target.
+    pub fn get_counter_vote_count(&self, target_id: &[u8; 32]) -> Result<u64> {
+        let entries = self.prefix_iter_cf(cf::COUNTER_VOTES, target_id, 10_000)?;
+        Ok(entries.len() as u64)
+    }
+
+    /// Store a channel mute record.
+    ///
+    /// A `duration_secs` of 0 means a permanent mute. Otherwise the mute
+    /// expires after `muted_at + duration_secs * 1000` milliseconds.
+    pub fn store_channel_mute(
+        &self,
+        channel_id: u64,
+        target: &str,
+        muted_by: &str,
+        duration_secs: u64,
+        reason: &str,
+        muted_at: u64,
+    ) -> Result<()> {
+        use super::schema;
+        let key = schema::encode_channel_mute_key(channel_id, target);
+        let value = serde_json::to_vec(&serde_json::json!({
+            "muted_by": muted_by,
+            "duration_secs": duration_secs,
+            "reason": reason,
+            "muted_at": muted_at,
+        }))?;
+        self.put_cf(cf::CHANNEL_MUTES, &key, &value)
+    }
+
+    /// Check if a user is muted in a channel, handling expiration.
+    ///
+    /// Returns `true` for permanent mutes (duration_secs == 0) or mutes that
+    /// haven't expired yet. Expired mutes are cleaned up automatically.
+    pub fn is_channel_muted(&self, channel_id: u64, address: &str) -> Result<bool> {
+        use super::schema;
+        let key = schema::encode_channel_mute_key(channel_id, address);
+        match self.get_cf(cf::CHANNEL_MUTES, &key)? {
+            Some(data) => {
+                if let Ok(record) = serde_json::from_slice::<serde_json::Value>(&data) {
+                    let duration = record.get("duration_secs")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    if duration > 0 {
+                        let muted_at = record.get("muted_at")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        let now_ms = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64;
+                        let elapsed_secs = now_ms.saturating_sub(muted_at) / 1000;
+                        if elapsed_secs >= duration {
+                            // Mute expired — clean up
+                            let _ = self.delete_cf(cf::CHANNEL_MUTES, &key);
+                            return Ok(false);
+                        }
+                    }
+                }
+                Ok(true) // permanent mute or not yet expired
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Remove a channel mute (for unmuting).
+    pub fn remove_channel_mute(&self, channel_id: u64, address: &str) -> Result<()> {
+        use super::schema;
+        let key = schema::encode_channel_mute_key(channel_id, address);
+        self.delete_cf(cf::CHANNEL_MUTES, &key)
+    }
+
+    // --- Settings Sync ---
+
+    /// Store encrypted settings blob for a user.
+    ///
+    /// The blob is opaque to the node — encryption/decryption happens client-side.
+    pub fn store_settings(&self, wallet_address: &str, data: &[u8]) -> Result<()> {
+        self.put_cf(cf::SETTINGS_SYNC, wallet_address.as_bytes(), data)
+    }
+
+    /// Get encrypted settings blob for a user.
+    pub fn get_settings(&self, wallet_address: &str) -> Result<Option<Vec<u8>>> {
+        self.get_cf(cf::SETTINGS_SYNC, wallet_address.as_bytes())
+    }
+
+    // --- Notifications ---
+
+    /// Store a notification for a user.
+    ///
+    /// Notifications are stored in reverse-chronological order (newest first)
+    /// using negated timestamps in the key.
+    pub fn store_notification(
+        &self,
+        target_address: &str,
+        notification_id: &[u8; 32],
+        timestamp: u64,
+        notification: &serde_json::Value,
+    ) -> Result<()> {
+        use super::schema;
+        let key = schema::encode_notification_key(target_address, timestamp, notification_id);
+        let value = serde_json::to_vec(notification)?;
+        self.put_cf(cf::NOTIFICATIONS, &key, &value)
+    }
+
+    /// Get notifications for a user, optionally filtered by a since timestamp.
+    ///
+    /// Returns notifications in reverse-chronological order (newest first).
+    /// If `since` is provided, only notifications newer than that timestamp are returned.
+    pub fn get_notifications(
+        &self,
+        address: &str,
+        since: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<serde_json::Value>> {
+        let mut prefix = Vec::with_capacity(address.len() + 1);
+        prefix.extend_from_slice(address.as_bytes());
+        prefix.push(0xFF);
+
+        let entries = self.prefix_iter_cf(cf::NOTIFICATIONS, &prefix, limit)?;
+        Ok(entries
+            .into_iter()
+            .filter_map(|(key, value)| {
+                // Key layout: address + 0xFF + !timestamp(8) + notification_id(32)
+                let ts_start = prefix.len();
+                if key.len() < ts_start + 8 + 32 {
+                    return None;
+                }
+                let neg_ts = u64::from_be_bytes(key[ts_start..ts_start + 8].try_into().ok()?);
+                let timestamp = !neg_ts;
+
+                // Filter by since timestamp if provided
+                if let Some(since_ts) = since {
+                    if timestamp <= since_ts {
+                        return None;
+                    }
+                }
+
+                serde_json::from_slice(&value).ok()
+            })
+            .collect())
+    }
+
+    /// Delete notifications older than a given timestamp (for 30-day TTL cleanup).
+    ///
+    /// Returns the number of deleted notifications.
+    pub fn cleanup_old_notifications(&self, address: &str, older_than: u64) -> Result<u64> {
+        let mut prefix = Vec::with_capacity(address.len() + 1);
+        prefix.extend_from_slice(address.as_bytes());
+        prefix.push(0xFF);
+
+        let entries = self.prefix_iter_cf(cf::NOTIFICATIONS, &prefix, 10_000)?;
+        let mut deleted = 0u64;
+
+        for (key, _) in &entries {
+            let ts_start = prefix.len();
+            if key.len() < ts_start + 8 + 32 {
+                continue;
+            }
+            let neg_ts = u64::from_be_bytes(key[ts_start..ts_start + 8].try_into().unwrap_or([0; 8]));
+            let timestamp = !neg_ts;
+
+            if timestamp < older_than {
+                self.delete_cf(cf::NOTIFICATIONS, key)?;
+                deleted += 1;
+            }
+        }
+
+        Ok(deleted)
+    }
+
     // --- Anchor Verification ---
 
     /// Compute the anchor verification status for a given node.

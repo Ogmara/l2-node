@@ -5,6 +5,61 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0] - 2026-04-02
+
+### Added
+- **9 new column families** — `deletion_markers`, `edit_history`, `chat_reactions`,
+  `chat_reaction_counts`, `reports`, `counter_votes`, `channel_mutes`,
+  `settings_sync`, `notifications` with full key encoders and storage helpers.
+- **Moderation routing** — `Report` (0x40), `CounterVote` (0x41), and `ChannelMute`
+  (0x42) messages now stored and indexed. Reports and counter-votes tracked per
+  target. Mutes stored with expiration support.
+- **Account/Device routing** — `SettingsSync` (0x33) stores encrypted settings
+  per user. `DeviceRevocation` (0x32) revokes device keys via identity resolver.
+  `DeletionRequest` (0x50) soft-deletes single messages or all user news posts.
+- **5 new API endpoints:**
+  - `GET /api/v1/users/{address}/posts` — user's news posts with enrichment
+  - `GET /api/v1/notifications` — persisted mention notifications (30-day retention)
+  - `GET /api/v1/moderation/reports?target=<hex>` — transparency log with score
+  - `GET /api/v1/moderation/user/{address}` — reputation profile with trust score
+  - `GET /api/v1/account/export` — downloadable text file with all user data
+- **Notification persistence** — NotificationEngine now stores notifications in
+  the NOTIFICATIONS CF for API retrieval, not just WebSocket broadcast.
+- **`create_channel` handler** — `POST /api/v1/channels` now returns
+  `{ "ok": true, "msg_id": "...", "channel_id": N }` instead of generic post_message.
+- **`enrich_message_json` helper** — centralized deletion/edit status enrichment
+  applied to all message-returning endpoints.
+- **Mute enforcement in API** — `get_channel_messages` adds `"muted": true` flag
+  on messages from muted authors (content still delivered, clients hide by default).
+
+### Changed
+- All message-returning endpoints now check `DELETION_MARKERS` and `EDIT_HISTORY`,
+  adding `"deleted": true` / `"edited": true` fields and blanking deleted payloads.
+- Payload validators wired for CounterVote, ChannelMute, SettingsSync,
+  DeviceRevocation, and DeletionRequest message types.
+
+### Removed
+- Stale TODO comment about ChannelDelete in router.rs (already implemented via API).
+
+## [0.10.0] - 2026-04-02
+
+### Added
+- **Edit/Delete message routing (Phase 2)** — full routing pipeline for 8
+  message types: ChatEdit, ChatDelete, ChatReaction, DirectMessageEdit,
+  DirectMessageDelete, DirectMessageReaction, NewsEdit, NewsDelete.
+- **`authorize_edit_delete` method** — verifies original message authorship,
+  enforces 30-minute edit window, and requires registered user for NewsEdit.
+- **`extract_channel_id` for ChatEdit/ChatDelete** — enables channel-scoped
+  ban enforcement for edit and delete operations.
+- **`update_indexes` arms** — stores edit history (EDIT_HISTORY CF), deletion
+  markers (DELETION_MARKERS CF), and chat reactions (CHAT_REACTIONS CF). DM
+  reactions are encrypted and intentionally not indexed.
+- **Payload validators** — `validate_chat_edit`, `validate_chat_delete`,
+  `validate_dm_edit`, `validate_dm_delete`, `validate_news_edit`,
+  `validate_news_delete` with type-specific length limits.
+- **Type-specific validation dispatch** — Edit and Delete payloads now route
+  to the correct validator based on `msg_type` (chat vs DM vs news limits).
+
 ## [0.9.7] - 2026-04-02
 
 ### Fixed

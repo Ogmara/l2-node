@@ -219,6 +219,11 @@ impl MessageRouter {
             return RouteResult::Rejected(format!("unauthorized: {}", e));
         }
 
+        // Step 7d: Authorize edit/delete operations — author must match original, edits have 30-min window
+        if let Err(e) = self.authorize_edit_delete(&envelope, &resolved_author, now_ms) {
+            return RouteResult::Rejected(format!("edit/delete denied: {}", e));
+        }
+
         // Step 8: Store message (atomically increments total_messages counter)
         if let Err(e) = self.storage.store_message(&envelope.msg_id, raw_bytes) {
             return RouteResult::Rejected(format!("storage error: {}", e));
@@ -355,9 +360,22 @@ impl MessageRouter {
                 DeserializedPayload::ChannelCreate(ref p) => validation::validate_channel_create(p),
                 DeserializedPayload::ChannelUpdate(ref p) => validation::validate_channel_update(p),
                 DeserializedPayload::ProfileUpdate(ref p) => validation::validate_profile_update(p),
-                DeserializedPayload::Edit(ref p) => validation::validate_edit(p),
+                DeserializedPayload::Edit(ref p) => match envelope.msg_type {
+                    MessageType::ChatEdit => validation::validate_chat_edit(p),
+                    MessageType::DirectMessageEdit => validation::validate_dm_edit(p),
+                    MessageType::NewsEdit => validation::validate_news_edit(p),
+                    _ => validation::validate_edit(p),
+                },
+                DeserializedPayload::Delete(ref p) => match envelope.msg_type {
+                    MessageType::ChatDelete => validation::validate_chat_delete(p),
+                    MessageType::DirectMessageDelete => validation::validate_dm_delete(p),
+                    MessageType::NewsDelete => validation::validate_news_delete(p),
+                    _ => Ok(()),
+                },
                 DeserializedPayload::Reaction(ref p) => validation::validate_reaction(p),
                 DeserializedPayload::Report(ref p) => validation::validate_report(p),
+                DeserializedPayload::CounterVote(ref p) => validation::validate_counter_vote(p),
+                DeserializedPayload::ChannelMute(ref p) => validation::validate_channel_mute(p),
                 DeserializedPayload::DeviceDelegation(ref p) => {
                     validation::validate_device_delegation(p)
                 }
@@ -399,6 +417,15 @@ impl MessageRouter {
                 }
                 DeserializedPayload::DirectMessage(ref p) => {
                     validation::validate_direct_message(resolved_author, p)
+                }
+                DeserializedPayload::SettingsSync(ref p) => {
+                    validation::validate_settings_sync(p)
+                }
+                DeserializedPayload::DeviceRevocation(ref p) => {
+                    validation::validate_device_revocation(p)
+                }
+                DeserializedPayload::DeletionRequest(ref p) => {
+                    validation::validate_deletion_request(p)
                 }
                 // Types with no specific validation rules (NewsReaction uses existing validate_reaction)
                 _ => Ok(()),
@@ -561,12 +588,92 @@ impl MessageRouter {
         }
     }
 
+    /// Authorize edit and delete operations.
+    ///
+    /// Verifies:
+    /// 1. The target message exists.
+    /// 2. The resolved author matches the original message's author.
+    /// 3. For edits: the edit is within the 30-minute window.
+    /// 4. For NewsEdit: the user must be a registered user (exists in USERS CF).
+    fn authorize_edit_delete(
+        &self,
+        envelope: &Envelope,
+        resolved_author: &str,
+        now_ms: u64,
+    ) -> Result<(), String> {
+        // Only applies to edit/delete message types
+        let (target_id, is_edit) = match envelope.msg_type {
+            MessageType::ChatEdit | MessageType::DirectMessageEdit | MessageType::NewsEdit => {
+                let payload = rmp_serde::from_slice::<EditPayload>(&envelope.payload)
+                    .map_err(|e| format!("failed to deserialize edit payload: {}", e))?;
+                (payload.target_id, true)
+            }
+            MessageType::ChatDelete | MessageType::DirectMessageDelete | MessageType::NewsDelete => {
+                let payload = rmp_serde::from_slice::<DeletePayload>(&envelope.payload)
+                    .map_err(|e| format!("failed to deserialize delete payload: {}", e))?;
+                (payload.target_id, false)
+            }
+            _ => return Ok(()), // not an edit/delete message
+        };
+
+        // 1. Look up the original message
+        let original_bytes = self
+            .storage
+            .get_cf(schema::cf::MESSAGES, &target_id)
+            .map_err(|e| format!("storage error: {}", e))?
+            .ok_or_else(|| "target message not found".to_string())?;
+
+        // 2. Deserialize the original envelope to get its author
+        let original_envelope: Envelope = rmp_serde::from_slice(&original_bytes)
+            .map_err(|e| format!("failed to deserialize original message: {}", e))?;
+
+        // 3. Resolve the original author to wallet address
+        let original_resolved = self
+            .identity
+            .resolve(&original_envelope.author)
+            .map_err(|e| format!("failed to resolve original author: {}", e))?;
+
+        // 4. Verify authorship — only the original author can edit/delete their message
+        if resolved_author != original_resolved {
+            return Err("only the original author can edit/delete this message".into());
+        }
+
+        // 5. For edits: enforce 30-minute window from original timestamp
+        if is_edit {
+            const EDIT_WINDOW_MS: u64 = 30 * 60 * 1000;
+            if now_ms.saturating_sub(original_envelope.timestamp) > EDIT_WINDOW_MS {
+                return Err("edit window expired (30 minutes from original message)".into());
+            }
+        }
+
+        // 6. For NewsEdit: additionally require user to be registered
+        if envelope.msg_type == MessageType::NewsEdit {
+            if !self
+                .storage
+                .exists_cf(schema::cf::USERS, resolved_author.as_bytes())
+                .unwrap_or(false)
+            {
+                return Err("news edits require a registered user account".into());
+            }
+        }
+
+        Ok(())
+    }
+
     /// Extract the channel_id from channel-scoped message payloads.
     fn extract_channel_id(&self, envelope: &Envelope) -> Option<u64> {
         match envelope.msg_type {
             MessageType::ChatMessage => {
                 rmp_serde::from_slice::<ChatMessagePayload>(&envelope.payload)
                     .ok().map(|p| p.channel_id)
+            }
+            MessageType::ChatEdit => {
+                rmp_serde::from_slice::<EditPayload>(&envelope.payload)
+                    .ok().and_then(|p| p.channel_id)
+            }
+            MessageType::ChatDelete => {
+                rmp_serde::from_slice::<DeletePayload>(&envelope.payload)
+                    .ok().and_then(|p| p.channel_id)
             }
             MessageType::ChatReaction => {
                 rmp_serde::from_slice::<ReactionPayload>(&envelope.payload)
@@ -880,12 +987,6 @@ impl MessageRouter {
                     );
                 }
             }
-            // TODO: Add ChannelDelete support — when creator deletes a channel:
-            // 1. Remove all members from CHANNEL_MEMBERS
-            // 2. Remove channel metadata from CHANNELS
-            // 3. Decrement TOTAL_CHANNELS
-            // 4. Optionally: remove all channel messages from CHANNEL_MSGS
-            // Requires adding MessageType::ChannelDelete (or use ChannelUpdate with deleted flag)
             MessageType::ChannelLeave => {
                 if let Ok(payload) =
                     rmp_serde::from_slice::<ChannelLeavePayload>(&envelope.payload)
@@ -1098,6 +1199,204 @@ impl MessageRouter {
                     )?;
                 }
             }
+            MessageType::ChatEdit => {
+                if let Ok(payload) =
+                    rmp_serde::from_slice::<EditPayload>(&envelope.payload)
+                {
+                    self.storage.store_edit(
+                        &payload.target_id,
+                        envelope.timestamp,
+                        &envelope.msg_id,
+                    )?;
+                }
+            }
+            MessageType::ChatDelete => {
+                if let Ok(payload) =
+                    rmp_serde::from_slice::<DeletePayload>(&envelope.payload)
+                {
+                    self.storage.store_deletion_marker(
+                        &payload.target_id,
+                        resolved_author,
+                        envelope.timestamp,
+                    )?;
+                }
+            }
+            MessageType::ChatReaction => {
+                if let Ok(payload) =
+                    rmp_serde::from_slice::<ReactionPayload>(&envelope.payload)
+                {
+                    self.storage.toggle_chat_reaction(
+                        &payload.target_id,
+                        &payload.emoji,
+                        resolved_author,
+                        payload.remove,
+                    )?;
+                }
+            }
+            MessageType::DirectMessageEdit => {
+                if let Ok(payload) =
+                    rmp_serde::from_slice::<EditPayload>(&envelope.payload)
+                {
+                    self.storage.store_edit(
+                        &payload.target_id,
+                        envelope.timestamp,
+                        &envelope.msg_id,
+                    )?;
+                }
+            }
+            MessageType::DirectMessageDelete => {
+                if let Ok(payload) =
+                    rmp_serde::from_slice::<DeletePayload>(&envelope.payload)
+                {
+                    self.storage.store_deletion_marker(
+                        &payload.target_id,
+                        resolved_author,
+                        envelope.timestamp,
+                    )?;
+                }
+            }
+            // DM reactions are encrypted — the reaction payload is end-to-end encrypted
+            // content, so we cannot parse emoji/target_id for indexing. The envelope is
+            // already stored in MESSAGES (step 8). No additional indexing needed.
+            MessageType::DirectMessageReaction => {}
+            MessageType::NewsEdit => {
+                if let Ok(payload) =
+                    rmp_serde::from_slice::<EditPayload>(&envelope.payload)
+                {
+                    self.storage.store_edit(
+                        &payload.target_id,
+                        envelope.timestamp,
+                        &envelope.msg_id,
+                    )?;
+                }
+            }
+            MessageType::NewsDelete => {
+                if let Ok(payload) =
+                    rmp_serde::from_slice::<DeletePayload>(&envelope.payload)
+                {
+                    self.storage.store_deletion_marker(
+                        &payload.target_id,
+                        resolved_author,
+                        envelope.timestamp,
+                    )?;
+                }
+            }
+            MessageType::SettingsSync => {
+                if let Ok(payload) =
+                    rmp_serde::from_slice::<SettingsSyncPayload>(&envelope.payload)
+                {
+                    self.storage.store_settings(
+                        resolved_author,
+                        &payload.encrypted_settings,
+                    )?;
+                    debug!(author = %resolved_author, "Settings synced");
+                }
+            }
+            MessageType::DeviceRevocation => {
+                if let Ok(payload) =
+                    rmp_serde::from_slice::<DeviceRevocationPayload>(&envelope.payload)
+                {
+                    // Convert hex pubkey to klv1 address
+                    let pubkey_bytes = hex::decode(&payload.device_pub_key)
+                        .context("invalid device_pub_key hex")?;
+                    let pubkey_array: [u8; 32] = pubkey_bytes.try_into()
+                        .map_err(|_| anyhow::anyhow!("device_pub_key must be 32 bytes"))?;
+                    let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&pubkey_array)
+                        .map_err(|e| anyhow::anyhow!("invalid Ed25519 public key: {}", e))?;
+                    let device_address = crypto::pubkey_to_address(&verifying_key)
+                        .map_err(|e| anyhow::anyhow!("failed to encode device address: {}", e))?;
+
+                    let revoked = self.identity.revoke_device(&device_address, resolved_author)
+                        .context("revoking device")?;
+                    if revoked {
+                        debug!(
+                            device = %device_address,
+                            wallet = %resolved_author,
+                            "Device revoked"
+                        );
+                    } else {
+                        warn!(
+                            device = %device_address,
+                            wallet = %resolved_author,
+                            "Device revocation failed: device not found or not owned"
+                        );
+                    }
+                }
+            }
+            MessageType::DeletionRequest => {
+                if let Ok(payload) =
+                    rmp_serde::from_slice::<DeletionRequestPayload>(&envelope.payload)
+                {
+                    match payload.delete_type {
+                        DeletionType::SingleMessage => {
+                            if let Some(target_id) = payload.target_id {
+                                self.storage.store_deletion_marker(
+                                    &target_id,
+                                    resolved_author,
+                                    envelope.timestamp,
+                                )?;
+                                debug!(
+                                    target = %hex::encode(target_id),
+                                    author = %resolved_author,
+                                    "Single message deletion marker stored"
+                                );
+                            }
+                        }
+                        DeletionType::AllUserContent => {
+                            // Mark all of the user's news posts as deleted.
+                            // This is the most common use case for account deletion.
+                            let prefix = {
+                                let mut p = Vec::with_capacity(resolved_author.len() + 1);
+                                p.extend_from_slice(resolved_author.as_bytes());
+                                p.push(0xFF); // separator matching encode_news_by_author_key
+                                p
+                            };
+                            // Iterate the user's news posts and store deletion markers
+                            let mut deleted_count: u64 = 0;
+                            // Process in batches to avoid holding too much in memory
+                            let batch_size = 500;
+                            loop {
+                                let entries = self.storage.prefix_iter_cf(
+                                    schema::cf::NEWS_BY_AUTHOR,
+                                    &prefix,
+                                    batch_size,
+                                )?;
+                                if entries.is_empty() {
+                                    break;
+                                }
+                                for (key, _) in &entries {
+                                    // Key format: (author_bytes, 0xFF, !timestamp:8, msg_id:32)
+                                    // Extract msg_id from the last 32 bytes
+                                    if key.len() >= 32 {
+                                        let msg_id_offset = key.len() - 32;
+                                        let msg_id: [u8; 32] = key[msg_id_offset..]
+                                            .try_into()
+                                            .unwrap_or([0u8; 32]);
+                                        if msg_id != [0u8; 32] {
+                                            self.storage.store_deletion_marker(
+                                                &msg_id,
+                                                resolved_author,
+                                                envelope.timestamp,
+                                            )?;
+                                            deleted_count += 1;
+                                        }
+                                    }
+                                }
+                                // If we got fewer than batch_size, we've exhausted the prefix
+                                if entries.len() < batch_size {
+                                    break;
+                                }
+                            }
+                            warn!(
+                                author = %resolved_author,
+                                news_posts_marked = deleted_count,
+                                "AllUserContent deletion: marked news posts. \
+                                 Channel message deletion is not yet implemented."
+                            );
+                        }
+                    }
+                }
+            }
             MessageType::ProfileUpdate => {
                 if let Ok(payload) =
                     rmp_serde::from_slice::<ProfileUpdatePayload>(&envelope.payload)
@@ -1147,6 +1446,47 @@ impl MessageRouter {
                     }
 
                     tracing::info!(address = %resolved_author, "Profile updated");
+                }
+            }
+            MessageType::Report => {
+                if let Ok(payload) =
+                    rmp_serde::from_slice::<ReportPayload>(&envelope.payload)
+                {
+                    let reason = format!("{:?}", payload.reason);
+                    let details = payload.details.as_deref().unwrap_or("");
+                    self.storage.store_report(
+                        &payload.target_id,
+                        resolved_author,
+                        &reason,
+                        details,
+                        envelope.timestamp,
+                    )?;
+                }
+            }
+            MessageType::CounterVote => {
+                if let Ok(payload) =
+                    rmp_serde::from_slice::<CounterVotePayload>(&envelope.payload)
+                {
+                    self.storage.store_counter_vote(
+                        &payload.target_id,
+                        resolved_author,
+                        envelope.timestamp,
+                    )?;
+                }
+            }
+            MessageType::ChannelMute => {
+                if let Ok(payload) =
+                    rmp_serde::from_slice::<ChannelMutePayload>(&envelope.payload)
+                {
+                    let reason = payload.reason.as_deref().unwrap_or("");
+                    self.storage.store_channel_mute(
+                        payload.channel_id,
+                        &payload.target_user,
+                        resolved_author,
+                        payload.duration_secs,
+                        reason,
+                        envelope.timestamp,
+                    )?;
                 }
             }
             _ => {}

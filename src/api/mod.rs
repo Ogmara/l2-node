@@ -82,7 +82,19 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
             "/api/v1/news/{msg_id}/reposts",
             get(routes::get_news_reposts),
         )
-        .route("/api/v1/media/{cid}", get(routes::get_media));
+        .route("/api/v1/media/{cid}", get(routes::get_media))
+        .route(
+            "/api/v1/users/{address}/posts",
+            get(routes::get_user_posts),
+        )
+        .route(
+            "/api/v1/moderation/reports",
+            get(routes::get_moderation_reports),
+        )
+        .route(
+            "/api/v1/moderation/user/{address}",
+            get(routes::get_user_moderation),
+        );
 
     // Routes that optionally benefit from auth (e.g. filtering private channels)
     let optional_auth_routes = Router::new()
@@ -108,9 +120,10 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
 
     // Authenticated routes (Klever wallet signature required)
     let auth_routes = Router::new()
+        .route("/api/v1/notifications", get(routes::get_notifications))
         .route("/api/v1/messages", post(routes::post_message))
         .route("/api/v1/profile", put(routes::update_profile))
-        .route("/api/v1/channels", post(routes::post_message))
+        .route("/api/v1/channels", post(routes::create_channel))
         .route("/api/v1/channels/{channel_id}", delete(routes::delete_channel))
         .route("/api/v1/dm/conversations", get(routes::get_dm_conversations))
         .route("/api/v1/dm/unread", get(routes::get_dm_unread_counts))
@@ -178,6 +191,8 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
             delete(routes::revoke_device),
         )
         .route("/api/v1/devices", get(routes::list_devices))
+        // Account data export
+        .route("/api/v1/account/export", get(routes::export_account))
         .layer(middleware::from_fn(auth::auth_middleware));
 
     // WebSocket routes
