@@ -5,6 +5,21 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 2026-04-02
+
+### Security
+- **Private channels exposed to everyone** — `list_channels`, `get_channel`, and
+  `get_channel_messages` returned private channels (type 2) to all users including
+  unauthenticated visitors. Private channels are now filtered from listings and
+  return 404 for non-members on detail/messages endpoints.
+
+### Added
+- **Optional auth middleware** — `optional_auth_middleware` parses auth headers
+  when present but passes through without error when missing. Used on public
+  endpoints that need to optionally know the caller's identity.
+- `check_channel_access()` helper — reusable private channel membership check
+  used across list, detail, and messages endpoints.
+
 ## [0.8.4] - 2026-04-02
 
 ### Fixed

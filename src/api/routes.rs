@@ -212,8 +212,12 @@ pub async fn network_nodes(
 }
 
 /// GET /api/v1/channels
+///
+/// Returns public/read-public channels for everyone. Private channels (type 2)
+/// are only included for authenticated users who are a member of that channel.
 pub async fn list_channels(
     Extension(state): Extension<Arc<AppState>>,
+    auth_user: Option<Extension<AuthUser>>,
     Query(params): Query<PaginationParams>,
 ) -> impl IntoResponse {
     let limit = params.limit.unwrap_or(20).min(100) as usize;
@@ -223,9 +227,23 @@ pub async fn list_channels(
         .prefix_iter_cf(cf::CHANNELS, &[], limit)
     {
         Ok(entries) => {
+            let caller = auth_user.as_ref().map(|u| u.address.as_str());
+
             let channels: Vec<serde_json::Value> = entries
                 .iter()
-                .filter_map(|(_, v)| serde_json::from_slice(v).ok())
+                .filter_map(|(_, v)| serde_json::from_slice::<serde_json::Value>(v).ok())
+                .filter(|ch| {
+                    let ch_type = ch.get("channel_type").and_then(|v| v.as_u64()).unwrap_or(0);
+                    // Public (0) and read-public (1) are visible to everyone
+                    if ch_type != 2 {
+                        return true;
+                    }
+                    // Private (2): only show if caller is a member
+                    let Some(addr) = caller else { return false };
+                    let Some(id) = ch.get("channel_id").and_then(|v| v.as_u64()) else { return false };
+                    let member_key = crate::storage::schema::encode_channel_member_key(id, addr);
+                    state.storage.exists_cf(cf::CHANNEL_MEMBERS, &member_key).unwrap_or(false)
+                })
                 .collect();
             let total = channels.len();
             Json(serde_json::json!({
@@ -244,9 +262,27 @@ pub async fn list_channels(
     }
 }
 
+/// Check if the caller has access to a private channel.
+/// Returns true if the channel is public/read-public, or if the caller is a member.
+fn check_channel_access(
+    state: &AppState,
+    channel_meta: &serde_json::Value,
+    channel_id: u64,
+    caller: Option<&str>,
+) -> bool {
+    let ch_type = channel_meta.get("channel_type").and_then(|v| v.as_u64()).unwrap_or(0);
+    if ch_type != 2 {
+        return true; // public or read-public
+    }
+    let Some(addr) = caller else { return false };
+    let member_key = crate::storage::schema::encode_channel_member_key(channel_id, addr);
+    state.storage.exists_cf(cf::CHANNEL_MEMBERS, &member_key).unwrap_or(false)
+}
+
 /// GET /api/v1/channels/:channel_id — extended response with moderators, pins, member_count
 pub async fn get_channel(
     Extension(state): Extension<Arc<AppState>>,
+    auth_user: Option<Extension<AuthUser>>,
     Path(channel_id): Path<u64>,
 ) -> impl IntoResponse {
     match state
@@ -255,6 +291,10 @@ pub async fn get_channel(
     {
         Ok(Some(data)) => match serde_json::from_slice::<serde_json::Value>(&data) {
             Ok(channel) => {
+                let caller = auth_user.as_ref().map(|u| u.address.as_str());
+                if !check_channel_access(&state, &channel, channel_id, caller) {
+                    return (StatusCode::NOT_FOUND, "channel not found").into_response();
+                }
                 // Fetch moderator list
                 let prefix = channel_id.to_be_bytes();
                 let moderators: Vec<String> = state.storage
@@ -316,9 +356,20 @@ pub async fn get_channel(
 /// GET /api/v1/channels/:channel_id/messages
 pub async fn get_channel_messages(
     Extension(state): Extension<Arc<AppState>>,
+    auth_user: Option<Extension<AuthUser>>,
     Path(channel_id): Path<u64>,
     Query(params): Query<MessageParams>,
 ) -> impl IntoResponse {
+    // Block access to private channel messages for non-members
+    if let Ok(Some(data)) = state.storage.get_cf(cf::CHANNELS, &channel_id.to_be_bytes()) {
+        if let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&data) {
+            let caller = auth_user.as_ref().map(|u| u.address.as_str());
+            if !check_channel_access(&state, &meta, channel_id, caller) {
+                return (StatusCode::NOT_FOUND, "channel not found").into_response();
+            }
+        }
+    }
+
     let limit = params.limit.unwrap_or(50).min(500) as usize;
     let prefix = channel_id.to_be_bytes();
 
