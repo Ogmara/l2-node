@@ -59,6 +59,21 @@ pub async fn auth_middleware(mut req: Request, next: Next) -> Response {
     }
 }
 
+/// Optional auth middleware — inserts AuthUser into extensions if valid auth
+/// headers are present, but passes through without error if missing/invalid.
+/// Used on public routes that optionally benefit from knowing the caller.
+pub async fn optional_auth_middleware(mut req: Request, next: Next) -> Response {
+    let app_state = match req.extensions().get::<Arc<AppState>>() {
+        Some(state) => state.clone(),
+        None => return next.run(req).await,
+    };
+
+    if let Ok(user) = extract_and_verify(&req, &app_state) {
+        req.extensions_mut().insert(user);
+    }
+    next.run(req).await
+}
+
 /// Extract and verify auth headers, then resolve device → wallet.
 fn extract_and_verify(req: &Request, app_state: &AppState) -> Result<AuthUser, String> {
     let headers = req.headers();

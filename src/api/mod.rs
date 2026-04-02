@@ -73,21 +73,11 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
         .route("/api/v1/health", get(routes::health))
         .route("/api/v1/network/stats", get(routes::network_stats))
         .route("/api/v1/network/nodes", get(routes::network_nodes))
-        .route("/api/v1/channels", get(routes::list_channels))
-        .route("/api/v1/channels/{channel_id}", get(routes::get_channel))
-        .route(
-            "/api/v1/channels/{channel_id}/messages",
-            get(routes::get_channel_messages),
-        )
         .route("/api/v1/users/{address}", get(routes::get_user))
         .route("/api/v1/users/{address}/followers", get(routes::get_followers))
         .route("/api/v1/users/{address}/following", get(routes::get_following))
         .route("/api/v1/news", get(routes::list_news))
         .route("/api/v1/news/{msg_id}", get(routes::get_news_post))
-        .route(
-            "/api/v1/news/{msg_id}/reactions",
-            get(routes::get_news_reactions),
-        )
         .route(
             "/api/v1/news/{msg_id}/reposts",
             get(routes::get_news_reposts),
@@ -101,6 +91,20 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
             get(routes::get_channel_pins),
         )
         .route("/api/v1/media/{cid}", get(routes::get_media));
+
+    // Routes that optionally benefit from auth (e.g. filtering private channels)
+    let optional_auth_routes = Router::new()
+        .route("/api/v1/channels", get(routes::list_channels))
+        .route("/api/v1/channels/{channel_id}", get(routes::get_channel))
+        .route(
+            "/api/v1/channels/{channel_id}/messages",
+            get(routes::get_channel_messages),
+        )
+        .route(
+            "/api/v1/news/{msg_id}/reactions",
+            get(routes::get_news_reactions),
+        )
+        .layer(middleware::from_fn(auth::optional_auth_middleware));
 
     // Authenticated routes (Klever wallet signature required)
     let auth_routes = Router::new()
@@ -206,6 +210,7 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
     // Compose all routes with body size limit (10 MB for media uploads)
     Router::new()
         .merge(public_routes)
+        .merge(optional_auth_routes)
         .merge(auth_routes)
         .merge(ws_routes)
         .merge(admin_routes)
