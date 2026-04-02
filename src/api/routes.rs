@@ -1920,9 +1920,9 @@ pub async fn register_device(
         return (StatusCode::BAD_REQUEST, "claim timestamp expired or too far in future").into_response();
     }
 
-    // Build the claim string and verify the wallet signature.
-    // Uses the original (non-normalized) hex from the request, since the wallet
-    // signed this exact string. Signature verification must match what was signed.
+    // Build the claim string for signature verification.
+    // Uses the original (non-normalized) hex from the request, since the signer
+    // signed this exact string.
     let claim_string = format!(
         "ogmara-device-claim:{}:{}:{}",
         body.device_pubkey_hex, body.wallet_address, body.timestamp
@@ -1937,18 +1937,42 @@ pub async fn register_device(
         Err(_) => return (StatusCode::BAD_REQUEST, "invalid signature bytes").into_response(),
     };
 
+    // Try wallet signature first (desktop Klever Extension flow)
     let wallet_verifying_key = match crate::crypto::address_to_verifying_key(&body.wallet_address) {
         Ok(k) => k,
         Err(_) => return (StatusCode::BAD_REQUEST, "invalid wallet_address").into_response(),
     };
 
-    // Verify using Klever message signing format (same as wallet UIs use)
-    if let Err(_) = crate::crypto::signing::verify_klever_message(
+    let wallet_sig_valid = crate::crypto::signing::verify_klever_message(
         &wallet_verifying_key,
         claim_string.as_bytes(),
         &signature,
-    ) {
-        return (StatusCode::UNAUTHORIZED, "wallet signature verification failed").into_response();
+    ).is_ok();
+
+    if !wallet_sig_valid {
+        // Fallback: accept device-signed claim (K5 mobile browser flow).
+        // The device signs the claim instead of the wallet. Security checks:
+        // 1. Caller must be the device itself (auth_user.signing_address == device_address)
+        // 2. Wallet must be a registered on-chain user (exists in USERS CF)
+        let device_sig_valid = crate::crypto::signing::verify_klever_message(
+            &device_verifying_key,
+            claim_string.as_bytes(),
+            &signature,
+        ).is_ok();
+
+        if !device_sig_valid {
+            return (StatusCode::UNAUTHORIZED, "signature verification failed").into_response();
+        }
+
+        // Device-signed: caller MUST be the device itself (not a relay)
+        if auth_user.signing_address != device_address {
+            return (StatusCode::FORBIDDEN, "device-signed claims must come from the device itself").into_response();
+        }
+
+        // Wallet must be a registered on-chain user (prevents claiming arbitrary addresses)
+        if !state.storage.exists_cf(cf::USERS, body.wallet_address.as_bytes()).unwrap_or(false) {
+            return (StatusCode::FORBIDDEN, "wallet must be a registered user for device-signed registration").into_response();
+        }
     }
 
     // Check device limit per wallet
