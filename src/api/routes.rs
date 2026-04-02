@@ -626,6 +626,70 @@ pub async fn post_message(
     }
 }
 
+/// DELETE /api/v1/channels/:channel_id — delete a channel (creator only).
+///
+/// Removes channel metadata, all members, bans, pins, and invites.
+/// Messages remain in storage but the channel is no longer discoverable.
+pub async fn delete_channel(
+    Extension(state): Extension<Arc<AppState>>,
+    Extension(auth_user): Extension<AuthUser>,
+    Path(channel_id): Path<u64>,
+) -> impl IntoResponse {
+    // Verify the requester is the channel creator
+    let channel_key = channel_id.to_be_bytes();
+    match state.storage.get_cf(cf::CHANNELS, &channel_key) {
+        Ok(Some(data)) => {
+            if let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&data) {
+                let creator = meta.get("creator").and_then(|v| v.as_str()).unwrap_or("");
+                if creator != auth_user.address {
+                    return (StatusCode::FORBIDDEN, "only the channel creator can delete").into_response();
+                }
+            } else {
+                return (StatusCode::INTERNAL_SERVER_ERROR, "corrupt channel data").into_response();
+            }
+        }
+        Ok(None) => return (StatusCode::NOT_FOUND, "channel not found").into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "Storage error deleting channel");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+        }
+    }
+
+    // Delete channel metadata
+    let _ = state.storage.delete_cf(cf::CHANNELS, &channel_key);
+
+    // Delete all members
+    if let Ok(members) = state.storage.prefix_iter_cf(cf::CHANNEL_MEMBERS, &channel_key, 10_000) {
+        for (key, _) in &members {
+            let _ = state.storage.delete_cf(cf::CHANNEL_MEMBERS, key);
+        }
+    }
+
+    // Delete all bans
+    if let Ok(bans) = state.storage.prefix_iter_cf(cf::CHANNEL_BANS, &channel_key, 10_000) {
+        for (key, _) in &bans {
+            let _ = state.storage.delete_cf(cf::CHANNEL_BANS, key);
+        }
+    }
+
+    // Delete all pins
+    if let Ok(pins) = state.storage.prefix_iter_cf(cf::CHANNEL_PINS, &channel_key, 100) {
+        for (key, _) in &pins {
+            let _ = state.storage.delete_cf(cf::CHANNEL_PINS, key);
+        }
+    }
+
+    // Delete all invites
+    if let Ok(invites) = state.storage.prefix_iter_cf(cf::CHANNEL_INVITES, &channel_key, 10_000) {
+        for (key, _) in &invites {
+            let _ = state.storage.delete_cf(cf::CHANNEL_INVITES, key);
+        }
+    }
+
+    tracing::info!(channel_id, creator = %auth_user.address, "Channel deleted");
+    Json(OkResponse { ok: true }).into_response()
+}
+
 /// PUT /api/v1/profile — submit a signed profile update
 pub async fn update_profile(
     Extension(state): Extension<Arc<AppState>>,
