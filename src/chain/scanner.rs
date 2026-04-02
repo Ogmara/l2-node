@@ -390,6 +390,39 @@ impl ChainScanner {
                 let key = crate::storage::schema::encode_delegation_key(&user, &device_key);
                 let bytes = serde_json::to_vec(&record)?;
                 self.storage.put_cf(cf::DELEGATIONS, &key, &bytes)?;
+
+                // Also write DEVICE_WALLET_MAP so identity resolution works.
+                // Convert hex pubkey → klv1 address for the map key.
+                if let Ok(pubkey_bytes) = hex::decode(&device_key) {
+                    if pubkey_bytes.len() == 32 {
+                        if let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(
+                            &<[u8; 32]>::try_from(pubkey_bytes.as_slice()).unwrap(),
+                        ) {
+                            if let Ok(device_address) = crate::crypto::pubkey_to_address(&vk) {
+                                let _ = self.storage.put_cf(
+                                    cf::DEVICE_WALLET_MAP,
+                                    device_address.as_bytes(),
+                                    user.as_bytes(),
+                                );
+                                // Also write reverse mapping
+                                let wd_key = crate::storage::schema::encode_wallet_device_key(
+                                    &user, &device_address,
+                                );
+                                let claim = serde_json::json!({
+                                    "device_address": device_address,
+                                    "wallet_address": user,
+                                    "created_at": timestamp,
+                                });
+                                if let Ok(claim_bytes) = serde_json::to_vec(&claim) {
+                                    let _ = self.storage.put_cf(
+                                        cf::WALLET_DEVICES, &wd_key, &claim_bytes,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+
                 info!(user = %user, "Device delegated (on-chain)");
             }
 
