@@ -5,6 +5,14 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.4] - 2026-04-02
+
+### Fixed
+- **Chain scanner missing creator member** — channels created via on-chain events
+  did not add the creator to `CHANNEL_MEMBERS` with role `"creator"`. This caused
+  the web admin dashboard to be hidden for channel owners. Scanner now adds the
+  creator as first member on new channel creation (consistent with message router).
+
 ## [0.8.3] - 2026-04-02
 
 ### Fixed

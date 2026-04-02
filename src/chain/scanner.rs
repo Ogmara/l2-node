@@ -338,6 +338,18 @@ impl ChainScanner {
                     self.storage.increment_stat(
                         crate::storage::schema::state_keys::TOTAL_CHANNELS,
                     )?;
+
+                    // Add creator as first member with "creator" role
+                    let member_key = crate::storage::schema::encode_channel_member_key(
+                        channel_id, &record.creator,
+                    );
+                    let member_record = serde_json::json!({
+                        "joined_at": timestamp,
+                        "role": "creator",
+                    });
+                    if let Ok(member_bytes) = serde_json::to_vec(&member_record) {
+                        let _ = self.storage.put_cf(cf::CHANNEL_MEMBERS, &member_key, &member_bytes);
+                    }
                 }
                 info!(channel_id, slug = %record.slug, "Channel created (on-chain)");
             }
