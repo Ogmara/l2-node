@@ -5,6 +5,15 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.7] - 2026-04-02
+
+### Fixed
+- **Device-signed registration rejected unnecessarily** — removed USERS CF
+  existence check that blocked device-signed claims for wallets not yet
+  registered on-chain. The device auth check (caller = device) is sufficient
+  security. Added server-side logging for registration success/failure to
+  aid debugging.
+
 ## [0.9.6] - 2026-04-02
 
 ### Added

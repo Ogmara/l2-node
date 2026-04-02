@@ -1951,9 +1951,8 @@ pub async fn register_device(
 
     if !wallet_sig_valid {
         // Fallback: accept device-signed claim (K5 mobile browser flow).
-        // The device signs the claim instead of the wallet. Security checks:
-        // 1. Caller must be the device itself (auth_user.signing_address == device_address)
-        // 2. Wallet must be a registered on-chain user (exists in USERS CF)
+        // The device signs the claim instead of the wallet. Security:
+        // caller must be the device itself (proven by auth headers).
         let device_sig_valid = crate::crypto::signing::verify_klever_message(
             &device_verifying_key,
             claim_string.as_bytes(),
@@ -1961,6 +1960,11 @@ pub async fn register_device(
         ).is_ok();
 
         if !device_sig_valid {
+            tracing::warn!(
+                device = %device_address,
+                wallet = %body.wallet_address,
+                "Device registration failed: neither wallet nor device signature valid"
+            );
             return (StatusCode::UNAUTHORIZED, "signature verification failed").into_response();
         }
 
@@ -1969,10 +1973,11 @@ pub async fn register_device(
             return (StatusCode::FORBIDDEN, "device-signed claims must come from the device itself").into_response();
         }
 
-        // Wallet must be a registered on-chain user (prevents claiming arbitrary addresses)
-        if !state.storage.exists_cf(cf::USERS, body.wallet_address.as_bytes()).unwrap_or(false) {
-            return (StatusCode::FORBIDDEN, "wallet must be a registered user for device-signed registration").into_response();
-        }
+        tracing::info!(
+            device = %device_address,
+            wallet = %body.wallet_address,
+            "Device registered via device-signed claim (K5 fallback)"
+        );
     }
 
     // Check device limit per wallet
