@@ -1798,6 +1798,43 @@ pub async fn register_device(
 
     match state.identity.register_device(&claim) {
         Ok(()) => {
+            // Migrate read state from device address to wallet address.
+            // If the user was using a device key before registering, their
+            // channel/DM read cursors are stored under the device address.
+            if device_address != body.wallet_address {
+                let device_prefix = device_address.as_bytes();
+                // Channel read state
+                if let Ok(entries) = state.storage.prefix_iter_cf(cf::CHANNEL_READ_STATE, device_prefix, 500) {
+                    for (old_key, value) in &entries {
+                        // Extract channel_id from old key: (device_addr, 0xFF, channel_id:8)
+                        let sep_pos = device_address.len();
+                        if old_key.len() >= sep_pos + 1 + 8 && old_key[sep_pos] == 0xFF {
+                            let channel_id_bytes: [u8; 8] = old_key[sep_pos + 1..sep_pos + 9].try_into().unwrap_or([0u8; 8]);
+                            let channel_id = u64::from_be_bytes(channel_id_bytes);
+                            let new_key = crate::storage::schema::encode_channel_read_key(&body.wallet_address, channel_id);
+                            // Only migrate if wallet doesn't already have a cursor for this channel
+                            if let Ok(None) = state.storage.get_cf(cf::CHANNEL_READ_STATE, &new_key) {
+                                let _ = state.storage.put_cf(cf::CHANNEL_READ_STATE, &new_key, value);
+                            }
+                        }
+                    }
+                }
+                // DM read state
+                if let Ok(entries) = state.storage.prefix_iter_cf(cf::DM_READ_STATE, device_prefix, 500) {
+                    for (old_key, value) in &entries {
+                        let sep_pos = device_address.len();
+                        if old_key.len() >= sep_pos + 1 + 32 && old_key[sep_pos] == 0xFF {
+                            let mut conv_id = [0u8; 32];
+                            conv_id.copy_from_slice(&old_key[sep_pos + 1..sep_pos + 33]);
+                            let new_key = crate::storage::schema::encode_dm_read_key(&body.wallet_address, &conv_id);
+                            if let Ok(None) = state.storage.get_cf(cf::DM_READ_STATE, &new_key) {
+                                let _ = state.storage.put_cf(cf::DM_READ_STATE, &new_key, value);
+                            }
+                        }
+                    }
+                }
+            }
+
             tracing::info!(
                 device = %device_address,
                 wallet = %body.wallet_address,

@@ -162,6 +162,27 @@ impl MessageRouter {
             Err(e) => return RouteResult::Rejected(format!("identity resolution failed: {}", e)),
         };
 
+        // Step 4d: Require wallet identity for content messages.
+        // Device-only keys (no wallet mapping) can only perform DeviceDelegation.
+        // All other message types require the device to be registered under a wallet.
+        if envelope.msg_type != MessageType::DeviceDelegation
+            && envelope.msg_type.requires_registration()
+            && resolved_author == envelope.author
+        {
+            // resolved_author == envelope.author means no wallet mapping was found
+            // (the resolver returned the device address as-is).
+            // Check if this is truly a built-in wallet (address is self-registered)
+            // by looking up the USERS table.
+            if self.storage.get_cf(
+                crate::storage::schema::cf::USERS,
+                envelope.author.as_bytes(),
+            ).ok().flatten().is_none() {
+                return RouteResult::Rejected(
+                    "wallet identity required: connect a wallet before posting".into(),
+                );
+            }
+        }
+
         // Step 5: Verify timestamp (±5 min drift)
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
