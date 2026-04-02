@@ -823,7 +823,7 @@ pub async fn get_dm_messages(
     Path(address): Path<String>,
     Query(params): Query<MessageParams>,
 ) -> impl IntoResponse {
-    if !address.starts_with("klv1") || address.len() != 44 {
+    if !address.starts_with("klv1") || address.len() < 44 {
         return (StatusCode::BAD_REQUEST, "invalid Klever address").into_response();
     }
     let limit = params.limit.unwrap_or(50).min(500) as usize;
@@ -872,7 +872,7 @@ pub async fn mark_dm_read(
     Extension(auth_user): Extension<AuthUser>,
     Path(address): Path<String>,
 ) -> impl IntoResponse {
-    if !address.starts_with("klv1") || address.len() != 44 {
+    if !address.starts_with("klv1") || address.len() < 44 {
         return (StatusCode::BAD_REQUEST, "invalid Klever address").into_response();
     }
     let now_ms = SystemTime::now()

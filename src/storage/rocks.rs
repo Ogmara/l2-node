@@ -92,9 +92,9 @@ impl Storage {
                     cf_opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(32));
                 }
                 if *name == cf::DM_CONVERSATIONS {
-                    // Key: (wallet_address:44, !timestamp:8, conversation_id:32)
-                    // All klv1 bech32 addresses are exactly 44 characters
-                    cf_opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(44));
+                    // Key: (wallet_address:62, !timestamp:8, conversation_id:32)
+                    // klv1 bech32 addresses with 32-byte Ed25519 keys are 62 characters
+                    cf_opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(62));
                 }
                 ColumnFamilyDescriptor::new(*name, cf_opts)
             })
