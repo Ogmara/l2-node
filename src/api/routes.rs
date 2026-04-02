@@ -400,18 +400,54 @@ pub async fn list_news(
                         >(&envelope_bytes)
                         {
                             let mut post = envelope_to_json(&envelope, &state.identity);
-                            // Enrich with engagement counts per spec
                             if let serde_json::Value::Object(ref mut map) = post {
-                                let reactions = state.storage.get_news_reactions(&msg_id).unwrap_or_default();
-                                let reaction_counts: serde_json::Map<String, serde_json::Value> = reactions
-                                    .into_iter()
-                                    .map(|(e, c)| (e, serde_json::json!(c)))
-                                    .collect();
-                                map.insert("reaction_counts".into(), serde_json::json!(reaction_counts));
-                                map.insert("repost_count".into(),
-                                    serde_json::json!(state.storage.get_repost_count(&msg_id).unwrap_or(0)));
-                                map.insert("comment_count".into(),
-                                    serde_json::json!(state.storage.get_comment_count(&msg_id).unwrap_or(0)));
+                                // Check if this is a comment (msg_type == "NewsComment")
+                                let is_comment = map.get("msg_type")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s == "NewsComment")
+                                    .unwrap_or(false);
+
+                                if is_comment {
+                                    // Enrich with parent post context
+                                    if let Ok(payload) = rmp_serde::from_slice::<
+                                        crate::messages::types::NewsCommentPayload,
+                                    >(&envelope.payload) {
+                                        map.insert("parent_post_id".into(),
+                                            serde_json::json!(hex::encode(payload.post_id)));
+                                        // Fetch parent post for author + title preview
+                                        if let Ok(Some(parent_bytes)) = state.storage.get_message(&payload.post_id) {
+                                            if let Ok(parent_env) = rmp_serde::from_slice::<
+                                                crate::messages::envelope::Envelope,
+                                            >(&parent_bytes) {
+                                                let parent_author = state.identity.resolve(&parent_env.author)
+                                                    .unwrap_or_else(|_| parent_env.author.clone());
+                                                map.insert("parent_author".into(),
+                                                    serde_json::json!(parent_author));
+                                                // Try to extract parent title
+                                                if let Ok(parent_payload) = rmp_serde::from_slice::<
+                                                    crate::messages::types::NewsPostPayload,
+                                                >(&parent_env.payload) {
+                                                    if !parent_payload.title.is_empty() {
+                                                        map.insert("parent_title".into(),
+                                                            serde_json::json!(parent_payload.title));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    // Regular post: enrich with engagement counts
+                                    let reactions = state.storage.get_news_reactions(&msg_id).unwrap_or_default();
+                                    let reaction_counts: serde_json::Map<String, serde_json::Value> = reactions
+                                        .into_iter()
+                                        .map(|(e, c)| (e, serde_json::json!(c)))
+                                        .collect();
+                                    map.insert("reaction_counts".into(), serde_json::json!(reaction_counts));
+                                    map.insert("repost_count".into(),
+                                        serde_json::json!(state.storage.get_repost_count(&msg_id).unwrap_or(0)));
+                                    map.insert("comment_count".into(),
+                                        serde_json::json!(state.storage.get_comment_count(&msg_id).unwrap_or(0)));
+                                }
                             }
                             posts.push(post);
                         }
