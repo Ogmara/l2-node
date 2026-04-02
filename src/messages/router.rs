@@ -214,6 +214,11 @@ impl MessageRouter {
             return RouteResult::Rejected(format!("banned: {}", e));
         }
 
+        // Step 7b2: Check mute enforcement — muted users cannot send messages/reactions
+        if let Err(e) = self.check_channel_mute(&envelope, &resolved_author) {
+            return RouteResult::Rejected(format!("muted: {}", e));
+        }
+
         // Step 7c: Authorize channel admin operations
         if let Err(e) = self.authorize_channel_action(&envelope, &resolved_author) {
             return RouteResult::Rejected(format!("unauthorized: {}", e));
@@ -472,6 +477,24 @@ impl MessageRouter {
                 }
                 Err(format!("user is banned from channel {}", channel_id))
             }
+            _ => Ok(()),
+        }
+    }
+
+    /// Check if user is muted in the channel. Muted users cannot send ChatMessage
+    /// or ChatReaction to the channel. Other message types (edits, deletes, leaves) are allowed.
+    fn check_channel_mute(&self, envelope: &Envelope, resolved_author: &str) -> Result<(), String> {
+        // Only enforce mute on ChatMessage and ChatReaction
+        match envelope.msg_type {
+            MessageType::ChatMessage | MessageType::ChatReaction => {}
+            _ => return Ok(()),
+        }
+        let channel_id = match self.extract_channel_id(envelope) {
+            Some(id) => id,
+            None => return Ok(()),
+        };
+        match self.storage.is_channel_muted(channel_id, resolved_author) {
+            Ok(true) => Err(format!("user is muted in channel {}", channel_id)),
             _ => Ok(()),
         }
     }
@@ -1344,47 +1367,32 @@ impl MessageRouter {
                         }
                         DeletionType::AllUserContent => {
                             // Mark all of the user's news posts as deleted.
-                            // This is the most common use case for account deletion.
                             let prefix = {
                                 let mut p = Vec::with_capacity(resolved_author.len() + 1);
                                 p.extend_from_slice(resolved_author.as_bytes());
-                                p.push(0xFF); // separator matching encode_news_by_author_key
+                                p.push(0xFF);
                                 p
                             };
-                            // Iterate the user's news posts and store deletion markers
+                            let entries = self.storage.prefix_iter_cf(
+                                schema::cf::NEWS_BY_AUTHOR,
+                                &prefix,
+                                10_000, // single scan, capped
+                            )?;
                             let mut deleted_count: u64 = 0;
-                            // Process in batches to avoid holding too much in memory
-                            let batch_size = 500;
-                            loop {
-                                let entries = self.storage.prefix_iter_cf(
-                                    schema::cf::NEWS_BY_AUTHOR,
-                                    &prefix,
-                                    batch_size,
-                                )?;
-                                if entries.is_empty() {
-                                    break;
-                                }
-                                for (key, _) in &entries {
-                                    // Key format: (author_bytes, 0xFF, !timestamp:8, msg_id:32)
-                                    // Extract msg_id from the last 32 bytes
-                                    if key.len() >= 32 {
-                                        let msg_id_offset = key.len() - 32;
-                                        let msg_id: [u8; 32] = key[msg_id_offset..]
-                                            .try_into()
-                                            .unwrap_or([0u8; 32]);
-                                        if msg_id != [0u8; 32] {
-                                            self.storage.store_deletion_marker(
-                                                &msg_id,
-                                                resolved_author,
-                                                envelope.timestamp,
-                                            )?;
-                                            deleted_count += 1;
-                                        }
+                            for (key, _) in &entries {
+                                // Key: (author, 0xFF, !timestamp:8, msg_id:32)
+                                if key.len() >= 32 {
+                                    let msg_id: [u8; 32] = key[key.len() - 32..]
+                                        .try_into()
+                                        .unwrap_or([0u8; 32]);
+                                    if msg_id != [0u8; 32] {
+                                        self.storage.store_deletion_marker(
+                                            &msg_id,
+                                            resolved_author,
+                                            envelope.timestamp,
+                                        )?;
+                                        deleted_count += 1;
                                     }
-                                }
-                                // If we got fewer than batch_size, we've exhausted the prefix
-                                if entries.len() < batch_size {
-                                    break;
                                 }
                             }
                             warn!(
