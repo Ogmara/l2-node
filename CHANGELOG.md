@@ -5,6 +5,18 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.4] - 2026-04-02
+
+### Fixed
+- **K5 delegation identity resolution broken** — chain scanner stored device
+  delegations in `DELEGATIONS` CF but never wrote to `DEVICE_WALLET_MAP`.
+  The auth middleware uses `DEVICE_WALLET_MAP` for device → wallet resolution,
+  so K5-delegated devices were never resolved to their wallet address. All
+  operations (channel access, DMs, unread counts) used the device address
+  instead of the wallet address, causing cross-device identity mismatch.
+  Scanner now writes both `DEVICE_WALLET_MAP` and `WALLET_DEVICES` entries
+  when processing `DeviceDelegated` events.
+
 ## [0.9.3] - 2026-04-02
 
 ### Security
