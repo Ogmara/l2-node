@@ -278,6 +278,7 @@ impl Node {
             self.config.klever.contract_address.clone(),
             ipfs_client,
             identity.clone(),
+            self.config.api.public_url.clone(),
         ));
         let api_config = self.config.clone();
         let api_shutdown_rx = self.shutdown_rx();

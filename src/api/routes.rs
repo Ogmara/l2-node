@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use rocksdb::WriteBatch;
 
-use crate::storage::schema::cf;
+use crate::storage::schema::{cf, state_keys};
 
 use super::auth::AuthUser;
 use super::state::AppState;
@@ -198,7 +198,6 @@ pub async fn network_stats(Extension(state): Extension<Arc<AppState>>) -> Json<S
             anchoring_since: None,
         }
     });
-    use crate::storage::schema::state_keys;
     let total_messages = state.storage.get_stat(state_keys::TOTAL_MESSAGES).unwrap_or(0);
     let total_news_messages = state.storage.get_stat(state_keys::TOTAL_NEWS_MESSAGES).unwrap_or(0);
     let total_channel_messages = state.storage.get_stat(state_keys::TOTAL_CHANNEL_MESSAGES).unwrap_or(0);
@@ -228,20 +227,69 @@ pub async fn network_nodes(
 ) -> impl IntoResponse {
     let limit = params.limit.unwrap_or(100).min(500) as usize;
 
+    // Build self entry — this node always appears first
+    let self_user_count = state.storage.get_stat(state_keys::TOTAL_USERS).unwrap_or(0) as u32;
+    let self_channels: Vec<u64> = state
+        .storage
+        .prefix_iter_cf(cf::CHANNELS, &[], 10_000)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|(key, _)| {
+            if key.len() >= 8 {
+                Some(u64::from_be_bytes(key[..8].try_into().ok()?))
+            } else {
+                None
+            }
+        })
+        .collect();
+    let self_anchor_status = state.storage.compute_anchor_status(&state.node_id).unwrap_or_else(|_| {
+        crate::storage::rocks::AnchorStatus {
+            verified: false,
+            level: "none".to_string(),
+            last_anchor_age_seconds: None,
+            anchoring_since: None,
+            total_anchors: 0,
+        }
+    });
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    let self_entry = NodeEntry {
+        node_id: state.node_id.clone(),
+        api_endpoint: state.public_url.clone(),
+        channels: self_channels,
+        user_count: self_user_count,
+        last_seen: now_ms,
+        anchor_status: self_anchor_status,
+    };
+
     match state.storage.prefix_iter_cf(cf::PEER_DIRECTORY, &[], limit) {
         Ok(entries) => {
-            let nodes: Vec<NodeEntry> = entries
-                .into_iter()
-                .filter_map(|(_, v)| {
+            let mut nodes: Vec<NodeEntry> = Vec::with_capacity(entries.len() + 1);
+            nodes.push(self_entry);
+
+            for (_, v) in entries {
+                let entry = (|| {
                     let ann: serde_json::Value = serde_json::from_slice(&v).ok()?;
                     let node_id = ann.get("node_id")?.as_str()?.to_string();
+                    // Skip if this is our own node (avoid duplicate)
+                    if node_id == state.node_id {
+                        return None;
+                    }
+                    let last_seen = ann.get("last_seen").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let ttl_seconds = ann.get("ttl_seconds").and_then(|v| v.as_u64()).unwrap_or(600);
+                    // Filter stale entries (last_seen + TTL exceeded)
+                    if now_ms > last_seen + ttl_seconds * 1000 {
+                        return None;
+                    }
                     let api_endpoint = ann.get("api_endpoint").and_then(|v| v.as_str()).map(String::from);
                     let channels: Vec<u64> = ann.get("channels")
                         .and_then(|v| v.as_array())
                         .map(|arr| arr.iter().filter_map(|v| v.as_u64()).collect())
                         .unwrap_or_default();
                     let user_count = ann.get("user_count").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                    let last_seen = ann.get("last_seen").and_then(|v| v.as_u64()).unwrap_or(0);
 
                     let anchor_status = state.storage.compute_anchor_status(&node_id).unwrap_or_else(|_| {
                         crate::storage::rocks::AnchorStatus {
@@ -261,8 +309,12 @@ pub async fn network_nodes(
                         last_seen,
                         anchor_status,
                     })
-                })
-                .collect();
+                })();
+                if let Some(entry) = entry {
+                    nodes.push(entry);
+                }
+            }
+
             let total = nodes.len();
             Json(serde_json::json!({
                 "nodes": nodes,
