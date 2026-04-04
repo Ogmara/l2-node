@@ -146,24 +146,11 @@ impl NotificationEngine {
     ) {
         let users = self.local_users.read().await;
 
-        tracing::info!(
-            local_users = users.len(),
-            mentions_count = mentions.len(),
-            mentions = ?mentions,
-            "Checking mentions against local users"
-        );
-
         // Look up channel name once (if applicable)
         let channel_name = channel_id.and_then(|id| self.lookup_channel_name(id));
 
         for mentioned_address in mentions {
-            let is_local = users.contains(mentioned_address);
-            tracing::debug!(
-                address = %mentioned_address,
-                is_local,
-                "Mention check"
-            );
-            if is_local {
+            if users.contains(mentioned_address) {
                 let notification = Notification {
                     notification_type: NotificationType::Mention,
                     msg_id: hex::encode(envelope.msg_id),
@@ -214,12 +201,6 @@ impl NotificationEngine {
 
         // Persist to storage (if configured) so the GET /api/v1/notifications
         // endpoint can retrieve historical notifications.
-        tracing::info!(
-            target = %target_address,
-            msg_id = %notification.msg_id,
-            storage_configured = self.storage.is_some(),
-            "Delivering notification"
-        );
         if let Some(ref storage) = self.storage {
             // Field names match the SDK Notification interface:
             // type (not notification_type), from (not author)
@@ -232,21 +213,13 @@ impl NotificationEngine {
                 "preview": notification.preview,
                 "timestamp": notification.timestamp,
             });
-            match storage.store_notification(
+            if let Err(e) = storage.store_notification(
                 target_address,
                 notification_id,
                 notification.timestamp,
                 &notification_json,
             ) {
-                Ok(()) => {
-                    tracing::info!(
-                        target = %target_address,
-                        "Notification persisted to storage"
-                    );
-                }
-                Err(e) => {
-                    warn!(error = %e, "Failed to persist notification to storage");
-                }
+                warn!(error = %e, "Failed to persist notification to storage");
             }
         }
 
