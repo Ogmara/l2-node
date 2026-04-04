@@ -80,7 +80,8 @@ impl RateCategory {
             MessageType::NewsRepost => Self::Repost,
             MessageType::ChannelKick | MessageType::ChannelBan
             | MessageType::ChannelUnban | MessageType::ChannelMute => Self::ChannelAdmin,
-            MessageType::ChannelAddModerator | MessageType::ChannelRemoveModerator => Self::ModeratorChange,
+            MessageType::ChannelAddModerator | MessageType::ChannelRemoveModerator
+            | MessageType::PrivateChannelKeyDistribution => Self::ModeratorChange,
             MessageType::ChannelInvite => Self::ChannelInvite,
             MessageType::ChannelPinMessage | MessageType::ChannelUnpinMessage => Self::PinUnpin,
             _ => Self::Other,
@@ -435,6 +436,9 @@ impl MessageRouter {
                 DeserializedPayload::DeletionRequest(ref p) => {
                     validation::validate_deletion_request(p)
                 }
+                DeserializedPayload::PrivateChannelKeyDistribution(ref p) => {
+                    validation::validate_private_channel_key_distribution(p)
+                }
                 // Types with no specific validation rules (NewsReaction uses existing validate_reaction)
                 _ => Ok(()),
             },
@@ -616,6 +620,31 @@ impl MessageRouter {
                 }
                 Err("only creator or moderators can invite users".into())
             }
+            // Private channel key distribution — creator or moderator of the channel.
+            // Only valid on the anchor node (where the channel was created).
+            MessageType::PrivateChannelKeyDistribution => {
+                let channel_id = self.extract_channel_id(envelope).unwrap_or(0);
+                // Verify this is a private channel and we are the anchor node
+                let key = channel_id.to_be_bytes();
+                let meta_bytes = self.storage.get_cf(schema::cf::CHANNELS, &key)
+                    .map_err(|e| format!("storage error: {}", e))?
+                    .ok_or_else(|| "channel not found".to_string())?;
+                let meta: serde_json::Value = serde_json::from_slice(&meta_bytes)
+                    .map_err(|e| format!("invalid channel metadata: {}", e))?;
+                let channel_type = meta.get("channel_type").and_then(|v| v.as_u64()).unwrap_or(0);
+                if channel_type != 2 {
+                    return Err("key distribution is only for private channels".into());
+                }
+                if self.is_channel_creator(channel_id, resolved_author)? {
+                    return Ok(());
+                }
+                if self.storage.is_channel_moderator(channel_id, resolved_author)
+                    .unwrap_or(false)
+                {
+                    return Ok(());
+                }
+                Err("only creator or moderators can distribute channel keys".into())
+            }
             _ => Ok(()),
         }
     }
@@ -749,6 +778,10 @@ impl MessageRouter {
             }
             MessageType::ChannelMute => {
                 rmp_serde::from_slice::<ChannelMutePayload>(&envelope.payload)
+                    .ok().map(|p| p.channel_id)
+            }
+            MessageType::PrivateChannelKeyDistribution => {
+                rmp_serde::from_slice::<PrivateChannelKeyDistributionPayload>(&envelope.payload)
                     .ok().map(|p| p.channel_id)
             }
             _ => None,
@@ -1461,6 +1494,47 @@ impl MessageRouter {
                     }
                 }
             }
+            MessageType::PrivateChannelKeyDistribution => {
+                if let Ok(payload) =
+                    rmp_serde::from_slice::<PrivateChannelKeyDistributionPayload>(&envelope.payload)
+                {
+                    // Enforce epoch monotonicity — new epoch must be strictly greater
+                    // than the current latest to prevent key history tampering
+                    if let Ok(Some((current_epoch, _))) =
+                        self.storage.get_private_channel_keys_latest(payload.channel_id)
+                    {
+                        if payload.epoch <= current_epoch {
+                            return Err(anyhow::anyhow!(
+                                "key distribution epoch {} must be > current epoch {}",
+                                payload.epoch,
+                                current_epoch
+                            ));
+                        }
+                    }
+
+                    // Serialize the key distribution data (member_keys map)
+                    let key_data = serde_json::to_vec(&serde_json::json!({
+                        "epoch": payload.epoch,
+                        "member_keys": payload.member_keys,
+                        "distributed_by": resolved_author,
+                        "timestamp": envelope.timestamp,
+                    })).context("serializing key distribution")?;
+
+                    self.storage.store_private_channel_keys(
+                        payload.channel_id,
+                        payload.epoch,
+                        &key_data,
+                    )?;
+
+                    debug!(
+                        channel_id = payload.channel_id,
+                        epoch = payload.epoch,
+                        members = payload.member_keys.len(),
+                        author = %resolved_author,
+                        "Private channel key distribution stored"
+                    );
+                }
+            }
             MessageType::ProfileUpdate => {
                 if let Ok(payload) =
                     rmp_serde::from_slice::<ProfileUpdatePayload>(&envelope.payload)
@@ -1608,10 +1682,36 @@ impl MessageRouter {
                         }
                     }
 
+                    // Filter out private channels from the announcement.
+                    // Per spec §3.14: the channels field MUST only contain public (0x00) and
+                    // read-public (0x01) channel IDs. Private channels are never announced.
+                    // This is defense-in-depth — well-behaved nodes won't include them, but
+                    // we strip them here in case a misbehaving node does.
+                    let public_channels: Vec<u64> = payload.channels.iter()
+                        .filter(|&&ch_id| {
+                            let key = ch_id.to_be_bytes();
+                            match self.storage.get_cf(schema::cf::CHANNELS, &key) {
+                                Ok(Some(meta_bytes)) => {
+                                    match serde_json::from_slice::<serde_json::Value>(&meta_bytes) {
+                                        Ok(meta) => {
+                                            let ct = meta.get("channel_type")
+                                                .and_then(|v| v.as_u64())
+                                                .unwrap_or(0);
+                                            ct != 2 // exclude private channels
+                                        }
+                                        Err(_) => true, // unknown channel — keep it
+                                    }
+                                }
+                                _ => true, // unknown channel — keep it (we may not have metadata)
+                            }
+                        })
+                        .copied()
+                        .collect();
+
                     let record = serde_json::json!({
                         "node_id": payload.node_id,
                         "api_endpoint": payload.api_endpoint,
-                        "channels": payload.channels,
+                        "channels": public_channels,
                         "user_count": payload.user_count,
                         "last_seen": envelope.timestamp,
                         "ttl_seconds": payload.ttl_seconds,

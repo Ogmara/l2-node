@@ -114,6 +114,15 @@ pub mod cf {
     /// (channel_id:8, target_address) → MuteRecord JSON (muted_by, duration_secs, muted_at, reason)
     pub const CHANNEL_MUTES: &str = "channel_mutes";
 
+    // --- Private Channel Anchor Node ---
+
+    /// (channel_id:8, epoch:8) → KeyDistribution JSON (member_keys map)
+    /// Encrypted group key material per epoch, stored on the anchor node.
+    pub const PRIVATE_CHANNEL_KEYS: &str = "private_channel_keys";
+    /// channel_id:8 → AnchorRecord JSON (anchor_url, channel_id, creator)
+    /// Maps private channels to their anchor node URL (for remote private channels).
+    pub const PRIVATE_CHANNEL_ANCHORS: &str = "private_channel_anchors";
+
     // --- Cross-Device Sync ---
 
     /// wallet_address bytes → encrypted settings blob (SettingsSyncPayload serialized)
@@ -167,6 +176,8 @@ pub mod cf {
         CHANNEL_MUTES,
         SETTINGS_SYNC,
         NOTIFICATIONS,
+        PRIVATE_CHANNEL_KEYS,
+        PRIVATE_CHANNEL_ANCHORS,
     ];
 }
 
@@ -492,4 +503,21 @@ pub fn encode_notification_key(target_address: &str, timestamp: u64, notificatio
     key.extend_from_slice(&(!timestamp).to_be_bytes()); // newest first
     key.extend_from_slice(notification_id);
     key
+}
+
+// --- Private Channel key encoding ---
+
+/// Encode a private channel key distribution key: (channel_id, epoch).
+///
+/// Prefix iteration on channel_id returns all epochs for that channel.
+pub fn encode_private_channel_key(channel_id: u64, epoch: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(16);
+    key.extend_from_slice(&channel_id.to_be_bytes());
+    key.extend_from_slice(&epoch.to_be_bytes());
+    key
+}
+
+/// Encode a private channel anchor key: channel_id (8 bytes BE).
+pub fn encode_private_channel_anchor_key(channel_id: u64) -> Vec<u8> {
+    channel_id.to_be_bytes().to_vec()
 }

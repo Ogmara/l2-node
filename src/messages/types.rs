@@ -63,6 +63,9 @@ pub enum MessageType {
     // Account Management
     DeletionRequest = 0x50,
 
+    // Private Channel Management
+    PrivateChannelKeyDistribution = 0x60,
+
     // Network
     NodeAnnouncement = 0xE0,
     Ping = 0xF0,
@@ -112,6 +115,7 @@ impl MessageType {
             0x41 => Some(Self::CounterVote),
             0x42 => Some(Self::ChannelMute),
             0x50 => Some(Self::DeletionRequest),
+            0x60 => Some(Self::PrivateChannelKeyDistribution),
             0xE0 => Some(Self::NodeAnnouncement),
             0xF0 => Some(Self::Ping),
             0xF1 => Some(Self::Pong),
@@ -393,6 +397,10 @@ pub struct ChannelInvitePayload {
     pub channel_id: u64,
     /// User to invite.
     pub target_user: String,
+    /// Anchor node API endpoint (mandatory for private channels, None for public/read-public).
+    /// Tells the invited user's home node where this private channel is hosted.
+    #[serde(default)]
+    pub anchor_node: Option<String>,
 }
 
 // --- News Engagement Payloads ---
@@ -609,6 +617,22 @@ pub struct NodeAnnouncementPayload {
     pub ttl_seconds: u32,
 }
 
+// --- Private Channel Key Distribution (spec 8.1.1) ---
+
+/// Encrypted group key material for a private channel epoch.
+///
+/// The creator's client generates the group key and encrypts it per-member
+/// using X25519 ECDH + HKDF + AES-256-GCM. The anchor node stores this
+/// opaque blob — it cannot decrypt the group key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrivateChannelKeyDistributionPayload {
+    pub channel_id: u64,
+    /// Key rotation epoch (monotonically increasing).
+    pub epoch: u64,
+    /// Per-member encrypted group key: address → (nonce + encrypted_group_key).
+    pub member_keys: std::collections::HashMap<String, Vec<u8>>,
+}
+
 // --- Content Request/Response (spec 5.5.2) ---
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -620,6 +644,10 @@ pub enum ContentRequestType {
     NewsPostsByTag = 0x04,
     UserPosts = 0x05,
     PersonalFeed = 0x06,
+    /// Authenticated request for private channel messages (anchor node only).
+    PrivateChannelMessages = 0x07,
+    /// Authenticated request for private channel group key material.
+    PrivateChannelKeys = 0x08,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -632,6 +660,41 @@ pub struct ContentRequest {
     pub after_timestamp: Option<u64>,
     /// Max messages (max 500).
     pub limit: u32,
+}
+
+/// Authenticated content request for private channels (spec 5.5.5).
+///
+/// Used between nodes for cross-node private channel access. The requesting
+/// node proves membership by signing (channel_id + timestamp + requester).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrivateContentRequest {
+    pub request_type: ContentRequestType,
+    pub channel_id: u64,
+    /// The member requesting access.
+    pub requester: String,
+    /// Ed25519 signature over (channel_id_be8 ++ timestamp_be8 ++ requester_bytes).
+    pub proof: Vec<u8>,
+    /// Timestamp used in the signature (for replay protection).
+    pub timestamp: u64,
+    pub before_id: Option<[u8; 32]>,
+    pub after_id: Option<[u8; 32]>,
+    /// Max messages (max 500).
+    pub limit: u32,
+}
+
+/// Private channel live subscription request (spec 5.5.5).
+///
+/// Replaces GossipSub for private channels — a direct authenticated
+/// libp2p stream between the member's home node and the anchor node.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrivateChannelSubscribe {
+    pub channel_id: u64,
+    /// The subscribing member's address.
+    pub subscriber: String,
+    /// Ed25519 signature proving membership.
+    pub proof: Vec<u8>,
+    /// Timestamp for replay protection.
+    pub timestamp: u64,
 }
 
 /// Deserialize a payload from MessagePack bytes based on the message type.
@@ -680,6 +743,7 @@ pub fn deserialize_payload(
         MessageType::CounterVote => Ok(DeserializedPayload::CounterVote(rmp_serde::from_slice(payload_bytes)?)),
         MessageType::ChannelMute => Ok(DeserializedPayload::ChannelMute(rmp_serde::from_slice(payload_bytes)?)),
         MessageType::DeletionRequest => Ok(DeserializedPayload::DeletionRequest(rmp_serde::from_slice(payload_bytes)?)),
+        MessageType::PrivateChannelKeyDistribution => Ok(DeserializedPayload::PrivateChannelKeyDistribution(rmp_serde::from_slice(payload_bytes)?)),
         MessageType::NodeAnnouncement => Ok(DeserializedPayload::NodeAnnouncement(rmp_serde::from_slice(payload_bytes)?)),
         MessageType::SyncRequest => Ok(DeserializedPayload::ContentRequest(rmp_serde::from_slice(payload_bytes)?)),
         // Ping, Pong, StateRoot, SyncResponse carry opaque bytes
@@ -720,6 +784,7 @@ pub enum DeserializedPayload {
     CounterVote(CounterVotePayload),
     ChannelMute(ChannelMutePayload),
     DeletionRequest(DeletionRequestPayload),
+    PrivateChannelKeyDistribution(PrivateChannelKeyDistributionPayload),
     NodeAnnouncement(NodeAnnouncementPayload),
     ContentRequest(ContentRequest),
     Raw(Vec<u8>),

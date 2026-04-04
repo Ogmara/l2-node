@@ -183,6 +183,11 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
             "/api/v1/channels/{channel_id}/invite/{address}",
             post(routes::invite_user),
         )
+        // Private channel key distribution
+        .route(
+            "/api/v1/channels/{channel_id}/keys",
+            get(routes::get_channel_keys).post(routes::distribute_channel_keys),
+        )
         .route("/api/v1/media/upload", post(routes::upload_media))
         // Device identity management
         .route("/api/v1/devices/register", post(routes::register_device))

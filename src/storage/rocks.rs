@@ -1537,6 +1537,80 @@ impl Storage {
         }
     }
 
+    // --- Private Channel Anchor Node Storage ---
+
+    /// Store encrypted group key material for a private channel epoch.
+    pub fn store_private_channel_keys(
+        &self,
+        channel_id: u64,
+        epoch: u64,
+        key_data: &[u8],
+    ) -> Result<()> {
+        use super::schema;
+        let key = schema::encode_private_channel_key(channel_id, epoch);
+        self.put_cf(cf::PRIVATE_CHANNEL_KEYS, &key, key_data)
+    }
+
+    /// Get the latest (highest epoch) key distribution for a private channel.
+    pub fn get_private_channel_keys_latest(&self, channel_id: u64) -> Result<Option<(u64, Vec<u8>)>> {
+        use super::schema;
+        let prefix = channel_id.to_be_bytes();
+        // Reverse iterate to get the highest epoch first
+        let start = schema::encode_private_channel_key(channel_id, u64::MAX);
+        let entries = self.reverse_iter_cf(cf::PRIVATE_CHANNEL_KEYS, &start, &prefix, 1)?;
+        if let Some((key, value)) = entries.into_iter().next() {
+            if key.len() >= 16 {
+                let epoch = u64::from_be_bytes(key[8..16].try_into().unwrap_or([0; 8]));
+                return Ok(Some((epoch, value)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Get key distribution for a specific epoch.
+    pub fn get_private_channel_keys(&self, channel_id: u64, epoch: u64) -> Result<Option<Vec<u8>>> {
+        use super::schema;
+        let key = schema::encode_private_channel_key(channel_id, epoch);
+        self.get_cf(cf::PRIVATE_CHANNEL_KEYS, &key)
+    }
+
+    /// Store anchor node info for a remote private channel.
+    pub fn store_private_channel_anchor(
+        &self,
+        channel_id: u64,
+        anchor_data: &[u8],
+    ) -> Result<()> {
+        use super::schema;
+        let key = schema::encode_private_channel_anchor_key(channel_id);
+        self.put_cf(cf::PRIVATE_CHANNEL_ANCHORS, &key, anchor_data)
+    }
+
+    /// Get the anchor node info for a private channel.
+    pub fn get_private_channel_anchor(&self, channel_id: u64) -> Result<Option<Vec<u8>>> {
+        use super::schema;
+        let key = schema::encode_private_channel_anchor_key(channel_id);
+        self.get_cf(cf::PRIVATE_CHANNEL_ANCHORS, &key)
+    }
+
+    /// Check if this node is the anchor for a given private channel.
+    ///
+    /// A channel is locally anchored if it exists in the CHANNELS CF with type Private
+    /// and there is no entry in PRIVATE_CHANNEL_ANCHORS (which stores remote anchors).
+    pub fn is_local_anchor(&self, channel_id: u64) -> Result<bool> {
+        use super::schema;
+        let key = channel_id.to_be_bytes();
+        if let Some(meta_bytes) = self.get_cf(cf::CHANNELS, &key)? {
+            let meta: serde_json::Value = serde_json::from_slice(&meta_bytes)
+                .context("deserializing channel metadata")?;
+            if meta.get("channel_type").and_then(|v| v.as_u64()) == Some(2) {
+                // It's a private channel and we have its metadata — we're the anchor
+                let anchor_key = schema::encode_private_channel_anchor_key(channel_id);
+                return Ok(!self.exists_cf(cf::PRIVATE_CHANNEL_ANCHORS, &anchor_key)?);
+            }
+        }
+        Ok(false)
+    }
+
     /// List all devices registered to a wallet address.
     ///
     /// Returns the stored `DeviceClaim` for each device, ordered by key.
