@@ -92,13 +92,26 @@ fn enrich_message_json(msg: &mut serde_json::Value, storage: &crate::storage::ro
         }
     }
 
-    // Check edit status
+    // Check edit status and replace payload with latest edit content
     if let Ok(true) = storage.is_edited(&msg_id) {
         if let serde_json::Value::Object(ref mut map) = msg {
             map.insert("edited".into(), serde_json::json!(true));
             if let Ok(edits) = storage.get_edit_history(&msg_id) {
-                if let Some((last_ts, _)) = edits.last() {
+                if let Some((last_ts, edit_msg_id)) = edits.last() {
                     map.insert("last_edited_at".into(), serde_json::json!(last_ts));
+                    // Fetch the edit envelope and replace payload with new content
+                    if let Ok(Some(edit_bytes)) = storage.get_message(edit_msg_id) {
+                        if let Ok(edit_env) = rmp_serde::from_slice::<
+                            crate::messages::envelope::Envelope,
+                        >(&edit_bytes) {
+                            if let Ok(edit_payload) = rmp_serde::from_slice::<
+                                crate::messages::types::EditPayload,
+                            >(&edit_env.payload) {
+                                // Replace payload with the edited content string
+                                map.insert("payload".into(), serde_json::json!(edit_payload.content));
+                            }
+                        }
+                    }
                 }
             }
         }
