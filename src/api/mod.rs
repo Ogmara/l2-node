@@ -191,6 +191,8 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
             delete(routes::revoke_device),
         )
         .route("/api/v1/devices", get(routes::list_devices))
+        // Settings sync
+        .route("/api/v1/settings", get(routes::get_settings))
         // Account data export
         .route("/api/v1/account/export", get(routes::export_account))
         .layer(middleware::from_fn(auth::auth_middleware));

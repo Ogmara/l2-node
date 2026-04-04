@@ -1348,9 +1348,16 @@ impl MessageRouter {
                 if let Ok(payload) =
                     rmp_serde::from_slice::<SettingsSyncPayload>(&envelope.payload)
                 {
+                    // Store the full payload as JSON so the client can retrieve
+                    // encrypted_settings, nonce, and key_epoch for decryption.
+                    let json = serde_json::json!({
+                        "encrypted_settings": payload.encrypted_settings,
+                        "nonce": payload.nonce,
+                        "key_epoch": payload.key_epoch,
+                    });
                     self.storage.store_settings(
                         resolved_author,
-                        &payload.encrypted_settings,
+                        json.to_string().as_bytes(),
                     )?;
                     debug!(author = %resolved_author, "Settings synced");
                 }

@@ -5,6 +5,17 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.4] - 2026-04-04
+
+### Added
+
+- `GET /api/v1/settings` endpoint — returns encrypted settings with `encrypted_settings`, `nonce`, and `key_epoch` fields
+
+### Fixed
+
+- Settings sync now stores full payload (nonce + key_epoch) instead of just ciphertext, so clients can decrypt
+- Unread counts no longer include the requesting user's own messages
+
 ## [0.11.3] - 2026-04-04
 
 ### Fixed
