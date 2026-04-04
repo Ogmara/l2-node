@@ -1361,19 +1361,29 @@ pub async fn get_dm_unread_counts(
             _ => 0,
         };
 
-        // Count unread messages
+        // Count unread messages, excluding own
         if let Ok(msgs) = state
             .storage
             .prefix_iter_cf(cf::DM_MESSAGES, &conversation_id, 100)
         {
             let mut count = 0u64;
             for (msg_key, _) in &msgs {
-                if msg_key.len() >= 40 {
+                if msg_key.len() >= 72 {
                     let ts_bytes: [u8; 8] =
                         msg_key[32..40].try_into().unwrap_or([0u8; 8]);
                     let msg_ts = u64::from_be_bytes(ts_bytes);
                     if msg_ts > last_read_ts {
-                        count += 1;
+                        // Fetch envelope to check author
+                        let msg_id: [u8; 32] = msg_key[40..72].try_into().unwrap_or([0u8; 32]);
+                        if let Ok(Some(env_bytes)) = state.storage.get_message(&msg_id) {
+                            if let Ok(env) = rmp_serde::from_slice::<crate::messages::envelope::Envelope>(&env_bytes) {
+                                let resolved = state.identity.resolve(&env.author)
+                                    .unwrap_or_else(|_| env.author.clone());
+                                if resolved != auth_user.address {
+                                    count += 1;
+                                }
+                            }
+                        }
                     }
                 }
             }
