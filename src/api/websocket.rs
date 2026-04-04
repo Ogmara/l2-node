@@ -163,9 +163,14 @@ async fn handle_authenticated_ws(socket: WebSocket, state: Arc<AppState>) {
         }
     };
 
+    // Resolve device key → wallet address for notification matching.
+    // Mentions in messages reference wallet addresses, so we must register
+    // the wallet address (not the device/signing key) with the engine.
+    let wallet_address = state.identity.resolve(&auth_address).unwrap_or_else(|_| auth_address.clone());
+
     // Register this user with the notification engine for mention detection
     if let Some(ref engine) = state.notification_engine {
-        engine.add_local_user(&auth_address).await;
+        engine.add_local_user(&wallet_address).await;
     }
 
     // Subscribe to broadcast channel for forwarding messages
@@ -197,7 +202,7 @@ async fn handle_authenticated_ws(socket: WebSocket, state: Arc<AppState>) {
 
     // Unregister user from notification engine on disconnect
     if let Some(ref engine) = state.notification_engine {
-        engine.remove_local_user(&auth_address).await;
+        engine.remove_local_user(&wallet_address).await;
     }
 
     debug!(address = %auth_address, "WebSocket client disconnected");
