@@ -861,7 +861,22 @@ pub async fn post_message(
     use crate::messages::router::RouteResult;
 
     match state.router.process_message(&body) {
-        RouteResult::Accepted { msg_id, .. } => {
+        RouteResult::Accepted {
+            msg_id,
+            raw_bytes,
+            ..
+        } => {
+            // Feed to notification engine for mention detection
+            if let Some(ref engine) = state.notification_engine {
+                let engine = engine.clone();
+                tokio::spawn(async move {
+                    if let Ok(envelope) =
+                        rmp_serde::from_slice::<crate::messages::envelope::Envelope>(&raw_bytes)
+                    {
+                        engine.process(&envelope).await;
+                    }
+                });
+            }
             Json(MessageResponse {
                 msg_id: hex::encode(msg_id),
             })

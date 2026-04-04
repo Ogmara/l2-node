@@ -5,6 +5,24 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.0] - 2026-04-04
+
+### Added
+- **Notification engine wired into node startup** — `NotificationEngine` is now
+  created during `Node::run()` and connected to both the GossipSub message pipeline
+  and the REST API message submission endpoint
+- Mention detection for `ChatMessage` and `NewsComment` — parses the `mentions`
+  field and delivers notifications to locally connected users
+- Push gateway integration — when `[push_gateway]` is configured, notifications
+  are forwarded via HTTP POST to the push gateway with correct `PushTrigger` payload
+- WebSocket user tracking — authenticated WS clients are registered/unregistered
+  with the notification engine for real-time mention matching
+- `RouteResult::Accepted` now carries `raw_bytes` for downstream processing
+  without re-deserialization
+- `NotificationEngine` uses `Arc<RwLock<HashSet>>` for thread-safe local user tracking
+- `AppState::with_broadcast()` constructor for sharing the broadcast channel
+  between the notification engine and WebSocket layer
+
 ## [0.11.6] - 2026-04-04
 
 ### Fixed

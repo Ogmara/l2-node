@@ -52,8 +52,8 @@ auto_pin_on_interaction = true
 
 [push_gateway]
 enabled = false
-url = ""
-auth_token = ""
+url = ""             # e.g., "http://localhost:41722" (gateway appends /push)
+auth_token = ""      # must match OGMARA_PUSH_SECRET on the push gateway
 
 [logging]
 level = "info"

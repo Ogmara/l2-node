@@ -1,12 +1,14 @@
 //! Shared application state for the API layer.
 
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use tokio::sync::broadcast;
 
 use crate::ipfs::client::IpfsClient;
 use crate::messages::router::MessageRouter;
+use crate::notifications::engine::NotificationEngine;
 use crate::storage::identity::IdentityResolver;
 use crate::storage::rocks::Storage;
 
@@ -34,6 +36,9 @@ pub struct AppState {
     pub identity: IdentityResolver,
     /// Public URL where this node's API is reachable (from config).
     pub public_url: Option<String>,
+    /// Notification engine for mention detection and push delivery.
+    /// `None` if push gateway is not configured.
+    pub notification_engine: Option<Arc<NotificationEngine>>,
 }
 
 impl AppState {
@@ -46,8 +51,39 @@ impl AppState {
         ipfs: Option<IpfsClient>,
         identity: IdentityResolver,
         public_url: Option<String>,
+        notification_engine: Option<Arc<NotificationEngine>>,
     ) -> Self {
         let (ws_broadcast, _) = broadcast::channel(1024);
+        Self::with_broadcast(
+            storage,
+            router,
+            node_id,
+            klever_network,
+            contract_address,
+            ipfs,
+            identity,
+            public_url,
+            notification_engine,
+            ws_broadcast,
+        )
+    }
+
+    /// Create AppState with an externally provided broadcast channel.
+    ///
+    /// Used when the notification engine needs to share the same broadcast
+    /// channel as the WebSocket layer.
+    pub fn with_broadcast(
+        storage: Storage,
+        router: MessageRouter,
+        node_id: String,
+        klever_network: String,
+        contract_address: String,
+        ipfs: Option<IpfsClient>,
+        identity: IdentityResolver,
+        public_url: Option<String>,
+        notification_engine: Option<Arc<NotificationEngine>>,
+        ws_broadcast: broadcast::Sender<String>,
+    ) -> Self {
         Self {
             storage,
             router,
@@ -60,6 +96,7 @@ impl AppState {
             ipfs,
             identity,
             public_url,
+            notification_engine,
         }
     }
 

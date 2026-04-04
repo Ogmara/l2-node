@@ -173,6 +173,41 @@ impl Node {
             Err(e) => warn!(error = %e, "Failed to warm identity cache"),
         }
 
+        // Create shared broadcast channel (used by WS layer, notification engine, etc.)
+        let (ws_broadcast, _) = tokio::sync::broadcast::channel::<String>(1024);
+
+        // Initialize notification engine before the network service so gossip
+        // messages can be fed to it immediately.
+        let notification_engine = if self.config.push_gateway.enabled
+            && !self.config.push_gateway.url.is_empty()
+        {
+            let mut engine = crate::notifications::engine::NotificationEngine::new(
+                ws_broadcast.clone(),
+                Some(self.config.push_gateway.url.clone()),
+                if self.config.push_gateway.auth_token.is_empty() {
+                    None
+                } else {
+                    Some(self.config.push_gateway.auth_token.clone())
+                },
+            );
+            engine.set_storage(self.storage.clone());
+            info!(
+                url = %self.config.push_gateway.url,
+                "Notification engine initialized with push gateway"
+            );
+            Some(Arc::new(engine))
+        } else {
+            // Even without push gateway, create the engine for WS-only notifications
+            let mut engine = crate::notifications::engine::NotificationEngine::new(
+                ws_broadcast.clone(),
+                None,
+                None,
+            );
+            engine.set_storage(self.storage.clone());
+            info!("Notification engine initialized (WS-only, no push gateway)");
+            Some(Arc::new(engine))
+        };
+
         // Start the network service
         let keypair = self.libp2p_keypair()?;
         let mut network = crate::network::NetworkService::new(
@@ -180,6 +215,7 @@ impl Node {
             self.storage.clone(),
             identity.clone(),
             keypair,
+            notification_engine.clone(),
         )
         .await
         .context("starting network service")?;
@@ -270,7 +306,7 @@ impl Node {
             "mainnet".to_string()
         };
 
-        let app_state = Arc::new(crate::api::state::AppState::new(
+        let app_state = Arc::new(crate::api::state::AppState::with_broadcast(
             self.storage.clone(),
             api_router,
             self.node_id.clone(),
@@ -279,6 +315,8 @@ impl Node {
             ipfs_client,
             identity.clone(),
             self.config.api.public_url.clone(),
+            notification_engine.clone(),
+            ws_broadcast,
         ));
         let api_config = self.config.clone();
         let api_shutdown_rx = self.shutdown_rx();
