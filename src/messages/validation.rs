@@ -59,8 +59,8 @@ impl std::error::Error for ValidationError {}
 
 /// Validate a chat message payload.
 pub fn validate_chat_message(p: &ChatMessagePayload) -> Result<(), ValidationError> {
-    if p.content.is_empty() {
-        return Err(ValidationError("content must not be empty".into()));
+    if p.content.is_empty() && p.attachments.is_empty() {
+        return Err(ValidationError("content or attachments required".into()));
     }
     if p.content.len() > MAX_CHAT_CONTENT {
         return Err(ValidationError(format!(
@@ -108,8 +108,8 @@ pub fn validate_news_post(p: &NewsPostPayload) -> Result<(), ValidationError> {
 
 /// Validate a news comment payload.
 pub fn validate_news_comment(p: &NewsCommentPayload) -> Result<(), ValidationError> {
-    if p.content.is_empty() {
-        return Err(ValidationError("content must not be empty".into()));
+    if p.content.is_empty() && p.attachments.is_empty() {
+        return Err(ValidationError("content or attachments required".into()));
     }
     if p.content.len() > MAX_CHAT_CONTENT {
         return Err(ValidationError("content too long".into()));
