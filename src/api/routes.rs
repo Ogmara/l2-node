@@ -599,7 +599,18 @@ pub async fn get_user(
     let resolved = state.identity.resolve(&address).unwrap_or_else(|_| address.clone());
     match state.storage.get_cf(cf::USERS, resolved.as_bytes()) {
         Ok(Some(data)) => match serde_json::from_slice::<serde_json::Value>(&data) {
-            Ok(user) => Json(serde_json::json!({ "user": user })).into_response(),
+            Ok(mut user) => {
+                // Enrich with follower/following counts
+                let (following_count, follower_count) = state
+                    .storage
+                    .get_follower_counts(&resolved)
+                    .unwrap_or((0, 0));
+                if let serde_json::Value::Object(ref mut map) = user {
+                    map.insert("follower_count".into(), serde_json::json!(follower_count));
+                    map.insert("following_count".into(), serde_json::json!(following_count));
+                }
+                Json(serde_json::json!({ "user": user })).into_response()
+            }
             Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "corrupt user data").into_response(),
         },
         Ok(None) => (StatusCode::NOT_FOUND, "user not found").into_response(),

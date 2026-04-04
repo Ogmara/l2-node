@@ -5,6 +5,12 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.6] - 2026-04-04
+
+### Fixed
+
+- User profile endpoint now returns `follower_count` and `following_count` from cached counts
+
 ## [0.11.5] - 2026-04-04
 
 ### Fixed
