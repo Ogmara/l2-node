@@ -568,10 +568,11 @@ impl MessageRouter {
                 let channel_id = self.extract_channel_id(envelope).unwrap_or(0);
                 self.require_mod_permission(channel_id, resolved_author, "can_edit_info")
             }
-            // Private channel join: require an invite
+            // Private channel join: allow with explicit invite or via invite link.
+            // Knowing the channel_id (via shared invite link) is sufficient proof
+            // of invitation unless the owner has explicitly disabled invite links.
             MessageType::ChannelJoin => {
                 if let Ok(p) = rmp_serde::from_slice::<ChannelJoinPayload>(&envelope.payload) {
-                    // Check if channel is private (type 2)
                     if let Ok(Some(data)) = self.storage.get_cf(
                         schema::cf::CHANNELS, &p.channel_id.to_be_bytes(),
                     ) {
@@ -582,13 +583,18 @@ impl MessageRouter {
                                 _ => false,
                             };
                             if is_private {
-                                // Private channel: check for invite
                                 let invite_key = schema::encode_channel_invite_key(
                                     p.channel_id, resolved_author,
                                 );
-                                if !self.storage.exists_cf(schema::cf::CHANNEL_INVITES, &invite_key)
-                                    .unwrap_or(false)
-                                {
+                                let has_invite = self.storage.exists_cf(
+                                    schema::cf::CHANNEL_INVITES, &invite_key,
+                                ).unwrap_or(false);
+                                // Only reject if invite links are explicitly disabled
+                                let links_disabled = meta
+                                    .get("invite_links_disabled")
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(false);
+                                if !has_invite && links_disabled {
                                     return Err("private channel: invite required".into());
                                 }
                             }
