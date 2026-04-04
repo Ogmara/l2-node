@@ -2396,7 +2396,7 @@ pub async fn get_unread_counts(
             _ => 0, // Never read — everything is unread
         };
 
-        // Count messages newer than last_read_ts by checking envelope timestamps
+        // Count messages newer than last_read_ts, excluding the user's own messages
         let prefix = channel_id.to_be_bytes();
         if let Ok(msgs) = state.storage.prefix_iter_cf(cf::CHANNEL_MSGS, &prefix, 100) {
             let mut count = 0u64;
@@ -2407,7 +2407,12 @@ pub async fn get_unread_counts(
                     if let Ok(Some(env_bytes)) = state.storage.get_message(&msg_id) {
                         if let Ok(env) = rmp_serde::from_slice::<crate::messages::envelope::Envelope>(&env_bytes) {
                             if env.timestamp > last_read_ts {
-                                count += 1;
+                                // Resolve author and skip own messages
+                                let resolved = state.identity.resolve(&env.author)
+                                    .unwrap_or_else(|_| env.author.clone());
+                                if resolved != auth_user.address {
+                                    count += 1;
+                                }
                             }
                         }
                     }
@@ -2420,6 +2425,34 @@ pub async fn get_unread_counts(
     }
 
     Json(serde_json::json!({ "unread": unread })).into_response()
+}
+
+/// GET /api/v1/settings — retrieve synced settings (authenticated)
+pub async fn get_settings(
+    Extension(state): Extension<Arc<AppState>>,
+    Extension(auth_user): Extension<AuthUser>,
+) -> impl IntoResponse {
+    match state.storage.get_settings(&auth_user.address) {
+        Ok(Some(data)) => {
+            // Data is stored as JSON string by the SettingsSync handler
+            match serde_json::from_slice::<serde_json::Value>(&data) {
+                Ok(json) => Json(json).into_response(),
+                Err(_) => {
+                    // Legacy format (raw bytes) — return hex-encoded for backwards compat
+                    Json(serde_json::json!({
+                        "encrypted_settings": data,
+                        "nonce": [],
+                        "key_epoch": 0,
+                    })).into_response()
+                }
+            }
+        }
+        Ok(None) => (StatusCode::NOT_FOUND, "no settings found").into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to get settings");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+        }
+    }
 }
 
 /// GET /api/v1/account/export — download all user data as a text file (authenticated)
