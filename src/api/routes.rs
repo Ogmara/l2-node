@@ -465,7 +465,28 @@ pub async fn get_channel(
             Ok(channel) => {
                 let caller = auth_user.as_ref().map(|u| u.address.as_str());
                 if !check_channel_access(&state, &channel, channel_id, caller) {
-                    return (StatusCode::NOT_FOUND, "channel not found").into_response();
+                    // Private channel, caller not a member — return limited info
+                    // so join/invite pages can display the channel name and type.
+                    let prefix = channel_id.to_be_bytes();
+                    let member_count = state.storage
+                        .prefix_iter_cf(cf::CHANNEL_MEMBERS, &prefix, 10000)
+                        .map(|e| e.len() as u64)
+                        .unwrap_or(0);
+                    let mut limited = serde_json::json!({
+                        "channel_type": channel.get("channel_type").cloned().unwrap_or(serde_json::json!(2)),
+                        "channel_id": channel_id,
+                    });
+                    // Include safe display fields
+                    for key in ["display_name", "slug", "description"] {
+                        if let Some(v) = channel.get(key) {
+                            limited[key] = v.clone();
+                        }
+                    }
+                    return Json(serde_json::json!({
+                        "channel": limited,
+                        "member_count": member_count,
+                        "restricted": true,
+                    })).into_response();
                 }
                 // Fetch moderator list
                 let prefix = channel_id.to_be_bytes();
