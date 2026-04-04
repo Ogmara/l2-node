@@ -202,11 +202,13 @@ impl NotificationEngine {
         // Persist to storage (if configured) so the GET /api/v1/notifications
         // endpoint can retrieve historical notifications.
         if let Some(ref storage) = self.storage {
+            // Field names match the SDK Notification interface:
+            // type (not notification_type), from (not author)
             let notification_json = serde_json::json!({
-                "notification_type": notification.notification_type,
+                "type": notification_type_str(&notification.notification_type),
                 "msg_id": notification.msg_id,
-                "author": notification.author,
-                "channel_id": notification.channel_id,
+                "from": notification.author,
+                "channel_id": notification.channel_id.map(|id| id.to_string()),
                 "channel_name": notification.channel_name,
                 "preview": notification.preview,
                 "timestamp": notification.timestamp,
@@ -286,6 +288,15 @@ impl NotificationEngine {
                 warn!(error = %e, "Failed to send push notification to gateway");
             }
         }
+    }
+}
+
+/// Convert NotificationType to the string expected by the SDK Notification interface.
+fn notification_type_str(nt: &NotificationType) -> &'static str {
+    match nt {
+        NotificationType::Mention => "mention",
+        NotificationType::Reply => "reply",
+        NotificationType::Dm => "dm",
     }
 }
 
