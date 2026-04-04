@@ -227,6 +227,17 @@ async fn handle_ws_client_message(
             if let Ok(bytes) = rmp_serde::to_vec(&envelope) {
                 let result = state.router.process_message(&bytes);
                 debug!(result = ?result, "WS message processed");
+                // Feed accepted messages to notification engine for mention detection
+                if let crate::messages::router::RouteResult::Accepted { raw_bytes, .. } = result {
+                    if let Some(ref engine) = state.notification_engine {
+                        let engine = engine.clone();
+                        tokio::spawn(async move {
+                            if let Ok(env) = rmp_serde::from_slice::<crate::messages::envelope::Envelope>(&raw_bytes) {
+                                engine.process(&env).await;
+                            }
+                        });
+                    }
+                }
             }
         }
         WsClientMessage::Dm { envelope } => {
