@@ -104,6 +104,8 @@ pub enum RouteResult {
     Accepted {
         msg_id: [u8; 32],
         msg_type: MessageType,
+        /// Raw envelope bytes for downstream processing (notifications, etc.).
+        raw_bytes: Vec<u8>,
     },
     /// Message is a duplicate (already stored).
     Duplicate,
@@ -251,6 +253,7 @@ impl MessageRouter {
         RouteResult::Accepted {
             msg_id: envelope.msg_id,
             msg_type: envelope.msg_type,
+            raw_bytes: raw_bytes.to_vec(),
         }
     }
 

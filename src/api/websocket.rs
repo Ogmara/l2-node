@@ -143,7 +143,7 @@ async fn handle_authenticated_ws(socket: WebSocket, state: Arc<AppState>) {
 
     // Parse and verify auth message
     let auth_result = verify_ws_auth(&auth_text);
-    let _auth_address = match auth_result {
+    let auth_address = match auth_result {
         Ok(addr) => {
             debug!(address = %addr, "WebSocket client authenticated");
             addr
@@ -162,6 +162,11 @@ async fn handle_authenticated_ws(socket: WebSocket, state: Arc<AppState>) {
             return;
         }
     };
+
+    // Register this user with the notification engine for mention detection
+    if let Some(ref engine) = state.notification_engine {
+        engine.add_local_user(&auth_address).await;
+    }
 
     // Subscribe to broadcast channel for forwarding messages
     let mut broadcast_rx = state.ws_broadcast.subscribe();
@@ -190,7 +195,12 @@ async fn handle_authenticated_ws(socket: WebSocket, state: Arc<AppState>) {
         }
     }
 
-    debug!("WebSocket client disconnected");
+    // Unregister user from notification engine on disconnect
+    if let Some(ref engine) = state.notification_engine {
+        engine.remove_local_user(&auth_address).await;
+    }
+
+    debug!(address = %auth_address, "WebSocket client disconnected");
 }
 
 /// Handle a parsed client WebSocket message.

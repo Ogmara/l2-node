@@ -12,6 +12,7 @@ pub mod discovery;
 pub mod gossip;
 pub mod sync;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -21,7 +22,9 @@ use libp2p::{Multiaddr, PeerId, Swarm};
 use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
+use crate::messages::envelope::Envelope;
 use crate::messages::router::{MessageRouter, RouteResult};
+use crate::notifications::engine::NotificationEngine;
 use crate::storage::identity::IdentityResolver;
 use crate::storage::rocks::Storage;
 
@@ -38,6 +41,8 @@ pub struct NetworkService {
     router: MessageRouter,
     /// Storage reference for sync operations.
     storage: Storage,
+    /// Notification engine for mention detection and push delivery.
+    notification_engine: Option<Arc<NotificationEngine>>,
 }
 
 impl NetworkService {
@@ -47,6 +52,7 @@ impl NetworkService {
         storage: Storage,
         identity: IdentityResolver,
         keypair: libp2p::identity::Keypair,
+        notification_engine: Option<Arc<NotificationEngine>>,
     ) -> Result<Self> {
         let mut swarm = behaviour::build_swarm(config, keypair)
             .context("building libp2p swarm")?;
@@ -107,6 +113,7 @@ impl NetworkService {
             topics,
             router,
             storage,
+            notification_engine,
         })
     }
 
@@ -279,12 +286,27 @@ impl NetworkService {
     /// Handle a received GossipSub message through the full validation pipeline.
     fn handle_gossip_message(&self, data: &[u8]) -> Result<()> {
         match self.router.process_message(data) {
-            RouteResult::Accepted { msg_id, msg_type } => {
+            RouteResult::Accepted {
+                msg_id,
+                msg_type,
+                raw_bytes,
+            } => {
                 debug!(
                     msg_id = %hex::encode(msg_id),
                     msg_type = ?msg_type,
                     "Message accepted from gossip"
                 );
+
+                // Feed to notification engine for mention detection (fire-and-forget)
+                if let Some(ref engine) = self.notification_engine {
+                    let engine = engine.clone();
+                    tokio::spawn(async move {
+                        if let Ok(envelope) = rmp_serde::from_slice::<Envelope>(&raw_bytes) {
+                            engine.process(&envelope).await;
+                        }
+                    });
+                }
+
                 Ok(())
             }
             RouteResult::Duplicate => {

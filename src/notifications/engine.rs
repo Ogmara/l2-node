@@ -5,14 +5,16 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::Serialize;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, warn};
 
 use crate::messages::envelope::Envelope;
 use crate::messages::types::{ChatMessagePayload, MessageType, NewsCommentPayload};
 use crate::storage::rocks::Storage;
+use crate::storage::schema::cf;
 
 /// A notification to deliver to a user.
 #[derive(Debug, Clone, Serialize)]
@@ -25,6 +27,8 @@ pub struct Notification {
     pub author: String,
     /// Channel context (if applicable).
     pub channel_id: Option<u64>,
+    /// Human-readable channel name (for display in push notifications).
+    pub channel_name: Option<String>,
     /// Preview of the content (first 100 chars).
     pub preview: String,
     /// Timestamp of the triggering message.
@@ -40,12 +44,16 @@ pub enum NotificationType {
 }
 
 /// The notification engine processes messages and generates notifications.
+///
+/// Thread-safe: can be shared across tasks via `Arc<NotificationEngine>`.
 pub struct NotificationEngine {
     /// Addresses of locally connected users (for mention matching).
-    local_users: HashSet<String>,
+    /// Protected by RwLock for concurrent access from WS handlers
+    /// and the message processing pipeline.
+    local_users: Arc<RwLock<HashSet<String>>>,
     /// Broadcast channel for WebSocket delivery.
     ws_broadcast: broadcast::Sender<String>,
-    /// Push gateway URL (if configured).
+    /// Push gateway base URL (if configured).
     push_gateway_url: Option<String>,
     /// Push gateway auth token.
     push_gateway_token: Option<String>,
@@ -62,11 +70,14 @@ impl NotificationEngine {
         push_gateway_token: Option<String>,
     ) -> Self {
         Self {
-            local_users: HashSet::new(),
+            local_users: Arc::new(RwLock::new(HashSet::new())),
             ws_broadcast,
             push_gateway_url,
             push_gateway_token,
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap_or_default(),
             storage: None,
         }
     }
@@ -80,13 +91,17 @@ impl NotificationEngine {
     }
 
     /// Register a locally connected user for mention notifications.
-    pub fn add_local_user(&mut self, address: &str) {
-        self.local_users.insert(address.to_string());
+    pub async fn add_local_user(&self, address: &str) {
+        let mut users = self.local_users.write().await;
+        users.insert(address.to_string());
+        debug!(address, local_users = users.len(), "Added local user for notifications");
     }
 
     /// Remove a locally connected user.
-    pub fn remove_local_user(&mut self, address: &str) {
-        self.local_users.remove(address);
+    pub async fn remove_local_user(&self, address: &str) {
+        let mut users = self.local_users.write().await;
+        users.remove(address);
+        debug!(address, local_users = users.len(), "Removed local user from notifications");
     }
 
     /// Process an envelope and generate notifications if applicable.
@@ -129,30 +144,58 @@ impl NotificationEngine {
         channel_id: Option<u64>,
         preview: &str,
     ) {
+        let users = self.local_users.read().await;
+
+        // Look up channel name once (if applicable)
+        let channel_name = channel_id.and_then(|id| self.lookup_channel_name(id));
+
         for mentioned_address in mentions {
-            if self.local_users.contains(mentioned_address) {
+            if users.contains(mentioned_address) {
                 let notification = Notification {
                     notification_type: NotificationType::Mention,
                     msg_id: hex::encode(envelope.msg_id),
                     author: envelope.author.clone(),
                     channel_id,
+                    channel_name: channel_name.clone(),
                     preview: preview.to_string(),
                     timestamp: envelope.timestamp,
                 };
 
-                self.deliver(mentioned_address, &envelope.msg_id, notification).await;
+                self.deliver(mentioned_address, &envelope.msg_id, notification)
+                    .await;
             }
         }
+    }
+
+    /// Look up a channel's display name from storage.
+    fn lookup_channel_name(&self, channel_id: u64) -> Option<String> {
+        let storage = self.storage.as_ref()?;
+        let data = storage
+            .get_cf(cf::CHANNELS, &channel_id.to_be_bytes())
+            .ok()??;
+        let channel: serde_json::Value = serde_json::from_slice(&data).ok()?;
+        // Try "name" first, fall back to "slug"
+        channel
+            .get("name")
+            .or_else(|| channel.get("slug"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
     }
 
     /// Deliver a notification via WebSocket broadcast, push gateway, and persistent storage.
     ///
     /// `target_address` is the klv1 address of the notification recipient.
     /// `notification_id` is the 32-byte msg_id used as a unique notification key.
-    async fn deliver(&self, target_address: &str, notification_id: &[u8; 32], notification: Notification) {
+    async fn deliver(
+        &self,
+        target_address: &str,
+        notification_id: &[u8; 32],
+        notification: Notification,
+    ) {
         debug!(
             to = ?notification.notification_type,
             msg_id = %notification.msg_id,
+            target = %target_address,
             "Delivering notification"
         );
 
@@ -164,6 +207,7 @@ impl NotificationEngine {
                 "msg_id": notification.msg_id,
                 "author": notification.author,
                 "channel_id": notification.channel_id,
+                "channel_name": notification.channel_name,
                 "preview": notification.preview,
                 "timestamp": notification.timestamp,
             });
@@ -187,14 +231,41 @@ impl NotificationEngine {
         }
 
         // Push gateway (if configured)
-        if let Some(ref url) = self.push_gateway_url {
-            self.send_to_push_gateway(url, &notification).await;
+        if let Some(ref base_url) = self.push_gateway_url {
+            self.send_to_push_gateway(base_url, target_address, &notification)
+                .await;
         }
     }
 
     /// Send a notification to the push gateway.
-    async fn send_to_push_gateway(&self, url: &str, notification: &Notification) {
-        let mut req = self.http.post(url).json(notification);
+    ///
+    /// Posts to `{base_url}/push` with the payload format expected by the
+    /// push gateway's `PushTrigger` struct.
+    async fn send_to_push_gateway(
+        &self,
+        base_url: &str,
+        target_address: &str,
+        notification: &Notification,
+    ) {
+        let url = format!("{}/push", base_url.trim_end_matches('/'));
+
+        let notification_type = match notification.notification_type {
+            NotificationType::Mention => "mention",
+            NotificationType::Reply => "reply",
+            NotificationType::Dm => "dm",
+        };
+
+        let body = serde_json::json!({
+            "address": target_address,
+            "type": notification_type,
+            "channel_id": notification.channel_id,
+            "channel_name": notification.channel_name,
+            "msg_id": notification.msg_id,
+            "sender": notification.author,
+            "timestamp": notification.timestamp,
+        });
+
+        let mut req = self.http.post(&url).json(&body);
 
         if let Some(ref token) = self.push_gateway_token {
             req = req.bearer_auth(token);
@@ -202,13 +273,17 @@ impl NotificationEngine {
 
         match req.send().await {
             Ok(resp) if resp.status().is_success() => {
-                debug!("Push notification sent successfully");
+                debug!(target = %target_address, "Push notification sent to gateway");
             }
             Ok(resp) => {
-                warn!(status = %resp.status(), "Push gateway returned error");
+                warn!(
+                    status = %resp.status(),
+                    target = %target_address,
+                    "Push gateway returned error"
+                );
             }
             Err(e) => {
-                warn!(error = %e, "Failed to send push notification");
+                warn!(error = %e, "Failed to send push notification to gateway");
             }
         }
     }
