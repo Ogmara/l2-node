@@ -103,6 +103,19 @@ fn enrich_message_json(msg: &mut serde_json::Value, storage: &crate::storage::ro
             }
         }
     }
+
+    // Enrich with chat reaction counts
+    if let Ok(reactions) = storage.get_chat_reactions(&msg_id) {
+        if !reactions.is_empty() {
+            let reaction_map: serde_json::Map<String, serde_json::Value> = reactions
+                .into_iter()
+                .map(|(emoji, count)| (emoji, serde_json::json!(count)))
+                .collect();
+            if let serde_json::Value::Object(ref mut map) = msg {
+                map.insert("reactions".into(), serde_json::json!(reaction_map));
+            }
+        }
+    }
 }
 
 // --- Query parameters ---
