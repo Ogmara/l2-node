@@ -5,6 +5,40 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.0] - 2026-04-04
+
+### Added
+
+- **Private channel anchor node model** — private channels are now hosted on a
+  single anchor node (the creator's node) with no GossipSub metadata leakage.
+  Members access private channels through their home node, which proxies
+  authenticated requests to the anchor node via libp2p (spec §5.5.5)
+- **New message type: `PrivateChannelKeyDistribution` (0x60)** — allows channel
+  creators/admins to distribute encrypted group keys to members. The anchor node
+  stores opaque key material but cannot decrypt it (spec §8.1.1)
+- **New content request types**: `PrivateChannelMessages` (0x07) and
+  `PrivateChannelKeys` (0x08) for authenticated cross-node private channel access
+- **New API endpoints**: `GET/POST /api/v1/channels/{id}/keys` for fetching and
+  distributing encrypted group key material (members-only, 404 for non-members)
+- **New storage column families**: `private_channel_keys` (encrypted key material
+  per epoch), `private_channel_anchors` (remote anchor node URLs)
+- **Authenticated sync protocol** — `SyncRequest` now supports `requester`,
+  `proof`, and `proof_timestamp` fields for Ed25519-signed membership proofs
+  when accessing private channel data across nodes
+- **`PrivateContentRequest` and `PrivateChannelSubscribe` types** — protocol
+  structs for authenticated content fetching and live subscription streams
+
+### Changed
+
+- `ChannelInvitePayload` now includes `anchor_node: Option<String>` field
+  (mandatory for private channels) — tells the invited user's node where to
+  connect for the channel
+- `NodeAnnouncementPayload.channels` now explicitly filters out private channels
+  (type 0x02) when storing peer directory entries — defense-in-depth even if a
+  misbehaving node includes them
+- `ContentRequestType` extended with `PrivateChannelMessages` and
+  `PrivateChannelKeys` variants
+
 ## [0.12.3] - 2026-04-04
 
 ### Fixed

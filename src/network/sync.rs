@@ -28,6 +28,15 @@ pub struct SyncRequest {
     pub after_timestamp: Option<u64>,
     /// Max messages to return (capped at 500).
     pub limit: u32,
+    /// Requester address for authenticated requests (PrivateChannelMessages/Keys).
+    #[serde(default)]
+    pub requester: Option<String>,
+    /// Ed25519 signature proof for authenticated requests.
+    #[serde(default)]
+    pub proof: Option<Vec<u8>>,
+    /// Timestamp used in the proof signature (replay protection).
+    #[serde(default)]
+    pub proof_timestamp: Option<u64>,
 }
 
 /// Type of content being requested.
@@ -39,6 +48,10 @@ pub enum SyncRequestType {
     NewsPosts = 0x03,
     NewsPostsByTag = 0x04,
     UserPosts = 0x05,
+    /// Authenticated request for private channel messages (anchor node verifies membership).
+    PrivateChannelMessages = 0x07,
+    /// Authenticated request for private channel key material.
+    PrivateChannelKeys = 0x08,
 }
 
 /// Sync response from a peer.
@@ -149,16 +162,121 @@ fn handle_sync_request(request: SyncRequest, storage: &Storage) -> SyncResponse 
                 Vec::new()
             }
         }
+        SyncRequestType::PrivateChannelMessages => {
+            if let Some(channel_id) = request.channel_id {
+                match verify_private_channel_access(storage, &request, channel_id) {
+                    Ok(()) => fetch_channel_messages(storage, channel_id, &request, limit),
+                    Err(reason) => {
+                        warn!(channel_id, reason = %reason, "Private channel access denied");
+                        Vec::new()
+                    }
+                }
+            } else {
+                Vec::new()
+            }
+        }
+        SyncRequestType::PrivateChannelKeys => {
+            if let Some(channel_id) = request.channel_id {
+                match verify_private_channel_access(storage, &request, channel_id) {
+                    Ok(()) => fetch_private_channel_keys(storage, channel_id),
+                    Err(reason) => {
+                        warn!(channel_id, reason = %reason, "Private channel key access denied");
+                        Vec::new()
+                    }
+                }
+            } else {
+                Vec::new()
+            }
+        }
         // Other request types will be implemented as storage queries are built out
         _ => Vec::new(),
     };
 
-    let has_more = messages.len() == limit;
+    // PrivateChannelKeys always returns at most 1 entry (latest epoch) — never paginated
+    let has_more = match request.request_type {
+        SyncRequestType::PrivateChannelKeys => false,
+        _ => messages.len() == limit,
+    };
 
     SyncResponse {
         request_type: request.request_type,
         messages,
         has_more,
+    }
+}
+
+/// Verify that a private channel sync request is authorized.
+///
+/// Checks: (1) requester address is provided, (2) requester is a member of the channel,
+/// (3) signature proof is valid. Returns Ok(()) if access is granted.
+fn verify_private_channel_access(
+    storage: &Storage,
+    request: &SyncRequest,
+    channel_id: u64,
+) -> Result<(), String> {
+    use crate::storage::schema::{cf, encode_channel_member_key};
+
+    let requester = request.requester.as_ref()
+        .ok_or_else(|| "requester address required for private channel access".to_string())?;
+
+    // Verify the requester is a member of the channel
+    let member_key = encode_channel_member_key(channel_id, requester);
+    let is_member = storage.exists_cf(cf::CHANNEL_MEMBERS, &member_key)
+        .map_err(|e| format!("storage error: {}", e))?;
+
+    if !is_member {
+        // Generic error — don't reveal whether the channel exists
+        return Err("access denied".into());
+    }
+
+    // Verify the proof signature (requester signs: channel_id ++ timestamp ++ requester_bytes)
+    let proof = request.proof.as_ref()
+        .ok_or_else(|| "proof signature required".to_string())?;
+    let proof_ts = request.proof_timestamp
+        .ok_or_else(|| "proof_timestamp required".to_string())?;
+
+    // Check timestamp is within ±5 minutes (replay protection)
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let drift = if now_ms > proof_ts { now_ms - proof_ts } else { proof_ts - now_ms };
+    if drift > 300_000 {
+        return Err("proof timestamp too old or in the future".into());
+    }
+
+    // Build domain-separated signed data and hash with Keccak-256 (consistent with
+    // the rest of the Ogmara protocol). The domain prefix prevents cross-protocol
+    // signature confusion.
+    let mut preimage = Vec::with_capacity(32 + 8 + 8 + requester.len());
+    preimage.extend_from_slice(b"ogmara-private-channel-access:");
+    preimage.extend_from_slice(&channel_id.to_be_bytes());
+    preimage.extend_from_slice(&proof_ts.to_be_bytes());
+    preimage.extend_from_slice(requester.as_bytes());
+    let signed_hash = crate::crypto::keccak256(&preimage);
+
+    // Verify Ed25519 signature over the Keccak-256 hash
+    let pubkey_bytes = crate::crypto::address_to_pubkey_bytes(requester)
+        .map_err(|_| "invalid requester address".to_string())?;
+    let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&pubkey_bytes)
+        .map_err(|_| "invalid public key".to_string())?;
+    let signature = ed25519_dalek::Signature::from_slice(proof)
+        .map_err(|_| "invalid signature format".to_string())?;
+    verifying_key.verify_strict(&signed_hash, &signature)
+        .map_err(|_| "signature verification failed".to_string())?;
+
+    Ok(())
+}
+
+/// Fetch the latest key distribution for a private channel.
+fn fetch_private_channel_keys(storage: &Storage, channel_id: u64) -> Vec<Vec<u8>> {
+    match storage.get_private_channel_keys_latest(channel_id) {
+        Ok(Some((_epoch, key_data))) => vec![key_data],
+        Ok(None) => Vec::new(),
+        Err(e) => {
+            warn!(error = %e, channel_id, "Failed to fetch private channel keys");
+            Vec::new()
+        }
     }
 }
 

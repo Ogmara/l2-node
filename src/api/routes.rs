@@ -3105,3 +3105,141 @@ pub async fn get_user_moderation(
     }))
     .into_response()
 }
+
+// --- Private Channel Key Distribution Endpoints ---
+
+/// GET /api/v1/channels/:channel_id/keys — get encrypted group key material (authenticated)
+///
+/// Returns the latest (or specified epoch) key distribution for a private channel.
+/// Only accessible to channel members. Returns 404 for non-members (no channel existence leakage).
+pub async fn get_channel_keys(
+    Extension(state): Extension<Arc<AppState>>,
+    Extension(auth_user): Extension<AuthUser>,
+    Path(channel_id): Path<u64>,
+    Query(params): Query<KeyParams>,
+) -> impl IntoResponse {
+    // Verify the channel exists and is private
+    let channel_key = channel_id.to_be_bytes();
+    let meta = match state.storage.get_cf(cf::CHANNELS, &channel_key) {
+        Ok(Some(bytes)) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
+            Ok(m) => m,
+            Err(_) => return (StatusCode::NOT_FOUND, "not found").into_response(),
+        },
+        _ => return (StatusCode::NOT_FOUND, "not found").into_response(),
+    };
+
+    let channel_type = meta.get("channel_type").and_then(|v| v.as_u64()).unwrap_or(0);
+    if channel_type != 2 {
+        // Return 404 to avoid leaking whether the channel exists or its type
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
+
+    // Verify the user is a member
+    let member_key = crate::storage::schema::encode_channel_member_key(channel_id, &auth_user.address);
+    match state.storage.exists_cf(cf::CHANNEL_MEMBERS, &member_key) {
+        Ok(true) => {}
+        _ => return (StatusCode::NOT_FOUND, "not found").into_response(),
+    }
+
+    // Fetch key material
+    let result = if let Some(epoch) = params.epoch {
+        state.storage.get_private_channel_keys(channel_id, epoch)
+            .map(|opt| opt.map(|data| (epoch, data)))
+    } else {
+        state.storage.get_private_channel_keys_latest(channel_id)
+    };
+
+    match result {
+        Ok(Some((epoch, key_data))) => {
+            // key_data is JSON: { epoch, member_keys, distributed_by, timestamp }
+            // Only return the requesting member's encrypted key blob — not the full
+            // member_keys map — to avoid leaking the membership list to individual members.
+            match serde_json::from_slice::<serde_json::Value>(&key_data) {
+                Ok(data) => {
+                    let my_key = data.get("member_keys")
+                        .and_then(|m| m.get(&auth_user.address));
+                    Json(serde_json::json!({
+                        "channel_id": channel_id,
+                        "epoch": epoch,
+                        "encrypted_key": my_key,
+                        "timestamp": data.get("timestamp"),
+                    })).into_response()
+                }
+                Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "corrupt key data").into_response(),
+            }
+        }
+        Ok(None) => Json(serde_json::json!({
+            "channel_id": channel_id,
+            "epoch": null,
+            "encrypted_key": null,
+        })).into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, channel_id, "Failed to fetch channel keys");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
+        }
+    }
+}
+
+/// POST /api/v1/channels/:channel_id/keys — distribute group keys (authenticated)
+///
+/// Only the channel creator or admins can publish key distributions.
+/// The node stores the encrypted key material but cannot decrypt it.
+pub async fn distribute_channel_keys(
+    Extension(state): Extension<Arc<AppState>>,
+    Extension(auth_user): Extension<AuthUser>,
+    Path(channel_id): Path<u64>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    use crate::messages::router::RouteResult;
+    use crate::messages::types::PrivateChannelKeyDistributionPayload;
+
+    // Defense-in-depth: verify the envelope's channel_id and author match expectations
+    if let Ok(envelope) = rmp_serde::from_slice::<crate::messages::envelope::Envelope>(&body) {
+        // Resolve envelope author to wallet address for comparison
+        let envelope_wallet = state.identity
+            .resolve(&envelope.author)
+            .unwrap_or_else(|_| envelope.author.clone());
+        if envelope_wallet != auth_user.address {
+            return (
+                StatusCode::BAD_REQUEST,
+                "envelope author does not match authenticated user",
+            )
+                .into_response();
+        }
+        if let Ok(payload) =
+            rmp_serde::from_slice::<PrivateChannelKeyDistributionPayload>(&envelope.payload)
+        {
+            if payload.channel_id != channel_id {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "payload channel_id does not match URL path",
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    match state.router.process_message(&body) {
+        RouteResult::Accepted { msg_id, .. } => {
+            // Fetch the latest epoch to confirm which epoch was accepted (per spec §4.2)
+            let epoch = state.storage.get_private_channel_keys_latest(channel_id)
+                .ok().flatten().map(|(e, _)| e);
+            Json(serde_json::json!({
+                "ok": true,
+                "msg_id": hex::encode(msg_id),
+                "epoch": epoch,
+            })).into_response()
+        }
+        RouteResult::Rejected(reason) => {
+            (StatusCode::BAD_REQUEST, reason).into_response()
+        }
+        RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
+    }
+}
+
+/// Query params for key distribution endpoint.
+#[derive(Debug, Deserialize)]
+pub struct KeyParams {
+    /// Specific epoch to fetch. If omitted, returns the latest.
+    pub epoch: Option<u64>,
+}

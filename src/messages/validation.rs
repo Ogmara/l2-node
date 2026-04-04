@@ -434,6 +434,9 @@ pub fn validate_channel_unpin(p: &ChannelUnpinMessagePayload) -> Result<(), Vali
     Ok(())
 }
 
+/// Maximum anchor_node URL length.
+pub const MAX_ANCHOR_NODE_URL: usize = 256;
+
 /// Validate a channel invite payload.
 pub fn validate_channel_invite(p: &ChannelInvitePayload) -> Result<(), ValidationError> {
     if p.channel_id == 0 {
@@ -441,6 +444,50 @@ pub fn validate_channel_invite(p: &ChannelInvitePayload) -> Result<(), Validatio
     }
     if p.target_user.is_empty() || !p.target_user.starts_with("klv1") {
         return Err(ValidationError("target_user must be a valid Klever address".into()));
+    }
+    // Validate anchor_node URL if present (mandatory for private channels,
+    // validated in router; here we just check format safety)
+    if let Some(ref url) = p.anchor_node {
+        if url.len() > MAX_ANCHOR_NODE_URL {
+            return Err(ValidationError("anchor_node URL too long".into()));
+        }
+        if !url.starts_with("https://") && !url.starts_with("http://") {
+            return Err(ValidationError(
+                "anchor_node must be a valid HTTP(S) URL".into(),
+            ));
+        }
+        // Reject private/internal IP ranges to prevent SSRF
+        let host_part = url.trim_start_matches("https://").trim_start_matches("http://");
+        let host = host_part.split('/').next().unwrap_or("");
+        let host = host.split(':').next().unwrap_or(""); // strip port
+        if host == "localhost"
+            || host == "127.0.0.1"
+            || host == "0.0.0.0"
+            || host == "[::1]"
+            || host.starts_with("10.")
+            || host.starts_with("172.16.")
+            || host.starts_with("172.17.")
+            || host.starts_with("172.18.")
+            || host.starts_with("172.19.")
+            || host.starts_with("172.20.")
+            || host.starts_with("172.21.")
+            || host.starts_with("172.22.")
+            || host.starts_with("172.23.")
+            || host.starts_with("172.24.")
+            || host.starts_with("172.25.")
+            || host.starts_with("172.26.")
+            || host.starts_with("172.27.")
+            || host.starts_with("172.28.")
+            || host.starts_with("172.29.")
+            || host.starts_with("172.30.")
+            || host.starts_with("172.31.")
+            || host.starts_with("192.168.")
+            || host.starts_with("169.254.")
+        {
+            return Err(ValidationError(
+                "anchor_node must not point to private/internal addresses".into(),
+            ));
+        }
     }
     Ok(())
 }
@@ -593,6 +640,45 @@ pub fn validate_direct_message(
 }
 
 // --- News Engagement validation ---
+
+/// Maximum members in a single key distribution (per spec: private channels are small groups).
+pub const MAX_KEY_DISTRIBUTION_MEMBERS: usize = 500;
+/// Maximum encrypted key blob size per member (nonce + ciphertext).
+pub const MAX_ENCRYPTED_KEY_SIZE: usize = 256;
+
+/// Validate a private channel key distribution payload.
+pub fn validate_private_channel_key_distribution(
+    p: &PrivateChannelKeyDistributionPayload,
+) -> Result<(), ValidationError> {
+    if p.channel_id == 0 {
+        return Err(ValidationError("channel_id must be > 0".into()));
+    }
+    if p.member_keys.is_empty() {
+        return Err(ValidationError("member_keys must not be empty".into()));
+    }
+    if p.member_keys.len() > MAX_KEY_DISTRIBUTION_MEMBERS {
+        return Err(ValidationError(format!(
+            "too many members: {} > {}",
+            p.member_keys.len(),
+            MAX_KEY_DISTRIBUTION_MEMBERS
+        )));
+    }
+    for (address, key_blob) in &p.member_keys {
+        if !address.starts_with("klv1") {
+            return Err(ValidationError(format!(
+                "invalid member address: {}",
+                address
+            )));
+        }
+        if key_blob.is_empty() {
+            return Err(ValidationError("encrypted key blob must not be empty".into()));
+        }
+        if key_blob.len() > MAX_ENCRYPTED_KEY_SIZE {
+            return Err(ValidationError("encrypted key blob too large".into()));
+        }
+    }
+    Ok(())
+}
 
 /// Validate a news repost payload.
 pub fn validate_news_repost(author: &str, p: &NewsRepostPayload) -> Result<(), ValidationError> {
