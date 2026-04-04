@@ -1537,6 +1537,79 @@ impl MessageRouter {
                     )?;
                 }
             }
+            MessageType::NodeAnnouncement => {
+                if let Ok(payload) =
+                    rmp_serde::from_slice::<NodeAnnouncementPayload>(&envelope.payload)
+                {
+                    // Verify node_id matches the envelope author's public key.
+                    // node_id = Base58(SHA-256(public_key)[:20])
+                    let expected_node_id = {
+                        use sha2::{Digest, Sha256};
+                        let pubkey_bytes = crate::crypto::address_to_pubkey_bytes(&envelope.author)
+                            .context("invalid author address in NodeAnnouncement")?;
+                        let hash = Sha256::digest(&pubkey_bytes);
+                        bs58::encode(&hash[..20]).into_string()
+                    };
+                    if payload.node_id != expected_node_id {
+                        warn!(
+                            claimed = %payload.node_id,
+                            expected = %expected_node_id,
+                            author = %envelope.author,
+                            "NodeAnnouncement node_id mismatch — rejecting"
+                        );
+                        return Ok(());
+                    }
+
+                    // Validate payload bounds
+                    if payload.channels.len() > 10_000 {
+                        warn!(node_id = %payload.node_id, count = payload.channels.len(),
+                            "NodeAnnouncement channels list too large — rejecting");
+                        return Ok(());
+                    }
+                    if let Some(ref ep) = payload.api_endpoint {
+                        if ep.len() > 256
+                            || (!ep.starts_with("http://") && !ep.starts_with("https://"))
+                        {
+                            warn!(node_id = %payload.node_id,
+                                "NodeAnnouncement invalid api_endpoint — rejecting");
+                            return Ok(());
+                        }
+                    }
+
+                    // Cap peer directory size (evict oldest if at limit)
+                    let peer_count = self.storage
+                        .prefix_iter_cf(schema::cf::PEER_DIRECTORY, &[], 10_001)?
+                        .len();
+                    if peer_count >= 10_000 {
+                        // Already at capacity — only allow updates to existing entries
+                        if self.storage.get_cf(
+                            schema::cf::PEER_DIRECTORY,
+                            payload.node_id.as_bytes(),
+                        )?.is_none() {
+                            debug!(node_id = %payload.node_id,
+                                "Peer directory at capacity, ignoring new node");
+                            return Ok(());
+                        }
+                    }
+
+                    let record = serde_json::json!({
+                        "node_id": payload.node_id,
+                        "api_endpoint": payload.api_endpoint,
+                        "channels": payload.channels,
+                        "user_count": payload.user_count,
+                        "last_seen": envelope.timestamp,
+                        "ttl_seconds": payload.ttl_seconds,
+                    });
+                    let record_bytes = serde_json::to_vec(&record)
+                        .context("serializing node announcement")?;
+                    self.storage.put_cf(
+                        schema::cf::PEER_DIRECTORY,
+                        payload.node_id.as_bytes(),
+                        &record_bytes,
+                    )?;
+                    debug!(node_id = %payload.node_id, "Peer directory updated from announcement");
+                }
+            }
             _ => {}
         }
 

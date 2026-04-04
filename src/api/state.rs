@@ -32,6 +32,8 @@ pub struct AppState {
     pub ipfs: Option<IpfsClient>,
     /// Device-to-wallet identity resolver (cached lookups).
     pub identity: IdentityResolver,
+    /// Public URL where this node's API is reachable (from config).
+    pub public_url: Option<String>,
 }
 
 impl AppState {
@@ -43,6 +45,7 @@ impl AppState {
         contract_address: String,
         ipfs: Option<IpfsClient>,
         identity: IdentityResolver,
+        public_url: Option<String>,
     ) -> Self {
         let (ws_broadcast, _) = broadcast::channel(1024);
         Self {
@@ -56,6 +59,7 @@ impl AppState {
             contract_address,
             ipfs,
             identity,
+            public_url,
         }
     }
 

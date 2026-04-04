@@ -132,6 +132,10 @@ pub struct ApiConfig {
     /// REST/WS API listen port (default: 41721).
     #[serde(default = "default_api_port")]
     pub listen_port: u16,
+    /// Public URL where this node's API is reachable (e.g. "https://node.ogmara.org").
+    /// Used to advertise this node in the network node list.
+    #[serde(default)]
+    pub public_url: Option<String>,
     /// CORS allowed origins.
     #[serde(default = "default_cors")]
     pub cors_origins: Vec<String>,
@@ -148,6 +152,7 @@ impl Default for ApiConfig {
         Self {
             listen_addr: default_api_addr(),
             listen_port: default_api_port(),
+            public_url: None,
             cors_origins: default_cors(),
             rate_limit_per_ip: default_rate_limit(),
             admin: AdminConfig::default(),
