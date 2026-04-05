@@ -569,6 +569,17 @@ pub async fn get_channel_messages(
     let limit = params.limit.unwrap_or(50).min(500) as usize;
     let prefix = channel_id.to_be_bytes();
 
+    // Look up the authenticated user's read cursor for unread divider support
+    let last_read_ts: Option<u64> = auth_user.as_ref().and_then(|u| {
+        let read_key = crate::storage::schema::encode_channel_read_key(&u.address, channel_id);
+        match state.storage.get_cf(cf::CHANNEL_READ_STATE, &read_key) {
+            Ok(Some(bytes)) if bytes.len() == 8 => {
+                Some(u64::from_be_bytes(bytes.try_into().unwrap_or([0u8; 8])))
+            }
+            _ => None,
+        }
+    });
+
     // Resolve `after` cursor to a seek key for incremental fetching
     let entries_result = if let Some(after_hex) = &params.after {
         // Parse the hex msg_id, look up the message to get its lamport_ts,
@@ -625,11 +636,15 @@ pub async fn get_channel_messages(
                 }
             }
             let has_more = entries.len() == limit;
-            Json(serde_json::json!({
+            let mut resp = serde_json::json!({
                 "messages": messages,
                 "has_more": has_more,
-            }))
-            .into_response()
+            });
+            // Include the read cursor so clients can render an unread divider
+            if let Some(ts) = last_read_ts {
+                resp["last_read_ts"] = serde_json::json!(ts);
+            }
+            Json(resp).into_response()
         }
         Err(e) => {
             {

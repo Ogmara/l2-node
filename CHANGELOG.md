@@ -5,6 +5,13 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.3] - 2026-04-05
+
+### Added
+- **Unread divider support** — `GET /channels/{id}/messages` now includes
+  `last_read_ts` in the response when the caller is authenticated, enabling
+  clients to render a "New messages" divider at the first unread message
+
 ## [0.13.2] - 2026-04-05
 
 ### Added
