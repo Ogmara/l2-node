@@ -165,24 +165,44 @@ impl MessageRouter {
             Err(e) => return RouteResult::Rejected(format!("identity resolution failed: {}", e)),
         };
 
-        // Step 4d: Require wallet identity for content messages.
-        // Device-only keys (no wallet mapping) can only perform DeviceDelegation.
-        // All other message types require the device to be registered under a wallet.
+        // Step 4d: Tiered identity requirements.
+        //
+        // Basic messages (chat, news posts, reactions, follows, etc.) are allowed
+        // for any wallet with a valid signature — no on-chain registration needed.
+        //
+        // Advanced messages (edits, deletes, channel management, moderation, private
+        // channels) require a verified identity: on-chain registration via the SC,
+        // indicated by `registered_at > 0` in the USERS record.
+        //
+        // DeviceDelegation is always exempt (it establishes the mapping itself).
+        // The check uses `resolved_author` (the wallet identity) regardless of
+        // whether a device mapping exists — extension/K5 users must also have
+        // on-chain registration for advanced features.
         if envelope.msg_type != MessageType::DeviceDelegation
-            && envelope.msg_type.requires_registration()
-            && resolved_author == envelope.author
+            && envelope.msg_type.requires_verified_identity()
         {
-            // resolved_author == envelope.author means no wallet mapping was found
-            // (the resolver returned the device address as-is).
-            // Check if this is truly a built-in wallet (address is self-registered)
-            // by looking up the USERS table.
-            if self.storage.get_cf(
+            match self.storage.get_cf(
                 crate::storage::schema::cf::USERS,
-                envelope.author.as_bytes(),
-            ).ok().flatten().is_none() {
-                return RouteResult::Rejected(
-                    "wallet identity required: connect a wallet before posting".into(),
-                );
+                resolved_author.as_bytes(),
+            ) {
+                Ok(Some(data)) => {
+                    // User exists — check if on-chain registered (registered_at > 0
+                    // means the chain scanner wrote this, not just a ProfileUpdate).
+                    let is_verified = serde_json::from_slice::<serde_json::Value>(&data)
+                        .ok()
+                        .and_then(|v| v.get("registered_at")?.as_u64())
+                        .map_or(false, |ts| ts > 0);
+                    if !is_verified {
+                        return RouteResult::Rejected(
+                            "on-chain registration required: verify your wallet to use this feature".into(),
+                        );
+                    }
+                }
+                _ => {
+                    return RouteResult::Rejected(
+                        "on-chain registration required: verify your wallet to use this feature".into(),
+                    );
+                }
             }
         }
 
@@ -707,14 +727,19 @@ impl MessageRouter {
             }
         }
 
-        // 6. For NewsEdit: additionally require user to be registered
+        // 6. For NewsEdit: defense-in-depth check (Step 4d already gates this,
+        // but verify on-chain registration here too for edit-specific flow).
         if envelope.msg_type == MessageType::NewsEdit {
-            if !self
+            let is_verified = self
                 .storage
-                .exists_cf(schema::cf::USERS, resolved_author.as_bytes())
-                .unwrap_or(false)
-            {
-                return Err("news edits require a registered user account".into());
+                .get_cf(schema::cf::USERS, resolved_author.as_bytes())
+                .ok()
+                .flatten()
+                .and_then(|data| serde_json::from_slice::<serde_json::Value>(&data).ok())
+                .and_then(|v| v.get("registered_at")?.as_u64())
+                .map_or(false, |ts| ts > 0);
+            if !is_verified {
+                return Err("news edits require on-chain registration".into());
             }
         }
 
@@ -1543,7 +1568,11 @@ impl MessageRouter {
                         .storage
                         .exists_cf(schema::cf::USERS, resolved_author.as_bytes())?;
 
-                    // Load existing user record or create a new one
+                    // Load existing user record or create a new one.
+                    // New records from ProfileUpdate get registered_at: 0 to distinguish
+                    // them from on-chain registered users (where the chain scanner sets
+                    // a real timestamp). This enables tiered access: unverified users
+                    // can chat/post but need on-chain registration for advanced features.
                     let mut record = match self
                         .storage
                         .get_cf(schema::cf::USERS, resolved_author.as_bytes())?
@@ -1553,7 +1582,7 @@ impl MessageRouter {
                         None => serde_json::json!({
                             "address": resolved_author,
                             "public_key": "",
-                            "registered_at": envelope.timestamp,
+                            "registered_at": 0,
                         }),
                     };
 

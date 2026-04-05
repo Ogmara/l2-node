@@ -5,6 +5,22 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.0] - 2026-04-05
+
+### Changed
+- **Tiered identity access** — unverified wallets (no on-chain registration) can
+  now use basic features: chat messages, news posts, comments, reactions, DMs,
+  channel join/leave, follows, profile updates, and reports. Advanced features
+  (edits, deletes, channel creation/management, moderation, private channels)
+  still require on-chain registration via the Klever smart contract.
+- `requires_verified_identity()` method on `MessageType` determines which
+  messages need on-chain verification vs. just a valid signature
+- Router Step 4d now checks `registered_at > 0` in the USERS record to
+  distinguish on-chain registered users from profile-only records
+- `ProfileUpdate`-created USERS records now set `registered_at: 0` (previously
+  used the envelope timestamp), clearly distinguishing them from on-chain
+  registrations set by the chain scanner
+
 ## [0.13.3] - 2026-04-05
 
 ### Added

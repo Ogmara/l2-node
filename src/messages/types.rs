@@ -131,9 +131,48 @@ impl MessageType {
         (*self as u8) >= 0xE0
     }
 
-    /// Whether this message type requires the sender to be registered.
+    /// Whether this message type requires the sender to have any identity
+    /// (either on-chain registration or a USERS record from ProfileUpdate).
+    /// Basic content messages (chat, news posts, reactions, follows, etc.)
+    /// are allowed for unverified users — they only need a valid signature.
     pub fn requires_registration(&self) -> bool {
         !self.is_network()
+    }
+
+    /// Whether this message type requires a *verified* (on-chain registered)
+    /// identity. Advanced features like channel creation, message editing,
+    /// moderation, and private channels require on-chain registration.
+    /// Unverified wallets can only use basic features (chat, news, reactions).
+    pub fn requires_verified_identity(&self) -> bool {
+        matches!(
+            self,
+            // Edits & deletes — trust feature
+            Self::ChatEdit
+            | Self::ChatDelete
+            | Self::DirectMessageEdit
+            | Self::DirectMessageDelete
+            | Self::NewsEdit
+            | Self::NewsDelete
+            // Channel management — all require verification
+            | Self::ChannelCreate
+            | Self::ChannelUpdate
+            | Self::ChannelAddModerator
+            | Self::ChannelRemoveModerator
+            | Self::ChannelKick
+            | Self::ChannelBan
+            | Self::ChannelUnban
+            | Self::ChannelPinMessage
+            | Self::ChannelUnpinMessage
+            | Self::ChannelInvite
+            // Moderation — spec 07 §2.2 requires registration for reports
+            | Self::Report
+            | Self::CounterVote
+            | Self::ChannelMute
+            // Account management
+            | Self::DeletionRequest
+            // Private channels
+            | Self::PrivateChannelKeyDistribution
+        )
     }
 }
 
