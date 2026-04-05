@@ -5,6 +5,16 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.2] - 2026-04-05
+
+### Added
+- **Incremental message fetching** — `after` query parameter on
+  `GET /channels/{id}/messages` and `GET /dm/{address}/messages` endpoints.
+  Clients can poll with `after=<latest_msg_id>` to fetch only new messages
+  instead of re-fetching the entire history. Reduces server load and bandwidth.
+- `prefix_iter_cf_after` storage method for efficient forward seeks past a
+  cursor key in RocksDB column families
+
 ## [0.13.1] - 2026-04-04
 
 ### Fixed

@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use rocksdb::WriteBatch;
 
-use crate::storage::schema::{cf, state_keys};
+use crate::storage::schema::{cf, encode_channel_msg_key, encode_dm_msg_key, state_keys};
 
 use super::auth::AuthUser;
 use super::state::AppState;
@@ -142,6 +142,9 @@ pub struct PaginationParams {
 #[derive(Debug, Deserialize)]
 pub struct MessageParams {
     pub before: Option<String>,
+    /// Hex-encoded msg_id cursor: return messages strictly after this message.
+    /// Mutually exclusive with `before`; if both provided, `after` takes precedence.
+    pub after: Option<String>,
     pub limit: Option<u32>,
 }
 
@@ -566,10 +569,36 @@ pub async fn get_channel_messages(
     let limit = params.limit.unwrap_or(50).min(500) as usize;
     let prefix = channel_id.to_be_bytes();
 
-    match state
-        .storage
-        .prefix_iter_cf(cf::CHANNEL_MSGS, &prefix, limit)
-    {
+    // Resolve `after` cursor to a seek key for incremental fetching
+    let entries_result = if let Some(after_hex) = &params.after {
+        // Parse the hex msg_id, look up the message to get its lamport_ts,
+        // then verify the message belongs to this channel (prevents cross-channel oracle)
+        let after_key = (|| -> Option<Vec<u8>> {
+            let msg_id_bytes = hex::decode(after_hex).ok()?;
+            let msg_id: [u8; 32] = msg_id_bytes.try_into().ok()?;
+            let envelope_bytes = state.storage.get_message(&msg_id).ok()??;
+            let envelope = rmp_serde::from_slice::<crate::messages::envelope::Envelope>(
+                &envelope_bytes,
+            ).ok()?;
+            let key = encode_channel_msg_key(channel_id, envelope.lamport_ts, &msg_id);
+            // Verify this msg_id is indexed under this channel (not a foreign channel)
+            if !state.storage.exists_cf(cf::CHANNEL_MSGS, &key).unwrap_or(false) {
+                return None;
+            }
+            Some(key)
+        })();
+        match after_key {
+            Some(seek_key) => state.storage.prefix_iter_cf_after(
+                cf::CHANNEL_MSGS, &seek_key, &prefix, limit,
+            ),
+            // Cursor not found or not in this channel — fall back to full fetch
+            None => state.storage.prefix_iter_cf(cf::CHANNEL_MSGS, &prefix, limit),
+        }
+    } else {
+        state.storage.prefix_iter_cf(cf::CHANNEL_MSGS, &prefix, limit)
+    };
+
+    match entries_result {
         Ok(entries) => {
             let mut messages = Vec::with_capacity(entries.len());
             for (key, _) in &entries {
@@ -1247,10 +1276,35 @@ pub async fn get_dm_messages(
     let conversation_id =
         crate::crypto::compute_conversation_id(&auth_user.address, &address);
 
-    match state
-        .storage
-        .prefix_iter_cf(cf::DM_MESSAGES, &conversation_id, limit)
-    {
+    // Resolve `after` cursor for incremental DM fetching
+    // Verify the cursor message belongs to this conversation (prevents cross-conversation oracle)
+    let entries_result = if let Some(after_hex) = &params.after {
+        let after_key = (|| -> Option<Vec<u8>> {
+            let msg_id_bytes = hex::decode(after_hex).ok()?;
+            let msg_id: [u8; 32] = msg_id_bytes.try_into().ok()?;
+            let envelope_bytes = state.storage.get_message(&msg_id).ok()??;
+            let envelope = rmp_serde::from_slice::<crate::messages::envelope::Envelope>(
+                &envelope_bytes,
+            ).ok()?;
+            let key = encode_dm_msg_key(&conversation_id, envelope.timestamp, &msg_id);
+            // Verify this msg_id is indexed under this conversation
+            if !state.storage.exists_cf(cf::DM_MESSAGES, &key).unwrap_or(false) {
+                return None;
+            }
+            Some(key)
+        })();
+        match after_key {
+            Some(seek_key) => state.storage.prefix_iter_cf_after(
+                cf::DM_MESSAGES, &seek_key, &conversation_id, limit,
+            ),
+            // Cursor not found or not in this conversation — fall back to full fetch
+            None => state.storage.prefix_iter_cf(cf::DM_MESSAGES, &conversation_id, limit),
+        }
+    } else {
+        state.storage.prefix_iter_cf(cf::DM_MESSAGES, &conversation_id, limit)
+    };
+
+    match entries_result {
         Ok(entries) => {
             let mut messages = Vec::with_capacity(entries.len());
             for (key, _) in &entries {
