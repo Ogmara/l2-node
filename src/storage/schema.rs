@@ -205,6 +205,8 @@ pub mod state_keys {
     pub const CHANNEL_TYPE_NORMALIZED: &[u8] = b"migration_channel_type_normalized";
     /// Sentinel: set to 1 after DELEGATIONS are backfilled into DEVICE_WALLET_MAP.
     pub const DELEGATION_MAP_BACKFILLED: &[u8] = b"migration_delegation_map_backfilled";
+    /// Sentinel: set to 1 after device addresses are re-derived from klv1 → ogd1.
+    pub const DEVICE_HRP_MIGRATED: &[u8] = b"migration_device_hrp_migrated";
 }
 
 /// Encode a channel message index key: (channel_id, lamport_ts, msg_id).

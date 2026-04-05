@@ -84,6 +84,14 @@ impl Node {
             }
         }
 
+        // Migrate device addresses from klv1... to ogd1... prefix (one-time migration)
+        let hrp_migrated = storage.get_stat(state_keys::DEVICE_HRP_MIGRATED)? > 0;
+        if !hrp_migrated {
+            if let Err(e) = storage.migrate_device_hrp() {
+                warn!(error = %e, "Failed to migrate device address HRP");
+            }
+        }
+
         // Load Lamport counter from storage
         let lamport_value = storage.get_lamport_counter()?;
         let lamport_counter = Arc::new(AtomicU64::new(lamport_value));
