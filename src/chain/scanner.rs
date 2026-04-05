@@ -414,13 +414,13 @@ impl ChainScanner {
                 self.storage.put_cf(cf::DELEGATIONS, &key, &bytes)?;
 
                 // Also write DEVICE_WALLET_MAP so identity resolution works.
-                // Convert hex pubkey → klv1 address for the map key.
+                // Convert hex pubkey → ogd1 device address for the map key.
                 if let Ok(pubkey_bytes) = hex::decode(&device_key) {
                     if pubkey_bytes.len() == 32 {
                         if let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(
                             &<[u8; 32]>::try_from(pubkey_bytes.as_slice()).unwrap(),
                         ) {
-                            if let Ok(device_address) = crate::crypto::pubkey_to_address(&vk) {
+                            if let Ok(device_address) = crate::crypto::device_pubkey_to_address(&vk) {
                                 let _ = self.storage.put_cf(
                                     cf::DEVICE_WALLET_MAP,
                                     device_address.as_bytes(),

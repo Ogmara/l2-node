@@ -1433,14 +1433,14 @@ impl MessageRouter {
                 if let Ok(payload) =
                     rmp_serde::from_slice::<DeviceRevocationPayload>(&envelope.payload)
                 {
-                    // Convert hex pubkey to klv1 address
+                    // Convert hex pubkey to ogd1 device address
                     let pubkey_bytes = hex::decode(&payload.device_pub_key)
                         .context("invalid device_pub_key hex")?;
                     let pubkey_array: [u8; 32] = pubkey_bytes.try_into()
                         .map_err(|_| anyhow::anyhow!("device_pub_key must be 32 bytes"))?;
                     let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&pubkey_array)
                         .map_err(|e| anyhow::anyhow!("invalid Ed25519 public key: {}", e))?;
-                    let device_address = crypto::pubkey_to_address(&verifying_key)
+                    let device_address = crypto::device_pubkey_to_address(&verifying_key)
                         .map_err(|e| anyhow::anyhow!("failed to encode device address: {}", e))?;
 
                     let revoked = self.identity.revoke_device(&device_address, resolved_author)

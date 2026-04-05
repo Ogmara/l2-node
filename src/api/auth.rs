@@ -2,7 +2,7 @@
 //!
 //! Authenticated endpoints require three headers (spec 4.2):
 //!   X-Ogmara-Auth:      base64(Ed25519 signature)
-//!   X-Ogmara-Address:   klv1... Klever address
+//!   X-Ogmara-Address:   klv1... (wallet) or ogd1... (device) address
 //!   X-Ogmara-Timestamp: unix timestamp in milliseconds
 //!
 //! Auth string: "ogmara-auth:{timestamp}:{method}:{path}"
@@ -34,7 +34,8 @@ pub struct AuthUser {
     /// Resolved wallet address — the user's on-chain identity.
     /// All storage/indexing uses this address.
     pub address: String,
-    /// The device key address that signed this request (klv1...).
+    /// The address that signed this request — either a wallet (klv1...)
+    /// or a delegated device key (ogd1...).
     /// May be the same as `address` for built-in wallets.
     pub signing_address: String,
 }

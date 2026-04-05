@@ -2223,17 +2223,20 @@ pub async fn register_device(
         _ => return (StatusCode::BAD_REQUEST, "invalid device_pubkey_hex").into_response(),
     };
 
-    // Derive the device's klv1... address from the public key
+    // Derive the device's ogd1... address from the public key
     let device_verifying_key = match ed25519_dalek::VerifyingKey::from_bytes(&device_pubkey_bytes) {
         Ok(k) => k,
         Err(_) => return (StatusCode::BAD_REQUEST, "invalid Ed25519 public key").into_response(),
     };
-    let device_address = match crate::crypto::pubkey_to_address(&device_verifying_key) {
+    let device_address = match crate::crypto::device_pubkey_to_address(&device_verifying_key) {
         Ok(a) => a,
         Err(_) => return (StatusCode::BAD_REQUEST, "failed to derive device address").into_response(),
     };
 
-    // Validate wallet address format
+    // Validate wallet address format — must be a klv1 wallet address, not a device address
+    if !body.wallet_address.starts_with("klv1") {
+        return (StatusCode::BAD_REQUEST, "wallet_address must be a klv1 wallet address").into_response();
+    }
     if crate::crypto::address_to_verifying_key(&body.wallet_address).is_err() {
         return (StatusCode::BAD_REQUEST, "invalid wallet_address").into_response();
     }

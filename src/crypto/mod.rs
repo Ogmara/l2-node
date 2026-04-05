@@ -15,6 +15,14 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use sha3::{Digest, Keccak256};
 use thiserror::Error;
 
+/// Bech32 human-readable prefix for Klever wallet addresses (klv1...).
+pub const WALLET_HRP: &str = "klv";
+
+/// Bech32 human-readable prefix for Ogmara device key addresses (ogd1...).
+/// Device keys are ephemeral Ed25519 keys delegated by a wallet.
+/// Using a distinct prefix prevents confusion with wallet addresses.
+pub const DEVICE_HRP: &str = "ogd";
+
 #[derive(Debug, Error)]
 pub enum CryptoError {
     #[error("invalid signature")]
@@ -39,22 +47,35 @@ pub fn keccak256(data: &[u8]) -> [u8; 32] {
     hash
 }
 
-/// Derive a Klever address (klv1...) from an Ed25519 public key.
+/// Derive a Klever wallet address (klv1...) from an Ed25519 public key.
 pub fn pubkey_to_address(pubkey: &VerifyingKey) -> Result<String, CryptoError> {
-    let hrp = bech32::Hrp::parse("klv").expect("valid hrp");
+    let hrp = bech32::Hrp::parse(WALLET_HRP).expect("valid hrp");
     bech32::encode::<bech32::Bech32>(hrp, pubkey.as_bytes())
         .map_err(|e| CryptoError::Bech32Error(e.to_string()))
 }
 
-/// Decode a Klever address (klv1...) to raw 32-byte public key bytes.
+/// Derive an Ogmara device address (ogd1...) from an Ed25519 public key.
+///
+/// Device keys are ephemeral keys delegated by a wallet. The distinct `ogd`
+/// prefix makes them visually distinguishable from wallet addresses (`klv1`).
+pub fn device_pubkey_to_address(pubkey: &VerifyingKey) -> Result<String, CryptoError> {
+    let hrp = bech32::Hrp::parse(DEVICE_HRP).expect("valid hrp");
+    bech32::encode::<bech32::Bech32>(hrp, pubkey.as_bytes())
+        .map_err(|e| CryptoError::Bech32Error(e.to_string()))
+}
+
+/// Decode a bech32 address (klv1... or ogd1...) to raw 32-byte public key bytes.
+///
+/// Accepts both Klever wallet addresses and Ogmara device addresses.
 pub fn address_to_pubkey_bytes(address: &str) -> Result<[u8; 32], CryptoError> {
     let (hrp, data) = bech32::decode(address)
         .map_err(|e| CryptoError::InvalidAddress(e.to_string()))?;
 
-    if hrp.as_str() != "klv" {
+    let hrp_str = hrp.as_str();
+    if hrp_str != WALLET_HRP && hrp_str != DEVICE_HRP {
         return Err(CryptoError::InvalidAddress(format!(
-            "expected 'klv' prefix, got '{}'",
-            hrp
+            "expected '{}' or '{}' prefix, got '{}'",
+            WALLET_HRP, DEVICE_HRP, hrp_str
         )));
     }
 
@@ -70,11 +91,16 @@ pub fn address_to_pubkey_bytes(address: &str) -> Result<[u8; 32], CryptoError> {
     Ok(bytes)
 }
 
-/// Decode a Klever address to a VerifyingKey.
+/// Decode a bech32 address (klv1... or ogd1...) to a VerifyingKey.
 pub fn address_to_verifying_key(address: &str) -> Result<VerifyingKey, CryptoError> {
     let bytes = address_to_pubkey_bytes(address)?;
     VerifyingKey::from_bytes(&bytes)
         .map_err(|e| CryptoError::InvalidPublicKey(e.to_string()))
+}
+
+/// Check whether an address uses the device HRP (ogd1...).
+pub fn is_device_address(address: &str) -> bool {
+    address.starts_with("ogd1")
 }
 
 /// Generate a new random Ed25519 key pair for node identity.

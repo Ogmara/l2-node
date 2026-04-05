@@ -21,7 +21,7 @@ pub type RocksDb = DBWithThreadMode<MultiThreaded>;
 /// Claim format: `"ogmara-device-claim:{device_pubkey_hex}:{wallet_address}:{timestamp}"`
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DeviceClaim {
-    /// The device's klv1... address (derived from device Ed25519 key).
+    /// The device's ogd1... address (derived from device Ed25519 key).
     pub device_address: String,
     /// The wallet's klv1... address that authorized this device.
     pub wallet_address: String,
@@ -917,7 +917,7 @@ impl Storage {
                 Ok(vk) => vk,
                 Err(_) => continue,
             };
-            let device_address = match crate::crypto::pubkey_to_address(&vk) {
+            let device_address = match crate::crypto::device_pubkey_to_address(&vk) {
                 Ok(a) => a,
                 Err(_) => continue,
             };
@@ -951,6 +951,94 @@ impl Storage {
         self.put_cf(
             cf::NODE_STATE,
             super::schema::state_keys::DELEGATION_MAP_BACKFILLED,
+            &1u64.to_be_bytes(),
+        )?;
+
+        Ok(())
+    }
+
+    /// Migrate device addresses from klv1... to ogd1... prefix.
+    ///
+    /// Re-derives all device addresses in DEVICE_WALLET_MAP and WALLET_DEVICES
+    /// using the `ogd` bech32 HRP instead of `klv`. Old entries are removed.
+    /// Runs once on startup; idempotent.
+    pub fn migrate_device_hrp(&self) -> Result<()> {
+        use tracing::info;
+
+        // Collect all existing DEVICE_WALLET_MAP entries
+        let entries = self.prefix_iter_cf(cf::DEVICE_WALLET_MAP, &[], 100_000)?;
+        let mut migrated = 0u32;
+        let mut skipped = 0u32;
+
+        for (key_bytes, wallet_bytes) in &entries {
+            let old_address = match std::str::from_utf8(key_bytes) {
+                Ok(s) => s,
+                Err(_) => { skipped += 1; continue; }
+            };
+
+            // Skip entries that already use the ogd prefix
+            if old_address.starts_with("ogd1") {
+                continue;
+            }
+
+            // Only migrate klv1 device entries
+            if !old_address.starts_with("klv1") {
+                continue;
+            }
+
+            // Decode the old klv1 address to pubkey bytes, re-encode as ogd1
+            let pubkey_bytes = match crate::crypto::address_to_pubkey_bytes(old_address) {
+                Ok(b) => b,
+                Err(_) => { skipped += 1; continue; }
+            };
+            let vk = match ed25519_dalek::VerifyingKey::from_bytes(&pubkey_bytes) {
+                Ok(vk) => vk,
+                Err(_) => { skipped += 1; continue; }
+            };
+            let new_address = match crate::crypto::device_pubkey_to_address(&vk) {
+                Ok(a) => a,
+                Err(_) => { skipped += 1; continue; }
+            };
+
+            let wallet = match std::str::from_utf8(wallet_bytes) {
+                Ok(s) => s.to_string(),
+                Err(_) => { skipped += 1; continue; }
+            };
+
+            // Write new forward map: ogd1... → wallet
+            self.put_cf(cf::DEVICE_WALLET_MAP, new_address.as_bytes(), wallet.as_bytes())?;
+            // Delete old forward map: klv1... → wallet
+            self.delete_cf(cf::DEVICE_WALLET_MAP, key_bytes)?;
+
+            // Migrate reverse map: delete old (wallet, klv1) key, write (wallet, ogd1) key
+            let old_wd_key = super::schema::encode_wallet_device_key(&wallet, old_address);
+            let old_claim = self.get_cf(cf::WALLET_DEVICES, &old_wd_key)?;
+            if let Some(claim_bytes) = old_claim {
+                // Update the device_address field in the claim JSON
+                let mut claim: serde_json::Value = serde_json::from_slice(&claim_bytes)
+                    .unwrap_or_default();
+                claim["device_address"] = serde_json::json!(new_address);
+
+                let new_wd_key = super::schema::encode_wallet_device_key(&wallet, &new_address);
+                if let Ok(new_claim_bytes) = serde_json::to_vec(&claim) {
+                    self.put_cf(cf::WALLET_DEVICES, &new_wd_key, &new_claim_bytes)?;
+                }
+                self.delete_cf(cf::WALLET_DEVICES, &old_wd_key)?;
+            }
+
+            migrated += 1;
+        }
+
+        if migrated > 0 || skipped > 0 {
+            info!(migrated, skipped, "Migrated device addresses from klv1 to ogd1 prefix");
+        }
+        if skipped > 0 {
+            warn!(skipped, "Some device address entries were skipped during HRP migration (corrupted data)");
+        }
+
+        self.put_cf(
+            cf::NODE_STATE,
+            super::schema::state_keys::DEVICE_HRP_MIGRATED,
             &1u64.to_be_bytes(),
         )?;
 

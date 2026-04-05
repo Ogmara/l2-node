@@ -5,6 +5,26 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.0] - 2026-04-05
+
+### Added
+- **Device address prefix (`ogd1...`)** — device keys now use a distinct bech32
+  prefix `ogd` instead of `klv`, making them visually distinguishable from wallet
+  addresses. Prevents confusion between ephemeral device keys and wallet identities.
+- `device_pubkey_to_address()` function in crypto module for encoding device
+  public keys with the `ogd` HRP
+- `is_device_address()` helper to check if an address uses the device prefix
+- One-time startup migration (`migrate_device_hrp`) re-derives all existing
+  device addresses in `DEVICE_WALLET_MAP` and `WALLET_DEVICES` from `klv1` to
+  `ogd1` format
+
+### Changed
+- `address_to_pubkey_bytes()` and `address_to_verifying_key()` now accept both
+  `klv1...` (wallet) and `ogd1...` (device) addresses
+- Auth middleware accepts `ogd1...` device addresses in `X-Ogmara-Address` header
+- `/api/v1/devices/register` now returns `ogd1...` device addresses
+- Chain scanner writes `ogd1...` device addresses for on-chain delegations
+
 ## [0.14.0] - 2026-04-05
 
 ### Changed
