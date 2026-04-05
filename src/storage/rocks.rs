@@ -963,7 +963,7 @@ impl Storage {
     /// using the `ogd` bech32 HRP instead of `klv`. Old entries are removed.
     /// Runs once on startup; idempotent.
     pub fn migrate_device_hrp(&self) -> Result<()> {
-        use tracing::info;
+        use tracing::{info, warn};
 
         // Collect all existing DEVICE_WALLET_MAP entries
         let entries = self.prefix_iter_cf(cf::DEVICE_WALLET_MAP, &[], 100_000)?;
