@@ -189,6 +189,48 @@ impl Storage {
         Ok(results)
     }
 
+    /// Iterate over a column family starting strictly after a given key.
+    ///
+    /// Seeks to `start_key`, skips it, then iterates forward within the prefix.
+    /// Used for incremental fetching (e.g., "give me messages after this one").
+    pub fn prefix_iter_cf_after(
+        &self,
+        cf_name: &str,
+        start_key: &[u8],
+        prefix: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let cf = self
+            .db
+            .cf_handle(cf_name)
+            .with_context(|| format!("column family '{}' not found", cf_name))?;
+
+        let mut iter = self.db.raw_iterator_cf(&cf);
+        iter.seek(start_key);
+
+        // Skip the start_key itself (we want entries strictly after it)
+        if iter.valid() {
+            if let Some(key) = iter.key() {
+                if key == start_key {
+                    iter.next();
+                }
+            }
+        }
+
+        let mut results = Vec::with_capacity(limit.min(500));
+        while iter.valid() && results.len() < limit {
+            if let (Some(key), Some(value)) = (iter.key(), iter.value()) {
+                if !key.starts_with(prefix) {
+                    break;
+                }
+                results.push((key.to_vec(), value.to_vec()));
+            }
+            iter.next();
+        }
+
+        Ok(results)
+    }
+
     /// Iterate backwards over a column family starting from a key.
     ///
     /// Returns key-value pairs in reverse lexicographic order.
