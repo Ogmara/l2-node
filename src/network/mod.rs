@@ -12,6 +12,7 @@ pub mod discovery;
 pub mod gossip;
 pub mod sync;
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -43,6 +44,8 @@ pub struct NetworkService {
     storage: Storage,
     /// Notification engine for mention detection and push delivery.
     notification_engine: Option<Arc<NotificationEngine>>,
+    /// Shared peer count (read by API health endpoint).
+    peer_count: Arc<AtomicU32>,
 }
 
 impl NetworkService {
@@ -53,6 +56,7 @@ impl NetworkService {
         identity: IdentityResolver,
         keypair: libp2p::identity::Keypair,
         notification_engine: Option<Arc<NotificationEngine>>,
+        peer_count: Arc<AtomicU32>,
     ) -> Result<Self> {
         let mut swarm = behaviour::build_swarm(config, keypair)
             .context("building libp2p swarm")?;
@@ -136,6 +140,7 @@ impl NetworkService {
             router,
             storage,
             notification_engine,
+            peer_count,
         })
     }
 
@@ -319,6 +324,7 @@ impl NetworkService {
                 ..
             } => {
                 let total_peers = self.swarm.connected_peers().count();
+                self.peer_count.store(total_peers as u32, Ordering::Relaxed);
                 info!(
                     peer = %peer_id,
                     connections = %num_established,
@@ -342,6 +348,7 @@ impl NetworkService {
                 ..
             } => {
                 let total_peers = self.swarm.connected_peers().count();
+                self.peer_count.store(total_peers as u32, Ordering::Relaxed);
                 if let Some(ref err) = cause {
                     warn!(
                         peer = %peer_id,

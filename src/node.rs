@@ -216,6 +216,9 @@ impl Node {
             Some(Arc::new(engine))
         };
 
+        // Shared peer counter (updated by network layer, read by API health endpoint)
+        let peer_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+
         // Start the network service
         let keypair = self.libp2p_keypair()?;
         let mut network = crate::network::NetworkService::new(
@@ -224,6 +227,7 @@ impl Node {
             identity.clone(),
             keypair,
             notification_engine.clone(),
+            peer_count.clone(),
         )
         .await
         .context("starting network service")?;
@@ -371,6 +375,7 @@ impl Node {
             notification_engine.clone(),
             ws_broadcast,
             anchor_trigger_tx,
+            peer_count,
         ));
         let api_config = self.config.clone();
         let api_shutdown_rx = self.shutdown_rx();

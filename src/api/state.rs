@@ -22,8 +22,8 @@ pub struct AppState {
     pub node_id: String,
     /// When the node started.
     pub started_at: Instant,
-    /// Connected peer count (updated by the network layer).
-    peers: AtomicU32,
+    /// Connected peer count (shared with the network layer).
+    peers: Arc<AtomicU32>,
     /// Broadcast channel for forwarding messages to WebSocket clients.
     pub ws_broadcast: broadcast::Sender<String>,
     /// Klever network name ("testnet" or "mainnet"), derived from config.
@@ -70,6 +70,7 @@ impl AppState {
             notification_engine,
             ws_broadcast,
             anchor_trigger,
+            Arc::new(AtomicU32::new(0)),
         )
     }
 
@@ -89,13 +90,14 @@ impl AppState {
         notification_engine: Option<Arc<NotificationEngine>>,
         ws_broadcast: broadcast::Sender<String>,
         anchor_trigger: Option<mpsc::Sender<oneshot::Sender<Result<String, String>>>>,
+        peer_count: Arc<AtomicU32>,
     ) -> Self {
         Self {
             storage,
             router,
             node_id,
             started_at: Instant::now(),
-            peers: AtomicU32::new(0),
+            peers: peer_count,
             ws_broadcast,
             klever_network,
             contract_address,
