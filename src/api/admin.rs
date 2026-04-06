@@ -145,11 +145,14 @@ pub async fn trigger_anchor(
             "tx_hash": tx_hash,
         }))
         .into_response(),
-        Ok(Err(err)) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": err })),
-        )
-            .into_response(),
+        Ok(Err(err)) => {
+            tracing::error!(error = %err, "State anchor failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": err })),
+            )
+                .into_response()
+        }
         Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": "anchoring task dropped reply channel" })),
