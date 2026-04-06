@@ -1,7 +1,8 @@
 //! Shared application state for the API layer.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -11,6 +12,13 @@ use crate::messages::router::MessageRouter;
 use crate::notifications::engine::NotificationEngine;
 use crate::storage::identity::IdentityResolver;
 use crate::storage::rocks::Storage;
+
+/// Info about a connected Ogmara peer (from libp2p Identify).
+#[derive(Debug, Clone)]
+pub struct ConnectedPeerInfo {
+    /// Agent version string (e.g. "ogmara-node/0.21.0").
+    pub agent_version: String,
+}
 
 /// Shared state accessible to all API handlers.
 pub struct AppState {
@@ -45,6 +53,9 @@ pub struct AppState {
     /// Channel to publish messages to GossipSub via the network layer.
     /// Sends (topic_string, raw_envelope_bytes).
     pub gossip_tx: tokio::sync::mpsc::UnboundedSender<(String, Vec<u8>)>,
+    /// Connected Ogmara peers (keyed by node_id), updated by the network layer.
+    /// Used by `/api/v1/network/nodes` to include peers that haven't announced yet.
+    pub connected_peers: Arc<RwLock<HashMap<String, ConnectedPeerInfo>>>,
 }
 
 impl AppState {
@@ -76,6 +87,7 @@ impl AppState {
             anchor_trigger,
             Arc::new(AtomicU32::new(0)),
             gossip_tx,
+            Arc::new(RwLock::new(HashMap::new())),
         )
     }
 
@@ -97,6 +109,7 @@ impl AppState {
         anchor_trigger: Option<mpsc::Sender<oneshot::Sender<Result<String, String>>>>,
         peer_count: Arc<AtomicU32>,
         gossip_tx: tokio::sync::mpsc::UnboundedSender<(String, Vec<u8>)>,
+        connected_peers: Arc<RwLock<HashMap<String, ConnectedPeerInfo>>>,
     ) -> Self {
         Self {
             storage,
@@ -113,6 +126,7 @@ impl AppState {
             notification_engine,
             anchor_trigger,
             gossip_tx,
+            connected_peers,
         }
     }
 

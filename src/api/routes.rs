@@ -344,6 +344,35 @@ pub async fn network_nodes(
                 }
             }
 
+            // Include connected Ogmara peers that aren't in the PEER_DIRECTORY yet
+            // (e.g. peers whose NodeAnnouncement hasn't arrived via GossipSub)
+            // Note: do not hold this lock across .await points
+            if let Ok(connected) = state.connected_peers.read() {
+                let known_ids: std::collections::HashSet<String> =
+                    nodes.iter().map(|n| n.node_id.clone()).collect();
+                for (node_id, _info) in connected.iter() {
+                    if known_ids.contains(node_id) {
+                        continue;
+                    }
+                    nodes.push(NodeEntry {
+                        node_id: node_id.clone(),
+                        api_endpoint: None,
+                        channels: vec![],
+                        user_count: 0,
+                        last_seen: now_ms,
+                        anchor_status: state.storage.compute_anchor_status(node_id).unwrap_or_else(|_| {
+                            crate::storage::rocks::AnchorStatus {
+                                verified: false,
+                                level: "none".to_string(),
+                                last_anchor_age_seconds: None,
+                                anchoring_since: None,
+                                total_anchors: 0,
+                            }
+                        }),
+                    });
+                }
+            }
+
             let total = nodes.len();
             Json(serde_json::json!({
                 "nodes": nodes,
