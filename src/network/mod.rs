@@ -313,10 +313,15 @@ impl NetworkService {
                 for addr in info.listen_addrs.into_iter().take(16) {
                     self.swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
                 }
+
+                // Sync channel messages from this peer if it's an Ogmara node
+                if info.protocol_version.starts_with("/ogmara/") {
+                    self.sync_channels_with_peer(peer_id);
+                }
             }
 
             SwarmEvent::Behaviour(OgmaraBehaviourEvent::RequestResponse(event)) => {
-                sync::handle_request_response_event(event, &self.storage, &self.router);
+                self.handle_request_response(event);
             }
 
             SwarmEvent::NewListenAddr { address, .. } => {
@@ -404,6 +409,149 @@ impl NetworkService {
             }
 
             _ => {}
+        }
+    }
+
+    /// Handle a request-response event — sync protocol.
+    ///
+    /// Inbound requests: build response from local storage and send it back.
+    /// Inbound responses: validate and store each message.
+    fn handle_request_response(
+        &mut self,
+        event: libp2p::request_response::Event<sync::SyncRequest, sync::SyncResponse>,
+    ) {
+        use libp2p::request_response;
+
+        match event {
+            request_response::Event::Message {
+                peer,
+                message:
+                    request_response::Message::Request {
+                        request,
+                        channel,
+                        ..
+                    },
+                ..
+            } => {
+                debug!(
+                    peer = %peer,
+                    request_type = ?request.request_type,
+                    channel_id = ?request.channel_id,
+                    "Received sync request"
+                );
+
+                let response = sync::build_sync_response(request, &self.storage);
+
+                info!(
+                    peer = %peer,
+                    messages = response.messages.len(),
+                    has_more = response.has_more,
+                    "Sending sync response"
+                );
+
+                if self
+                    .swarm
+                    .behaviour_mut()
+                    .request_response
+                    .send_response(channel, response)
+                    .is_err()
+                {
+                    warn!(peer = %peer, "Failed to send sync response (channel closed)");
+                }
+            }
+
+            request_response::Event::Message {
+                peer,
+                message:
+                    request_response::Message::Response {
+                        response,
+                        ..
+                    },
+                ..
+            } => {
+                info!(
+                    peer = %peer,
+                    request_type = ?response.request_type,
+                    messages = response.messages.len(),
+                    has_more = response.has_more,
+                    "Received sync response"
+                );
+
+                let mut accepted = 0u32;
+                let mut rejected = 0u32;
+                for msg_bytes in &response.messages {
+                    match self.router.process_message(msg_bytes) {
+                        RouteResult::Accepted { .. } => accepted += 1,
+                        RouteResult::Duplicate => {}
+                        RouteResult::Rejected(reason) => {
+                            warn!(reason = %reason, "Rejected synced message");
+                            rejected += 1;
+                        }
+                    }
+                }
+                if accepted > 0 || rejected > 0 {
+                    info!(accepted, rejected, "Sync response processed");
+                }
+            }
+
+            request_response::Event::OutboundFailure {
+                peer, error, ..
+            } => {
+                warn!(peer = %peer, error = %error, "Sync request failed");
+            }
+
+            request_response::Event::InboundFailure {
+                peer, error, ..
+            } => {
+                warn!(peer = %peer, error = %error, "Sync inbound failure");
+            }
+
+            _ => {}
+        }
+    }
+
+    /// Initiate sync for all subscribed channels with a connected peer.
+    ///
+    /// Called when a new peer connection is established. Sends a SyncRequest
+    /// for each channel the node is subscribed to, requesting messages after
+    /// the latest message the node already has for that channel.
+    fn sync_channels_with_peer(&mut self, peer_id: PeerId) {
+        let channel_ids: Vec<u64> = self.topics.subscribed_channels().iter().copied().collect();
+
+        if channel_ids.is_empty() {
+            return;
+        }
+
+        info!(
+            peer = %peer_id,
+            channels = channel_ids.len(),
+            "Starting sync with peer"
+        );
+
+        for channel_id in channel_ids {
+            // Find the latest message timestamp for this channel to avoid re-fetching
+            let after_timestamp = self
+                .storage
+                .latest_channel_timestamp(channel_id)
+                .unwrap_or(None);
+
+            let request = sync::SyncRequest {
+                request_type: sync::SyncRequestType::ChannelMessages,
+                channel_id: Some(channel_id),
+                conversation_id: None,
+                before_id: None,
+                after_id: None,
+                after_timestamp,
+                limit: 500,
+                requester: None,
+                proof: None,
+                proof_timestamp: None,
+            };
+
+            self.swarm
+                .behaviour_mut()
+                .request_response
+                .send_request(&peer_id, request);
         }
     }
 

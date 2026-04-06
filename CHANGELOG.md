@@ -5,6 +5,27 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.0] - 2026-04-06
+
+### Added
+- **Sync protocol: initial message sync on peer connection** — when a peer is
+  identified as an Ogmara node, the node sends `SyncRequest` for every subscribed
+  channel, requesting messages after the latest Lamport timestamp already stored
+  locally. This is how new nodes catch up on historical messages.
+- `Storage::latest_channel_timestamp()` — finds the most recent Lamport timestamp
+  for a channel by seeking to the end of the CHANNEL_MSGS index.
+- `Storage::iter_cf_from()` — iterates a column family from a seek position,
+  bounded by a prefix. Used for incremental sync (after_timestamp filtering).
+
+### Fixed
+- **Sync response was never sent** — `handle_sync_request()` built the response
+  from local storage but dropped the `ResponseChannel` without sending it. The
+  production node was preparing messages but never delivering them to the requester.
+  Now `send_response()` is called on the swarm's request-response behaviour.
+- **`after_timestamp` filter was ignored** — `fetch_channel_messages()` ignored
+  the `after_timestamp` field, always returning messages from the start. Now seeks
+  to the correct position in the CHANNEL_MSGS index.
+
 ## [0.18.0] - 2026-04-06
 
 ### Added
