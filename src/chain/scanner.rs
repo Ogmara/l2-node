@@ -3,11 +3,14 @@
 //! Monitors the Ogmara smart contract on Klever mainnet (or testnet) for
 //! events like user registrations, channel creation, delegations, etc.
 //! Updates local state in RocksDB accordingly (spec 03-l2-node.md section 3.2).
+//!
+//! Rate-limit aware: uses exponential backoff on HTTP 429 responses and
+//! inter-batch delays during catch-up to stay within Klever API quotas.
 
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::KleverConfig;
 use crate::storage::rocks::Storage;
@@ -15,6 +18,19 @@ use crate::storage::schema::cf;
 
 use super::parser;
 use super::types::*;
+
+/// Minimum delay between batches during catch-up scanning (ms).
+const CATCHUP_BATCH_DELAY_MS: u64 = 500;
+/// Base backoff on rate limit (ms). Doubled on each consecutive 429.
+const BACKOFF_BASE_MS: u64 = 5_000;
+/// Maximum backoff cap (ms).
+const BACKOFF_MAX_MS: u64 = 120_000;
+/// Number of blocks per batch during catch-up.
+const CATCHUP_BATCH_SIZE: u64 = 2_000;
+/// Number of blocks per batch when near chain tip.
+const TIP_BATCH_SIZE: u64 = 500;
+/// If we're more than this many blocks behind, we're in catch-up mode.
+const CATCHUP_THRESHOLD: u64 = 5_000;
 
 /// The chain scanner service.
 pub struct ChainScanner {
@@ -26,13 +42,17 @@ pub struct ChainScanner {
     storage: Storage,
     /// Last processed block height (cursor).
     last_block: u64,
+    /// Current exponential backoff duration (reset on success).
+    backoff: Duration,
+    /// Number of consecutive rate-limit errors.
+    consecutive_429s: u32,
 }
 
 impl ChainScanner {
     /// Create a new chain scanner.
     pub fn new(config: KleverConfig, storage: Storage) -> Result<Self> {
         let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(15))
             .build()
             .context("creating HTTP client")?;
 
@@ -49,6 +69,8 @@ impl ChainScanner {
             http,
             storage,
             last_block,
+            backoff: Duration::ZERO,
+            consecutive_429s: 0,
         })
     }
 
@@ -62,7 +84,6 @@ impl ChainScanner {
             || self.config.contract_address.is_empty()
         {
             info!("Chain scanner disabled — Klever node_url, api_url, or contract_address not configured");
-            // Wait for shutdown
             let _ = shutdown_rx.recv().await;
             return;
         }
@@ -75,8 +96,48 @@ impl ChainScanner {
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    if let Err(e) = self.poll_blocks().await {
-                        warn!(error = %e, "Chain scanner poll failed");
+                    // If we're in backoff, wait before trying
+                    if !self.backoff.is_zero() {
+                        info!(
+                            backoff_secs = self.backoff.as_secs(),
+                            consecutive_429s = self.consecutive_429s,
+                            "Rate-limited, backing off"
+                        );
+                        tokio::select! {
+                            _ = tokio::time::sleep(self.backoff) => {},
+                            _ = shutdown_rx.recv() => {
+                                info!("Chain scanner shutting down");
+                                return;
+                            }
+                        }
+                    }
+
+                    match self.poll_blocks(&mut shutdown_rx).await {
+                        Ok(()) => {
+                            // Reset backoff on success
+                            if self.consecutive_429s > 0 {
+                                info!("Chain scanner recovered from rate limiting");
+                            }
+                            self.backoff = Duration::ZERO;
+                            self.consecutive_429s = 0;
+                        }
+                        Err(e) => {
+                            let err_str = e.to_string();
+                            if err_str.contains("429") || err_str.contains("Too Many Requests") {
+                                self.consecutive_429s += 1;
+                                let backoff_ms = (BACKOFF_BASE_MS * 2u64.saturating_pow(self.consecutive_429s.saturating_sub(1)))
+                                    .min(BACKOFF_MAX_MS);
+                                self.backoff = Duration::from_millis(backoff_ms);
+                                warn!(
+                                    error = %e,
+                                    backoff_ms,
+                                    consecutive_429s = self.consecutive_429s,
+                                    "Chain scanner rate-limited, will back off"
+                                );
+                            } else {
+                                warn!(error = %e, "Chain scanner poll failed");
+                            }
+                        }
                     }
                 }
                 _ = shutdown_rx.recv() => {
@@ -88,35 +149,72 @@ impl ChainScanner {
     }
 
     /// Poll for new blocks since the last cursor position.
-    async fn poll_blocks(&mut self) -> Result<()> {
+    async fn poll_blocks(
+        &mut self,
+        shutdown_rx: &mut tokio::sync::broadcast::Receiver<()>,
+    ) -> Result<()> {
         let latest = self.get_latest_block_height().await?;
 
         if latest <= self.last_block {
             return Ok(());
         }
 
-        debug!(
-            from = self.last_block + 1,
-            to = latest,
-            "Scanning blocks"
-        );
+        let behind = latest - self.last_block;
+        let catching_up = behind > CATCHUP_THRESHOLD;
+        let batch_size = if catching_up { CATCHUP_BATCH_SIZE } else { TIP_BATCH_SIZE };
 
-        // Process blocks in batches — scan wide ranges per API call
-        let batch_size = 500u64;
+        if catching_up {
+            info!(
+                behind,
+                from = self.last_block + 1,
+                to = latest,
+                batch_size,
+                "Catch-up scan starting"
+            );
+        } else {
+            debug!(
+                from = self.last_block + 1,
+                to = latest,
+                "Scanning blocks"
+            );
+        }
+
         let mut current = self.last_block + 1;
 
         while current <= latest {
             let end = (current + batch_size - 1).min(latest);
 
-            if let Err(e) = self.process_block_range(current, end).await {
-                warn!(from = current, to = end, error = %e, "Failed to process block range");
-                return Ok(());
-            }
+            self.process_block_range(current, end).await?;
 
             // Update cursor after successful batch
             self.last_block = end;
             self.storage.set_chain_cursor(end)?;
             current = end + 1;
+
+            // Inter-batch delay to avoid hitting rate limits
+            if current <= latest {
+                let delay = if catching_up {
+                    Duration::from_millis(CATCHUP_BATCH_DELAY_MS)
+                } else {
+                    Duration::from_millis(200)
+                };
+
+                // Check for shutdown during the delay
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {},
+                    _ = shutdown_rx.recv() => {
+                        info!(
+                            cursor = self.last_block,
+                            "Chain scanner shutting down mid-scan"
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
+        if catching_up {
+            info!(cursor = self.last_block, "Catch-up scan complete");
         }
 
         Ok(())
@@ -159,82 +257,109 @@ impl ChainScanner {
     }
 
     /// Process a range of blocks — fetch transactions and filter for Ogmara SC events.
+    ///
+    /// Paginates through the transaction list to ensure all transactions are captured
+    /// even in busy block ranges. Capped at 50 pages to prevent infinite loops.
     async fn process_block_range(&self, start: u64, end: u64) -> Result<()> {
-        let url = format!(
-            "{}/v1.0/transaction/list?status=success&page=1&limit=100&startBlock={}&endBlock={}",
-            self.config.api_url, start, end
-        );
+        let mut page = 1u64;
+        const MAX_PAGES: u64 = 50;
 
-        let response = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .context("fetching block transactions")?;
-
-        let status = response.status();
-        let text = response.text().await.context("reading transactions body")?;
-
-        if !status.is_success() {
-            anyhow::bail!(
-                "transaction list HTTP {}: {}",
-                status,
-                &text[..text.len().min(200)]
+        loop {
+            if page > MAX_PAGES {
+                warn!(start, end, "Hit pagination cap ({MAX_PAGES} pages) — some transactions may be missed");
+                break;
+            }
+            let url = format!(
+                "{}/v1.0/transaction/list?status=success&type=63&toAddress={}&page={}&limit=100&startBlock={}&endBlock={}",
+                self.config.api_url, self.config.contract_address, page, start, end
             );
-        }
 
-        let resp: serde_json::Value =
-            serde_json::from_str(&text).context("parsing block transactions JSON")?;
+            let response = self
+                .http
+                .get(&url)
+                .send()
+                .await
+                .context("fetching block transactions")?;
 
-        // Extract transactions array
-        let txs = match resp.pointer("/data/transactions") {
-            Some(serde_json::Value::Array(arr)) => arr,
-            _ => return Ok(()), // No transactions in this range
-        };
+            let status = response.status();
+            let text = response.text().await.context("reading transactions body")?;
 
-        for tx_value in txs {
-            let tx: KleverTransaction = match serde_json::from_value(tx_value.clone()) {
-                Ok(tx) => tx,
-                Err(_) => continue,
+            if !status.is_success() {
+                anyhow::bail!(
+                    "transaction list HTTP {}: {}",
+                    status,
+                    &text[..text.len().min(200)]
+                );
+            }
+
+            let resp: serde_json::Value =
+                serde_json::from_str(&text).context("parsing block transactions JSON")?;
+
+            // Extract transactions array
+            let txs = match resp.pointer("/data/transactions") {
+                Some(serde_json::Value::Array(arr)) if !arr.is_empty() => arr,
+                _ => break, // No (more) transactions
             };
 
-            // Filter for successful SC invoke transactions targeting our contract
-            if tx.status != "success" {
-                continue;
-            }
+            let tx_count = txs.len();
 
-            let contract_address = tx
-                .contract
-                .first()
-                .map(|c| c.parameter.address.as_str())
-                .unwrap_or("");
+            for tx_value in txs {
+                let tx: KleverTransaction = match serde_json::from_value(tx_value.clone()) {
+                    Ok(tx) => tx,
+                    Err(e) => {
+                        debug!(error = %e, "Skipping unparseable transaction");
+                        continue;
+                    }
+                };
 
-            if contract_address != self.config.contract_address {
-                continue;
-            }
+                if tx.status != "success" {
+                    continue;
+                }
 
-            // Decode the SC function call from the data field
-            // data[0] is hex-encoded "functionName@arg1@arg2"
-            let call_data = match tx.data.first() {
-                Some(hex_data) => {
-                    match hex::decode(hex_data) {
-                        Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
-                        Err(_) => continue,
+                // Already filtered by toAddress in the API query, but double-check
+                // the contract call parameter address matches
+                let contract_address = tx
+                    .contract
+                    .first()
+                    .map(|c| c.parameter.address.as_str())
+                    .unwrap_or("");
+
+                if contract_address != self.config.contract_address {
+                    continue;
+                }
+
+                // Decode the SC function call from the data field
+                // data[0] is hex-encoded "functionName@arg1@arg2"
+                let call_data = match tx.data.first() {
+                    Some(hex_data) => {
+                        match hex::decode(hex_data) {
+                            Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+                            Err(_) => continue,
+                        }
+                    }
+                    None => continue,
+                };
+
+                if let Some(event) = parser::parse_sc_call(&call_data, &tx.sender, tx.timestamp) {
+                    if let Err(e) = self.handle_event(event).await {
+                        warn!(
+                            block = start,
+                            tx = %tx.hash,
+                            error = %e,
+                            "Failed to handle SC event"
+                        );
                     }
                 }
-                None => continue,
-            };
-
-            if let Some(event) = parser::parse_sc_call(&call_data, &tx.sender, tx.timestamp) {
-                if let Err(e) = self.handle_event(event).await {
-                    warn!(
-                        block = start,
-                        tx = %tx.hash,
-                        error = %e,
-                        "Failed to handle SC event"
-                    );
-                }
             }
+
+            // If we got fewer than the limit, no more pages
+            if tx_count < 100 {
+                break;
+            }
+            page += 1;
+
+            // Brief pause between pages
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
         Ok(())
