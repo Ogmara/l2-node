@@ -275,6 +275,51 @@ impl Node {
             }
         });
 
+        // Start state anchorer (if enabled)
+        let anchor_trigger_tx = if self.config.anchoring.enabled {
+            let anchor_klever = self.config.klever.clone();
+            let anchor_config = self.config.anchoring.clone();
+            let anchor_storage = self.storage.clone();
+            let anchor_node_id = self.node_id.clone();
+
+            // Resolve wallet key: env var > config file > node identity key
+            let wallet_key_hex = std::env::var("OGMARA_ANCHOR_WALLET_KEY")
+                .unwrap_or_else(|_| anchor_config.wallet_key.clone());
+
+            let anchor_key = if wallet_key_hex.is_empty() {
+                info!("State anchoring using node identity key");
+                self.signing_key.clone()
+            } else {
+                let mut bytes = hex::decode(&wallet_key_hex)
+                    .context("decoding anchor wallet key hex")?;
+                let key_bytes: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+                    anyhow::anyhow!("anchor wallet key must be 32 bytes, got {}", bytes.len())
+                })?;
+                let key = SigningKey::from_bytes(&key_bytes);
+                // Zeroize the intermediate secret material
+                bytes.fill(0);
+                info!("State anchoring using separate wallet key");
+                key
+            };
+            let anchor_shutdown_rx = self.shutdown_rx();
+            let (trigger_tx, trigger_rx) = tokio::sync::mpsc::channel(1);
+            let _anchor_task = tokio::spawn(async move {
+                match crate::chain::anchoring::StateAnchorer::new(
+                    anchor_klever,
+                    anchor_config,
+                    anchor_storage,
+                    anchor_key,
+                    anchor_node_id,
+                ) {
+                    Ok(mut anchorer) => anchorer.run(anchor_shutdown_rx, trigger_rx).await,
+                    Err(e) => warn!(error = %e, "Failed to start state anchorer"),
+                }
+            });
+            Some(trigger_tx)
+        } else {
+            None
+        };
+
         // IPFS client (stored for API media endpoints)
         let ipfs_client = match crate::ipfs::client::IpfsClient::new(&self.config.ipfs) {
             Ok(ipfs) => {
@@ -325,6 +370,7 @@ impl Node {
             self.config.api.public_url.clone(),
             notification_engine.clone(),
             ws_broadcast,
+            anchor_trigger_tx,
         ));
         let api_config = self.config.clone();
         let api_shutdown_rx = self.shutdown_rx();

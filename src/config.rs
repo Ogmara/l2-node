@@ -27,6 +27,8 @@ pub struct Config {
     #[serde(default)]
     pub push_gateway: PushGatewayConfig,
     #[serde(default)]
+    pub anchoring: AnchoringConfig,
+    #[serde(default)]
     pub logging: LoggingConfig,
     #[serde(default)]
     pub alerts: AlertsConfig,
@@ -245,6 +247,48 @@ impl Default for PushGatewayConfig {
     }
 }
 
+/// State anchoring configuration.
+///
+/// When enabled, the node periodically computes a Merkle root of L2 state
+/// and submits it to the Klever blockchain via the Ogmara KApp smart contract.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct AnchoringConfig {
+    /// Enable periodic state anchoring to the Klever blockchain.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Anchoring interval in seconds (default: 3600 = ~24 anchors/day).
+    #[serde(default = "default_anchor_interval")]
+    pub interval_seconds: u64,
+    /// Optional: hex-encoded 32-byte Ed25519 private key for the anchor wallet.
+    /// If empty, uses the node's identity key. The corresponding klv1... address
+    /// must be authorized on the smart contract via `authorizeAnchorer`.
+    ///
+    /// **Security:** Prefer using `OGMARA_ANCHOR_WALLET_KEY` environment variable
+    /// instead of putting the key in the config file.
+    #[serde(default, skip_serializing)]
+    pub wallet_key: String,
+}
+
+impl std::fmt::Debug for AnchoringConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AnchoringConfig")
+            .field("enabled", &self.enabled)
+            .field("interval_seconds", &self.interval_seconds)
+            .field("wallet_key", &if self.wallet_key.is_empty() { "<none>" } else { "<redacted>" })
+            .finish()
+    }
+}
+
+impl Default for AnchoringConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_seconds: default_anchor_interval(),
+            wallet_key: String::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoggingConfig {
     /// Log level: trace, debug, info, warn, error.
@@ -416,6 +460,9 @@ fn default_cache_ttl() -> u64 {
 fn default_cache_size() -> u64 {
     1024
 }
+fn default_anchor_interval() -> u64 {
+    3600
+}
 fn default_log_level() -> String {
     "info".to_string()
 }
@@ -529,6 +576,11 @@ auto_pin_on_interaction = true
 enabled = false
 url = ""
 auth_token = ""
+
+[anchoring]
+enabled = false
+interval_seconds = 3600
+# wallet_key = ""  # optional, defaults to node identity key
 
 [logging]
 level = "info"

@@ -699,6 +699,65 @@ impl Storage {
         Ok(entries.len() as u32)
     }
 
+    // --- State Anchoring ---
+
+    /// Compute the current L2 state Merkle root by iterating USERS, CHANNELS,
+    /// and DELEGATIONS column families.
+    ///
+    /// Returns `(state_root, message_count, channel_count, user_count)`.
+    /// Should be called from `spawn_blocking` to avoid blocking the async runtime.
+    pub fn compute_current_state_root(&self) -> Result<([u8; 32], u64, u32, u32)> {
+        use crate::crypto::merkle::StateManager;
+        use super::schema::state_keys;
+
+        let mut state_mgr = StateManager::new();
+
+        // Iterate USERS
+        let user_cf = self.db.cf_handle(cf::USERS)
+            .context("USERS cf not found")?;
+        let mut user_count = 0u32;
+        let mut iter = self.db.raw_iterator_cf(&user_cf);
+        iter.seek_to_first();
+        while iter.valid() {
+            if let Some(value) = iter.value() {
+                state_mgr.add_user(value);
+                user_count += 1;
+            }
+            iter.next();
+        }
+
+        // Iterate CHANNELS
+        let chan_cf = self.db.cf_handle(cf::CHANNELS)
+            .context("CHANNELS cf not found")?;
+        let mut channel_count = 0u32;
+        let mut iter = self.db.raw_iterator_cf(&chan_cf);
+        iter.seek_to_first();
+        while iter.valid() {
+            if let Some(value) = iter.value() {
+                state_mgr.add_channel(value);
+                channel_count += 1;
+            }
+            iter.next();
+        }
+
+        // Iterate DELEGATIONS
+        let deleg_cf = self.db.cf_handle(cf::DELEGATIONS)
+            .context("DELEGATIONS cf not found")?;
+        let mut iter = self.db.raw_iterator_cf(&deleg_cf);
+        iter.seek_to_first();
+        while iter.valid() {
+            if let Some(value) = iter.value() {
+                state_mgr.add_delegation(value);
+            }
+            iter.next();
+        }
+
+        let state_root = state_mgr.compute_state_root();
+        let message_count = self.get_stat(state_keys::TOTAL_MESSAGES)?;
+
+        Ok((state_root, message_count, channel_count, user_count))
+    }
+
     // --- Network Stats Counters ---
 
     /// Read a u64 stat counter from NODE_STATE.
