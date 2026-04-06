@@ -182,6 +182,81 @@ sudo systemctl start ogmara-node
 
 Or use the provided script: `sudo ./scripts/update-node.sh`
 
+## Docker
+
+### Pre-built image
+
+```bash
+docker pull ogmara/ogmara:l2-node-latest
+```
+
+Images are tagged by version (`ogmara/ogmara:l2-node-0.17.0`) and
+`l2-node-latest` for the most recent.
+
+### Run with Docker
+
+```bash
+# Create a config file (start from the example)
+mkdir -p ~/ogmara-node
+cp ogmara.example.toml ~/ogmara-node/ogmara.toml
+# Edit ~/ogmara-node/ogmara.toml as needed
+
+docker run -d \
+  --name ogmara-node \
+  -v ~/ogmara-node/ogmara.toml:/etc/ogmara/ogmara.toml:ro \
+  -v ogmara-data:/data \
+  -p 41720:41720/udp \
+  -p 41720:41720/tcp \
+  -p 41721:41721 \
+  ogmara/ogmara:l2-node-latest
+```
+
+### Check logs
+
+```bash
+docker logs ogmara-node -f
+docker logs ogmara-node 2>&1 | grep -i "peer\|connect\|error"
+```
+
+### Verify
+
+```bash
+curl -s http://localhost:41721/api/v1/health | jq .
+curl -s http://localhost:41721/api/v1/network/stats | jq .
+```
+
+### Build image locally
+
+```bash
+docker build --network=host -t ogmara/ogmara:l2-node-latest .
+```
+
+Note: `--network=host` may be needed on some Linux distributions
+where Docker bridge networking has iptables issues.
+
+### Multi-node setup
+
+To connect a second node to an existing one, add the first node as
+a bootstrap peer in the config:
+
+```toml
+[network]
+bootstrap_nodes = ["/ip4/<NODE1_IP>/tcp/41720/p2p/<NODE1_PEER_ID>"]
+```
+
+Find a node's peer ID in its startup logs:
+```bash
+docker logs ogmara-node 2>&1 | grep "local_peer_id"
+```
+
+The peer ID is stable across restarts (identity key persisted to disk).
+
+### Docker Hub
+
+All Ogmara images share a single Docker Hub repository with tags:
+- `ogmara/ogmara:l2-node-0.17.0`
+- `ogmara/ogmara:l2-node-latest`
+
 ## Ports
 
 | Port | Protocol | Purpose |
