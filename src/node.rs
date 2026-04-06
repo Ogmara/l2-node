@@ -237,7 +237,35 @@ impl Node {
             "Network service started"
         );
 
-        // Subscribe to pinned channels
+        // Channel for chain scanner → network layer topic subscriptions
+        let (channel_tx, channel_rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+
+        // Subscribe to all existing channels from storage so the node
+        // participates in GossipSub for channels it already knows about.
+        match self.storage.prefix_iter_cf(
+            crate::storage::schema::cf::CHANNELS,
+            &[],
+            100_000,
+        ) {
+            Ok(entries) => {
+                let mut count = 0u64;
+                for (key, _) in &entries {
+                    if key.len() == 8 {
+                        let channel_id = u64::from_be_bytes(
+                            <[u8; 8]>::try_from(key.as_slice()).expect("len checked"),
+                        );
+                        network.subscribe_channel(channel_id);
+                        count += 1;
+                    }
+                }
+                if count > 0 {
+                    info!(count, "Subscribed to existing channel topics");
+                }
+            }
+            Err(e) => warn!(error = %e, "Failed to load existing channels for GossipSub"),
+        }
+
+        // Subscribe to pinned channels (may overlap with above, subscribe_channel is idempotent)
         for &channel_id in &self.config.storage.pinned_channels {
             network.subscribe_channel(channel_id);
         }
@@ -265,7 +293,7 @@ impl Node {
         // Run network event loop in a task
         let network_shutdown_rx = self.shutdown_rx();
         let network_task = tokio::spawn(async move {
-            network.run(network_shutdown_rx).await;
+            network.run(network_shutdown_rx, channel_rx).await;
         });
 
         // Start chain scanner
@@ -273,7 +301,7 @@ impl Node {
         let chain_storage = self.storage.clone();
         let chain_shutdown_rx = self.shutdown_rx();
         let chain_task = tokio::spawn(async move {
-            match crate::chain::scanner::ChainScanner::new(chain_config, chain_storage) {
+            match crate::chain::scanner::ChainScanner::new(chain_config, chain_storage, channel_tx) {
                 Ok(mut scanner) => scanner.run(chain_shutdown_rx).await,
                 Err(e) => warn!(error = %e, "Failed to start chain scanner"),
             }

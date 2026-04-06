@@ -46,11 +46,21 @@ pub struct ChainScanner {
     backoff: Duration,
     /// Number of consecutive rate-limit errors.
     consecutive_429s: u32,
+    /// Channel to notify the network layer about new channel discoveries.
+    /// The network service subscribes to the corresponding GossipSub topic.
+    channel_tx: tokio::sync::mpsc::UnboundedSender<u64>,
 }
 
 impl ChainScanner {
     /// Create a new chain scanner.
-    pub fn new(config: KleverConfig, storage: Storage) -> Result<Self> {
+    ///
+    /// `channel_tx` notifies the network layer when new channels are discovered
+    /// so it can subscribe to the corresponding GossipSub topics.
+    pub fn new(
+        config: KleverConfig,
+        storage: Storage,
+        channel_tx: tokio::sync::mpsc::UnboundedSender<u64>,
+    ) -> Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
             .build()
@@ -71,6 +81,7 @@ impl ChainScanner {
             last_block,
             backoff: Duration::ZERO,
             consecutive_429s: 0,
+            channel_tx,
         })
     }
 
@@ -498,6 +509,9 @@ impl ChainScanner {
                         let _ = self.storage.put_cf(cf::CHANNEL_MEMBERS, &member_key, &member_bytes);
                     }
                 }
+                // Notify network layer to subscribe to this channel's GossipSub topic
+                let _ = self.channel_tx.send(channel_id);
+
                 info!(channel_id, slug = %record.slug, "Channel created (on-chain)");
             }
 

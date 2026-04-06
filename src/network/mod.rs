@@ -184,11 +184,13 @@ impl NetworkService {
 
     /// Run the network event loop. Call this from a spawned task.
     ///
-    /// Processes swarm events and routes messages to storage.
+    /// Processes swarm events, routes messages to storage, and subscribes
+    /// to new channel topics as they are discovered by the chain scanner.
     /// Periodically retries Kademlia bootstrap if peer count is low.
     pub async fn run(
         &mut self,
         mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+        mut channel_rx: tokio::sync::mpsc::UnboundedReceiver<u64>,
     ) {
         info!(
             peer_id = %self.swarm.local_peer_id(),
@@ -204,6 +206,10 @@ impl NetworkService {
             tokio::select! {
                 event = self.swarm.select_next_some() => {
                     self.handle_swarm_event(event);
+                }
+                Some(channel_id) = channel_rx.recv() => {
+                    self.topics.subscribe_channel(&mut self.swarm, channel_id);
+                    info!(channel_id, "Auto-subscribed to channel topic (chain discovery)");
                 }
                 _ = bootstrap_interval.tick() => {
                     let peer_count = self.swarm.connected_peers().count();

@@ -5,6 +5,19 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.18.0] - 2026-04-06
+
+### Added
+- **Auto-subscribe to channel GossipSub topics** — the node now subscribes to
+  `/ogmara/v1/channel/{id}` for every channel it knows about. On startup, all
+  existing channels from storage are subscribed. When the chain scanner discovers
+  new channels, it notifies the network layer via an internal channel to subscribe
+  immediately. Previously, only pinned channels and the three default topics
+  (network, profile, news/global) were subscribed — meaning the node never
+  received or relayed channel messages over GossipSub.
+- `tokio::mpsc` bridge from chain scanner to network service for real-time
+  channel topic subscription on discovery.
+
 ## [0.17.1] - 2026-04-06
 
 ### Fixed
