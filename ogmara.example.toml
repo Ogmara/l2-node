@@ -13,13 +13,16 @@ max_peers = 50
 enable_mdns = true
 
 [klever]
-# Klever node/API URLs — configure for testnet or mainnet
-# Testnet example: "https://node.testnet.klever.org"
-# Mainnet example: "https://node.mainnet.klever.org"
-node_url = ""
-api_url = ""
-contract_address = ""
-scan_interval_ms = 3000
+# Klever node/API URLs — configure for testnet or mainnet.
+# Testnet (default):
+node_url = "https://node.testnet.klever.org"
+api_url = "https://api.testnet.klever.org"
+contract_address = "klv1qqqqqqqqqqqqqpgq0ja2j7xwz843ryfsk9vlz6xzsaak590h6pgq7nwr02"
+# Mainnet (swap these when ready):
+# node_url = "https://node.mainnet.klever.org"
+# api_url = "https://api.mainnet.klever.org"
+# contract_address = ""
+scan_interval_ms = 60000    # 60s — safe for testnet rate limits
 
 [ipfs]
 api_url = "http://127.0.0.1:5001"
