@@ -5,6 +5,34 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.17.0] - 2026-04-06
+
+### Added
+- **Connection event diagnostics** — `OutgoingConnectionError`, `IncomingConnectionError`,
+  and `Dialing` swarm events are now handled and logged. Previously these were silently
+  swallowed by a catch-all handler, making handshake failures invisible.
+- **Kademlia bootstrap integration** — bootstrap node peer IDs are extracted from
+  multiaddrs and added to the Kademlia routing table before dialing. Kademlia
+  `bootstrap()` is triggered on first peer connection and retried every 30 seconds.
+  Previously Kademlia always reported "No known peers" because bootstrap nodes were
+  never registered in the DHT.
+- **Connection limits** — `max_peers` config is now enforced via libp2p's
+  `connection_limits::Behaviour`. Inbound connections are capped at half of
+  `max_peers` (default 25) to prevent resource exhaustion from a single source.
+
+### Changed
+- `ConnectionEstablished` and `ConnectionClosed` events upgraded from `debug!` to
+  `info!` level with additional fields: direction (inbound/outbound), remote address,
+  total peer count, and close cause
+- `Identify::Received` upgraded from `debug!` to `info!` level with listen address count
+- Kademlia `RoutingUpdated` events logged at `info!` level (was `debug!`)
+- Identify address injection capped at 16 addresses per peer to mitigate routing
+  table poisoning
+
+### Security
+- Added `memory-connection-limits` feature to libp2p to enforce `max_peers` config
+- Capped Identify listen address injection (max 16 per peer) to prevent DHT poisoning
+
 ## [0.16.0] - 2026-04-06
 
 ### Added
