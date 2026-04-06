@@ -292,6 +292,62 @@ impl Storage {
         self.exists_cf(cf::MESSAGES, msg_id)
     }
 
+    /// Iterate a column family starting at `seek_key`, bounded by `prefix`.
+    ///
+    /// Seeks to the first key >= `seek_key`, then iterates forward as long as
+    /// keys start with `prefix`. This allows seeking to a specific point within
+    /// a prefix range (e.g., seeking to a specific timestamp within a channel).
+    pub fn iter_cf_from(
+        &self,
+        cf_name: &str,
+        seek_key: &[u8],
+        prefix: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let cf = self
+            .db
+            .cf_handle(cf_name)
+            .with_context(|| format!("column family '{}' not found", cf_name))?;
+
+        let mut iter = self.db.raw_iterator_cf(&cf);
+        iter.seek(seek_key);
+
+        let mut results = Vec::with_capacity(limit.min(500));
+        while iter.valid() && results.len() < limit {
+            if let (Some(key), Some(value)) = (iter.key(), iter.value()) {
+                if !key.starts_with(prefix) {
+                    break;
+                }
+                results.push((key.to_vec(), value.to_vec()));
+            }
+            iter.next();
+        }
+
+        Ok(results)
+    }
+
+    /// Get the latest Lamport timestamp for a channel from the CHANNEL_MSGS index.
+    ///
+    /// Key format: (channel_id:8, lamport_ts:8, msg_id:32).
+    /// Seeks to the end of the channel's prefix to find the newest entry.
+    pub fn latest_channel_timestamp(&self, channel_id: u64) -> Result<Option<u64>> {
+        let prefix = channel_id.to_be_bytes();
+        // Seek to end of this channel's key space: next channel_id prefix
+        let mut end_key = (channel_id + 1).to_be_bytes().to_vec();
+
+        let entries = self.reverse_iter_cf(cf::CHANNEL_MSGS, &end_key, &prefix, 1)?;
+        end_key.fill(0); // not secret, just tidy
+
+        match entries.first() {
+            Some((key, _)) if key.len() >= 16 => {
+                let mut ts_bytes = [0u8; 8];
+                ts_bytes.copy_from_slice(&key[8..16]);
+                Ok(Some(u64::from_be_bytes(ts_bytes)))
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// Store the chain scanner cursor (last processed block height).
     pub fn set_chain_cursor(&self, block_height: u64) -> Result<()> {
         self.put_cf(

@@ -4,11 +4,9 @@
 //! via the sync protocol (spec 5.5). This uses libp2p's request-response
 //! behaviour with CBOR encoding.
 
-use libp2p::request_response;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, warn};
+use tracing::warn;
 
-use crate::messages::router::{MessageRouter, RouteResult};
 use crate::storage::rocks::Storage;
 
 /// Sync request sent to a peer (spec 5.5.2).
@@ -68,90 +66,8 @@ pub struct SyncResponse {
 /// Codec type alias for the sync protocol.
 pub type SyncCodec = libp2p::request_response::cbor::Behaviour<SyncRequest, SyncResponse>;
 
-/// Handle a request-response event from the swarm.
-pub fn handle_request_response_event(
-    event: request_response::Event<SyncRequest, SyncResponse>,
-    storage: &Storage,
-    router: &MessageRouter,
-) {
-    match event {
-        request_response::Event::Message {
-            peer,
-            message:
-                request_response::Message::Request {
-                    request,
-                    channel,
-                    ..
-                },
-            ..
-        } => {
-            debug!(
-                peer = %peer,
-                request_type = ?request.request_type,
-                channel_id = ?request.channel_id,
-                "Received sync request"
-            );
-
-            // Build response from local storage
-            let response = handle_sync_request(request, storage);
-
-            debug!(
-                messages = response.messages.len(),
-                has_more = response.has_more,
-                "Sync response prepared"
-            );
-        }
-
-        request_response::Event::Message {
-            peer,
-            message:
-                request_response::Message::Response {
-                    response,
-                    ..
-                },
-            ..
-        } => {
-            debug!(
-                peer = %peer,
-                messages = response.messages.len(),
-                has_more = response.has_more,
-                "Received sync response"
-            );
-
-            // Validate and store each message through the full pipeline
-            let mut accepted = 0u32;
-            let mut rejected = 0u32;
-            for msg_bytes in &response.messages {
-                match router.process_message(msg_bytes) {
-                    RouteResult::Accepted { .. } => accepted += 1,
-                    RouteResult::Duplicate => {} // expected during sync
-                    RouteResult::Rejected(reason) => {
-                        warn!(reason = %reason, "Rejected synced message");
-                        rejected += 1;
-                    }
-                }
-            }
-            debug!(accepted, rejected, "Sync response processed");
-        }
-
-        request_response::Event::OutboundFailure {
-            peer, error, ..
-        } => {
-            warn!(peer = %peer, error = %error, "Sync request failed");
-        }
-
-        request_response::Event::InboundFailure {
-            peer, error, ..
-        } => {
-            warn!(peer = %peer, error = %error, "Sync inbound failure");
-        }
-
-        _ => {}
-    }
-}
-
-/// Handle a sync request by querying local storage.
-fn handle_sync_request(request: SyncRequest, storage: &Storage) -> SyncResponse {
+/// Build a sync response from local storage for an incoming request.
+pub fn build_sync_response(request: SyncRequest, storage: &Storage) -> SyncResponse {
     let limit = request.limit.min(500) as usize;
 
     let messages = match request.request_type {
@@ -281,19 +197,31 @@ fn fetch_private_channel_keys(storage: &Storage, channel_id: u64) -> Vec<Vec<u8>
 }
 
 /// Fetch channel messages from storage using the channel_msgs index.
+///
+/// If `after_timestamp` is set, only returns messages with Lamport timestamp
+/// strictly greater than the given value (used for incremental sync).
 fn fetch_channel_messages(
     storage: &Storage,
     channel_id: u64,
-    _request: &SyncRequest,
+    request: &SyncRequest,
     limit: usize,
 ) -> Vec<Vec<u8>> {
     use crate::storage::schema::cf;
 
-    // Build prefix for the channel_msgs column family
     let prefix = channel_id.to_be_bytes();
 
-    // Query the index to get msg_ids, then fetch full envelopes
-    match storage.prefix_iter_cf(cf::CHANNEL_MSGS, &prefix, limit) {
+    // Build seek key: if after_timestamp is set, start scanning after that timestamp
+    let seek_key = if let Some(after_ts) = request.after_timestamp {
+        let mut key = Vec::with_capacity(16);
+        key.extend_from_slice(&prefix);
+        key.extend_from_slice(&(after_ts + 1).to_be_bytes());
+        key
+    } else {
+        prefix.to_vec()
+    };
+
+    // Iterate from the seek position, but use the channel_id prefix to bound the scan
+    match storage.iter_cf_from(cf::CHANNEL_MSGS, &seek_key, &prefix, limit) {
         Ok(entries) => {
             let mut messages = Vec::with_capacity(entries.len());
             for (key, _) in entries {
