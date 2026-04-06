@@ -228,6 +228,8 @@ impl Node {
             keypair,
             notification_engine.clone(),
             peer_count.clone(),
+            self.signing_key.clone(),
+            self.node_id.clone(),
         )
         .await
         .context("starting network service")?;

@@ -46,6 +46,12 @@ pub struct NetworkService {
     notification_engine: Option<Arc<NotificationEngine>>,
     /// Shared peer count (read by API health endpoint).
     peer_count: Arc<AtomicU32>,
+    /// Node identity for signing announcements.
+    signing_key: ed25519_dalek::SigningKey,
+    /// Node ID (Base58).
+    node_id: String,
+    /// Public API URL (if configured).
+    public_url: Option<String>,
 }
 
 impl NetworkService {
@@ -57,6 +63,8 @@ impl NetworkService {
         keypair: libp2p::identity::Keypair,
         notification_engine: Option<Arc<NotificationEngine>>,
         peer_count: Arc<AtomicU32>,
+        signing_key: ed25519_dalek::SigningKey,
+        node_id: String,
     ) -> Result<Self> {
         let mut swarm = behaviour::build_swarm(config, keypair)
             .context("building libp2p swarm")?;
@@ -134,6 +142,8 @@ impl NetworkService {
         // Create message router with rate limiting and identity resolution
         let router = MessageRouter::new(storage.clone(), identity, config.api.rate_limit_per_ip);
 
+        let public_url = config.api.public_url.clone();
+
         Ok(Self {
             swarm,
             topics,
@@ -141,6 +151,9 @@ impl NetworkService {
             storage,
             notification_engine,
             peer_count,
+            signing_key,
+            node_id,
+            public_url,
         })
     }
 
@@ -202,6 +215,11 @@ impl NetworkService {
         let mut bootstrap_interval = tokio::time::interval(Duration::from_secs(30));
         bootstrap_interval.tick().await; // skip the immediate first tick
 
+        // Periodic NodeAnnouncement (every 5 minutes) — tells other nodes
+        // we exist so they can list us in /api/v1/network/nodes.
+        let mut announce_interval = tokio::time::interval(Duration::from_secs(300));
+        announce_interval.tick().await; // skip immediate tick
+
         loop {
             tokio::select! {
                 event = self.swarm.select_next_some() => {
@@ -210,6 +228,9 @@ impl NetworkService {
                 Some(channel_id) = channel_rx.recv() => {
                     self.topics.subscribe_channel(&mut self.swarm, channel_id);
                     info!(channel_id, "Auto-subscribed to channel topic (chain discovery)");
+                }
+                _ = announce_interval.tick() => {
+                    self.publish_node_announcement();
                 }
                 _ = bootstrap_interval.tick() => {
                     let peer_count = self.swarm.connected_peers().count();
@@ -349,6 +370,8 @@ impl NetworkService {
                     if let Err(e) = self.swarm.behaviour_mut().kademlia.bootstrap() {
                         debug!(error = %e, "Kademlia bootstrap not ready yet");
                     }
+                    // Announce ourselves immediately so other nodes know we exist
+                    self.publish_node_announcement();
                 }
             }
 
@@ -552,6 +575,94 @@ impl NetworkService {
                 .behaviour_mut()
                 .request_response
                 .send_request(&peer_id, request);
+        }
+    }
+
+    /// Publish a NodeAnnouncement to the /ogmara/v1/network topic.
+    ///
+    /// Announces this node's presence, capabilities, and served channels
+    /// so other nodes can discover it and the website can list it.
+    fn publish_node_announcement(&mut self) {
+        use crate::messages::envelope::{Envelope, PROTOCOL_VERSION};
+        use crate::messages::types::{Capability, MessageType, NodeAnnouncementPayload};
+        use ed25519_dalek::Signer;
+
+        let channels: Vec<u64> = self.topics.subscribed_channels().iter().copied().collect();
+        let user_count = self
+            .storage
+            .get_stat(crate::storage::schema::state_keys::TOTAL_USERS)
+            .unwrap_or(0) as u32;
+
+        let payload = NodeAnnouncementPayload {
+            node_id: self.node_id.clone(),
+            channels,
+            user_count,
+            capabilities: vec![
+                Capability::Chat,
+                Capability::News,
+                Capability::Sync,
+            ],
+            api_endpoint: self.public_url.clone(),
+            ttl_seconds: 600, // 10 minutes
+        };
+
+        let payload_bytes = match rmp_serde::to_vec(&payload) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(error = %e, "Failed to serialize NodeAnnouncement");
+                return;
+            }
+        };
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let author = match crate::crypto::pubkey_to_address(&self.signing_key.verifying_key()) {
+            Ok(a) => a,
+            Err(e) => {
+                warn!(error = %e, "Failed to compute node address");
+                return;
+            }
+        };
+
+        // Compute msg_id: Keccak-256(author_pubkey + payload + timestamp)
+        let pubkey_bytes = self.signing_key.verifying_key().to_bytes();
+        let ts_bytes = now_ms.to_be_bytes();
+        let mut preimage = Vec::with_capacity(32 + payload_bytes.len() + 8);
+        preimage.extend_from_slice(&pubkey_bytes);
+        preimage.extend_from_slice(&payload_bytes);
+        preimage.extend_from_slice(&ts_bytes);
+        let msg_id = crate::crypto::keccak256(&preimage);
+
+        // Sign the msg_id
+        let signature = self.signing_key.sign(&msg_id);
+
+        let envelope = Envelope {
+            version: PROTOCOL_VERSION,
+            msg_type: MessageType::NodeAnnouncement,
+            msg_id,
+            author,
+            timestamp: now_ms,
+            lamport_ts: 0, // announcements don't need causal ordering
+            payload: payload_bytes,
+            signature: signature.to_bytes().to_vec(),
+            relay_path: Vec::new(),
+        };
+
+        let envelope_bytes = match rmp_serde::to_vec(&envelope) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(error = %e, "Failed to serialize announcement envelope");
+                return;
+            }
+        };
+
+        let topic = libp2p::gossipsub::IdentTopic::new(gossip::TOPIC_NETWORK);
+        match self.swarm.behaviour_mut().gossipsub.publish(topic, envelope_bytes) {
+            Ok(_) => info!(node_id = %self.node_id, "Published NodeAnnouncement"),
+            Err(e) => debug!(error = %e, "Failed to publish NodeAnnouncement (no peers yet?)"),
         }
     }
 
