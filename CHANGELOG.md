@@ -29,6 +29,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Identify address injection capped at 16 addresses per peer to mitigate routing
   table poisoning
 
+### Fixed
+- **Health endpoint peer count always 0** — the network layer now shares an atomic
+  peer counter with the API layer. `ConnectionEstablished` and `ConnectionClosed`
+  update the shared counter, so `/api/v1/health` and `/api/v1/network/stats` report
+  the actual connected peer count.
+
 ### Security
 - Added `memory-connection-limits` feature to libp2p to enforce `max_peers` config
 - Capped Identify listen address injection (max 16 per peer) to prevent DHT poisoning
