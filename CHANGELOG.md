@@ -5,6 +5,17 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.20.0] - 2026-04-06
+
+### Added
+- **Periodic NodeAnnouncement publishing** — the node now announces itself to
+  the `/ogmara/v1/network` GossipSub topic every 5 minutes, and immediately on
+  first peer connection. The announcement includes node_id, served channels,
+  user count, capabilities, and public API URL. This is how nodes discover each
+  other and appear in the `/api/v1/network/nodes` endpoint and the website's
+  network dashboard. Previously, NodeAnnouncement was defined in the protocol
+  but never published — nodes were invisible to each other.
+
 ## [0.19.0] - 2026-04-06
 
 ### Added
