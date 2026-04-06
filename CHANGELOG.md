@@ -5,6 +5,19 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.20.1] - 2026-04-06
+
+### Fixed
+- **Sync rejects historical messages** — the message router applied the ±5 minute
+  timestamp drift check to synced historical messages, rejecting 79 of 81 messages
+  in testing. Added `process_synced_message()` which skips timestamp and rate-limit
+  validation while still enforcing signature, identity, and payload checks.
+- **GossipSub mesh can't form with <5 peers** — the default `mesh_n_low=5` meant
+  GossipSub couldn't form a mesh with fewer than 5 nodes, so `publish()` never
+  reached the other node. NodeAnnouncements were published locally but never
+  delivered. Tuned mesh parameters: `mesh_n=3, mesh_n_low=1, mesh_outbound_min=1`
+  so the mesh forms with as few as 1 peer.
+
 ## [0.20.0] - 2026-04-06
 
 ### Added

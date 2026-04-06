@@ -503,7 +503,7 @@ impl NetworkService {
                 let mut accepted = 0u32;
                 let mut rejected = 0u32;
                 for msg_bytes in &response.messages {
-                    match self.router.process_message(msg_bytes) {
+                    match self.router.process_synced_message(msg_bytes) {
                         RouteResult::Accepted { .. } => accepted += 1,
                         RouteResult::Duplicate => {}
                         RouteResult::Rejected(reason) => {
