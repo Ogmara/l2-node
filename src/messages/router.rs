@@ -128,6 +128,19 @@ impl MessageRouter {
     /// Returns the routing result indicating whether the message was
     /// accepted, is a duplicate, or was rejected.
     pub fn process_message(&self, raw_bytes: &[u8]) -> RouteResult {
+        self.process_message_inner(raw_bytes, false)
+    }
+
+    /// Process a synced historical message — skips timestamp drift and rate limiting.
+    ///
+    /// Used for messages received via the sync protocol, which are intentionally
+    /// older than the 5-minute drift window. All other validation (signature,
+    /// identity, payload, dedup) still applies.
+    pub fn process_synced_message(&self, raw_bytes: &[u8]) -> RouteResult {
+        self.process_message_inner(raw_bytes, true)
+    }
+
+    fn process_message_inner(&self, raw_bytes: &[u8], is_sync: bool) -> RouteResult {
         // Step 1: Deserialize
         let envelope: Envelope = match rmp_serde::from_slice(raw_bytes) {
             Ok(env) => env,
@@ -206,21 +219,21 @@ impl MessageRouter {
             }
         }
 
-        // Step 5: Verify timestamp (±5 min drift)
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
 
-        if !envelope.is_timestamp_valid(now_ms) {
+        // Step 5: Verify timestamp (±5 min drift) — skipped for synced historical messages
+        if !is_sync && !envelope.is_timestamp_valid(now_ms) {
             return RouteResult::Rejected(format!(
                 "timestamp drift too large: {} vs now {}",
                 envelope.timestamp, now_ms
             ));
         }
 
-        // Step 6: Rate limit by wallet address (not device key)
-        if envelope.msg_type.requires_registration() {
+        // Step 6: Rate limit by wallet address — skipped for synced messages
+        if !is_sync && envelope.msg_type.requires_registration() {
             let category = RateCategory::from_msg_type(envelope.msg_type);
             if self.is_rate_limited(&resolved_author, category, now_ms) {
                 return RouteResult::Rejected(format!("rate limited ({:?})", category));

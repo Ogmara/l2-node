@@ -47,11 +47,17 @@ pub fn build_swarm(config: &Config, keypair: Keypair) -> Result<Swarm<OgmaraBeha
             .with_max_established_incoming(Some(config.network.max_peers / 2)),
     );
 
-    // GossipSub configuration
+    // GossipSub configuration — mesh parameters tuned for small networks.
+    // Defaults require mesh_n_low=5 peers to form a mesh, which is impossible
+    // with fewer than 5 nodes. Messages won't propagate without a mesh.
     let gossipsub_config = gossipsub::ConfigBuilder::default()
         .heartbeat_interval(Duration::from_secs(1))
         .validation_mode(gossipsub::ValidationMode::Strict)
         .max_transmit_size(262144) // 256 KB max message
+        .mesh_n(3)                 // target 3 peers in mesh (default: 6)
+        .mesh_n_low(1)             // form mesh with as few as 1 peer (default: 5)
+        .mesh_n_high(6)            // cap at 6 (default: 12)
+        .mesh_outbound_min(1)      // at least 1 outbound mesh peer (default: 2)
         .build()
         .map_err(|e| anyhow::anyhow!("gossipsub config error: {}", e))?;
 
