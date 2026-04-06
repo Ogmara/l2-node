@@ -360,18 +360,26 @@ impl StateAnchorer {
     }
 
     /// Build the raw TX JSON for a SmartContract invoke.
+    ///
+    /// Format matches the koperator CLI's verified working format:
+    /// - `type: 63` at top level (SmartContract TX type)
+    /// - `contracts` array without `contractType` (already implied by top-level type)
+    /// - `permID: 0` and `kdaFee: ""` required by the Klever node
     fn build_raw_tx(&self, nonce: u64, data_b64: &str) -> Result<Value> {
+        let contract = serde_json::json!({
+            "scType": 0,
+            "address": self.klever.contract_address,
+            "callValue": null
+        });
         Ok(serde_json::json!({
             "type": 63,
             "sender": self.sender_address,
             "nonce": nonce,
-            "contracts": [{
-                "contractType": 63,
-                "scType": 0,
-                "address": self.klever.contract_address,
-                "callValue": {}
-            }],
-            "data": [data_b64]
+            "permID": 0,
+            "data": [data_b64],
+            "contract": contract,
+            "contracts": [contract],
+            "kdaFee": ""
         }))
     }
 }
