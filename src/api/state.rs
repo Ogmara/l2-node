@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::ipfs::client::IpfsClient;
 use crate::messages::router::MessageRouter;
@@ -39,6 +39,9 @@ pub struct AppState {
     /// Notification engine for mention detection and push delivery.
     /// `None` if push gateway is not configured.
     pub notification_engine: Option<Arc<NotificationEngine>>,
+    /// Channel to trigger an immediate state anchor from the admin API.
+    /// `None` if anchoring is not enabled.
+    pub anchor_trigger: Option<mpsc::Sender<oneshot::Sender<Result<String, String>>>>,
 }
 
 impl AppState {
@@ -52,6 +55,7 @@ impl AppState {
         identity: IdentityResolver,
         public_url: Option<String>,
         notification_engine: Option<Arc<NotificationEngine>>,
+        anchor_trigger: Option<mpsc::Sender<oneshot::Sender<Result<String, String>>>>,
     ) -> Self {
         let (ws_broadcast, _) = broadcast::channel(1024);
         Self::with_broadcast(
@@ -65,6 +69,7 @@ impl AppState {
             public_url,
             notification_engine,
             ws_broadcast,
+            anchor_trigger,
         )
     }
 
@@ -83,6 +88,7 @@ impl AppState {
         public_url: Option<String>,
         notification_engine: Option<Arc<NotificationEngine>>,
         ws_broadcast: broadcast::Sender<String>,
+        anchor_trigger: Option<mpsc::Sender<oneshot::Sender<Result<String, String>>>>,
     ) -> Self {
         Self {
             storage,
@@ -97,6 +103,7 @@ impl AppState {
             identity,
             public_url,
             notification_engine,
+            anchor_trigger,
         }
     }
 

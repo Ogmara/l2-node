@@ -88,17 +88,72 @@ pub async fn pin_channel(
 pub async fn state_latest(
     Extension(state): Extension<Arc<AppState>>,
 ) -> impl IntoResponse {
-    let anchor_height = state.storage.get_chain_cursor().unwrap_or(0);
-    Json(serde_json::json!({
-        "latest_anchor_height": anchor_height,
-        "state_root": null,
-    }))
+    let storage = state.storage.clone();
+    match tokio::task::spawn_blocking(move || storage.compute_current_state_root()).await {
+        Ok(Ok((root, msg_count, chan_count, user_count))) => {
+            let anchor_height = state.storage.get_chain_cursor().unwrap_or(0);
+            let last_anchor_ts = state
+                .storage
+                .get_stat(crate::storage::schema::state_keys::LAST_ANCHOR_TS)
+                .unwrap_or(0);
+            Json(serde_json::json!({
+                "state_root": hex::encode(root),
+                "message_count": msg_count,
+                "channel_count": chan_count,
+                "user_count": user_count,
+                "latest_anchor_height": anchor_height,
+                "last_anchor_ts": if last_anchor_ts > 0 { Some(last_anchor_ts) } else { None },
+            }))
+            .into_response()
+        }
+        Ok(Err(e)) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("error: {}", e)).into_response()
+        }
+        Err(e) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("task failed: {}", e)).into_response()
+        }
+    }
 }
 
 /// POST /admin/state/anchor — trigger immediate state anchoring.
 pub async fn trigger_anchor(
-    Extension(_state): Extension<Arc<AppState>>,
+    Extension(state): Extension<Arc<AppState>>,
 ) -> impl IntoResponse {
-    // State anchoring will be implemented in Phase 5
-    (StatusCode::NOT_IMPLEMENTED, "state anchoring not yet implemented")
+    let trigger = match &state.anchor_trigger {
+        Some(tx) => tx.clone(),
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": "state anchoring not enabled" })),
+            )
+                .into_response();
+        }
+    };
+
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    if trigger.send(reply_tx).await.is_err() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "anchoring task not running" })),
+        )
+            .into_response();
+    }
+
+    match reply_rx.await {
+        Ok(Ok(tx_hash)) => Json(serde_json::json!({
+            "ok": true,
+            "tx_hash": tx_hash,
+        }))
+        .into_response(),
+        Ok(Err(err)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": err })),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "anchoring task dropped reply channel" })),
+        )
+            .into_response(),
+    }
 }

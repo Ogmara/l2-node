@@ -5,6 +5,31 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.0] - 2026-04-06
+
+### Added
+- **State anchoring to Klever blockchain** — the node can now periodically compute
+  a Merkle root of L2 state (users, channels, delegations) and submit it on-chain
+  by invoking the `anchorState` endpoint on the Ogmara KApp smart contract. This
+  creates verifiable trust anchors proving L2 state at each checkpoint.
+- `StateAnchorer` background task (`chain/anchoring.rs`) with configurable interval,
+  exponential backoff on failure, and graceful shutdown handling
+- `[anchoring]` config section with `enabled`, `interval_seconds`, and optional
+  `wallet_key` (supports `OGMARA_ANCHOR_WALLET_KEY` env var for secret management)
+- `compute_current_state_root()` on `Storage` — iterates USERS, CHANNELS, and
+  DELEGATIONS column families to build the Merkle tree and produce the state root
+- `POST /admin/state/anchor` — trigger an immediate state anchor on-demand
+- `GET /admin/state/latest` — returns the current Merkle root, message/channel/user
+  counts, and last anchor timestamp
+- Full Klever TX construction flow: build → decode hash → Ed25519 sign → broadcast
+- Unit tests for hex encoding and SC call data construction
+
+### Security
+- Anchor wallet key is redacted in Debug output and skipped during serialization
+- Supports loading wallet key from environment variable instead of config file
+- Intermediate key material is zeroized after use
+- HTTP status codes checked before parsing Klever API responses
+
 ## [0.15.0] - 2026-04-05
 
 ### Added

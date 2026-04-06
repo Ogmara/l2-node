@@ -207,6 +207,8 @@ pub mod state_keys {
     pub const DELEGATION_MAP_BACKFILLED: &[u8] = b"migration_delegation_map_backfilled";
     /// Sentinel: set to 1 after device addresses are re-derived from klv1 → ogd1.
     pub const DEVICE_HRP_MIGRATED: &[u8] = b"migration_device_hrp_migrated";
+    /// Unix timestamp of last successful state anchor submission (u64 big-endian).
+    pub const LAST_ANCHOR_TS: &[u8] = b"last_anchor_ts";
 }
 
 /// Encode a channel message index key: (channel_id, lamport_ts, msg_id).
