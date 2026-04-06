@@ -409,6 +409,41 @@ pub async fn list_channels(
 
 /// Check if a channel's metadata indicates it is private (type 2).
 /// Handles both integer and legacy string representations.
+/// Determine the GossipSub topic for a message envelope based on its type and payload.
+///
+/// Returns None if the message type doesn't map to a GossipSub topic.
+fn gossip_topic_for_envelope(envelope: &crate::messages::envelope::Envelope) -> Option<String> {
+    use crate::messages::types::MessageType;
+
+    match envelope.msg_type {
+        MessageType::ChatMessage | MessageType::ChatEdit | MessageType::ChatDelete
+        | MessageType::ChatReaction | MessageType::ChannelPinMessage
+        | MessageType::ChannelUnpinMessage | MessageType::ChannelJoin
+        | MessageType::ChannelLeave => {
+            // Extract channel_id from payload
+            let payload: serde_json::Value = rmp_serde::from_slice(&envelope.payload).ok()?;
+            let channel_id = payload.get("channel_id")?.as_u64()?;
+            Some(crate::network::gossip::channel_topic(channel_id))
+        }
+        MessageType::NewsPost => {
+            Some(crate::network::gossip::TOPIC_NEWS_GLOBAL.to_string())
+        }
+        MessageType::ProfileUpdate => {
+            Some(crate::network::gossip::TOPIC_PROFILE.to_string())
+        }
+        MessageType::DirectMessage => {
+            // DMs go to the recipient's topic
+            let payload: serde_json::Value = rmp_serde::from_slice(&envelope.payload).ok()?;
+            let recipient = payload.get("recipient")?.as_str()?;
+            Some(crate::network::gossip::dm_topic(recipient))
+        }
+        MessageType::NodeAnnouncement | MessageType::DeviceDelegation => {
+            Some(crate::network::gossip::TOPIC_NETWORK.to_string())
+        }
+        _ => None,
+    }
+}
+
 fn is_private_channel(channel_meta: &serde_json::Value) -> bool {
     match channel_meta.get("channel_type") {
         Some(serde_json::Value::Number(n)) => n.as_u64() == Some(2),
@@ -929,19 +964,25 @@ pub async fn post_message(
         RouteResult::Accepted {
             msg_id,
             raw_bytes,
-            ..
+            msg_type,
         } => {
-            // Feed to notification engine for mention detection
-            if let Some(ref engine) = state.notification_engine {
-                let engine = engine.clone();
-                tokio::spawn(async move {
-                    if let Ok(envelope) =
-                        rmp_serde::from_slice::<crate::messages::envelope::Envelope>(&raw_bytes)
-                    {
+            // Publish to GossipSub so other nodes receive the message
+            if let Ok(envelope) =
+                rmp_serde::from_slice::<crate::messages::envelope::Envelope>(&raw_bytes)
+            {
+                if let Some(topic) = gossip_topic_for_envelope(&envelope) {
+                    let _ = state.gossip_tx.send((topic, raw_bytes.clone()));
+                }
+
+                // Feed to notification engine for mention detection
+                if let Some(ref engine) = state.notification_engine {
+                    let engine = engine.clone();
+                    tokio::spawn(async move {
                         engine.process(&envelope).await;
-                    }
-                });
+                    });
+                }
             }
+
             Json(MessageResponse {
                 msg_id: hex::encode(msg_id),
             })

@@ -242,6 +242,10 @@ impl Node {
         // Channel for chain scanner → network layer topic subscriptions
         let (channel_tx, channel_rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
 
+        // Channel for API layer → network layer GossipSub publishing
+        let (gossip_tx, gossip_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(String, Vec<u8>)>();
+
         // Subscribe to all existing channels from storage so the node
         // participates in GossipSub for channels it already knows about.
         match self.storage.prefix_iter_cf(
@@ -295,7 +299,7 @@ impl Node {
         // Run network event loop in a task
         let network_shutdown_rx = self.shutdown_rx();
         let network_task = tokio::spawn(async move {
-            network.run(network_shutdown_rx, channel_rx).await;
+            network.run(network_shutdown_rx, channel_rx, gossip_rx).await;
         });
 
         // Start chain scanner
@@ -406,6 +410,7 @@ impl Node {
             ws_broadcast,
             anchor_trigger_tx,
             peer_count,
+            gossip_tx,
         ));
         let api_config = self.config.clone();
         let api_shutdown_rx = self.shutdown_rx();

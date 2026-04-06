@@ -42,6 +42,9 @@ pub struct AppState {
     /// Channel to trigger an immediate state anchor from the admin API.
     /// `None` if anchoring is not enabled.
     pub anchor_trigger: Option<mpsc::Sender<oneshot::Sender<Result<String, String>>>>,
+    /// Channel to publish messages to GossipSub via the network layer.
+    /// Sends (topic_string, raw_envelope_bytes).
+    pub gossip_tx: tokio::sync::mpsc::UnboundedSender<(String, Vec<u8>)>,
 }
 
 impl AppState {
@@ -58,6 +61,7 @@ impl AppState {
         anchor_trigger: Option<mpsc::Sender<oneshot::Sender<Result<String, String>>>>,
     ) -> Self {
         let (ws_broadcast, _) = broadcast::channel(1024);
+        let (gossip_tx, _) = tokio::sync::mpsc::unbounded_channel();
         Self::with_broadcast(
             storage,
             router,
@@ -71,6 +75,7 @@ impl AppState {
             ws_broadcast,
             anchor_trigger,
             Arc::new(AtomicU32::new(0)),
+            gossip_tx,
         )
     }
 
@@ -91,6 +96,7 @@ impl AppState {
         ws_broadcast: broadcast::Sender<String>,
         anchor_trigger: Option<mpsc::Sender<oneshot::Sender<Result<String, String>>>>,
         peer_count: Arc<AtomicU32>,
+        gossip_tx: tokio::sync::mpsc::UnboundedSender<(String, Vec<u8>)>,
     ) -> Self {
         Self {
             storage,
@@ -106,6 +112,7 @@ impl AppState {
             public_url,
             notification_engine,
             anchor_trigger,
+            gossip_tx,
         }
     }
 
