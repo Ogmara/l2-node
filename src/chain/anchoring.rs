@@ -227,12 +227,11 @@ impl StateAnchorer {
             })?
             .clone();
 
-        // Step 5: Decode TX to get the hash
-        let decode_body = serde_json::json!({ "tx": tx_result });
+        // Step 5: Decode TX to get the hash (send the raw TX object directly)
         let decode_resp = self
             .http
             .post(format!("{}/transaction/decode", self.klever.node_url))
-            .json(&decode_body)
+            .json(&tx_result)
             .send()
             .await
             .context("POST /transaction/decode")?;
