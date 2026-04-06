@@ -19,6 +19,8 @@ use super::sync::SyncCodec;
 /// The composed network behaviour for the Ogmara node.
 #[derive(NetworkBehaviour)]
 pub struct OgmaraBehaviour {
+    /// Connection limits to prevent resource exhaustion.
+    pub connection_limits: libp2p::connection_limits::Behaviour,
     /// GossipSub for pub/sub message propagation.
     pub gossipsub: gossipsub::Behaviour,
     /// Kademlia DHT for peer discovery and content routing.
@@ -37,6 +39,13 @@ pub struct OgmaraBehaviour {
 /// Build the libp2p swarm with all configured behaviours.
 pub fn build_swarm(config: &Config, keypair: Keypair) -> Result<Swarm<OgmaraBehaviour>> {
     let peer_id = keypair.public().to_peer_id();
+
+    // Connection limits (enforces max_peers from config)
+    let connection_limits = libp2p::connection_limits::Behaviour::new(
+        libp2p::connection_limits::ConnectionLimits::default()
+            .with_max_established(Some(config.network.max_peers))
+            .with_max_established_incoming(Some(config.network.max_peers / 2)),
+    );
 
     // GossipSub configuration
     let gossipsub_config = gossipsub::ConfigBuilder::default()
@@ -93,6 +102,7 @@ pub fn build_swarm(config: &Config, keypair: Keypair) -> Result<Swarm<OgmaraBeha
         );
 
     let behaviour = OgmaraBehaviour {
+        connection_limits,
         gossipsub,
         kademlia,
         mdns,

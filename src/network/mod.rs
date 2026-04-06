@@ -18,7 +18,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use libp2p::swarm::SwarmEvent;
-use libp2p::{Multiaddr, PeerId, Swarm};
+use libp2p::{kad, Multiaddr, PeerId, Swarm};
 use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
@@ -85,10 +85,32 @@ impl NetworkService {
             "Network listening"
         );
 
-        // Connect to bootstrap nodes
+        // Connect to bootstrap nodes and add them to Kademlia
         for addr_str in &config.network.bootstrap_nodes {
             match addr_str.parse::<Multiaddr>() {
                 Ok(addr) => {
+                    // Extract peer ID from multiaddr (the /p2p/<peer_id> component)
+                    let peer_id = addr.iter().find_map(|proto| {
+                        if let libp2p::multiaddr::Protocol::P2p(id) = proto {
+                            Some(id)
+                        } else {
+                            None
+                        }
+                    });
+
+                    // Add to Kademlia routing table so DHT bootstrap can find peers
+                    if let Some(pid) = peer_id {
+                        // Strip /p2p/ from addr for Kademlia (it wants transport-only addrs)
+                        let transport_addr: Multiaddr = addr
+                            .iter()
+                            .filter(|p| !matches!(p, libp2p::multiaddr::Protocol::P2p(_)))
+                            .collect();
+                        swarm
+                            .behaviour_mut()
+                            .kademlia
+                            .add_address(&pid, transport_addr);
+                    }
+
                     if let Err(e) = swarm.dial(addr.clone()) {
                         warn!(addr = %addr, error = %e, "Failed to dial bootstrap node");
                     } else {
@@ -158,6 +180,7 @@ impl NetworkService {
     /// Run the network event loop. Call this from a spawned task.
     ///
     /// Processes swarm events and routes messages to storage.
+    /// Periodically retries Kademlia bootstrap if peer count is low.
     pub async fn run(
         &mut self,
         mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
@@ -167,10 +190,26 @@ impl NetworkService {
             "Network event loop started"
         );
 
+        // Periodic Kademlia bootstrap retry (every 30s) — ensures DHT
+        // stays populated even after transient disconnections.
+        let mut bootstrap_interval = tokio::time::interval(Duration::from_secs(30));
+        bootstrap_interval.tick().await; // skip the immediate first tick
+
         loop {
             tokio::select! {
                 event = self.swarm.select_next_some() => {
                     self.handle_swarm_event(event);
+                }
+                _ = bootstrap_interval.tick() => {
+                    let peer_count = self.swarm.connected_peers().count();
+                    if peer_count == 0 {
+                        debug!("No connected peers, skipping Kademlia bootstrap");
+                    } else {
+                        match self.swarm.behaviour_mut().kademlia.bootstrap() {
+                            Ok(_) => debug!(peer_count, "Kademlia bootstrap triggered"),
+                            Err(e) => debug!(error = %e, "Kademlia bootstrap failed"),
+                        }
+                    }
                 }
                 _ = shutdown_rx.recv() => {
                     info!("Network shutting down");
@@ -229,20 +268,38 @@ impl NetworkService {
             }
 
             SwarmEvent::Behaviour(OgmaraBehaviourEvent::Kademlia(event)) => {
-                debug!(event = ?event, "Kademlia event");
+                match &event {
+                    kad::Event::RoutingUpdated {
+                        peer, addresses, ..
+                    } => {
+                        info!(
+                            peer = %peer,
+                            addresses = addresses.len(),
+                            "Kademlia routing table updated"
+                        );
+                    }
+                    kad::Event::OutboundQueryProgressed { result, .. } => {
+                        debug!(result = ?result, "Kademlia query progressed");
+                    }
+                    _ => {
+                        debug!(event = ?event, "Kademlia event");
+                    }
+                }
             }
 
             SwarmEvent::Behaviour(OgmaraBehaviourEvent::Identify(
                 libp2p::identify::Event::Received { peer_id, info, .. },
             )) => {
-                debug!(
+                info!(
                     peer = %peer_id,
                     protocol_version = %info.protocol_version,
                     agent_version = %info.agent_version,
+                    listen_addrs = info.listen_addrs.len(),
                     "Identified peer"
                 );
-                // Add identified peer's addresses to Kademlia
-                for addr in info.listen_addrs {
+                // Add identified peer's addresses to Kademlia (capped to prevent
+                // routing table poisoning from a malicious peer advertising many addrs)
+                for addr in info.listen_addrs.into_iter().take(16) {
                     self.swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
                 }
             }
@@ -258,25 +315,79 @@ impl NetworkService {
             SwarmEvent::ConnectionEstablished {
                 peer_id,
                 num_established,
+                endpoint,
                 ..
             } => {
-                debug!(
+                let total_peers = self.swarm.connected_peers().count();
+                info!(
                     peer = %peer_id,
                     connections = %num_established,
+                    total_peers,
+                    direction = if endpoint.is_dialer() { "outbound" } else { "inbound" },
+                    remote_addr = %endpoint.get_remote_address(),
                     "Connection established"
                 );
+                // Trigger Kademlia bootstrap when we get our first peer
+                if total_peers == 1 {
+                    if let Err(e) = self.swarm.behaviour_mut().kademlia.bootstrap() {
+                        debug!(error = %e, "Kademlia bootstrap not ready yet");
+                    }
+                }
             }
 
             SwarmEvent::ConnectionClosed {
                 peer_id,
                 num_established,
+                cause,
                 ..
             } => {
-                debug!(
-                    peer = %peer_id,
-                    remaining = %num_established,
-                    "Connection closed"
+                let total_peers = self.swarm.connected_peers().count();
+                if let Some(ref err) = cause {
+                    warn!(
+                        peer = %peer_id,
+                        remaining = %num_established,
+                        total_peers,
+                        cause = %err,
+                        "Connection closed with error"
+                    );
+                } else {
+                    info!(
+                        peer = %peer_id,
+                        remaining = %num_established,
+                        total_peers,
+                        "Connection closed"
+                    );
+                }
+            }
+
+            SwarmEvent::OutgoingConnectionError {
+                peer_id,
+                error,
+                ..
+            } => {
+                warn!(
+                    peer = ?peer_id,
+                    error = %error,
+                    "Outgoing connection failed"
                 );
+            }
+
+            SwarmEvent::IncomingConnectionError {
+                local_addr,
+                send_back_addr,
+                error,
+                ..
+            } => {
+                warn!(
+                    local_addr = %local_addr,
+                    remote_addr = %send_back_addr,
+                    error = %error,
+                    "Incoming connection failed"
+                );
+            }
+
+            SwarmEvent::Dialing { peer_id, .. } => {
+                debug!(peer = ?peer_id, "Dialing peer");
             }
 
             _ => {}
