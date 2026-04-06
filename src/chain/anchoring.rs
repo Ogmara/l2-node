@@ -212,7 +212,7 @@ impl StateAnchorer {
             let err_msg = send_body.get("error").and_then(|e| e.as_str()).unwrap_or("server error");
             return Err(anyhow::anyhow!("TX send HTTP {}: {}", send_status, err_msg));
         }
-        info!(response = %send_body, "TX send response");
+        debug!(response = %send_body, "TX send response");
 
         // Extract the raw TX result — /transaction/send may return error + data simultaneously
         let tx_result = send_body
@@ -263,7 +263,7 @@ impl StateAnchorer {
         broadcast_tx["Signature"] = serde_json::json!([sig_b64]);
 
         let broadcast_body = serde_json::json!({ "tx": broadcast_tx });
-        info!(body = %broadcast_body, "Broadcasting signed TX");
+        debug!(body = %broadcast_body, "Broadcasting signed TX");
         let broadcast_resp = self
             .http
             .post(format!("{}/transaction/broadcast", self.klever.node_url))
