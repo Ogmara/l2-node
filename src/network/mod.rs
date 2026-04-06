@@ -204,6 +204,7 @@ impl NetworkService {
         &mut self,
         mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
         mut channel_rx: tokio::sync::mpsc::UnboundedReceiver<u64>,
+        mut gossip_rx: tokio::sync::mpsc::UnboundedReceiver<(String, Vec<u8>)>,
     ) {
         info!(
             peer_id = %self.swarm.local_peer_id(),
@@ -228,6 +229,13 @@ impl NetworkService {
                 Some(channel_id) = channel_rx.recv() => {
                     self.topics.subscribe_channel(&mut self.swarm, channel_id);
                     info!(channel_id, "Auto-subscribed to channel topic (chain discovery)");
+                }
+                Some((topic, data)) = gossip_rx.recv() => {
+                    let topic_obj = libp2p::gossipsub::IdentTopic::new(&topic);
+                    match self.swarm.behaviour_mut().gossipsub.publish(topic_obj, data) {
+                        Ok(_) => debug!(topic = %topic, "Published message to GossipSub"),
+                        Err(e) => warn!(topic = %topic, error = %e, "Failed to publish to GossipSub"),
+                    }
                 }
                 _ = announce_interval.tick() => {
                     self.publish_node_announcement();

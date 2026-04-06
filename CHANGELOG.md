@@ -5,6 +5,17 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.21.0] - 2026-04-06
+
+### Added
+- **GossipSub publishing from API layer** — messages submitted via `POST /api/v1/messages`
+  are now published to the appropriate GossipSub topic after validation and storage.
+  Previously, accepted messages were stored locally but never forwarded to peers — the
+  API layer had no connection to the network layer. Added an `mpsc` channel from the
+  API to the network event loop for gossip publishing. Topic routing covers chat
+  messages (channel topics), news posts (global), profile updates, DMs (recipient
+  topic), and node announcements (network topic).
+
 ## [0.20.1] - 2026-04-06
 
 ### Fixed
