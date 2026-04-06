@@ -5,6 +5,16 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.22.0] - 2026-04-06
+
+### Added
+- **Connected peers in `/api/v1/network/nodes`** — peers that are connected via
+  libp2p but haven't sent a `NodeAnnouncement` yet now appear in the nodes list.
+  Uses the Identify protocol to extract the peer's Ed25519 public key and compute
+  their Ogmara node_id. Entries are added on connection and removed on disconnect.
+  This ensures the dashboard shows all reachable nodes, not just those that have
+  completed the 5-minute announcement cycle.
+
 ## [0.21.0] - 2026-04-06
 
 ### Added

@@ -12,8 +12,9 @@ pub mod discovery;
 pub mod gossip;
 pub mod sync;
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -22,6 +23,7 @@ use libp2p::swarm::SwarmEvent;
 use libp2p::{kad, Multiaddr, PeerId, Swarm};
 use tracing::{debug, error, info, warn};
 
+use crate::api::state::ConnectedPeerInfo;
 use crate::config::Config;
 use crate::messages::envelope::Envelope;
 use crate::messages::router::{MessageRouter, RouteResult};
@@ -52,6 +54,10 @@ pub struct NetworkService {
     node_id: String,
     /// Public API URL (if configured).
     public_url: Option<String>,
+    /// Connected Ogmara peers (shared with API layer for /network/nodes).
+    connected_peers: Arc<RwLock<HashMap<String, ConnectedPeerInfo>>>,
+    /// Internal mapping: libp2p PeerId → Ogmara node_id (for removal on disconnect).
+    peer_node_ids: HashMap<PeerId, String>,
 }
 
 impl NetworkService {
@@ -65,6 +71,7 @@ impl NetworkService {
         peer_count: Arc<AtomicU32>,
         signing_key: ed25519_dalek::SigningKey,
         node_id: String,
+        connected_peers: Arc<RwLock<HashMap<String, ConnectedPeerInfo>>>,
     ) -> Result<Self> {
         let mut swarm = behaviour::build_swarm(config, keypair)
             .context("building libp2p swarm")?;
@@ -154,6 +161,8 @@ impl NetworkService {
             signing_key,
             node_id,
             public_url,
+            connected_peers,
+            peer_node_ids: HashMap::new(),
         })
     }
 
@@ -330,10 +339,12 @@ impl NetworkService {
             SwarmEvent::Behaviour(OgmaraBehaviourEvent::Identify(
                 libp2p::identify::Event::Received { peer_id, info, .. },
             )) => {
+                let is_ogmara = info.protocol_version.starts_with("/ogmara/");
+                let agent_ver = info.agent_version.clone();
                 info!(
                     peer = %peer_id,
                     protocol_version = %info.protocol_version,
-                    agent_version = %info.agent_version,
+                    agent_version = %agent_ver,
                     listen_addrs = info.listen_addrs.len(),
                     "Identified peer"
                 );
@@ -343,9 +354,34 @@ impl NetworkService {
                     self.swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
                 }
 
-                // Sync channel messages from this peer if it's an Ogmara node
-                if info.protocol_version.starts_with("/ogmara/") {
+                if is_ogmara {
+                    // Sync channel messages from this peer
                     self.sync_channels_with_peer(peer_id);
+
+                    // Track this peer so it appears in /api/v1/network/nodes
+                    // even before its NodeAnnouncement arrives via GossipSub
+                    if let Ok(ed25519_pk) = info.public_key.try_into_ed25519() {
+                        use sha2::{Digest, Sha256};
+                        let hash = Sha256::digest(ed25519_pk.to_bytes());
+                        let node_id = bs58::encode(&hash[..20]).into_string();
+                        self.peer_node_ids.insert(peer_id, node_id.clone());
+                        // Note: do not hold this lock across .await points
+                        match self.connected_peers.write() {
+                            Ok(mut peers) => {
+                                // Defensive cap to prevent unbounded growth
+                                if peers.len() < 1024 || peers.contains_key(&node_id) {
+                                    peers.insert(node_id, ConnectedPeerInfo {
+                                        agent_version: if agent_ver.len() > 256 {
+                                            agent_ver[..256].to_string()
+                                        } else {
+                                            agent_ver
+                                        },
+                                    });
+                                }
+                            }
+                            Err(e) => warn!("connected_peers lock poisoned: {e}"),
+                        }
+                    }
                 }
             }
 
@@ -406,6 +442,15 @@ impl NetworkService {
                         total_peers,
                         "Connection closed"
                     );
+                }
+                // Remove from connected peers when last connection to this peer closes
+                if num_established == 0 {
+                    if let Some(node_id) = self.peer_node_ids.remove(&peer_id) {
+                        match self.connected_peers.write() {
+                            Ok(mut peers) => { peers.remove(&node_id); }
+                            Err(e) => warn!("connected_peers lock poisoned: {e}"),
+                        }
+                    }
                 }
             }
 
