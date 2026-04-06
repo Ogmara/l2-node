@@ -5,6 +5,22 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.17.1] - 2026-04-06
+
+### Fixed
+- **Chain scanner rate limiting (HTTP 429)** — new nodes syncing from block 0 were
+  hammering the Klever API with back-to-back requests, causing persistent 429 errors.
+  Added exponential backoff (5s base, doubles each time, 120s cap) on rate-limit
+  responses, inter-batch delays (500ms catch-up, 200ms near tip), and larger batch
+  sizes during catch-up (2000 blocks vs 500 near tip).
+- **Transaction API filtering** — queries now filter by `type=63` (SC invoke) and
+  `toAddress=<contract>` server-side, dramatically reducing response size and API load.
+  Previously fetched ALL transactions and filtered locally.
+- **Missing transaction pagination** — the scanner now pages through all results
+  instead of only processing the first 100 transactions per block range. Capped at
+  50 pages with a warning if hit.
+- Unparseable transactions now logged at debug level instead of silently skipped.
+
 ## [0.17.0] - 2026-04-06
 
 ### Added
