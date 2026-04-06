@@ -341,6 +341,13 @@ impl StateAnchorer {
     ///
     /// Format: `anchorState@hexBlockHeight@hexStateRoot@hexMsgCount@hexChanCount@hexUserCount@hexNodeId`
     /// The SC generates the timestamp from the blockchain block context.
+    ///
+    /// In the `@`-delimited Klever SC call format, the VM hex-decodes each argument.
+    /// For `u64`/`u32` args: hex is decoded to big-endian bytes → integer.
+    /// For `ManagedBuffer` args (state_root, node_id): hex is decoded to raw bytes.
+    /// Since the SC checks `state_root.len() == 64` (expects the hex STRING, not raw bytes),
+    /// we must double-hex-encode: hex(ascii_hex_string) so the VM decodes it back to the
+    /// 64-char hex string the SC expects.
     fn build_sc_call_data(
         &self,
         block_height: u64,
@@ -349,10 +356,13 @@ impl StateAnchorer {
         channel_count: u32,
         user_count: u32,
     ) -> String {
+        // state_root: SC expects ManagedBuffer of length 64 (the hex string, not raw bytes).
+        // Double-hex-encode so VM decodes hex → ASCII hex string.
+        let state_root_encoded = hex::encode(state_root_hex.as_bytes());
         format!(
             "anchorState@{}@{}@{}@{}@{}@{}",
             encode_u64_hex(block_height),
-            state_root_hex,
+            state_root_encoded,
             encode_u64_hex(message_count),
             encode_u32_hex(channel_count),
             encode_u32_hex(user_count),
@@ -466,7 +476,8 @@ mod tests {
         assert_eq!(parts.len(), 7); // 6 args + function name
         assert_eq!(parts[0], "anchorState");
         assert_eq!(parts[1], "03e8"); // block_height 1000 (padded to even)
-        assert_eq!(parts[2], "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890");
+        // state_root is double-hex-encoded (hex of the ASCII hex string)
+        assert_eq!(parts[2], hex::encode("abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890".as_bytes()));
         assert_eq!(parts[3], "0102"); // message_count 258 (padded to even)
         assert_eq!(parts[4], "14");   // channel_count 20 (already even)
         assert_eq!(parts[5], "0b");   // user_count 11 (padded to even)
