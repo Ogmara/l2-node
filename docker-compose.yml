@@ -1,0 +1,44 @@
+# Ogmara L2 Node + IPFS — Docker Compose
+#
+# Usage:
+#   1. Copy ogmara.example.toml to ogmara.toml and edit if needed
+#   2. docker compose up -d
+#   3. curl http://localhost:41721/api/v1/health
+#
+# Testnet defaults work out of the box with one change:
+#   In ogmara.toml, set ipfs.api_url = "http://ipfs:5001"
+#   (Docker networking uses container names, not localhost)
+
+services:
+  ipfs:
+    image: ipfs/kubo:v0.40.1
+    container_name: ogmara-ipfs
+    restart: unless-stopped
+    volumes:
+      - ipfs-data:/data/ipfs
+    ports:
+      - "4001:4001/tcp"      # IPFS swarm (TCP)
+      - "4001:4001/udp"      # IPFS swarm (QUIC)
+      # API (5001) and gateway (8080) are internal only
+    environment:
+      - IPFS_PROFILE=server
+    # Restrict API to internal access only
+    command: ["daemon", "--migrate=true"]
+
+  node:
+    image: ogmara/ogmara:l2-node-latest
+    container_name: ogmara-node
+    restart: unless-stopped
+    depends_on:
+      - ipfs
+    volumes:
+      - ./ogmara.toml:/etc/ogmara/ogmara.toml:ro
+      - node-data:/data
+    ports:
+      - "41720:41720/udp"    # libp2p QUIC
+      - "41720:41720/tcp"    # libp2p TCP
+      - "41721:41721/tcp"    # REST/WebSocket API
+
+volumes:
+  ipfs-data:
+  node-data:
