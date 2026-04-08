@@ -48,13 +48,50 @@ sudo mkdir -p /etc/ogmara
 sudo cp ogmara.example.toml /etc/ogmara/ogmara.toml
 ```
 
-Required settings:
-- `klever.node_url` — Klever RPC endpoint
-- `klever.api_url` — Klever API endpoint
-- `klever.contract_address` — Ogmara KApp smart contract address
+### Network selection
 
-Important settings:
-- `klever.scan_interval_ms` — Set to `60000` (60s) for testnet to avoid rate limits
+The `[klever]` section determines which network your node connects to.
+The example config defaults to **testnet** — recommended for first-time
+setup. Switch to mainnet when you're ready for production.
+
+| Network | node_url | api_url | contract_address |
+|---------|----------|---------|------------------|
+| **Testnet** | `https://node.testnet.klever.org` | `https://api.testnet.klever.org` | `klv1qqqqqqqqqqqqqpgq0ja2j7xwz843ryfsk9vlz6xzsaak590h6pgq7nwr02` |
+| **Mainnet** | `https://node.mainnet.klever.org` | `https://api.mainnet.klever.org` | `klv1qqqqqqqqqqqqqpgq8c9yag9vuc2pe64fwvqsq9e8ul8w5zuglf5qfgh7z3` |
+
+To switch networks, edit the `[klever]` section in `ogmara.toml`:
+
+```toml
+[klever]
+# Testnet:
+# node_url = "https://node.testnet.klever.org"
+# api_url = "https://api.testnet.klever.org"
+# contract_address = "klv1qqqqqqqqqqqqqpgq0ja2j7xwz843ryfsk9vlz6xzsaak590h6pgq7nwr02"
+
+# Mainnet:
+node_url = "https://node.mainnet.klever.org"
+api_url = "https://api.mainnet.klever.org"
+contract_address = "klv1qqqqqqqqqqqqqpgq8c9yag9vuc2pe64fwvqsq9e8ul8w5zuglf5qfgh7z3"
+```
+
+After changing the network, restart the node and clear old data if switching
+between testnet and mainnet (different chain state):
+
+```bash
+# Systemd
+sudo systemctl stop ogmara-node
+rm -rf /var/lib/ogmara/node/data/*
+sudo systemctl start ogmara-node
+
+# Docker
+docker stop ogmara-node && docker rm ogmara-node
+docker volume rm ogmara-data
+# Re-run the docker run command
+```
+
+### Other settings
+
+- `klever.scan_interval_ms` — Set to `60000` (60s) to avoid rate limits
 - `api.listen_addr` — Use `127.0.0.1` behind a reverse proxy, `0.0.0.0` for direct access
 - `logging.level` — Use `info` for production, `debug` for troubleshooting
 
@@ -195,11 +232,15 @@ Images are tagged by version (`ogmara/ogmara:l2-node-0.17.0`) and
 
 ### Run with Docker
 
+The Docker image is network-agnostic — your `ogmara.toml` config file
+determines whether the node connects to testnet or mainnet. See
+[Network selection](#network-selection) above.
+
 ```bash
 # Create a config file (start from the example)
 mkdir -p ~/ogmara-node
 cp ogmara.example.toml ~/ogmara-node/ogmara.toml
-# Edit ~/ogmara-node/ogmara.toml as needed
+# Edit ~/ogmara-node/ogmara.toml — choose testnet or mainnet
 
 docker run -d \
   --name ogmara-node \
