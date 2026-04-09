@@ -1,186 +1,298 @@
-//! Embedded admin dashboard — serves a self-contained HTML page and
-//! provides a WebSocket endpoint for real-time metrics updates.
+//! Embedded admin dashboard — serves a multi-section SPA and provides
+//! REST endpoints and WebSocket for real-time metrics updates.
 //!
-//! Spec 4.5: bundled into the binary via `include_str!`, no external
-//! CDN dependencies, works fully offline/air-gapped.
+//! Spec 10-dashboard.md: bundled into the binary via `include_str!`,
+//! no external CDN dependencies, works fully offline/air-gapped.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::Extension;
-use axum::http::{header, StatusCode};
+use axum::extract::{Extension, Query};
+use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse};
-use futures::SinkExt;
-use serde::Serialize;
-use tracing::debug;
+use axum::Json;
+use serde::Deserialize;
+use tracing::{debug, warn};
+
+use crate::metrics::MetricsSnapshot;
 
 use super::state::AppState;
 
-/// Metrics payload pushed to the dashboard WebSocket every 2 seconds (spec 4.5.2).
-#[derive(Debug, Serialize)]
-pub struct DashboardMetrics {
-    pub node_version: &'static str,
-    pub protocol_version: u8,
-    pub uptime_seconds: u64,
-    pub peers_connected: u32,
-    pub messages_total: u64,
-    pub messages_per_second: f64,
-    pub users_total: u64,
-    pub channels_total: u64,
-    pub disk_used_bytes: u64,
-    pub memory_used_bytes: u64,
-    pub bandwidth_in_bytes_sec: u64,
-    pub bandwidth_out_bytes_sec: u64,
-    pub klever_last_block: u64,
-    pub klever_sync_lag_blocks: u64,
-    pub ipfs_connected: bool,
-    pub ipfs_pinned_count: u64,
-    pub last_anchor_height: u64,
-    pub last_anchor_age_seconds: u64,
-}
+/// Maximum concurrent dashboard WebSocket connections (prevents local DoS).
+const MAX_DASHBOARD_WS: usize = 10;
+
+// ── Dashboard page ──────────────────────────────────────────────────
 
 /// GET /admin/dashboard — serve the embedded HTML dashboard.
 pub async fn dashboard_page() -> impl IntoResponse {
     Html(DASHBOARD_HTML)
 }
 
-/// GET /admin/dashboard/ws — WebSocket for real-time metric updates.
+// ── WebSocket ───────────────────────────────────────────────────────
+
+/// Active WebSocket connection counter.
+static WS_CONNECTIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// GET /admin/dashboard/ws — WebSocket for real-time metric updates (2s push).
 pub async fn dashboard_ws(
     ws: WebSocketUpgrade,
     Extension(state): Extension<Arc<AppState>>,
 ) -> impl IntoResponse {
+    let current = WS_CONNECTIONS.load(std::sync::atomic::Ordering::Relaxed);
+    if current >= MAX_DASHBOARD_WS {
+        return (StatusCode::SERVICE_UNAVAILABLE, "too many dashboard connections")
+            .into_response();
+    }
     ws.on_upgrade(move |socket| handle_dashboard_ws(socket, state))
+        .into_response()
 }
 
-async fn handle_dashboard_ws(mut socket: WebSocket, state: Arc<AppState>) {
+async fn handle_dashboard_ws(socket: WebSocket, state: Arc<AppState>) {
+    use futures::{SinkExt, StreamExt};
+
+    WS_CONNECTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     debug!("Dashboard WebSocket connected");
 
+    let (mut sender, mut receiver) = socket.split();
     let mut interval = tokio::time::interval(Duration::from_secs(2));
 
     loop {
-        interval.tick().await;
+        tokio::select! {
+            _ = interval.tick() => {
+                let snapshot = state
+                    .metrics_latest
+                    .read()
+                    .map(|s| *s)
+                    .unwrap_or_default();
 
-        let metrics = collect_metrics(&state);
-        let msg = serde_json::json!({
-            "type": "metrics",
-            "timestamp": chrono::Utc::now().timestamp(),
-            "data": metrics,
-        });
-
-        match serde_json::to_string(&msg) {
-            Ok(json) => {
-                if socket.send(Message::Text(json.into())).await.is_err() {
-                    break;
+                let msg = build_ws_payload(&state, &snapshot);
+                match serde_json::to_string(&msg) {
+                    Ok(json) => {
+                        if sender.send(Message::Text(json.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
                 }
             }
-            Err(_) => break,
+            msg = receiver.next() => {
+                match msg {
+                    Some(Ok(Message::Close(_))) | None => break,
+                    _ => {} // ignore pings, pongs, text from client
+                }
+            }
         }
     }
 
+    WS_CONNECTIONS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     debug!("Dashboard WebSocket disconnected");
 }
 
-/// Collect current metrics from the application state.
-fn collect_metrics(state: &AppState) -> DashboardMetrics {
+/// Build the WebSocket payload from a metrics snapshot and live state.
+fn build_ws_payload(state: &AppState, snap: &MetricsSnapshot) -> serde_json::Value {
     let uptime = state.started_at.elapsed().as_secs();
-    let last_block = state.storage.get_chain_cursor().unwrap_or(0);
 
-    DashboardMetrics {
-        node_version: env!("CARGO_PKG_VERSION"),
-        protocol_version: crate::messages::envelope::PROTOCOL_VERSION,
-        uptime_seconds: uptime,
-        peers_connected: state.peer_count(),
-        messages_total: 0,  // TODO: track in storage counter
-        messages_per_second: 0.0,
-        users_total: 0,
-        channels_total: 0,
-        disk_used_bytes: 0,
-        memory_used_bytes: 0,
-        bandwidth_in_bytes_sec: 0,
-        bandwidth_out_bytes_sec: 0,
-        klever_last_block: last_block,
-        klever_sync_lag_blocks: 0,
-        ipfs_connected: false, // TODO: periodic health check
-        ipfs_pinned_count: 0,
-        last_anchor_height: 0,
-        last_anchor_age_seconds: 0,
-    }
+    serde_json::json!({
+        "type": "metrics",
+        "version": 2,
+        "timestamp": chrono::Utc::now().timestamp(),
+        "data": {
+            "node": {
+                "version": env!("CARGO_PKG_VERSION"),
+                "protocol": crate::messages::envelope::PROTOCOL_VERSION,
+                "uptime_seconds": uptime,
+                "network": &state.klever_network,
+                "node_id": &state.node_id,
+            },
+            "system": {
+                "cpu_percent": snap.cpu_percent,
+                "memory_used_bytes": snap.memory_used_bytes,
+                "memory_total_bytes": snap.memory_total_bytes,
+                "disk_used_bytes": snap.disk_used_bytes,
+                "disk_total_bytes": snap.disk_total_bytes,
+            },
+            "network": {
+                "peers_connected": snap.peers_connected,
+                "bandwidth_in_bytes_sec": snap.bandwidth_in_bytes_sec,
+                "bandwidth_out_bytes_sec": snap.bandwidth_out_bytes_sec,
+                "messages_received_sec": snap.messages_received_sec,
+                "messages_relayed_sec": snap.messages_relayed_sec,
+                "messages_received_total": snap.messages_received_total,
+                "messages_relayed_total": snap.messages_relayed_total,
+                "messages_stored_total": snap.messages_stored_total,
+                "failed_validations_total": snap.failed_validations_total,
+                "rate_limited_total": snap.rate_limited_total,
+            },
+            "storage": {
+                "db_size_bytes": snap.db_size_bytes,
+                "messages_total": snap.messages_total,
+                "users_total": snap.users_total,
+                "channels_total": snap.channels_total,
+            },
+            "ipfs": {
+                "connected": snap.ipfs_connected,
+                "pinned_count": snap.ipfs_pinned_count,
+                "repo_size_bytes": snap.ipfs_repo_size_bytes,
+            },
+            "chain": {
+                "contract_address": &state.contract_address,
+                "last_indexed_block": snap.klever_last_block,
+                "sync_lag_blocks": snap.klever_sync_lag_blocks,
+            },
+            "anchoring": {
+                "last_anchor_age_seconds": snap.last_anchor_age_seconds,
+                "total_anchors": snap.total_anchors,
+            },
+        }
+    })
 }
 
-/// The embedded dashboard HTML — self-contained, no external dependencies.
-/// Respects prefers-color-scheme for dark/light theme.
-const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Ogmara Node Dashboard</title>
-<style>
-:root { --bg: #f5f5f5; --fg: #1a1a1a; --card: #fff; --border: #e0e0e0; --accent: #6c5ce7; --green: #00b894; --yellow: #fdcb6e; --red: #d63031; }
-@media (prefers-color-scheme: dark) { :root { --bg: #1a1a2e; --fg: #e0e0e0; --card: #16213e; --border: #0f3460; --accent: #a29bfe; --green: #55efc4; --yellow: #ffeaa7; --red: #ff7675; } }
-* { margin: 0; padding: 0; box-sizing: border-box; }
-body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--fg); padding: 20px; }
-h1 { font-size: 1.5em; margin-bottom: 20px; color: var(--accent); }
-.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 16px; }
-.card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
-.card h2 { font-size: 0.9em; text-transform: uppercase; letter-spacing: 0.05em; opacity: 0.7; margin-bottom: 8px; }
-.metric { font-size: 2em; font-weight: 700; }
-.metric.green { color: var(--green); }
-.metric.yellow { color: var(--yellow); }
-.metric.red { color: var(--red); }
-.label { font-size: 0.85em; opacity: 0.6; margin-top: 4px; }
-.status { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
-.status.ok { background: var(--green); }
-.status.warn { background: var(--yellow); }
-.status.err { background: var(--red); }
-#conn-status { position: fixed; top: 10px; right: 20px; font-size: 0.8em; }
-</style>
-</head>
-<body>
-<div id="conn-status"><span class="status err" id="ws-dot"></span><span id="ws-text">Connecting...</span></div>
-<h1>Ogmara Node Dashboard <span id="version" style="font-size:0.5em;opacity:0.5"></span></h1>
-<div class="grid">
-  <div class="card"><h2>Uptime</h2><div class="metric green" id="uptime">--</div></div>
-  <div class="card"><h2>Peers</h2><div class="metric" id="peers">--</div></div>
-  <div class="card"><h2>Messages</h2><div class="metric" id="messages">--</div><div class="label" id="msg-rate">-- msg/s</div></div>
-  <div class="card"><h2>Users</h2><div class="metric" id="users">--</div></div>
-  <div class="card"><h2>Channels</h2><div class="metric" id="channels">--</div></div>
-  <div class="card"><h2>Klever Sync</h2><div class="metric" id="klever-block">--</div><div class="label" id="klever-lag">lag: --</div></div>
-  <div class="card"><h2>IPFS</h2><div class="metric" id="ipfs-status">--</div><div class="label" id="ipfs-pins">-- pinned</div></div>
-  <div class="card"><h2>State Anchor</h2><div class="metric" id="anchor-height">--</div><div class="label" id="anchor-age">-- ago</div></div>
-  <div class="card"><h2>Disk</h2><div class="metric" id="disk">--</div></div>
-  <div class="card"><h2>Memory</h2><div class="metric" id="memory">--</div></div>
-</div>
-<script>
-function fmt(n) { if (n >= 1e9) return (n/1e9).toFixed(1)+'G'; if (n >= 1e6) return (n/1e6).toFixed(1)+'M'; if (n >= 1e3) return (n/1e3).toFixed(1)+'K'; return n.toString(); }
-function fmtBytes(b) { if (b >= 1073741824) return (b/1073741824).toFixed(1)+' GB'; if (b >= 1048576) return (b/1048576).toFixed(1)+' MB'; return (b/1024).toFixed(0)+' KB'; }
-function fmtTime(s) { if (s >= 86400) return Math.floor(s/86400)+'d '+Math.floor((s%86400)/3600)+'h'; if (s >= 3600) return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m'; if (s >= 60) return Math.floor(s/60)+'m '+s%60+'s'; return s+'s'; }
-function connect() {
-  const ws = new WebSocket('ws://'+location.host+'/admin/dashboard/ws');
-  ws.onopen = () => { document.getElementById('ws-dot').className='status ok'; document.getElementById('ws-text').textContent='Connected'; };
-  ws.onclose = () => { document.getElementById('ws-dot').className='status err'; document.getElementById('ws-text').textContent='Disconnected'; setTimeout(connect, 3000); };
-  ws.onmessage = (e) => {
-    const msg = JSON.parse(e.data); if (msg.type !== 'metrics') return; const d = msg.data;
-    document.getElementById('version').textContent = 'v' + d.node_version + ' (protocol ' + d.protocol_version + ')';
-    document.getElementById('uptime').textContent = fmtTime(d.uptime_seconds);
-    document.getElementById('peers').textContent = d.peers_connected;
-    document.getElementById('messages').textContent = fmt(d.messages_total);
-    document.getElementById('msg-rate').textContent = d.messages_per_second.toFixed(1)+' msg/s';
-    document.getElementById('users').textContent = fmt(d.users_total);
-    document.getElementById('channels').textContent = fmt(d.channels_total);
-    document.getElementById('klever-block').textContent = '#'+fmt(d.klever_last_block);
-    document.getElementById('klever-lag').textContent = 'lag: '+d.klever_sync_lag_blocks+' blocks';
-    document.getElementById('ipfs-status').textContent = d.ipfs_connected ? 'Connected' : 'Offline';
-    document.getElementById('ipfs-status').className = 'metric '+(d.ipfs_connected?'green':'red');
-    document.getElementById('ipfs-pins').textContent = fmt(d.ipfs_pinned_count)+' pinned';
-    document.getElementById('anchor-height').textContent = '#'+fmt(d.last_anchor_height);
-    document.getElementById('anchor-age').textContent = fmtTime(d.last_anchor_age_seconds)+' ago';
-    document.getElementById('disk').textContent = fmtBytes(d.disk_used_bytes);
-    document.getElementById('memory').textContent = fmtBytes(d.memory_used_bytes);
-  };
+// ── REST Endpoints ──────────────────────────────────────────────────
+
+/// GET /admin/metrics/snapshot — current-instant full metrics.
+pub async fn metrics_snapshot(
+    Extension(state): Extension<Arc<AppState>>,
+) -> impl IntoResponse {
+    let snap = state
+        .metrics_latest
+        .read()
+        .map(|s| *s)
+        .unwrap_or_default();
+
+    Json(build_ws_payload(&state, &snap))
 }
-connect();
-</script>
-</body>
-</html>"#;
+
+/// Query parameters for history endpoint.
+#[derive(Deserialize)]
+pub struct HistoryQuery {
+    /// Metric name to retrieve.
+    pub metric: String,
+    /// Time period: "1h", "6h", "24h".
+    #[serde(default = "default_period")]
+    pub period: String,
+}
+
+fn default_period() -> String {
+    "1h".to_string()
+}
+
+/// GET /admin/metrics/history — time-series data from ring buffer.
+pub async fn metrics_history(
+    Extension(state): Extension<Arc<AppState>>,
+    Query(query): Query<HistoryQuery>,
+) -> impl IntoResponse {
+    let minutes = match query.period.as_str() {
+        "1h" => 60,
+        "6h" => 360,
+        "24h" => 1440,
+        _ => 60,
+    };
+
+    let points = if let Ok(history) = state.metrics_history.read() {
+        let snapshots = history.last_n(minutes);
+        snapshots
+            .iter()
+            .map(|s| {
+                let v: f64 = match query.metric.as_str() {
+                    "cpu_percent" => s.cpu_percent as f64,
+                    "memory_used_bytes" => s.memory_used_bytes as f64,
+                    "disk_used_bytes" => s.disk_used_bytes as f64,
+                    "peers_connected" => s.peers_connected as f64,
+                    "messages_per_minute" => s.messages_received_sec * 60.0,
+                    "bandwidth_in" => s.bandwidth_in_bytes_sec as f64,
+                    "bandwidth_out" => s.bandwidth_out_bytes_sec as f64,
+                    "ipfs_pinned_count" => s.ipfs_pinned_count as f64,
+                    "ipfs_repo_size_bytes" => s.ipfs_repo_size_bytes as f64,
+                    _ => 0.0,
+                };
+                serde_json::json!({ "t": s.timestamp_ms / 1000, "v": v })
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+
+    Json(serde_json::json!({
+        "metric": query.metric,
+        "period": query.period,
+        "points": points,
+    }))
+}
+
+/// GET /admin/metrics/peers — detailed connected peers table.
+pub async fn metrics_peers(
+    Extension(state): Extension<Arc<AppState>>,
+) -> impl IntoResponse {
+    let peers = if let Ok(map) = state.connected_peers.read() {
+        map.iter()
+            .map(|(node_id, info)| {
+                serde_json::json!({
+                    "node_id": node_id,
+                    "agent_version": info.agent_version,
+                })
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+
+    Json(serde_json::json!({
+        "peers": peers,
+        "total": state.peer_count(),
+    }))
+}
+
+/// GET /admin/metrics/storage — storage breakdown by column family.
+pub async fn metrics_storage(
+    Extension(state): Extension<Arc<AppState>>,
+) -> impl IntoResponse {
+    let storage = state.storage.clone();
+    let cf_stats = match tokio::task::spawn_blocking(move || storage.cf_stats()).await {
+        Ok(stats) => stats,
+        Err(e) => {
+            warn!(error = %e, "Failed to collect CF stats");
+            Vec::new()
+        }
+    };
+
+    let db_size = state
+        .metrics_latest
+        .read()
+        .map(|s| s.db_size_bytes)
+        .unwrap_or(0);
+
+    let snap = state
+        .metrics_latest
+        .read()
+        .map(|s| *s)
+        .unwrap_or_default();
+
+    let families: Vec<serde_json::Value> = cf_stats
+        .iter()
+        .map(|(name, keys, size)| {
+            serde_json::json!({
+                "name": name,
+                "estimated_keys": keys,
+                "estimated_size_bytes": size,
+            })
+        })
+        .collect();
+
+    Json(serde_json::json!({
+        "db_size_bytes": db_size,
+        "column_families": families,
+        "ipfs": {
+            "connected": snap.ipfs_connected,
+            "pinned_count": snap.ipfs_pinned_count,
+            "repo_size_bytes": snap.ipfs_repo_size_bytes,
+        }
+    }))
+}
+
+// ── Embedded HTML ───────────────────────────────────────────────────
+
+/// The embedded dashboard HTML — self-contained multi-section SPA.
+/// Vanilla HTML/CSS/JS, inline SVG charts, no external dependencies.
+/// Dark theme default with light theme toggle.
+const DASHBOARD_HTML: &str = include_str!("dashboard.html");

@@ -217,11 +217,15 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
             .route("/admin/state/latest", get(admin::state_latest))
             .route("/admin/state/anchor", post(admin::trigger_anchor));
 
-        // Dashboard (if enabled in config)
+        // Dashboard and metrics endpoints (if enabled in config)
         if config.api.admin.dashboard {
             routes = routes
                 .route("/admin/dashboard", get(dashboard::dashboard_page))
-                .route("/admin/dashboard/ws", get(dashboard::dashboard_ws));
+                .route("/admin/dashboard/ws", get(dashboard::dashboard_ws))
+                .route("/admin/metrics/snapshot", get(dashboard::metrics_snapshot))
+                .route("/admin/metrics/history", get(dashboard::metrics_history))
+                .route("/admin/metrics/peers", get(dashboard::metrics_peers))
+                .route("/admin/metrics/storage", get(dashboard::metrics_storage));
         }
 
         routes.layer(middleware::from_fn(admin::localhost_only))

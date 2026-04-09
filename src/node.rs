@@ -219,6 +219,9 @@ impl Node {
         // Shared peer counter (updated by network layer, read by API health endpoint)
         let peer_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
+        // Shared network counters for metrics (spec 10-dashboard.md §6.2)
+        let network_counters = Arc::new(crate::metrics::counters::NetworkCounters::new());
+
         // Shared connected-peers map (updated by network layer on Identify, read by API /network/nodes)
         let connected_peers = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
 
@@ -234,6 +237,7 @@ impl Node {
             self.signing_key.clone(),
             self.node_id.clone(),
             connected_peers.clone(),
+            network_counters.clone(),
         )
         .await
         .context("starting network service")?;
@@ -401,6 +405,40 @@ impl Node {
             "mainnet".to_string()
         };
 
+        // Start metrics collector (spec 10-dashboard.md §6)
+        let metrics_collector = crate::metrics::MetricsCollector::new(
+            self.config.metrics.clone(),
+            self.storage.clone(),
+            ipfs_client.clone(),
+            peer_count.clone(),
+            network_counters.clone(),
+            &self.config.node.data_dir.to_string_lossy(),
+        );
+        let metrics_latest = metrics_collector.latest_handle();
+        let metrics_history = metrics_collector.history_handle();
+
+        if self.config.metrics.enabled {
+            let metrics_shutdown_rx = self.shutdown_rx();
+            tokio::spawn(async move {
+                metrics_collector.run(metrics_shutdown_rx).await;
+            });
+            info!("Metrics collector started");
+        }
+
+        // Start alert engine (if enabled, spec 10-dashboard.md §9)
+        if self.config.alerts.enabled {
+            let alert_engine = crate::notifications::alerts::AlertEngine::new(
+                self.config.alerts.clone(),
+                self.node_id.clone(),
+            );
+            let alert_metrics = metrics_latest.clone();
+            let alert_shutdown_rx = self.shutdown_rx();
+            tokio::spawn(async move {
+                alert_engine.run(alert_metrics, alert_shutdown_rx).await;
+            });
+            info!("Alert engine started");
+        }
+
         let app_state = Arc::new(crate::api::state::AppState::with_broadcast(
             self.storage.clone(),
             api_router,
@@ -416,6 +454,9 @@ impl Node {
             peer_count,
             gossip_tx,
             connected_peers,
+            network_counters,
+            metrics_latest,
+            metrics_history,
         ));
         let api_config = self.config.clone();
         let api_shutdown_rx = self.shutdown_rx();

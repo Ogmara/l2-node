@@ -2042,7 +2042,7 @@ dependencies = [
  "libp2p-identity",
  "libp2p-swarm",
  "memory-stats",
- "sysinfo",
+ "sysinfo 0.33.1",
  "tracing",
 ]
 
@@ -2588,8 +2588,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "objc2-core-foundation"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2a180dd8642fa45cdb7dd721cd4c11b1cadd4929ce112ebd8b9f5803cc79d536"
+dependencies = [
+ "bitflags",
+]
+
+[[package]]
 name = "ogmara-node"
-version = "0.22.0"
+version = "0.23.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2614,6 +2623,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "sha3",
+ "sysinfo 0.34.2",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -3670,6 +3680,19 @@ dependencies = [
  "memchr",
  "ntapi",
  "rayon",
+ "windows 0.57.0",
+]
+
+[[package]]
+name = "sysinfo"
+version = "0.34.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4b93974b3d3aeaa036504b8eefd4c039dced109171c1ae973f1dc63b2c7e4b2"
+dependencies = [
+ "libc",
+ "memchr",
+ "ntapi",
+ "objc2-core-foundation",
  "windows 0.57.0",
 ]
 

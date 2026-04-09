@@ -840,6 +840,56 @@ impl Storage {
         Ok(new_val)
     }
 
+    /// Estimate total database size in bytes from RocksDB properties.
+    ///
+    /// Uses `rocksdb.estimate-live-data-size` across all column families.
+    /// This is an approximation — actual disk usage may differ due to
+    /// compaction, WAL, and SST overhead.
+    pub fn estimate_db_size(&self) -> Result<u64> {
+        let mut total: u64 = 0;
+        for cf_name in cf::ALL {
+            if let Some(cf_handle) = self.db.cf_handle(cf_name) {
+                if let Ok(Some(size_str)) =
+                    self.db.property_value_cf(&cf_handle, "rocksdb.estimate-live-data-size")
+                {
+                    if let Ok(size) = size_str.parse::<u64>() {
+                        total += size;
+                    }
+                }
+            }
+        }
+        Ok(total)
+    }
+
+    /// Get estimated key count and data size per column family.
+    ///
+    /// Used by the dashboard storage breakdown endpoint.
+    pub fn cf_stats(&self) -> Vec<(String, u64, u64)> {
+        let mut stats = Vec::new();
+        for cf_name in cf::ALL {
+            if let Some(cf_handle) = self.db.cf_handle(cf_name) {
+                let keys = self
+                    .db
+                    .property_value_cf(&cf_handle, "rocksdb.estimate-num-keys")
+                    .ok()
+                    .flatten()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0);
+                let size = self
+                    .db
+                    .property_value_cf(&cf_handle, "rocksdb.estimate-live-data-size")
+                    .ok()
+                    .flatten()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0);
+                if keys > 0 || size > 0 {
+                    stats.push((cf_name.to_string(), keys, size));
+                }
+            }
+        }
+        stats
+    }
+
     /// Rebuild stat counters by scanning existing data.
     /// Called once on startup when counters are zero but data exists.
     pub fn rebuild_stat_counters(&self) -> Result<()> {

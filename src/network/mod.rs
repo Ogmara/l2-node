@@ -27,6 +27,7 @@ use crate::api::state::ConnectedPeerInfo;
 use crate::config::Config;
 use crate::messages::envelope::Envelope;
 use crate::messages::router::{MessageRouter, RouteResult};
+use crate::metrics::counters::NetworkCounters;
 use crate::notifications::engine::NotificationEngine;
 use crate::storage::identity::IdentityResolver;
 use crate::storage::rocks::Storage;
@@ -58,6 +59,8 @@ pub struct NetworkService {
     connected_peers: Arc<RwLock<HashMap<String, ConnectedPeerInfo>>>,
     /// Internal mapping: libp2p PeerId → Ogmara node_id (for removal on disconnect).
     peer_node_ids: HashMap<PeerId, String>,
+    /// Shared network counters for metrics dashboard (spec 10-dashboard.md §6.2).
+    counters: Arc<NetworkCounters>,
 }
 
 impl NetworkService {
@@ -72,6 +75,7 @@ impl NetworkService {
         signing_key: ed25519_dalek::SigningKey,
         node_id: String,
         connected_peers: Arc<RwLock<HashMap<String, ConnectedPeerInfo>>>,
+        counters: Arc<NetworkCounters>,
     ) -> Result<Self> {
         let mut swarm = behaviour::build_swarm(config, keypair)
             .context("building libp2p swarm")?;
@@ -163,6 +167,7 @@ impl NetworkService {
             public_url,
             connected_peers,
             peer_node_ids: HashMap::new(),
+            counters,
         })
     }
 
@@ -240,9 +245,14 @@ impl NetworkService {
                     info!(channel_id, "Auto-subscribed to channel topic (chain discovery)");
                 }
                 Some((topic, data)) = gossip_rx.recv() => {
+                    let data_len = data.len() as u64;
                     let topic_obj = libp2p::gossipsub::IdentTopic::new(&topic);
                     match self.swarm.behaviour_mut().gossipsub.publish(topic_obj, data) {
-                        Ok(_) => debug!(topic = %topic, "Published message to GossipSub"),
+                        Ok(_) => {
+                            self.counters.add_bytes_out(data_len);
+                            self.counters.inc_messages_relayed();
+                            debug!(topic = %topic, "Published message to GossipSub");
+                        }
                         Err(e) => warn!(topic = %topic, error = %e, "Failed to publish to GossipSub"),
                     }
                 }
@@ -721,6 +731,10 @@ impl NetworkService {
 
     /// Handle a received GossipSub message through the full validation pipeline.
     fn handle_gossip_message(&self, data: &[u8]) -> Result<()> {
+        // Track incoming bytes and messages for dashboard metrics
+        self.counters.add_bytes_in(data.len() as u64);
+        self.counters.inc_messages_received();
+
         match self.router.process_message(data) {
             RouteResult::Accepted {
                 msg_id,
@@ -732,6 +746,8 @@ impl NetworkService {
                     msg_type = ?msg_type,
                     "Message accepted from gossip"
                 );
+
+                self.counters.inc_messages_stored();
 
                 // Feed to notification engine for mention detection (fire-and-forget)
                 if let Some(ref engine) = self.notification_engine {
@@ -750,6 +766,7 @@ impl NetworkService {
                 Ok(())
             }
             RouteResult::Rejected(reason) => {
+                self.counters.inc_failed_validations();
                 warn!(reason = %reason, "Rejected message from gossip");
                 Ok(())
             }

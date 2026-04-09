@@ -9,6 +9,9 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::ipfs::client::IpfsClient;
 use crate::messages::router::MessageRouter;
+use crate::metrics::counters::NetworkCounters;
+use crate::metrics::ring_buffer::RingBuffer;
+use crate::metrics::MetricsSnapshot;
 use crate::notifications::engine::NotificationEngine;
 use crate::storage::identity::IdentityResolver;
 use crate::storage::rocks::Storage;
@@ -56,6 +59,12 @@ pub struct AppState {
     /// Connected Ogmara peers (keyed by node_id), updated by the network layer.
     /// Used by `/api/v1/network/nodes` to include peers that haven't announced yet.
     pub connected_peers: Arc<RwLock<HashMap<String, ConnectedPeerInfo>>>,
+    /// Shared network counters for metrics collection (dashboard spec §6.2).
+    pub counters: Arc<NetworkCounters>,
+    /// Latest metrics snapshot from the MetricsCollector (dashboard spec §6).
+    pub metrics_latest: Arc<RwLock<MetricsSnapshot>>,
+    /// Metrics history ring buffer (24h at 1-min resolution).
+    pub metrics_history: Arc<RwLock<RingBuffer<MetricsSnapshot>>>,
 }
 
 impl AppState {
@@ -73,6 +82,9 @@ impl AppState {
     ) -> Self {
         let (ws_broadcast, _) = broadcast::channel(1024);
         let (gossip_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let counters = Arc::new(NetworkCounters::new());
+        let metrics_latest = Arc::new(RwLock::new(MetricsSnapshot::default()));
+        let metrics_history = Arc::new(RwLock::new(RingBuffer::new(1440)));
         Self::with_broadcast(
             storage,
             router,
@@ -88,6 +100,9 @@ impl AppState {
             Arc::new(AtomicU32::new(0)),
             gossip_tx,
             Arc::new(RwLock::new(HashMap::new())),
+            counters,
+            metrics_latest,
+            metrics_history,
         )
     }
 
@@ -95,6 +110,7 @@ impl AppState {
     ///
     /// Used when the notification engine needs to share the same broadcast
     /// channel as the WebSocket layer.
+    #[allow(clippy::too_many_arguments)]
     pub fn with_broadcast(
         storage: Storage,
         router: MessageRouter,
@@ -110,6 +126,9 @@ impl AppState {
         peer_count: Arc<AtomicU32>,
         gossip_tx: tokio::sync::mpsc::UnboundedSender<(String, Vec<u8>)>,
         connected_peers: Arc<RwLock<HashMap<String, ConnectedPeerInfo>>>,
+        counters: Arc<NetworkCounters>,
+        metrics_latest: Arc<RwLock<MetricsSnapshot>>,
+        metrics_history: Arc<RwLock<RingBuffer<MetricsSnapshot>>>,
     ) -> Self {
         Self {
             storage,
@@ -127,6 +146,9 @@ impl AppState {
             anchor_trigger,
             gossip_tx,
             connected_peers,
+            counters,
+            metrics_latest,
+            metrics_history,
         }
     }
 
