@@ -13,6 +13,7 @@ mod storage;
 mod api;
 mod chain;
 mod ipfs;
+mod metrics;
 mod network;
 mod notifications;
 

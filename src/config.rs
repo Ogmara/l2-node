@@ -32,6 +32,8 @@ pub struct Config {
     pub logging: LoggingConfig,
     #[serde(default)]
     pub alerts: AlertsConfig,
+    #[serde(default)]
+    pub metrics: MetricsConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -170,6 +172,13 @@ pub struct AdminConfig {
     /// Serve built-in admin dashboard.
     #[serde(default = "default_true")]
     pub dashboard: bool,
+    /// Wallet addresses authorized for remote dashboard access.
+    /// Empty list = localhost-only (no auth required from localhost).
+    #[serde(default)]
+    pub admin_wallets: Vec<String>,
+    /// Session token lifetime in hours (default: 24).
+    #[serde(default = "default_24")]
+    pub session_ttl_hours: u64,
 }
 
 impl Default for AdminConfig {
@@ -177,6 +186,8 @@ impl Default for AdminConfig {
         Self {
             enabled: true,
             dashboard: true,
+            admin_wallets: Vec::new(),
+            session_ttl_hours: 24,
         }
     }
 }
@@ -227,14 +238,24 @@ impl Default for CacheConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct PushGatewayConfig {
     #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
     pub url: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub auth_token: String,
+}
+
+impl std::fmt::Debug for PushGatewayConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PushGatewayConfig")
+            .field("enabled", &self.enabled)
+            .field("url", &self.url)
+            .field("auth_token", &if self.auth_token.is_empty() { "<none>" } else { "<redacted>" })
+            .finish()
+    }
 }
 
 impl Default for PushGatewayConfig {
@@ -318,6 +339,9 @@ pub struct AlertsConfig {
     pub discord: DiscordAlertConfig,
     #[serde(default)]
     pub webhook: WebhookAlertConfig,
+    /// Post alerts to an Ogmara channel using a wallet identity.
+    #[serde(default)]
+    pub ogmara_channel: OgmaraChannelAlertConfig,
     #[serde(default)]
     pub thresholds: AlertThresholds,
     #[serde(default)]
@@ -331,30 +355,101 @@ impl Default for AlertsConfig {
             telegram: TelegramAlertConfig::default(),
             discord: DiscordAlertConfig::default(),
             webhook: WebhookAlertConfig::default(),
+            ogmara_channel: OgmaraChannelAlertConfig::default(),
             thresholds: AlertThresholds::default(),
             cooldown: AlertCooldown::default(),
         }
     }
 }
 
+/// Configuration for posting alerts to an Ogmara channel (spec 10-dashboard.md §9.4).
+///
+/// The configured wallet must already be a member of the target channel
+/// (joined via a client app before enabling this feature).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OgmaraChannelAlertConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Target channel ID (see spec 10-dashboard.md §2.2 for retrieval).
+    #[serde(default)]
+    pub channel_id: u64,
+    /// Klever address (klv1...) to post alerts as.
+    #[serde(default)]
+    pub wallet_address: String,
+    /// Path to Ed25519 private key file. Prefer OGMARA_ALERT_SIGNING_KEY env var.
+    #[serde(default, skip_serializing)]
+    pub signing_key_path: String,
+}
+
+/// Metrics collection configuration (spec 10-dashboard.md §10.3).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricsConfig {
+    /// Enable metrics collection (default: true).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// System metrics sampling interval in seconds.
+    #[serde(default = "default_10")]
+    pub system_interval_seconds: u64,
+    /// IPFS metrics polling interval in seconds.
+    #[serde(default = "default_30")]
+    pub ipfs_interval_seconds: u64,
+    /// Storage metrics polling interval in seconds.
+    #[serde(default = "default_60")]
+    pub storage_interval_seconds: u64,
+    /// Ring buffer capacity (1-minute snapshots to retain).
+    #[serde(default = "default_1440")]
+    pub history_capacity: u64,
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            system_interval_seconds: 10,
+            ipfs_interval_seconds: 30,
+            storage_interval_seconds: 60,
+            history_capacity: 1440,
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct TelegramAlertConfig {
     #[serde(default)]
     pub enabled: bool,
-    /// Loaded from environment variable in production.
-    #[serde(default)]
+    /// Loaded from environment variable in production. Never put in config file.
+    #[serde(default, skip_serializing)]
     pub bot_token: String,
     #[serde(default)]
     pub chat_id: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+impl std::fmt::Debug for TelegramAlertConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TelegramAlertConfig")
+            .field("enabled", &self.enabled)
+            .field("bot_token", &if self.bot_token.is_empty() { "<none>" } else { "<redacted>" })
+            .field("chat_id", &self.chat_id)
+            .finish()
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct DiscordAlertConfig {
     #[serde(default)]
     pub enabled: bool,
-    /// Loaded from environment variable in production.
-    #[serde(default)]
+    /// Loaded from environment variable in production. Never put in config file.
+    #[serde(default, skip_serializing)]
     pub webhook_url: String,
+}
+
+impl std::fmt::Debug for DiscordAlertConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DiscordAlertConfig")
+            .field("enabled", &self.enabled)
+            .field("webhook_url", &if self.webhook_url.is_empty() { "<none>" } else { "<redacted>" })
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -502,6 +597,15 @@ fn default_50() -> u32 {
 fn default_300() -> u64 {
     300
 }
+fn default_10() -> u64 {
+    10
+}
+fn default_24() -> u64 {
+    24
+}
+fn default_1440() -> u64 {
+    1440
+}
 
 impl Config {
     /// Load configuration from a TOML file.
@@ -561,6 +665,8 @@ rate_limit_per_ip = 100
 [api.admin]
 enabled = true
 dashboard = true
+admin_wallets = []
+session_ttl_hours = 24
 
 [storage]
 engine = "rocksdb"
@@ -581,6 +687,24 @@ auth_token = ""
 enabled = false
 interval_seconds = 3600
 # wallet_key = ""  # optional, defaults to node identity key
+
+[metrics]
+enabled = true
+system_interval_seconds = 10
+ipfs_interval_seconds = 30
+storage_interval_seconds = 60
+history_capacity = 1440
+
+[alerts]
+enabled = false
+
+[alerts.cooldown]
+seconds = 300
+
+[alerts.thresholds]
+min_peers = 3
+max_disk_usage_percent = 90
+max_memory_usage_percent = 85
 
 [logging]
 level = "info"

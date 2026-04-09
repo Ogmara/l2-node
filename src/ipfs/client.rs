@@ -212,6 +212,28 @@ impl IpfsClient {
         Ok(())
     }
 
+    /// Get IPFS repo statistics (total size and pinned object count).
+    ///
+    /// Used by the metrics collector for dashboard stats (spec 10-dashboard.md §6.1).
+    pub async fn repo_stat(&self) -> Result<(u64, u64)> {
+        // Get repo size
+        let url = format!("{}/api/v0/repo/stat", self.api_url);
+        let resp: serde_json::Value = self
+            .http
+            .post(&url)
+            .send()
+            .await
+            .context("fetching IPFS repo stat")?
+            .json()
+            .await
+            .context("parsing IPFS repo stat response")?;
+
+        let repo_size = resp["RepoSize"].as_u64().unwrap_or(0);
+        let num_objects = resp["NumObjects"].as_u64().unwrap_or(0);
+
+        Ok((repo_size, num_objects))
+    }
+
     /// Get the gateway URL for a CID (for serving to clients).
     pub fn gateway_url_for(&self, cid: &str) -> Result<String> {
         validate_cid(cid)?;

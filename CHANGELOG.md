@@ -5,6 +5,47 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.23.0] - 2026-04-09
+
+### Added
+- **Node operator dashboard** — complete multi-section SPA served at `/admin/dashboard`
+  with real-time metrics via WebSocket (2s push). Sections: Overview (health indicators,
+  metric cards with sparklines), Network (peers table, bandwidth charts), Storage
+  (RocksDB column family breakdown, IPFS stats), Messages (throughput charts, counters),
+  Alerts (status display). Dark theme default with light toggle. Vanilla HTML/CSS/JS,
+  inline SVG charts, zero external dependencies. (spec 10-dashboard.md)
+- **Metrics collection infrastructure** — background `MetricsCollector` task sampling
+  CPU/memory/disk via `sysinfo` crate, network counters via shared atomics, storage
+  stats via RocksDB properties, IPFS stats via HTTP API. 24-hour ring buffer at
+  1-minute resolution (~280 KB memory).
+- **New admin REST endpoints** — `GET /admin/metrics/snapshot` (full current metrics),
+  `GET /admin/metrics/history` (time-series from ring buffer), `GET /admin/metrics/peers`
+  (detailed peer table), `GET /admin/metrics/storage` (column family breakdown).
+- **Network counters** — `NetworkCounters` struct with shared atomics tracking bytes
+  in/out, messages received/relayed/stored, failed validations, rate-limited requests.
+  Wired into NetworkService gossip handlers for real-time tracking.
+- **Alert engine** — background task evaluating configurable thresholds every 30 seconds.
+  Conditions: IPFS unreachable, low peers, high disk/memory, SC sync lag. Dispatchers:
+  Telegram, Discord, generic webhook. Severity levels: critical, warning, info.
+  Cooldown support to prevent spam. (spec 10-dashboard.md §9)
+- **`[alerts.ogmara_channel]` config** — configuration for posting alerts to an Ogmara
+  private channel using the operator's wallet identity. (dispatcher implementation in
+  next version)
+- **`[metrics]` config section** — configurable sampling intervals for system (10s),
+  IPFS (30s), storage (60s), and ring buffer capacity (1440 slots = 24h).
+- **`admin_wallets` and `session_ttl_hours`** in `[api.admin]` config — preparation
+  for wallet-signature dashboard authentication (auth endpoints in next version).
+- **`Storage::estimate_db_size()`** — estimates live data size across all column families.
+- **`Storage::cf_stats()`** — returns per-CF key count and size estimates.
+- **`IpfsClient::repo_stat()`** — queries IPFS repo size and object count.
+
+### Changed
+- **Dashboard WebSocket payload** upgraded to v2 format with structured sections:
+  `node`, `system`, `network`, `storage`, `ipfs`, `chain`, `anchoring`.
+- **Alert severity levels** standardized to `critical`/`warning`/`info` (was
+  `error`/`warning`/`info`). Node restart alert renamed to `node_started` (info
+  severity, fires on every startup for uptime tracking).
+
 ## [0.22.0] - 2026-04-06
 
 ### Added

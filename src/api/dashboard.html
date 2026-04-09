@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ogmara Node Dashboard</title>
+<style>
+:root {
+  --bg: #0f1117; --bg2: #1a1d28; --fg: #e0e0e0; --fg2: #8890a0;
+  --card: #1a1d28; --border: #2a2d38; --accent: #7c6cf0; --accent2: #a29bfe;
+  --green: #55efc4; --yellow: #ffeaa7; --red: #ff7675; --blue: #74b9ff;
+  --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  --mono: 'SF Mono', 'Fira Code', monospace;
+  --radius: 8px;
+}
+[data-theme="light"] {
+  --bg: #f5f6fa; --bg2: #ffffff; --fg: #1a1a2e; --fg2: #6c7a89;
+  --card: #ffffff; --border: #e0e0e0; --accent: #6c5ce7; --accent2: #a29bfe;
+  --green: #00b894; --yellow: #fdcb6e; --red: #d63031; --blue: #0984e3;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: var(--font); background: var(--bg); color: var(--fg); min-height: 100vh; }
+.header { display: flex; align-items: center; justify-content: space-between; padding: 12px 20px; background: var(--bg2); border-bottom: 1px solid var(--border); }
+.header h1 { font-size: 1.1em; color: var(--accent); display: flex; align-items: center; gap: 8px; }
+.header-right { display: flex; align-items: center; gap: 12px; font-size: 0.85em; }
+.badge { padding: 2px 8px; border-radius: 4px; font-size: 0.8em; font-weight: 600; }
+.badge-net { background: var(--accent); color: #fff; }
+.badge-ok { background: var(--green); color: #111; }
+.badge-err { background: var(--red); color: #fff; }
+#theme-btn { background: none; border: 1px solid var(--border); color: var(--fg2); padding: 4px 8px; border-radius: 4px; cursor: pointer; font-size: 0.85em; }
+.nav { display: flex; gap: 0; border-bottom: 1px solid var(--border); background: var(--bg2); padding: 0 20px; overflow-x: auto; }
+.nav button { background: none; border: none; color: var(--fg2); padding: 10px 16px; cursor: pointer; font-size: 0.9em; border-bottom: 2px solid transparent; white-space: nowrap; }
+.nav button.active { color: var(--accent); border-bottom-color: var(--accent); }
+.nav button:hover { color: var(--fg); }
+.content { padding: 20px; max-width: 1400px; margin: 0 auto; }
+.tab { display: none; }
+.tab.active { display: block; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; margin-bottom: 20px; }
+.card { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px; }
+.card h3 { font-size: 0.75em; text-transform: uppercase; letter-spacing: 0.05em; color: var(--fg2); margin-bottom: 6px; }
+.metric { font-size: 1.8em; font-weight: 700; font-family: var(--mono); }
+.metric.green { color: var(--green); } .metric.yellow { color: var(--yellow); } .metric.red { color: var(--red); }
+.label { font-size: 0.8em; color: var(--fg2); margin-top: 4px; }
+.spark { height: 30px; margin-top: 6px; }
+.spark svg { width: 100%; height: 100%; }
+.spark polyline { fill: none; stroke: var(--accent2); stroke-width: 1.5; }
+.health { display: flex; gap: 16px; margin-bottom: 16px; flex-wrap: wrap; }
+.health-item { display: flex; align-items: center; gap: 6px; font-size: 0.85em; }
+.dot { width: 8px; height: 8px; border-radius: 50%; }
+.dot-ok { background: var(--green); } .dot-warn { background: var(--yellow); } .dot-err { background: var(--red); }
+.chart-box { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px; margin-bottom: 16px; }
+.chart-box h3 { font-size: 0.85em; color: var(--fg2); margin-bottom: 8px; }
+.chart { height: 160px; }
+.chart svg { width: 100%; height: 100%; }
+table { width: 100%; border-collapse: collapse; font-size: 0.85em; }
+th { text-align: left; padding: 8px; border-bottom: 2px solid var(--border); color: var(--fg2); font-weight: 600; text-transform: uppercase; font-size: 0.75em; letter-spacing: 0.03em; }
+td { padding: 8px; border-bottom: 1px solid var(--border); }
+.alert-banner { background: #d6303122; border: 1px solid var(--red); border-radius: var(--radius); padding: 10px 14px; margin-bottom: 16px; display: none; }
+.alert-banner.show { display: flex; align-items: center; gap: 8px; }
+.two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+@media (max-width: 768px) { .two-col { grid-template-columns: 1fr; } .grid { grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); } }
+.conn-dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; margin-right: 4px; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1><svg width="20" height="20" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="2"/><path d="M8 12a4 4 0 108 0 4 4 0 00-8 0" stroke="currentColor" stroke-width="2"/></svg> Ogmara Node</h1>
+  <div class="header-right">
+    <span id="version" style="color:var(--fg2)"></span>
+    <span class="badge badge-net" id="network-badge">--</span>
+    <span id="conn-status"><span class="conn-dot" id="ws-dot" style="background:var(--red)"></span><span id="ws-text" style="color:var(--fg2);font-size:0.8em">Connecting</span></span>
+    <button id="theme-btn" onclick="toggleTheme()">Light</button>
+  </div>
+</div>
+
+<div class="nav" id="nav">
+  <button class="active" data-tab="overview">Overview</button>
+  <button data-tab="network">Network</button>
+  <button data-tab="storage">Storage</button>
+  <button data-tab="messages">Messages</button>
+  <button data-tab="alerts">Alerts</button>
+</div>
+
+<div class="content">
+  <!-- Alert Banner -->
+  <div class="alert-banner" id="alert-banner">
+    <span style="color:var(--yellow);font-weight:700">WARNING</span>
+    <span id="alert-msg">--</span>
+  </div>
+
+  <!-- OVERVIEW TAB -->
+  <div class="tab active" id="tab-overview">
+    <div class="health" id="health-row">
+      <div class="health-item"><span class="dot dot-ok" id="h-klever"></span>Klever</div>
+      <div class="health-item"><span class="dot dot-err" id="h-ipfs"></span>IPFS</div>
+      <div class="health-item"><span class="dot dot-ok" id="h-peers"></span>Peers (<span id="h-peer-count">0</span>)</div>
+      <div class="health-item"><span class="dot dot-ok" id="h-anchor"></span>Anchoring</div>
+    </div>
+    <div class="grid">
+      <div class="card"><h3>Uptime</h3><div class="metric green" id="uptime">--</div></div>
+      <div class="card"><h3>Peers</h3><div class="metric" id="peers">--</div><div class="spark" id="spark-peers"></div></div>
+      <div class="card"><h3>Messages</h3><div class="metric" id="messages">--</div><div class="label" id="msg-rate">-- msg/s</div></div>
+      <div class="card"><h3>Users</h3><div class="metric" id="users">--</div></div>
+      <div class="card"><h3>Channels</h3><div class="metric" id="channels">--</div></div>
+      <div class="card"><h3>CPU</h3><div class="metric" id="cpu">--%</div><div class="spark" id="spark-cpu"></div></div>
+      <div class="card"><h3>Memory</h3><div class="metric" id="memory">--</div><div class="label" id="mem-detail">--</div><div class="spark" id="spark-mem"></div></div>
+      <div class="card"><h3>Disk</h3><div class="metric" id="disk">--</div><div class="label" id="disk-detail">--</div></div>
+      <div class="card"><h3>IPFS</h3><div class="metric" id="ipfs-status">--</div><div class="label" id="ipfs-detail">--</div></div>
+      <div class="card"><h3>Klever Sync</h3><div class="metric" id="klever-block">--</div><div class="label" id="klever-lag">--</div></div>
+      <div class="card"><h3>DB Size</h3><div class="metric" id="db-size">--</div></div>
+      <div class="card"><h3>Anchoring</h3><div class="metric" id="anchor-count">--</div><div class="label" id="anchor-age">--</div></div>
+    </div>
+  </div>
+
+  <!-- NETWORK TAB -->
+  <div class="tab" id="tab-network">
+    <div class="two-col">
+      <div class="chart-box"><h3>Peers (last hour)</h3><div class="chart" id="chart-peers"></div></div>
+      <div class="chart-box"><h3>Bandwidth (last hour)</h3><div class="chart" id="chart-bw"></div></div>
+    </div>
+    <div class="card" style="margin-bottom:16px">
+      <h3>Connected Peers</h3>
+      <table id="peers-table"><thead><tr><th>Node ID</th><th>Agent Version</th></tr></thead><tbody id="peers-body"></tbody></table>
+    </div>
+  </div>
+
+  <!-- STORAGE TAB -->
+  <div class="tab" id="tab-storage">
+    <div class="two-col">
+      <div>
+        <div class="card" style="margin-bottom:16px">
+          <h3>Database</h3>
+          <div class="metric" id="st-db-size">--</div>
+          <div class="label" id="st-db-label">--</div>
+        </div>
+        <div class="card">
+          <h3>Column Families</h3>
+          <table><thead><tr><th>Name</th><th>Keys</th><th>Size</th></tr></thead><tbody id="cf-body"></tbody></table>
+        </div>
+      </div>
+      <div>
+        <div class="card" style="margin-bottom:16px">
+          <h3>IPFS</h3>
+          <div class="metric" id="st-ipfs-status">--</div>
+          <div class="label" id="st-ipfs-detail">--</div>
+        </div>
+        <div class="chart-box"><h3>Disk Usage (last hour)</h3><div class="chart" id="chart-disk"></div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- MESSAGES TAB -->
+  <div class="tab" id="tab-messages">
+    <div class="chart-box"><h3>Message Throughput (last hour)</h3><div class="chart" id="chart-msgs"></div></div>
+    <div class="grid">
+      <div class="card"><h3>Received Total</h3><div class="metric" id="m-recv">--</div></div>
+      <div class="card"><h3>Relayed Total</h3><div class="metric" id="m-relay">--</div></div>
+      <div class="card"><h3>Stored Total</h3><div class="metric" id="m-stored">--</div></div>
+      <div class="card"><h3>Failed Signatures</h3><div class="metric" id="m-failed">--</div></div>
+      <div class="card"><h3>Rate Limited</h3><div class="metric" id="m-ratelim">--</div></div>
+    </div>
+  </div>
+
+  <!-- ALERTS TAB -->
+  <div class="tab" id="tab-alerts">
+    <div class="card" style="margin-bottom:16px">
+      <h3>Alert Status</h3>
+      <p style="color:var(--fg2);font-size:0.9em">Alert engine status and configuration will be displayed here when enabled in config.</p>
+    </div>
+  </div>
+</div>
+
+<script>
+// ─── Data ───────────────────────────────────────────────────────────
+const sparkData = { peers: [], cpu: [], mem: [], disk: [], bw_in: [], bw_out: [], msgs: [] };
+const SPARK_MAX = 60; // last 60 data points (2s each = 2 min)
+
+// ─── Format helpers ─────────────────────────────────────────────────
+function fmt(n) { if (n >= 1e9) return (n/1e9).toFixed(1)+'G'; if (n >= 1e6) return (n/1e6).toFixed(1)+'M'; if (n >= 1e3) return (n/1e3).toFixed(1)+'K'; return n.toString(); }
+function fmtBytes(b) { if (b >= 1099511627776) return (b/1099511627776).toFixed(1)+' TB'; if (b >= 1073741824) return (b/1073741824).toFixed(1)+' GB'; if (b >= 1048576) return (b/1048576).toFixed(1)+' MB'; if (b >= 1024) return (b/1024).toFixed(0)+' KB'; return b+' B'; }
+function fmtTime(s) { if (s >= 86400) return Math.floor(s/86400)+'d '+Math.floor((s%86400)/3600)+'h'; if (s >= 3600) return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m'; if (s >= 60) return Math.floor(s/60)+'m '+(s%60)+'s'; return s+'s'; }
+function fmtPct(used, total) { return total > 0 ? ((used/total)*100).toFixed(1)+'%' : '--'; }
+function fmtRate(bps) { if (bps >= 1048576) return (bps/1048576).toFixed(1)+' MB/s'; if (bps >= 1024) return (bps/1024).toFixed(1)+' KB/s'; return bps+' B/s'; }
+
+// ─── SVG Chart Rendering ────────────────────────────────────────────
+function sparkline(containerId, points, color) {
+  const el = document.getElementById(containerId);
+  if (!el || points.length < 2) { if(el) el.innerHTML=''; return; }
+  const w = 200, h = 30;
+  let min = Infinity, max = -Infinity;
+  for (const v of points) { if (v < min) min = v; if (v > max) max = v; }
+  if (max === min) { max = min + 1; }
+  const pts = points.map((v, i) => {
+    const x = (i / (points.length - 1)) * w;
+    const y = h - ((v - min) / (max - min)) * (h - 2) - 1;
+    return x.toFixed(1)+','+y.toFixed(1);
+  }).join(' ');
+  el.innerHTML = `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none"><polyline points="${pts}" style="stroke:${color||'var(--accent2)'};stroke-width:1.5;fill:none"/></svg>`;
+}
+
+function lineChart(containerId, datasets, opts) {
+  const el = document.getElementById(containerId);
+  if (!el) return;
+  const w = 400, h = 150, pad = { l: 45, r: 10, t: 10, b: 25 };
+  const cw = w - pad.l - pad.r, ch = h - pad.t - pad.b;
+
+  let allVals = [];
+  for (const ds of datasets) allVals.push(...ds.data);
+  if (allVals.length < 2) { el.innerHTML = '<svg viewBox="0 0 400 150"><text x="200" y="80" text-anchor="middle" fill="var(--fg2)" font-size="12">No data yet</text></svg>'; return; }
+
+  let min = Math.min(...allVals), max = Math.max(...allVals);
+  if (max === min) max = min + 1;
+
+  let svg = `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">`;
+  // Y-axis labels
+  for (let i = 0; i <= 4; i++) {
+    const y = pad.t + (ch / 4) * i;
+    const val = max - (i / 4) * (max - min);
+    svg += `<line x1="${pad.l}" y1="${y}" x2="${w-pad.r}" y2="${y}" stroke="var(--border)" stroke-width="0.5"/>`;
+    svg += `<text x="${pad.l-4}" y="${y+3}" text-anchor="end" fill="var(--fg2)" font-size="9">${opts?.fmtY ? opts.fmtY(val) : val.toFixed(0)}</text>`;
+  }
+  // Data lines
+  for (const ds of datasets) {
+    if (ds.data.length < 2) continue;
+    const pts = ds.data.map((v, i) => {
+      const x = pad.l + (i / (ds.data.length - 1)) * cw;
+      const y = pad.t + ch - ((v - min) / (max - min)) * ch;
+      return x.toFixed(1)+','+y.toFixed(1);
+    }).join(' ');
+    svg += `<polyline points="${pts}" fill="none" stroke="${ds.color}" stroke-width="1.5"/>`;
+  }
+  // Legend
+  let lx = pad.l;
+  for (const ds of datasets) {
+    svg += `<rect x="${lx}" y="${h-12}" width="10" height="3" fill="${ds.color}"/>`;
+    svg += `<text x="${lx+14}" y="${h-8}" fill="var(--fg2)" font-size="9">${ds.label}</text>`;
+    lx += ds.label.length * 6 + 24;
+  }
+  svg += '</svg>';
+  el.innerHTML = svg;
+}
+
+// ─── Tab Navigation ─────────────────────────────────────────────────
+document.getElementById('nav').addEventListener('click', (e) => {
+  if (e.target.tagName !== 'BUTTON') return;
+  document.querySelectorAll('.nav button').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  e.target.classList.add('active');
+  document.getElementById('tab-' + e.target.dataset.tab).classList.add('active');
+  // Load data for the tab
+  if (e.target.dataset.tab === 'network') loadPeers();
+  if (e.target.dataset.tab === 'storage') loadStorage();
+});
+
+// ─── Theme Toggle ───────────────────────────────────────────────────
+function toggleTheme() {
+  const html = document.documentElement;
+  const current = html.getAttribute('data-theme');
+  const next = current === 'dark' ? 'light' : 'dark';
+  html.setAttribute('data-theme', next);
+  document.getElementById('theme-btn').textContent = next === 'dark' ? 'Light' : 'Dark';
+  localStorage.setItem('ogmara-theme', next);
+}
+// Restore saved theme
+const saved = localStorage.getItem('ogmara-theme');
+if (saved) { document.documentElement.setAttribute('data-theme', saved); document.getElementById('theme-btn').textContent = saved === 'dark' ? 'Light' : 'Dark'; }
+
+// ─── WebSocket Connection ───────────────────────────────────────────
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const ws = new WebSocket(proto + '//' + location.host + '/admin/dashboard/ws');
+
+  ws.onopen = () => {
+    document.getElementById('ws-dot').style.background = 'var(--green)';
+    document.getElementById('ws-text').textContent = 'Connected';
+  };
+
+  ws.onclose = () => {
+    document.getElementById('ws-dot').style.background = 'var(--red)';
+    document.getElementById('ws-text').textContent = 'Reconnecting...';
+    setTimeout(connect, 3000);
+  };
+
+  ws.onmessage = (e) => {
+    try { const msg = JSON.parse(e.data); if (msg.type === 'metrics') updateDashboard(msg.data); }
+    catch(_) {}
+  };
+}
+
+function updateDashboard(d) {
+  const n = d.node || {}, s = d.system || {}, net = d.network || {}, st = d.storage || {}, ipfs = d.ipfs || {}, ch = d.chain || {}, anch = d.anchoring || {};
+
+  // Header
+  document.getElementById('version').textContent = 'v' + (n.version||'') + ' (p' + (n.protocol||'') + ')';
+  document.getElementById('network-badge').textContent = (n.network||'--').toUpperCase();
+
+  // Health indicators
+  setDot('h-klever', ch.last_indexed_block > 0 ? 'ok' : 'err');
+  setDot('h-ipfs', ipfs.connected ? 'ok' : 'err');
+  const peerOk = (net.peers_connected||0) >= 3;
+  setDot('h-peers', peerOk ? 'ok' : (net.peers_connected > 0 ? 'warn' : 'err'));
+  document.getElementById('h-peer-count').textContent = net.peers_connected||0;
+  setDot('h-anchor', anch.total_anchors > 0 ? 'ok' : 'warn');
+
+  // Overview cards
+  setText('uptime', fmtTime(n.uptime_seconds||0));
+  setText('peers', net.peers_connected||0);
+  setText('messages', fmt(st.messages_total||0));
+  setText('msg-rate', (net.messages_received_sec||0).toFixed(1) + ' msg/s');
+  setText('users', fmt(st.users_total||0));
+  setText('channels', fmt(st.channels_total||0));
+
+  const cpuPct = (s.cpu_percent||0).toFixed(1);
+  const cpuEl = document.getElementById('cpu');
+  cpuEl.textContent = cpuPct + '%';
+  cpuEl.className = 'metric ' + (s.cpu_percent > 80 ? 'red' : s.cpu_percent > 50 ? 'yellow' : '');
+
+  setText('memory', fmtBytes(s.memory_used_bytes||0));
+  setText('mem-detail', fmtPct(s.memory_used_bytes, s.memory_total_bytes) + ' of ' + fmtBytes(s.memory_total_bytes||0));
+
+  setText('disk', fmtPct(s.disk_used_bytes, s.disk_total_bytes));
+  setText('disk-detail', fmtBytes(s.disk_used_bytes||0) + ' / ' + fmtBytes(s.disk_total_bytes||0));
+
+  const ipfsEl = document.getElementById('ipfs-status');
+  ipfsEl.textContent = ipfs.connected ? 'Connected' : 'Offline';
+  ipfsEl.className = 'metric ' + (ipfs.connected ? 'green' : 'red');
+  setText('ipfs-detail', fmt(ipfs.pinned_count||0) + ' pins, ' + fmtBytes(ipfs.repo_size_bytes||0));
+
+  setText('klever-block', '#' + fmt(ch.last_indexed_block||0));
+  setText('klever-lag', 'lag: ' + (ch.sync_lag_blocks||0) + ' blocks');
+
+  setText('db-size', fmtBytes(st.db_size_bytes||0));
+  setText('anchor-count', fmt(anch.total_anchors||0) + ' anchors');
+  setText('anchor-age', anch.last_anchor_age_seconds > 0 ? fmtTime(anch.last_anchor_age_seconds) + ' ago' : 'never');
+
+  // Messages tab
+  setText('m-recv', fmt(net.messages_received_total||0));
+  setText('m-relay', fmt(net.messages_relayed_total||0));
+  setText('m-stored', fmt(net.messages_stored_total||0));
+  setText('m-failed', fmt(net.failed_validations_total||0));
+  setText('m-ratelim', fmt(net.rate_limited_total||0));
+
+  // Sparkline data
+  pushSpark('peers', net.peers_connected||0);
+  pushSpark('cpu', s.cpu_percent||0);
+  pushSpark('mem', s.memory_used_bytes||0);
+  pushSpark('msgs', net.messages_received_sec||0);
+  pushSpark('bw_in', net.bandwidth_in_bytes_sec||0);
+  pushSpark('bw_out', net.bandwidth_out_bytes_sec||0);
+
+  sparkline('spark-peers', sparkData.peers, 'var(--accent2)');
+  sparkline('spark-cpu', sparkData.cpu, 'var(--yellow)');
+  sparkline('spark-mem', sparkData.mem, 'var(--blue)');
+
+  // Charts (only render if tab is visible)
+  if (document.getElementById('tab-network').classList.contains('active')) {
+    lineChart('chart-peers', [{data: sparkData.peers, color: 'var(--accent2)', label: 'Peers'}]);
+    lineChart('chart-bw', [
+      {data: sparkData.bw_in, color: 'var(--green)', label: 'In'},
+      {data: sparkData.bw_out, color: 'var(--blue)', label: 'Out'}
+    ], {fmtY: fmtRate});
+  }
+  if (document.getElementById('tab-messages').classList.contains('active')) {
+    lineChart('chart-msgs', [{data: sparkData.msgs, color: 'var(--accent2)', label: 'Received/s'}]);
+  }
+  if (document.getElementById('tab-storage').classList.contains('active')) {
+    setText('st-db-size', fmtBytes(st.db_size_bytes||0));
+    setText('st-db-label', fmt(st.messages_total||0)+' msgs, '+fmt(st.users_total||0)+' users, '+fmt(st.channels_total||0)+' channels');
+    const stIpfs = document.getElementById('st-ipfs-status');
+    stIpfs.textContent = ipfs.connected ? 'Connected' : 'Offline';
+    stIpfs.className = 'metric '+(ipfs.connected?'green':'red');
+    setText('st-ipfs-detail', fmt(ipfs.pinned_count||0)+' objects, '+fmtBytes(ipfs.repo_size_bytes||0));
+  }
+}
+
+function setText(id, val) { const el = document.getElementById(id); if (el) el.textContent = val; }
+function setDot(id, state) { const el = document.getElementById(id); if (el) el.className = 'dot dot-' + state; }
+function pushSpark(key, val) { sparkData[key].push(val); if (sparkData[key].length > SPARK_MAX) sparkData[key].shift(); }
+
+// ─── Lazy-loaded REST data ──────────────────────────────────────────
+async function loadPeers() {
+  try {
+    const resp = await fetch('/admin/metrics/peers');
+    const data = await resp.json();
+    const body = document.getElementById('peers-body');
+    body.innerHTML = '';
+    for (const p of (data.peers||[])) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td style="font-family:var(--mono);font-size:0.85em">${esc(p.node_id||'--')}</td><td>${esc(p.agent_version||'--')}</td>`;
+      body.appendChild(tr);
+    }
+    if ((data.peers||[]).length === 0) {
+      body.innerHTML = '<tr><td colspan="2" style="color:var(--fg2)">No peers connected</td></tr>';
+    }
+  } catch(_) {}
+}
+
+async function loadStorage() {
+  try {
+    const resp = await fetch('/admin/metrics/storage');
+    const data = await resp.json();
+    const body = document.getElementById('cf-body');
+    body.innerHTML = '';
+    for (const cf of (data.column_families||[])) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td style="font-family:var(--mono);font-size:0.85em">${esc(cf.name)}</td><td>${fmt(cf.estimated_keys)}</td><td>${fmtBytes(cf.estimated_size_bytes)}</td>`;
+      body.appendChild(tr);
+    }
+  } catch(_) {}
+}
+
+function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
+// ─── Init ───────────────────────────────────────────────────────────
+connect();
+</script>
+</body>
+</html>

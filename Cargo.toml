@@ -1,6 +1,6 @@
 [package]
 name = "ogmara-node"
-version = "0.22.0"
+version = "0.23.0"
 edition = "2021"
 authors = ["Ogmara Contributors"]
 license = "MIT"
@@ -64,6 +64,9 @@ toml = "1.1"
 
 # CLI
 clap = { version = "4.6", features = ["derive"] }
+
+# System metrics
+sysinfo = "0.34"
 
 # Utilities
 hex = "0.4"
