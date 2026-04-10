@@ -55,6 +55,8 @@ pub struct MetricsSnapshot {
     // Storage
     pub db_size_bytes: u64,
     pub messages_total: u64,
+    pub channel_messages_total: u64,
+    pub news_messages_total: u64,
     pub users_total: u64,
     pub channels_total: u64,
 
@@ -71,6 +73,20 @@ pub struct MetricsSnapshot {
     pub last_anchor_height: u64,
     pub last_anchor_age_seconds: u64,
     pub total_anchors: u64,
+}
+
+/// Cached storage statistics (refreshed at storage_interval).
+#[derive(Debug, Clone, Copy, Default)]
+struct StorageStats {
+    db_size: u64,
+    messages_total: u64,
+    channel_messages: u64,
+    news_messages: u64,
+    users_total: u64,
+    channels_total: u64,
+    klever_last_block: u64,
+    last_anchor_ts: u64,
+    total_anchors: u64,
 }
 
 /// IPFS statistics collected via the IPFS HTTP API.
@@ -159,24 +175,8 @@ impl MetricsCollector {
         let mut history_tick = tokio::time::interval(history_interval);
 
         // Cached storage metrics (refreshed at storage_interval)
-        let mut db_size: u64 = 0;
-        let mut messages_total: u64 = 0;
-        let mut users_total: u64 = 0;
-        let mut channels_total: u64 = 0;
-        let mut klever_last_block: u64 = 0;
-        let mut last_anchor_ts: u64 = 0;
-        let mut total_anchors: u64 = 0;
-
-        // Initial storage collection
-        self.collect_storage_stats(
-            &mut db_size,
-            &mut messages_total,
-            &mut users_total,
-            &mut channels_total,
-            &mut klever_last_block,
-            &mut last_anchor_ts,
-            &mut total_anchors,
-        );
+        let mut ss = StorageStats::default();
+        self.collect_storage_stats(&mut ss);
 
         debug!("Metrics collector started");
 
@@ -184,21 +184,14 @@ impl MetricsCollector {
             tokio::select! {
                 _ = system_tick.tick() => {
                     self.system_collector.refresh_cpu_memory();
-                    self.update_latest_snapshot(
-                        db_size, messages_total, users_total, channels_total,
-                        klever_last_block, last_anchor_ts, total_anchors,
-                    );
+                    self.update_latest_snapshot(&ss);
                 }
                 _ = ipfs_tick.tick() => {
                     self.refresh_ipfs_stats().await;
                 }
                 _ = storage_tick.tick() => {
                     self.system_collector.refresh_disks();
-                    self.collect_storage_stats(
-                        &mut db_size, &mut messages_total, &mut users_total,
-                        &mut channels_total, &mut klever_last_block,
-                        &mut last_anchor_ts, &mut total_anchors,
-                    );
+                    self.collect_storage_stats(&mut ss);
                 }
                 _ = history_tick.tick() => {
                     // Write current snapshot to history ring buffer
@@ -217,16 +210,7 @@ impl MetricsCollector {
     }
 
     /// Update the latest snapshot with current data from all sources.
-    fn update_latest_snapshot(
-        &mut self,
-        db_size: u64,
-        messages_total: u64,
-        users_total: u64,
-        channels_total: u64,
-        klever_last_block: u64,
-        last_anchor_ts: u64,
-        total_anchors: u64,
-    ) {
+    fn update_latest_snapshot(&mut self, ss: &StorageStats) {
         let system = self.system_collector.collect();
         let counter_snap = self.counters.snapshot();
         let elapsed = self.prev_counter_time.elapsed().as_secs_f64();
@@ -239,8 +223,8 @@ impl MetricsCollector {
             .unwrap_or_default()
             .as_millis() as u64;
 
-        let anchor_age = if last_anchor_ts > 0 {
-            (now_ms / 1000).saturating_sub(last_anchor_ts)
+        let anchor_age = if ss.last_anchor_ts > 0 {
+            (now_ms / 1000).saturating_sub(ss.last_anchor_ts)
         } else {
             0
         };
@@ -262,21 +246,23 @@ impl MetricsCollector {
             messages_stored_total: counter_snap.messages_stored,
             failed_validations_total: counter_snap.failed_validations,
             rate_limited_total: counter_snap.rate_limited_requests,
-            db_size_bytes: db_size,
-            messages_total,
-            users_total,
-            channels_total,
+            db_size_bytes: ss.db_size,
+            messages_total: ss.messages_total,
+            channel_messages_total: ss.channel_messages,
+            news_messages_total: ss.news_messages,
+            users_total: ss.users_total,
+            channels_total: ss.channels_total,
             ipfs_connected: self.ipfs_stats.connected,
             ipfs_pinned_count: self.ipfs_stats.pinned_count,
             ipfs_repo_size_bytes: self.ipfs_stats.repo_size_bytes,
-            klever_last_block,
+            klever_last_block: ss.klever_last_block,
             klever_sync_lag_blocks: {
                 let chain_tip = self.storage.get_stat(state_keys::CHAIN_TIP).unwrap_or(0);
-                chain_tip.saturating_sub(klever_last_block)
+                chain_tip.saturating_sub(ss.klever_last_block)
             },
             last_anchor_height: 0,
             last_anchor_age_seconds: anchor_age,
-            total_anchors,
+            total_anchors: ss.total_anchors,
         };
 
         if let Ok(mut latest) = self.latest.write() {
@@ -285,32 +271,23 @@ impl MetricsCollector {
     }
 
     /// Collect storage statistics from RocksDB and NODE_STATE counters.
-    fn collect_storage_stats(
-        &self,
-        db_size: &mut u64,
-        messages_total: &mut u64,
-        users_total: &mut u64,
-        channels_total: &mut u64,
-        klever_last_block: &mut u64,
-        last_anchor_ts: &mut u64,
-        total_anchors: &mut u64,
-    ) {
-        *messages_total = self.storage.get_stat(state_keys::TOTAL_MESSAGES).unwrap_or(0);
-        *users_total = self.storage.get_stat(state_keys::TOTAL_USERS).unwrap_or(0);
-        *channels_total = self.storage.get_stat(state_keys::TOTAL_CHANNELS).unwrap_or(0);
-        *klever_last_block = self.storage.get_chain_cursor().unwrap_or(0);
-        *last_anchor_ts = self.storage.get_stat(state_keys::LAST_ANCHOR_TS).unwrap_or(0);
+    fn collect_storage_stats(&self, ss: &mut StorageStats) {
+        ss.messages_total = self.storage.get_stat(state_keys::TOTAL_MESSAGES).unwrap_or(0);
+        ss.channel_messages = self.storage.get_stat(state_keys::TOTAL_CHANNEL_MESSAGES).unwrap_or(0);
+        ss.news_messages = self.storage.get_stat(state_keys::TOTAL_NEWS_MESSAGES).unwrap_or(0);
+        ss.users_total = self.storage.get_stat(state_keys::TOTAL_USERS).unwrap_or(0);
+        ss.channels_total = self.storage.get_stat(state_keys::TOTAL_CHANNELS).unwrap_or(0);
+        ss.klever_last_block = self.storage.get_chain_cursor().unwrap_or(0);
+        ss.last_anchor_ts = self.storage.get_stat(state_keys::LAST_ANCHOR_TS).unwrap_or(0);
 
         // Get anchor status from ANCHOR_BY_NODE CF (accurate for this node)
         match self.storage.get_self_anchor_status(&self.node_id) {
-            Ok(status) => {
-                *total_anchors = status.total_anchors;
-            }
-            Err(_) => *total_anchors = 0,
+            Ok(status) => ss.total_anchors = status.total_anchors,
+            Err(_) => ss.total_anchors = 0,
         }
 
         // Estimate database size from RocksDB properties
-        *db_size = self.storage.estimate_db_size().unwrap_or(0);
+        ss.db_size = self.storage.estimate_db_size().unwrap_or(0);
     }
 
     /// Refresh IPFS health and stats.

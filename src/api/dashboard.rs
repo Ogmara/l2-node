@@ -132,6 +132,8 @@ fn build_ws_payload(state: &AppState, snap: &MetricsSnapshot) -> serde_json::Val
             "storage": {
                 "db_size_bytes": snap.db_size_bytes,
                 "messages_total": snap.messages_total,
+                "channel_messages_total": snap.channel_messages_total,
+                "news_messages_total": snap.news_messages_total,
                 "users_total": snap.users_total,
                 "channels_total": snap.channels_total,
             },
