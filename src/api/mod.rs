@@ -243,10 +243,12 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
                 .route("/admin/metrics/storage", get(dashboard::metrics_storage));
         }
 
-        // Protected admin routes use the new auth middleware (localhost bypass + wallet session)
+        // Protected admin routes use the new auth middleware (localhost bypass + wallet session).
+        // Layer order: middleware runs first (outermost), then Extension is available.
+        // In Axum, last .layer() = outermost, so middleware must be last.
         let protected = routes
-            .layer(axum::Extension(admin_auth_state))
-            .layer(middleware::from_fn(admin_auth::admin_auth_middleware));
+            .layer(middleware::from_fn(admin_auth::admin_auth_middleware))
+            .layer(axum::Extension(admin_auth_state));
 
         // Merge unprotected auth routes with protected admin routes
         auth_routes.merge(protected)

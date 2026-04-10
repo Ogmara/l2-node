@@ -5,6 +5,13 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.24.2] - 2026-04-10
+
+### Fixed
+- **Admin auth middleware Extension ordering** — the `AdminAuthState` extension
+  layer was added inside the middleware layer, making it unavailable when the
+  middleware ran. Swapped layer order so Extension is outermost (available first).
+
 ## [0.24.1] - 2026-04-10
 
 ### Fixed
