@@ -146,6 +146,9 @@ pub struct ApiConfig {
     /// Rate limit per IP (requests per minute).
     #[serde(default = "default_rate_limit")]
     pub rate_limit_per_ip: u32,
+    /// Proof-of-Work anti-spam configuration.
+    #[serde(default)]
+    pub pow: PowConfig,
     /// Admin API configuration.
     #[serde(default)]
     pub admin: AdminConfig,
@@ -159,7 +162,37 @@ impl Default for ApiConfig {
             public_url: None,
             cors_origins: default_cors(),
             rate_limit_per_ip: default_rate_limit(),
+            pow: PowConfig::default(),
             admin: AdminConfig::default(),
+        }
+    }
+}
+
+/// Proof-of-Work anti-spam configuration.
+///
+/// New wallets must solve a SHA-256 hash puzzle before their first message
+/// is accepted. On-chain registered wallets and wallets that already solved
+/// a challenge are exempt. The difficulty is measured in leading zero bits.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PowConfig {
+    /// Enable PoW challenges for unknown wallets.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Difficulty: number of leading zero bits required in the hash.
+    /// 20 bits ≈ ~1M hashes ≈ 2-3 seconds on a phone.
+    #[serde(default = "default_pow_difficulty")]
+    pub difficulty: u8,
+    /// Challenge TTL in seconds (default: 300 = 5 minutes).
+    #[serde(default = "default_pow_ttl")]
+    pub challenge_ttl_seconds: u64,
+}
+
+impl Default for PowConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            difficulty: default_pow_difficulty(),
+            challenge_ttl_seconds: default_pow_ttl(),
         }
     }
 }
@@ -543,6 +576,12 @@ fn default_cors() -> Vec<String> {
 fn default_rate_limit() -> u32 {
     100
 }
+fn default_pow_difficulty() -> u8 {
+    20
+}
+fn default_pow_ttl() -> u64 {
+    300
+}
 fn default_engine() -> String {
     "rocksdb".to_string()
 }
@@ -661,6 +700,11 @@ listen_addr = "127.0.0.1"
 listen_port = 41721
 cors_origins = ["http://localhost:*"]
 rate_limit_per_ip = 100
+
+[api.pow]
+enabled = true
+difficulty = 20
+challenge_ttl_seconds = 300
 
 [api.admin]
 enabled = true

@@ -14,6 +14,7 @@ use crate::metrics::ring_buffer::RingBuffer;
 use crate::metrics::MetricsSnapshot;
 use crate::notifications::alerts::SharedAlertHistory;
 use crate::notifications::engine::NotificationEngine;
+use crate::pow::PowManager;
 use crate::storage::identity::IdentityResolver;
 use crate::storage::rocks::Storage;
 
@@ -68,6 +69,8 @@ pub struct AppState {
     pub metrics_history: Arc<RwLock<RingBuffer<MetricsSnapshot>>>,
     /// Shared alert history from the AlertEngine (spec 10-dashboard.md §9).
     pub alert_history: SharedAlertHistory,
+    /// PoW anti-spam manager (None = PoW disabled).
+    pub pow: Option<Arc<PowManager>>,
 }
 
 impl AppState {
@@ -108,6 +111,7 @@ impl AppState {
             metrics_latest,
             metrics_history,
             alert_history,
+            None, // PoW disabled in test/simplified constructor
         )
     }
 
@@ -135,6 +139,7 @@ impl AppState {
         metrics_latest: Arc<RwLock<MetricsSnapshot>>,
         metrics_history: Arc<RwLock<RingBuffer<MetricsSnapshot>>>,
         alert_history: SharedAlertHistory,
+        pow: Option<Arc<PowManager>>,
     ) -> Self {
         Self {
             storage,
@@ -156,6 +161,7 @@ impl AppState {
             metrics_latest,
             metrics_history,
             alert_history,
+            pow,
         }
     }
 

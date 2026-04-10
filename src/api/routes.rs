@@ -19,6 +19,125 @@ use crate::storage::schema::{cf, encode_channel_msg_key, encode_dm_msg_key, stat
 use super::auth::AuthUser;
 use super::state::AppState;
 
+/// Build a 429 response with a PoW challenge for the given wallet address.
+///
+/// Called when the router returns `RouteResult::PowRequired`. The client
+/// must solve the challenge and submit it to `/api/v1/pow/verify` before
+/// retrying the original request.
+fn pow_required_response(state: &AppState, address: &str) -> axum::response::Response {
+    if let Some(ref pow) = state.pow {
+        match pow.generate_challenge(address) {
+            Some(challenge) => (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({
+                    "error": "pow_required",
+                    "message": "Proof-of-work required for new wallets",
+                    "challenge": challenge,
+                })),
+            )
+                .into_response(),
+            None => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "too many pending challenges, try again later",
+            )
+                .into_response(),
+        }
+    } else {
+        // PoW disabled but router returned PowRequired — shouldn't happen, treat as internal error
+        (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+    }
+}
+
+// --- PoW anti-spam endpoints (public, no auth required) ---
+
+/// POST /api/v1/pow/challenge — request a PoW challenge for a wallet address.
+///
+/// Body: `{ "address": "klv1..." }` or `{ "address": "ogd1..." }`
+pub async fn pow_challenge(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(body): Json<PowChallengeRequest>,
+) -> impl IntoResponse {
+    // Validate address format
+    if (!body.address.starts_with("klv1") && !body.address.starts_with("ogd1"))
+        || body.address.len() < 10
+        || body.address.len() > 100
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "invalid address format" })),
+        )
+            .into_response();
+    }
+
+    match &state.pow {
+        Some(pow) => {
+            if pow.is_wallet_known(&body.address) {
+                return (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "known": true,
+                        "message": "Wallet already verified"
+                    })),
+                )
+                    .into_response();
+            }
+            match pow.generate_challenge(&body.address) {
+                Some(challenge) => {
+                    (StatusCode::OK, Json(serde_json::json!({ "challenge": challenge }))).into_response()
+                }
+                None => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({
+                        "error": "too many pending challenges, try again later"
+                    })),
+                )
+                    .into_response(),
+            }
+        }
+        None => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "known": true,
+                "message": "PoW not required on this node"
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /api/v1/pow/verify — submit a PoW solution.
+///
+/// Body: `{ "challenge_id": "...", "address": "klv1...", "nonce": 123456 }`
+pub async fn pow_verify(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(solution): Json<crate::pow::PowSolution>,
+) -> impl IntoResponse {
+    match &state.pow {
+        Some(pow) => match pow.verify_solution(&solution) {
+            Ok(()) => (
+                StatusCode::OK,
+                Json(serde_json::json!({ "ok": true, "message": "Wallet verified" })),
+            )
+                .into_response(),
+            Err(reason) => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": reason })),
+            )
+                .into_response(),
+        },
+        None => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "ok": true, "message": "PoW not required" })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct PowChallengeRequest {
+    pub address: String,
+}
+
 /// Convert an Envelope's byte-array fields (msg_id, payload, signature) to hex strings
 /// in the JSON representation. serde serializes [u8; 32] and Vec<u8> as number arrays,
 /// but the API should return hex strings for client consumption.
@@ -1026,6 +1145,7 @@ pub async fn post_message(
         RouteResult::Duplicate => {
             (StatusCode::CONFLICT, "message already exists").into_response()
         }
+        RouteResult::PowRequired { address } => pow_required_response(&state, &address),
         RouteResult::Rejected(reason) => {
             state.counters.inc_failed_validations();
             (StatusCode::BAD_REQUEST, reason).into_response()
@@ -1068,6 +1188,7 @@ pub async fn create_channel(
         RouteResult::Duplicate => {
             (StatusCode::CONFLICT, "message already exists").into_response()
         }
+        RouteResult::PowRequired { address } => pow_required_response(&state, &address),
         RouteResult::Rejected(reason) => {
             (StatusCode::BAD_REQUEST, reason).into_response()
         }
@@ -1175,6 +1296,7 @@ pub async fn update_profile(
         RouteResult::Duplicate => {
             (StatusCode::CONFLICT, "already processed").into_response()
         }
+        RouteResult::PowRequired { address } => pow_required_response(&state, &address),
         RouteResult::Rejected(reason) => {
             (StatusCode::BAD_REQUEST, reason).into_response()
         }
@@ -1200,6 +1322,7 @@ pub async fn send_dm(
         RouteResult::Duplicate => {
             (StatusCode::CONFLICT, "message already exists").into_response()
         }
+        RouteResult::PowRequired { address } => pow_required_response(&state, &address),
         RouteResult::Rejected(reason) => {
             (StatusCode::BAD_REQUEST, reason).into_response()
         }
@@ -1557,6 +1680,7 @@ pub async fn follow_user(
     match state.router.process_message(&body) {
         RouteResult::Accepted { .. } => Json(OkResponse { ok: true }).into_response(),
         RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
+        RouteResult::PowRequired { address } => pow_required_response(&state, &address),
         RouteResult::Rejected(reason) => {
             (StatusCode::BAD_REQUEST, reason).into_response()
         }
@@ -1575,6 +1699,7 @@ pub async fn unfollow_user(
     match state.router.process_message(&body) {
         RouteResult::Accepted { .. } => Json(OkResponse { ok: true }).into_response(),
         RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
+        RouteResult::PowRequired { address } => pow_required_response(&state, &address),
         RouteResult::Rejected(reason) => {
             (StatusCode::BAD_REQUEST, reason).into_response()
         }
@@ -1637,6 +1762,7 @@ pub async fn react_to_news(
     match state.router.process_message(&body) {
         RouteResult::Accepted { .. } => Json(OkResponse { ok: true }).into_response(),
         RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
+        RouteResult::PowRequired { address } => pow_required_response(&state, &address),
         RouteResult::Rejected(reason) => {
             (StatusCode::BAD_REQUEST, reason).into_response()
         }
@@ -1662,6 +1788,7 @@ pub async fn repost_news(
         RouteResult::Duplicate => {
             (StatusCode::CONFLICT, "already reposted").into_response()
         }
+        RouteResult::PowRequired { address } => pow_required_response(&state, &address),
         RouteResult::Rejected(reason) => {
             (StatusCode::BAD_REQUEST, reason).into_response()
         }
@@ -1959,6 +2086,7 @@ pub async fn add_moderator(
     match state.router.process_message(&body) {
         RouteResult::Accepted { .. } => Json(OkResponse { ok: true }).into_response(),
         RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
+        RouteResult::PowRequired { address } => pow_required_response(&state, &address),
         RouteResult::Rejected(reason) => {
             (StatusCode::BAD_REQUEST, reason).into_response()
         }
@@ -1977,6 +2105,7 @@ pub async fn remove_moderator(
     match state.router.process_message(&body) {
         RouteResult::Accepted { .. } => Json(OkResponse { ok: true }).into_response(),
         RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
+        RouteResult::PowRequired { address } => pow_required_response(&state, &address),
         RouteResult::Rejected(reason) => {
             (StatusCode::BAD_REQUEST, reason).into_response()
         }
@@ -1994,6 +2123,7 @@ pub async fn kick_user(
 
     match state.router.process_message(&body) {
         RouteResult::Accepted { .. } => Json(OkResponse { ok: true }).into_response(),
+        RouteResult::PowRequired { address } => pow_required_response(&state, &address),
         RouteResult::Rejected(reason) => {
             (StatusCode::BAD_REQUEST, reason).into_response()
         }
@@ -2012,6 +2142,7 @@ pub async fn ban_user(
 
     match state.router.process_message(&body) {
         RouteResult::Accepted { .. } => Json(OkResponse { ok: true }).into_response(),
+        RouteResult::PowRequired { address } => pow_required_response(&state, &address),
         RouteResult::Rejected(reason) => {
             (StatusCode::BAD_REQUEST, reason).into_response()
         }
@@ -2030,6 +2161,7 @@ pub async fn unban_user(
 
     match state.router.process_message(&body) {
         RouteResult::Accepted { .. } => Json(OkResponse { ok: true }).into_response(),
+        RouteResult::PowRequired { address } => pow_required_response(&state, &address),
         RouteResult::Rejected(reason) => {
             (StatusCode::BAD_REQUEST, reason).into_response()
         }
@@ -2048,6 +2180,7 @@ pub async fn pin_message(
 
     match state.router.process_message(&body) {
         RouteResult::Accepted { .. } => Json(OkResponse { ok: true }).into_response(),
+        RouteResult::PowRequired { address } => pow_required_response(&state, &address),
         RouteResult::Rejected(reason) => {
             (StatusCode::BAD_REQUEST, reason).into_response()
         }
@@ -2066,6 +2199,7 @@ pub async fn unpin_message(
 
     match state.router.process_message(&body) {
         RouteResult::Accepted { .. } => Json(OkResponse { ok: true }).into_response(),
+        RouteResult::PowRequired { address } => pow_required_response(&state, &address),
         RouteResult::Rejected(reason) => {
             (StatusCode::BAD_REQUEST, reason).into_response()
         }
@@ -2084,6 +2218,7 @@ pub async fn invite_user(
 
     match state.router.process_message(&body) {
         RouteResult::Accepted { .. } => Json(OkResponse { ok: true }).into_response(),
+        RouteResult::PowRequired { address } => pow_required_response(&state, &address),
         RouteResult::Rejected(reason) => {
             (StatusCode::BAD_REQUEST, reason).into_response()
         }
@@ -3379,6 +3514,7 @@ pub async fn distribute_channel_keys(
                 "epoch": epoch,
             })).into_response()
         }
+        RouteResult::PowRequired { address } => pow_required_response(&state, &address),
         RouteResult::Rejected(reason) => {
             (StatusCode::BAD_REQUEST, reason).into_response()
         }

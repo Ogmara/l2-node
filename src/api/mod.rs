@@ -21,6 +21,8 @@ use anyhow::{Context, Result};
 use axum::middleware;
 use axum::routing::{delete, get, post, put};
 use axum::Router;
+use tower_governor::GovernorLayer;
+use tower_governor::governor::GovernorConfigBuilder;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing::info;
@@ -203,6 +205,11 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
         .route("/api/v1/account/export", get(routes::export_account))
         .layer(middleware::from_fn(auth::auth_middleware));
 
+    // PoW anti-spam endpoints (public — unauthenticated)
+    let pow_routes = Router::new()
+        .route("/api/v1/pow/challenge", post(routes::pow_challenge))
+        .route("/api/v1/pow/verify", post(routes::pow_verify));
+
     // WebSocket routes
     let ws_routes = Router::new()
         .route("/api/v1/ws", get(websocket::ws_authenticated))
@@ -261,14 +268,27 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
         Router::new()
     };
 
+    // IP-based rate limiting: limit total HTTP requests per IP per minute.
+    // Uses the `governor` crate via `tower_governor` middleware.
+    let rate_limit_per_ip = config.api.rate_limit_per_ip;
+    let governor_conf = Arc::new(
+        GovernorConfigBuilder::default()
+            .per_millisecond(60_000 / rate_limit_per_ip.max(1) as u64)
+            .burst_size(rate_limit_per_ip.max(1))
+            .finish()
+            .expect("valid governor config"),
+    );
+
     // Compose all routes with body size limit (10 MB for media uploads)
     Router::new()
         .merge(public_routes)
         .merge(optional_auth_routes)
         .merge(auth_routes)
+        .merge(pow_routes)
         .merge(ws_routes)
         .merge(admin_routes)
         .layer(axum::extract::DefaultBodyLimit::max(10 * 1024 * 1024))
+        .layer(GovernorLayer::new(governor_conf))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .layer(axum::Extension(app_state))

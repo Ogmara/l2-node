@@ -13,6 +13,7 @@
 //! 10. Notify local clients (WebSocket push)
 //! 11. Check mention notifications
 
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -96,6 +97,8 @@ pub struct MessageRouter {
     identity: IdentityResolver,
     /// Per-user, per-category rate limit counters: "(address:category)" → entry.
     rate_limits: DashMap<String, RateLimitEntry>,
+    /// PoW anti-spam manager (None = PoW disabled).
+    pow: Option<Arc<crate::pow::PowManager>>,
 }
 
 /// Result of processing a message through the router.
@@ -112,14 +115,25 @@ pub enum RouteResult {
     Duplicate,
     /// Message rejected with reason.
     Rejected(String),
+    /// Message rejected because the wallet needs to solve a PoW challenge first.
+    /// The API layer converts this to a 429 response with the challenge payload.
+    PowRequired {
+        /// The wallet address that needs to solve the challenge.
+        address: String,
+    },
 }
 
 impl MessageRouter {
-    pub fn new(storage: Storage, identity: IdentityResolver, _rate_limit_per_minute: u32) -> Self {
+    pub fn new(
+        storage: Storage,
+        identity: IdentityResolver,
+        pow: Option<Arc<crate::pow::PowManager>>,
+    ) -> Self {
         Self {
             storage,
             identity,
             rate_limits: DashMap::new(),
+            pow,
         }
     }
 
@@ -219,6 +233,35 @@ impl MessageRouter {
             }
         }
 
+        // Step 4e: Proof-of-Work gate for unknown wallets.
+        //
+        // Wallets that are on-chain registered (checked in 4d) or already known
+        // (solved PoW before, persisted in KNOWN_WALLETS CF) skip this check.
+        // DeviceDelegation is always exempt (it establishes the device mapping).
+        // Network messages are exempt. Synced historical messages are exempt.
+        if !is_sync
+            && envelope.msg_type != MessageType::DeviceDelegation
+            && envelope.msg_type.requires_registration()
+        {
+            if let Some(ref pow) = self.pow {
+                // Skip if wallet already passed the on-chain registration check above
+                // (requires_verified_identity returned true and check passed).
+                // For basic messages (chat, news, etc.), check PoW requirement.
+                let needs_pow = if envelope.msg_type.requires_verified_identity() {
+                    // Already verified on-chain above — if we got here, they're registered
+                    false
+                } else {
+                    !pow.is_wallet_known(&resolved_author)
+                };
+
+                if needs_pow {
+                    return RouteResult::PowRequired {
+                        address: resolved_author,
+                    };
+                }
+            }
+        }
+
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -273,6 +316,19 @@ impl MessageRouter {
         // Step 8b: Update indexes using resolved wallet address
         if let Err(e) = self.update_indexes(&envelope, &resolved_author) {
             warn!(error = %e, "Failed to update indexes (message still stored)");
+        }
+
+        // After first successful message from a basic (non-registered) wallet,
+        // mark them as known so future PoW checks are skipped (persists across restarts).
+        // Only needed for message types subject to PoW (step 4e).
+        if let Some(ref pow) = self.pow {
+            if !is_sync
+                && envelope.msg_type != MessageType::DeviceDelegation
+                && envelope.msg_type.requires_registration()
+                && !envelope.msg_type.requires_verified_identity()
+            {
+                pow.mark_wallet_known(&resolved_author);
+            }
         }
 
         debug!(

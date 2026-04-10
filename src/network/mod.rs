@@ -150,8 +150,8 @@ impl NetworkService {
         let mut topics = TopicManager::new();
         topics.subscribe_defaults(&mut swarm);
 
-        // Create message router with rate limiting and identity resolution
-        let router = MessageRouter::new(storage.clone(), identity, config.api.rate_limit_per_ip);
+        // Create message router for P2P message processing (no PoW for gossip)
+        let router = MessageRouter::new(storage.clone(), identity, None);
 
         let public_url = config.api.public_url.clone();
 
@@ -579,6 +579,10 @@ impl NetworkService {
                             warn!(reason = %reason, "Rejected synced message");
                             rejected += 1;
                         }
+                        RouteResult::PowRequired { .. } => {
+                            // PoW not enforced for synced messages
+                            rejected += 1;
+                        }
                     }
                 }
                 if accepted > 0 || rejected > 0 {
@@ -774,6 +778,10 @@ impl NetworkService {
             RouteResult::Rejected(reason) => {
                 self.counters.inc_failed_validations();
                 warn!(reason = %reason, "Rejected message from gossip");
+                Ok(())
+            }
+            RouteResult::PowRequired { address } => {
+                debug!(address = %address, "PoW required for gossip message (skipping)");
                 Ok(())
             }
         }
