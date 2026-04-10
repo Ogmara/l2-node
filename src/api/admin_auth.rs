@@ -296,8 +296,10 @@ pub async fn auth_login(
     debug!(address = %req.address, "Dashboard login successful");
 
     // Set HttpOnly cookie + return token in body
+    // Use SameSite=Lax (not Strict) so the cookie works on initial navigation
+    // from external links. Secure flag ensures HTTPS-only in production.
     let cookie = format!(
-        "ogmara_session={}; HttpOnly; SameSite=Strict; Path=/admin; Max-Age={}",
+        "ogmara_session={}; HttpOnly; SameSite=Lax; Path=/; Max-Age={}; Secure",
         token,
         auth_state.session_ttl_hours * 3600
     );
@@ -318,7 +320,7 @@ pub async fn auth_login(
 
 /// POST /admin/auth/logout — clear session cookie.
 pub async fn auth_logout() -> impl IntoResponse {
-    let cookie = "ogmara_session=; HttpOnly; SameSite=Strict; Path=/admin; Max-Age=0";
+    let cookie = "ogmara_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0; Secure";
 
     let mut response = Json(serde_json::json!({ "ok": true })).into_response();
     response.headers_mut().insert(
@@ -334,15 +336,37 @@ pub async fn auth_logout() -> impl IntoResponse {
 /// Middleware that allows access from localhost (no auth) or with a valid
 /// session token (for remote access via admin_wallets).
 ///
-/// Replaces the old `localhost_only` middleware when admin_wallets is configured.
+/// Supports `X-Forwarded-For` header for reverse proxy deployments (Apache, nginx).
+/// When behind a proxy, the TCP peer is always 127.0.0.1 — this header reveals the
+/// real client IP so the localhost bypass only applies to actual local access.
 pub async fn admin_auth_middleware(
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Extension(auth_state): Extension<Arc<AdminAuthState>>,
     req: Request,
     next: Next,
 ) -> Response {
+    // Determine real client IP: X-Forwarded-For (first entry) if present, else TCP peer.
+    // Only trust X-Forwarded-For when the TCP peer is loopback (i.e., request came from
+    // a local reverse proxy). If TCP peer is remote, ignore the header (could be spoofed).
+    let real_ip_is_loopback = if addr.ip().is_loopback() {
+        // Check if a reverse proxy forwarded this from a remote client
+        match req.headers().get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+            Some(forwarded) => {
+                // X-Forwarded-For: client, proxy1, proxy2 — first entry is the original client
+                let client_ip = forwarded.split(',').next().unwrap_or("").trim();
+                match client_ip.parse::<std::net::IpAddr>() {
+                    Ok(ip) => ip.is_loopback(),
+                    Err(_) => false, // unparseable → treat as remote (require auth)
+                }
+            }
+            None => true, // No proxy header, TCP peer is loopback → genuine localhost
+        }
+    } else {
+        false
+    };
+
     // Localhost always passes (spec 10-dashboard.md §5.6)
-    if addr.ip().is_loopback() {
+    if real_ip_is_loopback {
         return next.run(req).await;
     }
 
