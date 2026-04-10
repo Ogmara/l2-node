@@ -5,6 +5,16 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.24.6] - 2026-04-10
+
+### Fixed
+- **Line charts no longer stretched** — charts now use the container's actual pixel
+  dimensions instead of a fixed viewBox with `preserveAspectRatio="none"`, which
+  was causing extreme horizontal stretching on wide screens.
+- **Y-axis labels on zero-value charts** — when all values are 0, the axis showed
+  "1,1,1,0,0" (rounded integers from a 0-1 range). Now uses smart formatting
+  (decimal places based on value range) and anchors Y-axis at 0 when appropriate.
+
 ## [0.24.5] - 2026-04-10
 
 ### Fixed
