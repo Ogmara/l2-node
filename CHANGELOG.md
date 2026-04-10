@@ -5,6 +5,22 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.24.1] - 2026-04-10
+
+### Fixed
+- **Reverse proxy support for admin auth** — the localhost bypass now checks
+  `X-Forwarded-For` header when the TCP peer is loopback. Without this, all
+  requests through Apache/nginx appeared as localhost and bypassed auth entirely.
+  Only trusts the header when TCP peer is `127.0.0.1` (prevents spoofing from
+  remote clients).
+- **Cookie path changed from `/admin` to `/`** — ensures the session cookie is
+  sent for auth endpoint requests at `/admin/auth/*` which were outside the
+  previous path scope.
+- **Cookie SameSite changed from Strict to Lax** — Strict blocks the cookie on
+  initial navigation from external links (e.g., bookmarks). Lax allows it.
+- **Added Secure flag to session cookies** — ensures cookies are only sent over
+  HTTPS in production.
+
 ## [0.24.0] - 2026-04-10
 
 ### Added
