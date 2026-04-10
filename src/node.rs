@@ -413,6 +413,7 @@ impl Node {
             peer_count.clone(),
             network_counters.clone(),
             &self.config.node.data_dir.to_string_lossy(),
+            self.node_id.clone(),
         );
         let metrics_latest = metrics_collector.latest_handle();
         let metrics_history = metrics_collector.history_handle();

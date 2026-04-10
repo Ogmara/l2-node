@@ -91,6 +91,7 @@ pub struct MetricsCollector {
     ipfs: Option<IpfsClient>,
     peer_count: Arc<AtomicU32>,
     counters: Arc<NetworkCounters>,
+    node_id: String,
 
     // Internal state
     system_collector: SystemCollector,
@@ -112,6 +113,7 @@ impl MetricsCollector {
         peer_count: Arc<AtomicU32>,
         counters: Arc<NetworkCounters>,
         data_dir: &str,
+        node_id: String,
     ) -> Self {
         // Clamp capacity: min 60 (1 hour), max 10080 (1 week at 1-min resolution)
         let capacity = (config.history_capacity as usize).clamp(60, 10080);
@@ -121,6 +123,7 @@ impl MetricsCollector {
             ipfs,
             peer_count,
             counters,
+            node_id,
             system_collector: SystemCollector::new(data_dir),
             prev_counter_snapshot: CounterSnapshot::default(),
             prev_counter_time: Instant::now(),
@@ -295,14 +298,11 @@ impl MetricsCollector {
         *klever_last_block = self.storage.get_chain_cursor().unwrap_or(0);
         *last_anchor_ts = self.storage.get_stat(state_keys::LAST_ANCHOR_TS).unwrap_or(0);
 
-        // Estimate anchor count from RocksDB property (O(1) vs O(n) scan)
-        *total_anchors = self
-            .storage
-            .cf_stats()
-            .iter()
-            .find(|(name, _, _)| name == "state_anchors")
-            .map(|(_, keys, _)| *keys)
-            .unwrap_or(0);
+        // Get anchor count from ANCHOR_BY_NODE CF (accurate count for this node)
+        match self.storage.get_self_anchor_status(&self.node_id) {
+            Ok(status) => *total_anchors = status.total_anchors,
+            Err(_) => *total_anchors = 0,
+        }
 
         // Estimate database size from RocksDB properties
         *db_size = self.storage.estimate_db_size().unwrap_or(0);
