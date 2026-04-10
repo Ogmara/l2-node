@@ -474,8 +474,8 @@ async function doLogin() {
   btn.textContent = 'Connecting...';
 
   try {
-    // 1. Check for Klever Extension
-    if (!window.klever) {
+    // 1. Detect Klever Extension — two objects: kleverWeb (desktop) and klever (K5 mobile)
+    if (!window.kleverWeb && !window.klever) {
       errEl.textContent = 'Klever Extension not found. Install it from klever.org';
       return;
     }
@@ -483,19 +483,21 @@ async function doLogin() {
     // 2. Get wallet address
     let address;
     try {
-      const acc = await window.klever.getAccount();
-      address = acc.address || acc;
-    } catch(e) {
-      // Try alternative method
-      try {
-        address = await window.klever.getWalletAddress();
-      } catch(e2) {
-        errEl.textContent = 'Could not get wallet address. Unlock your Klever Extension.';
-        return;
+      if (window.kleverWeb) {
+        // Desktop extension: must initialize first, then getWalletAddress
+        await window.kleverWeb.initialize();
+        address = await window.kleverWeb.getWalletAddress();
+      } else if (window.klever) {
+        // K5 mobile browser: klever.getWalletAddress or getAccount
+        address = await (window.klever.getWalletAddress?.() || window.klever.getAccount?.());
+        if (typeof address === 'object') address = address.address;
       }
+    } catch(e) {
+      errEl.textContent = 'Could not get wallet address. Unlock your Klever wallet.';
+      return;
     }
     if (!address || !address.startsWith('klv1')) {
-      errEl.textContent = 'Invalid wallet address.';
+      errEl.textContent = 'Invalid wallet address. Make sure your Klever wallet is unlocked.';
       return;
     }
 
@@ -514,24 +516,30 @@ async function doLogin() {
 
     btn.textContent = 'Sign with wallet...';
 
-    // 5. Sign with Klever Extension
+    // 5. Sign with Klever — try klever first (wallet provider), then kleverWeb
     let signature;
     try {
-      signature = await window.klever.signMessage(msg);
+      if (window.klever?.signMessage) {
+        signature = await window.klever.signMessage(msg);
+      } else if (window.kleverWeb?.signMessage) {
+        signature = await window.kleverWeb.signMessage(msg);
+      } else {
+        throw new Error('signMessage not available');
+      }
     } catch(e) {
-      errEl.textContent = 'Signing cancelled or failed.';
+      errEl.textContent = 'Signing cancelled or failed: ' + (e.message || 'unknown');
       return;
     }
 
-    // Validate signature format (hex string → base64)
+    // Validate signature format — must be 128 hex chars (64-byte Ed25519)
     let sigBase64;
-    if (/^[0-9a-fA-F]{128}$/.test(signature)) {
-      // Convert hex to base64url
+    if (typeof signature === 'string' && /^[0-9a-fA-F]{128}$/.test(signature)) {
+      // Convert hex to base64url-no-pad
       const bytes = new Uint8Array(64);
       for (let i = 0; i < 64; i++) bytes[i] = parseInt(signature.substr(i*2, 2), 16);
       sigBase64 = btoa(String.fromCharCode(...bytes)).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
     } else {
-      errEl.textContent = 'Invalid signature from wallet.';
+      errEl.textContent = 'Invalid signature from wallet (expected 128 hex chars).';
       return;
     }
 

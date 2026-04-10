@@ -5,6 +5,15 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.24.4] - 2026-04-10
+
+### Fixed
+- **Klever Extension detection** — was only checking `window.klever` (K5 mobile),
+  now checks both `window.kleverWeb` (desktop extension) and `window.klever`.
+  Desktop extension requires `initialize()` before `getWalletAddress()`. Message
+  signing tries `window.klever.signMessage` first, then `window.kleverWeb.signMessage`
+  as fallback. Matches the patterns used in the web and desktop apps.
+
 ## [0.24.3] - 2026-04-10
 
 ### Fixed
