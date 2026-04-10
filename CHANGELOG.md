@@ -5,6 +5,29 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.25.0] - 2026-04-10
+
+### Added
+- **Chain sync lag** — chain scanner now stores the chain tip height in NODE_STATE
+  on every poll cycle. Dashboard computes real `sync_lag_blocks` as `chain_tip -
+  last_indexed_block` instead of hardcoded 0.
+- **Alert history endpoint** — `GET /admin/alerts/history` returns the last 100
+  alerts from the shared AlertEngine history (severity, condition, message, timestamp).
+- **Alerts tab wired** — loads alert history from the REST endpoint with severity
+  color coding. Shows "No alerts recorded" when alerts are disabled.
+- **Alert banner wired** — top-of-page banner now shows the latest unresolved alert
+  from the history endpoint. Previously was dead HTML that never triggered.
+- **History ring buffer charts** — Network, Storage, and Messages tabs now fetch
+  real 1-minute resolution data from `GET /admin/metrics/history` instead of relying
+  solely on the 2-second in-browser sparkline buffer. Charts show actual last-hour
+  data from the server's ring buffer.
+
+### Fixed
+- **Klever health dot** — now turns yellow when sync lag exceeds 100 blocks (was
+  only checking if any block was ever indexed).
+- **Anchoring health dot** — now turns yellow when last anchor age exceeds 2 hours
+  (was only checking if any anchor existed, regardless of recency).
+
 ## [0.24.9] - 2026-04-10
 
 ### Fixed

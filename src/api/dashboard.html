@@ -191,8 +191,8 @@ td { padding: 8px; border-bottom: 1px solid var(--border); }
   <!-- ALERTS TAB -->
   <div class="tab" id="tab-alerts">
     <div class="card" style="margin-bottom:16px">
-      <h3>Alert Status</h3>
-      <p style="color:var(--fg2);font-size:0.9em">Alert engine status and configuration will be displayed here when enabled in config.</p>
+      <h3>Alert History</h3>
+      <table><thead><tr><th>Time</th><th>Severity</th><th>Condition</th><th>Message</th></tr></thead><tbody id="alerts-body"><tr><td colspan="4" style="color:var(--fg2)">Loading...</td></tr></tbody></table>
     </div>
   </div>
 </div>
@@ -292,8 +292,19 @@ document.getElementById('nav').addEventListener('click', (e) => {
   e.target.classList.add('active');
   document.getElementById('tab-' + e.target.dataset.tab).classList.add('active');
   // Load data for the tab
-  if (e.target.dataset.tab === 'network') loadPeers();
-  if (e.target.dataset.tab === 'storage') loadStorage();
+  if (e.target.dataset.tab === 'network') {
+    loadPeers();
+    loadHistoryChart('chart-peers', 'peers_connected', 'Peers', 'var(--accent2)');
+    loadHistoryChart('chart-bw', 'bandwidth_in', 'In', 'var(--green)', fmtRate);
+  }
+  if (e.target.dataset.tab === 'storage') {
+    loadStorage();
+    loadHistoryChart('chart-disk', 'disk_used_bytes', 'Disk Used', 'var(--accent2)', fmtBytes);
+  }
+  if (e.target.dataset.tab === 'messages') {
+    loadHistoryChart('chart-msgs', 'messages_per_minute', 'Msgs/min', 'var(--accent2)');
+  }
+  if (e.target.dataset.tab === 'alerts') loadAlerts();
 });
 
 // ─── Theme Toggle ───────────────────────────────────────────────────
@@ -339,12 +350,14 @@ function updateDashboard(d) {
   document.getElementById('network-badge').textContent = (n.network||'--').toUpperCase();
 
   // Health indicators
-  setDot('h-klever', ch.last_indexed_block > 0 ? 'ok' : 'err');
+  const syncLag = ch.sync_lag_blocks||0;
+  setDot('h-klever', ch.last_indexed_block > 0 ? (syncLag > 100 ? 'warn' : 'ok') : 'err');
   setDot('h-ipfs', ipfs.connected ? 'ok' : 'err');
   const peerOk = (net.peers_connected||0) >= 3;
   setDot('h-peers', peerOk ? 'ok' : (net.peers_connected > 0 ? 'warn' : 'err'));
   document.getElementById('h-peer-count').textContent = net.peers_connected||0;
-  setDot('h-anchor', anch.total_anchors > 0 ? 'ok' : 'warn');
+  const anchorAge = anch.last_anchor_age_seconds||0;
+  setDot('h-anchor', anch.total_anchors > 0 ? (anchorAge > 7200 ? 'warn' : 'ok') : 'warn');
 
   // Overview cards
   setText('uptime', fmtTime(n.uptime_seconds||0));
@@ -426,6 +439,18 @@ function setDot(id, state) { const el = document.getElementById(id); if (el) el.
 function pushSpark(key, val) { sparkData[key].push(val); if (sparkData[key].length > SPARK_MAX) sparkData[key].shift(); }
 
 // ─── Lazy-loaded REST data ──────────────────────────────────────────
+// ─── History-backed charts (from ring buffer, 1-min resolution) ─────
+async function loadHistoryChart(containerId, metric, label, color, fmtY) {
+  try {
+    const resp = await fetch(`/admin/metrics/history?metric=${metric}&period=1h`);
+    const data = await resp.json();
+    const points = (data.points||[]).map(p => p.v);
+    if (points.length > 1) {
+      lineChart(containerId, [{data: points, color: color, label: label}], {fmtY: fmtY});
+    }
+  } catch(_) {}
+}
+
 async function loadPeers() {
   try {
     const resp = await fetch('/admin/metrics/peers');
@@ -453,6 +478,36 @@ async function loadStorage() {
       const tr = document.createElement('tr');
       tr.innerHTML = `<td style="font-family:var(--mono);font-size:0.85em">${esc(cf.name)}</td><td>${fmt(cf.estimated_keys)}</td><td>${fmtBytes(cf.estimated_size_bytes)}</td>`;
       body.appendChild(tr);
+    }
+  } catch(_) {}
+}
+
+async function loadAlerts() {
+  try {
+    const resp = await fetch('/admin/alerts/history');
+    const data = await resp.json();
+    const body = document.getElementById('alerts-body');
+    body.innerHTML = '';
+    const alerts = data.alerts || [];
+    if (alerts.length === 0) {
+      body.innerHTML = '<tr><td colspan="4" style="color:var(--fg2)">No alerts recorded. Enable alerts in ogmara.toml to start monitoring.</td></tr>';
+      return;
+    }
+    for (const a of alerts) {
+      const tr = document.createElement('tr');
+      const time = new Date(a.triggered_at).toLocaleString();
+      const sevColor = a.severity === 'critical' ? 'var(--red)' : a.severity === 'warning' ? 'var(--yellow)' : 'var(--fg2)';
+      tr.innerHTML = `<td style="white-space:nowrap">${esc(time)}</td><td style="color:${sevColor};font-weight:600;text-transform:uppercase">${esc(a.severity)}</td><td style="font-family:var(--mono);font-size:0.85em">${esc(a.condition)}</td><td>${esc(a.message)}</td>`;
+      body.appendChild(tr);
+    }
+    // Update alert banner with latest non-resolved alert
+    const active = alerts.find(a => !a.resolved);
+    const banner = document.getElementById('alert-banner');
+    if (active) {
+      document.getElementById('alert-msg').textContent = active.message;
+      banner.classList.add('show');
+    } else {
+      banner.classList.remove('show');
     }
   } catch(_) {}
 }

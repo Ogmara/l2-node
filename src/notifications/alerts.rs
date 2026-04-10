@@ -127,6 +127,11 @@ impl AlertEngine {
         self.history.clone()
     }
 
+    /// Set an externally created shared history (for sharing with AppState).
+    pub fn set_history(&mut self, history: SharedAlertHistory) {
+        self.history = history;
+    }
+
     /// Run the alert evaluation loop.
     pub async fn run(
         mut self,

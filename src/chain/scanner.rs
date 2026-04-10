@@ -166,6 +166,13 @@ impl ChainScanner {
     ) -> Result<()> {
         let latest = self.get_latest_block_height().await?;
 
+        // Store chain tip for dashboard sync lag calculation (spec 10-dashboard.md §6)
+        let _ = self.storage.put_cf(
+            cf::NODE_STATE,
+            crate::storage::schema::state_keys::CHAIN_TIP,
+            &latest.to_be_bytes(),
+        );
+
         if latest <= self.last_block {
             return Ok(());
         }

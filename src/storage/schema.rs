@@ -209,6 +209,9 @@ pub mod state_keys {
     pub const DEVICE_HRP_MIGRATED: &[u8] = b"migration_device_hrp_migrated";
     /// Unix timestamp of last successful state anchor submission (u64 big-endian).
     pub const LAST_ANCHOR_TS: &[u8] = b"last_anchor_ts";
+    /// Latest known Klever chain tip block height (u64 big-endian).
+    /// Updated by the chain scanner on every poll cycle for dashboard sync lag.
+    pub const CHAIN_TIP: &[u8] = b"chain_tip";
 }
 
 /// Encode a channel message index key: (channel_id, lamport_ts, msg_id).

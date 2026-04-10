@@ -12,6 +12,7 @@ use crate::messages::router::MessageRouter;
 use crate::metrics::counters::NetworkCounters;
 use crate::metrics::ring_buffer::RingBuffer;
 use crate::metrics::MetricsSnapshot;
+use crate::notifications::alerts::SharedAlertHistory;
 use crate::notifications::engine::NotificationEngine;
 use crate::storage::identity::IdentityResolver;
 use crate::storage::rocks::Storage;
@@ -65,6 +66,8 @@ pub struct AppState {
     pub metrics_latest: Arc<RwLock<MetricsSnapshot>>,
     /// Metrics history ring buffer (24h at 1-min resolution).
     pub metrics_history: Arc<RwLock<RingBuffer<MetricsSnapshot>>>,
+    /// Shared alert history from the AlertEngine (spec 10-dashboard.md §9).
+    pub alert_history: SharedAlertHistory,
 }
 
 impl AppState {
@@ -85,6 +88,7 @@ impl AppState {
         let counters = Arc::new(NetworkCounters::new());
         let metrics_latest = Arc::new(RwLock::new(MetricsSnapshot::default()));
         let metrics_history = Arc::new(RwLock::new(RingBuffer::new(1440)));
+        let alert_history = Arc::new(RwLock::new(std::collections::VecDeque::new()));
         Self::with_broadcast(
             storage,
             router,
@@ -103,6 +107,7 @@ impl AppState {
             counters,
             metrics_latest,
             metrics_history,
+            alert_history,
         )
     }
 
@@ -129,6 +134,7 @@ impl AppState {
         counters: Arc<NetworkCounters>,
         metrics_latest: Arc<RwLock<MetricsSnapshot>>,
         metrics_history: Arc<RwLock<RingBuffer<MetricsSnapshot>>>,
+        alert_history: SharedAlertHistory,
     ) -> Self {
         Self {
             storage,
@@ -149,6 +155,7 @@ impl AppState {
             counters,
             metrics_latest,
             metrics_history,
+            alert_history,
         }
     }
 
