@@ -352,7 +352,7 @@ function updateDashboard(d) {
   ipfsEl.className = 'metric ' + (ipfs.connected ? 'green' : 'red');
   setText('ipfs-detail', fmt(ipfs.pinned_count||0) + ' pins, ' + fmtBytes(ipfs.repo_size_bytes||0));
 
-  setText('klever-block', '#' + fmt(ch.last_indexed_block||0));
+  setText('klever-block', '#' + (ch.last_indexed_block||0).toLocaleString());
   setText('klever-lag', 'lag: ' + (ch.sync_lag_blocks||0) + ' blocks');
 
   setText('db-size', fmtBytes(st.db_size_bytes||0));
