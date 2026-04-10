@@ -7,6 +7,7 @@ mod config;
 mod crypto;
 mod messages;
 mod node;
+mod pow;
 mod storage;
 
 // Phase 2+ stubs

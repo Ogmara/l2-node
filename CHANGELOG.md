@@ -5,6 +5,35 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.26.0] - 2026-04-10
+
+### Added
+- **IP rate limiting** — per-IP request throttling via `governor` crate middleware.
+  Configured via `api.rate_limit_per_ip` (default: 100 req/min). Previously this
+  config value existed but was deliberately ignored (`_rate_limit_per_minute`).
+- **Proof-of-Work anti-spam** — new wallets must solve a SHA-256 hash puzzle
+  (~2-3 seconds) before their first message is accepted. On-chain registered
+  wallets and wallets that have previously solved a challenge are exempt.
+  Configurable via `[api.pow]` section (difficulty, TTL, enable/disable).
+- **Known wallets persistence** — new `KNOWN_WALLETS` RocksDB column family
+  stores wallets that have solved PoW or are on-chain registered. Survives
+  node restarts (unlike in-memory rate limit counters).
+- **PoW API endpoints** — `POST /api/v1/pow/challenge` and
+  `POST /api/v1/pow/verify` for requesting and submitting PoW solutions.
+- **Background cleanup task** — periodic eviction (every 5 min) of stale
+  per-user rate limit entries and expired PoW challenges.
+
+### Fixed
+- Rate limit entries now cleaned up periodically. Previously
+  `cleanup_rate_limits()` existed but was never called, causing unbounded
+  memory growth.
+
+### Security
+- Mitigates Sybil spam attacks via key rotation. Each new wallet identity
+  now requires ~2-3 seconds of CPU work before posting, making mass identity
+  creation impractical (1000 wallets = ~30-40 min CPU time).
+- IP-based rate limiting prevents HTTP-level DoS from single sources.
+
 ## [0.25.2] - 2026-04-10
 
 ### Fixed

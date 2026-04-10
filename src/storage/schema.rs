@@ -131,6 +131,13 @@ pub mod cf {
     /// Reverse-chronological order. 30-day retention.
     pub const NOTIFICATIONS: &str = "notifications";
 
+    // --- Anti-Spam / Proof-of-Work ---
+
+    /// wallet_address → first_seen_ts (u64 BE) — wallets that have completed PoW or are on-chain registered.
+    /// Presence in this CF means the wallet is "known" and skips future PoW challenges.
+    /// Persists across restarts (unlike in-memory rate limit counters).
+    pub const KNOWN_WALLETS: &str = "known_wallets";
+
     /// All column family names for database initialization.
     pub const ALL: &[&str] = &[
         MESSAGES,
@@ -178,6 +185,7 @@ pub mod cf {
         NOTIFICATIONS,
         PRIVATE_CHANNEL_KEYS,
         PRIVATE_CHANNEL_ANCHORS,
+        KNOWN_WALLETS,
     ];
 }
 

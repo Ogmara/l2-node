@@ -390,11 +390,28 @@ impl Node {
             }
         };
 
+        // Initialize PoW anti-spam manager
+        let pow_manager = if self.config.api.pow.enabled {
+            let mgr = Arc::new(crate::pow::PowManager::new(
+                self.config.api.pow.clone(),
+                self.storage.clone(),
+            ));
+            info!(
+                difficulty = self.config.api.pow.difficulty,
+                ttl = self.config.api.pow.challenge_ttl_seconds,
+                "PoW anti-spam enabled"
+            );
+            Some(mgr)
+        } else {
+            info!("PoW anti-spam disabled");
+            None
+        };
+
         // Start REST/WS API server
         let api_router = crate::messages::router::MessageRouter::new(
             self.storage.clone(),
             identity.clone(),
-            self.config.api.rate_limit_per_ip,
+            pow_manager.clone(),
         );
         // Derive Klever network name from configured node URL
         let klever_network = if self.config.klever.node_url.contains("testnet") {
@@ -464,7 +481,29 @@ impl Node {
             metrics_latest,
             metrics_history,
             alert_history,
+            pow_manager.clone(),
         ));
+        // Periodic cleanup task: evict stale rate limit entries and expired PoW challenges.
+        // Runs every 5 minutes to prevent unbounded memory growth.
+        let cleanup_state = app_state.clone();
+        let mut cleanup_shutdown_rx = self.shutdown_rx();
+        let cleanup_task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        // Clean up stale per-user rate limit entries
+                        cleanup_state.router.cleanup_rate_limits();
+                        // Clean up expired PoW challenges
+                        if let Some(ref pow) = cleanup_state.pow {
+                            pow.cleanup_expired_challenges();
+                        }
+                    }
+                    _ = cleanup_shutdown_rx.recv() => break,
+                }
+            }
+        });
+
         let api_config = self.config.clone();
         let api_shutdown_rx = self.shutdown_rx();
         let api_task = tokio::spawn(async move {
@@ -491,6 +530,7 @@ impl Node {
         self.storage.set_lamport_counter(val)?;
 
         lamport_task.abort();
+        cleanup_task.abort();
         network_task.abort();
         chain_task.abort();
         api_task.abort();

@@ -1,6 +1,6 @@
 [package]
 name = "ogmara-node"
-version = "0.25.2"
+version = "0.26.0"
 edition = "2021"
 authors = ["Ogmara Contributors"]
 license = "MIT"
@@ -47,6 +47,8 @@ futures = "0.3"
 axum = { version = "0.8", features = ["ws", "multipart"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
+governor = "0.10"                # IP-based rate limiting
+tower_governor = "0.8"           # Axum middleware for governor
 base64 = "0.22"
 
 # HTTP client (for Klever RPC + IPFS API)
@@ -70,6 +72,7 @@ clap = { version = "4.6", features = ["derive"] }
 sysinfo = "0.34"
 
 # Utilities
+uuid = { version = "1.16", features = ["v4"] }
 hex = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
 bytes = "1.11"
