@@ -217,14 +217,23 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
 
     // Admin routes (localhost + wallet auth via middleware)
     let admin_routes = if config.api.admin.enabled {
-        // Auth endpoints are outside the auth middleware (they handle their own auth)
-        let auth_routes = Router::new()
+        // Public admin routes — no auth required (login page + auth endpoints).
+        // The dashboard HTML must load without auth so it can show the login screen.
+        let mut public_admin = Router::new()
             .route("/admin/auth/challenge", get(admin_auth::auth_challenge))
             .route("/admin/auth/login", post(admin_auth::auth_login))
-            .route("/admin/auth/logout", post(admin_auth::auth_logout))
+            .route("/admin/auth/logout", post(admin_auth::auth_logout));
+
+        if config.api.admin.dashboard {
+            public_admin = public_admin
+                .route("/admin/dashboard", get(dashboard::dashboard_page));
+        }
+
+        let public_admin = public_admin
             .layer(axum::Extension(admin_auth_state.clone()));
 
-        let mut routes = Router::new()
+        // Protected admin routes — require localhost or valid session token.
+        let mut protected = Router::new()
             .route("/admin/peers", get(admin::list_peers))
             .route("/admin/storage/stats", get(admin::storage_stats))
             .route("/admin/peers/ban", post(admin::ban_peer))
@@ -232,10 +241,8 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
             .route("/admin/state/latest", get(admin::state_latest))
             .route("/admin/state/anchor", post(admin::trigger_anchor));
 
-        // Dashboard and metrics endpoints (if enabled in config)
         if config.api.admin.dashboard {
-            routes = routes
-                .route("/admin/dashboard", get(dashboard::dashboard_page))
+            protected = protected
                 .route("/admin/dashboard/ws", get(dashboard::dashboard_ws))
                 .route("/admin/metrics/snapshot", get(dashboard::metrics_snapshot))
                 .route("/admin/metrics/history", get(dashboard::metrics_history))
@@ -243,15 +250,12 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
                 .route("/admin/metrics/storage", get(dashboard::metrics_storage));
         }
 
-        // Protected admin routes use the new auth middleware (localhost bypass + wallet session).
-        // Layer order: middleware runs first (outermost), then Extension is available.
-        // In Axum, last .layer() = outermost, so middleware must be last.
-        let protected = routes
+        let protected = protected
             .layer(middleware::from_fn(admin_auth::admin_auth_middleware))
             .layer(axum::Extension(admin_auth_state));
 
-        // Merge unprotected auth routes with protected admin routes
-        auth_routes.merge(protected)
+        // Merge public + protected admin routes
+        public_admin.merge(protected)
     } else {
         Router::new()
     };
