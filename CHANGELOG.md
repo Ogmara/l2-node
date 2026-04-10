@@ -5,6 +5,14 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.24.3] - 2026-04-10
+
+### Fixed
+- **Dashboard page loads without auth** — the HTML page was behind the auth
+  middleware, returning "authentication required" before the login UI could
+  render. Moved `/admin/dashboard` to the public route group alongside the
+  auth endpoints. Data endpoints (metrics, WebSocket) remain protected.
+
 ## [0.24.2] - 2026-04-10
 
 ### Fixed
