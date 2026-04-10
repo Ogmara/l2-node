@@ -28,8 +28,12 @@ contract_address = "klv1qqqqqqqqqqqqqpgq0ja2j7xwz843ryfsk9vlz6xzsaak590h6pgq7nwr
 scan_interval_ms = 60000    # 60s — safe for rate limits
 
 [ipfs]
+# Local IPFS (default): node and IPFS on the same server
 api_url = "http://127.0.0.1:5001"
-gateway_url = "http://127.0.0.1:8080"
+gateway_url = "http://127.0.0.1:8081"
+# Remote IPFS: point to the remote server (must be secured — see docs/specs/04-ipfs.md §7.2)
+# api_url = "http://10.0.0.2:5001"       # via WireGuard tunnel
+# gateway_url = "http://10.0.0.2:8081"   # via WireGuard tunnel
 max_upload_size_mb = 50
 auto_thumbnail = true
 
