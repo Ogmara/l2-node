@@ -5,6 +5,17 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.24.7] - 2026-04-10
+
+### Fixed
+- **Anchor count was inflated** — used RocksDB `estimate-num-keys` which grows
+  with each flush/compaction. Now uses `get_self_anchor_status()` which accurately
+  counts this node's anchors from the `ANCHOR_BY_NODE` column family.
+
+### Added
+- **Ogmara favicon** — embedded the official purple-blue monogram "O" SVG favicon
+  as an inline data URI in the dashboard page.
+
 ## [0.24.6] - 2026-04-10
 
 ### Fixed
