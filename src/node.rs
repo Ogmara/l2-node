@@ -426,12 +426,17 @@ impl Node {
             info!("Metrics collector started");
         }
 
+        // Create shared alert history (readable by dashboard, writable by alert engine)
+        let alert_history: crate::notifications::alerts::SharedAlertHistory =
+            std::sync::Arc::new(std::sync::RwLock::new(std::collections::VecDeque::new()));
+
         // Start alert engine (if enabled, spec 10-dashboard.md §9)
         if self.config.alerts.enabled {
-            let alert_engine = crate::notifications::alerts::AlertEngine::new(
+            let mut alert_engine = crate::notifications::alerts::AlertEngine::new(
                 self.config.alerts.clone(),
                 self.node_id.clone(),
             );
+            alert_engine.set_history(alert_history.clone());
             let alert_metrics = metrics_latest.clone();
             let alert_shutdown_rx = self.shutdown_rx();
             tokio::spawn(async move {
@@ -458,6 +463,7 @@ impl Node {
             network_counters,
             metrics_latest,
             metrics_history,
+            alert_history,
         ));
         let api_config = self.config.clone();
         let api_shutdown_rx = self.shutdown_rx();

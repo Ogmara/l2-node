@@ -270,8 +270,11 @@ impl MetricsCollector {
             ipfs_pinned_count: self.ipfs_stats.pinned_count,
             ipfs_repo_size_bytes: self.ipfs_stats.repo_size_bytes,
             klever_last_block,
-            klever_sync_lag_blocks: 0, // TODO: compare with latest known block
-            last_anchor_height: 0, // populated when anchor TX data is available
+            klever_sync_lag_blocks: {
+                let chain_tip = self.storage.get_stat(state_keys::CHAIN_TIP).unwrap_or(0);
+                chain_tip.saturating_sub(klever_last_block)
+            },
+            last_anchor_height: 0,
             last_anchor_age_seconds: anchor_age,
             total_anchors,
         };
@@ -298,9 +301,11 @@ impl MetricsCollector {
         *klever_last_block = self.storage.get_chain_cursor().unwrap_or(0);
         *last_anchor_ts = self.storage.get_stat(state_keys::LAST_ANCHOR_TS).unwrap_or(0);
 
-        // Get anchor count from ANCHOR_BY_NODE CF (accurate count for this node)
+        // Get anchor status from ANCHOR_BY_NODE CF (accurate for this node)
         match self.storage.get_self_anchor_status(&self.node_id) {
-            Ok(status) => *total_anchors = status.total_anchors,
+            Ok(status) => {
+                *total_anchors = status.total_anchors;
+            }
             Err(_) => *total_anchors = 0,
         }
 

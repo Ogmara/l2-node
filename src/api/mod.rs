@@ -247,7 +247,8 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
                 .route("/admin/metrics/snapshot", get(dashboard::metrics_snapshot))
                 .route("/admin/metrics/history", get(dashboard::metrics_history))
                 .route("/admin/metrics/peers", get(dashboard::metrics_peers))
-                .route("/admin/metrics/storage", get(dashboard::metrics_storage));
+                .route("/admin/metrics/storage", get(dashboard::metrics_storage))
+                .route("/admin/alerts/history", get(dashboard::alerts_history));
         }
 
         let protected = protected

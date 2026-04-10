@@ -290,6 +290,32 @@ pub async fn metrics_storage(
     }))
 }
 
+/// GET /admin/alerts/history — alert history from the AlertEngine.
+pub async fn alerts_history(
+    Extension(state): Extension<Arc<AppState>>,
+) -> impl IntoResponse {
+    let alerts = if let Ok(history) = state.alert_history.read() {
+        history
+            .iter()
+            .rev()
+            .take(100)
+            .map(|a| {
+                serde_json::json!({
+                    "severity": a.severity,
+                    "condition": a.condition,
+                    "message": a.message,
+                    "triggered_at": a.triggered_at,
+                    "resolved": a.resolved,
+                })
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+
+    Json(serde_json::json!({ "alerts": alerts }))
+}
+
 // ── Embedded HTML ───────────────────────────────────────────────────
 
 /// The embedded dashboard HTML — self-contained multi-section SPA.
