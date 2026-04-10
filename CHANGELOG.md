@@ -5,6 +5,21 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.25.1] - 2026-04-10
+
+### Security
+- **Challenge nonce failures now return errors** — previously, if the mutex was
+  poisoned or the 100-nonce limit was reached, the server returned a nonce that
+  could never be consumed (silent failure). Now returns HTTP 503 with an error
+  message. Prevents DoS via challenge pool exhaustion.
+- **Cookie parse errors handled** — `cookie.parse().unwrap()` replaced with
+  graceful error handling to prevent panics on malformed session tokens.
+- **Atomic WebSocket connection limit** — the check-and-increment was a non-atomic
+  load+compare that could exceed the 10-connection limit under concurrency. Now
+  uses `fetch_update` for a single atomic operation.
+- **Mutex poison logged on challenge consume** — poisoned mutex during nonce
+  consumption now logs a warning instead of silently returning None.
+
 ## [0.25.0] - 2026-04-10
 
 ### Added

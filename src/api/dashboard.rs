@@ -39,8 +39,13 @@ pub async fn dashboard_ws(
     ws: WebSocketUpgrade,
     Extension(state): Extension<Arc<AppState>>,
 ) -> impl IntoResponse {
-    let current = WS_CONNECTIONS.load(std::sync::atomic::Ordering::Relaxed);
-    if current >= MAX_DASHBOARD_WS {
+    // Atomically increment if under limit (prevents race between check and increment)
+    let acquired = WS_CONNECTIONS.fetch_update(
+        std::sync::atomic::Ordering::Relaxed,
+        std::sync::atomic::Ordering::Relaxed,
+        |current| if current < MAX_DASHBOARD_WS { Some(current + 1) } else { None },
+    );
+    if acquired.is_err() {
         return (StatusCode::SERVICE_UNAVAILABLE, "too many dashboard connections")
             .into_response();
     }
@@ -51,7 +56,7 @@ pub async fn dashboard_ws(
 async fn handle_dashboard_ws(socket: WebSocket, state: Arc<AppState>) {
     use futures::{SinkExt, StreamExt};
 
-    WS_CONNECTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Connection already counted by the atomic fetch_update in dashboard_ws()
     debug!("Dashboard WebSocket connected");
 
     let (mut sender, mut receiver) = socket.split();
