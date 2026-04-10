@@ -566,10 +566,16 @@ impl NetworkService {
                 let mut accepted = 0u32;
                 let mut rejected = 0u32;
                 for msg_bytes in &response.messages {
+                    self.counters.add_bytes_in(msg_bytes.len() as u64);
+                    self.counters.inc_messages_received();
                     match self.router.process_synced_message(msg_bytes) {
-                        RouteResult::Accepted { .. } => accepted += 1,
+                        RouteResult::Accepted { .. } => {
+                            self.counters.inc_messages_stored();
+                            accepted += 1;
+                        }
                         RouteResult::Duplicate => {}
                         RouteResult::Rejected(reason) => {
+                            self.counters.inc_failed_validations();
                             warn!(reason = %reason, "Rejected synced message");
                             rejected += 1;
                         }
