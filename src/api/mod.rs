@@ -7,6 +7,7 @@
 //! - Admin endpoints (localhost-only)
 
 pub mod admin;
+pub mod admin_auth;
 pub mod auth;
 pub mod dashboard;
 pub mod routes;
@@ -207,8 +208,22 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
         .route("/api/v1/ws", get(websocket::ws_authenticated))
         .route("/api/v1/ws/public", get(websocket::ws_public));
 
-    // Admin routes (localhost-only via middleware)
+    // Admin auth state (shared between middleware and auth endpoints)
+    let admin_auth_state = std::sync::Arc::new(admin_auth::AdminAuthState::new(
+        config.api.admin.admin_wallets.clone(),
+        config.api.admin.session_ttl_hours,
+        app_state.node_id.clone(),
+    ));
+
+    // Admin routes (localhost + wallet auth via middleware)
     let admin_routes = if config.api.admin.enabled {
+        // Auth endpoints are outside the auth middleware (they handle their own auth)
+        let auth_routes = Router::new()
+            .route("/admin/auth/challenge", get(admin_auth::auth_challenge))
+            .route("/admin/auth/login", post(admin_auth::auth_login))
+            .route("/admin/auth/logout", post(admin_auth::auth_logout))
+            .layer(axum::Extension(admin_auth_state.clone()));
+
         let mut routes = Router::new()
             .route("/admin/peers", get(admin::list_peers))
             .route("/admin/storage/stats", get(admin::storage_stats))
@@ -228,7 +243,13 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
                 .route("/admin/metrics/storage", get(dashboard::metrics_storage));
         }
 
-        routes.layer(middleware::from_fn(admin::localhost_only))
+        // Protected admin routes use the new auth middleware (localhost bypass + wallet session)
+        let protected = routes
+            .layer(axum::Extension(admin_auth_state))
+            .layer(middleware::from_fn(admin_auth::admin_auth_middleware));
+
+        // Merge unprotected auth routes with protected admin routes
+        auth_routes.merge(protected)
     } else {
         Router::new()
     };

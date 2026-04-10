@@ -5,6 +5,34 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.24.0] - 2026-04-10
+
+### Added
+- **Wallet-based dashboard authentication** — challenge-response login using Klever
+  wallet signatures (spec 10-dashboard.md §5). Flow: GET `/admin/auth/challenge` →
+  sign with Klever Extension → POST `/admin/auth/login` → HMAC-signed session token.
+  Enables remote dashboard access for wallets listed in `admin_wallets` config.
+- **Login page in dashboard UI** — "Connect Wallet" button integrates with Klever
+  Extension (`window.klever.signMessage`). Shows wallet address on success, logout
+  button clears session. Localhost access remains auth-free (bypass preserved).
+- **Session tokens** — HMAC-SHA256 signed, HttpOnly cookie + Bearer header support,
+  configurable TTL (default 24h), invalidated on node restart (new HMAC secret).
+- **Admin auth middleware** — replaces `localhost_only`. Passes localhost requests
+  without auth, validates session token for remote requests, rejects if no
+  `admin_wallets` configured.
+- **`/admin/auth/challenge`** — generates 32-byte random nonce with 5-minute TTL.
+- **`/admin/auth/login`** — verifies nonce, wallet address against admin list,
+  Klever message signature, issues session token + cookie.
+- **`/admin/auth/logout`** — clears session cookie.
+
+### Security
+- Nonces are single-use and TTL-bounded (5 min, max 100 pending).
+- Session tokens use constant-time comparison to prevent timing attacks.
+- Challenge nonces pruned on every new challenge request.
+- WebSocket connection limit (max 10) prevents local DoS.
+- Secret config fields (`bot_token`, `webhook_url`, `auth_token`) marked
+  `skip_serializing` with redacted `Debug` impl — never leak via logs or serialization.
+
 ## [0.23.0] - 2026-04-09
 
 ### Added

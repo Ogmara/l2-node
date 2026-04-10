@@ -1,6 +1,6 @@
 [package]
 name = "ogmara-node"
-version = "0.23.0"
+version = "0.24.0"
 edition = "2021"
 authors = ["Ogmara Contributors"]
 license = "MIT"
@@ -29,6 +29,7 @@ x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 aes-gcm = "0.10"             # AES-256-GCM for DM encryption
 hkdf = "0.12"
 sha2 = "0.10"                # SHA-256 for HKDF / Merkle tree
+hmac = "0.12"                # HMAC-SHA256 for session tokens
 
 # Storage
 rocksdb = "0.24"
