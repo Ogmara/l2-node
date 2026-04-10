@@ -5,6 +5,14 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.24.9] - 2026-04-10
+
+### Fixed
+- **Message counters were always zero** — counters were only wired into the GossipSub
+  handler. Messages from REST API (`POST /api/v1/messages`) and sync protocol were
+  not counted. Added counter increments to `post_message` route handler (received,
+  stored, failed) and sync response handler (received, stored, failed per message).
+
 ## [0.24.8] - 2026-04-10
 
 ### Fixed

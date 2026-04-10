@@ -989,12 +989,18 @@ pub async fn post_message(
 ) -> impl IntoResponse {
     use crate::messages::router::RouteResult;
 
+    // Track incoming bytes for dashboard metrics
+    state.counters.add_bytes_in(body.len() as u64);
+    state.counters.inc_messages_received();
+
     match state.router.process_message(&body) {
         RouteResult::Accepted {
             msg_id,
             raw_bytes,
             msg_type,
         } => {
+            state.counters.inc_messages_stored();
+
             // Publish to GossipSub so other nodes receive the message
             if let Ok(envelope) =
                 rmp_serde::from_slice::<crate::messages::envelope::Envelope>(&raw_bytes)
@@ -1021,6 +1027,7 @@ pub async fn post_message(
             (StatusCode::CONFLICT, "message already exists").into_response()
         }
         RouteResult::Rejected(reason) => {
+            state.counters.inc_failed_validations();
             (StatusCode::BAD_REQUEST, reason).into_response()
         }
     }
