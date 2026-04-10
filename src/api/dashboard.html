@@ -227,23 +227,40 @@ function sparkline(containerId, points, color) {
 function lineChart(containerId, datasets, opts) {
   const el = document.getElementById(containerId);
   if (!el) return;
-  const w = 400, h = 150, pad = { l: 45, r: 10, t: 10, b: 25 };
+  // Use the container's actual dimensions for proper aspect ratio
+  const rect = el.getBoundingClientRect();
+  const w = Math.max(rect.width, 300), h = Math.max(rect.height, 120);
+  const pad = { l: 55, r: 15, t: 12, b: 28 };
   const cw = w - pad.l - pad.r, ch = h - pad.t - pad.b;
 
   let allVals = [];
   for (const ds of datasets) allVals.push(...ds.data);
-  if (allVals.length < 2) { el.innerHTML = '<svg viewBox="0 0 400 150"><text x="200" y="80" text-anchor="middle" fill="var(--fg2)" font-size="12">No data yet</text></svg>'; return; }
+  if (allVals.length < 2) { el.innerHTML = `<svg width="${w}" height="${h}"><text x="${w/2}" y="${h/2}" text-anchor="middle" fill="var(--fg2)" font-size="12">No data yet</text></svg>`; return; }
 
   let min = Math.min(...allVals), max = Math.max(...allVals);
-  if (max === min) max = min + 1;
+  // When all values are the same (or zero), show a sensible range
+  if (max === min) { min = Math.max(0, min - 1); max = max + 1; }
+  // Always start Y-axis from 0 if all values are >= 0
+  if (min >= 0 && min < max * 0.3) min = 0;
 
-  let svg = `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">`;
-  // Y-axis labels
+  // Smart Y-axis label formatting
+  const fmtYLabel = opts?.fmtY || ((v) => {
+    if (max - min < 0.1) return v.toFixed(3);
+    if (max - min < 1) return v.toFixed(2);
+    if (max - min < 10) return v.toFixed(1);
+    if (max >= 1e9) return (v/1e9).toFixed(1)+'G';
+    if (max >= 1e6) return (v/1e6).toFixed(1)+'M';
+    if (max >= 1e3) return (v/1e3).toFixed(1)+'K';
+    return v.toFixed(0);
+  });
+
+  let svg = `<svg width="${w}" height="${h}">`;
+  // Y-axis grid lines + labels
   for (let i = 0; i <= 4; i++) {
     const y = pad.t + (ch / 4) * i;
     const val = max - (i / 4) * (max - min);
     svg += `<line x1="${pad.l}" y1="${y}" x2="${w-pad.r}" y2="${y}" stroke="var(--border)" stroke-width="0.5"/>`;
-    svg += `<text x="${pad.l-4}" y="${y+3}" text-anchor="end" fill="var(--fg2)" font-size="9">${opts?.fmtY ? opts.fmtY(val) : val.toFixed(0)}</text>`;
+    svg += `<text x="${pad.l-6}" y="${y+4}" text-anchor="end" fill="var(--fg2)" font-size="10">${fmtYLabel(val)}</text>`;
   }
   // Data lines
   for (const ds of datasets) {
@@ -258,9 +275,9 @@ function lineChart(containerId, datasets, opts) {
   // Legend
   let lx = pad.l;
   for (const ds of datasets) {
-    svg += `<rect x="${lx}" y="${h-12}" width="10" height="3" fill="${ds.color}"/>`;
-    svg += `<text x="${lx+14}" y="${h-8}" fill="var(--fg2)" font-size="9">${ds.label}</text>`;
-    lx += ds.label.length * 6 + 24;
+    svg += `<rect x="${lx}" y="${h-14}" width="12" height="3" rx="1" fill="${ds.color}"/>`;
+    svg += `<text x="${lx+16}" y="${h-9}" fill="var(--fg2)" font-size="10">${ds.label}</text>`;
+    lx += ds.label.length * 6.5 + 28;
   }
   svg += '</svg>';
   el.innerHTML = svg;
