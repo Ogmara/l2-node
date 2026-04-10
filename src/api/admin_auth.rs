@@ -85,8 +85,8 @@ impl AdminAuthState {
         !self.admin_wallets.is_empty()
     }
 
-    /// Generate a challenge nonce.
-    fn create_challenge(&self) -> (String, u64) {
+    /// Generate a challenge nonce. Returns error if storage fails or limit is reached.
+    fn create_challenge(&self) -> Result<(String, u64), &'static str> {
         let mut nonce_bytes = [0u8; 32];
         use rand::RngCore;
         rand::thread_rng().fill_bytes(&mut nonce_bytes);
@@ -94,32 +94,42 @@ impl AdminAuthState {
 
         let timestamp_ms = now_ms();
 
-        // Store the challenge
-        if let Ok(mut challenges) = self.challenges.lock() {
-            // Prune expired challenges
-            challenges.retain(|_, c| c.created_at.elapsed() < NONCE_TTL);
+        let mut challenges = self.challenges.lock().map_err(|e| {
+            warn!("Challenge mutex poisoned: {}", e);
+            "internal server error"
+        })?;
 
-            // Enforce limit
-            if challenges.len() < MAX_PENDING_CHALLENGES {
-                challenges.insert(
-                    nonce.clone(),
-                    PendingChallenge {
-                        nonce: nonce.clone(),
-                        timestamp_ms,
-                        node_id: self.node_id.clone(),
-                        created_at: Instant::now(),
-                    },
-                );
-            }
+        // Prune expired challenges
+        challenges.retain(|_, c| c.created_at.elapsed() < NONCE_TTL);
+
+        // Enforce limit — return error so the client knows why
+        if challenges.len() >= MAX_PENDING_CHALLENGES {
+            return Err("too many pending challenges, try again later");
         }
 
-        (nonce, timestamp_ms)
+        challenges.insert(
+            nonce.clone(),
+            PendingChallenge {
+                nonce: nonce.clone(),
+                timestamp_ms,
+                node_id: self.node_id.clone(),
+                created_at: Instant::now(),
+            },
+        );
+
+        Ok((nonce, timestamp_ms))
     }
 
     /// Validate and consume a challenge nonce. Returns the challenge message that was signed.
     fn consume_challenge(&self, nonce: &str) -> Option<String> {
         let challenge = {
-            let mut challenges = self.challenges.lock().ok()?;
+            let mut challenges = match self.challenges.lock() {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("Challenge mutex poisoned on consume: {}", e);
+                    return None;
+                }
+            };
             challenges.remove(nonce)?
         };
 
@@ -207,13 +217,16 @@ impl AdminAuthState {
 pub async fn auth_challenge(
     Extension(auth_state): Extension<Arc<AdminAuthState>>,
 ) -> impl IntoResponse {
-    let (nonce, timestamp) = auth_state.create_challenge();
-
-    Json(serde_json::json!({
-        "nonce": nonce,
-        "timestamp": timestamp,
-        "node_id": auth_state.node_id,
-    }))
+    match auth_state.create_challenge() {
+        Ok((nonce, timestamp)) => Json(serde_json::json!({
+            "nonce": nonce,
+            "timestamp": timestamp,
+            "node_id": auth_state.node_id,
+        })).into_response(),
+        Err(msg) => (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
+            "error": msg
+        }))).into_response(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -310,10 +323,9 @@ pub async fn auth_login(
         "expires_in_hours": auth_state.session_ttl_hours,
     })).into_response();
 
-    response.headers_mut().insert(
-        axum::http::header::SET_COOKIE,
-        cookie.parse().unwrap(),
-    );
+    if let Ok(cookie_val) = cookie.parse() {
+        response.headers_mut().insert(axum::http::header::SET_COOKIE, cookie_val);
+    }
 
     response
 }
@@ -323,10 +335,9 @@ pub async fn auth_logout() -> impl IntoResponse {
     let cookie = "ogmara_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0; Secure";
 
     let mut response = Json(serde_json::json!({ "ok": true })).into_response();
-    response.headers_mut().insert(
-        axum::http::header::SET_COOKIE,
-        cookie.parse().unwrap(),
-    );
+    if let Ok(cookie_val) = cookie.parse() {
+        response.headers_mut().insert(axum::http::header::SET_COOKIE, cookie_val);
+    }
 
     response
 }
