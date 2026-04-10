@@ -126,7 +126,7 @@ td { padding: 8px; border-bottom: 1px solid var(--border); }
     <div class="grid">
       <div class="card"><h3>Uptime</h3><div class="metric green" id="uptime">--</div></div>
       <div class="card"><h3>Peers</h3><div class="metric" id="peers">--</div><div class="spark" id="spark-peers"></div></div>
-      <div class="card"><h3>Messages</h3><div class="metric" id="messages">--</div><div class="label" id="msg-rate">-- msg/s</div></div>
+      <div class="card"><h3>Messages</h3><div class="metric" id="messages">--</div><div class="label" id="msg-detail">--</div></div>
       <div class="card"><h3>Users</h3><div class="metric" id="users">--</div></div>
       <div class="card"><h3>Channels</h3><div class="metric" id="channels">--</div></div>
       <div class="card"><h3>CPU</h3><div class="metric" id="cpu">--%</div><div class="spark" id="spark-cpu"></div></div>
@@ -362,8 +362,8 @@ function updateDashboard(d) {
   // Overview cards
   setText('uptime', fmtTime(n.uptime_seconds||0));
   setText('peers', net.peers_connected||0);
-  setText('messages', fmt(st.messages_total||0));
-  setText('msg-rate', (net.messages_received_sec||0).toFixed(1) + ' msg/s');
+  setText('messages', fmt(st.channel_messages_total||0));
+  setText('msg-detail', fmt(st.news_messages_total||0) + ' news, ' + fmt(st.messages_total||0) + ' total envelopes');
   setText('users', fmt(st.users_total||0));
   setText('channels', fmt(st.channels_total||0));
 

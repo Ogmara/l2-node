@@ -5,6 +5,19 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.25.2] - 2026-04-10
+
+### Fixed
+- **Messages card showed total envelopes, not chat messages** — the "Messages"
+  card on the Overview tab was showing `TOTAL_MESSAGES` which includes ALL
+  envelope types (chat, news, profiles, channel events, delegations, etc.).
+  Now shows `channel_messages_total` (actual chat messages) as the primary
+  number, with news count and total envelopes as a label below.
+
+### Added
+- **Message type breakdown** in WebSocket payload — `channel_messages_total`
+  and `news_messages_total` fields added alongside `messages_total`.
+
 ## [0.25.1] - 2026-04-10
 
 ### Security
