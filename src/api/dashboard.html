@@ -407,6 +407,9 @@ function updateDashboard(d) {
   if (document.getElementById('tab-messages').classList.contains('active')) {
     lineChart('chart-msgs', [{data: sparkData.msgs, color: 'var(--accent2)', label: 'Received/s'}]);
   }
+  // Collect disk sparkline data (always, not just when tab visible)
+  pushSpark('disk', s.disk_used_bytes||0);
+
   if (document.getElementById('tab-storage').classList.contains('active')) {
     setText('st-db-size', fmtBytes(st.db_size_bytes||0));
     setText('st-db-label', fmt(st.messages_total||0)+' msgs, '+fmt(st.users_total||0)+' users, '+fmt(st.channels_total||0)+' channels');
@@ -414,6 +417,7 @@ function updateDashboard(d) {
     stIpfs.textContent = ipfs.connected ? 'Connected' : 'Offline';
     stIpfs.className = 'metric '+(ipfs.connected?'green':'red');
     setText('st-ipfs-detail', fmt(ipfs.pinned_count||0)+' objects, '+fmtBytes(ipfs.repo_size_bytes||0));
+    lineChart('chart-disk', [{data: sparkData.disk, color: 'var(--accent2)', label: 'Disk Used'}], {fmtY: fmtBytes});
   }
 }
 
