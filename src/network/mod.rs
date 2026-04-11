@@ -35,6 +35,22 @@ use crate::storage::rocks::Storage;
 use self::behaviour::{OgmaraBehaviour, OgmaraBehaviourEvent};
 use self::gossip::TopicManager;
 
+/// Peers queued for reconnection after disconnect, with exponential backoff.
+struct ReconnectEntry {
+    peer_id: PeerId,
+    addr: Multiaddr,
+    next_attempt: tokio::time::Instant,
+    backoff_secs: u64,
+    attempts: u32,
+}
+
+/// Maximum reconnection attempts before giving up on a peer.
+const MAX_RECONNECT_ATTEMPTS: u32 = 10;
+/// Base backoff for reconnection attempts (seconds).
+const RECONNECT_BASE_SECS: u64 = 5;
+/// Maximum backoff cap (seconds).
+const RECONNECT_MAX_SECS: u64 = 300;
+
 /// The running network layer.
 pub struct NetworkService {
     /// The libp2p swarm managing all protocols.
@@ -61,6 +77,13 @@ pub struct NetworkService {
     peer_node_ids: HashMap<PeerId, String>,
     /// Shared network counters for metrics dashboard (spec 10-dashboard.md §6.2).
     counters: Arc<NetworkCounters>,
+    /// Bootstrap node addresses (for periodic redial when peers are low).
+    bootstrap_addrs: Vec<Multiaddr>,
+    /// Peers queued for reconnection after disconnect (with backoff).
+    reconnect_queue: Vec<ReconnectEntry>,
+    /// Known peer addresses from Identify (PeerId → best known address).
+    /// Used to reconnect after disconnect.
+    known_peer_addrs: HashMap<PeerId, Multiaddr>,
 }
 
 impl NetworkService {
@@ -109,6 +132,7 @@ impl NetworkService {
         );
 
         // Connect to bootstrap nodes and add them to Kademlia
+        let mut bootstrap_addrs = Vec::new();
         for addr_str in &config.network.bootstrap_nodes {
             match addr_str.parse::<Multiaddr>() {
                 Ok(addr) => {
@@ -139,6 +163,7 @@ impl NetworkService {
                     } else {
                         info!(addr = %addr, "Dialing bootstrap node");
                     }
+                    bootstrap_addrs.push(addr);
                 }
                 Err(e) => {
                     warn!(addr = %addr_str, error = %e, "Invalid bootstrap node address");
@@ -168,6 +193,9 @@ impl NetworkService {
             connected_peers,
             peer_node_ids: HashMap::new(),
             counters,
+            bootstrap_addrs,
+            reconnect_queue: Vec::new(),
+            known_peer_addrs: HashMap::new(),
         })
     }
 
@@ -225,8 +253,7 @@ impl NetworkService {
             "Network event loop started"
         );
 
-        // Periodic Kademlia bootstrap retry (every 30s) — ensures DHT
-        // stays populated even after transient disconnections.
+        // Periodic Kademlia bootstrap + reconnection (every 30s).
         let mut bootstrap_interval = tokio::time::interval(Duration::from_secs(30));
         bootstrap_interval.tick().await; // skip the immediate first tick
 
@@ -234,6 +261,10 @@ impl NetworkService {
         // we exist so they can list us in /api/v1/network/nodes.
         let mut announce_interval = tokio::time::interval(Duration::from_secs(300));
         announce_interval.tick().await; // skip immediate tick
+
+        // Reconnection check interval (every 10s) — processes the reconnect queue.
+        let mut reconnect_interval = tokio::time::interval(Duration::from_secs(10));
+        reconnect_interval.tick().await;
 
         loop {
             tokio::select! {
@@ -260,15 +291,10 @@ impl NetworkService {
                     self.publish_node_announcement();
                 }
                 _ = bootstrap_interval.tick() => {
-                    let peer_count = self.swarm.connected_peers().count();
-                    if peer_count == 0 {
-                        debug!("No connected peers, skipping Kademlia bootstrap");
-                    } else {
-                        match self.swarm.behaviour_mut().kademlia.bootstrap() {
-                            Ok(_) => debug!(peer_count, "Kademlia bootstrap triggered"),
-                            Err(e) => debug!(error = %e, "Kademlia bootstrap failed"),
-                        }
-                    }
+                    self.periodic_bootstrap();
+                }
+                _ = reconnect_interval.tick() => {
+                    self.process_reconnect_queue();
                 }
                 _ = shutdown_rx.recv() => {
                     info!("Network shutting down");
@@ -306,6 +332,18 @@ impl NetworkService {
                 libp2p::gossipsub::Event::Subscribed { peer_id, topic },
             )) => {
                 debug!(peer = %peer_id, topic = %topic, "Peer subscribed to topic");
+            }
+
+            SwarmEvent::Behaviour(OgmaraBehaviourEvent::Gossipsub(
+                libp2p::gossipsub::Event::Unsubscribed { peer_id, topic },
+            )) => {
+                debug!(peer = %peer_id, topic = %topic, "Peer unsubscribed from topic");
+            }
+
+            SwarmEvent::Behaviour(OgmaraBehaviourEvent::Gossipsub(
+                libp2p::gossipsub::Event::GossipsubNotSupported { peer_id },
+            )) => {
+                info!(peer = %peer_id, "Peer does not support GossipSub");
             }
 
             SwarmEvent::Behaviour(OgmaraBehaviourEvent::Mdns(
@@ -358,11 +396,24 @@ impl NetworkService {
                     listen_addrs = info.listen_addrs.len(),
                     "Identified peer"
                 );
-                // Add identified peer's addresses to Kademlia (capped to prevent
-                // routing table poisoning from a malicious peer advertising many addrs)
+                // Add identified peer's addresses to Kademlia and store the
+                // first address for reconnection after disconnect.
+                let mut first_addr = None;
                 for addr in info.listen_addrs.into_iter().take(16) {
-                    self.swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
+                    if first_addr.is_none() {
+                        first_addr = Some(addr.clone());
+                    }
+                    // Only add Ogmara peers to Kademlia (prevent DHT pollution)
+                    if is_ogmara {
+                        self.swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
+                    }
                 }
+                // Store address for reconnection
+                if let Some(addr) = first_addr {
+                    self.known_peer_addrs.insert(peer_id, addr);
+                }
+                // Remove from reconnect queue if it was pending (successfully connected)
+                self.reconnect_queue.retain(|e| e.peer_id != peer_id);
 
                 if is_ogmara {
                     // Sync channel messages from this peer
@@ -461,6 +512,8 @@ impl NetworkService {
                             Err(e) => warn!("connected_peers lock poisoned: {e}"),
                         }
                     }
+                    // Queue for reconnection with exponential backoff
+                    self.queue_reconnect(peer_id);
                 }
             }
 
@@ -496,6 +549,138 @@ impl NetworkService {
 
             _ => {}
         }
+    }
+
+    /// Periodic bootstrap: if peers are low, redial bootstrap nodes and run Kademlia bootstrap.
+    ///
+    /// Fixes the deadlock where Kademlia bootstrap was skipped when peer_count==0,
+    /// preventing peer discovery from ever starting.
+    fn periodic_bootstrap(&mut self) {
+        let peer_count = self.swarm.connected_peers().count();
+
+        if peer_count == 0 {
+            // No peers at all — actively redial bootstrap nodes
+            info!("No connected peers — redialing bootstrap nodes");
+            for addr in self.bootstrap_addrs.clone() {
+                // Check if we're already connected to this peer
+                let peer_id = addr.iter().find_map(|proto| {
+                    if let libp2p::multiaddr::Protocol::P2p(id) = proto {
+                        Some(id)
+                    } else {
+                        None
+                    }
+                });
+                let already_connected = peer_id
+                    .map(|pid| self.swarm.is_connected(&pid))
+                    .unwrap_or(false);
+
+                if !already_connected {
+                    if let Err(e) = self.swarm.dial(addr.clone()) {
+                        debug!(addr = %addr, error = %e, "Bootstrap redial failed");
+                    } else {
+                        debug!(addr = %addr, "Redialing bootstrap node");
+                    }
+                }
+            }
+        }
+
+        // Always attempt Kademlia bootstrap regardless of peer count.
+        // With 0 peers, Kademlia will use its routing table (which may
+        // have bootstrap node entries even without active connections).
+        match self.swarm.behaviour_mut().kademlia.bootstrap() {
+            Ok(_) => debug!(peer_count, "Kademlia bootstrap triggered"),
+            Err(e) => debug!(error = %e, "Kademlia bootstrap skipped (no known peers in routing table)"),
+        }
+    }
+
+    /// Process the reconnect queue: attempt to redial peers whose backoff has expired.
+    fn process_reconnect_queue(&mut self) {
+        if self.reconnect_queue.is_empty() {
+            return;
+        }
+
+        let now = tokio::time::Instant::now();
+        let mut i = 0;
+        while i < self.reconnect_queue.len() {
+            let entry = &self.reconnect_queue[i];
+            if now < entry.next_attempt {
+                i += 1;
+                continue;
+            }
+
+            // Already reconnected? Remove from queue.
+            if self.swarm.is_connected(&entry.peer_id) {
+                self.reconnect_queue.swap_remove(i);
+                continue;
+            }
+
+            // Max attempts exceeded? Give up.
+            if entry.attempts >= MAX_RECONNECT_ATTEMPTS {
+                debug!(
+                    peer = %entry.peer_id,
+                    attempts = entry.attempts,
+                    "Giving up on reconnection"
+                );
+                self.reconnect_queue.swap_remove(i);
+                continue;
+            }
+
+            // Attempt redial
+            let addr = entry.addr.clone();
+            let peer = entry.peer_id;
+            let attempts = entry.attempts + 1;
+            let new_backoff = (entry.backoff_secs * 2).min(RECONNECT_MAX_SECS);
+
+            match self.swarm.dial(addr.clone()) {
+                Ok(_) => {
+                    debug!(
+                        peer = %peer,
+                        attempt = attempts,
+                        next_backoff = new_backoff,
+                        "Reconnection attempt"
+                    );
+                }
+                Err(e) => {
+                    debug!(
+                        peer = %peer,
+                        error = %e,
+                        "Reconnection dial failed"
+                    );
+                }
+            }
+
+            // Update backoff for next attempt
+            self.reconnect_queue[i].attempts = attempts;
+            self.reconnect_queue[i].backoff_secs = new_backoff;
+            self.reconnect_queue[i].next_attempt =
+                now + Duration::from_secs(new_backoff);
+            i += 1;
+        }
+    }
+
+    /// Queue a disconnected peer for reconnection with exponential backoff.
+    fn queue_reconnect(&mut self, peer_id: PeerId) {
+        // Don't queue if already in the queue
+        if self.reconnect_queue.iter().any(|e| e.peer_id == peer_id) {
+            return;
+        }
+
+        // Need a known address to reconnect
+        let addr = match self.known_peer_addrs.get(&peer_id) {
+            Some(a) => a.clone(),
+            None => return, // no address known, can't reconnect
+        };
+
+        self.reconnect_queue.push(ReconnectEntry {
+            peer_id,
+            addr,
+            next_attempt: tokio::time::Instant::now()
+                + Duration::from_secs(RECONNECT_BASE_SECS),
+            backoff_secs: RECONNECT_BASE_SECS,
+            attempts: 0,
+        });
+
+        debug!(peer = %peer_id, "Queued peer for reconnection");
     }
 
     /// Handle a request-response event — sync protocol.
