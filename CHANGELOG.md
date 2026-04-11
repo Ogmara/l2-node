@@ -5,6 +5,14 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.27.4] - 2026-04-11
+
+### Fixed
+- **Empty bootstrap_nodes auto-populated on startup** — existing configs with
+  `bootstrap_nodes = []` (from pre-v0.27.2) now get the official bootstrap nodes
+  injected at load time via a config migration. Logged as "Config migration: adding
+  default bootstrap nodes". No manual config editing required for upgrades.
+
 ## [0.27.3] - 2026-04-11
 
 ### Fixed

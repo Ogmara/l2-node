@@ -657,10 +657,25 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let content =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        let config: Config =
+        let mut config: Config =
             toml::from_str(&content).with_context(|| format!("parsing {}", path.display()))?;
         config.validate()?;
+        config.apply_migrations();
         Ok(config)
+    }
+
+    /// Apply runtime migrations for configs created by older versions.
+    ///
+    /// This ensures existing node operators get critical defaults (like bootstrap
+    /// nodes) without manually editing their config files after upgrades.
+    fn apply_migrations(&mut self) {
+        // Migration: populate empty bootstrap_nodes with official defaults.
+        // Configs created before v0.27.2 have `bootstrap_nodes = []` which
+        // prevents the node from joining the network.
+        if self.network.bootstrap_nodes.is_empty() {
+            tracing::info!("Config migration: adding default bootstrap nodes (empty bootstrap_nodes list)");
+            self.network.bootstrap_nodes = default_bootstrap_nodes();
+        }
     }
 
     /// Validate the configuration for consistency.
