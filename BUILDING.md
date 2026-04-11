@@ -75,18 +75,27 @@ contract_address = "klv1qqqqqqqqqqqqqpgq8c9yag9vuc2pe64fwvqsq9e8ul8w5zuglf5qfgh7
 ```
 
 After changing the network, restart the node and clear old data if switching
-between testnet and mainnet (different chain state):
+between testnet and mainnet (different chain state).
+
+**WARNING: Back up your node key first! Deleting the data directory creates a
+new wallet address — any KLV funds on the old address will be inaccessible.**
 
 ```bash
-# Systemd
+# 1. Back up the key
+ogmara-node export-key -o my-node-key.bak
+
+# 2. Clear old data
+# Systemd:
 sudo systemctl stop ogmara-node
 rm -rf /var/lib/ogmara/node/data/*
 sudo systemctl start ogmara-node
-
-# Docker
+# Docker:
 docker stop ogmara-node && docker rm ogmara-node
 docker volume rm ogmara-data
 # Re-run the docker run command
+
+# 3. Restore the key (keeps the same wallet address)
+ogmara-node import-key -i my-node-key.bak
 ```
 
 ### Other settings

@@ -98,10 +98,14 @@ impl Node {
 
         let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
 
+        let wallet_address = crate::crypto::pubkey_to_address(&signing_key.verifying_key())
+            .unwrap_or_else(|_| "unknown".to_string());
         info!(
             node_id = %node_id,
+            address = %wallet_address,
             data_dir = %data_dir.display(),
-            "Node initialized"
+            "Node initialized — this wallet address is your node's identity. \
+             Back up your key with: ogmara-node export-key"
         );
 
         Ok(Self {
