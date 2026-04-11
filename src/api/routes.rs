@@ -33,6 +33,7 @@ fn pow_required_response(state: &AppState, address: &str) -> axum::response::Res
                     "error": "pow_required",
                     "message": "Proof-of-work required for new wallets",
                     "challenge": challenge,
+                    "address": address,
                 })),
             )
                 .into_response(),
