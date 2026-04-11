@@ -5,6 +5,15 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.28.2] - 2026-04-11
+
+### Fixed
+- **Anchor status always "none"** — `compute_anchor_status()` and `get_self_anchor_status()`
+  used milliseconds for `now` but Klever TX timestamps stored in ANCHOR_BY_NODE keys are
+  in unix seconds. The seconds-vs-milliseconds mismatch caused every timestamp comparison
+  to fail, making all nodes show `level: "none"` regardless of actual anchoring activity.
+  Both functions now use `as_secs()` consistently.
+
 ## [0.28.1] - 2026-04-11
 
 ### Fixed

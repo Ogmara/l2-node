@@ -1586,18 +1586,19 @@ impl Storage {
     /// - "verified": anchored at least once in the last 24h
     /// - "none": no recent anchors
     pub fn compute_anchor_status(&self, node_id: &str) -> Result<AnchorStatus> {
-        let now_ms = SystemTime::now()
+        // Klever TX timestamps are in unix seconds, so use seconds throughout
+        let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_millis() as u64;
+            .as_secs();
 
         let mut prefix = Vec::with_capacity(node_id.len() + 1);
         prefix.extend_from_slice(node_id.as_bytes());
         prefix.push(0xFF);
 
         // Fetch recent anchors for this node (200 covers 7+ days of hourly anchoring)
-        let seven_days_ms = 7 * 24 * 60 * 60 * 1000u64;
-        let cutoff = now_ms.saturating_sub(seven_days_ms);
+        let seven_days = 7 * 24 * 60 * 60u64;
+        let cutoff = now.saturating_sub(seven_days);
 
         let entries = self.prefix_iter_cf(cf::ANCHOR_BY_NODE, &prefix, 200)?;
 
@@ -1644,12 +1645,12 @@ impl Storage {
 
         timestamps.sort_unstable();
         let most_recent = *timestamps.last().unwrap();
-        let age_secs = now_ms.saturating_sub(most_recent) / 1000;
+        let age_secs = now.saturating_sub(most_recent);
 
-        let twenty_four_hours_ms = 24 * 60 * 60 * 1000u64;
+        let twenty_four_hours = 24 * 60 * 60u64;
 
         // Check if anchored in last 24h
-        if age_secs > 24 * 60 * 60 {
+        if age_secs > twenty_four_hours {
             return Ok(AnchorStatus {
                 verified: false,
                 level: "none".to_string(),
@@ -1663,13 +1664,13 @@ impl Storage {
         // Need at least one anchor per 24h window across all 7 days
         let mut level = "verified".to_string();
         if timestamps.len() >= 7 {
-            let seven_days_ago = now_ms.saturating_sub(seven_days_ms);
-            if *timestamps.first().unwrap() <= seven_days_ago + twenty_four_hours_ms {
+            let seven_days_ago = now.saturating_sub(seven_days);
+            if *timestamps.first().unwrap() <= seven_days_ago + twenty_four_hours {
                 // Check each 24h window
                 let mut all_days_covered = true;
                 for day in 0..7 {
-                    let window_start = now_ms.saturating_sub((day + 1) as u64 * twenty_four_hours_ms);
-                    let window_end = now_ms.saturating_sub(day as u64 * twenty_four_hours_ms);
+                    let window_start = now.saturating_sub((day + 1) as u64 * twenty_four_hours);
+                    let window_end = now.saturating_sub(day as u64 * twenty_four_hours);
                     let has_anchor = timestamps.iter().any(|&ts| ts >= window_start && ts < window_end);
                     if !has_anchor {
                         all_days_covered = false;
@@ -1713,10 +1714,11 @@ impl Storage {
             });
         }
 
-        let now_ms = SystemTime::now()
+        // Klever TX timestamps are in unix seconds
+        let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_millis() as u64;
+            .as_secs();
 
         // Extract timestamps from keys and block heights from values
         let mut earliest_ts: Option<u64> = None;
@@ -1745,7 +1747,7 @@ impl Storage {
         }
 
         let last_age = if latest_ts > 0 {
-            Some(now_ms.saturating_sub(latest_ts) / 1000)
+            Some(now.saturating_sub(latest_ts))
         } else {
             None
         };
