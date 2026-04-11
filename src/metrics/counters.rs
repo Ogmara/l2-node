@@ -4,7 +4,9 @@
 //! and read by the MetricsCollector to compute per-second rates
 //! (spec 10-dashboard.md §6.2).
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 /// Atomic counters shared between network/router tasks and the metrics collector.
 ///
@@ -21,10 +23,22 @@ pub struct NetworkCounters {
     pub messages_relayed: AtomicU64,
     /// Total messages stored in the database.
     pub messages_stored: AtomicU64,
-    /// Total failed signature verifications.
+    /// Total rejected messages (any reason: signature, timestamp, rate limit, payload, etc.).
     pub failed_validations: AtomicU64,
     /// Total rate-limited requests.
     pub rate_limited_requests: AtomicU64,
+    /// Total PoW-required rejections (wallet needs to solve challenge first).
+    pub pow_required: AtomicU64,
+    /// Recent rejection reasons for dashboard display (last 50).
+    pub recent_rejections: Mutex<VecDeque<RecentRejection>>,
+}
+
+/// A recent message rejection for dashboard troubleshooting.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RecentRejection {
+    pub timestamp: u64,
+    pub reason: String,
+    pub author: String,
 }
 
 impl NetworkCounters {
@@ -38,6 +52,8 @@ impl NetworkCounters {
             messages_stored: AtomicU64::new(0),
             failed_validations: AtomicU64::new(0),
             rate_limited_requests: AtomicU64::new(0),
+            pow_required: AtomicU64::new(0),
+            recent_rejections: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -76,6 +92,37 @@ impl NetworkCounters {
         self.rate_limited_requests.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Increment the PoW-required counter.
+    pub fn inc_pow_required(&self) {
+        self.pow_required.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a rejection with reason for dashboard display.
+    pub fn record_rejection(&self, reason: &str, author: &str) {
+        let entry = RecentRejection {
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+            reason: reason.chars().take(200).collect(),
+            author: author.chars().take(66).collect(),
+        };
+        if let Ok(mut log) = self.recent_rejections.lock() {
+            log.push_back(entry);
+            while log.len() > 50 {
+                log.pop_front();
+            }
+        }
+    }
+
+    /// Get recent rejections for dashboard display.
+    pub fn get_recent_rejections(&self) -> Vec<RecentRejection> {
+        self.recent_rejections
+            .lock()
+            .map(|log| log.iter().rev().take(20).cloned().collect())
+            .unwrap_or_default()
+    }
+
     /// Read all counters as a snapshot (for delta computation).
     pub fn snapshot(&self) -> CounterSnapshot {
         CounterSnapshot {
@@ -86,6 +133,7 @@ impl NetworkCounters {
             messages_stored: self.messages_stored.load(Ordering::Relaxed),
             failed_validations: self.failed_validations.load(Ordering::Relaxed),
             rate_limited_requests: self.rate_limited_requests.load(Ordering::Relaxed),
+            pow_required: self.pow_required.load(Ordering::Relaxed),
         }
     }
 }
@@ -108,6 +156,7 @@ pub struct CounterSnapshot {
     pub messages_stored: u64,
     pub failed_validations: u64,
     pub rate_limited_requests: u64,
+    pub pow_required: u64,
 }
 
 impl CounterSnapshot {

@@ -51,6 +51,7 @@ pub struct MetricsSnapshot {
     pub messages_stored_total: u64,
     pub failed_validations_total: u64,
     pub rate_limited_total: u64,
+    pub pow_required_total: u64,
 
     // Storage
     pub db_size_bytes: u64,
@@ -246,6 +247,7 @@ impl MetricsCollector {
             messages_stored_total: counter_snap.messages_stored,
             failed_validations_total: counter_snap.failed_validations,
             rate_limited_total: counter_snap.rate_limited_requests,
+            pow_required_total: counter_snap.pow_required,
             db_size_bytes: ss.db_size,
             messages_total: ss.messages_total,
             channel_messages_total: ss.channel_messages,
