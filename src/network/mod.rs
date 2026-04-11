@@ -253,6 +253,9 @@ impl NetworkService {
             "Network event loop started"
         );
 
+        // Dial persisted peers from previous sessions (survives restart)
+        self.dial_persisted_peers();
+
         // Periodic Kademlia bootstrap + reconnection (every 30s).
         let mut bootstrap_interval = tokio::time::interval(Duration::from_secs(30));
         bootstrap_interval.tick().await; // skip the immediate first tick
@@ -409,9 +412,16 @@ impl NetworkService {
                     }
                 }
                 // Store address for reconnection (capped to prevent unbounded growth)
-                if let Some(addr) = first_addr {
+                if let Some(ref addr) = first_addr {
                     if self.known_peer_addrs.len() < 2048 || self.known_peer_addrs.contains_key(&peer_id) {
-                        self.known_peer_addrs.insert(peer_id, addr);
+                        self.known_peer_addrs.insert(peer_id, addr.clone());
+                    }
+                }
+                // Persist Ogmara peer address to storage for reconnection after restart.
+                // This ensures the node can rejoin the network even if bootstrap nodes are down.
+                if is_ogmara {
+                    if let Some(ref addr) = first_addr {
+                        self.persist_peer_addr(&peer_id, addr);
                     }
                 }
                 // Remove from reconnect queue if it was pending (successfully connected)
@@ -553,6 +563,74 @@ impl NetworkService {
         }
     }
 
+    /// Persist a peer's multiaddr to storage for reconnection after restart.
+    fn persist_peer_addr(&self, peer_id: &PeerId, addr: &Multiaddr) {
+        let key = peer_id.to_string();
+        let value = addr.to_string();
+        if let Err(e) = self.storage.put_cf(
+            crate::storage::schema::cf::PEER_DIRECTORY,
+            key.as_bytes(),
+            value.as_bytes(),
+        ) {
+            warn!(error = %e, "Failed to persist peer address");
+        }
+    }
+
+    /// Remove a peer's stored address (e.g., after giving up on reconnection).
+    fn remove_persisted_peer(&self, peer_id: &PeerId) {
+        let key = peer_id.to_string();
+        if let Err(e) = self.storage.delete_cf(
+            crate::storage::schema::cf::PEER_DIRECTORY,
+            key.as_bytes(),
+        ) {
+            debug!(error = %e, "Failed to remove persisted peer");
+        }
+    }
+
+    /// Load persisted peer addresses from storage and dial them.
+    ///
+    /// Called once at startup to reconnect to previously-known peers
+    /// without relying on bootstrap nodes.
+    fn dial_persisted_peers(&mut self) {
+        let entries = match self.storage.prefix_iter_cf(
+            crate::storage::schema::cf::PEER_DIRECTORY,
+            &[],
+            64, // cap to prevent dialing too many at once
+        ) {
+            Ok(e) => e,
+            Err(e) => {
+                warn!(error = %e, "Failed to load persisted peers");
+                return;
+            }
+        };
+
+        if entries.is_empty() {
+            return;
+        }
+
+        let mut dialed = 0u32;
+        for (key, value) in &entries {
+            let addr_str = match std::str::from_utf8(value) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let addr: Multiaddr = match addr_str.parse() {
+                Ok(a) => a,
+                Err(_) => continue,
+            };
+
+            if let Err(e) = self.swarm.dial(addr.clone()) {
+                debug!(addr = %addr, error = %e, "Failed to dial persisted peer");
+            } else {
+                dialed += 1;
+            }
+        }
+
+        if dialed > 0 {
+            info!(dialed, stored = entries.len(), "Dialing persisted peers from previous session");
+        }
+    }
+
     /// Periodic bootstrap: if peers are low, redial bootstrap nodes and run Kademlia bootstrap.
     ///
     /// Fixes the deadlock where Kademlia bootstrap was skipped when peer_count==0,
@@ -616,7 +694,7 @@ impl NetworkService {
                 continue;
             }
 
-            // Max attempts exceeded? Give up and clean up known address.
+            // Max attempts exceeded? Give up and clean up.
             if entry.attempts >= MAX_RECONNECT_ATTEMPTS {
                 let peer = entry.peer_id;
                 debug!(
@@ -625,6 +703,7 @@ impl NetworkService {
                     "Giving up on reconnection"
                 );
                 self.known_peer_addrs.remove(&peer);
+                self.remove_persisted_peer(&peer);
                 self.reconnect_queue.swap_remove(i);
                 continue;
             }

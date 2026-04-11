@@ -5,6 +5,17 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.28.0] - 2026-04-11
+
+### Added
+- **Persistent peer storage** — when an Ogmara peer is identified via the Identify
+  protocol, its multiaddr is persisted to the `PEER_DIRECTORY` RocksDB column family.
+  On startup, the node dials all stored peers (up to 64) alongside bootstrap nodes.
+  This eliminates the single point of failure: if all bootstrap nodes are down, the
+  node can still rejoin the network using previously-connected peers.
+- **Stale peer cleanup** — when reconnection attempts are exhausted (10 attempts),
+  the peer is removed from both in-memory cache and persistent storage.
+
 ## [0.27.4] - 2026-04-11
 
 ### Fixed
