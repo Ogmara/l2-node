@@ -5,6 +5,17 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.27.2] - 2026-04-11
+
+### Added
+- **Default bootstrap nodes** — `ogmara-node init` now generates config with the
+  official Ogmara bootstrap node (`node.ogmara.org`) pre-configured for both TCP
+  and QUIC transports. New node operators no longer need to manually find and add
+  bootstrap peers — the node connects to the network automatically on first start.
+  Uses DNS-based multiaddrs (`/dns4/`) so the config survives IP changes.
+- **Bootstrap nodes in struct default** — if `bootstrap_nodes` is omitted from
+  `ogmara.toml`, the official nodes are used automatically via `serde(default)`.
+
 ## [0.27.1] - 2026-04-11
 
 ### Fixed
