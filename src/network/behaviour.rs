@@ -68,14 +68,16 @@ pub fn build_swarm(config: &Config, keypair: Keypair) -> Result<Swarm<OgmaraBeha
     )
     .map_err(|e| anyhow::anyhow!("gossipsub behaviour error: {}", e))?;
 
-    // Kademlia DHT
+    // Kademlia DHT — protocol includes network_id for cross-network isolation
+    let kad_protocol = format!("/ogmara/{}/kad/1.0.0", config.network_id());
     let kademlia = {
         let store = MemoryStore::new(peer_id);
-        let mut config = kad::Config::new(
-            libp2p::StreamProtocol::new("/ogmara/kad/1.0.0"),
+        let mut kconfig = kad::Config::new(
+            libp2p::StreamProtocol::try_from_owned(kad_protocol)
+                .map_err(|e| anyhow::anyhow!("invalid Kademlia protocol string: {}", e))?,
         );
-        config.set_query_timeout(Duration::from_secs(30));
-        kad::Behaviour::with_config(peer_id, store, config)
+        kconfig.set_query_timeout(Duration::from_secs(30));
+        kad::Behaviour::with_config(peer_id, store, kconfig)
     };
 
     // mDNS (local network discovery)
@@ -85,23 +87,26 @@ pub fn build_swarm(config: &Config, keypair: Keypair) -> Result<Swarm<OgmaraBeha
     )
     .context("creating mDNS behaviour")?;
 
-    // Identify protocol
+    // Identify protocol — protocol_version includes network_id so peers on
+    // different networks (testnet vs mainnet) reject each other at handshake.
     let identify = libp2p::identify::Behaviour::new(
         libp2p::identify::Config::new(
-            "/ogmara/1.0.0".to_string(),
+            format!("/ogmara/{}/1.0.0", config.network_id()),
             keypair.public(),
         )
         .with_agent_version(format!("ogmara-node/{}", env!("CARGO_PKG_VERSION"))),
     );
 
-    // Request-Response for sync protocol
+    // Request-Response for sync protocol — includes network_id
+    let sync_protocol = format!("/ogmara/{}/sync/1.0.0", config.network_id());
     let request_response =
         libp2p::request_response::cbor::Behaviour::<
             super::sync::SyncRequest,
             super::sync::SyncResponse,
         >::new(
             [(
-                libp2p::StreamProtocol::new("/ogmara/sync/1.0.0"),
+                libp2p::StreamProtocol::try_from_owned(sync_protocol)
+                    .map_err(|e| anyhow::anyhow!("invalid sync protocol string: {}", e))?,
                 libp2p::request_response::ProtocolSupport::Full,
             )],
             libp2p::request_response::Config::default()

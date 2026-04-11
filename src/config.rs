@@ -61,6 +61,11 @@ pub struct NetworkConfig {
     /// Enable mDNS for local peer discovery.
     #[serde(default = "default_true")]
     pub enable_mdns: bool,
+    /// Network identifier for peer isolation ("mainnet" or "testnet").
+    /// Nodes on different networks will refuse to peer with each other.
+    /// If not set, auto-detected from klever.node_url at startup.
+    #[serde(default)]
+    pub network_id: Option<String>,
 }
 
 impl Default for NetworkConfig {
@@ -70,6 +75,7 @@ impl Default for NetworkConfig {
             bootstrap_nodes: default_bootstrap_nodes(),
             max_peers: default_max_peers(),
             enable_mdns: true,
+            network_id: None,
         }
     }
 }
@@ -652,6 +658,19 @@ fn default_1440() -> u64 {
     1440
 }
 
+/// Detect network ID from a Klever node URL.
+///
+/// Returns "testnet" if the URL contains "testnet", otherwise "mainnet".
+/// This is the safe default: unknown URLs are treated as mainnet to prevent
+/// testnet nodes from accidentally peering with mainnet.
+fn detect_network_id(node_url: &str) -> String {
+    if node_url.contains("testnet") {
+        "testnet".to_string()
+    } else {
+        "mainnet".to_string()
+    }
+}
+
 impl Config {
     /// Load configuration from a TOML file.
     pub fn load(path: &Path) -> Result<Self> {
@@ -659,8 +678,8 @@ impl Config {
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let mut config: Config =
             toml::from_str(&content).with_context(|| format!("parsing {}", path.display()))?;
-        config.validate()?;
         config.apply_migrations();
+        config.validate()?;
         Ok(config)
     }
 
@@ -676,6 +695,22 @@ impl Config {
             tracing::info!("Config migration: adding default bootstrap nodes (empty bootstrap_nodes list)");
             self.network.bootstrap_nodes = default_bootstrap_nodes();
         }
+
+        // Migration: auto-detect network_id from klever.node_url if not set.
+        // Configs created before v0.28.0 have no network_id field.
+        if self.network.network_id.is_none() {
+            let detected = detect_network_id(&self.klever.node_url);
+            tracing::info!(
+                network_id = %detected,
+                "Config migration: auto-detected network_id from klever.node_url"
+            );
+            self.network.network_id = Some(detected);
+        }
+    }
+
+    /// Return the resolved network ID (always present after apply_migrations).
+    pub fn network_id(&self) -> &str {
+        self.network.network_id.as_deref().unwrap_or("mainnet")
     }
 
     /// Validate the configuration for consistency.
@@ -688,6 +723,15 @@ impl Config {
         }
         if self.api.listen_port == self.network.listen_port {
             anyhow::bail!("api.listen_port and network.listen_port must be different");
+        }
+        // Validate network_id if explicitly set
+        if let Some(ref nid) = self.network.network_id {
+            if nid != "mainnet" && nid != "testnet" {
+                anyhow::bail!(
+                    "network.network_id must be \"mainnet\" or \"testnet\", got \"{}\"",
+                    nid
+                );
+            }
         }
         Ok(())
     }
@@ -707,6 +751,9 @@ bootstrap_nodes = [
 ]
 max_peers = 50
 enable_mdns = true
+# Network isolation: auto-detected from klever.node_url if not set.
+# Valid values: "testnet", "mainnet".
+# network_id = "testnet"
 
 [klever]
 node_url = ""

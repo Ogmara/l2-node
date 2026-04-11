@@ -5,6 +5,23 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.29.0] - 2026-04-11
+
+### Added
+- **Network isolation between testnet and mainnet** — nodes on different Klever
+  networks now refuse to peer with each other. All libp2p protocol identifiers
+  (Identify, Kademlia, Sync, GossipSub topics) include the network name
+  (`mainnet` or `testnet`), so cross-network connections are rejected at the
+  protocol-negotiation level. The `network.network_id` config field is
+  auto-detected from `klever.node_url` if not explicitly set. This prevents
+  data corruption from mixed-network syncing and channel ID collisions.
+
+### Security
+- **Cross-network peering vulnerability** — prior to this version, a testnet
+  node and a mainnet node could discover, connect, and sync messages with each
+  other because all protocol IDs and topic names were identical across networks.
+  This could cause channel ID collisions and data corruption.
+
 ## [0.28.3] - 2026-04-11
 
 ### Changed

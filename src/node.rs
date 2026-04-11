@@ -413,14 +413,9 @@ impl Node {
             identity.clone(),
             pow_manager.clone(),
         );
-        // Derive Klever network name from configured node URL
-        let klever_network = if self.config.klever.node_url.contains("testnet") {
-            "testnet".to_string()
-        } else if self.config.klever.node_url.is_empty() {
-            "unknown".to_string()
-        } else {
-            "mainnet".to_string()
-        };
+        // Use the authoritative network_id from config (set during migration/validation).
+        // This is the single source of truth — also used by libp2p protocol IDs and topics.
+        let klever_network = self.config.network_id().to_string();
 
         // Start metrics collector (spec 10-dashboard.md §6)
         let metrics_collector = crate::metrics::MetricsCollector::new(
