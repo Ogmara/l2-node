@@ -66,13 +66,24 @@ impl ChainScanner {
             .build()
             .context("creating HTTP client")?;
 
-        let last_block = storage.get_chain_cursor()?;
+        let mut last_block = storage.get_chain_cursor()?;
 
-        info!(
-            last_block,
-            contract = %config.contract_address,
-            "Chain scanner initialized"
-        );
+        // If the cursor is 0 (fresh node) and start_block is configured,
+        // skip ahead to avoid scanning millions of irrelevant blocks.
+        if last_block == 0 && config.start_block > 0 {
+            last_block = config.start_block;
+            info!(
+                start_block = config.start_block,
+                contract = %config.contract_address,
+                "Chain scanner skipping to start_block (fresh node)"
+            );
+        } else {
+            info!(
+                last_block,
+                contract = %config.contract_address,
+                "Chain scanner initialized"
+            );
+        }
 
         Ok(Self {
             config,

@@ -94,6 +94,11 @@ pub struct KleverConfig {
     /// Block scan interval in milliseconds.
     #[serde(default = "default_scan_interval")]
     pub scan_interval_ms: u64,
+    /// Block height to start scanning from (skip blocks before SC deployment).
+    /// Only used when the chain cursor is 0 (fresh node). Ignored if the node
+    /// has already scanned past this block. Default: 0 (scan from genesis).
+    #[serde(default)]
+    pub start_block: u64,
 }
 
 impl Default for KleverConfig {
@@ -103,6 +108,7 @@ impl Default for KleverConfig {
             api_url: String::new(),
             contract_address: String::new(),
             scan_interval_ms: default_scan_interval(),
+            start_block: 0,
         }
     }
 }
@@ -760,6 +766,10 @@ node_url = ""
 api_url = ""
 contract_address = ""
 scan_interval_ms = 3000
+# Skip blocks before SC deployment (saves hours on first sync).
+# Only used when chain cursor is 0 (fresh node). Ignored once scanning has started.
+# Mainnet: 29686185, Testnet: 9100000
+start_block = 0
 
 [ipfs]
 api_url = "http://127.0.0.1:5001"
