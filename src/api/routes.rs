@@ -861,7 +861,23 @@ pub async fn get_user(
             }
             Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "corrupt user data").into_response(),
         },
-        Ok(None) => (StatusCode::NOT_FOUND, "user not found").into_response(),
+        Ok(None) => {
+            // Return an empty profile instead of 404 — the address is valid,
+            // the user just hasn't set a profile yet. This avoids noisy 404s
+            // in the browser console for users who have posted but never
+            // configured a display name or avatar.
+            let (following_count, follower_count) = state
+                .storage
+                .get_follower_counts(&resolved)
+                .unwrap_or((0, 0));
+            Json(serde_json::json!({
+                "user": {
+                    "address": resolved,
+                    "follower_count": follower_count,
+                    "following_count": following_count,
+                }
+            })).into_response()
+        }
         Err(e) => {
             {
                 tracing::error!(error = %e, "Storage error in API handler");
