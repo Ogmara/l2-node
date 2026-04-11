@@ -74,6 +74,10 @@ pub struct MetricsSnapshot {
     pub last_anchor_height: u64,
     pub last_anchor_age_seconds: u64,
     pub total_anchors: u64,
+
+    // Wallet
+    /// Node's KLV balance in KLV units (balance / 1_000_000 for display).
+    pub wallet_balance_klv: u64,
 }
 
 /// Cached storage statistics (refreshed at storage_interval).
@@ -109,12 +113,19 @@ pub struct MetricsCollector {
     peer_count: Arc<AtomicU32>,
     counters: Arc<NetworkCounters>,
     node_id: String,
+    /// Klever API URL for balance queries.
+    klever_api_url: String,
+    /// Node's Klever wallet address (klv1...).
+    node_address: String,
+    /// HTTP client for Klever API queries.
+    http: reqwest::Client,
 
     // Internal state
     system_collector: SystemCollector,
     prev_counter_snapshot: CounterSnapshot,
     prev_counter_time: Instant,
     ipfs_stats: IpfsStats,
+    wallet_balance: u64,
 
     // Output
     latest: Arc<RwLock<MetricsSnapshot>>,
@@ -131,6 +142,8 @@ impl MetricsCollector {
         counters: Arc<NetworkCounters>,
         data_dir: &str,
         node_id: String,
+        klever_api_url: String,
+        node_address: String,
     ) -> Self {
         // Clamp capacity: min 60 (1 hour), max 10080 (1 week at 1-min resolution)
         let capacity = (config.history_capacity as usize).clamp(60, 10080);
@@ -141,10 +154,17 @@ impl MetricsCollector {
             peer_count,
             counters,
             node_id,
+            klever_api_url,
+            node_address,
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap_or_default(),
             system_collector: SystemCollector::new(data_dir),
             prev_counter_snapshot: CounterSnapshot::default(),
             prev_counter_time: Instant::now(),
             ipfs_stats: IpfsStats::default(),
+            wallet_balance: 0,
             latest: Arc::new(RwLock::new(MetricsSnapshot::default())),
             history: Arc::new(RwLock::new(RingBuffer::new(capacity))),
         }
@@ -193,6 +213,7 @@ impl MetricsCollector {
                 _ = storage_tick.tick() => {
                     self.system_collector.refresh_disks();
                     self.collect_storage_stats(&mut ss);
+                    self.refresh_wallet_balance().await;
                 }
                 _ = history_tick.tick() => {
                     // Write current snapshot to history ring buffer
@@ -265,6 +286,7 @@ impl MetricsCollector {
             last_anchor_height: 0,
             last_anchor_age_seconds: anchor_age,
             total_anchors: ss.total_anchors,
+            wallet_balance_klv: self.wallet_balance,
         };
 
         if let Ok(mut latest) = self.latest.write() {
@@ -321,6 +343,33 @@ impl MetricsCollector {
             Err(e) => {
                 warn!(error = %e, "Failed to collect IPFS repo stats");
             }
+        }
+    }
+
+    /// Fetch the node's KLV balance from the Klever API.
+    async fn refresh_wallet_balance(&mut self) {
+        if self.klever_api_url.is_empty() || self.node_address.is_empty() {
+            return;
+        }
+
+        let url = format!("{}/v1.0/address/{}", self.klever_api_url, self.node_address);
+        match self.http.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                match resp.json::<serde_json::Value>().await {
+                    Ok(body) => {
+                        self.wallet_balance = body
+                            .pointer("/data/account/balance")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                    }
+                    Err(e) => debug!(error = %e, "Failed to parse wallet balance response"),
+                }
+            }
+            Ok(resp) if resp.status().as_u16() == 404 => {
+                // Account not found on-chain (never funded)
+                self.wallet_balance = 0;
+            }
+            _ => {} // silently skip on network errors (will retry next cycle)
         }
     }
 }

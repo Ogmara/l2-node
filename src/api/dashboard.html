@@ -136,6 +136,7 @@ td { padding: 8px; border-bottom: 1px solid var(--border); }
       <div class="card"><h3>Klever Sync</h3><div class="metric" id="klever-block">--</div><div class="label" id="klever-lag">--</div></div>
       <div class="card"><h3>DB Size</h3><div class="metric" id="db-size">--</div></div>
       <div class="card"><h3>Anchoring</h3><div class="metric" id="anchor-count">--</div><div class="label" id="anchor-age">--</div></div>
+      <div class="card"><h3>Node Wallet</h3><div class="metric" id="wallet-balance">--</div><div class="label" id="wallet-addr" style="font-family:var(--mono);font-size:0.7em;word-break:break-all">--</div></div>
     </div>
   </div>
 
@@ -395,6 +396,14 @@ function updateDashboard(d) {
   setText('db-size', fmtBytes(st.db_size_bytes||0));
   setText('anchor-count', fmt(anch.total_anchors||0) + ' anchors');
   setText('anchor-age', anch.last_anchor_age_seconds > 0 ? fmtTime(anch.last_anchor_age_seconds) + ' ago' : 'never');
+
+  // Wallet
+  const w = d.wallet || {};
+  const balKlv = (w.balance_klv||0) / 1_000_000;
+  const balEl = document.getElementById('wallet-balance');
+  balEl.textContent = balKlv.toFixed(2) + ' KLV';
+  balEl.className = 'metric ' + (balKlv < 10 ? 'red' : balKlv < 50 ? 'yellow' : 'green');
+  setText('wallet-addr', w.address || '--');
 
   // Messages tab
   setText('m-recv', fmt(net.messages_received_total||0));

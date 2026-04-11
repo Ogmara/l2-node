@@ -152,6 +152,10 @@ fn build_ws_payload(state: &AppState, snap: &MetricsSnapshot) -> serde_json::Val
                 "last_anchor_age_seconds": snap.last_anchor_age_seconds,
                 "total_anchors": snap.total_anchors,
             },
+            "wallet": {
+                "address": &state.node_address,
+                "balance_klv": snap.wallet_balance_klv,
+            },
         }
     })
 }
