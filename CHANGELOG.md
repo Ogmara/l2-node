@@ -5,6 +5,22 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.26.1] - 2026-04-11
+
+### Added
+- **PoW counter in dashboard** — Messages tab now shows "PoW Required" count
+  separately from "Rejected". Previously PoW rejections were uncounted.
+- **Recent rejections log** — Messages tab shows the last 20 rejection reasons
+  with timestamps and author addresses. Helps node operators diagnose why messages
+  are failing (signature errors, timestamp drift, PoW required, payload validation).
+- **`GET /admin/metrics/rejections`** — REST endpoint returning last 50 rejections
+  with reason, author, and timestamp.
+
+### Fixed
+- **"Failed Signatures" renamed to "Rejected"** — the counter tracks ALL rejection
+  reasons (signature, timestamp, rate limit, payload), not just signature failures.
+  The old label was misleading.
+
 ## [0.26.0] - 2026-04-10
 
 ### Added

@@ -128,6 +128,7 @@ fn build_ws_payload(state: &AppState, snap: &MetricsSnapshot) -> serde_json::Val
                 "messages_stored_total": snap.messages_stored_total,
                 "failed_validations_total": snap.failed_validations_total,
                 "rate_limited_total": snap.rate_limited_total,
+                "pow_required_total": snap.pow_required_total,
             },
             "storage": {
                 "db_size_bytes": snap.db_size_bytes,
@@ -295,6 +296,14 @@ pub async fn metrics_storage(
             "repo_size_bytes": snap.ipfs_repo_size_bytes,
         }
     }))
+}
+
+/// GET /admin/metrics/rejections — recent message rejections for troubleshooting.
+pub async fn metrics_rejections(
+    Extension(state): Extension<Arc<AppState>>,
+) -> impl IntoResponse {
+    let rejections = state.counters.get_recent_rejections();
+    Json(serde_json::json!({ "rejections": rejections }))
 }
 
 /// GET /admin/alerts/history — alert history from the AlertEngine.

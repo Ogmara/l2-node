@@ -183,8 +183,13 @@ td { padding: 8px; border-bottom: 1px solid var(--border); }
       <div class="card"><h3>Received Total</h3><div class="metric" id="m-recv">--</div></div>
       <div class="card"><h3>Relayed Total</h3><div class="metric" id="m-relay">--</div></div>
       <div class="card"><h3>Stored Total</h3><div class="metric" id="m-stored">--</div></div>
-      <div class="card"><h3>Failed Signatures</h3><div class="metric" id="m-failed">--</div></div>
+      <div class="card"><h3>Rejected</h3><div class="metric" id="m-failed">--</div><div class="label">sig/payload/timestamp failures</div></div>
+      <div class="card"><h3>PoW Required</h3><div class="metric" id="m-pow">--</div><div class="label">wallets needing PoW challenge</div></div>
       <div class="card"><h3>Rate Limited</h3><div class="metric" id="m-ratelim">--</div></div>
+    </div>
+    <div class="card">
+      <h3>Recent Rejections</h3>
+      <table><thead><tr><th>Time</th><th>Author</th><th>Reason</th></tr></thead><tbody id="rejections-body"><tr><td colspan="3" style="color:var(--fg2)">Loading...</td></tr></tbody></table>
     </div>
   </div>
 
@@ -303,6 +308,7 @@ document.getElementById('nav').addEventListener('click', (e) => {
   }
   if (e.target.dataset.tab === 'messages') {
     loadHistoryChart('chart-msgs', 'messages_per_minute', 'Msgs/min', 'var(--accent2)');
+    loadRejections();
   }
   if (e.target.dataset.tab === 'alerts') loadAlerts();
 });
@@ -395,6 +401,7 @@ function updateDashboard(d) {
   setText('m-relay', fmt(net.messages_relayed_total||0));
   setText('m-stored', fmt(net.messages_stored_total||0));
   setText('m-failed', fmt(net.failed_validations_total||0));
+  setText('m-pow', fmt(net.pow_required_total||0));
   setText('m-ratelim', fmt(net.rate_limited_total||0));
 
   // Sparkline data
@@ -477,6 +484,27 @@ async function loadStorage() {
     for (const cf of (data.column_families||[])) {
       const tr = document.createElement('tr');
       tr.innerHTML = `<td style="font-family:var(--mono);font-size:0.85em">${esc(cf.name)}</td><td>${fmt(cf.estimated_keys)}</td><td>${fmtBytes(cf.estimated_size_bytes)}</td>`;
+      body.appendChild(tr);
+    }
+  } catch(_) {}
+}
+
+async function loadRejections() {
+  try {
+    const resp = await fetch('/admin/metrics/rejections');
+    const data = await resp.json();
+    const body = document.getElementById('rejections-body');
+    body.innerHTML = '';
+    const items = data.rejections || [];
+    if (items.length === 0) {
+      body.innerHTML = '<tr><td colspan="3" style="color:var(--fg2)">No recent rejections</td></tr>';
+      return;
+    }
+    for (const r of items) {
+      const tr = document.createElement('tr');
+      const time = new Date(r.timestamp).toLocaleTimeString();
+      const addr = r.author.length > 20 ? r.author.slice(0,10)+'...'+r.author.slice(-6) : r.author;
+      tr.innerHTML = `<td style="white-space:nowrap">${esc(time)}</td><td style="font-family:var(--mono);font-size:0.8em" title="${esc(r.author)}">${esc(addr)}</td><td style="font-size:0.85em;color:var(--red)">${esc(r.reason)}</td>`;
       body.appendChild(tr);
     }
   } catch(_) {}

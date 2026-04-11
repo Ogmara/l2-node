@@ -1145,9 +1145,14 @@ pub async fn post_message(
         RouteResult::Duplicate => {
             (StatusCode::CONFLICT, "message already exists").into_response()
         }
-        RouteResult::PowRequired { address } => pow_required_response(&state, &address),
+        RouteResult::PowRequired { address } => {
+            state.counters.inc_pow_required();
+            state.counters.record_rejection("PoW required", &address);
+            pow_required_response(&state, &address)
+        }
         RouteResult::Rejected(reason) => {
             state.counters.inc_failed_validations();
+            state.counters.record_rejection(&reason, &_auth_user.address);
             (StatusCode::BAD_REQUEST, reason).into_response()
         }
     }
