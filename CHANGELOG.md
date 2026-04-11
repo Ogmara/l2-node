@@ -5,6 +5,38 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.27.0] - 2026-04-11
+
+### Fixed
+- **Peer reconnection deadlock** — nodes could not reconnect after restart because
+  Kademlia bootstrap was skipped when `peer_count == 0`, creating a deadlock: can't
+  find peers without bootstrap, can't bootstrap without peers. Now always attempts
+  Kademlia bootstrap and redials configured bootstrap nodes when peer count is zero.
+- **No reconnection on peer disconnect** — when a peer disconnected, the node forgot
+  about it entirely with no retry. Now queues disconnected peers for reconnection with
+  exponential backoff (5s base, doubling up to 5 min, max 10 attempts).
+- **Idle connection timeout too aggressive** — was 60 seconds, causing peers to
+  disconnect during quiet periods. Increased to 5 minutes.
+- **Non-Ogmara peers polluted DHT** — Identify results from non-Ogmara peers were
+  added to the Kademlia routing table, wasting queries. Now only adds peers whose
+  protocol version starts with `/ogmara/`.
+- **GossipSub Unsubscribed event ignored** — peer unsubscriptions were silently
+  swallowed. Now logged for mesh debugging.
+- **GossipsubNotSupported event ignored** — peers that don't support GossipSub were
+  silently accepted. Now logged for protocol compatibility tracking.
+
+### Added
+- **Peer reconnection with exponential backoff** — `ReconnectEntry` queue processes
+  every 10 seconds. Disconnected Ogmara peers are redialed with 5s→10s→20s→...→5min
+  backoff, up to 10 attempts. Successfully reconnected peers are removed from queue.
+- **Known peer address tracking** — stores the first listen address from Identify
+  for each peer. Used for reconnection after disconnect.
+- **Periodic bootstrap node redial** — every 30 seconds, if peer count is zero,
+  actively redials all configured bootstrap nodes. Previously only dialed once at
+  startup.
+- **Per-peer connection limit** — max 2 connections per peer to prevent a single
+  peer from exhausting the inbound connection limit.
+
 ## [0.26.1] - 2026-04-11
 
 ### Added

@@ -44,7 +44,8 @@ pub fn build_swarm(config: &Config, keypair: Keypair) -> Result<Swarm<OgmaraBeha
     let connection_limits = libp2p::connection_limits::Behaviour::new(
         libp2p::connection_limits::ConnectionLimits::default()
             .with_max_established(Some(config.network.max_peers))
-            .with_max_established_incoming(Some(config.network.max_peers / 2)),
+            .with_max_established_incoming(Some(config.network.max_peers / 2))
+            .with_max_established_per_peer(Some(2)),  // prevent per-peer connection exhaustion
     );
 
     // GossipSub configuration — mesh parameters tuned for small networks.
@@ -128,7 +129,7 @@ pub fn build_swarm(config: &Config, keypair: Keypair) -> Result<Swarm<OgmaraBeha
         .with_behaviour(|_| Ok(behaviour))
         .context("configuring behaviour")?
         .with_swarm_config(|cfg: libp2p::swarm::Config| {
-            cfg.with_idle_connection_timeout(Duration::from_secs(60))
+            cfg.with_idle_connection_timeout(Duration::from_secs(300)) // 5 min — 60s was too aggressive
         })
         .build();
 
