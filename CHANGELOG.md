@@ -5,6 +5,19 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.28.1] - 2026-04-11
+
+### Fixed
+- **PEER_DIRECTORY key collision** — persisted peer addresses and NodeAnnouncement
+  entries shared the same CF without key prefixes. Peer addresses now use `pa:` prefix
+  (`pa:{peer_id}` → multiaddr). Prevents cross-contamination where `dial_persisted_peers`
+  tried to parse JSON announcements as multiaddrs, and `/network/nodes` tried to parse
+  multiaddrs as JSON.
+- **Unbounded peer address writes** — `persist_peer_addr()` now caps at 256 stored
+  entries. Previously every Identify event wrote to storage with no limit.
+- **O(n) reconnect queue eviction** — `remove(0)` replaced with `swap_remove(0)` for
+  O(1) performance when the 128-entry queue is full.
+
 ## [0.28.0] - 2026-04-11
 
 ### Added
