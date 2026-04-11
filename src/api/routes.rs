@@ -2555,7 +2555,10 @@ pub async fn register_device(
         );
     }
 
-    // Check device limit per wallet
+    // Check device limit per wallet.
+    // If list_devices fails (e.g. corrupted entry from pre-v0.15 migration),
+    // log a warning and proceed — the new registration will overwrite the
+    // corrupted data. Better to recover than to permanently block the wallet.
     match state.identity.list_devices(&body.wallet_address) {
         Ok(existing) => {
             let is_update = existing.iter().any(|c| c.device_address == device_address);
@@ -2567,8 +2570,12 @@ pub async fn register_device(
             }
         }
         Err(e) => {
-            tracing::error!(error = %e, "Failed to list devices");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+            tracing::warn!(
+                error = %e,
+                wallet = %body.wallet_address,
+                "Failed to list devices (corrupted entry?), proceeding with registration"
+            );
+            // Continue — the new device claim will be written regardless
         }
     }
 
