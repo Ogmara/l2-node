@@ -11,6 +11,9 @@ listen_port = 41720
 bootstrap_nodes = []
 max_peers = 50
 enable_mdns = true
+# Network isolation: nodes on different networks refuse to peer.
+# Auto-detected from klever.node_url if not set. Valid: "testnet", "mainnet".
+# network_id = "testnet"
 
 [klever]
 # Choose ONE network below — uncomment the block you want and comment out the other.

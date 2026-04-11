@@ -560,8 +560,12 @@ pub async fn list_channels(
 /// Determine the GossipSub topic for a message envelope based on its type and payload.
 ///
 /// Returns None if the message type doesn't map to a GossipSub topic.
-fn gossip_topic_for_envelope(envelope: &crate::messages::envelope::Envelope) -> Option<String> {
+fn gossip_topic_for_envelope(
+    envelope: &crate::messages::envelope::Envelope,
+    network_id: &str,
+) -> Option<String> {
     use crate::messages::types::MessageType;
+    use crate::network::gossip;
 
     match envelope.msg_type {
         MessageType::ChatMessage | MessageType::ChatEdit | MessageType::ChatDelete
@@ -571,22 +575,22 @@ fn gossip_topic_for_envelope(envelope: &crate::messages::envelope::Envelope) -> 
             // Extract channel_id from payload
             let payload: serde_json::Value = rmp_serde::from_slice(&envelope.payload).ok()?;
             let channel_id = payload.get("channel_id")?.as_u64()?;
-            Some(crate::network::gossip::channel_topic(channel_id))
+            Some(gossip::channel_topic(network_id, channel_id))
         }
         MessageType::NewsPost => {
-            Some(crate::network::gossip::TOPIC_NEWS_GLOBAL.to_string())
+            Some(gossip::topic_news_global(network_id))
         }
         MessageType::ProfileUpdate => {
-            Some(crate::network::gossip::TOPIC_PROFILE.to_string())
+            Some(gossip::topic_profile(network_id))
         }
         MessageType::DirectMessage => {
             // DMs go to the recipient's topic
             let payload: serde_json::Value = rmp_serde::from_slice(&envelope.payload).ok()?;
             let recipient = payload.get("recipient")?.as_str()?;
-            Some(crate::network::gossip::dm_topic(recipient))
+            Some(gossip::dm_topic(network_id, recipient))
         }
         MessageType::NodeAnnouncement | MessageType::DeviceDelegation => {
-            Some(crate::network::gossip::TOPIC_NETWORK.to_string())
+            Some(gossip::topic_network(network_id))
         }
         _ => None,
     }
@@ -1140,7 +1144,7 @@ pub async fn post_message(
             if let Ok(envelope) =
                 rmp_serde::from_slice::<crate::messages::envelope::Envelope>(&raw_bytes)
             {
-                if let Some(topic) = gossip_topic_for_envelope(&envelope) {
+                if let Some(topic) = gossip_topic_for_envelope(&envelope, &state.klever_network) {
                     let _ = state.gossip_tx.send((topic, raw_bytes.clone()));
                 }
 

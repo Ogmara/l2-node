@@ -172,7 +172,7 @@ impl NetworkService {
         }
 
         // Create topic manager and subscribe to default topics
-        let mut topics = TopicManager::new();
+        let mut topics = TopicManager::new(config.network_id());
         topics.subscribe_defaults(&mut swarm);
 
         // Create message router for P2P message processing (no PoW for gossip)
@@ -354,8 +354,14 @@ impl NetworkService {
             )) => {
                 for (peer_id, addr) in peers {
                     debug!(peer = %peer_id, addr = %addr, "mDNS discovered peer");
-                    self.swarm.behaviour_mut().kademlia.add_address(&peer_id, addr.clone());
-                    self.swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                    // Only dial the peer — do NOT add to Kademlia or GossipSub yet.
+                    // The Identify handler will promote same-network peers after
+                    // verifying the protocol version. This prevents wrong-network
+                    // peers (e.g., testnet+mainnet on the same LAN) from polluting
+                    // the routing table or receiving GossipSub messages.
+                    if let Err(e) = self.swarm.dial(addr) {
+                        debug!(peer = %peer_id, error = %e, "Failed to dial mDNS peer");
+                    }
                 }
             }
 
@@ -390,15 +396,40 @@ impl NetworkService {
             SwarmEvent::Behaviour(OgmaraBehaviourEvent::Identify(
                 libp2p::identify::Event::Received { peer_id, info, .. },
             )) => {
-                let is_ogmara = info.protocol_version.starts_with("/ogmara/");
+                // Network isolation: only accept peers on the same network.
+                // Protocol version format: /ogmara/{network_id}/1.0.0
+                let expected_prefix = format!("/ogmara/{}/", self.topics.network_id());
+                let is_ogmara = info.protocol_version.starts_with(&expected_prefix);
                 let agent_ver = info.agent_version.clone();
+
+                // Reject peers that are not on our network — disconnect immediately.
+                if !is_ogmara {
+                    if info.protocol_version.starts_with("/ogmara/") {
+                        warn!(
+                            peer = %peer_id,
+                            their_protocol = %info.protocol_version,
+                            our_network = %self.topics.network_id(),
+                            "Rejecting peer from different network — disconnecting"
+                        );
+                    } else {
+                        debug!(
+                            peer = %peer_id,
+                            protocol_version = %info.protocol_version,
+                            "Non-Ogmara peer identified — disconnecting"
+                        );
+                    }
+                    let _ = self.swarm.disconnect_peer_id(peer_id);
+                    return;
+                }
+
                 info!(
                     peer = %peer_id,
                     protocol_version = %info.protocol_version,
                     agent_version = %agent_ver,
                     listen_addrs = info.listen_addrs.len(),
-                    "Identified peer"
+                    "Identified Ogmara peer"
                 );
+
                 // Add identified peer's addresses to Kademlia and store the
                 // first address for reconnection after disconnect.
                 let mut first_addr = None;
@@ -406,10 +437,7 @@ impl NetworkService {
                     if first_addr.is_none() {
                         first_addr = Some(addr.clone());
                     }
-                    // Only add Ogmara peers to Kademlia (prevent DHT pollution)
-                    if is_ogmara {
-                        self.swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
-                    }
+                    self.swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
                 }
                 // Store address for reconnection (capped to prevent unbounded growth)
                 if let Some(ref addr) = first_addr {
@@ -417,43 +445,38 @@ impl NetworkService {
                         self.known_peer_addrs.insert(peer_id, addr.clone());
                     }
                 }
-                // Persist Ogmara peer address to storage for reconnection after restart.
-                // This ensures the node can rejoin the network even if bootstrap nodes are down.
-                if is_ogmara {
-                    if let Some(ref addr) = first_addr {
-                        self.persist_peer_addr(&peer_id, addr);
-                    }
+                // Persist peer address to storage for reconnection after restart.
+                if let Some(ref addr) = first_addr {
+                    self.persist_peer_addr(&peer_id, addr);
                 }
                 // Remove from reconnect queue if it was pending (successfully connected)
                 self.reconnect_queue.retain(|e| e.peer_id != peer_id);
 
-                if is_ogmara {
-                    // Sync channel messages from this peer
-                    self.sync_channels_with_peer(peer_id);
+                // Sync channel messages from this peer
+                self.sync_channels_with_peer(peer_id);
 
-                    // Track this peer so it appears in /api/v1/network/nodes
-                    // even before its NodeAnnouncement arrives via GossipSub
-                    if let Ok(ed25519_pk) = info.public_key.try_into_ed25519() {
-                        use sha2::{Digest, Sha256};
-                        let hash = Sha256::digest(ed25519_pk.to_bytes());
-                        let node_id = bs58::encode(&hash[..20]).into_string();
-                        self.peer_node_ids.insert(peer_id, node_id.clone());
-                        // Note: do not hold this lock across .await points
-                        match self.connected_peers.write() {
-                            Ok(mut peers) => {
-                                // Defensive cap to prevent unbounded growth
-                                if peers.len() < 1024 || peers.contains_key(&node_id) {
-                                    peers.insert(node_id, ConnectedPeerInfo {
-                                        agent_version: if agent_ver.len() > 256 {
-                                            agent_ver[..256].to_string()
-                                        } else {
-                                            agent_ver
-                                        },
-                                    });
-                                }
+                // Track this peer so it appears in /api/v1/network/nodes
+                // even before its NodeAnnouncement arrives via GossipSub
+                if let Ok(ed25519_pk) = info.public_key.try_into_ed25519() {
+                    use sha2::{Digest, Sha256};
+                    let hash = Sha256::digest(ed25519_pk.to_bytes());
+                    let node_id = bs58::encode(&hash[..20]).into_string();
+                    self.peer_node_ids.insert(peer_id, node_id.clone());
+                    // Note: do not hold this lock across .await points
+                    match self.connected_peers.write() {
+                        Ok(mut peers) => {
+                            // Defensive cap to prevent unbounded growth
+                            if peers.len() < 1024 || peers.contains_key(&node_id) {
+                                peers.insert(node_id, ConnectedPeerInfo {
+                                    agent_version: if agent_ver.len() > 256 {
+                                        agent_ver[..256].to_string()
+                                    } else {
+                                        agent_ver
+                                    },
+                                });
                             }
-                            Err(e) => warn!("connected_peers lock poisoned: {e}"),
                         }
+                        Err(e) => warn!("connected_peers lock poisoned: {e}"),
                     }
                 }
             }
@@ -943,7 +966,7 @@ impl NetworkService {
         }
     }
 
-    /// Publish a NodeAnnouncement to the /ogmara/v1/network topic.
+    /// Publish a NodeAnnouncement to the /ogmara/{network}/v1/network topic.
     ///
     /// Announces this node's presence, capabilities, and served channels
     /// so other nodes can discover it and the website can list it.
@@ -1024,7 +1047,7 @@ impl NetworkService {
             }
         };
 
-        let topic = libp2p::gossipsub::IdentTopic::new(gossip::TOPIC_NETWORK);
+        let topic = libp2p::gossipsub::IdentTopic::new(gossip::topic_network(self.topics.network_id()));
         match self.swarm.behaviour_mut().gossipsub.publish(topic, envelope_bytes) {
             Ok(_) => info!(node_id = %self.node_id, "Published NodeAnnouncement"),
             Err(e) => debug!(error = %e, "Failed to publish NodeAnnouncement (no peers yet?)"),
