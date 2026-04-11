@@ -563,13 +563,29 @@ impl NetworkService {
         }
     }
 
+    /// Key prefix for persisted peer addresses in PEER_DIRECTORY CF.
+    /// Separates peer addrs from NodeAnnouncement entries which use no prefix.
+    const PEER_ADDR_PREFIX: &'static [u8] = b"pa:";
+
     /// Persist a peer's multiaddr to storage for reconnection after restart.
     fn persist_peer_addr(&self, peer_id: &PeerId, addr: &Multiaddr) {
-        let key = peer_id.to_string();
+        // Cap stored peers at 256 to prevent unbounded growth
+        let existing = self.storage.prefix_iter_cf(
+            crate::storage::schema::cf::PEER_DIRECTORY,
+            Self::PEER_ADDR_PREFIX,
+            257,
+        ).map(|e| e.len()).unwrap_or(0);
+        if existing >= 256 {
+            return; // full — existing peers are retained, new ones skipped
+        }
+
+        let mut key = Vec::with_capacity(3 + 64);
+        key.extend_from_slice(Self::PEER_ADDR_PREFIX);
+        key.extend_from_slice(peer_id.to_string().as_bytes());
         let value = addr.to_string();
         if let Err(e) = self.storage.put_cf(
             crate::storage::schema::cf::PEER_DIRECTORY,
-            key.as_bytes(),
+            &key,
             value.as_bytes(),
         ) {
             warn!(error = %e, "Failed to persist peer address");
@@ -578,10 +594,12 @@ impl NetworkService {
 
     /// Remove a peer's stored address (e.g., after giving up on reconnection).
     fn remove_persisted_peer(&self, peer_id: &PeerId) {
-        let key = peer_id.to_string();
+        let mut key = Vec::with_capacity(3 + 64);
+        key.extend_from_slice(Self::PEER_ADDR_PREFIX);
+        key.extend_from_slice(peer_id.to_string().as_bytes());
         if let Err(e) = self.storage.delete_cf(
             crate::storage::schema::cf::PEER_DIRECTORY,
-            key.as_bytes(),
+            &key,
         ) {
             debug!(error = %e, "Failed to remove persisted peer");
         }
@@ -594,7 +612,7 @@ impl NetworkService {
     fn dial_persisted_peers(&mut self) {
         let entries = match self.storage.prefix_iter_cf(
             crate::storage::schema::cf::PEER_DIRECTORY,
-            &[],
+            Self::PEER_ADDR_PREFIX,
             64, // cap to prevent dialing too many at once
         ) {
             Ok(e) => e,
@@ -609,7 +627,7 @@ impl NetworkService {
         }
 
         let mut dialed = 0u32;
-        for (key, value) in &entries {
+        for (_key, value) in &entries {
             let addr_str = match std::str::from_utf8(value) {
                 Ok(s) => s,
                 Err(_) => continue,
@@ -756,8 +774,8 @@ impl NetworkService {
 
         // Cap queue size to prevent unbounded growth from mass disconnections
         if self.reconnect_queue.len() >= 128 {
-            debug!("Reconnect queue full, dropping oldest entry");
-            self.reconnect_queue.remove(0);
+            debug!("Reconnect queue full, dropping entry");
+            self.reconnect_queue.swap_remove(0); // O(1) vs O(n) for remove(0)
         }
 
         self.reconnect_queue.push(ReconnectEntry {
