@@ -126,6 +126,8 @@ pub fn build_swarm(config: &Config, keypair: Keypair) -> Result<Swarm<OgmaraBeha
         )
         .context("configuring TCP transport")?
         .with_quic()
+        .with_dns()
+        .context("configuring DNS transport")?
         .with_behaviour(|_| Ok(behaviour))
         .context("configuring behaviour")?
         .with_swarm_config(|cfg: libp2p::swarm::Config| {

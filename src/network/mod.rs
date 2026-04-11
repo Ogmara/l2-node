@@ -578,9 +578,9 @@ impl NetworkService {
 
                 if !already_connected {
                     if let Err(e) = self.swarm.dial(addr.clone()) {
-                        debug!(addr = %addr, error = %e, "Bootstrap redial failed");
+                        warn!(addr = %addr, error = %e, "Bootstrap redial failed");
                     } else {
-                        debug!(addr = %addr, "Redialing bootstrap node");
+                        info!(addr = %addr, "Redialing bootstrap node");
                     }
                 }
             }
