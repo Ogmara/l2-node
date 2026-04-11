@@ -52,8 +52,8 @@ pub struct NetworkConfig {
     /// libp2p listen port (default: 41720).
     #[serde(default = "default_listen_port")]
     pub listen_port: u16,
-    /// Bootstrap node multiaddresses.
-    #[serde(default)]
+    /// Bootstrap node multiaddresses for peer discovery.
+    #[serde(default = "default_bootstrap_nodes")]
     pub bootstrap_nodes: Vec<String>,
     /// Maximum peer connections.
     #[serde(default = "default_max_peers")]
@@ -67,7 +67,7 @@ impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
             listen_port: default_listen_port(),
-            bootstrap_nodes: Vec::new(),
+            bootstrap_nodes: default_bootstrap_nodes(),
             max_peers: default_max_peers(),
             enable_mdns: true,
         }
@@ -552,6 +552,12 @@ fn default_listen_port() -> u16 {
 fn default_max_peers() -> u32 {
     50
 }
+fn default_bootstrap_nodes() -> Vec<String> {
+    vec![
+        "/dns4/node.ogmara.org/tcp/41720/p2p/12D3KooWNx9TnsmVQux3fMm6sUUe5tFdeXjECUSyDqYtYfsbt3Mo".to_string(),
+        "/dns4/node.ogmara.org/udp/41720/quic-v1/p2p/12D3KooWNx9TnsmVQux3fMm6sUUe5tFdeXjECUSyDqYtYfsbt3Mo".to_string(),
+    ]
+}
 fn default_scan_interval() -> u64 {
     3000
 }
@@ -678,7 +684,12 @@ data_dir = "./data"
 
 [network]
 listen_port = 41720
-bootstrap_nodes = []
+# Official Ogmara bootstrap nodes — required for peer discovery.
+# New nodes must connect to at least one bootstrap node to join the network.
+bootstrap_nodes = [
+    "/dns4/node.ogmara.org/tcp/41720/p2p/12D3KooWNx9TnsmVQux3fMm6sUUe5tFdeXjECUSyDqYtYfsbt3Mo",
+    "/dns4/node.ogmara.org/udp/41720/quic-v1/p2p/12D3KooWNx9TnsmVQux3fMm6sUUe5tFdeXjECUSyDqYtYfsbt3Mo",
+]
 max_peers = 50
 enable_mdns = true
 
