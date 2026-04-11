@@ -43,6 +43,8 @@ pub struct AppState {
     pub klever_network: String,
     /// Ogmara KApp smart contract address (from config).
     pub contract_address: String,
+    /// Node's Klever wallet address (klv1...).
+    pub node_address: String,
     /// IPFS client for media upload/retrieval (None if IPFS not configured).
     pub ipfs: Option<IpfsClient>,
     /// Device-to-wallet identity resolver (cached lookups).
@@ -112,6 +114,7 @@ impl AppState {
             metrics_history,
             alert_history,
             None, // PoW disabled in test/simplified constructor
+            String::new(), // node_address not needed in test constructor
         )
     }
 
@@ -140,6 +143,7 @@ impl AppState {
         metrics_history: Arc<RwLock<RingBuffer<MetricsSnapshot>>>,
         alert_history: SharedAlertHistory,
         pow: Option<Arc<PowManager>>,
+        node_address: String,
     ) -> Self {
         Self {
             storage,
@@ -150,6 +154,7 @@ impl AppState {
             ws_broadcast,
             klever_network,
             contract_address,
+            node_address,
             ipfs,
             identity,
             public_url,

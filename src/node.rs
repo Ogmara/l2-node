@@ -418,6 +418,7 @@ impl Node {
         let klever_network = self.config.network_id().to_string();
 
         // Start metrics collector (spec 10-dashboard.md §6)
+        let node_address = self.address().unwrap_or_default();
         let metrics_collector = crate::metrics::MetricsCollector::new(
             self.config.metrics.clone(),
             self.storage.clone(),
@@ -426,6 +427,8 @@ impl Node {
             network_counters.clone(),
             &self.config.node.data_dir.to_string_lossy(),
             self.node_id.clone(),
+            self.config.klever.api_url.clone(),
+            node_address.clone(),
         );
         let metrics_latest = metrics_collector.latest_handle();
         let metrics_history = metrics_collector.history_handle();
@@ -477,6 +480,7 @@ impl Node {
             metrics_history,
             alert_history,
             pow_manager.clone(),
+            node_address,
         ));
         // Periodic cleanup task: evict stale rate limit entries and expired PoW challenges.
         // Runs every 5 minutes to prevent unbounded memory growth.
