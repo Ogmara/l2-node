@@ -1,6 +1,6 @@
 [package]
 name = "ogmara-node"
-version = "0.27.2"
+version = "0.27.3"
 edition = "2021"
 authors = ["Ogmara Contributors"]
 license = "MIT"
@@ -36,7 +36,7 @@ rocksdb = "0.24"
 
 # Networking
 libp2p = { version = "0.56", features = [
-    "gossipsub", "kad", "mdns", "quic", "tcp",
+    "gossipsub", "kad", "mdns", "quic", "tcp", "dns",
     "noise", "yamux", "identify", "request-response",
     "memory-connection-limits",
     "tokio", "ed25519", "macros", "cbor",

@@ -5,6 +5,17 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.27.3] - 2026-04-11
+
+### Fixed
+- **DNS bootstrap nodes couldn't resolve** — the libp2p swarm was built without
+  the DNS transport (`.with_dns()`), so `/dns4/node.ogmara.org/...` multiaddrs
+  silently failed to dial. Added `dns` feature to libp2p and `.with_dns()` to
+  the swarm builder. This was the root cause of new nodes not connecting to the
+  network even with bootstrap nodes configured.
+- **Bootstrap redial errors invisible** — dial failures were logged at `debug`
+  level, invisible at default `info` log level. Upgraded to `warn`/`info`.
+
 ## [0.27.2] - 2026-04-11
 
 ### Added
