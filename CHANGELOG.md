@@ -5,6 +5,23 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.30.0] - 2026-04-11
+
+### Added
+- **`ogmara-node export-key`** — exports the node's Ed25519 private key to a file
+  for backup. Includes address and node ID in comments, sets 0600 permissions.
+  Prevents fund loss when the data directory is deleted or migrated.
+- **`ogmara-node import-key`** — imports a previously exported key into the node's
+  database. Restores the node's identity (wallet address, peer ID) after a data
+  wipe, server migration, or disaster recovery.
+- **Startup wallet address log** — the node now logs its Klever wallet address at
+  startup with a reminder to back up the key.
+
+### Changed
+- **Documentation warnings** — all docs mentioning `rm -rf data` now include
+  prominent warnings about private key loss and instructions to `export-key` first.
+  Updated 03-l2-node.md spec and BUILDING.md.
+
 ## [0.29.2] - 2026-04-11
 
 ### Added
