@@ -5,6 +5,16 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.30.1] - 2026-04-11
+
+### Fixed
+- **Config file auto-discovery** — all subcommands (`run`, `identity`, `export-key`,
+  `import-key`) now auto-detect the config file at common locations
+  (`/etc/ogmara/ogmara.toml`, `/etc/ogmara-node/ogmara.toml`) if the default
+  `ogmara.toml` doesn't exist in the current directory. Previously, running
+  `ogmara-node export-key` on a server failed with "No such file" because the
+  config was in `/etc/ogmara/` but the command expected `./ogmara.toml`.
+
 ## [0.30.0] - 2026-04-11
 
 ### Added

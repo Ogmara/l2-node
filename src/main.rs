@@ -30,11 +30,31 @@ use tracing::info;
 #[command(version)]
 struct Cli {
     /// Path to configuration file.
+    /// Checked in order: provided path, /etc/ogmara/ogmara.toml, ./ogmara.toml
     #[arg(short, long, default_value = "ogmara.toml")]
     config: PathBuf,
 
     #[command(subcommand)]
     command: Option<Commands>,
+}
+
+/// Resolve the config file path — tries the provided path first, then common locations.
+fn resolve_config(path: &std::path::Path) -> PathBuf {
+    if path.exists() {
+        return path.to_path_buf();
+    }
+    // Try common system locations
+    let alternatives = [
+        std::path::PathBuf::from("/etc/ogmara/ogmara.toml"),
+        std::path::PathBuf::from("/etc/ogmara-node/ogmara.toml"),
+    ];
+    for alt in &alternatives {
+        if alt.exists() {
+            return alt.clone();
+        }
+    }
+    // Return original path (will fail with a clear error message)
+    path.to_path_buf()
 }
 
 #[derive(Subcommand)]
@@ -86,7 +106,8 @@ async fn main() -> Result<()> {
         }
 
         Commands::Run => {
-            let cfg = config::Config::load(&cli.config)?;
+            let config_path = resolve_config(&cli.config);
+            let cfg = config::Config::load(&config_path)?;
             init_logging(&cfg.logging);
             info!("Ogmara L2 Node v{}", env!("CARGO_PKG_VERSION"));
 
@@ -95,7 +116,8 @@ async fn main() -> Result<()> {
         }
 
         Commands::Identity => {
-            let cfg = config::Config::load(&cli.config)?;
+            let config_path = resolve_config(&cli.config);
+            let cfg = config::Config::load(&config_path)?;
             init_logging(&cfg.logging);
 
             let node = node::Node::init(cfg).await?;
@@ -109,7 +131,8 @@ async fn main() -> Result<()> {
         }
 
         Commands::ExportKey { output } => {
-            let cfg = config::Config::load(&cli.config)?;
+            let config_path = resolve_config(&cli.config);
+            let cfg = config::Config::load(&config_path)?;
             init_logging(&cfg.logging);
 
             if output.exists() {
@@ -155,7 +178,8 @@ async fn main() -> Result<()> {
         }
 
         Commands::ImportKey { input } => {
-            let cfg = config::Config::load(&cli.config)?;
+            let config_path = resolve_config(&cli.config);
+            let cfg = config::Config::load(&config_path)?;
             init_logging(&cfg.logging);
 
             if !input.exists() {
