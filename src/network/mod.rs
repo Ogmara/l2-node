@@ -408,9 +408,11 @@ impl NetworkService {
                         self.swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
                     }
                 }
-                // Store address for reconnection
+                // Store address for reconnection (capped to prevent unbounded growth)
                 if let Some(addr) = first_addr {
-                    self.known_peer_addrs.insert(peer_id, addr);
+                    if self.known_peer_addrs.len() < 2048 || self.known_peer_addrs.contains_key(&peer_id) {
+                        self.known_peer_addrs.insert(peer_id, addr);
+                    }
                 }
                 // Remove from reconnect queue if it was pending (successfully connected)
                 self.reconnect_queue.retain(|e| e.peer_id != peer_id);
@@ -614,13 +616,15 @@ impl NetworkService {
                 continue;
             }
 
-            // Max attempts exceeded? Give up.
+            // Max attempts exceeded? Give up and clean up known address.
             if entry.attempts >= MAX_RECONNECT_ATTEMPTS {
+                let peer = entry.peer_id;
                 debug!(
-                    peer = %entry.peer_id,
+                    peer = %peer,
                     attempts = entry.attempts,
                     "Giving up on reconnection"
                 );
+                self.known_peer_addrs.remove(&peer);
                 self.reconnect_queue.swap_remove(i);
                 continue;
             }
@@ -670,6 +674,12 @@ impl NetworkService {
             Some(a) => a.clone(),
             None => return, // no address known, can't reconnect
         };
+
+        // Cap queue size to prevent unbounded growth from mass disconnections
+        if self.reconnect_queue.len() >= 128 {
+            debug!("Reconnect queue full, dropping oldest entry");
+            self.reconnect_queue.remove(0);
+        }
 
         self.reconnect_queue.push(ReconnectEntry {
             peer_id,
