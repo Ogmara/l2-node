@@ -5,6 +5,15 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.30.4] - 2026-04-11
+
+### Fixed
+- **Device registration 500 on corrupted entries** — `list_devices` fails to
+  deserialize pre-v0.15 device claims (JSON/MessagePack format mismatch),
+  causing a 500 that permanently blocks wallet connection. Now logs a warning
+  and proceeds with registration instead of crashing. The new valid device
+  claim overwrites the corrupted data.
+
 ## [0.30.3] - 2026-04-11
 
 ### Fixed
