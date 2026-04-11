@@ -20,7 +20,7 @@ mod notifications;
 
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use tracing::info;
 
@@ -118,14 +118,27 @@ async fn main() -> Result<()> {
         Commands::Identity => {
             let config_path = resolve_config(&cli.config);
             let cfg = config::Config::load(&config_path)?;
-            init_logging(&cfg.logging);
 
-            let node = node::Node::init(cfg).await?;
-            println!("Node ID:     {}", node.node_id);
-            println!("Public Key:  {}", hex::encode(node.public_key().as_bytes()));
-            match node.address() {
-                Ok(addr) => println!("Address:     {}", addr),
-                Err(e) => println!("Address:     error: {}", e),
+            // Read key using read-only DB access (works while node is running)
+            let db_path = cfg.node.data_dir.join("db");
+            match storage::rocks::Storage::read_node_key_readonly(&db_path)? {
+                Some(key_bytes) => {
+                    let signing_key = ed25519_dalek::SigningKey::from_bytes(&key_bytes);
+                    let node_id = {
+                        use sha2::{Digest, Sha256};
+                        let hash = Sha256::digest(signing_key.verifying_key().as_bytes());
+                        bs58::encode(&hash[..20]).into_string()
+                    };
+                    println!("Node ID:     {}", node_id);
+                    println!("Public Key:  {}", hex::encode(signing_key.verifying_key().as_bytes()));
+                    match crypto::pubkey_to_address(&signing_key.verifying_key()) {
+                        Ok(addr) => println!("Address:     {}", addr),
+                        Err(e) => println!("Address:     error: {}", e),
+                    }
+                }
+                None => {
+                    println!("No node key found. Has the node been started at least once?");
+                }
             }
             Ok(())
         }
@@ -133,7 +146,6 @@ async fn main() -> Result<()> {
         Commands::ExportKey { output } => {
             let config_path = resolve_config(&cli.config);
             let cfg = config::Config::load(&config_path)?;
-            init_logging(&cfg.logging);
 
             if output.exists() {
                 anyhow::bail!(
@@ -143,11 +155,26 @@ async fn main() -> Result<()> {
                 );
             }
 
-            let node = node::Node::init(cfg).await?;
-            let address = node.address().unwrap_or_else(|_| "unknown".to_string());
+            // Read key directly from RocksDB using read-only open — works
+            // even while the node is running (no write lock needed).
+            let db_path = cfg.node.data_dir.join("db");
+            let key_bytes = storage::rocks::Storage::read_node_key_readonly(&db_path)
+                .context("reading node key from database")?
+                .ok_or_else(|| anyhow::anyhow!(
+                    "no node key found in {}. Has the node been started at least once?",
+                    db_path.display()
+                ))?;
 
-            // Write key as hex + address for verification
-            let key_hex = hex::encode(node.signing_key.to_bytes());
+            let signing_key = ed25519_dalek::SigningKey::from_bytes(&key_bytes);
+            let address = crypto::pubkey_to_address(&signing_key.verifying_key())
+                .unwrap_or_else(|_| "unknown".to_string());
+            let node_id = {
+                use sha2::{Digest, Sha256};
+                let hash = Sha256::digest(signing_key.verifying_key().as_bytes());
+                bs58::encode(&hash[..20]).into_string()
+            };
+
+            let key_hex = hex::encode(signing_key.to_bytes());
             let content = format!(
                 "# Ogmara Node Key Backup\n\
                  # Address: {}\n\
@@ -156,12 +183,11 @@ async fn main() -> Result<()> {
                  # Anyone with this key can impersonate your node and spend its funds.\n\
                  # Store securely. Never share. Never commit to git.\n\
                  {}\n",
-                address, node.node_id, key_hex
+                address, node_id, key_hex
             );
 
             std::fs::write(&output, content.as_bytes())?;
 
-            // Set restrictive permissions (owner-only read)
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -170,7 +196,7 @@ async fn main() -> Result<()> {
 
             println!("Key exported to: {}", output.display());
             println!("Address:         {}", address);
-            println!("Node ID:         {}", node.node_id);
+            println!("Node ID:         {}", node_id);
             println!();
             println!("WARNING: Store this file securely. It contains your node's private key.");
             println!("         Anyone with this file can impersonate your node and spend its funds.");

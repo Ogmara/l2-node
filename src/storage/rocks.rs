@@ -65,6 +65,42 @@ pub struct Storage {
 }
 
 impl Storage {
+    /// Read the node's private key from a RocksDB database using read-only mode.
+    ///
+    /// This works even while the node is running (no write lock). Used by the
+    /// `export-key` CLI command to back up the key without stopping the node.
+    pub fn read_node_key_readonly(db_path: &Path) -> Result<Option<[u8; 32]>> {
+        let mut db_opts = Options::default();
+        db_opts.create_if_missing(false);
+
+        let cf_names: Vec<String> = match DBWithThreadMode::<MultiThreaded>::list_cf(&db_opts, db_path) {
+            Ok(names) => names,
+            Err(_) => return Ok(None), // DB doesn't exist yet
+        };
+
+        let cf_descriptors: Vec<ColumnFamilyDescriptor> = cf_names
+            .iter()
+            .map(|name| ColumnFamilyDescriptor::new(name.as_str(), Options::default()))
+            .collect();
+
+        let db = DBWithThreadMode::<MultiThreaded>::open_cf_descriptors_read_only(
+            &db_opts, db_path, cf_descriptors, false,
+        ).map_err(|e| anyhow::anyhow!("opening RocksDB read-only: {}", e))?;
+
+        let cf = db.cf_handle(cf::NODE_STATE)
+            .ok_or_else(|| anyhow::anyhow!("NODE_STATE CF not found"))?;
+
+        match db.get_cf(&cf, super::schema::state_keys::NODE_PRIVATE_KEY)
+            .map_err(|e| anyhow::anyhow!("reading node key: {}", e))? {
+            Some(bytes) if bytes.len() == 32 => {
+                let mut key = [0u8; 32];
+                key.copy_from_slice(&bytes);
+                Ok(Some(key))
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// Open or create the RocksDB database at the given path.
     ///
     /// Creates all column families defined in the schema if they don't exist.

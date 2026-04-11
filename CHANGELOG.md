@@ -5,6 +5,15 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.30.2] - 2026-04-11
+
+### Fixed
+- **`export-key` and `identity` work while node is running** — these commands
+  used `Node::init()` which requires a write lock on RocksDB, failing with
+  "Resource temporarily unavailable" when the node process holds the lock.
+  Now uses a read-only RocksDB open (`open_cf_descriptors_read_only`) that
+  coexists with the running node's write lock.
+
 ## [0.30.1] - 2026-04-11
 
 ### Fixed
