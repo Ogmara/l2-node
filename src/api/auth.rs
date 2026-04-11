@@ -140,11 +140,19 @@ fn extract_and_verify(req: &Request, app_state: &AppState) -> Result<AuthUser, S
 
     signing::verify_auth_header(&verifying_key, timestamp, method, path, &signature)
         .map_err(|e| {
+            // Debug: log the exact auth string and hash for comparison with client
+            let auth_string = format!("ogmara-auth:{}:{}:{}", timestamp, method, path);
+            let klever_hash = signing::klever_message_hash(auth_string.as_bytes());
             tracing::warn!(
                 address = %address,
                 method = %method,
                 path = %path,
                 timestamp = %timestamp,
+                auth_string = %auth_string,
+                auth_string_len = %auth_string.len(),
+                klever_hash = %hex::encode(klever_hash),
+                sig_hex = %hex::encode(signature.to_bytes()),
+                pubkey_hex = %hex::encode(verifying_key.as_bytes()),
                 error = %e,
                 "Auth signature verification failed"
             );
