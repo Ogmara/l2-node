@@ -5,6 +5,16 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.30.3] - 2026-04-11
+
+### Fixed
+- **PoW challenge response includes resolved address** — the 429 `pow_required`
+  response now includes an `address` field with the exact resolved author
+  address the challenge was issued for. This lets the SDK submit the correct
+  address without guessing, fixing mismatches when device registration hasn't
+  completed yet.
+- Added detailed debug logging for auth signature failures (temporary diagnostic).
+
 ## [0.30.2] - 2026-04-11
 
 ### Fixed
