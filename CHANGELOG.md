@@ -5,6 +5,29 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.30.5] - 2026-05-02
+
+### Fixed
+- **Chain scanner overwrote L2-only channel fields** — both `ChannelCreated`
+  and `ChannelTransferred` event handlers rebuilt the `CHANNELS[id]` row from
+  a struct that only knew `display_name`, `description`, `member_count`.
+  Fields written by L2 `ChannelUpdate` envelopes (`logo_cid`, `banner_cid`,
+  `website_url`, `tags`) were silently dropped on every overwrite. Symptom:
+  public channel avatars and banners disappeared after node restart, chain
+  re-scan, or any on-chain event that re-emitted `ChannelCreated` /
+  `ChannelTransferred`. Private channels were unaffected because they have
+  no on-chain footprint.
+
+  Both handlers now JSON-merge into the existing record instead of struct-
+  serializing — only the on-chain authoritative fields are overwritten
+  (`channel_id`, `slug`, `creator`, `channel_type`, `created_at` for
+  ChannelCreated; `creator` for ChannelTransferred), every other field
+  survives intact. New channels still get the canonical `ChannelRecord`
+  skeleton on first sight. Future L2-only fields are preserved automatically
+  without requiring scanner changes. Corrupted-JSON and non-object record
+  shapes are now logged via `tracing::warn!`/`error!` instead of silently
+  swallowed or aborting the entire scan tick.
+
 ## [0.30.4] - 2026-04-11
 
 ### Fixed
