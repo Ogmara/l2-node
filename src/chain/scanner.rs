@@ -476,38 +476,59 @@ impl ChainScanner {
                 // Only increment counter for genuinely new channels (idempotent on re-scan)
                 let is_new = !self.storage.exists_cf(cf::CHANNELS, &channel_key)?;
 
-                // If L2 ChannelCreate envelope already stored metadata (with display_name
-                // and description), preserve those fields. The chain scanner only knows
-                // what's on-chain (slug, type, creator), not the L2-only fields.
-                let (display_name, description, member_count) = if !is_new {
-                    if let Ok(Some(existing)) = self.storage.get_cf(cf::CHANNELS, &channel_key) {
-                        if let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&existing) {
-                            (
-                                meta.get("display_name").and_then(|v| v.as_str()).map(String::from),
-                                meta.get("description").and_then(|v| v.as_str()).map(String::from),
-                                meta.get("member_count").and_then(|v| v.as_u64()).unwrap_or(0),
-                            )
-                        } else {
-                            (None, None, 0)
-                        }
+                // If a record already exists (from prior on-chain re-scan or L2
+                // ChannelUpdate envelope), JSON-merge: overwrite only the
+                // on-chain authoritative fields and preserve every L2-only
+                // field (display_name, description, member_count, logo_cid,
+                // banner_cid, website_url, tags, and anything added later).
+                // This avoids dropping L2 metadata on re-scan, which previously
+                // erased channel avatars/banners on public channels every time
+                // the scanner re-processed their ChannelCreated event.
+                let bytes = if let Ok(Some(existing)) = self.storage.get_cf(cf::CHANNELS, &channel_key) {
+                    let mut meta = serde_json::from_slice::<serde_json::Value>(&existing)
+                        .unwrap_or_else(|e| {
+                            tracing::error!(
+                                channel_id,
+                                error = %e,
+                                "CHANNELS record failed to parse as JSON — rebuilding from on-chain fields"
+                            );
+                            serde_json::json!({})
+                        });
+                    if let Some(obj) = meta.as_object_mut() {
+                        obj.insert("channel_id".into(), serde_json::json!(channel_id));
+                        obj.insert("slug".into(), serde_json::json!(slug.clone()));
+                        obj.insert("creator".into(), serde_json::json!(creator.clone()));
+                        obj.insert("channel_type".into(), serde_json::json!(channel_type));
+                        obj.insert("created_at".into(), serde_json::json!(timestamp));
+                        // Default missing L2-only fields without overwriting present ones
+                        obj.entry("display_name").or_insert(serde_json::Value::Null);
+                        obj.entry("description").or_insert(serde_json::Value::Null);
+                        obj.entry("member_count").or_insert(serde_json::json!(0));
+                        serde_json::to_vec(&meta)?
                     } else {
-                        (None, None, 0)
+                        // Existing record is JSON but not an object — skip the
+                        // merge (don't abort the whole batch) and keep going.
+                        tracing::warn!(
+                            channel_id,
+                            "CHANNELS record is not a JSON object — skipping merge"
+                        );
+                        return Ok(());
                     }
                 } else {
-                    (None, None, 0)
+                    // First time we've seen this channel — write the canonical
+                    // ChannelRecord with no L2 fields populated yet.
+                    let record = ChannelRecord {
+                        channel_id,
+                        slug: slug.clone(),
+                        creator: creator.clone(),
+                        channel_type,
+                        created_at: timestamp,
+                        display_name: None,
+                        description: None,
+                        member_count: 0,
+                    };
+                    serde_json::to_vec(&record)?
                 };
-
-                let record = ChannelRecord {
-                    channel_id,
-                    slug,
-                    creator,
-                    channel_type,
-                    created_at: timestamp,
-                    display_name,
-                    description,
-                    member_count,
-                };
-                let bytes = serde_json::to_vec(&record)?;
                 self.storage
                     .put_cf(cf::CHANNELS, &channel_key, &bytes)?;
                 if is_new {
@@ -517,7 +538,7 @@ impl ChainScanner {
 
                     // Add creator as first member with "creator" role
                     let member_key = crate::storage::schema::encode_channel_member_key(
-                        channel_id, &record.creator,
+                        channel_id, &creator,
                     );
                     let member_record = serde_json::json!({
                         "joined_at": timestamp,
@@ -530,7 +551,7 @@ impl ChainScanner {
                 // Notify network layer to subscribe to this channel's GossipSub topic
                 let _ = self.channel_tx.send(channel_id);
 
-                info!(channel_id, slug = %record.slug, "Channel created (on-chain)");
+                info!(channel_id, slug = %slug, "Channel created (on-chain)");
             }
 
             ScEvent::ChannelTransferred {
@@ -542,12 +563,30 @@ impl ChainScanner {
                     self.storage
                         .get_cf(cf::CHANNELS, &channel_id.to_be_bytes())?
                 {
-                    let mut record: ChannelRecord = serde_json::from_slice(&existing)?;
-                    record.creator = to;
-                    let bytes = serde_json::to_vec(&record)?;
-                    self.storage
-                        .put_cf(cf::CHANNELS, &channel_id.to_be_bytes(), &bytes)?;
-                    info!(channel_id, "Channel transferred (on-chain)");
+                    // JSON-merge to preserve L2-only fields (logo_cid, banner_cid,
+                    // website_url, tags). Same rationale as ChannelCreated above:
+                    // struct round-trip would silently drop them.
+                    let mut meta = serde_json::from_slice::<serde_json::Value>(&existing)
+                        .unwrap_or_else(|e| {
+                            tracing::error!(
+                                channel_id,
+                                error = %e,
+                                "CHANNELS record corrupted on transfer — rebuilding from on-chain fields"
+                            );
+                            serde_json::json!({})
+                        });
+                    if let Some(obj) = meta.as_object_mut() {
+                        obj.insert("creator".into(), serde_json::json!(to));
+                        let bytes = serde_json::to_vec(&meta)?;
+                        self.storage
+                            .put_cf(cf::CHANNELS, &channel_id.to_be_bytes(), &bytes)?;
+                        info!(channel_id, "Channel transferred (on-chain)");
+                    } else {
+                        tracing::warn!(
+                            channel_id,
+                            "CHANNELS record is not a JSON object — skipping transfer write"
+                        );
+                    }
                 }
             }
 
