@@ -184,6 +184,19 @@ pub fn validate_channel_update(p: &ChannelUpdatePayload) -> Result<(), Validatio
             }
         }
     }
+    // Reject the whole envelope when the runtime channel_type flip targets
+    // Private. Switching to or from Private is not supported post-creation
+    // (different storage, discovery, and key-distribution model). Failing the
+    // entire payload here gives atomic semantics: clients see a clear
+    // rejection instead of "some fields applied, the type flip didn't".
+    // See protocol spec §3.6 — L2-mutable channel_type only flips Public ⇄ ReadPublic.
+    if let Some(new_type) = p.channel_type {
+        if new_type == ChannelType::Private {
+            return Err(ValidationError(
+                "channel_type cannot be flipped to Private post-creation".into(),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -694,4 +707,81 @@ pub fn validate_news_repost(author: &str, p: &NewsRepostPayload) -> Result<(), V
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_update(channel_id: u64) -> ChannelUpdatePayload {
+        ChannelUpdatePayload {
+            channel_id,
+            display_name: None,
+            description: None,
+            content_rating: None,
+            moderation: None,
+            logo_cid: None,
+            banner_cid: None,
+            website_url: None,
+            tags: None,
+            channel_type: None,
+            threads_enabled: None,
+        }
+    }
+
+    #[test]
+    fn channel_update_accepts_no_type_change() {
+        let p = empty_update(1);
+        assert!(validate_channel_update(&p).is_ok());
+    }
+
+    #[test]
+    fn channel_update_accepts_flip_to_public() {
+        let mut p = empty_update(1);
+        p.channel_type = Some(ChannelType::Public);
+        assert!(validate_channel_update(&p).is_ok());
+    }
+
+    #[test]
+    fn channel_update_accepts_flip_to_readpublic() {
+        let mut p = empty_update(1);
+        p.channel_type = Some(ChannelType::ReadPublic);
+        assert!(validate_channel_update(&p).is_ok());
+    }
+
+    #[test]
+    fn channel_update_rejects_flip_to_private() {
+        let mut p = empty_update(1);
+        p.channel_type = Some(ChannelType::Private);
+        let err = validate_channel_update(&p)
+            .expect_err("flip to Private must be rejected at validation");
+        assert!(
+            err.0.contains("Private"),
+            "error message should mention Private, got: {}",
+            err.0
+        );
+    }
+
+    #[test]
+    fn channel_update_rejects_private_flip_atomically() {
+        // The whole envelope is rejected — sibling fields don't get partial-applied
+        // because the validation step short-circuits the entire payload.
+        let mut p = empty_update(1);
+        p.display_name = Some("New Name".into());
+        p.description = Some("New Description".into());
+        p.channel_type = Some(ChannelType::Private);
+        assert!(
+            validate_channel_update(&p).is_err(),
+            "Private flip in any combination must reject the whole payload"
+        );
+    }
+
+    #[test]
+    fn channel_update_accepts_threads_enabled_toggle() {
+        let mut p = empty_update(1);
+        p.threads_enabled = Some(true);
+        assert!(validate_channel_update(&p).is_ok());
+        p.threads_enabled = Some(false);
+        assert!(validate_channel_update(&p).is_ok());
+    }
 }
