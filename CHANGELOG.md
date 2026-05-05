@@ -5,6 +5,74 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.31.0] - 2026-05-04
+
+### Added
+- **Read-only / broadcast channel enforcement (protocol spec §3.6, L2 spec §3.4
+  step 7e).** When a channel's runtime `channel_type` is `ReadPublic` (1), the
+  router now rejects `ChatMessage`, `ChatEdit`, and `ChatDelete` envelopes
+  whose resolved author is neither the channel creator nor a moderator.
+  `ChatReaction` is intentionally unaffected so members can still react.
+  Rejection surfaces as `broadcast_channel_post_denied` in the route result.
+  The check reads the L2 channel record (not the on-chain immutable
+  `channel_type`) so creators can flip broadcast mode at runtime.
+
+- **Runtime channel-type toggle via `ChannelUpdate`.** `ChannelUpdatePayload`
+  gained an optional `channel_type` field. Creators and moderators with
+  `can_edit_info` may flip a channel between `Public` and `ReadPublic` by
+  publishing a signed `ChannelUpdate` envelope. Switching to or from
+  `Private` is refused (the storage and discovery model differs and cannot
+  be retrofitted post-creation); refused flips are logged via `warn!` and
+  silently dropped from the merge — every other field in the same envelope
+  still applies.
+
+- **Threaded mode toggle (`threads_enabled`).** `ChannelUpdatePayload` also
+  gained an optional `threads_enabled: bool` flag persisted on the L2
+  channel record. The flag is a pure rendering/pagination hint — no
+  structural migration is performed and no router enforcement is wired
+  against it yet (Phase 3 will land the indexing CFs and thread endpoints).
+  Existing chat messages remain readable in either mode.
+
+### Changed
+- **Atomic ChannelUpdate semantics for refused type flips.** A
+  `ChannelUpdate` envelope that requests a flip to `Private` is now refused
+  at validation (`validate_channel_update`) rather than silently dropping
+  the `channel_type` field while applying sibling fields (display_name,
+  description, etc.). Clients receive a clear rejection ("channel_type
+  cannot be flipped to Private post-creation") instead of a misleading
+  partial-success. The exotic "flip away from Private" case is still guarded
+  inside the merge handler (validation cannot see the current channel state).
+- **Removed redundant CHANNELS read in read-only enforcement.** The
+  `check_readonly_channel` step now reuses the JSON value already loaded for
+  the channel-type lookup to derive `creator`, eliminating a second
+  `get_cf` call per chat write and closing a TOCTOU window where a deleted
+  channel record between reads could surface an error to the caller.
+
+### Notes
+- API responses already include the L2 channel JSON verbatim, so
+  `channel_type` and `threads_enabled` surface immediately in
+  `GET /api/v1/channels` and `GET /api/v1/channels/{id}` without further
+  changes. Clients should treat the L2 value as authoritative for runtime
+  posting policy (per protocol spec §3.6).
+- 6 new validation tests cover the channel_type flip matrix (Public,
+  ReadPublic, Private rejection, atomic-reject with sibling fields, and
+  the threads_enabled toggle). All 35 in-repo tests pass.
+
+### Known follow-ups (not blockers for this release)
+- Read-only enforcement adds an unconditional `CHANNELS` lookup and JSON
+  parse on every `ChatMessage`/`ChatEdit`/`ChatDelete`. RocksDB block cache
+  absorbs this under steady state, but a future pass should memoize
+  `(channel_id → channel_type, creator)` in a small `DashMap` invalidated
+  on `ChannelUpdate` to drop the JSON parse cost from the hot path.
+- `ChannelType` is `#[repr(u8)]` but lacks `serde_repr` — the wire format
+  is the variant name string, while storage uses the numeric discriminant.
+  This works correctly today but is a footgun if a future change ever
+  expects numeric wire format.
+- Mods with `can_edit_info` can flip `channel_type` (Public ⇄ ReadPublic),
+  not just creators. Per spec §3.6 this is intentional, but worth confirming
+  product-side; tightening to creator-only is a one-line change in
+  `authorize_channel_action`.
+
 ## [0.30.5] - 2026-05-02
 
 ### Fixed

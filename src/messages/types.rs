@@ -355,6 +355,18 @@ pub struct ChannelUpdatePayload {
     /// Channel topic tags, max 5.
     #[serde(default)]
     pub tags: Option<Vec<String>>,
+    /// L2-mutable runtime channel type. Allows flipping a channel between
+    /// `Public` and `ReadPublic` at runtime (broadcast mode toggle). Switching
+    /// to or from `Private` is rejected — Private channels have a different
+    /// storage and discovery model and cannot be retrofitted post-creation.
+    /// See protocol spec §3.6 for the full L2-mutable channel type semantics.
+    #[serde(default)]
+    pub channel_type: Option<ChannelType>,
+    /// Toggle between single-post and threaded posting mode. Default `None`
+    /// (no change). Affects rendering and pagination only — past messages
+    /// remain readable in either mode. See protocol spec §3.6.
+    #[serde(default)]
+    pub threads_enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

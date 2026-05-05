@@ -308,6 +308,13 @@ impl MessageRouter {
             return RouteResult::Rejected(format!("edit/delete denied: {}", e));
         }
 
+        // Step 7e: Read-only / broadcast channel enforcement — only creator and
+        // moderators can post ChatMessage / ChatEdit / ChatDelete in ReadPublic
+        // channels. Reactions remain open to all members. See protocol spec §3.6.
+        if let Err(e) = self.check_readonly_channel(&envelope, &resolved_author) {
+            return RouteResult::Rejected(format!("broadcast_channel_post_denied: {}", e));
+        }
+
         // Step 8: Store message (atomically increments total_messages counter)
         if let Err(e) = self.storage.store_message(&envelope.msg_id, raw_bytes) {
             return RouteResult::Rejected(format!("storage error: {}", e));
@@ -593,6 +600,85 @@ impl MessageRouter {
             Ok(true) => Err(format!("user is muted in channel {}", channel_id)),
             _ => Ok(()),
         }
+    }
+
+    /// Enforce read-only / broadcast channel posting policy (protocol spec §3.6).
+    ///
+    /// When the channel's runtime `channel_type` is `ReadPublic` (1), only the
+    /// channel creator and moderators can publish `ChatMessage`, `ChatEdit`,
+    /// or `ChatDelete`. `ChatReaction` is intentionally allowed for all
+    /// members so read-only channels remain socially interactive. All other
+    /// message types fall through unaffected.
+    ///
+    /// The check reads the L2 channel record (not the on-chain immutable
+    /// channel_type) so creators can flip broadcast mode at runtime via
+    /// `ChannelUpdate`. If the channel record is missing, the check is a
+    /// no-op — other pipeline steps already reject orphan messages.
+    fn check_readonly_channel(&self, envelope: &Envelope, resolved_author: &str) -> Result<(), String> {
+        // Only gates write actions on chat content. Reactions and admin/control
+        // messages have their own authorization paths.
+        match envelope.msg_type {
+            MessageType::ChatMessage | MessageType::ChatEdit | MessageType::ChatDelete => {}
+            _ => return Ok(()),
+        }
+        let channel_id = match self.extract_channel_id(envelope) {
+            Some(id) => id,
+            None => return Ok(()),
+        };
+        let key = channel_id.to_be_bytes();
+        let data = match self.storage.get_cf(schema::cf::CHANNELS, &key) {
+            Ok(Some(d)) => d,
+            // Channel not found: let downstream handle it. A truly orphan write
+            // will be rejected by validation/index pathways.
+            Ok(None) => return Ok(()),
+            Err(e) => return Err(format!("storage error: {}", e)),
+        };
+        let meta: serde_json::Value = match serde_json::from_slice(&data) {
+            Ok(m) => m,
+            Err(_) => return Ok(()), // corrupt metadata — fail open, log elsewhere
+        };
+        // Tolerate both numeric and legacy string encodings for channel_type
+        // (an older migration normalized strings → u8, but defensive parsing
+        // here keeps the gate working even on unmigrated rows).
+        let channel_type = match meta.get("channel_type") {
+            Some(serde_json::Value::Number(n)) => n.as_u64().unwrap_or(0),
+            Some(serde_json::Value::String(s)) => match s.as_str() {
+                "Public" => 0,
+                "ReadPublic" => 1,
+                "Private" => 2,
+                _ => 0,
+            },
+            _ => 0,
+        };
+        if channel_type != 1 {
+            // Not ReadPublic — no read-only policy to enforce.
+            return Ok(());
+        }
+        // Allow creator and moderators (any permission level — creator/mod
+        // status is the authorization, not a specific permission flag).
+        // Use the already-loaded `meta` to read `creator` directly — avoids a
+        // second CHANNELS read and removes a TOCTOU window if the channel
+        // record were deleted between reads (use unwrap_or(false) on the mod
+        // check for the same reason; missing data ⇒ deny, not error).
+        let is_creator = meta
+            .get("creator")
+            .and_then(|v| v.as_str())
+            .map(|c| c == resolved_author)
+            .unwrap_or(false);
+        if is_creator {
+            return Ok(());
+        }
+        if self
+            .storage
+            .is_channel_moderator(channel_id, resolved_author)
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        Err(format!(
+            "channel {} is read-only; only creator and moderators may post",
+            channel_id
+        ))
     }
 
     /// Authorize channel admin operations per spec section 2.6.
@@ -1367,6 +1453,8 @@ impl MessageRouter {
                         author = %resolved_author,
                         has_name = payload.display_name.is_some(),
                         has_desc = payload.description.is_some(),
+                        has_type_change = payload.channel_type.is_some(),
+                        has_threads_toggle = payload.threads_enabled.is_some(),
                         "Processing ChannelUpdate"
                     );
                     // Merge updated fields into existing channel metadata
@@ -1390,6 +1478,44 @@ impl MessageRouter {
                             }
                             if let Some(tags) = &payload.tags {
                                 meta["tags"] = serde_json::json!(tags);
+                            }
+                            // Runtime channel_type flip: only Public ⇄ ReadPublic.
+                            // The "to Private" case is already refused at
+                            // validation (see validate_channel_update). Here we
+                            // additionally guard the "from Private" case, which
+                            // validation cannot see because it doesn't know the
+                            // current channel state. Spec §3.6.
+                            if let Some(new_type) = payload.channel_type {
+                                let current_type = match meta.get("channel_type") {
+                                    Some(serde_json::Value::Number(n)) => n.as_u64().unwrap_or(0),
+                                    Some(serde_json::Value::String(s)) => match s.as_str() {
+                                        "Public" => 0,
+                                        "ReadPublic" => 1,
+                                        "Private" => 2,
+                                        _ => 0,
+                                    },
+                                    _ => 0,
+                                };
+                                let new_type_u8 = new_type as u8;
+                                if current_type == 2 {
+                                    tracing::warn!(
+                                        channel_id = payload.channel_id,
+                                        new_type = new_type_u8,
+                                        "ChannelUpdate channel_type flip refused: channel is Private"
+                                    );
+                                    // Drop only the channel_type field; sibling
+                                    // fields (description, etc.) still apply.
+                                    // The payload was authorized (mod with
+                                    // can_edit_info) and the rest is benign.
+                                } else {
+                                    meta["channel_type"] = serde_json::json!(new_type_u8);
+                                }
+                            }
+                            // Threaded mode toggle: pure boolean flag, no
+                            // structural migration (existing messages remain
+                            // readable in either mode). Spec §3.6.
+                            if let Some(threaded) = payload.threads_enabled {
+                                meta["threads_enabled"] = serde_json::Value::Bool(threaded);
                             }
                             let meta_bytes = serde_json::to_vec(&meta)
                                 .context("serializing updated channel metadata")?;
