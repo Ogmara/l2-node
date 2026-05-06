@@ -1768,11 +1768,11 @@ impl MessageRouter {
                     // them from on-chain registered users (where the chain scanner sets
                     // a real timestamp). This enables tiered access: unverified users
                     // can chat/post but need on-chain registration for advanced features.
-                    let mut record = match self
+                    let existing = self
                         .storage
-                        .get_cf(schema::cf::USERS, resolved_author.as_bytes())?
-                    {
-                        Some(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)
+                        .get_cf(schema::cf::USERS, resolved_author.as_bytes())?;
+                    let mut record = match &existing {
+                        Some(bytes) => serde_json::from_slice::<serde_json::Value>(bytes)
                             .unwrap_or_else(|_| serde_json::json!({})),
                         None => serde_json::json!({
                             "address": resolved_author,
@@ -1780,6 +1780,13 @@ impl MessageRouter {
                             "registered_at": 0,
                         }),
                     };
+
+                    // Capture old display_name BEFORE merge so we can clean up the
+                    // USERS_BY_NAME prefix index if the name actually changed.
+                    let old_name = record
+                        .get("display_name")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
 
                     // Merge profile fields
                     if let serde_json::Value::Object(ref mut map) = record {
@@ -1801,6 +1808,39 @@ impl MessageRouter {
                         resolved_author.as_bytes(),
                         &bytes,
                     )?;
+
+                    // Maintain USERS_BY_NAME prefix index for @-mention autocomplete.
+                    // If the name changed, remove the old index row first; then write
+                    // the new one. Empty / whitespace-only names produce no index row
+                    // (a user with no name simply isn't autocomplete-discoverable).
+                    let new_name = record
+                        .get("display_name")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    if old_name != new_name {
+                        if let Some(old) = &old_name {
+                            if !old.trim().is_empty() {
+                                let old_key = schema::encode_users_by_name_key(
+                                    &old.to_lowercase(),
+                                    resolved_author,
+                                );
+                                let _ = self.storage.delete_cf(schema::cf::USERS_BY_NAME, &old_key);
+                            }
+                        }
+                    }
+                    if let Some(new) = &new_name {
+                        if !new.trim().is_empty() {
+                            let new_key = schema::encode_users_by_name_key(
+                                &new.to_lowercase(),
+                                resolved_author,
+                            );
+                            let _ = self.storage.put_cf(
+                                schema::cf::USERS_BY_NAME,
+                                &new_key,
+                                &[],
+                            );
+                        }
+                    }
 
                     if is_new {
                         self.storage

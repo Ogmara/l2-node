@@ -92,6 +92,17 @@ impl Node {
             }
         }
 
+        // Backfill USERS_BY_NAME prefix index from USERS (one-time migration).
+        // Required so the v0.32.0 mention-autocomplete endpoint returns
+        // pre-existing users immediately, not just users who update their
+        // profile after the upgrade.
+        let users_by_name_backfilled = storage.get_stat(state_keys::USERS_BY_NAME_BACKFILLED)? > 0;
+        if !users_by_name_backfilled {
+            if let Err(e) = storage.backfill_users_by_name() {
+                warn!(error = %e, "Failed to backfill USERS_BY_NAME index");
+            }
+        }
+
         // Load Lamport counter from storage
         let lamport_value = storage.get_lamport_counter()?;
         let lamport_counter = Arc::new(AtomicU64::new(lamport_value));

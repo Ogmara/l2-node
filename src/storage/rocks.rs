@@ -1081,6 +1081,55 @@ impl Storage {
         Ok(())
     }
 
+    /// Backfill USERS_BY_NAME from existing USERS records.
+    ///
+    /// The USERS_BY_NAME column family is the prefix index for the
+    /// `@`-mention autocomplete endpoint (`GET /api/v1/users/search`). It's
+    /// maintained in lockstep on every ProfileUpdate, but pre-existing
+    /// users (registered before v0.32.0) need a one-time backfill.
+    ///
+    /// Idempotent — protected by the USERS_BY_NAME_BACKFILLED sentinel
+    /// in NODE_STATE.
+    pub fn backfill_users_by_name(&self) -> Result<()> {
+        use tracing::info;
+
+        let entries = self.prefix_iter_cf(cf::USERS, &[], 100_000)?;
+        let mut written = 0u32;
+
+        for (key, value) in &entries {
+            let record: serde_json::Value = match serde_json::from_slice(value) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let display_name = match record.get("display_name").and_then(|v| v.as_str()) {
+                Some(n) if !n.trim().is_empty() => n,
+                _ => continue, // skip users with no display name
+            };
+            let address = match std::str::from_utf8(key) {
+                Ok(s) if s.starts_with("klv1") => s,
+                _ => continue,
+            };
+            let index_key = super::schema::encode_users_by_name_key(
+                &display_name.to_lowercase(),
+                address,
+            );
+            self.put_cf(cf::USERS_BY_NAME, &index_key, &[])?;
+            written += 1;
+        }
+
+        if written > 0 {
+            info!(written, "Backfilled USERS_BY_NAME from existing USERS records");
+        }
+
+        self.put_cf(
+            cf::NODE_STATE,
+            super::schema::state_keys::USERS_BY_NAME_BACKFILLED,
+            &1u64.to_be_bytes(),
+        )?;
+
+        Ok(())
+    }
+
     /// Backfill DEVICE_WALLET_MAP from existing DELEGATIONS entries.
     /// The chain scanner stored delegations but missed writing the identity map.
     /// Runs once on startup; idempotent.

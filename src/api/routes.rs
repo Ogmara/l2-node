@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use rocksdb::WriteBatch;
 
-use crate::storage::schema::{cf, encode_channel_msg_key, encode_dm_msg_key, state_keys};
+use crate::storage::schema::{cf, decode_users_by_name_key, encode_channel_msg_key, encode_dm_msg_key, state_keys};
 
 use super::auth::AuthUser;
 use super::state::AppState;
@@ -841,6 +841,137 @@ pub async fn get_channel_messages(
             }
         }
     }
+}
+
+/// Query parameters for `GET /api/v1/users/search`.
+#[derive(Debug, Deserialize)]
+pub struct UserSearchQuery {
+    /// Prefix to match against display_name (case-insensitive). Required, 1..=64 chars.
+    pub q: String,
+    /// Max results, clamped to 1..=50. Default 20.
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+/// GET /api/v1/users/search
+///
+/// Case-insensitive prefix search on `display_name` for client-side
+/// `@`-mention autocomplete. Backed by the USERS_BY_NAME prefix index
+/// (maintained on every ProfileUpdate, backfilled from USERS on first
+/// startup after v0.32.0).
+///
+/// Address-prefix matches: if `q` looks like a klv1-style prefix
+/// (`klv1...`), results also include exact/prefix matches against the
+/// USERS column family by address.
+///
+/// No authentication required — display names are public profile
+/// information already exposed via `GET /users/{address}`.
+///
+/// Spec: 03-l2-node §4.1, 06-frontend §6.1.1.
+pub async fn search_users(
+    Extension(state): Extension<Arc<AppState>>,
+    Query(params): Query<UserSearchQuery>,
+) -> impl IntoResponse {
+    // Validate query
+    let q_trimmed = params.q.trim();
+    if q_trimmed.is_empty() {
+        return (StatusCode::BAD_REQUEST, "query parameter `q` is required").into_response();
+    }
+    if q_trimmed.len() > 64 {
+        return (StatusCode::BAD_REQUEST, "query too long (max 64 chars)").into_response();
+    }
+    let limit = params.limit.unwrap_or(20).clamp(1, 50) as usize;
+
+    let q_lower = q_trimmed.to_lowercase();
+    let mut results: Vec<serde_json::Value> = Vec::new();
+    let mut seen_addresses: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // 1. Prefix scan on USERS_BY_NAME for display-name matches.
+    //    The index key is `lowercase(name) + 0x00 + address` so a prefix
+    //    scan with the lowercased query bytes returns every row whose name
+    //    starts with that query.
+    if let Ok(entries) = state
+        .storage
+        .prefix_iter_cf(cf::USERS_BY_NAME, q_lower.as_bytes(), limit * 4)
+    {
+        for (key, _) in &entries {
+            if results.len() >= limit {
+                break;
+            }
+            let (_name_lower, address) = match decode_users_by_name_key(key) {
+                Some(parts) => parts,
+                None => continue,
+            };
+            if seen_addresses.contains(address) {
+                continue;
+            }
+            if let Some(entry) = build_search_result(&state, address) {
+                seen_addresses.insert(address.to_string());
+                results.push(entry);
+            }
+        }
+    }
+
+    // 2. Address-prefix matches: if the query looks like a klv1 prefix,
+    //    fall through to USERS to find any address starting with that
+    //    prefix. This lets users complete `@klv1abc` even when no display
+    //    name is set.
+    if results.len() < limit && q_trimmed.starts_with("klv1") {
+        if let Ok(entries) = state
+            .storage
+            .prefix_iter_cf(cf::USERS, q_trimmed.as_bytes(), limit * 2)
+        {
+            for (key, _) in &entries {
+                if results.len() >= limit {
+                    break;
+                }
+                let address = match std::str::from_utf8(key) {
+                    Ok(s) if s.starts_with("klv1") => s,
+                    _ => continue,
+                };
+                if seen_addresses.contains(address) {
+                    continue;
+                }
+                if let Some(entry) = build_search_result(&state, address) {
+                    seen_addresses.insert(address.to_string());
+                    results.push(entry);
+                }
+            }
+        }
+    }
+
+    Json(serde_json::json!({ "users": results })).into_response()
+}
+
+/// Build a single search-result entry for `address` from the USERS row.
+/// Returns `None` if the user record is missing or unparseable.
+fn build_search_result(state: &Arc<AppState>, address: &str) -> Option<serde_json::Value> {
+    let bytes = state
+        .storage
+        .get_cf(cf::USERS, address.as_bytes())
+        .ok()
+        .flatten()?;
+    let user: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let display_name = user.get("display_name").and_then(|v| v.as_str()).map(String::from);
+    let avatar_cid = user.get("avatar_cid").and_then(|v| v.as_str()).map(String::from);
+    // `verified` reflects on-chain registration: definition is
+    // "USERS record exists AND `registered_at` is present AND > 0". The
+    // chain scanner sets a real timestamp on UserRegistered events; L2-only
+    // ProfileUpdate creates records with `registered_at: 0` (router.rs).
+    // Missing field falls through to `false` — defensive against malformed
+    // records but should never happen in normal flow because the
+    // ProfileUpdate / UserRegistered handlers always populate the field.
+    let verified = user
+        .get("registered_at")
+        .and_then(|v| v.as_u64())
+        .map(|ts| ts > 0)
+        .unwrap_or(false);
+    Some(serde_json::json!({
+        "address": address,
+        "display_name": display_name,
+        "avatar_cid": avatar_cid,
+        "verified": verified,
+    }))
 }
 
 /// GET /api/v1/users/:address
