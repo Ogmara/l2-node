@@ -20,6 +20,12 @@ pub mod cf {
     pub const NEWS_BY_AUTHOR: &str = "news_by_author";
     /// klever_address → UserProfile (serialized)
     pub const USERS: &str = "users";
+    /// (display_name_lower, 0x00, klever_address) → () — case-insensitive
+    /// prefix index for the @-mention autocomplete `GET /api/v1/users/search`
+    /// endpoint. Maintained in lockstep with USERS on every ProfileUpdate
+    /// (delete old name's row, insert new name's row). Backfilled from USERS
+    /// on first startup after v0.32.0 via a one-time migration sentinel.
+    pub const USERS_BY_NAME: &str = "users_by_name";
     /// channel_id → ChannelMetadata (serialized)
     pub const CHANNELS: &str = "channels";
     /// (user_address, device_pub_key) → Delegation (serialized)
@@ -148,6 +154,7 @@ pub mod cf {
         NEWS_BY_TAG,
         NEWS_BY_AUTHOR,
         USERS,
+        USERS_BY_NAME,
         CHANNELS,
         DELEGATIONS,
         STATE_ANCHORS,
@@ -211,6 +218,8 @@ pub mod state_keys {
     pub const COUNTERS_V2: &[u8] = b"stat_counters_v2";
     /// Sentinel: set to 1 after channel_type values are normalized from strings to u8.
     pub const CHANNEL_TYPE_NORMALIZED: &[u8] = b"migration_channel_type_normalized";
+    /// Sentinel: set to 1 after USERS_BY_NAME is backfilled from existing USERS records.
+    pub const USERS_BY_NAME_BACKFILLED: &[u8] = b"migration_users_by_name_backfilled";
     /// Sentinel: set to 1 after DELEGATIONS are backfilled into DEVICE_WALLET_MAP.
     pub const DELEGATION_MAP_BACKFILLED: &[u8] = b"migration_delegation_map_backfilled";
     /// Sentinel: set to 1 after device addresses are re-derived from klv1 → ogd1.
@@ -304,6 +313,37 @@ pub fn encode_follow_key(follower: &str, followed: &str) -> Vec<u8> {
     key.push(0xFF);
     key.extend_from_slice(followed.as_bytes());
     key
+}
+
+/// Encode a USERS_BY_NAME key: (display_name_lower, 0x00, klever_address).
+///
+/// Display names are lowercased before insertion so prefix scans are
+/// case-insensitive. The 0x00 separator distinguishes the name from the
+/// address suffix and is below the printable ASCII range, ensuring
+/// prefix-scan with just the name bytes matches every entry that starts
+/// with that name (e.g. "ali" matches "alice" and "alicesimon").
+///
+/// Caller is responsible for lowercasing the name.
+pub fn encode_users_by_name_key(display_name_lower: &str, klever_address: &str) -> Vec<u8> {
+    let name_bytes = display_name_lower.as_bytes();
+    let addr_bytes = klever_address.as_bytes();
+    let mut key = Vec::with_capacity(name_bytes.len() + 1 + addr_bytes.len());
+    key.extend_from_slice(name_bytes);
+    key.push(0x00);
+    key.extend_from_slice(addr_bytes);
+    key
+}
+
+/// Decode a USERS_BY_NAME key into (display_name_lower, klever_address).
+///
+/// Returns `None` if the key doesn't contain the expected 0x00 separator
+/// or the address suffix isn't valid UTF-8. Used by the search endpoint
+/// to materialize results from index hits.
+pub fn decode_users_by_name_key(key: &[u8]) -> Option<(&str, &str)> {
+    let sep = key.iter().position(|&b| b == 0x00)?;
+    let name = std::str::from_utf8(&key[..sep]).ok()?;
+    let addr = std::str::from_utf8(&key[sep + 1..]).ok()?;
+    Some((name, addr))
 }
 
 // --- News Engagement key encoding ---
@@ -535,4 +575,50 @@ pub fn encode_private_channel_key(channel_id: u64, epoch: u64) -> Vec<u8> {
 /// Encode a private channel anchor key: channel_id (8 bytes BE).
 pub fn encode_private_channel_anchor_key(channel_id: u64) -> Vec<u8> {
     channel_id.to_be_bytes().to_vec()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn users_by_name_key_round_trips() {
+        let key = encode_users_by_name_key("alice", "klv1abc");
+        let (name, addr) = decode_users_by_name_key(&key).unwrap();
+        assert_eq!(name, "alice");
+        assert_eq!(addr, "klv1abc");
+    }
+
+    #[test]
+    fn users_by_name_prefix_scan_orders_by_name() {
+        // Two users sharing a name prefix sort lexicographically by name first,
+        // then by address. A scan with prefix "ali" matches both.
+        let alice_a = encode_users_by_name_key("alice", "klv1aaa");
+        let alice_b = encode_users_by_name_key("alice", "klv1bbb");
+        let alicia = encode_users_by_name_key("alicia", "klv1ccc");
+        // All three start with "ali"
+        for k in [&alice_a, &alice_b, &alicia] {
+            assert!(k.starts_with(b"ali"), "key {:?} should start with 'ali'", k);
+        }
+        // Lexicographic ordering: alice_a < alice_b < alicia
+        assert!(alice_a < alice_b);
+        assert!(alice_b < alicia);
+    }
+
+    #[test]
+    fn users_by_name_decode_rejects_keys_without_separator() {
+        let bad = b"justaname".to_vec();
+        assert!(decode_users_by_name_key(&bad).is_none());
+    }
+
+    #[test]
+    fn users_by_name_separator_below_klv_prefix() {
+        // 0x00 is below '1' (the first byte after the "klv" hrp), so prefix
+        // scans on the lowercased name don't accidentally extend into the
+        // address bytes when names don't have a clean lex boundary.
+        let key = encode_users_by_name_key("alice", "klv1xyz");
+        let sep_pos = key.iter().position(|&b| b == 0x00).unwrap();
+        assert_eq!(sep_pos, "alice".len());
+        assert_eq!(key[sep_pos + 1], b'k');
+    }
 }

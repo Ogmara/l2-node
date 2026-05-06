@@ -5,6 +5,49 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.32.0] - 2026-05-06
+
+### Added
+- **`@`-mention autocomplete endpoint (`GET /api/v1/users/search`).**
+  Implements protocol spec §3.3 and L2 spec §4.1. Case-insensitive
+  prefix search on `display_name` returns up to 50 results with
+  `{ address, display_name, avatar_cid, verified }` per match. The
+  `verified` flag is `true` for on-chain-registered users
+  (`registered_at > 0`). No authentication required — display names
+  are already public profile data.
+  - Address-prefix matches: when the query starts with `klv1`, results
+    also include any address with that prefix from USERS, so users
+    can complete `@klv1abc...` without a display name set.
+  - Validation: `q` is required, 1..=64 chars after trim; `limit` is
+    clamped to 1..=50 (default 20). Empty/missing q returns 400.
+- **`USERS_BY_NAME` column family** — case-insensitive prefix index
+  keyed by `lowercase(display_name) + 0x00 + klever_address`. The
+  null separator is below printable ASCII so prefix scans of the
+  lowercased name match every entry without leaking into the address
+  suffix. Maintained in lockstep with USERS on every `ProfileUpdate`
+  (delete old name's row, insert new name's row).
+- **One-time migration `backfill_users_by_name`** — runs on first
+  startup after v0.32.0, scans existing USERS records and writes index
+  entries for every user with a non-empty display name. Protected by
+  the `USERS_BY_NAME_BACKFILLED` sentinel in `NODE_STATE` so it runs
+  exactly once. Without this, only post-upgrade `ProfileUpdate` events
+  would populate the index, leaving long-time users invisible to
+  autocomplete.
+- 4 new schema tests covering the index key encoding/decoding,
+  lexicographic prefix-scan ordering, and the separator's position
+  relative to the `klv1` prefix. Total tests: 35 → 39.
+
+### Notes
+- The chain scanner's `UserRegistered` handler doesn't need updating —
+  it preserves the existing `display_name` field on re-registration,
+  so any index row created by an earlier `ProfileUpdate` survives.
+  New on-chain registrations with no prior profile have no display
+  name and therefore no index row, which is correct.
+- `display_name` collisions are allowed: two users named "alice" both
+  appear in autocomplete and the client disambiguates by address.
+  This is consistent with the "no global username uniqueness" decision
+  in the original Phase 2 plan.
+
 ## [0.31.0] - 2026-05-04
 
 ### Added

@@ -76,6 +76,10 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
         .route("/api/v1/health", get(routes::health))
         .route("/api/v1/network/stats", get(routes::network_stats))
         .route("/api/v1/network/nodes", get(routes::network_nodes))
+        // /users/search must be registered BEFORE /users/{address} so axum
+        // matches the literal segment first instead of treating "search"
+        // as an address parameter.
+        .route("/api/v1/users/search", get(routes::search_users))
         .route("/api/v1/users/{address}", get(routes::get_user))
         .route("/api/v1/users/{address}/followers", get(routes::get_followers))
         .route("/api/v1/users/{address}/following", get(routes::get_following))
