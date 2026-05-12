@@ -2877,7 +2877,8 @@ pub async fn mark_channel_read(
 /// GET /api/v1/channels/unread — get unread message counts for all channels.
 ///
 /// For each channel, compares the user's read cursor (last_read_ts) against
-/// the latest messages in that channel.
+/// the latest messages in that channel. Also reports a per-channel count of
+/// unread messages where the viewer was @-mentioned (capped at 99).
 pub async fn get_unread_counts(
     Extension(state): Extension<Arc<AppState>>,
     Extension(auth_user): Extension<AuthUser>,
@@ -2892,6 +2893,7 @@ pub async fn get_unread_counts(
     };
 
     let mut unread: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+    let mut mentions: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
 
     for (key, value) in &channels {
         // Channel keys are channel_id as u64 BE bytes
@@ -2914,24 +2916,52 @@ pub async fn get_unread_counts(
             _ => 0, // Never read — everything is unread
         };
 
-        // Count messages newer than last_read_ts, excluding the user's own messages
+        // Count messages newer than last_read_ts, excluding the user's own messages.
+        // Within those, count how many @-mention the viewer (after device→wallet resolution).
+        //
+        // Hot-path optimization: the channel-message index key embeds the lamport
+        // timestamp at bytes 8..16. Decode that first and skip the RocksDB point
+        // lookup + envelope decode + payload decode entirely when the message is
+        // already-read. Also short-circuit once both counters hit 99 — that's the
+        // display cap, so any further decoding is wasted work.
         let prefix = channel_id.to_be_bytes();
         if let Ok(msgs) = state.storage.prefix_iter_cf(cf::CHANNEL_MSGS, &prefix, 100) {
             let mut count = 0u64;
+            let mut mention_count = 0u64;
             for (msg_key, _) in &msgs {
+                if count >= 99 && mention_count >= 99 { break; }
                 // Key: (channel_id:8, lamport_ts:8, msg_id:32)
-                if msg_key.len() >= 48 {
-                    let msg_id: [u8; 32] = msg_key[16..48].try_into().unwrap_or([0u8; 32]);
-                    if let Ok(Some(env_bytes)) = state.storage.get_message(&msg_id) {
-                        if let Ok(env) = rmp_serde::from_slice::<crate::messages::envelope::Envelope>(&env_bytes) {
-                            if env.timestamp > last_read_ts {
-                                // Resolve author and skip own messages
-                                let resolved = state.identity.resolve(&env.author)
-                                    .unwrap_or_else(|_| env.author.clone());
-                                if resolved != auth_user.address {
-                                    count += 1;
-                                }
-                            }
+                if msg_key.len() < 48 { continue; }
+                let key_ts = u64::from_be_bytes(msg_key[8..16].try_into().unwrap_or([0u8; 8]));
+                // Fast skip: if the index timestamp is already <= read cursor,
+                // the message is read; no need to fetch the envelope at all.
+                if key_ts <= last_read_ts { continue; }
+                let msg_id: [u8; 32] = msg_key[16..48].try_into().unwrap_or([0u8; 32]);
+                let env_bytes = match state.storage.get_message(&msg_id) {
+                    Ok(Some(b)) => b,
+                    _ => continue,
+                };
+                let env = match rmp_serde::from_slice::<crate::messages::envelope::Envelope>(&env_bytes) {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+                // Envelope timestamp is the authoritative wall-clock check.
+                // Index lamport_ts can lag wall-clock under heavy fan-in.
+                if env.timestamp <= last_read_ts { continue; }
+                let resolved = state.identity.resolve(&env.author)
+                    .unwrap_or_else(|_| env.author.clone());
+                if resolved == auth_user.address { continue; }
+                count += 1;
+                // Only decode the payload if we still need mention info.
+                if mention_count < 99 {
+                    if let Ok(payload) = rmp_serde::from_slice::<crate::messages::types::ChatMessagePayload>(&env.payload) {
+                        let mentioned = payload.mentions.iter().any(|m| {
+                            let resolved_m = state.identity.resolve(m)
+                                .unwrap_or_else(|_| m.clone());
+                            resolved_m == auth_user.address
+                        });
+                        if mentioned {
+                            mention_count += 1;
                         }
                     }
                 }
@@ -2939,10 +2969,13 @@ pub async fn get_unread_counts(
             if count > 0 {
                 unread.insert(channel_id.to_string(), serde_json::json!(count.min(99)));
             }
+            if mention_count > 0 {
+                mentions.insert(channel_id.to_string(), serde_json::json!(mention_count.min(99)));
+            }
         }
     }
 
-    Json(serde_json::json!({ "unread": unread })).into_response()
+    Json(serde_json::json!({ "unread": unread, "mentions": mentions })).into_response()
 }
 
 /// GET /api/v1/settings — retrieve synced settings (authenticated)
