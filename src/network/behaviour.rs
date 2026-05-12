@@ -14,6 +14,7 @@ use libp2p::{kad, Swarm, SwarmBuilder};
 
 use crate::config::Config;
 
+use super::snapshot::SnapshotCodec;
 use super::sync::SyncCodec;
 
 /// The composed network behaviour for the Ogmara node.
@@ -34,6 +35,10 @@ pub struct OgmaraBehaviour {
         super::sync::SyncRequest,
         super::sync::SyncResponse,
     >,
+    /// Request-Response for the snapshot bootstrap protocol
+    /// (spec 11-snapshot-sync.md). Serves cached state snapshots so new
+    /// nodes can skip block-by-block Klever scanning.
+    pub snapshot: SnapshotCodec,
 }
 
 /// Build the libp2p swarm with all configured behaviours.
@@ -113,6 +118,40 @@ pub fn build_swarm(config: &Config, keypair: Keypair) -> Result<Swarm<OgmaraBeha
                 .with_request_timeout(Duration::from_secs(30)),
         );
 
+    // Snapshot protocol — separate request-response codec with:
+    //  - longer request timeout (chunks can be a few MiB compressed),
+    //  - response size cap raised above default 10 MiB to fit MAX_CHUNK_BYTES,
+    //  - request size cap kept near default — requests are tiny.
+    // Inbound is gated by config.snapshot.serve_enabled; outbound stays
+    // available so Phase 2/3 clients can still negotiate the protocol.
+    let snapshot_protocol = format!("/ogmara/{}/snapshot/1.0.0", config.network_id());
+    let snapshot_support = if config.snapshot.serve_enabled {
+        libp2p::request_response::ProtocolSupport::Full
+    } else {
+        libp2p::request_response::ProtocolSupport::Outbound
+    };
+    // Allow ~MAX_CHUNK_BYTES + framing overhead for the response, and
+    // MAX_MANIFEST_BYTES for the request (covers GetManifest responses
+    // and any future Phase-2 requests that include large quorum metadata).
+    let snapshot_codec = libp2p::request_response::cbor::codec::Codec::<
+        super::snapshot::SnapshotRequest,
+        super::snapshot::SnapshotResponse,
+    >::default()
+        .set_request_size_maximum(super::snapshot::MAX_MANIFEST_BYTES as u64)
+        .set_response_size_maximum(
+            (super::snapshot::MAX_CHUNK_BYTES as u64).saturating_add(64 * 1024),
+        );
+    let snapshot = libp2p::request_response::Behaviour::with_codec(
+        snapshot_codec,
+        [(
+            libp2p::StreamProtocol::try_from_owned(snapshot_protocol)
+                .map_err(|e| anyhow::anyhow!("invalid snapshot protocol string: {}", e))?,
+            snapshot_support,
+        )],
+        libp2p::request_response::Config::default()
+            .with_request_timeout(Duration::from_secs(60)),
+    );
+
     let behaviour = OgmaraBehaviour {
         connection_limits,
         gossipsub,
@@ -120,6 +159,7 @@ pub fn build_swarm(config: &Config, keypair: Keypair) -> Result<Swarm<OgmaraBeha
         mdns,
         identify,
         request_response,
+        snapshot,
     };
 
     let swarm = SwarmBuilder::with_existing_identity(keypair)

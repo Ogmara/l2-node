@@ -73,6 +73,10 @@ pub struct AppState {
     pub alert_history: SharedAlertHistory,
     /// PoW anti-spam manager (None = PoW disabled).
     pub pow: Option<Arc<PowManager>>,
+    /// Shared snapshot cache (spec 11-snapshot-sync.md). Populated by the
+    /// background cache builder; read by `/admin/snapshot/status`.
+    /// Inner option is `None` until the first build completes.
+    pub snapshot_cache: crate::network::snapshot::SharedSnapshotCache,
 }
 
 impl AppState {
@@ -115,6 +119,7 @@ impl AppState {
             alert_history,
             None, // PoW disabled in test/simplified constructor
             String::new(), // node_address not needed in test constructor
+            Arc::new(RwLock::new(None)), // snapshot cache — empty in tests
         )
     }
 
@@ -144,6 +149,7 @@ impl AppState {
         alert_history: SharedAlertHistory,
         pow: Option<Arc<PowManager>>,
         node_address: String,
+        snapshot_cache: crate::network::snapshot::SharedSnapshotCache,
     ) -> Self {
         Self {
             storage,
@@ -167,6 +173,7 @@ impl AppState {
             metrics_history,
             alert_history,
             pow,
+            snapshot_cache,
         }
     }
 

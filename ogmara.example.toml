@@ -68,6 +68,21 @@ enabled = false
 url = ""             # e.g., "http://localhost:41722" (gateway appends /push)
 auth_token = ""      # must match OGMARA_PUSH_SECRET on the push gateway
 
+[snapshot]
+# Peer-to-peer state snapshots (spec 11-snapshot-sync.md).
+# Phase 1 (v0.34): this node caches a Merkle-rooted summary of its on-chain
+# state and serves chunks to peers that are bootstrapping. The client-side
+# fetch/apply path ships in v0.35+. Disable serving if your node is
+# resource-constrained or you don't want to participate.
+serve_enabled = true
+serve_rebuild_interval_secs = 3600     # rebuild cached snapshot every hour
+chunk_size_bytes = 4194304             # 4 MiB target per chunk
+serve_max_concurrent_requests = 8
+# Reserved for v0.35 — currently has no effect.
+bootstrap_enabled = false
+quorum_sample_size = 5
+quorum_min_peers = 3
+
 [logging]
 level = "info"
 format = "json"

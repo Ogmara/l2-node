@@ -95,6 +95,41 @@ pub fn hash_leaf(data: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+/// Hash a (key, value) pair for snapshot Merkle trees.
+///
+/// Encodes `u32_be(key.len) || key || u32_be(value.len) || value` and feeds
+/// it through `hash_leaf`. Both key length and value length are explicit so
+/// `("a", "bc")` and `("ab", "c")` cannot collide.
+///
+/// Used by `Storage::build_snapshot_cf` to compute per-CF Merkle roots
+/// (spec 11-snapshot-sync.md §3).
+///
+/// **Bounds:** RocksDB keys and values in Ogmara are always well under 4 GiB
+/// (the largest realistic value is a few KB of MessagePack-encoded user
+/// metadata). The current `MAX_BUILD_BYTES_PER_CF` cap (256 MiB) catches
+/// adversarial single-row gigantism earlier in the pipeline. This function
+/// asserts the u32 length encoding is safe rather than silently truncating.
+///
+/// # Panics
+///
+/// Panics if `key.len()` or `value.len()` exceeds `u32::MAX`. Reaching this
+/// path implies a corrupted RocksDB read or a hostile-data ingress that should
+/// already have been rejected earlier — a panic here is preferable to a
+/// silent length-prefix truncation that would weaken second-preimage
+/// resistance.
+pub fn hash_kv(key: &[u8], value: &[u8]) -> [u8; 32] {
+    let key_len = u32::try_from(key.len())
+        .expect("hash_kv: key >= 4 GiB — refuse to encode (would truncate length prefix)");
+    let value_len = u32::try_from(value.len())
+        .expect("hash_kv: value >= 4 GiB — refuse to encode (would truncate length prefix)");
+    let mut buf = Vec::with_capacity(8 + key.len() + value.len());
+    buf.extend_from_slice(&key_len.to_be_bytes());
+    buf.extend_from_slice(key);
+    buf.extend_from_slice(&value_len.to_be_bytes());
+    buf.extend_from_slice(value);
+    hash_leaf(&buf)
+}
+
 /// Build a Merkle tree from a list of leaf hashes.
 ///
 /// Returns the root hash. If the list is empty, returns a zero hash.

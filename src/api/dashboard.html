@@ -190,7 +190,7 @@ td { padding: 8px; border-bottom: 1px solid var(--border); }
     </div>
     <div class="card">
       <h3>Recent Rejections</h3>
-      <table><thead><tr><th>Time</th><th>Author</th><th>Reason</th></tr></thead><tbody id="rejections-body"><tr><td colspan="3" style="color:var(--fg2)">Loading...</td></tr></tbody></table>
+      <table><thead><tr><th>Date / Time</th><th>Author</th><th>Reason</th></tr></thead><tbody id="rejections-body"><tr><td colspan="3" style="color:var(--fg2)">Loading...</td></tr></tbody></table>
     </div>
   </div>
 
@@ -511,9 +511,11 @@ async function loadRejections() {
     }
     for (const r of items) {
       const tr = document.createElement('tr');
-      const time = new Date(r.timestamp).toLocaleTimeString();
+      const d = new Date(r.timestamp);
+      const time = d.toLocaleString();
+      const iso = d.toISOString();
       const addr = r.author.length > 20 ? r.author.slice(0,10)+'...'+r.author.slice(-6) : r.author;
-      tr.innerHTML = `<td style="white-space:nowrap">${esc(time)}</td><td style="font-family:var(--mono);font-size:0.8em" title="${esc(r.author)}">${esc(addr)}</td><td style="font-size:0.85em;color:var(--red)">${esc(r.reason)}</td>`;
+      tr.innerHTML = `<td style="white-space:nowrap;font-size:0.85em" title="${esc(iso)}">${esc(time)}</td><td style="font-family:var(--mono);font-size:0.8em" title="${esc(r.author)}">${esc(addr)}</td><td style="font-size:0.85em;color:var(--red)">${esc(r.reason)}</td>`;
       body.appendChild(tr);
     }
   } catch(_) {}

@@ -336,6 +336,67 @@ pub async fn alerts_history(
     Json(serde_json::json!({ "alerts": alerts }))
 }
 
+/// GET /admin/snapshot/status — current snapshot cache state.
+///
+/// Returns the most recent successfully built snapshot's metadata so
+/// operators can confirm Phase 1 serving is healthy (spec 11-snapshot-sync.md).
+/// Returns `{ "available": false }` if no cache has been built yet.
+pub async fn snapshot_status(
+    Extension(state): Extension<Arc<AppState>>,
+) -> impl IntoResponse {
+    use crate::storage::schema;
+
+    let last_served_height = state
+        .storage
+        .get_stat(schema::state_keys::SNAPSHOT_LAST_SERVED_HEIGHT)
+        .unwrap_or(0);
+
+    match state.snapshot_cache.read() {
+        Ok(guard) => match guard.as_ref() {
+            Some(cache) => {
+                let manifest = &cache.manifest;
+                let cf_summaries: Vec<serde_json::Value> = manifest
+                    .cfs
+                    .iter()
+                    .map(|cf| {
+                        serde_json::json!({
+                            "cf_name": cf.cf_name,
+                            "num_entries": cf.num_entries,
+                            "total_bytes": cf.total_bytes,
+                            "chunks": cf.chunks.len(),
+                            "cf_root": hex::encode(cf.cf_root),
+                        })
+                    })
+                    .collect();
+                Json(serde_json::json!({
+                    "available": true,
+                    "version": manifest.version,
+                    "network_id": manifest.network_id,
+                    "block_height": manifest.block_height,
+                    "snapshot_root": hex::encode(manifest.snapshot_root),
+                    "total_users": manifest.total_users,
+                    "total_channels": manifest.total_channels,
+                    "created_at": manifest.created_at,
+                    "producer_node_id": manifest.producer_node_id,
+                    "compressed_total_bytes": cache.compressed_total_bytes,
+                    "chunk_count": cache.chunks.len(),
+                    "column_families": cf_summaries,
+                    "last_served_height": last_served_height,
+                }))
+            }
+            None => Json(serde_json::json!({
+                "available": false,
+                "reason": "cache not yet built (warming up after startup)",
+                "last_served_height": last_served_height,
+            })),
+        },
+        Err(_) => Json(serde_json::json!({
+            "available": false,
+            "reason": "cache lock poisoned",
+        })),
+    }
+}
+
 // ── Embedded HTML ───────────────────────────────────────────────────
 
 /// The embedded dashboard HTML — self-contained multi-section SPA.

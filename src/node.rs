@@ -240,6 +240,11 @@ impl Node {
         // Shared connected-peers map (updated by network layer on Identify, read by API /network/nodes)
         let connected_peers = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
 
+        // Shared snapshot cache — populated by the background cache builder
+        // (spec 11-snapshot-sync.md §1). `None` until the first build completes.
+        let snapshot_cache: crate::network::snapshot::SharedSnapshotCache =
+            Arc::new(std::sync::RwLock::new(None));
+
         // Start the network service
         let keypair = self.libp2p_keypair()?;
         let mut network = crate::network::NetworkService::new(
@@ -253,6 +258,7 @@ impl Node {
             self.node_id.clone(),
             connected_peers.clone(),
             network_counters.clone(),
+            snapshot_cache.clone(),
         )
         .await
         .context("starting network service")?;
@@ -335,6 +341,101 @@ impl Node {
                 Err(e) => warn!(error = %e, "Failed to start chain scanner"),
             }
         });
+
+        // Snapshot cache builder — periodically rebuilds the served snapshot
+        // from current storage state (spec 11-snapshot-sync.md §1).
+        // Phase 1: serve-only. The cache lives in `snapshot_cache` (shared
+        // with NetworkService); rebuild cadence is configurable.
+        if self.config.snapshot.serve_enabled {
+            let snap_storage = self.storage.clone();
+            let snap_signing_key = self.signing_key.clone();
+            let snap_node_id = self.node_id.clone();
+            let snap_network_id = self.config.network_id().to_string();
+            let snap_cache = snapshot_cache.clone();
+            let snap_config = self.config.snapshot.clone();
+            let mut snap_shutdown_rx = self.shutdown_rx();
+            let _snapshot_task = tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(
+                    snap_config.serve_rebuild_interval_secs.max(60),
+                ));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                // First tick fires immediately — consume it.
+                tick.tick().await;
+
+                // Deferred-start: 60s warm-up so node boot isn't blocked by a
+                // full CF scan on every restart. Exit immediately on shutdown
+                // — don't make Ctrl-C wait a full minute.
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {}
+                    _ = snap_shutdown_rx.recv() => {
+                        info!("Snapshot cache builder shutting down (during warm-up)");
+                        return;
+                    }
+                }
+
+                loop {
+                    let storage_for_build = snap_storage.clone();
+                    let signing_for_build = snap_signing_key.clone();
+                    let node_id_for_build = snap_node_id.clone();
+                    let network_id_for_build = snap_network_id.clone();
+                    let chunk_size = snap_config.chunk_size_bytes;
+
+                    let build = tokio::task::spawn_blocking(move || {
+                        crate::network::snapshot::build_cache(
+                            &storage_for_build,
+                            &network_id_for_build,
+                            &node_id_for_build,
+                            &signing_for_build,
+                            chunk_size,
+                            crate::storage::schema::snapshot::codec::ZSTD,
+                        )
+                    })
+                    .await;
+
+                    match build {
+                        Ok(Ok(cache)) => {
+                            let height = cache.manifest.block_height;
+                            let root_hex = hex::encode(cache.manifest.snapshot_root);
+                            let bytes = cache.compressed_total_bytes;
+                            let chunks = cache.chunks.len();
+                            // Swap the new cache in, then drop the old one
+                            // OUTSIDE the write-lock so freeing the multi-MiB
+                            // chunk vecs doesn't block readers/serve handlers.
+                            let prev = match snap_cache.write() {
+                                Ok(mut guard) => guard.replace(cache),
+                                Err(e) => {
+                                    warn!(error = %e, "snapshot cache lock poisoned");
+                                    None
+                                }
+                            };
+                            drop(prev);
+                            crate::network::snapshot::record_serve_height(&snap_storage, height);
+                            info!(
+                                block_height = height,
+                                snapshot_root = %root_hex,
+                                chunks,
+                                compressed_bytes = bytes,
+                                "Snapshot cache rebuilt"
+                            );
+                        }
+                        Ok(Err(e)) => {
+                            warn!(error = %e, "Snapshot cache build failed");
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Snapshot cache build task panicked");
+                        }
+                    }
+
+                    tokio::select! {
+                        _ = tick.tick() => {}
+                        _ = snap_shutdown_rx.recv() => {
+                            info!("Snapshot cache builder shutting down");
+                            break;
+                        }
+                    }
+                }
+            });
+        }
 
         // Start state anchorer (if enabled)
         let anchor_trigger_tx = if self.config.anchoring.enabled {
@@ -496,6 +597,7 @@ impl Node {
             alert_history,
             pow_manager.clone(),
             node_address,
+            snapshot_cache.clone(),
         ));
         // Periodic cleanup task: evict stale rate limit entries and expired PoW challenges.
         // Runs every 5 minutes to prevent unbounded memory growth.
