@@ -5,6 +5,21 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.33.0] - 2026-05-12
+
+### Added
+- **Per-channel mention counts in `GET /api/v1/channels/unread`.**
+  Response now includes a `mentions` map alongside `unread`:
+  `{ "unread": { "1": 5 }, "mentions": { "1": 2 } }`. For each unread
+  message, the payload is MessagePack-decoded and its `mentions[]`
+  array is scanned for the viewer's wallet address (resolved through
+  delegation, so device-key mentions count too). Counts are capped at
+  99 like `unread`. Only channels with `mention_count > 0` appear in
+  the map. Older clients that ignore the new field continue to work
+  unchanged. Lets clients show a per-channel `@` indicator in the
+  sidebar so users see *where* they were pinged at a glance.
+- Spec `docs/specs/03-l2-node.md` §unread updated to document the new field.
+
 ## [0.32.0] - 2026-05-06
 
 ### Added
