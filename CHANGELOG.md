@@ -5,6 +5,78 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.34.0] - 2026-05-12
+
+### Added
+- **Snapshot bootstrap — Phase 1 (serve-only).** New `[snapshot]` config
+  section and `/ogmara/{net}/snapshot/1.0.0` libp2p request-response
+  protocol let v0.34+ nodes cache a Merkle-rooted summary of their
+  SC-derived state (users, channels, channel_members, delegations,
+  state_anchors, anchor_by_node) and serve it to peers. `device_wallet_map`
+  and `wallet_devices` are deliberately excluded — Phase 2 receivers
+  re-derive them from `delegations` rather than exposing wallet↔device
+  linkages in bulk to any peer. Once Phase 2 ships in v0.35, joining nodes will be
+  able to bootstrap from these caches instead of replaying millions of
+  Klever blocks. See `docs/specs/11-snapshot-sync.md` for the full
+  format, including the three-level Merkle hashing scheme, signed
+  manifests, and forward-compatibility plan.
+  - **Cache builder.** A background task rebuilds the cached snapshot
+    every `serve_rebuild_interval_secs` (default 3600s). Chunks target
+    4 MiB uncompressed, are MessagePack-serialized, then zstd-3
+    compressed. The first build is intentionally deferred 60s after
+    startup so it doesn't block boot.
+  - **Manifest signing.** Producers sign the canonical manifest bytes
+    with their Ed25519 node identity key. Receivers in Phase 2 will
+    verify against the libp2p PeerId-derived public key.
+  - **`GET /admin/snapshot/status`.** New admin endpoint surfaces the
+    current cache: block height, snapshot root, per-CF entry counts and
+    Merkle roots, compressed total bytes, and the producer node ID.
+  - **`NodeAnnouncementPayload` gains optional `snapshot_height` /
+    `snapshot_root` fields.** Older nodes ignore the new fields via
+    `#[serde(default)]` — backwards-compatible additive change.
+  - **`Capability::SnapshotServe` is implicit:** rather than extending
+    the `Capability` enum (which would break old `serde(repr(u8))`
+    decoders), peers infer snapshot-serving from the presence of
+    `snapshot_height` in the announcement.
+  - Adds `zstd = "0.13"` dependency for chunk compression.
+- **`crypto::merkle::hash_kv(key, value)`** — domain-separated leaf hash
+  for `(key, value)` pairs. Used by snapshot Merkle trees so that
+  `("a", "bc")` and `("ab", "c")` cannot collide.
+- **`storage::snapshot` module** — the wire-shared `ChunkHeader`,
+  `ChunkPayload`, `CfManifest`, and `BuiltCf` types plus
+  `finish_chunk` / `decode_chunk` helpers. 10 new unit tests cover the
+  round-trip and tampering detection paths.
+- **`Storage::build_snapshot_cf` and `Storage::compute_snapshot_root`**
+  produce the per-CF chunks and the overall snapshot root, respectively.
+- **`schema::snapshot::DOMAIN_CFS` constant** — canonical ordering of
+  the column families covered by a snapshot. Changing the order is a
+  manifest-version-bumping wire break.
+
+### Changed
+- `src/network/behaviour.rs` adds a second `request_response::cbor::Behaviour`
+  for the snapshot protocol. Per-request timeout is 60s (vs. 30s for sync) to
+  accommodate larger chunk responses. When `snapshot.serve_enabled = false`,
+  the protocol registers as `Outbound`-only so the node still negotiates the
+  protocol string for future Phase 2 client requests but doesn't accept
+  inbound serve requests.
+- `NetworkService::new` now takes a `SharedSnapshotCache` handle. `AppState`
+  carries the same handle so the admin endpoint can read it without going
+  through the network layer. Default-constructed (test) AppStates pass an
+  empty cache.
+- Spec `docs/specs/03-l2-node.md` §3.2.1 cross-references the new spec.
+
+## [0.33.1] - 2026-05-12
+
+### Changed
+- **Admin dashboard — "Recent Rejections" table now shows full date + time.**
+  Previously the Time column only rendered `toLocaleTimeString()`, which made
+  it impossible to tell whether a rejection happened today or last week.
+  The cell now uses `toLocaleString()` (locale-formatted date + time) and a
+  `title` tooltip with the full ISO-8601 timestamp for millisecond-precise
+  inspection. Header relabeled `Time` → `Date / Time`. No API changes —
+  the existing `/admin/metrics/rejections` payload already carried a
+  millisecond `timestamp` field; only the dashboard renderer changed.
+
 ## [0.33.0] - 2026-05-12
 
 ### Added

@@ -229,6 +229,57 @@ pub mod state_keys {
     /// Latest known Klever chain tip block height (u64 big-endian).
     /// Updated by the chain scanner on every poll cycle for dashboard sync lag.
     pub const CHAIN_TIP: &[u8] = b"chain_tip";
+    /// Snapshot serve cache: block height of the most recently built cache (u64 big-endian).
+    /// Diagnostic — surfaced via the admin /admin/snapshot/status endpoint.
+    pub const SNAPSHOT_LAST_SERVED_HEIGHT: &[u8] = b"snapshot_last_served_height";
+}
+
+/// Snapshot bootstrap (spec 11-snapshot-sync.md).
+pub mod snapshot {
+    use super::cf;
+
+    /// Column families included in a state snapshot, in deterministic order.
+    ///
+    /// The Merkle `snapshot_root` is computed by concatenating per-CF roots in
+    /// this exact order, so the array MUST NOT be reordered between releases
+    /// without bumping the snapshot manifest version. Receivers verify by
+    /// recomputing the root with the same ordering.
+    ///
+    /// All entries are SC-derived: they are written by the chain scanner from
+    /// Ogmara KApp events. Receivers can therefore catch up forward-scan from
+    /// the snapshot height without re-deriving anything from local gossip.
+    ///
+    /// **NOTE — `DEVICE_WALLET_MAP` and `WALLET_DEVICES` are intentionally
+    /// excluded.** They are fully derivable from `DELEGATIONS` (the chain
+    /// scanner's existing `backfill_delegation_map` builds them from
+    /// `DELEGATIONS` alone). Excluding them keeps device↔wallet linkages
+    /// behind the same authentication boundary as `GET /api/v1/devices`
+    /// rather than ship them in bulk to any peer that asks. Phase 2 apply
+    /// path re-derives these CFs locally after receiving the snapshot.
+    pub const DOMAIN_CFS: &[&str] = &[
+        cf::USERS,
+        cf::CHANNELS,
+        cf::CHANNEL_MEMBERS,
+        cf::DELEGATIONS,
+        cf::STATE_ANCHORS,
+        cf::ANCHOR_BY_NODE,
+    ];
+
+    /// Snapshot manifest format version.
+    pub const MANIFEST_VERSION: u8 = 1;
+
+    /// Domain-separation tag for the snapshot root hash.
+    /// Prevents a snapshot root from being mistaken for a state root or message
+    /// hash if both end up signed by the same Ed25519 key.
+    pub const SNAPSHOT_ROOT_DOMAIN: &[u8] = b"ogmara-snapshot-v1";
+
+    /// Chunk-payload compression codec identifier (manifest.codec field).
+    pub mod codec {
+        /// zstd at level 3 (default).
+        pub const ZSTD: u8 = 0;
+        /// No compression (uncompressed serialized payload).
+        pub const NONE: u8 = 1;
+    }
 }
 
 /// Encode a channel message index key: (channel_id, lamport_ts, msg_id).

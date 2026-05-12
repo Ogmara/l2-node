@@ -850,6 +850,157 @@ impl Storage {
         Ok((state_root, message_count, channel_count, user_count))
     }
 
+    // --- Snapshot Bootstrap (spec 11-snapshot-sync.md) ---
+
+    /// Build the chunk-set for a single CF in the snapshot pipeline.
+    ///
+    /// Iterates the CF in key-sorted order (RocksDB's natural iteration order)
+    /// and packs `(key, value)` rows into chunks of roughly `chunk_size_bytes`
+    /// of uncompressed payload. Returns the per-CF manifest (chunk headers +
+    /// Merkle root) and the compressed chunk bytes indexed by `seq`.
+    ///
+    /// `codec_id` is one of `schema::snapshot::codec::*`. The serve path uses
+    /// `ZSTD` (level 3); `NONE` is available for tests where determinism
+    /// trumps size.
+    ///
+    /// Should be called from `spawn_blocking` — full-CF iteration is unbounded.
+    pub fn build_snapshot_cf(
+        &self,
+        cf_name: &str,
+        chunk_size_bytes: u32,
+        codec_id: u8,
+    ) -> Result<super::snapshot::BuiltCf> {
+        use super::snapshot::{
+            finish_chunk, BuiltCf, ChunkHeader, MAX_BUILD_BYTES_PER_CF, MAX_BUILD_ENTRIES_PER_CF,
+        };
+        use crate::crypto::merkle::{compute_root, hash_kv};
+
+        if chunk_size_bytes == 0 {
+            anyhow::bail!("chunk_size_bytes must be > 0");
+        }
+        if codec_id != super::schema::snapshot::codec::ZSTD
+            && codec_id != super::schema::snapshot::codec::NONE
+        {
+            anyhow::bail!("unsupported snapshot codec id: {}", codec_id);
+        }
+
+        let cf_handle = self.db.cf_handle(cf_name)
+            .with_context(|| format!("column family '{}' not found", cf_name))?;
+        let target_chunk_bytes = chunk_size_bytes as usize;
+
+        let mut current_entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut current_uncompressed: usize = 0;
+        let mut current_leaves: Vec<[u8; 32]> = Vec::new();
+        let mut chunk_headers: Vec<ChunkHeader> = Vec::new();
+        let mut compressed_chunks: Vec<Vec<u8>> = Vec::new();
+        let mut all_chunk_roots: Vec<[u8; 32]> = Vec::new();
+        let mut total_entries: u64 = 0;
+        let mut total_bytes: u64 = 0;
+        let mut seq: u32 = 0;
+
+        // RocksDB iterators take an implicit DB snapshot at creation, so
+        // concurrent scanner writes don't produce inconsistent chunks here.
+        let mut iter = self.db.raw_iterator_cf(&cf_handle);
+        iter.seek_to_first();
+        while iter.valid() {
+            if let (Some(key), Some(value)) = (iter.key(), iter.value()) {
+                let row_size = key.len() + value.len();
+                total_entries = total_entries.saturating_add(1);
+                total_bytes = total_bytes.saturating_add(row_size as u64);
+
+                // Abort the build before allocating if an adversarial CF is
+                // larger than we'll ever serve. The previous cache stays in
+                // place so serving doesn't go dark on an attack.
+                if total_entries > MAX_BUILD_ENTRIES_PER_CF {
+                    anyhow::bail!(
+                        "cf '{}' exceeds MAX_BUILD_ENTRIES_PER_CF ({}); aborting build",
+                        cf_name, MAX_BUILD_ENTRIES_PER_CF
+                    );
+                }
+                if total_bytes > MAX_BUILD_BYTES_PER_CF {
+                    anyhow::bail!(
+                        "cf '{}' exceeds MAX_BUILD_BYTES_PER_CF ({} bytes); aborting build",
+                        cf_name, MAX_BUILD_BYTES_PER_CF
+                    );
+                }
+
+                current_leaves.push(hash_kv(key, value));
+                current_entries.push((key.to_vec(), value.to_vec()));
+                current_uncompressed = current_uncompressed.saturating_add(row_size);
+
+                if current_uncompressed >= target_chunk_bytes {
+                    finish_chunk(
+                        cf_name,
+                        seq,
+                        codec_id,
+                        &mut current_entries,
+                        &mut current_leaves,
+                        &mut chunk_headers,
+                        &mut compressed_chunks,
+                        &mut all_chunk_roots,
+                    )?;
+                    current_uncompressed = 0;
+                    seq = seq.checked_add(1).ok_or_else(|| {
+                        anyhow::anyhow!("cf '{}' produced more than u32::MAX chunks", cf_name)
+                    })?;
+                }
+            }
+            iter.next();
+        }
+        // Surface RocksDB iteration errors (corruption, I/O) rather than
+        // letting a truncated scan silently produce a wrong Merkle root.
+        iter.status()
+            .with_context(|| format!("rocksdb iteration error on cf '{}'", cf_name))?;
+
+        if !current_entries.is_empty() {
+            finish_chunk(
+                cf_name,
+                seq,
+                codec_id,
+                &mut current_entries,
+                &mut current_leaves,
+                &mut chunk_headers,
+                &mut compressed_chunks,
+                &mut all_chunk_roots,
+            )?;
+        }
+
+        let cf_root = compute_root(&all_chunk_roots);
+
+        Ok(BuiltCf {
+            cf_name: cf_name.to_string(),
+            num_entries: total_entries,
+            total_bytes,
+            chunk_size_bytes,
+            chunks: chunk_headers,
+            cf_root,
+            compressed_chunks,
+        })
+    }
+
+    /// Compute the snapshot Merkle root from per-CF roots in canonical order.
+    ///
+    /// `cf_roots` must be in the same order as
+    /// `super::schema::snapshot::DOMAIN_CFS`. The output is the value peers
+    /// compare during quorum agreement (spec 11-snapshot-sync.md §3.3).
+    pub fn compute_snapshot_root(
+        block_height: u64,
+        cf_roots: &[[u8; 32]],
+        total_users: u64,
+        total_channels: u64,
+    ) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(super::schema::snapshot::SNAPSHOT_ROOT_DOMAIN);
+        hasher.update(block_height.to_be_bytes());
+        for root in cf_roots {
+            hasher.update(root);
+        }
+        hasher.update(total_users.to_be_bytes());
+        hasher.update(total_channels.to_be_bytes());
+        hasher.finalize().into()
+    }
+
     // --- Network Stats Counters ---
 
     /// Read a u64 stat counter from NODE_STATE.

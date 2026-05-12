@@ -666,6 +666,18 @@ pub struct NodeAnnouncementPayload {
     pub api_endpoint: Option<String>,
     /// Announcement validity in seconds (default: 600 = 10 min).
     pub ttl_seconds: u32,
+    /// **v0.34+**: block height of this node's most recent cached snapshot.
+    /// `None` if `snapshot.serve_enabled = false` or the first cache build
+    /// hasn't completed yet. Used by Phase 2 clients during quorum sampling
+    /// (spec 11-snapshot-sync.md §3.1). Older nodes that don't know this
+    /// field deserialize it as `None` via `#[serde(default)]`.
+    #[serde(default)]
+    pub snapshot_height: Option<u64>,
+    /// **v0.34+**: snapshot Merkle root at `snapshot_height`. Receivers
+    /// compare across peers during quorum agreement; mismatch is a red flag.
+    /// Hex-encoded as 64 chars (32 bytes) when present.
+    #[serde(default)]
+    pub snapshot_root: Option<String>,
 }
 
 // --- Private Channel Key Distribution (spec 8.1.1) ---

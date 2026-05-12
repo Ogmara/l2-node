@@ -29,6 +29,8 @@ pub struct Config {
     #[serde(default)]
     pub anchoring: AnchoringConfig,
     #[serde(default)]
+    pub snapshot: SnapshotConfig,
+    #[serde(default)]
     pub logging: LoggingConfig,
     #[serde(default)]
     pub alerts: AlertsConfig,
@@ -354,6 +356,69 @@ impl Default for AnchoringConfig {
         }
     }
 }
+
+/// Snapshot bootstrap configuration (spec 11-snapshot-sync.md).
+///
+/// Controls peer-to-peer state snapshots: a serving node periodically caches
+/// a Merkle-rooted summary of its SC-derived state (users, channels, anchors)
+/// so new nodes can bootstrap without scanning millions of Klever blocks.
+///
+/// Phase 1 (v0.34): serve-only — caches a manifest and serves chunks on request.
+/// Phase 2/3 will add the client-side fetch + apply path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotConfig {
+    // --- Serving ---
+    /// Whether this node advertises and serves snapshots to peers.
+    /// Disable on resource-constrained nodes to skip the periodic cache build.
+    #[serde(default = "default_true")]
+    pub serve_enabled: bool,
+    /// How often to rebuild the cached snapshot from live storage (seconds).
+    /// 3600 = once per hour. Lower values are wasteful; higher values mean
+    /// fresh joiners replay more blocks after applying the snapshot.
+    #[serde(default = "default_snapshot_rebuild_interval")]
+    pub serve_rebuild_interval_secs: u64,
+    /// Target chunk size in bytes for the per-CF byte stream (default 4 MiB).
+    /// Smaller chunks = more parallelism but more overhead; larger = fewer
+    /// requests but heavier failure-retry cost.
+    #[serde(default = "default_snapshot_chunk_size")]
+    pub chunk_size_bytes: u32,
+    /// Maximum in-flight chunk responses across all peers. Throttles outbound
+    /// bandwidth when many peers are simultaneously bootstrapping.
+    #[serde(default = "default_snapshot_max_concurrent")]
+    pub serve_max_concurrent_requests: u32,
+
+    // --- Bootstrap (receive) — reserved for Phase 2/3, defaults are safe ---
+    /// Whether to fetch a snapshot at startup if conditions are met.
+    /// **Phase 1: not yet wired — left for forward-compatible config files.**
+    #[serde(default)]
+    pub bootstrap_enabled: bool,
+    /// Total peers to sample for snapshot quorum.
+    #[serde(default = "default_snapshot_quorum_sample")]
+    pub quorum_sample_size: u32,
+    /// Minimum peers that must agree on the snapshot root before accepting.
+    #[serde(default = "default_snapshot_quorum_min")]
+    pub quorum_min_peers: u32,
+}
+
+impl Default for SnapshotConfig {
+    fn default() -> Self {
+        Self {
+            serve_enabled: true,
+            serve_rebuild_interval_secs: default_snapshot_rebuild_interval(),
+            chunk_size_bytes: default_snapshot_chunk_size(),
+            serve_max_concurrent_requests: default_snapshot_max_concurrent(),
+            bootstrap_enabled: false,
+            quorum_sample_size: default_snapshot_quorum_sample(),
+            quorum_min_peers: default_snapshot_quorum_min(),
+        }
+    }
+}
+
+fn default_snapshot_rebuild_interval() -> u64 { 3600 }
+fn default_snapshot_chunk_size() -> u32 { 4 * 1024 * 1024 }
+fn default_snapshot_max_concurrent() -> u32 { 8 }
+fn default_snapshot_quorum_sample() -> u32 { 5 }
+fn default_snapshot_quorum_min() -> u32 { 3 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoggingConfig {
@@ -814,6 +879,19 @@ auth_token = ""
 enabled = false
 interval_seconds = 3600
 # wallet_key = ""  # optional, defaults to node identity key
+
+[snapshot]
+# Peer-to-peer state snapshots (spec 11-snapshot-sync.md).
+# Phase 1: serve-only — this node caches a state summary and answers
+# snapshot requests from peers. The fetch/apply side ships in v0.35+.
+serve_enabled = true
+serve_rebuild_interval_secs = 3600
+chunk_size_bytes = 4194304            # 4 MiB
+serve_max_concurrent_requests = 8
+# bootstrap_enabled is reserved for Phase 2 and currently has no effect.
+bootstrap_enabled = false
+quorum_sample_size = 5
+quorum_min_peers = 3
 
 [metrics]
 enabled = true

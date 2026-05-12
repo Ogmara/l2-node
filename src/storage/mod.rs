@@ -5,3 +5,4 @@
 pub mod identity;
 pub mod rocks;
 pub mod schema;
+pub mod snapshot;

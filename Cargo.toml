@@ -1,6 +1,6 @@
 [package]
 name = "ogmara-node"
-version = "0.33.0"
+version = "0.34.0"
 edition = "2021"
 authors = ["Ogmara Contributors"]
 license = "MIT"
@@ -78,6 +78,7 @@ chrono = { version = "0.4", features = ["serde"] }
 bytes = "1.11"
 dashmap = "6.1"
 bs58 = "0.5"
+zstd = "0.13"                # Snapshot chunk compression (spec 11-snapshot-sync.md)
 
 [dev-dependencies]
 tokio = { version = "1.50", features = ["test-util", "macros"] }

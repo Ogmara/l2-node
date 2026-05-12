@@ -10,6 +10,7 @@
 pub mod behaviour;
 pub mod discovery;
 pub mod gossip;
+pub mod snapshot;
 pub mod sync;
 
 use std::collections::HashMap;
@@ -34,6 +35,7 @@ use crate::storage::rocks::Storage;
 
 use self::behaviour::{OgmaraBehaviour, OgmaraBehaviourEvent};
 use self::gossip::TopicManager;
+use self::snapshot::SharedSnapshotCache;
 
 /// Peers queued for reconnection after disconnect, with exponential backoff.
 struct ReconnectEntry {
@@ -84,6 +86,17 @@ pub struct NetworkService {
     /// Known peer addresses from Identify (PeerId → best known address).
     /// Used to reconnect after disconnect.
     known_peer_addrs: HashMap<PeerId, Multiaddr>,
+    /// Shared snapshot cache — populated by the background cache-builder
+    /// task in `Node::run`. `None` until the first build completes.
+    snapshot_cache: SharedSnapshotCache,
+    /// Whether this node advertises and answers snapshot requests
+    /// (mirrors `config.snapshot.serve_enabled` at startup).
+    snapshot_serve_enabled: bool,
+    /// Concurrency limiter for outbound `SnapshotResponse::Chunk` sends.
+    /// `try_acquire`d in `handle_snapshot_event` for `GetChunk`. Sized from
+    /// `config.snapshot.serve_max_concurrent_requests`. Phase 1 — exists
+    /// to bound the working-set even if a peer pipelines many GetChunks.
+    snapshot_chunk_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl NetworkService {
@@ -99,6 +112,7 @@ impl NetworkService {
         node_id: String,
         connected_peers: Arc<RwLock<HashMap<String, ConnectedPeerInfo>>>,
         counters: Arc<NetworkCounters>,
+        snapshot_cache: SharedSnapshotCache,
     ) -> Result<Self> {
         let mut swarm = behaviour::build_swarm(config, keypair)
             .context("building libp2p swarm")?;
@@ -180,6 +194,15 @@ impl NetworkService {
 
         let public_url = config.api.public_url.clone();
 
+        let snapshot_serve_enabled = config.snapshot.serve_enabled;
+        // Clamp to [1, 4096] — config can't disable the semaphore entirely
+        // (we still want a backstop) and shouldn't request millions of permits.
+        let snapshot_permits = config
+            .snapshot
+            .serve_max_concurrent_requests
+            .clamp(1, 4096) as usize;
+        let snapshot_chunk_semaphore = Arc::new(tokio::sync::Semaphore::new(snapshot_permits));
+
         Ok(Self {
             swarm,
             topics,
@@ -196,6 +219,9 @@ impl NetworkService {
             bootstrap_addrs,
             reconnect_queue: Vec::new(),
             known_peer_addrs: HashMap::new(),
+            snapshot_cache,
+            snapshot_serve_enabled,
+            snapshot_chunk_semaphore,
         })
     }
 
@@ -483,6 +509,10 @@ impl NetworkService {
 
             SwarmEvent::Behaviour(OgmaraBehaviourEvent::RequestResponse(event)) => {
                 self.handle_request_response(event);
+            }
+
+            SwarmEvent::Behaviour(OgmaraBehaviourEvent::Snapshot(event)) => {
+                self.handle_snapshot_event(event);
             }
 
             SwarmEvent::NewListenAddr { address, .. } => {
@@ -921,6 +951,104 @@ impl NetworkService {
         }
     }
 
+    /// Handle an incoming snapshot-protocol request-response event
+    /// (spec 11-snapshot-sync.md). Phase 1: serves cached chunks; the
+    /// outbound (client) side is wired in Phase 2.
+    fn handle_snapshot_event(
+        &mut self,
+        event: libp2p::request_response::Event<
+            self::snapshot::SnapshotRequest,
+            self::snapshot::SnapshotResponse,
+        >,
+    ) {
+        use libp2p::request_response;
+
+        match event {
+            request_response::Event::Message {
+                peer,
+                message:
+                    request_response::Message::Request {
+                        request,
+                        channel,
+                        ..
+                    },
+                ..
+            } => {
+                debug!(peer = %peer, request = ?request, "Received snapshot request");
+
+                // Concurrency gate — only `GetChunk` is rate-limited (it's the
+                // expensive arm; `Advertise` and `GetManifest` are cheap).
+                // The permit is held until the response is sent to bound the
+                // working set across the libp2p task. `try_acquire_owned` is
+                // non-blocking — under load we return `RateLimited` immediately
+                // so the peer falls over to a different mirror in Phase 2+.
+                let _permit_guard = if matches!(request, self::snapshot::SnapshotRequest::GetChunk { .. }) {
+                    match self.snapshot_chunk_semaphore.clone().try_acquire_owned() {
+                        Ok(p) => Some(p),
+                        Err(_) => {
+                            warn!(
+                                peer = %peer,
+                                "Snapshot chunk request rate-limited (max concurrent reached)"
+                            );
+                            let resp = self::snapshot::SnapshotResponse::Error {
+                                code: self::snapshot::SnapshotErrorCode::RateLimited,
+                                message: "snapshot serve at capacity".into(),
+                            };
+                            if self
+                                .swarm
+                                .behaviour_mut()
+                                .snapshot
+                                .send_response(channel, resp)
+                                .is_err()
+                            {
+                                warn!(peer = %peer, "Failed to send RateLimited response (channel closed)");
+                            }
+                            return;
+                        }
+                    }
+                } else {
+                    None
+                };
+
+                let response = self::snapshot::build_response(
+                    &self.snapshot_cache,
+                    self.snapshot_serve_enabled,
+                    request,
+                );
+
+                if self
+                    .swarm
+                    .behaviour_mut()
+                    .snapshot
+                    .send_response(channel, response)
+                    .is_err()
+                {
+                    warn!(peer = %peer, "Failed to send snapshot response (channel closed)");
+                }
+            }
+
+            request_response::Event::Message {
+                peer,
+                message: request_response::Message::Response { .. },
+                ..
+            } => {
+                // Phase 1: we don't initiate snapshot requests yet, so any
+                // inbound response is unexpected — log and ignore.
+                debug!(peer = %peer, "Unexpected snapshot response (Phase 1 is serve-only)");
+            }
+
+            request_response::Event::OutboundFailure { peer, error, .. } => {
+                warn!(peer = %peer, error = %error, "Snapshot request failed");
+            }
+
+            request_response::Event::InboundFailure { peer, error, .. } => {
+                warn!(peer = %peer, error = %error, "Snapshot inbound failure");
+            }
+
+            _ => {}
+        }
+    }
+
     /// Initiate sync for all subscribed channels with a connected peer.
     ///
     /// Called when a new peer connection is established. Sends a SyncRequest
@@ -981,6 +1109,20 @@ impl NetworkService {
             .get_stat(crate::storage::schema::state_keys::TOTAL_USERS)
             .unwrap_or(0) as u32;
 
+        // Snapshot fields are only set when the cache builder has produced
+        // at least one snapshot. Older nodes that don't deserialize the
+        // new fields fall through via `#[serde(default)]`.
+        let (snapshot_height, snapshot_root) = match self.snapshot_cache.read() {
+            Ok(guard) => match guard.as_ref() {
+                Some(c) => (
+                    Some(c.manifest.block_height),
+                    Some(hex::encode(c.manifest.snapshot_root)),
+                ),
+                None => (None, None),
+            },
+            Err(_) => (None, None),
+        };
+
         let payload = NodeAnnouncementPayload {
             node_id: self.node_id.clone(),
             channels,
@@ -992,6 +1134,8 @@ impl NetworkService {
             ],
             api_endpoint: self.public_url.clone(),
             ttl_seconds: 600, // 10 minutes
+            snapshot_height,
+            snapshot_root,
         };
 
         let payload_bytes = match rmp_serde::to_vec(&payload) {
