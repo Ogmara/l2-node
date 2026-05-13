@@ -376,13 +376,17 @@ impl Node {
                 let storage_arc = Arc::new(self.storage.clone());
                 let snap_config = self.config.snapshot.clone();
                 let network_id = self.config.network_id().to_string();
+                let klever_node_url = self.config.klever.node_url.clone();
+                let contract_address = self.config.klever.contract_address.clone();
                 let data_dir = self.config.node.data_dir.clone();
-                info!("Phase 2 snapshot bootstrap starting (experimental)");
+                info!("Snapshot bootstrap starting (anchor-verified)");
                 match crate::network::snapshot_client::run_bootstrap(
                     &handle,
                     storage_arc,
                     &snap_config,
                     &network_id,
+                    &klever_node_url,
+                    &contract_address,
                     &data_dir,
                 )
                 .await

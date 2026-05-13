@@ -77,6 +77,26 @@ pub struct SnapshotManifest {
     /// Stored as `Vec<u8>` because serde lacks native support for `[u8; 64]`.
     /// Receivers MUST check `len() == 64` before passing to `Signature::from_slice`.
     pub producer_signature: Vec<u8>,
+    /// **v0.36+:** producer's Ed25519 public key (32 bytes), used for
+    /// `producer_signature` verification. Phase 3 receivers verify
+    /// `Base58(SHA-256(producer_pubkey)[:20]) == producer_node_id` and
+    /// then check the signature against this key. Older (Phase 1/2)
+    /// producers leave this empty; receivers fall back to "quorum +
+    /// merkle + anchor verification only" with a warning.
+    /// Included in `canonical_signing_bytes` only when non-empty so
+    /// Phase 1/2 signatures remain canonical.
+    #[serde(default)]
+    pub producer_pubkey: Vec<u8>,
+}
+
+/// Result of `SnapshotManifest::verify_producer_signature`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignatureCheck {
+    /// Pubkey present and signature verifies.
+    Verified,
+    /// Pubkey absent (Phase 1/2 producer). Caller decides whether to
+    /// accept the manifest with reduced trust.
+    SkippedNoPubkey,
 }
 
 impl SnapshotManifest {
@@ -121,6 +141,15 @@ impl SnapshotManifest {
         if self.cfs.len() > 64 {
             anyhow::bail!("cfs list too long ({} > 64)", self.cfs.len());
         }
+        // v0.36+ pubkey field — when present must be exactly 32 bytes (Ed25519).
+        // Absent means producer is v0.34/v0.35; receivers fall back to
+        // quorum-only trust with a warning.
+        if !self.producer_pubkey.is_empty() && self.producer_pubkey.len() != 32 {
+            anyhow::bail!(
+                "producer_pubkey must be empty or exactly 32 bytes, got {}",
+                self.producer_pubkey.len()
+            );
+        }
         // Sanity on per-CF chunk counts — refuse 100M+ chunks per CF.
         for cf in &self.cfs {
             if cf.chunks.len() > 1_000_000 {
@@ -135,6 +164,64 @@ impl SnapshotManifest {
             }
         }
         Ok(())
+    }
+
+    /// Verify the producer signature over the canonical bytes.
+    ///
+    /// **Phase 3** (v0.36+): if `producer_pubkey` is present, verify
+    /// strictly:
+    ///   1. `producer_pubkey.len() == 32` (Ed25519),
+    ///   2. `Base58(SHA-256(producer_pubkey)[:20]) == producer_node_id`,
+    ///   3. Ed25519 signature verifies over `canonical_signing_bytes()`.
+    /// Mismatch on any of these → `Err`.
+    ///
+    /// If `producer_pubkey` is absent (Phase 1/2 producer), the function
+    /// returns `Ok(SignatureCheck::SkippedNoPubkey)`. Callers warn but
+    /// proceed — trust falls back to quorum + Merkle + anchor verification.
+    pub fn verify_producer_signature(&self) -> anyhow::Result<SignatureCheck> {
+        use ed25519_dalek::{Signature, VerifyingKey};
+        use sha2::{Digest, Sha256};
+
+        if self.producer_pubkey.is_empty() {
+            return Ok(SignatureCheck::SkippedNoPubkey);
+        }
+        if self.producer_pubkey.len() != 32 {
+            anyhow::bail!(
+                "producer_pubkey must be 32 bytes, got {}",
+                self.producer_pubkey.len()
+            );
+        }
+        if self.producer_signature.len() != 64 {
+            anyhow::bail!(
+                "producer_signature must be 64 bytes, got {}",
+                self.producer_signature.len()
+            );
+        }
+        // Pubkey → node_id check.
+        let pubkey_arr: [u8; 32] = self.producer_pubkey.as_slice().try_into().unwrap();
+        let computed_node_id = {
+            let hash = Sha256::digest(pubkey_arr);
+            bs58::encode(&hash[..20]).into_string()
+        };
+        if computed_node_id != self.producer_node_id {
+            anyhow::bail!(
+                "producer_pubkey does not derive producer_node_id: claim={}, computed={}",
+                self.producer_node_id,
+                computed_node_id
+            );
+        }
+        // Signature verification.
+        let vk = VerifyingKey::from_bytes(&pubkey_arr)
+            .map_err(|e| anyhow::anyhow!("invalid producer_pubkey: {}", e))?;
+        let sig_arr: [u8; 64] = self.producer_signature.as_slice().try_into().unwrap();
+        let sig = Signature::from_bytes(&sig_arr);
+        let canonical = self.canonical_signing_bytes();
+        // verify_strict rejects small-subgroup component R signatures —
+        // not strictly required for snapshot auth, but cheap defense in
+        // depth (audit Phase 3 Sec N1).
+        vk.verify_strict(&canonical, &sig)
+            .map_err(|e| anyhow::anyhow!("producer_signature failed Ed25519 verification: {}", e))?;
+        Ok(SignatureCheck::Verified)
     }
 
     /// Build the canonical byte string used for signing.
@@ -178,6 +265,14 @@ impl SnapshotManifest {
             buf.extend_from_slice(cf.cf_name.as_bytes());
             buf.extend_from_slice(&cf.cf_root);
             buf.extend_from_slice(&(cf.chunks.len() as u32).to_be_bytes());
+        }
+        // v0.36+ producer_pubkey extension — included ONLY when non-empty
+        // so v0.34 / v0.35 producers' signatures remain canonical and
+        // verifiable against the unextended form.
+        if !self.producer_pubkey.is_empty() {
+            buf.push(0); // separator before pubkey
+            buf.extend_from_slice(&(self.producer_pubkey.len() as u32).to_be_bytes());
+            buf.extend_from_slice(&self.producer_pubkey);
         }
         buf
     }
@@ -366,6 +461,10 @@ pub fn build_cache(
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
+    // v0.36+: include the producer's Ed25519 pubkey so receivers can
+    // verify producer_signature without an out-of-band identity lookup.
+    let producer_pubkey = signing_key.verifying_key().to_bytes().to_vec();
+
     let mut manifest = SnapshotManifest {
         version: schema::snapshot::MANIFEST_VERSION,
         network_id: network_id.to_string(),
@@ -378,10 +477,10 @@ pub fn build_cache(
         created_at,
         producer_node_id: node_id.to_string(),
         producer_signature: Vec::new(),
+        producer_pubkey,
     };
 
-    // Sign the canonical bytes. Verification is deferred to Phase 2 when
-    // the client-side fetch path lands.
+    // Sign the canonical bytes (with pubkey extension).
     let canonical = manifest.canonical_signing_bytes();
     let sig = signing_key.sign(&canonical);
     manifest.producer_signature = sig.to_bytes().to_vec();
@@ -555,6 +654,7 @@ mod tests {
             created_at: 0,
             producer_node_id: "node1".into(),
             producer_signature: vec![0u8; 64],
+            producer_pubkey: Vec::new(),
         }
     }
 
@@ -593,6 +693,98 @@ mod tests {
     }
 
     #[test]
+    fn verify_producer_signature_skips_when_pubkey_absent() {
+        // v0.34/v0.35 producers ship no pubkey — receivers fall back to
+        // quorum-only trust with a warning, not a hard reject.
+        let m = good_manifest();
+        assert!(m.producer_pubkey.is_empty());
+        match m.verify_producer_signature() {
+            Ok(SignatureCheck::SkippedNoPubkey) => {}
+            other => panic!("expected SkippedNoPubkey, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn verify_producer_signature_round_trip() {
+        // Build a v0.36 manifest by hand with matching pubkey + signature,
+        // confirm verify() accepts it.
+        use ed25519_dalek::{Signer, SigningKey};
+        use rand::rngs::OsRng;
+        use sha2::{Digest, Sha256};
+
+        let key = SigningKey::generate(&mut OsRng);
+        let pubkey = key.verifying_key().to_bytes().to_vec();
+        let node_id = {
+            let hash = Sha256::digest(&pubkey);
+            bs58::encode(&hash[..20]).into_string()
+        };
+        let mut m = good_manifest();
+        m.producer_node_id = node_id;
+        m.producer_pubkey = pubkey;
+        let canonical = m.canonical_signing_bytes();
+        let sig = key.sign(&canonical);
+        m.producer_signature = sig.to_bytes().to_vec();
+
+        match m.verify_producer_signature() {
+            Ok(SignatureCheck::Verified) => {}
+            other => panic!("expected Verified, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn verify_producer_signature_catches_pubkey_node_id_mismatch() {
+        use ed25519_dalek::{Signer, SigningKey};
+        use rand::rngs::OsRng;
+
+        let key = SigningKey::generate(&mut OsRng);
+        let mut m = good_manifest();
+        // Pubkey doesn't hash to producer_node_id="node1".
+        m.producer_pubkey = key.verifying_key().to_bytes().to_vec();
+        let canonical = m.canonical_signing_bytes();
+        m.producer_signature = key.sign(&canonical).to_bytes().to_vec();
+        let result = m.verify_producer_signature();
+        assert!(result.is_err(), "node_id mismatch must fail");
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(msg.contains("does not derive producer_node_id"));
+    }
+
+    #[test]
+    fn verify_producer_signature_catches_tampered_signature() {
+        use ed25519_dalek::{Signer, SigningKey};
+        use rand::rngs::OsRng;
+        use sha2::{Digest, Sha256};
+
+        let key = SigningKey::generate(&mut OsRng);
+        let pubkey = key.verifying_key().to_bytes().to_vec();
+        let node_id = {
+            let hash = Sha256::digest(&pubkey);
+            bs58::encode(&hash[..20]).into_string()
+        };
+        let mut m = good_manifest();
+        m.producer_node_id = node_id;
+        m.producer_pubkey = pubkey;
+        let canonical = m.canonical_signing_bytes();
+        let mut sig = key.sign(&canonical).to_bytes();
+        // Flip a byte in the signature.
+        sig[0] ^= 0xff;
+        m.producer_signature = sig.to_vec();
+
+        let result = m.verify_producer_signature();
+        assert!(result.is_err(), "tampered signature must fail");
+    }
+
+    #[test]
+    fn validate_rejects_bad_pubkey_length() {
+        let mut m = good_manifest();
+        m.producer_pubkey = vec![0u8; 31]; // wrong
+        assert!(m.validate().is_err());
+        m.producer_pubkey = vec![0u8; 33];
+        assert!(m.validate().is_err());
+        m.producer_pubkey = vec![0u8; 32];
+        assert!(m.validate().is_ok()); // OK length but won't verify; that's a separate check
+    }
+
+    #[test]
     fn validate_rejects_too_many_cfs() {
         let mut m = good_manifest();
         m.cfs = (0..65)
@@ -624,6 +816,7 @@ mod tests {
             created_at: 1_700_000_000,
             producer_node_id: "node1".into(),
             producer_signature: vec![1u8; 64],
+            producer_pubkey: Vec::new(),
         };
         let mut m2 = m1.clone();
         m2.producer_signature = vec![2u8; 64];
@@ -646,6 +839,7 @@ mod tests {
                 created_at: 0,
                 producer_node_id: "node1".into(),
                 producer_signature: Vec::new(),
+                producer_pubkey: Vec::new(),
             },
             chunks: std::collections::HashMap::new(),
             chunk_headers: std::collections::HashMap::new(),
