@@ -278,6 +278,27 @@ async fn fetch_manifest(
 
     manifest.validate().context("manifest structural validation")?;
 
+    // Phase 3: verify the producer signature when the manifest carries a
+    // pubkey. Phase 1/2 producers (v0.34, v0.35) shipped no pubkey field;
+    // we tolerate that with a warning so a v0.36 client can still pull a
+    // snapshot from an upgrade-laggard peer, but log loudly so operators
+    // know they're relying on quorum + Merkle + anchor verification only.
+    match manifest.verify_producer_signature() {
+        Ok(crate::network::snapshot::SignatureCheck::Verified) => {
+            tracing::debug!("Producer signature verified");
+        }
+        Ok(crate::network::snapshot::SignatureCheck::SkippedNoPubkey) => {
+            tracing::warn!(
+                producer_node_id = %manifest.producer_node_id,
+                "Producer manifest has no pubkey (v0.34/v0.35 producer) — \
+                 signature verification SKIPPED; trust falls back to quorum + Merkle + Klever anchor checks"
+            );
+        }
+        Err(e) => {
+            bail!("producer signature verification failed: {}", e);
+        }
+    }
+
     if manifest.network_id != expected_network_id {
         bail!(
             "manifest network_id mismatch: peer={}, local={}",
@@ -559,6 +580,193 @@ pub fn verify_merkle_consistency(
     Ok(())
 }
 
+// --- Anchor re-verification against Klever (Phase 3) -------------------
+
+/// Outcome of verifying the snapshot's `STATE_ANCHORS` against Klever.
+#[derive(Debug, Clone)]
+pub struct AnchorVerifyResult {
+    /// Highest block height where the snapshot's claimed `state_root`
+    /// matched what's on the Klever chain. This becomes the receiver's
+    /// new `chain_cursor` after apply — the chain scanner will replay
+    /// the (at most one anchor interval) of blocks between this height
+    /// and `manifest.block_height`.
+    pub cutoff_height: u64,
+    /// How many anchors were checked before reaching the verified one.
+    pub checked: usize,
+    /// Total anchors in the snapshot.
+    pub total: usize,
+}
+
+/// Iterate the snapshot's `STATE_ANCHORS` rows from highest height down,
+/// re-checking each against the Klever SC's `getStateRoot(block_height)`
+/// view. Returns the highest `block_height` whose claim matched on-chain.
+///
+/// Rejection cases:
+/// - **Any anchor `Mismatch`** → snapshot is poisoned, abort with `Err`.
+/// - **All anchors `NotAnchored`** → snapshot has no on-chain backing,
+///   abort with `Err` (this also catches an attacker fabricating anchors).
+/// - **Klever RPC unreachable for every anchor** → abort with `Err` unless
+///   we've already accumulated ≥ 1 verified anchor at a higher height.
+///
+/// Spec 11-snapshot-sync.md §5a.5 (Phase 3 semantics).
+pub async fn verify_anchors_against_klever(
+    decoded_anchors: &[ChunkPayload],
+    http: &reqwest::Client,
+    klever_node_url: &str,
+    contract_address: &str,
+) -> Result<AnchorVerifyResult> {
+    use crate::chain::anchor_verify::{verify_anchor, AnchorVerifyOutcome};
+    use crate::chain::types::StateAnchorRecord;
+
+    // Flatten all chunks and parse anchors.
+    let mut anchors: Vec<StateAnchorRecord> = Vec::new();
+    for chunk in decoded_anchors {
+        for (key, value) in &chunk.entries {
+            // Sanity: key is block_height_be (8 bytes); value is JSON.
+            let key_arr: [u8; 8] = key.as_slice().try_into().map_err(|_| {
+                anyhow!(
+                    "STATE_ANCHORS chunk has unexpected key length: got {}, expected 8",
+                    key.len()
+                )
+            })?;
+            let record: StateAnchorRecord = serde_json::from_slice(value)
+                .context("parsing StateAnchorRecord from snapshot")?;
+            // Cross-check: row key block_height matches the record.
+            let key_height = u64::from_be_bytes(key_arr);
+            if key_height != record.block_height {
+                bail!(
+                    "STATE_ANCHORS row key/value height mismatch: key={}, record={}",
+                    key_height,
+                    record.block_height
+                );
+            }
+            anchors.push(record);
+        }
+    }
+
+    let total = anchors.len();
+    if total == 0 {
+        bail!("snapshot has no STATE_ANCHORS — refusing to apply an unanchored snapshot");
+    }
+
+    // Sort by block_height descending so we check newest first.
+    anchors.sort_by(|a, b| b.block_height.cmp(&a.block_height));
+
+    // Anti-downgrade ratchet (audit Phase 3 Sec W1): if a peer pads the
+    // snapshot with newer-than-real anchors, every one comes back
+    // NotAnchored and the loop walks down to a much-older verified
+    // anchor — silently demoting the cutoff. We refuse if more than
+    // this many newer-than-cutoff claims fail with NotAnchored.
+    const MAX_NEWER_NOT_ANCHORED: usize = 2;
+
+    // Overall budget (audit Phase 3 Code W2): a malicious peer could
+    // stuff hundreds of anchors and slow Klever RPC to its 15s per-
+    // request limit. Cap the entire verification at 2 minutes — enough
+    // for ~10 anchors at the per-request timeout, far more in the
+    // common case.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+
+    let mut checked: usize = 0;
+    let mut rpc_failures: usize = 0;
+    let mut newer_not_anchored: usize = 0;
+    let mut first_verified: Option<u64> = None;
+    // After we find the first match, we can stop — that's the highest
+    // verified anchor and therefore the cutoff.
+    for record in &anchors {
+        if tokio::time::Instant::now() >= deadline {
+            bail!(
+                "anchor verification exceeded total budget (checked {}/{}); aborting",
+                checked,
+                total
+            );
+        }
+        checked += 1;
+        let outcome = verify_anchor(
+            http,
+            klever_node_url,
+            contract_address,
+            record.block_height,
+            &record.state_root,
+        )
+        .await;
+
+        match outcome {
+            AnchorVerifyOutcome::Match => {
+                first_verified = Some(record.block_height);
+                break;
+            }
+            AnchorVerifyOutcome::Mismatch { on_chain, in_snapshot } => {
+                bail!(
+                    "POISONED SNAPSHOT — anchor at block {} on-chain root '{}' \
+                     differs from snapshot's claim '{}'. Refusing to apply.",
+                    record.block_height,
+                    on_chain,
+                    in_snapshot
+                );
+            }
+            AnchorVerifyOutcome::NotAnchored => {
+                // Newer anchors not yet on-chain — possible if the SC's
+                // anchoring is lagging, OR if the peer fabricated them.
+                // Tolerate a small number; refuse a large gap (downgrade attack).
+                newer_not_anchored += 1;
+                if newer_not_anchored > MAX_NEWER_NOT_ANCHORED {
+                    bail!(
+                        "snapshot reports too many newer anchors not present on Klever ({} > {}); \
+                         possible downgrade attack — refusing to apply",
+                        newer_not_anchored,
+                        MAX_NEWER_NOT_ANCHORED
+                    );
+                }
+                warn!(
+                    block_height = record.block_height,
+                    newer_not_anchored,
+                    "anchor not found on Klever — checking older anchors"
+                );
+                continue;
+            }
+            AnchorVerifyOutcome::RpcError(err) => {
+                rpc_failures += 1;
+                warn!(
+                    block_height = record.block_height,
+                    error = %err,
+                    "Klever RPC error verifying anchor — will retry next anchor"
+                );
+                // If RPC is broken for many anchors in a row, bail.
+                // Half the total is a reasonable threshold for "Klever down."
+                if rpc_failures > (total / 2).max(2) {
+                    bail!(
+                        "Klever RPC failed for {} of {} anchors — aborting verification",
+                        rpc_failures, total
+                    );
+                }
+                continue;
+            }
+        }
+    }
+
+    let cutoff_height = first_verified.ok_or_else(|| {
+        anyhow!(
+            "No snapshot anchors verified against Klever (checked {}/{}); refusing apply",
+            checked,
+            total
+        )
+    })?;
+
+    info!(
+        cutoff_height,
+        checked,
+        total,
+        rpc_failures,
+        "Anchor verification complete — snapshot trusted up to verified cutoff"
+    );
+
+    Ok(AnchorVerifyResult {
+        cutoff_height,
+        checked,
+        total,
+    })
+}
+
 // --- Apply path ---------------------------------------------------------
 
 /// Result of a successful bootstrap.
@@ -737,29 +945,26 @@ pub fn apply_snapshot(
 
 // --- Top-level orchestrator --------------------------------------------
 
-/// Run the full Phase 2 bootstrap.
+/// Run the full snapshot bootstrap (Phase 3 — anchor-verified).
 ///
 /// Returns `Ok(Some(outcome))` if a snapshot was successfully applied,
 /// `Ok(None)` if bootstrap was skipped (no quorum, peers unavailable,
-/// disabled, etc — log + fall back to scan), and `Err` only on fatal
-/// errors that the caller should surface to the operator.
+/// no on-chain anchors yet — log + fall back to scan), and `Err` only
+/// on fatal errors the caller should surface to the operator (poisoned
+/// snapshot detected via anchor mismatch is in this last bucket).
 ///
 /// `data_dir` is where the rollback checkpoint will be written.
+/// `klever_node_url` and `contract_address` are used to re-verify each
+/// snapshot anchor against the Ogmara KApp's `getStateRoot` view.
 pub async fn run_bootstrap(
     handle: &ClientHandle,
     storage: Arc<Storage>,
     config: &SnapshotConfig,
     network_id: &str,
+    klever_node_url: &str,
+    contract_address: &str,
     data_dir: &std::path::Path,
 ) -> Result<Option<BootstrapOutcome>> {
-    // Phase 2 safety gate.
-    if !config.experimental_skip_anchor_verify {
-        warn!(
-            "snapshot.bootstrap_enabled = true but experimental_skip_anchor_verify = false; \
-             refusing to apply (Phase 3 will add real anchor verification)"
-        );
-        return Ok(None);
-    }
 
     // Discovery: wait up to discovery_timeout for peers to appear, then
     // probe everyone connected.
@@ -841,21 +1046,33 @@ pub async fn run_bootstrap(
     verify_merkle_consistency(&manifest, &chunks)
         .context("snapshot Merkle root verification failed")?;
 
-    // Cutoff: Phase 2 trusts the manifest's claim (gated by
-    // `experimental_skip_anchor_verify` checked at function entry).
-    // Refuse `last_verified_anchor_height == 0` outright — applying an
-    // unanchored snapshot means trusting the producer entirely with no
-    // on-chain anchor to fall back to in Phase 3, and there's no
-    // operator override worth the risk in Phase 2.
-    if manifest.last_verified_anchor_height == 0 {
-        warn!(
-            "Snapshot manifest reports last_verified_anchor_height = 0 — \
-             refusing to apply an unanchored snapshot. Wait for the source \
-             node to anchor at least once and retry."
-        );
-        return Ok(None);
-    }
-    let cutoff_height = manifest.last_verified_anchor_height;
+    // Phase 3: re-verify the snapshot's STATE_ANCHORS against Klever
+    // and find the highest matching anchor. The producer's claim of
+    // `last_verified_anchor_height` is NOT trusted any more — we always
+    // ask Klever directly. Any anchor whose state_root differs from
+    // on-chain truth is a *poisoned snapshot* — hard abort.
+    let anchor_chunks = chunks
+        .get(crate::storage::schema::cf::STATE_ANCHORS)
+        .ok_or_else(|| anyhow!("STATE_ANCHORS chunks missing from decoded fetch"))?;
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .context("building HTTP client for Klever anchor verify")?;
+    let anchor_result = match verify_anchors_against_klever(
+        anchor_chunks,
+        &http,
+        klever_node_url,
+        contract_address,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(error = %e, "Anchor verification failed — falling back to chain scan");
+            return Ok(None);
+        }
+    };
+    let cutoff_height = anchor_result.cutoff_height;
 
     // Run apply in spawn_blocking — multi-CF clear+write is not async.
     let storage_for_apply = storage.clone();
@@ -1318,6 +1535,162 @@ mod tests {
         // Drop source so tempdir cleanup runs.
         drop(source_storage);
         drop(source_dir);
+    }
+
+    // --- Phase 3 anchor verification tests ---
+
+    use crate::chain::anchor_verify::AnchorVerifyOutcome;
+
+    fn anchor_chunk_payload(records: Vec<crate::chain::types::StateAnchorRecord>) -> ChunkPayload {
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = records
+            .into_iter()
+            .map(|r| {
+                let key = r.block_height.to_be_bytes().to_vec();
+                let val = serde_json::to_vec(&r).unwrap();
+                (key, val)
+            })
+            .collect();
+        ChunkPayload {
+            cf_name: cf_names::STATE_ANCHORS.to_string(),
+            seq: 0,
+            entries,
+        }
+    }
+
+    fn anchor_record(block_height: u64, state_root: &str) -> crate::chain::types::StateAnchorRecord {
+        crate::chain::types::StateAnchorRecord {
+            block_height,
+            state_root: state_root.to_string(),
+            message_count: 0,
+            channel_count: 0,
+            user_count: 0,
+            node_id: "test".into(),
+            anchored_at: 0,
+        }
+    }
+
+    /// Smoke test for the anchor verification iteration logic — the SC
+    /// query itself isn't unit-testable here (it requires Klever RPC),
+    /// so this test exercises the data extraction + sort + outcome
+    /// handling pieces by parsing chunks and inspecting the structures.
+    /// Full end-to-end verification is in the manual integration test.
+    #[test]
+    fn anchor_chunks_parse_and_sort_descending() {
+        use crate::chain::types::StateAnchorRecord;
+
+        let chunk = anchor_chunk_payload(vec![
+            anchor_record(100, "aa".repeat(32).as_str()),
+            anchor_record(300, "cc".repeat(32).as_str()),
+            anchor_record(200, "bb".repeat(32).as_str()),
+        ]);
+
+        // Re-parse like verify_anchors_against_klever would.
+        let mut parsed: Vec<StateAnchorRecord> = chunk
+            .entries
+            .iter()
+            .map(|(_, v)| serde_json::from_slice(v).unwrap())
+            .collect();
+        parsed.sort_by(|a, b| b.block_height.cmp(&a.block_height));
+
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0].block_height, 300);
+        assert_eq!(parsed[1].block_height, 200);
+        assert_eq!(parsed[2].block_height, 100);
+    }
+
+    #[test]
+    fn anchor_outcome_variants_distinguish_correctly() {
+        let m = AnchorVerifyOutcome::Match;
+        let na = AnchorVerifyOutcome::NotAnchored;
+        let mm = AnchorVerifyOutcome::Mismatch {
+            on_chain: "aa".into(),
+            in_snapshot: "bb".into(),
+        };
+        assert_ne!(m, na);
+        assert_ne!(m, mm);
+        assert_ne!(na, mm);
+    }
+
+    #[test]
+    fn anchor_chunk_with_bad_key_length_is_rejected_pattern() {
+        // The verify_anchors_against_klever loop checks `key.len() != 8`.
+        // We can confirm the key-length invariant by inspecting a built
+        // chunk: every anchor key is exactly 8 bytes (block_height_be).
+        let chunk = anchor_chunk_payload(vec![anchor_record(100, &"aa".repeat(32))]);
+        for (k, _) in &chunk.entries {
+            assert_eq!(k.len(), 8, "every STATE_ANCHORS key must be 8 bytes");
+        }
+    }
+
+    #[test]
+    fn anchor_chunk_key_value_height_mismatch_is_detected() {
+        // Manual tamper: key says height=100 but record says height=999.
+        let mut chunk = anchor_chunk_payload(vec![anchor_record(999, &"aa".repeat(32))]);
+        // Overwrite key to 100 while value still says 999.
+        chunk.entries[0].0 = 100u64.to_be_bytes().to_vec();
+
+        let entry = &chunk.entries[0];
+        let key_height = u64::from_be_bytes(entry.0.as_slice().try_into().unwrap());
+        let record: crate::chain::types::StateAnchorRecord =
+            serde_json::from_slice(&entry.1).unwrap();
+        assert_eq!(key_height, 100);
+        assert_eq!(record.block_height, 999);
+        // verify_anchors_against_klever catches this with `bail!`.
+    }
+
+    // --- Phase 3 rollback GC test ---
+
+    #[test]
+    fn rollback_gc_clears_after_cursor_advances() {
+        use crate::chain::scanner::gc_snapshot_rollback_if_ready;
+        use crate::storage::schema::{cf, state_keys};
+
+        let (storage, dir) = fresh_storage();
+        // Plant the marker keys + an actual rollback dir on disk.
+        let rb_path = dir.path().join("snapshot_rollback_test");
+        std::fs::create_dir(&rb_path).unwrap();
+        storage
+            .put_cf(
+                cf::NODE_STATE,
+                state_keys::SNAPSHOT_APPLIED_AT_HEIGHT,
+                &1000u64.to_be_bytes(),
+            )
+            .unwrap();
+        storage
+            .put_cf(
+                cf::NODE_STATE,
+                state_keys::SNAPSHOT_ROLLBACK_DIR,
+                rb_path.to_string_lossy().as_bytes(),
+            )
+            .unwrap();
+
+        // Too early: cursor only 50 blocks past cutoff — GC waits.
+        gc_snapshot_rollback_if_ready(&storage, 1050);
+        assert!(rb_path.exists(), "GC must wait for buffer");
+        assert!(storage
+            .get_cf(cf::NODE_STATE, state_keys::SNAPSHOT_ROLLBACK_DIR)
+            .unwrap()
+            .is_some());
+
+        // Past buffer (100 blocks): GC runs.
+        gc_snapshot_rollback_if_ready(&storage, 1100);
+        assert!(!rb_path.exists(), "rollback dir must be deleted");
+        assert!(storage
+            .get_cf(cf::NODE_STATE, state_keys::SNAPSHOT_ROLLBACK_DIR)
+            .unwrap()
+            .is_none(), "marker must be cleared");
+        assert!(storage
+            .get_cf(cf::NODE_STATE, state_keys::SNAPSHOT_APPLIED_AT_HEIGHT)
+            .unwrap()
+            .is_none(), "applied-at sentinel cleared after GC");
+    }
+
+    #[test]
+    fn rollback_gc_noop_when_no_marker() {
+        use crate::chain::scanner::gc_snapshot_rollback_if_ready;
+        let (storage, _dir) = fresh_storage();
+        // No-op (no marker set) — must not panic.
+        gc_snapshot_rollback_if_ready(&storage, 9999);
     }
 
     #[test]

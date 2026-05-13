@@ -218,6 +218,11 @@ impl ChainScanner {
             // Update cursor after successful batch
             self.last_block = end;
             self.storage.set_chain_cursor(end)?;
+            // Snapshot-bootstrap GC: if a recent snapshot apply left a
+            // rollback checkpoint on disk and we've now scanned far enough
+            // past the cutoff to consider it safely committed, delete it.
+            // Spec 11-snapshot-sync.md §5a.6.
+            gc_snapshot_rollback_if_ready(&self.storage, self.last_block);
             current = end + 1;
 
             // Inter-batch delay to avoid hitting rate limits
@@ -752,4 +757,103 @@ impl ChainScanner {
         padded[8 - bytes.len()..].copy_from_slice(&bytes);
         Ok(u64::from_be_bytes(padded))
     }
+}
+
+/// Blocks past `cutoff_height` before the rollback checkpoint is GC'd.
+/// Conservative — gives the operator time to inspect / notice any
+/// issues before the safety net is removed. Spec 11-snapshot-sync.md §5a.6.
+const SNAPSHOT_ROLLBACK_GC_BUFFER_BLOCKS: u64 = 100;
+
+/// Garbage-collect the snapshot-bootstrap rollback directory if the
+/// chain scanner has advanced safely past the apply cutoff.
+///
+/// Reads `SNAPSHOT_APPLIED_AT_HEIGHT` and `SNAPSHOT_ROLLBACK_DIR` from
+/// `NODE_STATE`. If both are set AND `current_cursor >= applied_at
+/// + SNAPSHOT_ROLLBACK_GC_BUFFER_BLOCKS`, deletes the rollback dir
+/// from disk and clears both keys. Best-effort — any failure is
+/// logged but does not propagate (the dir will just linger until
+/// the next successful pass or until the operator deletes it).
+pub fn gc_snapshot_rollback_if_ready(
+    storage: &crate::storage::rocks::Storage,
+    current_cursor: u64,
+) {
+    use crate::storage::schema::{cf, state_keys};
+
+    let applied_at = match storage.get_cf(cf::NODE_STATE, state_keys::SNAPSHOT_APPLIED_AT_HEIGHT) {
+        Ok(Some(b)) if b.len() == 8 => {
+            u64::from_be_bytes(b.as_slice().try_into().unwrap())
+        }
+        _ => return, // no apply on record → nothing to GC
+    };
+    if current_cursor < applied_at + SNAPSHOT_ROLLBACK_GC_BUFFER_BLOCKS {
+        return; // not safe yet — keep the rollback dir
+    }
+
+    let rollback_path_bytes = match storage.get_cf(cf::NODE_STATE, state_keys::SNAPSHOT_ROLLBACK_DIR) {
+        Ok(Some(b)) if !b.is_empty() => b,
+        _ => return, // no rollback dir recorded → nothing to delete
+    };
+    let path_str = match String::from_utf8(rollback_path_bytes) {
+        Ok(s) => s,
+        Err(_) => {
+            warn!("SNAPSHOT_ROLLBACK_DIR not valid UTF-8 — clearing marker");
+            let _ = storage.delete_cf(cf::NODE_STATE, state_keys::SNAPSHOT_ROLLBACK_DIR);
+            return;
+        }
+    };
+    let path = std::path::Path::new(&path_str);
+    if path.exists() {
+        // Hardening (audit Phase 3 Sec W4): refuse to GC if the recorded
+        // path is a symlink — `remove_dir_all` follows symlinks and would
+        // delete the target. Also require the path's canonical form to
+        // sit beside an `ogmara-node` style data dir name (best-effort —
+        // we don't have the data_dir handy here, so we only catch
+        // symlinks and require an absolute path with our expected
+        // `snapshot_rollback_` prefix in its file name).
+        let metadata = match std::fs::symlink_metadata(path) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(rollback_dir = %path.display(), error = %e, "rollback GC: stat failed");
+                return;
+            }
+        };
+        if metadata.file_type().is_symlink() {
+            warn!(
+                rollback_dir = %path.display(),
+                "Refusing to GC snapshot rollback dir — path is a symlink"
+            );
+            return;
+        }
+        let file_name_ok = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.starts_with("snapshot_rollback_"))
+            .unwrap_or(false);
+        if !file_name_ok || !path.is_absolute() {
+            warn!(
+                rollback_dir = %path.display(),
+                "Refusing to GC snapshot rollback dir — unexpected path shape"
+            );
+            return;
+        }
+        match std::fs::remove_dir_all(path) {
+            Ok(_) => info!(
+                rollback_dir = %path.display(),
+                current_cursor,
+                applied_at,
+                "Snapshot rollback checkpoint garbage-collected (cursor advanced past cutoff)"
+            ),
+            Err(e) => {
+                warn!(
+                    rollback_dir = %path.display(),
+                    error = %e,
+                    "Failed to delete rollback dir during GC — will retry next scan tick"
+                );
+                return;
+            }
+        }
+    }
+    // Clear the marker keys so we don't repeat the work.
+    let _ = storage.delete_cf(cf::NODE_STATE, state_keys::SNAPSHOT_ROLLBACK_DIR);
+    let _ = storage.delete_cf(cf::NODE_STATE, state_keys::SNAPSHOT_APPLIED_AT_HEIGHT);
 }

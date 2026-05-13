@@ -364,8 +364,7 @@ impl Default for AnchoringConfig {
 /// so new nodes can bootstrap without scanning millions of Klever blocks.
 ///
 /// **Phase 1 (v0.34):** serve-only — caches a manifest and serves chunks on request.
-/// **Phase 2 (v0.35):** opt-in client fetch + quorum + apply path. Anchor cutoff
-/// trusts the producer's claim (gated by `experimental_skip_anchor_verify`).
+/// **Phase 2 (v0.35):** opt-in client fetch + quorum + apply path.
 /// **Phase 3 (v0.36):** anchor re-verification against Klever; default-on bootstrap.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotConfig {
@@ -391,22 +390,18 @@ pub struct SnapshotConfig {
 
     // --- Bootstrap / receive (Phase 2+) ---
     /// Whether to fetch a snapshot at startup if conditions are met.
-    /// **Defaults to false** — Phase 2 is explicitly opt-in; operators who
-    /// want to pilot the bootstrap path must enable this in `ogmara.toml`.
-    #[serde(default)]
+    /// **Defaults to `true` in v0.36+** — Phase 3 added anchor
+    /// re-verification against Klever AND producer signature
+    /// verification, making the apply path safe to run by default on
+    /// fresh nodes. Set to `false` to keep the legacy block-by-block
+    /// scan from `start_block`.
+    #[serde(default = "default_true")]
     pub bootstrap_enabled: bool,
     /// Only attempt bootstrap when the chain cursor is "fresh" — either zero,
     /// or below the configured `klever.start_block`. Prevents accidentally
     /// rewriting a healthy node's state if `bootstrap_enabled` is flipped on.
     #[serde(default = "default_true")]
     pub bootstrap_only_if_fresh: bool,
-    /// **Phase 2 safety gate.** When true, accept the producer's
-    /// `last_verified_anchor_height` claim as the cursor cutoff WITHOUT
-    /// re-querying Klever. Required in Phase 2 to do anything; in Phase 3
-    /// the flag is removed and real anchor verification becomes mandatory.
-    /// Default false — explicit opt-in alongside `bootstrap_enabled`.
-    #[serde(default)]
-    pub experimental_skip_anchor_verify: bool,
     /// Permit applying a snapshot onto a non-empty node (i.e., not fresh
     /// per `bootstrap_only_if_fresh`). Dangerous — the apply path clears
     /// snapshot-domain CFs before writing chunks. Default false.
@@ -448,9 +443,8 @@ impl Default for SnapshotConfig {
             serve_rebuild_interval_secs: default_snapshot_rebuild_interval(),
             chunk_size_bytes: default_snapshot_chunk_size(),
             serve_max_concurrent_requests: default_snapshot_max_concurrent(),
-            bootstrap_enabled: false,
+            bootstrap_enabled: true,
             bootstrap_only_if_fresh: true,
-            experimental_skip_anchor_verify: false,
             allow_apply_over_existing: false,
             quorum_sample_size: default_snapshot_quorum_sample(),
             quorum_min_peers: default_snapshot_quorum_min(),
@@ -841,7 +835,39 @@ impl Config {
     }
 
     /// Validate the configuration for consistency.
+    ///
+    /// Audit Phase 3 Sec W3: snapshot bootstrap (default-on in v0.36+)
+    /// relies on Klever's `getStateRoot(block_height)` view for anchor
+    /// re-verification — the entire trust model of the apply path. If
+    /// `klever.node_url` is plain HTTP an on-path attacker can serve
+    /// fabricated `getStateRoot` responses that match a poisoned
+    /// snapshot. We warn (not hard-error) at config load so operators
+    /// notice; a future version will refuse non-HTTPS outright.
+    fn warn_if_non_https_klever_url(&self) {
+        let url = self.klever.node_url.trim();
+        if url.is_empty() {
+            return;
+        }
+        // Allow localhost / 127.0.0.1 / private LAN URLs (often used in
+        // dev / WireGuard setups where TLS terminates elsewhere).
+        let is_local = url.starts_with("http://localhost")
+            || url.starts_with("http://127.")
+            || url.starts_with("http://10.")
+            || url.starts_with("http://192.168.")
+            || url.starts_with("http://[::1]");
+        if url.starts_with("http://") && !is_local {
+            tracing::warn!(
+                klever_node_url = %url,
+                "Snapshot bootstrap re-verifies anchors via Klever RPC. \
+                 Using a non-HTTPS klever.node_url lets an on-path attacker forge \
+                 getStateRoot responses that match a poisoned snapshot. \
+                 Set https:// before enabling snapshot.bootstrap_enabled in production."
+            );
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
+        self.warn_if_non_https_klever_url();
         if self.network.listen_port == 0 {
             anyhow::bail!("network.listen_port must be > 0");
         }
@@ -938,17 +964,17 @@ interval_seconds = 3600
 
 [snapshot]
 # Peer-to-peer state snapshots (spec 11-snapshot-sync.md).
-# Phase 2 (v0.35): serve + opt-in client fetch. Setting bootstrap_enabled
-# = true lets a fresh node fetch the snapshot from peers instead of
-# scanning Klever block-by-block from start_block.
+# Phase 3 (v0.36): default-on. Fresh nodes fetch the snapshot from
+# peers and re-verify every anchor against Klever before applying.
 serve_enabled = true
 serve_rebuild_interval_secs = 3600
 chunk_size_bytes = 4194304            # 4 MiB
 serve_max_concurrent_requests = 8
 
-# Phase 2 client (opt-in). Both flags must be true to do anything.
-bootstrap_enabled = false
-experimental_skip_anchor_verify = false  # Required for Phase 2 apply; Phase 3 removes it
+# Bootstrap client — default-on in v0.36. Fresh nodes auto-bootstrap
+# from peers if a quorum agrees on a snapshot AND every anchor up to
+# cutoff_height verifies against Klever's getStateRoot view function.
+bootstrap_enabled = true
 bootstrap_only_if_fresh = true           # Refuse to overwrite an existing node's state
 allow_apply_over_existing = false        # Force operator override to apply over data
 

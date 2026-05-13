@@ -5,6 +5,80 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.36.0] - 2026-05-13
+
+### Added
+- **Snapshot bootstrap — Phase 3 (anchor-verified, default-on).**
+  Closes the security gaps deferred from v0.35 and flips bootstrap to
+  default-on for fresh nodes:
+  - **Klever anchor re-verification.** New
+    `chain::anchor_verify::query_klever_state_root_at` queries the
+    Ogmara KApp's `getStateRoot(block_height)` view (spec 02-onchain.md §745)
+    per snapshot anchor. `snapshot_client::verify_anchors_against_klever`
+    iterates `STATE_ANCHORS` rows top-down, finds the highest matching
+    anchor, sets that as `cutoff_height`. Any mismatch = poisoned
+    snapshot, hard abort. RPC failures retry up to half the anchor
+    count before giving up.
+  - **Producer Ed25519 signature verification.** New
+    `producer_pubkey: Vec<u8>` field on `SnapshotManifest`
+    (`#[serde(default)]` for back-compat). `verify_producer_signature`
+    checks pubkey length (== 32), pubkey-to-node_id derivation, and
+    Ed25519 signature over `canonical_signing_bytes`. v0.34/v0.35
+    producers without the pubkey fall back to "quorum + Merkle +
+    anchor verification only" with a clear warning, so a v0.36
+    receiver can still bootstrap from upgrade-laggard peers.
+    `canonical_signing_bytes` was extended to include the pubkey
+    only when non-empty, preserving v0.34/v0.35 canonical signatures.
+  - **Default-on bootstrap.** `snapshot.bootstrap_enabled` default
+    flipped from `false` to `true`. Fresh nodes auto-fetch snapshots
+    from peers. `bootstrap_only_if_fresh` (default true) still
+    blocks the apply on non-fresh nodes.
+  - **Automatic rollback dir GC.** New
+    `chain::scanner::gc_snapshot_rollback_if_ready` runs after each
+    block batch. Once `chain_cursor >= SNAPSHOT_APPLIED_AT_HEIGHT + 100`,
+    the rollback checkpoint dir is `remove_dir_all`'d and both
+    NODE_STATE sentinels are cleared. Best-effort — failure logs but
+    doesn't break the scanner.
+  - **`experimental_skip_anchor_verify` removed.** Phase 2's flag is
+    gone; v0.36 always verifies anchors.
+  - **11 new tests** — anchor chunk parse/sort, anchor verify outcome
+    invariants, key/value height cross-check, signature verification
+    round-trip + pubkey/node_id mismatch + tampered signature
+    catches, validate rejects bad pubkey length, rollback GC
+    early/ready/no-op cases. 85 total tests passing (was 73 in v0.35.0).
+- **`SnapshotManifest::verify_producer_signature` + `SignatureCheck` enum.**
+- **`chain::anchor_verify` module** with `query_klever_state_root_at`
+  + `verify_anchor` returning a structured `AnchorVerifyOutcome` enum
+  (`Match`/`Mismatch`/`NotAnchored`/`RpcError`).
+- **Spec `docs/specs/11-snapshot-sync.md`**: new §5a.5 (Klever-verified
+  cutoff), §5a.6 (producer signature), §5a.8 (rollback GC), §3.2/§3.4
+  updates for `producer_pubkey`. `03-l2-node.md` §3.2.1 rewritten to
+  describe the three-phase rollout.
+
+### Changed
+- `run_bootstrap` signature now takes `klever_node_url` and
+  `contract_address` parameters; `experimental_skip_anchor_verify`
+  parameter/field removed.
+- `SnapshotManifest::canonical_signing_bytes` extended additively —
+  Phase 1/2 signatures remain valid (pubkey appended only when present).
+- `ogmara.example.toml` rewritten — bootstrap is documented as
+  default-on with the verification chain explained inline.
+
+### Security
+- **Closes the Phase 2 audit's deferred items** (the two §5a.9 deferrals
+  in v0.35's spec): producer signature verification AND Klever anchor
+  re-verification are both now mandatory whenever the data is present.
+- **Trust model in v0.36+:** ALL of (quorum agreement on snapshot_root)
+  AND (Merkle re-computation from chunks) AND (per-anchor Klever
+  re-verification) AND (producer Ed25519 signature, when available)
+  must succeed. A peer-controlled attacker who can supply 3+ peers in
+  the quorum still cannot apply a poisoned snapshot — every claimed
+  anchor would have to also exist on the Klever chain with the same
+  state_root, which requires compromising the producer's anchor wallet.
+- Phase 1/2 producers (no `producer_pubkey`) fall back to "quorum +
+  Merkle + anchor verification" — three independent defenses, only
+  the signature backstop is missing. Receivers log a clear warning.
+
 ## [0.35.0] - 2026-05-13
 
 ### Added

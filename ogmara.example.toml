@@ -70,23 +70,26 @@ auth_token = ""      # must match OGMARA_PUSH_SECRET on the push gateway
 
 [snapshot]
 # Peer-to-peer state snapshots (spec 11-snapshot-sync.md).
-# v0.35: serve + opt-in client fetch. Setting bootstrap_enabled = true
-# lets a fresh node fetch the snapshot from peers instead of scanning
-# Klever block-by-block from start_block. Phase 2 is experimental — the
-# apply path can rewrite SC-derived CFs, so it requires explicit opt-in.
+# v0.36: default-on. Fresh nodes auto-bootstrap from peers — quorum
+# agreement on the snapshot root plus per-anchor verification against
+# Klever's getStateRoot view replaces the multi-hour block-by-block
+# Klever scan. Bootstrap is gated by bootstrap_only_if_fresh so
+# existing healthy nodes are untouched.
 serve_enabled = true
 serve_rebuild_interval_secs = 3600     # rebuild cached snapshot every hour
 chunk_size_bytes = 4194304             # 4 MiB target per chunk
 serve_max_concurrent_requests = 8
 
-# Client bootstrap (Phase 2 — experimental, opt-in).
-# To actually bootstrap from peers BOTH must be true:
-#   bootstrap_enabled = true
-#   experimental_skip_anchor_verify = true
-# Phase 3 (v0.36) will re-verify anchors against Klever and remove the
-# experimental flag.
-bootstrap_enabled = false
-experimental_skip_anchor_verify = false
+# Client bootstrap (v0.36 — default-on, anchor-verified).
+# A fresh node (chain_cursor == 0) will:
+#   1. Wait up to discovery_timeout_secs for peers.
+#   2. Reach quorum on (block_height, snapshot_root) with quorum_min_peers.
+#   3. Fetch manifest, re-verify Merkle tree, fetch+verify all chunks.
+#   4. Re-check each STATE_ANCHORS row against Klever's getStateRoot.
+#      Any mismatch = poisoned snapshot, hard abort.
+#   5. Apply only up to highest verified anchor (cutoff_height).
+# Set bootstrap_enabled = false to keep the legacy block-by-block path.
+bootstrap_enabled = true
 bootstrap_only_if_fresh = true
 allow_apply_over_existing = false
 
