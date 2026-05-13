@@ -55,6 +55,13 @@ impl Node {
         let storage =
             Storage::open(&db_path).with_context(|| "opening RocksDB storage")?;
 
+        // Phase 2 snapshot bootstrap crash recovery — detect a half-applied
+        // snapshot and restore from the rollback checkpoint before we touch
+        // the DB further. The window is: rollback dir persisted, destructive
+        // apply ops began, but the SNAPSHOT_APPLIED_AT_HEIGHT sentinel was
+        // never written. See spec 11-snapshot-sync.md §5a.6.
+        let storage = check_snapshot_apply_recovery(storage, &db_path)?;
+
         // Load or generate node identity key
         let signing_key = load_or_generate_key(&storage)?;
         let node_id = compute_node_id(&signing_key);
@@ -245,6 +252,12 @@ impl Node {
         let snapshot_cache: crate::network::snapshot::SharedSnapshotCache =
             Arc::new(std::sync::RwLock::new(None));
 
+        // Channel for snapshot-client commands (Phase 2). The bootstrap
+        // orchestrator (if enabled) uses this channel to dispatch outbound
+        // snapshot requests via NetworkService.
+        let (snapshot_client_tx, snapshot_client_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::network::SnapshotClientCommand>();
+
         // Start the network service
         let keypair = self.libp2p_keypair()?;
         let mut network = crate::network::NetworkService::new(
@@ -259,6 +272,7 @@ impl Node {
             connected_peers.clone(),
             network_counters.clone(),
             snapshot_cache.clone(),
+            snapshot_client_rx,
         )
         .await
         .context("starting network service")?;
@@ -330,6 +344,66 @@ impl Node {
         let network_task = tokio::spawn(async move {
             network.run(network_shutdown_rx, channel_rx, gossip_rx).await;
         });
+
+        // Phase 2 snapshot bootstrap (opt-in). Blocks startup so the chain
+        // scanner reads the post-apply cursor. Falls back to scan on any
+        // failure path. Spec 11-snapshot-sync.md §5 (Phase 2).
+        if self.config.snapshot.bootstrap_enabled {
+            let cursor = self.storage.get_chain_cursor().unwrap_or(0);
+            // "Fresh" is strict — cursor == 0. The earlier formulation
+            // `cursor < start_block` was fragile: an operator who sets
+            // `start_block` HIGH (e.g. 9_100_000 for testnet) on an
+            // existing healthy node with cursor=9_000_000 would have seen
+            // is_fresh=true and the apply would clobber their state.
+            // (Audit finding Phase 2 Sec W1.)
+            let is_fresh = cursor == 0;
+            if !is_fresh && self.config.snapshot.bootstrap_only_if_fresh {
+                info!(
+                    cursor,
+                    start_block = self.config.klever.start_block,
+                    "Snapshot bootstrap enabled but node is not fresh — skipping (set bootstrap_only_if_fresh=false to force)"
+                );
+            } else if !is_fresh && !self.config.snapshot.allow_apply_over_existing {
+                warn!(
+                    cursor,
+                    "Snapshot bootstrap requested over non-fresh node but allow_apply_over_existing=false — skipping"
+                );
+            } else {
+                let handle = crate::network::snapshot_client::ClientHandle::new(
+                    snapshot_client_tx.clone(),
+                    &self.config.snapshot,
+                );
+                let storage_arc = Arc::new(self.storage.clone());
+                let snap_config = self.config.snapshot.clone();
+                let network_id = self.config.network_id().to_string();
+                let data_dir = self.config.node.data_dir.clone();
+                info!("Phase 2 snapshot bootstrap starting (experimental)");
+                match crate::network::snapshot_client::run_bootstrap(
+                    &handle,
+                    storage_arc,
+                    &snap_config,
+                    &network_id,
+                    &data_dir,
+                )
+                .await
+                {
+                    Ok(Some(outcome)) => {
+                        info!(
+                            applied_at = outcome.applied_at,
+                            new_cursor = outcome.new_cursor,
+                            rollback_dir = %outcome.rollback_dir.display(),
+                            "Snapshot bootstrap succeeded — chain scanner will resume from new cursor"
+                        );
+                    }
+                    Ok(None) => {
+                        warn!("Snapshot bootstrap skipped — falling back to chain scan");
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Snapshot bootstrap failed — falling back to chain scan");
+                    }
+                }
+            }
+        }
 
         // Start chain scanner
         let chain_config = self.config.klever.clone();
@@ -689,4 +763,111 @@ fn compute_node_id(signing_key: &SigningKey) -> String {
     let hash = Sha256::digest(pubkey.as_bytes());
     // Take first 20 bytes and encode as base58
     bs58::encode(&hash[..20]).into_string()
+}
+
+/// Detect and recover from a half-applied snapshot bootstrap (Phase 2).
+///
+/// On boot, if `SNAPSHOT_ROLLBACK_DIR` is set in NODE_STATE but
+/// `SNAPSHOT_APPLIED_AT_HEIGHT` is absent, the previous apply crashed
+/// between starting the destructive ops and writing the success
+/// sentinel. We restore by:
+///   1. Closing the current Storage handle.
+///   2. Renaming `data/db` → `data/db_failed_apply_<ts>` (preserves
+///      forensics; operator can rm later).
+///   3. Renaming the rollback dir → `data/db`.
+///   4. Reopening Storage from the restored dir.
+///   5. Clearing `SNAPSHOT_ROLLBACK_DIR` so the next boot is clean.
+///
+/// If the rollback dir doesn't exist on disk (operator deleted it,
+/// disk failure, etc.) we refuse to boot with a clear error rather
+/// than silently start with a corrupt DB.
+///
+/// Returns the (possibly recovered) Storage handle.
+fn check_snapshot_apply_recovery(storage: Storage, db_path: &std::path::Path) -> Result<Storage> {
+    use crate::storage::schema::{cf, state_keys};
+
+    let rollback_raw = storage
+        .get_cf(cf::NODE_STATE, state_keys::SNAPSHOT_ROLLBACK_DIR)
+        .context("reading SNAPSHOT_ROLLBACK_DIR")?;
+    let Some(rollback_bytes) = rollback_raw else {
+        return Ok(storage); // No rollback marker — nothing to do.
+    };
+    if rollback_bytes.is_empty() {
+        return Ok(storage); // Cleared marker.
+    }
+
+    let sentinel_present = storage
+        .get_cf(cf::NODE_STATE, state_keys::SNAPSHOT_APPLIED_AT_HEIGHT)
+        .context("reading SNAPSHOT_APPLIED_AT_HEIGHT")?
+        .is_some();
+
+    if sentinel_present {
+        // Apply completed successfully; the rollback dir is just lingering.
+        // Clear the marker (the dir itself stays on disk until the scanner
+        // catches up — Phase 3 will GC it).
+        warn!(
+            "Found lingering SNAPSHOT_ROLLBACK_DIR with sentinel present — clearing marker (apply was successful)"
+        );
+        storage
+            .delete_cf(cf::NODE_STATE, state_keys::SNAPSHOT_ROLLBACK_DIR)
+            .context("clearing stale SNAPSHOT_ROLLBACK_DIR marker")?;
+        return Ok(storage);
+    }
+
+    // CRASHED APPLY — perform restore.
+    let rollback_path_str = String::from_utf8(rollback_bytes)
+        .context("SNAPSHOT_ROLLBACK_DIR is not valid UTF-8")?;
+    let rollback_path = std::path::PathBuf::from(&rollback_path_str);
+    if !rollback_path.exists() {
+        anyhow::bail!(
+            "Crashed snapshot apply detected (SNAPSHOT_ROLLBACK_DIR={} but \
+             sentinel absent) AND rollback directory no longer exists. \
+             Manual recovery required. See tests/integration/SNAPSHOT_BOOTSTRAP.md.",
+            rollback_path.display()
+        );
+    }
+
+    warn!(
+        rollback_dir = %rollback_path.display(),
+        "Crashed snapshot apply detected — restoring from rollback checkpoint"
+    );
+
+    // 1. Close the current DB handle.
+    drop(storage);
+
+    // 2. Move the (corrupt) DB aside for forensics.
+    let ts_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let corrupt_path = db_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("db_path has no parent"))?
+        .join(format!("db_failed_apply_{}", ts_ms));
+    std::fs::rename(db_path, &corrupt_path)
+        .with_context(|| format!("moving corrupt db to {}", corrupt_path.display()))?;
+
+    // 3. Promote the rollback checkpoint to the live DB location.
+    std::fs::rename(&rollback_path, db_path).with_context(|| {
+        format!(
+            "promoting rollback checkpoint {} to {}",
+            rollback_path.display(),
+            db_path.display()
+        )
+    })?;
+
+    // 4. Reopen Storage from the restored dir.
+    let storage = Storage::open(db_path).context("reopening RocksDB after rollback restore")?;
+
+    // 5. Clear the marker.
+    storage
+        .delete_cf(cf::NODE_STATE, state_keys::SNAPSHOT_ROLLBACK_DIR)
+        .context("clearing SNAPSHOT_ROLLBACK_DIR after restore")?;
+
+    info!(
+        forensics_dir = %corrupt_path.display(),
+        "Snapshot apply rollback complete — corrupt DB preserved for inspection (safe to delete after review)"
+    );
+
+    Ok(storage)
 }

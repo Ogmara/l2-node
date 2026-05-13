@@ -232,6 +232,18 @@ pub mod state_keys {
     /// Snapshot serve cache: block height of the most recently built cache (u64 big-endian).
     /// Diagnostic — surfaced via the admin /admin/snapshot/status endpoint.
     pub const SNAPSHOT_LAST_SERVED_HEIGHT: &[u8] = b"snapshot_last_served_height";
+    /// Snapshot apply (Phase 2): block height of the most recent snapshot
+    /// successfully applied locally (u64 big-endian). Written LAST in the
+    /// apply pipeline — its presence means the apply completed atomically
+    /// (CFs cleared, chunks written, cursor + counters committed). If a
+    /// crash leaves the rollback checkpoint directory present but this
+    /// sentinel absent, the next boot restores from the checkpoint.
+    pub const SNAPSHOT_APPLIED_AT_HEIGHT: &[u8] = b"snapshot_applied_at_height";
+    /// Snapshot apply: path of an in-flight rollback checkpoint, if any.
+    /// Set BEFORE the destructive apply phase; cleared after the apply
+    /// completes AND the chain scanner has advanced past the cutoff height
+    /// (proving the snapshot was good). Empty = no rollback pending.
+    pub const SNAPSHOT_ROLLBACK_DIR: &[u8] = b"snapshot_rollback_dir";
 }
 
 /// Snapshot bootstrap (spec 11-snapshot-sync.md).
