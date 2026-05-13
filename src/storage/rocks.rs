@@ -978,6 +978,102 @@ impl Storage {
         })
     }
 
+    /// Clear every row from a column family.
+    ///
+    /// Uses RocksDB's native `delete_range_cf` over `[0x00; 0..]..[0xff; 256]`
+    /// for an O(1) range tombstone — far cheaper than iterating and deleting
+    /// row-by-row on a multi-million-row CF.
+    ///
+    /// Should be called from `spawn_blocking`; the range delete walks file
+    /// metadata and can block briefly on large CFs.
+    pub fn clear_cf(&self, cf_name: &str) -> Result<()> {
+        let cf = self
+            .db
+            .cf_handle(cf_name)
+            .with_context(|| format!("column family '{}' not found", cf_name))?;
+        // `delete_range_cf` is [start, end) — we pass empty start and a
+        // large-enough end to cover any practical key. Snapshot CFs use
+        // key lengths well under 256 bytes; this end key is comfortably
+        // beyond any real entry.
+        let end_key: Vec<u8> = vec![0xffu8; 256];
+        self.db
+            .delete_range_cf(&cf, b"".as_ref(), end_key.as_slice())
+            .with_context(|| format!("delete_range on cf '{}'", cf_name))?;
+        // Walk once and clean up any keys >= the end_key sentinel — rare
+        // but possible if a row's key happens to be all-0xff for 256 bytes.
+        let mut iter = self.db.raw_iterator_cf(&cf);
+        iter.seek(&end_key);
+        let mut tail = Vec::new();
+        while iter.valid() {
+            if let Some(k) = iter.key() {
+                tail.push(k.to_vec());
+            }
+            iter.next();
+        }
+        iter.status()
+            .with_context(|| format!("rocksdb iter status after clear on '{}'", cf_name))?;
+        for k in tail {
+            self.db
+                .delete_cf(&cf, &k)
+                .with_context(|| format!("deleting tail key in '{}'", cf_name))?;
+        }
+        Ok(())
+    }
+
+    /// Apply a snapshot `ChunkPayload` to the given column family.
+    ///
+    /// Writes every `(key, value)` row in a single RocksDB `WriteBatch`
+    /// for atomicity. Should be called AFTER `clear_cf` for the same CF
+    /// and BEFORE writing the `SNAPSHOT_APPLIED_AT_HEIGHT` sentinel.
+    ///
+    /// **Pre-condition:** the caller has already verified the chunk's hash
+    /// against the manifest's `chunk_hash` and decoded it via
+    /// `storage::snapshot::decode_chunk`. This method does not re-verify.
+    pub fn apply_snapshot_chunk(
+        &self,
+        cf_name: &str,
+        chunk: &super::snapshot::ChunkPayload,
+    ) -> Result<()> {
+        if chunk.cf_name != cf_name {
+            anyhow::bail!(
+                "snapshot chunk cf_name mismatch: payload says '{}', expected '{}'",
+                chunk.cf_name,
+                cf_name
+            );
+        }
+        let cf = self
+            .db
+            .cf_handle(cf_name)
+            .with_context(|| format!("column family '{}' not found", cf_name))?;
+        let mut batch = WriteBatch::default();
+        for (k, v) in &chunk.entries {
+            batch.put_cf(&cf, k, v);
+        }
+        self.write_batch(batch)
+            .with_context(|| format!("applying snapshot chunk to '{}'", cf_name))
+    }
+
+    /// Create a RocksDB Checkpoint at `path` for rollback safety.
+    ///
+    /// Checkpoint uses hard links where possible — cheap on the same
+    /// filesystem (a few hundred milliseconds even for multi-GB DBs).
+    /// Returned path is the directory containing the checkpoint SSTs.
+    ///
+    /// **Caller invariant:** `path` must not already exist and its parent
+    /// directory must be writable. The caller is responsible for cleaning
+    /// up the checkpoint after the apply succeeds AND the chain scanner
+    /// has advanced past the cutoff height.
+    pub fn create_checkpoint(&self, path: &Path) -> Result<()> {
+        if path.exists() {
+            anyhow::bail!("checkpoint path already exists: {}", path.display());
+        }
+        let cp = rocksdb::checkpoint::Checkpoint::new(&self.db)
+            .context("creating rocksdb Checkpoint handle")?;
+        cp.create_checkpoint(path)
+            .with_context(|| format!("writing checkpoint to {}", path.display()))?;
+        Ok(())
+    }
+
     /// Compute the snapshot Merkle root from per-CF roots in canonical order.
     ///
     /// `cf_roots` must be in the same order as

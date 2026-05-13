@@ -363,11 +363,13 @@ impl Default for AnchoringConfig {
 /// a Merkle-rooted summary of its SC-derived state (users, channels, anchors)
 /// so new nodes can bootstrap without scanning millions of Klever blocks.
 ///
-/// Phase 1 (v0.34): serve-only — caches a manifest and serves chunks on request.
-/// Phase 2/3 will add the client-side fetch + apply path.
+/// **Phase 1 (v0.34):** serve-only — caches a manifest and serves chunks on request.
+/// **Phase 2 (v0.35):** opt-in client fetch + quorum + apply path. Anchor cutoff
+/// trusts the producer's claim (gated by `experimental_skip_anchor_verify`).
+/// **Phase 3 (v0.36):** anchor re-verification against Klever; default-on bootstrap.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotConfig {
-    // --- Serving ---
+    // --- Serving (Phase 1+) ---
     /// Whether this node advertises and serves snapshots to peers.
     /// Disable on resource-constrained nodes to skip the periodic cache build.
     #[serde(default = "default_true")]
@@ -387,17 +389,56 @@ pub struct SnapshotConfig {
     #[serde(default = "default_snapshot_max_concurrent")]
     pub serve_max_concurrent_requests: u32,
 
-    // --- Bootstrap (receive) — reserved for Phase 2/3, defaults are safe ---
+    // --- Bootstrap / receive (Phase 2+) ---
     /// Whether to fetch a snapshot at startup if conditions are met.
-    /// **Phase 1: not yet wired — left for forward-compatible config files.**
+    /// **Defaults to false** — Phase 2 is explicitly opt-in; operators who
+    /// want to pilot the bootstrap path must enable this in `ogmara.toml`.
     #[serde(default)]
     pub bootstrap_enabled: bool,
+    /// Only attempt bootstrap when the chain cursor is "fresh" — either zero,
+    /// or below the configured `klever.start_block`. Prevents accidentally
+    /// rewriting a healthy node's state if `bootstrap_enabled` is flipped on.
+    #[serde(default = "default_true")]
+    pub bootstrap_only_if_fresh: bool,
+    /// **Phase 2 safety gate.** When true, accept the producer's
+    /// `last_verified_anchor_height` claim as the cursor cutoff WITHOUT
+    /// re-querying Klever. Required in Phase 2 to do anything; in Phase 3
+    /// the flag is removed and real anchor verification becomes mandatory.
+    /// Default false — explicit opt-in alongside `bootstrap_enabled`.
+    #[serde(default)]
+    pub experimental_skip_anchor_verify: bool,
+    /// Permit applying a snapshot onto a non-empty node (i.e., not fresh
+    /// per `bootstrap_only_if_fresh`). Dangerous — the apply path clears
+    /// snapshot-domain CFs before writing chunks. Default false.
+    #[serde(default)]
+    pub allow_apply_over_existing: bool,
     /// Total peers to sample for snapshot quorum.
     #[serde(default = "default_snapshot_quorum_sample")]
     pub quorum_sample_size: u32,
     /// Minimum peers that must agree on the snapshot root before accepting.
     #[serde(default = "default_snapshot_quorum_min")]
     pub quorum_min_peers: u32,
+    /// Number of mirrors to fetch chunks from in parallel (clamped to the
+    /// number of agreeing peers actually available).
+    #[serde(default = "default_snapshot_parallel_fetches")]
+    pub parallel_fetches: u32,
+    /// Per-chunk retry budget across all mirrors before aborting bootstrap.
+    #[serde(default = "default_snapshot_chunk_retries")]
+    pub chunk_retries: u32,
+    /// How long to wait for snapshot-capable peers before giving up
+    /// and falling back to a full chain scan (seconds).
+    #[serde(default = "default_snapshot_discovery_timeout")]
+    pub discovery_timeout_secs: u64,
+    /// Per-request timeout for `Advertise` and `GetManifest` (seconds).
+    #[serde(default = "default_snapshot_manifest_timeout")]
+    pub manifest_timeout_secs: u64,
+    /// Per-request timeout for `GetChunk` (seconds).
+    #[serde(default = "default_snapshot_chunk_timeout")]
+    pub chunk_timeout_secs: u64,
+    /// Hard cap on a single snapshot's combined uncompressed bytes
+    /// (sum of `CfManifest.total_bytes`). Reject manifests beyond this.
+    #[serde(default = "default_snapshot_max_total_bytes")]
+    pub max_total_bytes: u64,
 }
 
 impl Default for SnapshotConfig {
@@ -408,8 +449,17 @@ impl Default for SnapshotConfig {
             chunk_size_bytes: default_snapshot_chunk_size(),
             serve_max_concurrent_requests: default_snapshot_max_concurrent(),
             bootstrap_enabled: false,
+            bootstrap_only_if_fresh: true,
+            experimental_skip_anchor_verify: false,
+            allow_apply_over_existing: false,
             quorum_sample_size: default_snapshot_quorum_sample(),
             quorum_min_peers: default_snapshot_quorum_min(),
+            parallel_fetches: default_snapshot_parallel_fetches(),
+            chunk_retries: default_snapshot_chunk_retries(),
+            discovery_timeout_secs: default_snapshot_discovery_timeout(),
+            manifest_timeout_secs: default_snapshot_manifest_timeout(),
+            chunk_timeout_secs: default_snapshot_chunk_timeout(),
+            max_total_bytes: default_snapshot_max_total_bytes(),
         }
     }
 }
@@ -419,6 +469,12 @@ fn default_snapshot_chunk_size() -> u32 { 4 * 1024 * 1024 }
 fn default_snapshot_max_concurrent() -> u32 { 8 }
 fn default_snapshot_quorum_sample() -> u32 { 5 }
 fn default_snapshot_quorum_min() -> u32 { 3 }
+fn default_snapshot_parallel_fetches() -> u32 { 3 }
+fn default_snapshot_chunk_retries() -> u32 { 5 }
+fn default_snapshot_discovery_timeout() -> u64 { 30 }
+fn default_snapshot_manifest_timeout() -> u64 { 10 }
+fn default_snapshot_chunk_timeout() -> u64 { 60 }
+fn default_snapshot_max_total_bytes() -> u64 { 2 * 1024 * 1024 * 1024 } // 2 GiB
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoggingConfig {
@@ -882,16 +938,28 @@ interval_seconds = 3600
 
 [snapshot]
 # Peer-to-peer state snapshots (spec 11-snapshot-sync.md).
-# Phase 1: serve-only — this node caches a state summary and answers
-# snapshot requests from peers. The fetch/apply side ships in v0.35+.
+# Phase 2 (v0.35): serve + opt-in client fetch. Setting bootstrap_enabled
+# = true lets a fresh node fetch the snapshot from peers instead of
+# scanning Klever block-by-block from start_block.
 serve_enabled = true
 serve_rebuild_interval_secs = 3600
 chunk_size_bytes = 4194304            # 4 MiB
 serve_max_concurrent_requests = 8
-# bootstrap_enabled is reserved for Phase 2 and currently has no effect.
+
+# Phase 2 client (opt-in). Both flags must be true to do anything.
 bootstrap_enabled = false
+experimental_skip_anchor_verify = false  # Required for Phase 2 apply; Phase 3 removes it
+bootstrap_only_if_fresh = true           # Refuse to overwrite an existing node's state
+allow_apply_over_existing = false        # Force operator override to apply over data
+
 quorum_sample_size = 5
 quorum_min_peers = 3
+parallel_fetches = 3
+chunk_retries = 5
+discovery_timeout_secs = 30
+manifest_timeout_secs = 10
+chunk_timeout_secs = 60
+max_total_bytes = 2147483648             # 2 GiB hard cap on snapshot size
 
 [metrics]
 enabled = true

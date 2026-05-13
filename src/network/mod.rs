@@ -11,6 +11,7 @@ pub mod behaviour;
 pub mod discovery;
 pub mod gossip;
 pub mod snapshot;
+pub mod snapshot_client;
 pub mod sync;
 
 use std::collections::HashMap;
@@ -97,6 +98,47 @@ pub struct NetworkService {
     /// `config.snapshot.serve_max_concurrent_requests`. Phase 1 — exists
     /// to bound the working-set even if a peer pipelines many GetChunks.
     snapshot_chunk_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Inbound channel for snapshot-client commands (Phase 2). The
+    /// bootstrap task constructs `SnapshotRequest`s and sends them via
+    /// this channel; we forward each to the swarm and stash a oneshot
+    /// sender keyed by the libp2p `OutboundRequestId` so the matching
+    /// response (or failure) is delivered back to the caller.
+    snapshot_client_rx: tokio::sync::mpsc::UnboundedReceiver<SnapshotClientCommand>,
+    /// Outstanding outbound snapshot requests awaiting a response.
+    pending_snapshot_requests:
+        HashMap<libp2p::request_response::OutboundRequestId, tokio::sync::oneshot::Sender<SnapshotClientResult>>,
+}
+
+/// Result delivered back to the snapshot client for one outbound request.
+pub type SnapshotClientResult = Result<self::snapshot::SnapshotResponse, SnapshotClientError>;
+
+/// Error variants surfaced to the snapshot client. Cheap to construct, no I/O.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum SnapshotClientError {
+    #[error("snapshot outbound failure: {0}")]
+    OutboundFailure(String),
+    #[error("network task dropped before response arrived")]
+    Cancelled,
+}
+
+/// Command sent from the snapshot-client task to the network event loop.
+///
+/// The bootstrap orchestrator runs as a separate task (so the event loop
+/// stays responsive to gossip/sync/identify). It dispatches snapshot
+/// requests through this channel and receives responses via the embedded
+/// `oneshot::Sender`. See `network::snapshot_client::ClientHandle`.
+pub enum SnapshotClientCommand {
+    /// Send an outbound snapshot request to a specific peer.
+    SendRequest {
+        peer: PeerId,
+        request: self::snapshot::SnapshotRequest,
+        reply: tokio::sync::oneshot::Sender<SnapshotClientResult>,
+    },
+    /// List PeerIds of currently connected peers (the orchestrator filters
+    /// down to snapshot-capable ones based on `NodeAnnouncement`).
+    ListConnectedPeers {
+        reply: tokio::sync::oneshot::Sender<Vec<PeerId>>,
+    },
 }
 
 impl NetworkService {
@@ -113,6 +155,7 @@ impl NetworkService {
         connected_peers: Arc<RwLock<HashMap<String, ConnectedPeerInfo>>>,
         counters: Arc<NetworkCounters>,
         snapshot_cache: SharedSnapshotCache,
+        snapshot_client_rx: tokio::sync::mpsc::UnboundedReceiver<SnapshotClientCommand>,
     ) -> Result<Self> {
         let mut swarm = behaviour::build_swarm(config, keypair)
             .context("building libp2p swarm")?;
@@ -222,6 +265,8 @@ impl NetworkService {
             snapshot_cache,
             snapshot_serve_enabled,
             snapshot_chunk_semaphore,
+            snapshot_client_rx,
+            pending_snapshot_requests: HashMap::new(),
         })
     }
 
@@ -324,6 +369,9 @@ impl NetworkService {
                 }
                 _ = reconnect_interval.tick() => {
                     self.process_reconnect_queue();
+                }
+                Some(cmd) = self.snapshot_client_rx.recv() => {
+                    self.handle_snapshot_client_command(cmd);
                 }
                 _ = shutdown_rx.recv() => {
                     info!("Network shutting down");
@@ -1029,16 +1077,33 @@ impl NetworkService {
 
             request_response::Event::Message {
                 peer,
-                message: request_response::Message::Response { .. },
+                message:
+                    request_response::Message::Response {
+                        response,
+                        request_id,
+                        ..
+                    },
                 ..
             } => {
-                // Phase 1: we don't initiate snapshot requests yet, so any
-                // inbound response is unexpected — log and ignore.
-                debug!(peer = %peer, "Unexpected snapshot response (Phase 1 is serve-only)");
+                // Phase 2: deliver the response back to the snapshot client
+                // task waiting on this request_id. If we have no waiter, the
+                // request was either issued by Phase 1 (no longer happens)
+                // or the bootstrap task gave up and dropped the receiver.
+                match self.pending_snapshot_requests.remove(&request_id) {
+                    Some(reply) => {
+                        let _ = reply.send(Ok(response));
+                    }
+                    None => {
+                        debug!(peer = %peer, ?request_id, "Snapshot response without pending waiter (bootstrap timed out?)");
+                    }
+                }
             }
 
-            request_response::Event::OutboundFailure { peer, error, .. } => {
-                warn!(peer = %peer, error = %error, "Snapshot request failed");
+            request_response::Event::OutboundFailure { peer, error, request_id, .. } => {
+                warn!(peer = %peer, error = %error, ?request_id, "Snapshot outbound request failed");
+                if let Some(reply) = self.pending_snapshot_requests.remove(&request_id) {
+                    let _ = reply.send(Err(SnapshotClientError::OutboundFailure(error.to_string())));
+                }
             }
 
             request_response::Event::InboundFailure { peer, error, .. } => {
@@ -1046,6 +1111,54 @@ impl NetworkService {
             }
 
             _ => {}
+        }
+    }
+
+    /// Dispatch a snapshot-client command onto the swarm.
+    ///
+    /// `SendRequest` parks the caller's `oneshot::Sender` in
+    /// `pending_snapshot_requests` keyed by libp2p's `OutboundRequestId`;
+    /// the response (or failure) arm of `handle_snapshot_event` resolves
+    /// the oneshot. `ListConnectedPeers` answers synchronously.
+    fn handle_snapshot_client_command(&mut self, cmd: SnapshotClientCommand) {
+        match cmd {
+            SnapshotClientCommand::SendRequest { peer, request, reply } => {
+                // Bound the pending-request map. A malicious peer churn
+                // pattern (connect, get many requests sent, disconnect,
+                // repeat) can leak entries between dispatch and the libp2p
+                // OutboundFailure event. The bootstrap path issues at most
+                // a few thousand requests total, so 8192 is plenty of
+                // headroom while still bounding the worst case.
+                // (Audit finding Phase 2 Code W2.)
+                const MAX_PENDING_SNAPSHOT_REQUESTS: usize = 8192;
+
+                // Opportunistic GC: drop any entries whose receiver was
+                // dropped (caller timed out and gave up). Cheap, runs on
+                // every SendRequest to amortize cost across the bootstrap.
+                self.pending_snapshot_requests
+                    .retain(|_, sender| !sender.is_closed());
+
+                if self.pending_snapshot_requests.len() >= MAX_PENDING_SNAPSHOT_REQUESTS {
+                    warn!(
+                        pending = self.pending_snapshot_requests.len(),
+                        "Snapshot pending-request map at cap — dropping new request"
+                    );
+                    let _ = reply.send(Err(SnapshotClientError::OutboundFailure(
+                        "snapshot client request cap reached".into(),
+                    )));
+                    return;
+                }
+                let id = self
+                    .swarm
+                    .behaviour_mut()
+                    .snapshot
+                    .send_request(&peer, request);
+                self.pending_snapshot_requests.insert(id, reply);
+            }
+            SnapshotClientCommand::ListConnectedPeers { reply } => {
+                let peers: Vec<PeerId> = self.swarm.connected_peers().copied().collect();
+                let _ = reply.send(peers);
+            }
         }
     }
 

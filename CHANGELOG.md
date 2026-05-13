@@ -5,6 +5,122 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.35.0] - 2026-05-13
+
+### Added
+- **Snapshot bootstrap — Phase 2 (opt-in client fetch + apply).** Joining
+  nodes can now fetch the snapshot domain from existing peers and skip
+  millions of Klever-block catch-up scans. The full pipeline:
+  - **Discovery + quorum** — `select_quorum` groups `Advertise` responses
+    by `(block_height, snapshot_root)`, requires ≥ `quorum_min_peers`
+    (default 3) agreeing peers, ties broken by majority size then height.
+    Pure logic, 7 unit tests cover threshold/tie-break/zero-height
+    semantics.
+  - **Manifest fetch + structural validation** — verifies `network_id`,
+    `block_height`, `snapshot_root` match quorum, sums `total_bytes`
+    against `max_total_bytes` (default 2 GiB), requires CFs match
+    `DOMAIN_CFS` exactly in order.
+  - **Parallel chunk fetch with retry** — `parallel_fetches` mirrors
+    round-robin, per-chunk `chunk_retries` budget, hash-verify before
+    decompress, `RateLimited`/`HeightMismatch` retry without consuming
+    budget.
+  - **Apply with rocksdb::Checkpoint rollback** — pre-apply Checkpoint
+    captures the live DB (hard-linked, cheap), CFs cleared via
+    `delete_range_cf`, chunks written via `WriteBatch`,
+    `DEVICE_WALLET_MAP`+`WALLET_DEVICES` re-derived from `DELEGATIONS`
+    via existing `backfill_delegation_map`, cursor+counters set,
+    `SNAPSHOT_APPLIED_AT_HEIGHT` sentinel written last as the atomic
+    commit point.
+  - **8 new apply-path tests** against real tempdir RocksDB —
+    `clear_cf` (empty + populated), `apply_snapshot_chunk` (write +
+    cf-name guard), `create_checkpoint` (roundtrip + refuse-existing),
+    full **end-to-end roundtrip** (source DB → build snapshot → wipe →
+    apply to target → verify state matches), idempotent guard against
+    double-apply at same height.
+- **`SnapshotClientCommand` channel + correlation map** in
+  `NetworkService`. The bootstrap orchestrator runs as its own task and
+  dispatches outbound `SnapshotRequest`s through an mpsc channel; each
+  outbound libp2p `OutboundRequestId` is stashed against a
+  `oneshot::Sender`, and the snapshot event handler resolves the
+  oneshot on `Message::Response` or `OutboundFailure`. Wrapped in
+  `tokio::time::timeout` for per-request deadlines.
+- **`Storage::clear_cf(cf_name)`** — RocksDB `delete_range_cf` over
+  `[b"", &[0xff;256])` plus a tail-cleanup walk for keys ≥ the sentinel.
+- **`Storage::apply_snapshot_chunk(cf, &ChunkPayload)`** — atomic
+  WriteBatch of every `(key, value)` row; rejects cf-name mismatch.
+- **`Storage::create_checkpoint(&Path)`** — wraps
+  `rocksdb::checkpoint::Checkpoint`; refuses to overwrite existing dirs.
+- **`schema::state_keys::SNAPSHOT_APPLIED_AT_HEIGHT`** + **`SNAPSHOT_ROLLBACK_DIR`**
+  sentinels for apply pipeline crash recovery.
+- **Expanded `SnapshotConfig`** — adds `bootstrap_only_if_fresh`,
+  `experimental_skip_anchor_verify`, `allow_apply_over_existing`,
+  `parallel_fetches`, `chunk_retries`, `discovery_timeout_secs`,
+  `manifest_timeout_secs`, `chunk_timeout_secs`, `max_total_bytes`. All
+  bootstrap flags default to safe-off; operators must explicitly opt in.
+- **`tests/integration/SNAPSHOT_BOOTSTRAP.md`** — operator procedure for
+  manual 3-node testnet verification while the automated harness is
+  deferred to Phase 3.
+- **Spec `docs/specs/11-snapshot-sync.md` §5a** — full Phase 2 client
+  semantics: discovery, quorum, manifest validation, chunk fetch with
+  retry, apply pipeline, cutoff semantics, crash recovery procedure.
+
+### Changed
+- `NetworkService::new` now takes a `SnapshotClientCommand` receiver.
+- Phase 2 snapshot client is **opt-in**: BOTH `bootstrap_enabled = true`
+  AND `experimental_skip_anchor_verify = true` must be set. Without the
+  experimental flag the orchestrator logs a warn and falls back to scan
+  — Phase 3 (v0.36) will remove the flag once anchor re-verification
+  against Klever is wired.
+- Node startup blocks the chain scanner spawn until the bootstrap task
+  finishes (succeeds or falls back). Discovery has a configurable
+  timeout (default 30s); on any failure path the scanner starts from
+  the existing cursor as before.
+- 34 snapshot-related tests now pass (was 15 in v0.34.0), 73 total.
+
+### Security
+The Phase 2 client passed parallel Code + Security audits. Findings
+addressed before ship:
+- **Merkle root recomputation after fetch.** Every received chunk's
+  leaves are re-hashed into a chunk_root, cf_roots are recomputed from
+  chunk_roots, and the snapshot_root is recomputed via
+  `Storage::compute_snapshot_root`. Mismatch aborts the apply. Without
+  this, a peer in the agreeing quorum could swap chunk contents for
+  any values and only need a matching `chunk_hash` in the manifest —
+  the per-chunk hash check by itself was therefore meaningless. New
+  `verify_merkle_consistency` function is the most important defense
+  added.
+- **Boot-time crash recovery.** `check_snapshot_apply_recovery` runs
+  before any read/write. If `SNAPSHOT_ROLLBACK_DIR` is set but the
+  success sentinel is absent → restore from rollback automatically:
+  rename the corrupt DB aside, promote the checkpoint, clear the
+  marker. If the rollback dir was manually deleted, refuse to boot
+  with a clear error.
+- **Per-row JSON validation during apply.** Every row in JSON-valued
+  CFs (USERS, CHANNELS, CHANNEL_MEMBERS, DELEGATIONS, STATE_ANCHORS)
+  must parse as valid JSON or the apply aborts atomically before any
+  destructive op. Closes the "malicious peer plants malformed values
+  → persistent API DoS" vector.
+- **Anchor height bounds.** Manifests with
+  `last_verified_anchor_height > block_height` or `== 0` are rejected.
+  The latter blocks unanchored snapshots outright; the former would
+  let a malicious primary advance `chain_cursor` past the tip.
+- **Stricter fresh-node gate.** "Fresh" is now `cursor == 0` only,
+  not `cursor < start_block`. The earlier formulation could let a
+  high `start_block` config slip the destructive apply past an
+  existing healthy node's state.
+- **Quorum split-brain detection.** If two equally-sized groups tie on
+  block_height but disagree on `snapshot_root`, `select_quorum`
+  returns `None` instead of letting `HashMap::into_iter` ordering
+  decide which fork to follow.
+- **Bounded `pending_snapshot_requests` map** (8192 cap) with
+  opportunistic GC of dropped receivers each send. Caps the per-session
+  memory of a peer-churn attack.
+- **Spec §5a.7 + §5a.8 explicitly document deferred items:** producer
+  signature verification ships in Phase 3 (currently only length is
+  checked), and sybil resistance relies on `bootstrap_nodes` being
+  trusted. The release-note language is unambiguous that Phase 2 is
+  an experimental opt-in with a quorum-based trust model.
+
 ## [0.34.0] - 2026-05-12
 
 ### Added
