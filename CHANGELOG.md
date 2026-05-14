@@ -5,6 +5,32 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.36.1] - 2026-05-14
+
+### Fixed
+- **Anchor count + status no longer cap at 200 lifetime anchors.**
+  `get_self_anchor_status` (dashboard `total_anchors`) and
+  `compute_anchor_status` (network-page `ANCHORED` column) both
+  previously called `prefix_iter_cf(.., 200)`, which returned only the
+  **oldest** 200 entries in the per-node anchor index. Once a node
+  crossed 200 lifetime anchors, two cascading bugs appeared:
+  - Dashboard's "total anchors" stuck at exactly 200 forever.
+  - Network page's anchor-verified status went empty (`—`) because
+    the function filtered the oldest-200 by `ts >= now - 7 days`, all
+    of which were necessarily older than 7 days for any node with
+    sustained anchoring → filtered set empty → returned
+    `verified: false, level: "none"`.
+
+  Replaced both with a full prefix scan (no limit, single forward
+  pass). ANCHOR_BY_NODE is one row per anchor for the calling node
+  only — bounded by anchoring frequency (~9k/year at default hourly
+  anchoring), so a full scan is cheap. `iter.status()` is checked
+  post-loop to surface RocksDB I/O errors. Counter accuracy and
+  network-page status are now correct regardless of lifetime anchor
+  count. Note: `last_anchor_age_seconds` was always correct — it
+  comes from the `LAST_ANCHOR_TS` NODE_STATE counter, a separate
+  code path written atomically by the StateAnchorer.
+
 ## [0.36.0] - 2026-05-13
 
 ### Added

@@ -1928,13 +1928,49 @@ impl Storage {
         prefix.extend_from_slice(node_id.as_bytes());
         prefix.push(0xFF);
 
-        // Fetch recent anchors for this node (200 covers 7+ days of hourly anchoring)
         let seven_days = 7 * 24 * 60 * 60u64;
         let cutoff = now.saturating_sub(seven_days);
 
-        let entries = self.prefix_iter_cf(cf::ANCHOR_BY_NODE, &prefix, 200)?;
+        // Single full-prefix scan (no 200 cap — previously made any node
+        // with >200 lifetime anchors show "level: none" because the 200
+        // oldest were all > 7 days old and filtered out). One row per
+        // anchor for this node only, bounded by anchoring frequency.
+        let cf = self
+            .db
+            .cf_handle(cf::ANCHOR_BY_NODE)
+            .context("ANCHOR_BY_NODE cf not found")?;
+        let mut iter = self.db.raw_iterator_cf(&cf);
+        iter.seek(&prefix);
 
-        if entries.is_empty() {
+        let mut timestamps: Vec<u64> = Vec::new();
+        let mut all_count = 0u64;
+        let mut earliest: Option<u64> = None;
+
+        while iter.valid() {
+            let k = match iter.key() {
+                Some(k) if k.starts_with(&prefix) => k,
+                _ => break,
+            };
+            if k.len() > prefix.len() + 7 {
+                let ts_start = k.len() - 8;
+                let mut ts_bytes = [0u8; 8];
+                ts_bytes.copy_from_slice(&k[ts_start..]);
+                let ts = u64::from_be_bytes(ts_bytes);
+                all_count += 1;
+                // Forward iter is timestamp-ascending — first hit is oldest.
+                if earliest.is_none() {
+                    earliest = Some(ts);
+                }
+                if ts >= cutoff {
+                    timestamps.push(ts);
+                }
+            }
+            iter.next();
+        }
+        iter.status()
+            .context("rocksdb iter status in compute_anchor_status")?;
+
+        if all_count == 0 {
             return Ok(AnchorStatus {
                 verified: false,
                 level: "none".to_string(),
@@ -1942,27 +1978,6 @@ impl Storage {
                 anchoring_since: None,
                 total_anchors: 0,
             });
-        }
-
-        // Parse timestamps from keys and filter recent ones
-        let mut timestamps: Vec<u64> = Vec::new();
-        let mut all_count = 0u64;
-        let mut earliest: Option<u64> = None;
-
-        for (key, _) in &entries {
-            if key.len() > prefix.len() + 7 {
-                let ts_start = key.len() - 8;
-                let mut ts_bytes = [0u8; 8];
-                ts_bytes.copy_from_slice(&key[ts_start..]);
-                let ts = u64::from_be_bytes(ts_bytes);
-                all_count += 1;
-                if earliest.is_none() || ts < earliest.unwrap() {
-                    earliest = Some(ts);
-                }
-                if ts >= cutoff {
-                    timestamps.push(ts);
-                }
-            }
         }
 
         if timestamps.is_empty() {
@@ -2033,10 +2048,53 @@ impl Storage {
         prefix.extend_from_slice(node_id.as_bytes());
         prefix.push(0xFF);
 
-        let entries = self.prefix_iter_cf(cf::ANCHOR_BY_NODE, &prefix, 200)?;
-        let total = entries.len() as u64;
+        // Full prefix scan with no limit — previously capped at 200 via
+        // prefix_iter_cf, which made total_anchors stick at 200 once a
+        // node crossed that many. ANCHOR_BY_NODE is one row per anchor
+        // for this node only, bounded by anchoring interval (~9k/year
+        // at hourly anchoring), so a full scan is cheap.
+        let cf = self
+            .db
+            .cf_handle(cf::ANCHOR_BY_NODE)
+            .context("ANCHOR_BY_NODE cf not found")?;
+        let mut iter = self.db.raw_iterator_cf(&cf);
+        iter.seek(&prefix);
 
-        if entries.is_empty() {
+        let mut total: u64 = 0;
+        let mut earliest_ts: Option<u64> = None;
+        let mut latest_ts: u64 = 0;
+        let mut latest_height: u64 = 0;
+
+        while iter.valid() {
+            let (k, v) = match (iter.key(), iter.value()) {
+                (Some(k), Some(v)) if k.starts_with(&prefix) => (k, v),
+                _ => break,
+            };
+            if k.len() >= prefix.len() + 8 {
+                let ts_start = k.len() - 8;
+                let mut ts_bytes = [0u8; 8];
+                ts_bytes.copy_from_slice(&k[ts_start..]);
+                let ts = u64::from_be_bytes(ts_bytes);
+                total += 1;
+                // Forward iter is timestamp-ascending — first hit is oldest.
+                if earliest_ts.is_none() {
+                    earliest_ts = Some(ts);
+                }
+                if ts > latest_ts {
+                    latest_ts = ts;
+                    if v.len() == 8 {
+                        let mut h = [0u8; 8];
+                        h.copy_from_slice(v);
+                        latest_height = u64::from_be_bytes(h);
+                    }
+                }
+            }
+            iter.next();
+        }
+        iter.status()
+            .context("rocksdb iter status in get_self_anchor_status")?;
+
+        if total == 0 {
             return Ok(SelfAnchorStatus {
                 is_anchorer: false,
                 last_anchor_height: None,
@@ -2051,32 +2109,6 @@ impl Storage {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-
-        // Extract timestamps from keys and block heights from values
-        let mut earliest_ts: Option<u64> = None;
-        let mut latest_ts: u64 = 0;
-        let mut latest_height: u64 = 0;
-
-        for (key, value) in &entries {
-            if key.len() >= prefix.len() + 8 {
-                let ts_start = key.len() - 8;
-                let mut ts_bytes = [0u8; 8];
-                ts_bytes.copy_from_slice(&key[ts_start..]);
-                let ts = u64::from_be_bytes(ts_bytes);
-
-                if earliest_ts.is_none() || ts < earliest_ts.unwrap() {
-                    earliest_ts = Some(ts);
-                }
-                if ts > latest_ts {
-                    latest_ts = ts;
-                    if value.len() == 8 {
-                        let mut h = [0u8; 8];
-                        h.copy_from_slice(value);
-                        latest_height = u64::from_be_bytes(h);
-                    }
-                }
-            }
-        }
 
         let last_age = if latest_ts > 0 {
             Some(now.saturating_sub(latest_ts))
