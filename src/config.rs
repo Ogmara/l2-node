@@ -896,7 +896,7 @@ impl Config {
         }
     }
 
-    pub fn validate(&self) -> Result<()> {
+    pub fn validate(&mut self) -> Result<()> {
         self.warn_if_non_https_klever_url();
         if self.network.listen_port == 0 {
             anyhow::bail!("network.listen_port must be > 0");
@@ -916,17 +916,27 @@ impl Config {
                 );
             }
         }
-        // Validate media-handler tunables (v0.40). These are read from
-        // IpfsConfig at AppState construction and feed directly into a
-        // moka cache + tokio Semaphore. A misconfigured value can break
-        // the media endpoint in ways that aren't recoverable at
-        // runtime — zero permits causes every request to block
-        // forever; absurdly large values revert the v0.39
-        // memory-amplification mitigation. Reject at config-load time.
+        // Validate media-handler tunables (v0.40). Two classes of check:
         //
-        // Upper bounds are deliberately wide enough that anyone with a
-        // legitimate tuning case can still pick a value, but narrow
-        // enough that a typo can't trigger an OOM-class regression.
+        //   HARD REJECTS — values that produce broken runtime behavior:
+        //     * zero permits → semaphore deadlocks every request
+        //     * zero cache caps → degenerate (cache that holds nothing)
+        //     * absurd upper bounds → reverts the v0.39 memory
+        //       amplification mitigation
+        //
+        //   SOFT FIXES — cross-field inconsistencies that DON'T affect
+        //   correctness but indicate operator confusion:
+        //     * item_mb > total_mb → every cached item evicts everything
+        //     * item_mb > max_upload_mb → harmless (items > max_upload
+        //       can't enter the system anyway), but suggests the
+        //       operator is unaware of the implicit cap
+        //
+        //   v0.40.1 fix: soft cases now auto-clamp + warn instead of
+        //   bailing. Pre-0.40.1 this branch hard-rejected legitimate
+        //   pre-v0.40 production configs (e.g. `max_upload_size_mb = 10`
+        //   combined with the default `media_cache_item_mb = 16`), which
+        //   prevented upgrades. The hard rejects remain to catch values
+        //   that actually break runtime.
         if self.ipfs.media_handler_permits == 0 {
             anyhow::bail!("ipfs.media_handler_permits must be > 0 (zero deadlocks the media endpoint)");
         }
@@ -944,28 +954,9 @@ impl Config {
         if self.ipfs.media_cache_item_mb == 0 {
             anyhow::bail!("ipfs.media_cache_item_mb must be > 0");
         }
-        // Per-item cap larger than the total cache means every cached
-        // item evicts every other item. Functional but wasteful — and
-        // almost certainly a configuration typo.
-        if self.ipfs.media_cache_item_mb > self.ipfs.media_cache_total_mb {
-            anyhow::bail!(
-                "ipfs.media_cache_item_mb ({}) must be <= ipfs.media_cache_total_mb ({})",
-                self.ipfs.media_cache_item_mb,
-                self.ipfs.media_cache_total_mb
-            );
-        }
-        // Per-item cap larger than max upload makes no sense — items
-        // that large can't enter the system in the first place.
-        if self.ipfs.media_cache_item_mb > self.ipfs.max_upload_size_mb {
-            anyhow::bail!(
-                "ipfs.media_cache_item_mb ({}) must be <= ipfs.max_upload_size_mb ({})",
-                self.ipfs.media_cache_item_mb,
-                self.ipfs.max_upload_size_mb
-            );
-        }
-        // 64 GiB is a generous ceiling — even pathological tuning
-        // doesn't need more than this. Beyond, you're shifting the
-        // bottleneck to host memory; configure explicitly.
+        // 64 GiB is a generous ceiling for the total cache — beyond
+        // this you're shifting the bottleneck to host memory. Configure
+        // explicitly with a justification.
         const MAX_MEDIA_CACHE_TOTAL_MB: u64 = 65_536;
         if self.ipfs.media_cache_total_mb > MAX_MEDIA_CACHE_TOTAL_MB {
             anyhow::bail!(
@@ -973,6 +964,37 @@ impl Config {
                 self.ipfs.media_cache_total_mb,
                 MAX_MEDIA_CACHE_TOTAL_MB
             );
+        }
+        // SOFT FIXES below — auto-clamp and emit a warning rather than
+        // bailing. `eprintln` is used instead of `tracing::warn` because
+        // validation runs BEFORE the tracing subscriber is initialized;
+        // a tracing warn would be silently dropped.
+        //
+        // Per-item cap larger than max upload: items that large can't
+        // enter the system in the first place, so the over-spec is
+        // harmless. Clamp to keep the displayed config self-consistent.
+        if self.ipfs.media_cache_item_mb > self.ipfs.max_upload_size_mb {
+            eprintln!(
+                "[config] ipfs.media_cache_item_mb ({}) > ipfs.max_upload_size_mb ({}); \
+                 clamping to {} (items larger than max_upload can't enter the system).",
+                self.ipfs.media_cache_item_mb,
+                self.ipfs.max_upload_size_mb,
+                self.ipfs.max_upload_size_mb,
+            );
+            self.ipfs.media_cache_item_mb = self.ipfs.max_upload_size_mb;
+        }
+        // Per-item cap larger than total cache: each cached item would
+        // evict every other item. Clamp so the LRU has room to keep
+        // SOMETHING after each insert.
+        if self.ipfs.media_cache_item_mb > self.ipfs.media_cache_total_mb {
+            eprintln!(
+                "[config] ipfs.media_cache_item_mb ({}) > ipfs.media_cache_total_mb ({}); \
+                 clamping to {} (cap per item must fit within total cache).",
+                self.ipfs.media_cache_item_mb,
+                self.ipfs.media_cache_total_mb,
+                self.ipfs.media_cache_total_mb,
+            );
+            self.ipfs.media_cache_item_mb = self.ipfs.media_cache_total_mb;
         }
         Ok(())
     }
@@ -1098,5 +1120,110 @@ level = "info"
 format = "json"
 "#
         .to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a baseline `Config` for validation tests by parsing the
+    /// canonical `default_toml()`. Each test mutates the fields it
+    /// cares about, then calls `validate()`.
+    fn baseline_config() -> Config {
+        toml::from_str(&Config::default_toml()).expect("default toml parses")
+    }
+
+    // --- Hard rejects ---------------------------------------------------
+
+    #[test]
+    fn validate_rejects_zero_media_permits() {
+        let mut c = baseline_config();
+        c.ipfs.media_handler_permits = 0;
+        let err = c.validate().expect_err("zero permits must reject");
+        assert!(format!("{}", err).contains("media_handler_permits"));
+    }
+
+    #[test]
+    fn validate_rejects_zero_media_cache_total() {
+        let mut c = baseline_config();
+        c.ipfs.media_cache_total_mb = 0;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_zero_media_cache_item() {
+        let mut c = baseline_config();
+        c.ipfs.media_cache_item_mb = 0;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_oversized_media_cache_total() {
+        let mut c = baseline_config();
+        c.ipfs.media_cache_total_mb = 1_000_000; // 1 TiB — way over cap
+        let err = c.validate().expect_err("oversized total must reject");
+        assert!(format!("{}", err).contains("media_cache_total_mb"));
+    }
+
+    #[test]
+    fn validate_rejects_oversized_permits() {
+        let mut c = baseline_config();
+        c.ipfs.media_handler_permits = 100_000;
+        assert!(c.validate().is_err());
+    }
+
+    // --- Soft fixes (v0.40.1 regression) --------------------------------
+
+    /// Regression: pre-0.40.1 this combination (default item_mb=16
+    /// against a smaller-than-default max_upload_mb=10) caused the
+    /// process to exit at startup. The fix clamps + warns instead of
+    /// bailing — production nodes with pre-v0.40 configs upgrade
+    /// without operator intervention.
+    #[test]
+    fn validate_clamps_item_to_max_upload_instead_of_failing() {
+        let mut c = baseline_config();
+        c.ipfs.max_upload_size_mb = 10;
+        c.ipfs.media_cache_item_mb = 16; // would have been the v0.40.0 default
+        c.validate().expect("must NOT bail on this combination");
+        assert_eq!(
+            c.ipfs.media_cache_item_mb, 10,
+            "item_mb should be clamped to max_upload_mb",
+        );
+    }
+
+    #[test]
+    fn validate_clamps_item_to_total_when_misconfigured() {
+        let mut c = baseline_config();
+        c.ipfs.media_cache_total_mb = 8;
+        c.ipfs.media_cache_item_mb = 100;
+        c.ipfs.max_upload_size_mb = 200; // not the bottleneck this time
+        c.validate().expect("must NOT bail; clamp instead");
+        assert!(
+            c.ipfs.media_cache_item_mb <= 8,
+            "item_mb clamped via max_upload then total: got {}",
+            c.ipfs.media_cache_item_mb
+        );
+    }
+
+    #[test]
+    fn validate_passes_defaults_unchanged() {
+        // Sanity: the canonical default config from `default_toml()`
+        // must pass validation without any clamping. Catches a future
+        // bump to a default value that conflicts with the validation.
+        let mut c = baseline_config();
+        let before = c.ipfs.media_cache_item_mb;
+        c.validate().expect("defaults must pass");
+        assert_eq!(c.ipfs.media_cache_item_mb, before, "no clamping on defaults");
+    }
+
+    #[test]
+    fn validate_passes_when_item_equals_max_upload() {
+        // Boundary case — equality is allowed.
+        let mut c = baseline_config();
+        c.ipfs.max_upload_size_mb = 16;
+        c.ipfs.media_cache_item_mb = 16;
+        c.validate().expect("equality is fine");
+        assert_eq!(c.ipfs.media_cache_item_mb, 16);
     }
 }
