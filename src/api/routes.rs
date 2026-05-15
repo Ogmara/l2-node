@@ -10,6 +10,7 @@ use axum::extract::{Extension, Multipart, Path, Query};
 use axum::http::{header, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use rocksdb::WriteBatch;
@@ -17,7 +18,7 @@ use rocksdb::WriteBatch;
 use crate::storage::schema::{cf, decode_users_by_name_key, encode_channel_msg_key, encode_dm_msg_key, state_keys};
 
 use super::auth::AuthUser;
-use super::state::AppState;
+use super::state::{AppState, CachedMedia, MEDIA_CACHE_ITEM_BYTES};
 
 /// Build a 429 response with a PoW challenge for the given wallet address.
 ///
@@ -2640,171 +2641,409 @@ pub async fn upload_media(
     }
 }
 
-/// GET /api/v1/media/:cid — retrieve media from IPFS (public).
+/// GET / HEAD `/api/v1/media/:cid` — retrieve media from IPFS (public).
 ///
-/// Supports HTTP `Range:` requests with `206 Partial Content` responses
-/// and always advertises `Accept-Ranges: bytes`. Without this, media
-/// players (WebKitGTK's `<video>` element, VLC, mpv) cannot stream MP4
-/// files whose `moov` atom sits after `mdat` — they need to seek to
-/// the end of the file to read metadata before they can play. The
-/// pre-0.38 handler ignored Range entirely and always returned the
-/// full body, which made every non-faststart MP4 unplayable.
+/// Same handler serves both methods; HEAD elides the body but emits
+/// identical headers (RFC 9110 §9.3.2). Architecture (v0.39, audit-revised):
+///
+///   1. **`If-None-Match` 304 short-circuit runs BEFORE semaphore
+///      acquisition.** Cache lookup is free; for cache misses,
+///      existence is probed via `exists_local` (Kubo `files/stat?
+///      offline=true`) so an attacker can't weaponize the existence
+///      oracle into a DHT-walk amplification vector.
+///   2. **Body-fetch path bounded by `media_semaphore`** (32 permits),
+///      preventing memory-amplification DoS.
+///   3. **`media_cache` (moka LRU) stores `(bytes, content_type)`
+///      tuples.** Cache hits skip both the IPFS fetch AND the
+///      content-type re-sniff. Coalesced fills via `try_get_with`
+///      prevent thundering-herd on cold cache.
+///   4. **Range requests on uncached large files** use
+///      `IpfsClient::get_range`; only the requested bytes leave IPFS.
+///   5. **`Content-Disposition` policy: `inline` for an explicit
+///      allowlist of media MIME prefixes; everything else is
+///      `attachment`.** Inverts the pre-audit blacklist that would
+///      auto-inline any new MIME type a future detector might add.
+///   6. **HEAD responses use the (status, headers) IntoResponse form**
+///      (no body in tuple), so the user-set `Content-Length` is the
+///      only one emitted — no double-header / smuggling risk.
 pub async fn get_media(
     Extension(state): Extension<Arc<AppState>>,
     Path(cid): Path<String>,
+    method: axum::http::Method,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
+    let is_head = method == axum::http::Method::HEAD;
     let ipfs = match &state.ipfs {
         Some(c) => c,
-        None => return (StatusCode::SERVICE_UNAVAILABLE, "IPFS not configured").into_response(),
-    };
-
-    let data = match ipfs.get(&cid).await {
-        Ok(d) => d,
-        Err(e) => {
-            tracing::warn!(cid = %cid, error = %e, "IPFS retrieval failed");
-            return (StatusCode::NOT_FOUND, "media not found").into_response();
-        }
-    };
-
-    let total = data.len() as u64;
-    let content_type = detect_content_type(&data);
-    let cache_control = "public, max-age=31536000, immutable".to_string();
-    // ETag from the CID. IPFS CIDs are content-addressed — the bytes
-    // for a given CID never change — so the CID itself is a perfect
-    // strong validator. Quoting per RFC 7232 §2.3. Future revision can
-    // honor `If-None-Match` and return 304 to skip the IPFS fetch.
-    let etag = format!("\"{}\"", cid);
-
-    // If-None-Match: clients holding a fresh copy can probe with
-    // `If-None-Match: "<cid>"` and we return 304 with no body. This
-    // is independent of Range — the CID alone guarantees identity.
-    //
-    // Per RFC 7232 §3.2, the wildcard `*` matches any current
-    // representation of the resource; since this handler only serves
-    // a successful response when the CID exists, `*` always matches
-    // when we reach this point.
-    if headers
-        .get(header::IF_NONE_MATCH)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v == "*" || v == etag)
-        .unwrap_or(false)
-    {
-        return (
-            StatusCode::NOT_MODIFIED,
-            [
-                (header::ETAG, etag),
-                (header::ACCEPT_RANGES, "bytes".to_string()),
-                (header::CACHE_CONTROL, cache_control),
-            ],
-        )
-            .into_response();
-    }
-
-    // No Range header → full 200 OK response, but with `Accept-Ranges`
-    // unconditionally set so the next request can seek. Players probe
-    // this header on the initial HEAD/GET before issuing range
-    // requests; omitting it makes them assume the resource is
-    // non-seekable and fall back to start-to-end download.
-    let range_value = match headers.get(header::RANGE).and_then(|v| v.to_str().ok()) {
-        Some(v) => v.to_string(),
         None => {
-            return (
-                StatusCode::OK,
-                [
-                    (header::CONTENT_TYPE, content_type),
-                    (header::ACCEPT_RANGES, "bytes".to_string()),
-                    // `Vary: Range` signals to intermediate caches that
-                    // responses differ when Range differs — without it,
-                    // an intermediary might cache a 206 partial under
-                    // the same key as a 200 full response and replay
-                    // truncated bytes back to clients.
-                    (header::VARY, "Range".to_string()),
-                    (header::ETAG, etag),
-                    (header::CACHE_CONTROL, cache_control),
-                    (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
-                    (header::CONTENT_LENGTH, total.to_string()),
-                ],
-                data,
-            )
+            return (StatusCode::SERVICE_UNAVAILABLE, "IPFS not configured")
                 .into_response();
         }
     };
 
-    match parse_byte_range(&range_value, total) {
-        Some((start, end)) => {
-            // 206 Partial Content. Slice is inclusive on both ends per
-            // RFC 7233. The defensive `usize::try_from` is a no-op on
-            // 64-bit (where `usize == u64`) but guards correctness if
-            // anyone ever cross-compiles for armv7 / wasm32: a silent
-            // u64→usize truncation would slice the wrong bytes and
-            // either panic or return content-confusion.
-            let start_usize = match usize::try_from(start) {
-                Ok(v) => v,
-                Err(_) => {
-                    return (
-                        StatusCode::RANGE_NOT_SATISFIABLE,
-                        [
-                            (header::ACCEPT_RANGES, "bytes".to_string()),
-                            (header::CONTENT_RANGE, format!("bytes */{}", total)),
-                        ],
-                    )
-                        .into_response();
-                }
-            };
-            let end_usize = match usize::try_from(end) {
-                Ok(v) => v,
-                Err(_) => {
-                    return (
-                        StatusCode::RANGE_NOT_SATISFIABLE,
-                        [
-                            (header::ACCEPT_RANGES, "bytes".to_string()),
-                            (header::CONTENT_RANGE, format!("bytes */{}", total)),
-                        ],
-                    )
-                        .into_response();
-                }
-            };
-            let slice = data[start_usize..=end_usize].to_vec();
-            let content_length = slice.len() as u64;
-            (
-                StatusCode::PARTIAL_CONTENT,
-                [
-                    (header::CONTENT_TYPE, content_type),
-                    (header::ACCEPT_RANGES, "bytes".to_string()),
-                    (header::VARY, "Range".to_string()),
-                    (header::ETAG, etag),
-                    (header::CACHE_CONTROL, cache_control),
-                    (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
-                    (
-                        header::CONTENT_RANGE,
-                        format!("bytes {}-{}/{}", start, end, total),
-                    ),
-                    (header::CONTENT_LENGTH, content_length.to_string()),
-                ],
-                slice,
-            )
-                .into_response()
+    let etag = format!("\"{}\"", cid);
+    let cache_control = "public, max-age=31536000, immutable";
+
+    // ----- If-None-Match short-circuit (NO semaphore yet) -----------
+    // Audit warning W-1 (code) + W-3 (security): both held the permit
+    // through a `get_size` call that could hit the DHT for unknown
+    // CIDs. We now check the cache (free) and then `exists_local`
+    // (offline-only) before paying the semaphore cost. The 304 path
+    // is also the busiest in CDN-fronted deployments — every
+    // periodic revalidator hits it.
+    if let Some(if_none_match) = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty())
+    {
+        if if_none_match == "*" || if_none_match == etag {
+            let cache_hit = state.media_cache.get(&cid).await.is_some();
+            let exists = cache_hit
+                || ipfs.exists_local(&cid).await.unwrap_or(false);
+            if exists {
+                return build_304(etag, cache_control);
+            }
+            return (StatusCode::NOT_FOUND, "media not found").into_response();
         }
+    }
+
+    // Acquire a semaphore permit before any body fetch. If permits are
+    // exhausted, requests queue (Tokio fairness). `acquire_owned`
+    // returns a permit that doesn't borrow from the semaphore, the
+    // right pattern when the permit must survive across awaits inside
+    // the handler.
+    let _permit = match state.media_semaphore.clone().acquire_owned().await {
+        Ok(p) => p,
+        Err(_) => {
+            // Semaphore closed (shutdown in progress). Tell the client
+            // to retry rather than report a misleading 5xx.
+            return (StatusCode::SERVICE_UNAVAILABLE, "shutting down").into_response();
+        }
+    };
+
+    let range_value = headers
+        .get(header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_string());
+
+    // ----- Cache hit fast path --------------------------------------
+    if let Some(cached) = state.media_cache.get(&cid).await {
+        return serve_from_cached(
+            is_head,
+            cached,
+            etag,
+            cache_control,
+            &cid,
+            range_value.as_deref(),
+        );
+    }
+
+    // ----- Cache miss: actual size first ----------------------------
+    // `get_size` (v0.39.0) now uses `files/stat?offline=true` and
+    // returns the ACTUAL file size (not `CumulativeSize`), so the
+    // `total` we report in Content-Range matches what `get_range`
+    // can deliver. Audit warning W-2 (security) / #3 (code).
+    let total = match ipfs.get_size(&cid).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(cid = %cid, error = %e, "IPFS stat failed");
+            return (StatusCode::NOT_FOUND, "media not found").into_response();
+        }
+    };
+
+    // Stream-range path: large file + Range. No full buffer.
+    if let Some(ref range_str) = range_value {
+        if total > MEDIA_CACHE_ITEM_BYTES as u64 {
+            return serve_range_streamed(
+                is_head, ipfs, &cid, range_str, total, etag, cache_control,
+            )
+            .await;
+        }
+    }
+
+    // Cacheable path (small file, any request) OR large file + no
+    // Range. For cacheable files we use `try_get_with` so concurrent
+    // requests for the same cold CID coalesce into a single IPFS
+    // fetch (audit note N-4 security). For large files we go direct
+    // — caching them would evict 16× more useful small items.
+    let cached: CachedMedia = if total <= MEDIA_CACHE_ITEM_BYTES as u64 {
+        // Closure captures `ipfs` and `cid` by reference. The future
+        // is constructed each time but only the FIRST waiter's
+        // future runs; subsequent waiters skip the IPFS round-trip.
+        let cid_for_fetch = cid.clone();
+        let init = async {
+            let bytes = ipfs.get(&cid_for_fetch).await?;
+            let content_type = detect_content_type(&bytes).to_string();
+            Ok::<_, anyhow::Error>(CachedMedia { bytes, content_type })
+        };
+        match state
+            .media_cache
+            .try_get_with(cid.clone(), init)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(cid = %cid, error = %*e, "IPFS retrieval failed");
+                return (StatusCode::NOT_FOUND, "media not found").into_response();
+            }
+        }
+    } else {
+        // Too large to cache. Direct fetch — no coalesce, no insert.
+        match ipfs.get(&cid).await {
+            Ok(bytes) => {
+                let content_type = detect_content_type(&bytes).to_string();
+                CachedMedia { bytes, content_type }
+            }
+            Err(e) => {
+                tracing::warn!(cid = %cid, error = %e, "IPFS retrieval failed");
+                return (StatusCode::NOT_FOUND, "media not found").into_response();
+            }
+        }
+    };
+
+    serve_from_cached(
+        is_head,
+        cached,
+        etag,
+        cache_control,
+        &cid,
+        range_value.as_deref(),
+    )
+}
+
+/// Build the `Content-Disposition` header value for a media response.
+///
+/// **Inline allowlist** (post-audit revision): only the EXACT MIME
+/// types below are rendered inline; everything else is downloaded as
+/// an attachment. Audit warning W-4 (security).
+///
+/// The list is an EXACT enumeration (not a prefix match) so that
+/// dangerous subtypes are excluded by default. Notably:
+///
+///   - **`image/svg+xml` is NOT inline.** SVG can contain `<script>`
+///     elements and is a stored-XSS vector at the media origin. A
+///     prefix-match on `image/` would have admitted SVG; the exact
+///     enumeration excludes it.
+///   - **`text/*` is never inline.** Even `text/plain` can be sniffed
+///     by old browsers into `text/html` under some legacy paths;
+///     forcing `attachment` removes the entire XSS class.
+///   - **`application/*` is inline only for `application/pdf`**, where
+///     modern browsers sandbox the renderer heavily.
+///
+/// Any future detector addition (e.g. `image/heic`) requires an
+/// explicit code change here, with the security review that comes
+/// with it.
+fn media_content_disposition(content_type: &str, cid: &str) -> String {
+    // Keep this list in lockstep with `detect_content_type`. Sniffable
+    // types that ARE safe to render inline live here; everything else
+    // is forced to `attachment`.
+    const INLINE_ALLOWED: &[&str] = &[
+        // Raster images — no script execution.
+        "image/png",
+        "image/jpeg",
+        "image/gif",
+        "image/webp",
+        // Video containers — `<video>` decoder, no JS surface.
+        "video/mp4",
+        "video/webm",
+        "video/ogg",
+        "video/x-msvideo",
+        // Audio — `<audio>` decoder.
+        "audio/mpeg",
+        "audio/wav",
+        "audio/flac",
+        // PDF — modern browsers sandbox the renderer.
+        "application/pdf",
+    ];
+    let inline = INLINE_ALLOWED.iter().any(|t| *t == content_type);
+    if inline {
+        format!("inline; filename=\"{}\"", cid)
+    } else {
+        format!("attachment; filename=\"{}\"", cid)
+    }
+}
+
+/// 304 Not Modified response. Used by the If-None-Match short-circuit.
+fn build_304(etag: String, cache_control: &'static str) -> axum::response::Response {
+    (
+        StatusCode::NOT_MODIFIED,
+        [
+            (header::ETAG, etag),
+            (header::ACCEPT_RANGES, "bytes".to_string()),
+            (header::CACHE_CONTROL, cache_control.to_string()),
+        ],
+    )
+        .into_response()
+}
+
+/// 416 Range Not Satisfiable response.
+fn build_416(total: u64) -> axum::response::Response {
+    (
+        StatusCode::RANGE_NOT_SATISFIABLE,
+        [
+            (header::ACCEPT_RANGES, "bytes".to_string()),
+            (header::CONTENT_RANGE, format!("bytes */{}", total)),
+        ],
+    )
+        .into_response()
+}
+
+/// Serve a media body from a fully-buffered `CachedMedia` (cache hit
+/// OR just-fetched small file). Handles 200 / 206 / 416 selection
+/// based on the Range header; elides the body for HEAD requests.
+fn serve_from_cached(
+    is_head: bool,
+    cached: CachedMedia,
+    etag: String,
+    cache_control: &'static str,
+    cid: &str,
+    range_value: Option<&str>,
+) -> axum::response::Response {
+    let CachedMedia { bytes, content_type } = cached;
+    let total = bytes.len() as u64;
+    let disposition = media_content_disposition(&content_type, cid);
+
+    let range_str = match range_value {
         None => {
-            // Malformed or unsatisfiable Range. Per RFC 7233 §4.4 we
-            // SHOULD return 416 with a `Content-Range: bytes */<size>`
-            // header so the client can recover. Multi-range requests
-            // (which we deliberately don't support) also hit this
-            // branch — clients that need byte ranges will retry with
-            // a single range. RFC 9110 §15.5.17 also recommends
-            // `Accept-Ranges: bytes` so the client knows ranges ARE
-            // supported (the 416 was only about *this* request);
-            // without it older VLC builds give up entirely.
-            (
-                StatusCode::RANGE_NOT_SATISFIABLE,
-                [
-                    (header::ACCEPT_RANGES, "bytes".to_string()),
-                    (header::CONTENT_RANGE, format!("bytes */{}", total)),
-                ],
-            )
-                .into_response()
+            // 200 OK. HEAD uses the `(status, headers)` tuple form
+            // (NO body) — that's the only way to guarantee axum
+            // doesn't emit a body-derived `Content-Length: 0`
+            // alongside our user-set `Content-Length: <total>`
+            // (audit warning W-5 security).
+            let headers = [
+                (header::CONTENT_TYPE, content_type),
+                (header::ACCEPT_RANGES, "bytes".to_string()),
+                (header::VARY, "Range".to_string()),
+                (header::ETAG, etag),
+                (header::CACHE_CONTROL, cache_control.to_string()),
+                (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+                (header::CONTENT_DISPOSITION, disposition),
+                (header::CONTENT_LENGTH, total.to_string()),
+            ];
+            return if is_head {
+                (StatusCode::OK, headers).into_response()
+            } else {
+                (StatusCode::OK, headers, bytes).into_response()
+            };
         }
+        Some(s) => s,
+    };
+
+    let (start, end) = match parse_byte_range(range_str, total) {
+        Some(r) => r,
+        None => return build_416(total),
+    };
+    let start_usize = match usize::try_from(start) {
+        Ok(v) => v,
+        Err(_) => return build_416(total),
+    };
+    let end_usize = match usize::try_from(end) {
+        Ok(v) => v,
+        Err(_) => return build_416(total),
+    };
+    // Zero-copy slice — Bytes holds a refcount + view, doesn't copy
+    // the underlying buffer.
+    let slice: Bytes = bytes.slice(start_usize..=end_usize);
+    let content_length = slice.len() as u64;
+    let headers = [
+        (header::CONTENT_TYPE, content_type),
+        (header::ACCEPT_RANGES, "bytes".to_string()),
+        (header::VARY, "Range".to_string()),
+        (header::ETAG, etag),
+        (header::CACHE_CONTROL, cache_control.to_string()),
+        (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+        (header::CONTENT_DISPOSITION, disposition),
+        (
+            header::CONTENT_RANGE,
+            format!("bytes {}-{}/{}", start, end, total),
+        ),
+        (header::CONTENT_LENGTH, content_length.to_string()),
+    ];
+    if is_head {
+        (StatusCode::PARTIAL_CONTENT, headers).into_response()
+    } else {
+        (StatusCode::PARTIAL_CONTENT, headers, slice).into_response()
+    }
+}
+
+/// Stream-range path: large uncached file + Range request. Fetches
+/// only the requested bytes from IPFS + a 16-byte prefix for
+/// content-type sniffing. Never buffers the full blob.
+async fn serve_range_streamed(
+    is_head: bool,
+    ipfs: &crate::ipfs::client::IpfsClient,
+    cid: &str,
+    range_str: &str,
+    total: u64,
+    etag: String,
+    cache_control: &'static str,
+) -> axum::response::Response {
+    let (start, end) = match parse_byte_range(range_str, total) {
+        Some(r) => r,
+        None => return build_416(total),
+    };
+    let length = end - start + 1;
+
+    // Fetch just the requested range from IPFS.
+    let slice = match ipfs.get_range(cid, start, length).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(cid = %cid, error = %e, "IPFS range fetch failed");
+            return (StatusCode::BAD_GATEWAY, "range fetch failed").into_response();
+        }
+    };
+
+    // Defense against a malicious / misbehaving Kubo that reports an
+    // inflated size but truncates the actual response. Without this
+    // check we'd emit `Content-Range: bytes start-end/total` where
+    // `end - start + 1` doesn't equal the body length we're sending.
+    // Audit critical C-1 (security).
+    if slice.len() as u64 != length {
+        tracing::warn!(
+            cid = %cid,
+            expected = length,
+            actual = slice.len(),
+            "IPFS range returned wrong length"
+        );
+        return (StatusCode::BAD_GATEWAY, "range length mismatch").into_response();
+    }
+
+    // For content-type sniffing we need bytes from the start of the
+    // file, not the requested range. If we're already serving the
+    // start, reuse those bytes; otherwise do a 16-byte prefix fetch.
+    // Surface a sniff-fetch failure as 502 rather than silently
+    // flipping the disposition to `attachment` (audit warning W-2).
+    let content_type = if start == 0 {
+        detect_content_type(&slice)
+    } else {
+        match ipfs.get_range(cid, 0, 16).await {
+            Ok(head) => detect_content_type(&head),
+            Err(e) => {
+                tracing::warn!(cid = %cid, error = %e, "sniff prefix fetch failed");
+                return (StatusCode::BAD_GATEWAY, "sniff fetch failed").into_response();
+            }
+        }
+    };
+    let disposition = media_content_disposition(&content_type, cid);
+    let content_length = slice.len() as u64;
+    let headers = [
+        (header::CONTENT_TYPE, content_type),
+        (header::ACCEPT_RANGES, "bytes".to_string()),
+        (header::VARY, "Range".to_string()),
+        (header::ETAG, etag),
+        (header::CACHE_CONTROL, cache_control.to_string()),
+        (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+        (header::CONTENT_DISPOSITION, disposition),
+        (
+            header::CONTENT_RANGE,
+            format!("bytes {}-{}/{}", start, end, total),
+        ),
+        (header::CONTENT_LENGTH, content_length.to_string()),
+    ];
+    if is_head {
+        (StatusCode::PARTIAL_CONTENT, headers).into_response()
+    } else {
+        (StatusCode::PARTIAL_CONTENT, headers, slice).into_response()
     }
 }
 
@@ -4326,5 +4565,96 @@ mod media_tests {
         assert_eq!(detect_content_type(b"\x89"), "application/octet-stream");
         assert_eq!(detect_content_type(b"\xFF\xD8"), "application/octet-stream");
         assert_eq!(detect_content_type(b"GIF"), "application/octet-stream");
+    }
+
+    // --- media_content_disposition (v0.39 allowlist) ---
+    //
+    // The pre-audit policy was a BLACKLIST: anything not
+    // `application/octet-stream` was returned `inline`. Audit warning
+    // W-4 (security) — if a future detector added `text/html`,
+    // `image/svg+xml`, or similar to the recognized list, the policy
+    // would auto-flip them to `inline` and create stored-XSS surface
+    // at the media origin. The v0.39 policy is an ALLOWLIST: only the
+    // explicit media-rendering prefixes are inline; everything else
+    // (including hypothetical future text/html, svg, xml) is forced
+    // to `attachment`. These tests lock the allowlist.
+
+    use super::media_content_disposition;
+
+    #[test]
+    fn disposition_image_is_inline() {
+        let d = media_content_disposition("image/png", "bafy123");
+        assert_eq!(d, "inline; filename=\"bafy123\"");
+        let d = media_content_disposition("image/jpeg", "bafy123");
+        assert!(d.starts_with("inline;"));
+        let d = media_content_disposition("image/webp", "bafy123");
+        assert!(d.starts_with("inline;"));
+    }
+
+    #[test]
+    fn disposition_video_is_inline() {
+        assert!(media_content_disposition("video/mp4", "bafy123").starts_with("inline;"));
+        assert!(media_content_disposition("video/webm", "bafy123").starts_with("inline;"));
+        assert!(media_content_disposition("video/ogg", "bafy123").starts_with("inline;"));
+        assert!(
+            media_content_disposition("video/x-msvideo", "bafy123").starts_with("inline;")
+        );
+    }
+
+    #[test]
+    fn disposition_audio_is_inline() {
+        assert!(media_content_disposition("audio/mpeg", "bafy123").starts_with("inline;"));
+        assert!(media_content_disposition("audio/wav", "bafy123").starts_with("inline;"));
+        assert!(media_content_disposition("audio/flac", "bafy123").starts_with("inline;"));
+    }
+
+    #[test]
+    fn disposition_pdf_is_inline() {
+        assert!(
+            media_content_disposition("application/pdf", "bafy123").starts_with("inline;")
+        );
+    }
+
+    #[test]
+    fn disposition_octet_stream_is_attachment() {
+        let d = media_content_disposition("application/octet-stream", "bafy123");
+        assert_eq!(d, "attachment; filename=\"bafy123\"");
+    }
+
+    #[test]
+    fn disposition_unrecognized_is_attachment() {
+        // The CORE security guarantee of the allowlist: any future
+        // detector addition that isn't an explicit media type gets
+        // `attachment` automatically. These all SHOULD be `attachment`,
+        // not `inline`.
+        assert!(
+            media_content_disposition("text/html", "bafy123").starts_with("attachment;")
+        );
+        assert!(
+            media_content_disposition("text/plain", "bafy123").starts_with("attachment;")
+        );
+        assert!(
+            media_content_disposition("image/svg+xml", "bafy123").starts_with("attachment;")
+        );
+        assert!(
+            media_content_disposition("application/xml", "bafy123").starts_with("attachment;")
+        );
+        assert!(
+            media_content_disposition("application/javascript", "bafy123")
+                .starts_with("attachment;")
+        );
+        assert!(
+            media_content_disposition("application/zip", "bafy123").starts_with("attachment;")
+        );
+    }
+
+    #[test]
+    fn disposition_uses_cid_as_filename() {
+        // The CID-as-filename is intentional — original upload
+        // filenames are not stored at the IPFS layer. CIDs are
+        // base32-alphanumeric per `validate_cid`, so embedding them
+        // in a quoted-string is safe without escaping.
+        let d = media_content_disposition("image/png", "bafkrei123abc");
+        assert!(d.contains("filename=\"bafkrei123abc\""));
     }
 }

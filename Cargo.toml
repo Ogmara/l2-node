@@ -1,6 +1,6 @@
 [package]
 name = "ogmara-node"
-version = "0.38.0"
+version = "0.39.0"
 edition = "2021"
 authors = ["Ogmara Contributors"]
 license = "MIT"
@@ -79,6 +79,7 @@ bytes = "1.11"
 dashmap = "6.1"
 bs58 = "0.5"
 zstd = "0.13"                # Snapshot chunk compression (spec 11-snapshot-sync.md)
+moka = { version = "0.12", features = ["future"] }  # Bounded LRU for hot media (spec 4.1 §media)
 
 [dev-dependencies]
 tokio = { version = "1.50", features = ["test-util", "macros"] }

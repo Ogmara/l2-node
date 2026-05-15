@@ -5,6 +5,133 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.39.0] - 2026-05-15
+
+### Fixed
+- **Memory-amplification DoS vector on `/api/v1/media/:cid` closed.**
+  v0.38 added Range support but still buffered the full IPFS blob on
+  every request and had no concurrency cap. A botnet issuing rolling
+  Range requests against a 50 MB asset could trivially push the node
+  past memory exhaustion (200 clients × 50 MB ≈ 10 GB transient RSS).
+  v0.39 lands the three-part fix the v0.38 CHANGELOG tracked:
+  - **Streaming IPFS reads** via the new `IpfsClient::get_range(cid,
+    offset, length)` method (Kubo `cat?offset=&length=`). Range
+    requests against files larger than `MEDIA_CACHE_ITEM_BYTES` (16 MB)
+    fetch ONLY the requested bytes — no full-blob buffering ever.
+  - **Bounded LRU cache for hot media** (`moka::future::Cache`).
+    Capped at `MEDIA_CACHE_TOTAL_BYTES` (256 MB total, weighted by
+    item size) and per-item at `MEDIA_CACHE_ITEM_BYTES` (16 MB).
+    Hot small items (thumbnails, frequently-viewed images) serve
+    from memory; large items always stream from IPFS.
+  - **Semaphore on concurrent media handlers**
+    (`MEDIA_HANDLER_PERMITS` = 32). Further requests queue rather
+    than spawning unbounded fetch + slice tasks. Combined with the
+    per-fetch `max_upload_bytes`, peak transient RSS is now bounded
+    at roughly `permits × max_upload`.
+
+### Added
+- **`HEAD /api/v1/media/:cid` handler** (RFC 9110 §9.3.2). Same
+  headers as GET, empty body. Players probing for `Accept-Ranges`
+  no longer need to issue a full GET; cache-fresh clients can
+  re-validate with `If-None-Match` against the ETag in a single
+  HEAD round-trip. Mitigates the memory amplification further by
+  not requiring any IPFS body fetch for probe-only traffic.
+- **`Content-Disposition` header on every media response.**
+  - `inline; filename="<cid>"` for known media types — browser
+    renders inline in `<img>`, `<video>`, `<audio>`.
+  - `attachment; filename="<cid>"` for `application/octet-stream`
+    fallback — opaque blobs download rather than render. Hardens
+    against any future MIME-sniffing regression even though
+    `X-Content-Type-Options: nosniff` is already set.
+- **`IpfsClient::get_size(cid)`** — offline-only stat call
+  (`files/stat?offline=true`) returning the actual `Size` field.
+  Used by the media handler for both Range bounds validation and
+  cache-eligibility decisions before any bytes leave the IPFS node.
+- **`IpfsClient::exists_local(cid)`** — companion offline-only
+  existence probe used by the `If-None-Match` 304 short-circuit.
+  No DHT walks — an attacker probing fabricated CIDs can no longer
+  pin Kubo into network resolution.
+
+### Changed
+- **`IpfsClient::get()` now returns `bytes::Bytes` instead of
+  `Vec<u8>`.** Reference-counted, zero-copy share. Slicing for
+  Range responses no longer copies the underlying buffer; the
+  cache stores a single backing allocation that 200 OK, 206
+  Partial Content, and N concurrent readers all share.
+
+### Tuning constants
+Defined in `api/state.rs`, hardcoded for v0.39; promote to config
+in a future release if production tuning demands it:
+- `MEDIA_CACHE_TOTAL_BYTES = 256 MiB` — LRU total capacity
+- `MEDIA_CACHE_ITEM_BYTES  = 16 MiB`  — per-item cache threshold
+- `MEDIA_HANDLER_PERMITS   = 32`      — concurrent handlers
+
+### Migration notes
+- **No client-facing API changes.** Same endpoint, same response
+  shape, same headers (now with `Content-Disposition` added).
+- **Apache config from v0.38 still required** — the no-gzip
+  directive for `/api/v1/media/` remains essential for Range
+  semantics. The v0.38 rate-limit recommendation can be relaxed
+  now that the in-node semaphore caps concurrency at 32, but
+  keeping it doesn't hurt.
+
+### Tests
+Existing 34 `media_tests` plus 7 new `disposition_*` tests
+covering the inline allowlist policy (41 total). The allowlist
+tests are the load-bearing security regression — they lock
+`image/svg+xml`, `text/html`, `application/javascript`, and
+related dangerous types to `attachment`, preventing any future
+detector addition from inadvertently promoting them to inline.
+
+### Security hardening (audit-driven)
+This release also addresses every actionable finding from the
+v0.39 code + security audit pass:
+
+- **CumulativeSize bug fixed.** `get_size` now calls
+  `files/stat?offline=true` and returns the actual `Size` field,
+  not `CumulativeSize`. The pre-fix path would emit
+  `Content-Range: bytes start-end/<inflated-total>` with a body
+  shorter than `end-start+1` — clients saw stalled or corrupt
+  responses (audit critical C-1 security, warning W-3 code).
+- **`If-None-Match` 304 short-circuit runs BEFORE the semaphore
+  AND uses offline-only existence checks** (audit warnings W-1
+  code / W-3 security). Pre-fix, a CDN periodically revalidating
+  could saturate all 32 permits while making cheap probes that
+  should not have required them; and an attacker spamming
+  fabricated CIDs could pin Kubo into DHT walks. Both closed.
+- **`media_cache` value now `CachedMedia { bytes, content_type }`**
+  — cache hits skip both the IPFS fetch AND the
+  `detect_content_type` re-sniff. The stream-range path's
+  separate sniff fetch is unchanged but no longer affects cache
+  hits (audit notes #5 code, N-2 security).
+- **Cache-fill coalesced via `try_get_with`.** Concurrent cold-
+  cache requests for the same CID now share a single IPFS fetch
+  rather than each issuing their own (audit note N-4 security).
+- **HEAD responses use the `(status, headers)` tuple form** (no
+  body in tuple), guaranteeing the user-set `Content-Length`
+  header is the only one emitted — no double-Content-Length
+  smuggling risk (audit warning W-5 security).
+- **`Content-Disposition` inline policy inverted from blacklist
+  to allowlist** (audit warning W-4 security). The previous
+  policy (anything-not-octet-stream → inline) would have
+  auto-inlined any future detector addition; the new policy is
+  an explicit MIME enumeration that requires opt-in for new
+  types. Notably `image/svg+xml` is NOT inline — SVG's
+  `<script>` execution would otherwise be a stored-XSS vector.
+- **Stream-range slice length validated against requested
+  length** — if Kubo returns a truncated range (e.g. due to an
+  inflated stat), we respond with 502 Bad Gateway rather than
+  200 + bogus `Content-Range` (audit critical C-1 security).
+- **Sniff prefix fetch failure surfaces as 502** rather than
+  silently flipping the disposition to `attachment` and breaking
+  inline `<video>` playback for an otherwise-valid file (audit
+  warning W-2 code).
+- **`get_size` response capped at 8 KiB** to bound parser memory
+  (audit note #6 code).
+- **`exists_local` (offline-only stat) added to `IpfsClient`** as
+  the building block for the safe-existence-probe path used in
+  the 304 short-circuit.
+
 ## [0.38.0] - 2026-05-15
 
 ### Fixed
