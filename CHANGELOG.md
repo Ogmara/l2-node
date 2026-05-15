@@ -5,6 +5,45 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.37.0] - 2026-05-15
+
+### Fixed
+- **Edits no longer destroy title, tags, attachments, or mentions on read.**
+  Before this release `enrich_message_json` replaced the entire `payload`
+  field with the edit's content string whenever a message was edited. For
+  news posts that meant the title, tags, and attachments vanished from
+  every subsequent read; for chat messages, attachments and mentions
+  vanished too. The projection now decodes the original payload by
+  `msg_type`, applies the edit's `content` plus any field-level overrides
+  (`title`, `tags`, `attachments`) on top, and re-encodes as msgpack
+  bytes — so clients see the same payload shape whether or not a message
+  has been edited. Old envelopes without overrides still work: missing
+  fields fall back to the original post's values.
+
+### Added
+- **Optional field-level overrides on `EditPayload` (spec §3.7).** The
+  struct now carries `title: Option<String>`, `tags: Option<Vec<String>>`,
+  and `attachments: Option<Vec<Attachment>>` in trailing positions with
+  `#[serde(default)]`. msgpack wire-compat with pre-0.37 4-element edit
+  envelopes is preserved — a dedicated test
+  (`edit_payload_decodes_legacy_four_field_msgpack`) guards the
+  contract. Validation caps mirror `validate_news_post`:
+  `MAX_NEWS_TITLE`, `MAX_NEWS_TAGS` (+ `MAX_TAG_LENGTH` per tag),
+  `MAX_ATTACHMENTS`. Per-type rules:
+  - `NewsEdit` — all three fields applicable.
+  - `ChatEdit` — only `attachments` accepted; `title`/`tags` rejected at
+    validation so a misconfigured client fails loudly instead of
+    silently being ignored.
+  - `DirectMessageEdit` — all field overrides rejected (encrypted
+    ciphertext blobs have no field-level shape from the server's view).
+
+### Security
+- Edit validation now enforces the same caps as the original post on any
+  override fields a client supplies, closing a small inconsistency where
+  a client could resend an arbitrarily large title in an edit envelope
+  (the field was previously decoded but never validated, since the
+  struct didn't carry it).
+
 ## [0.36.1] - 2026-05-14
 
 ### Fixed
