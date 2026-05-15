@@ -676,7 +676,17 @@ impl Node {
                 .saturating_mul(1024 * 1024),
             handler_permits: self.config.ipfs.media_handler_permits,
             per_ip_permits: self.config.ipfs.media_per_ip_permits,
+            max_tracked_ips: self.config.ipfs.media_max_tracked_ips,
         };
+        // Build trusted-proxy set (v0.42). Config-load already
+        // validated parseability; `expect` is safe because the
+        // validate() pass would have aborted startup on any bad entry.
+        let trusted_proxies = Arc::new(
+            crate::trusted_proxies::TrustedProxies::from_strings(
+                &self.config.api.trusted_proxies,
+            )
+            .expect("trusted_proxies validated at config load"),
+        );
         let app_state = Arc::new(crate::api::state::AppState::with_broadcast(
             self.storage.clone(),
             api_router,
@@ -700,6 +710,7 @@ impl Node {
             node_address,
             snapshot_cache.clone(),
             media_tuning,
+            trusted_proxies,
         ));
         // Background sweep: drop zero-counter entries from the per-IP
         // media limiter (v0.41). Without this, the DashMap accumulates

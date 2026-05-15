@@ -5,6 +5,106 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.42.0] - 2026-05-15
+
+### Added
+
+- **DashMap overflow cap on the per-IP media limiter.**
+  Closes a memory-exhaustion vector flagged after v0.41: between the
+  5-minute background sweeps, an attacker rotating through millions
+  of source /24s could inflate the `DashMap<IpAddr, Arc<AtomicUsize>>`
+  to hundreds of MB (each /24 bucket left a zero-counter entry after
+  its fast-rejected acquire). v0.42 adds a hard cap on the tracked-IP
+  map; on overflow the limiter runs an opportunistic inline sweep, and
+  if still full, new (untracked) buckets get **`503 Service Unavailable`
+  + `Retry-After: 300`**. Existing buckets continue to be served
+  normally — legitimate clients are never displaced by an unrelated
+  flood.
+- **`IpfsConfig::media_max_tracked_ips`** — new tunable, default
+  `65,536` (≈ 10 MiB resident at worst-case fill). HARD reject zero
+  (would 503 every new client); HARD reject ceilings above 16M
+  entries (≈ 2.4 GiB resident — clearly a typo).
+- **`RejectReason::CapacityExceeded`** variant on `PerIpSemaphore`,
+  mapped to 503 + Retry-After in the media handler.
+- **`api.trusted_proxies` config field** — list of CIDRs/IPs trusted
+  to forward client identity in `Forwarded` / `X-Forwarded-For`
+  headers. Loopback (127.0.0.0/8, ::1) remains implicitly trusted;
+  add CDN/edge ranges here for multi-hop CDN deployments.
+- **RFC 7239 `Forwarded` header support** alongside `X-Forwarded-For`.
+  Preferred over XFF when present (more precise; supports
+  bracketed IPv6 + port + obfuscated identifiers per RFC).
+- **Right-to-left trust walk** for chain resolution
+  (`src/trusted_proxies.rs`). Matches the standard pattern in
+  Nginx `ngx_http_realip_module` and Apache `mod_remoteip`: walk
+  the forwarding chain from rightmost to leftmost, skipping
+  trusted-proxy entries; the first untrusted address is the real
+  client (or closest unspoofable intermediate). Strictly more
+  secure than the v0.41 leftmost-trust scheme — a malicious
+  intermediate can no longer fabricate the leftmost entry to
+  impersonate any IP.
+- **`If-Range: <HTTP-date>` form** on the media endpoint, alongside
+  the existing ETag form (RFC 7233 §3.2). Matched at second
+  resolution against the cache entry's `last_modified` timestamp.
+  Clients that resume a partial download by date (rather than ETag)
+  now get a proper 206 instead of falling back to a full 200.
+- **`Last-Modified` header** on cached media responses. Records
+  when the node first cached the CID. CIDs are content-addressed
+  (immutable), so on cache eviction + re-fetch the value updates
+  — clients that see a different `Last-Modified` after eviction
+  fall back to a fresh 200 (correct per RFC 7233 §3.2).
+- **`httpdate` dependency** (v1.0) for RFC 7231 HTTP-date
+  parsing/formatting.
+
+### Changed
+
+- **Client-IP resolution semantics changed from leftmost-trust to
+  rightmost-untrusted-walk.** With the default empty `trusted_proxies`,
+  a multi-hop `X-Forwarded-For: client, proxy1, proxy2` now resolves
+  to the rightmost untrusted entry (`proxy2`) rather than the leftmost
+  alleged client. This is a security fix: pre-v0.42, a malicious
+  intermediate could forge any leftmost IP and bypass per-IP rate
+  limiting / media permits.
+
+  **Operators with multi-hop CDN setups must add their CDN/edge IPs
+  to `api.trusted_proxies` to recover the original-client resolution.**
+  Single-Apache-on-loopback deployments are unaffected because the
+  chain has only one entry.
+
+- **`CachedMedia` struct** gained a `last_modified: SystemTime` field.
+  Set on cache fill; consumed by `serve_from_cached` for `Last-Modified`
+  emission + `If-Range` date matching.
+- **`serve_from_cached` signature** now takes the full request
+  `HeaderMap` instead of a pre-computed `Option<&str>` range value,
+  since `If-Range` matching must run against the cache entry's
+  `last_modified` (which the caller doesn't know).
+- **`resolve_client_ip` moved to `crate::trusted_proxies`** (top-level
+  module) so `config.rs` can call its parse-validate from both bin
+  and lib compilation contexts. The `routes.rs` wrapper is now a
+  thin extractor that reads `Forwarded` + `X-Forwarded-For` from
+  the `HeaderMap` and forwards to the canonical resolver.
+
+### Security
+
+- The leftmost-trust → rightmost-untrusted-walk change closes a
+  forgery vector that was present (but unexploitable in the
+  single-proxy default deployment) since v0.41 introduced XFF trust.
+  Multi-hop and CDN-fronted deployments are now strictly safer.
+- DashMap overflow cap caps the worst-case resident memory of the
+  per-IP limiter at roughly `max_tracked_ips × ~150 bytes` regardless
+  of attack traffic. With defaults that's ≈ 10 MiB.
+- `Forwarded` parsing follows RFC 7239 strictly: obfuscated
+  identifiers (`_abc123`) and the literal `unknown` are silently
+  skipped, not honored as IP claims.
+
+### Notes
+
+- `admin_auth.rs` retains its own loopback-only XFF trust; it does
+  NOT consult `api.trusted_proxies`. Aligning the two trust surfaces
+  is tracked for a follow-up release. Admin endpoints are
+  loopback-restricted by default, so the divergence is not a
+  current attack surface — but operators running admin auth from
+  off-host shouldn't expect `trusted_proxies` to apply there yet.
+
 ## [0.41.0] - 2026-05-15
 
 ### Added

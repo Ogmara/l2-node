@@ -2708,18 +2708,20 @@ pub async fn get_media(
         }
     }
 
-    // ----- Per-IP + global limiter (v0.41) -------------------------
+    // ----- Per-IP + global limiter (v0.41, v0.42 trust model) ------
     // Resolve the real client IP, then acquire one per-IP slot AND
     // one global slot. Per-IP cap exhaustion returns 429 fast (no
-    // global queue cost paid); global exhaustion queues FIFO.
+    // global queue cost paid); global exhaustion queues FIFO;
+    // tracked-IP-map overflow returns 503 (v0.42).
     //
-    // IP resolution rules (mirrors `admin_auth.rs`):
-    //   * TCP peer is loopback  → trust the X-Forwarded-For header
-    //     (proxy fronting us). First entry is the original client.
-    //   * TCP peer is non-loopback → use the peer directly.
-    //     X-Forwarded-For would be self-set by a remote attacker
-    //     and must be ignored.
-    let client_ip = resolve_client_ip(peer_addr, &headers);
+    // IP resolution rules (v0.42 — see `crate::trusted_proxies`):
+    //   * TCP peer is loopback OR in `api.trusted_proxies` →
+    //     consult `Forwarded` / `X-Forwarded-For` headers, walking
+    //     the forwarding chain right-to-left and skipping trusted
+    //     entries. The first untrusted address is the real client.
+    //   * Otherwise → use the peer directly; headers are
+    //     attacker-controlled and ignored.
+    let client_ip = resolve_client_ip(peer_addr, &headers, &state.trusted_proxies);
     let _permit = match state.media_limiter.acquire(client_ip).await {
         Ok(p) => p,
         Err(crate::api::media_limiter::RejectReason::PerIpExceeded) => {
@@ -2745,27 +2747,27 @@ pub async fn get_media(
             return (StatusCode::SERVICE_UNAVAILABLE, "shutting down")
                 .into_response();
         }
-    };
-
-    // `Range` is only honored when `If-Range` (if present) matches
-    // the current ETag. Per RFC 7233 §3.2: clients use `If-Range` to
-    // resume a partial download — they hold a stale slice and want
-    // a 206 if the resource hasn't changed, or the full 200 if it
-    // has. CIDs are content-addressed (the bytes never change), so
-    // ETag match is just CID match; on mismatch we drop the Range
-    // and serve the full body so the client can rebuild from scratch.
-    let if_range_matches = headers
-        .get(header::IF_RANGE)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v == etag)
-        .unwrap_or(true); // No If-Range header → Range is honored unconditionally.
-    let range_value = if if_range_matches {
-        headers
-            .get(header::RANGE)
-            .and_then(|v| v.to_str().ok())
-            .map(|v| v.to_string())
-    } else {
-        None
+        Err(crate::api::media_limiter::RejectReason::CapacityExceeded) => {
+            // v0.42: the per-IP tracking map hit its hard cap and the
+            // inline sweep couldn't free a slot. Tell the client to
+            // back off — Retry-After is set to the background sweep
+            // interval (5 min) so an honest client polling on this
+            // CID resumes after the next cleanup. The 503 also tells
+            // CDNs not to cache this response. Operationally this
+            // path only fires under an adversarial /24-rotation flood.
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [
+                    (header::RETRY_AFTER, "300".to_string()),
+                    (
+                        header::CONTENT_TYPE,
+                        "text/plain; charset=utf-8".to_string(),
+                    ),
+                ],
+                "media subsystem at capacity; retry shortly",
+            )
+                .into_response();
+        }
     };
 
     // ----- Cache hit fast path --------------------------------------
@@ -2776,7 +2778,7 @@ pub async fn get_media(
             etag,
             cache_control,
             &cid,
-            range_value.as_deref(),
+            &headers,
         );
     }
 
@@ -2793,7 +2795,14 @@ pub async fn get_media(
         }
     };
 
-    // Stream-range path: large file + Range. No full buffer.
+    // Stream-range path: large file + Range. No full buffer. The
+    // streamed path has no stored `last_modified` (we don't store
+    // anything for uncached blobs), so `If-Range` is matched by
+    // ETag only — an `If-Range: <date>` against the streamed path
+    // never matches and the Range is dropped, which then falls
+    // through to the full-fetch cacheable path below (or the file
+    // is too large to cache and we serve a 200 of the whole thing).
+    let range_value = determine_range(&headers, &etag, None);
     if let Some(ref range_str) = range_value {
         if total > state.media_cache_item_bytes as u64 {
             return serve_range_streamed(
@@ -2816,7 +2825,11 @@ pub async fn get_media(
         let init = async {
             let bytes = ipfs.get(&cid_for_fetch).await?;
             let content_type = detect_content_type(&bytes).to_string();
-            Ok::<_, anyhow::Error>(CachedMedia { bytes, content_type })
+            Ok::<_, anyhow::Error>(CachedMedia {
+                bytes,
+                content_type,
+                last_modified: std::time::SystemTime::now(),
+            })
         };
         match state
             .media_cache
@@ -2834,7 +2847,11 @@ pub async fn get_media(
         match ipfs.get(&cid).await {
             Ok(bytes) => {
                 let content_type = detect_content_type(&bytes).to_string();
-                CachedMedia { bytes, content_type }
+                CachedMedia {
+                    bytes,
+                    content_type,
+                    last_modified: std::time::SystemTime::now(),
+                }
             }
             Err(e) => {
                 tracing::warn!(cid = %cid, error = %e, "IPFS retrieval failed");
@@ -2849,7 +2866,7 @@ pub async fn get_media(
         etag,
         cache_control,
         &cid,
-        range_value.as_deref(),
+        &headers,
     )
 }
 
@@ -2905,54 +2922,24 @@ fn media_content_disposition(content_type: &str, cid: &str) -> String {
     }
 }
 
-/// Resolve the real client IP for the per-IP media limiter (v0.41).
+/// Resolve the real client IP for the per-IP media limiter.
 ///
-/// When the TCP peer is loopback we are clearly behind a local
-/// reverse proxy (Apache, nginx, etc.); the proxy sets
-/// `X-Forwarded-For` with the original client IP and we trust it.
-/// When the TCP peer is non-loopback, the request came directly to
-/// our port and any `X-Forwarded-For` header is attacker-controlled
-/// — we ignore it and use the peer.
-///
-/// The X-Forwarded-For value may be a comma-separated chain
-/// (`client, proxy1, proxy2`); the leftmost entry is the original
-/// client. We take the first parseable IP, fall back to the peer
-/// on any parse failure.
-///
-/// This mirrors the pattern used by `admin_auth_middleware` so the
-/// security boundary is identical across the two trust-the-proxy
-/// surfaces.
-fn resolve_client_ip(peer: std::net::SocketAddr, headers: &axum::http::HeaderMap) -> std::net::IpAddr {
-    let peer_ip = peer.ip();
-    if !is_loopback_canonical(peer_ip) {
-        return peer_ip;
-    }
-    headers
+/// v0.41 introduced loopback-only XFF trust; v0.42 generalizes this
+/// to configurable trusted_proxies + RFC 7239 Forwarded support +
+/// rightmost-untrusted-walk for chain resolution. See
+/// `crate::trusted_proxies` for the security rationale.
+fn resolve_client_ip(
+    peer: std::net::SocketAddr,
+    headers: &axum::http::HeaderMap,
+    trusted_proxies: &crate::trusted_proxies::TrustedProxies,
+) -> std::net::IpAddr {
+    let forwarded = headers
+        .get("forwarded")
+        .and_then(|v| v.to_str().ok());
+    let xff = headers
         .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(',').next())
-        .map(str::trim)
-        .and_then(|s| s.parse::<std::net::IpAddr>().ok())
-        .unwrap_or(peer_ip)
-}
-
-/// Loopback detection that handles the IPv4-mapped IPv6 form
-/// (`::ffff:127.0.0.1`).
-///
-/// On dual-stack Linux listeners bound to `::`, incoming IPv4
-/// connections arrive as `::ffff:a.b.c.d` rather than as native
-/// IPv4. `IpAddr::is_loopback` returns `false` for that form even
-/// though the underlying IPv4 IS loopback — so a same-host Apache
-/// talking to a v6-bound node would have XFF silently ignored.
-/// This helper canonicalizes through `to_ipv4_mapped` first.
-fn is_loopback_canonical(ip: std::net::IpAddr) -> bool {
-    match ip {
-        std::net::IpAddr::V4(v4) => v4.is_loopback(),
-        std::net::IpAddr::V6(v6) => v6
-            .to_ipv4_mapped()
-            .map(|v4| v4.is_loopback())
-            .unwrap_or_else(|| v6.is_loopback()),
-    }
+        .and_then(|v| v.to_str().ok());
+    crate::trusted_proxies::resolve_client_ip(peer, forwarded, xff, trusted_proxies)
 }
 
 /// 304 Not Modified response. Used by the If-None-Match short-circuit.
@@ -2983,18 +2970,28 @@ fn build_416(total: u64) -> axum::response::Response {
 /// Serve a media body from a fully-buffered `CachedMedia` (cache hit
 /// OR just-fetched small file). Handles 200 / 206 / 416 selection
 /// based on the Range header; elides the body for HEAD requests.
+///
+/// `If-Range` matching is performed here (v0.42) because the cache
+/// owns `last_modified`, which the HTTP-date form of `If-Range`
+/// needs to compare against.
 fn serve_from_cached(
     is_head: bool,
     cached: CachedMedia,
     etag: String,
     cache_control: &'static str,
     cid: &str,
-    range_value: Option<&str>,
+    headers_in: &axum::http::HeaderMap,
 ) -> axum::response::Response {
-    let CachedMedia { bytes, content_type } = cached;
+    let CachedMedia { bytes, content_type, last_modified } = cached;
     let total = bytes.len() as u64;
     let disposition = media_content_disposition(&content_type, cid);
+    // RFC 7231 §7.1.1.2: Last-Modified is HTTP-date format.
+    let last_modified_str = httpdate::fmt_http_date(last_modified);
 
+    // If-Range matching uses the cached `last_modified` so the
+    // HTTP-date form is honored — see `match_if_range` for the
+    // ETag-first, date-fallback semantics.
+    let range_value = determine_range(headers_in, &etag, Some(last_modified));
     let range_str = match range_value {
         None => {
             // 200 OK. HEAD uses the `(status, headers)` tuple form
@@ -3007,6 +3004,7 @@ fn serve_from_cached(
                 (header::ACCEPT_RANGES, "bytes".to_string()),
                 (header::VARY, "Range".to_string()),
                 (header::ETAG, etag),
+                (header::LAST_MODIFIED, last_modified_str),
                 (header::CACHE_CONTROL, cache_control.to_string()),
                 (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
                 (header::CONTENT_DISPOSITION, disposition),
@@ -3021,7 +3019,7 @@ fn serve_from_cached(
         Some(s) => s,
     };
 
-    let (start, end) = match parse_byte_range(range_str, total) {
+    let (start, end) = match parse_byte_range(&range_str, total) {
         Some(r) => r,
         None => return build_416(total),
     };
@@ -3042,6 +3040,7 @@ fn serve_from_cached(
         (header::ACCEPT_RANGES, "bytes".to_string()),
         (header::VARY, "Range".to_string()),
         (header::ETAG, etag),
+        (header::LAST_MODIFIED, last_modified_str),
         (header::CACHE_CONTROL, cache_control.to_string()),
         (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
         (header::CONTENT_DISPOSITION, disposition),
@@ -3056,6 +3055,72 @@ fn serve_from_cached(
     } else {
         (StatusCode::PARTIAL_CONTENT, headers, slice).into_response()
     }
+}
+
+/// Check whether a request's `If-Range` header (if any) authorizes
+/// serving a 206 partial response. Per RFC 7233 §3.2:
+///
+///   * **No `If-Range`** → unconditionally honor any `Range`.
+///   * **`If-Range: "<etag>"`** → match against the resource ETag;
+///     on match honor Range, otherwise serve full 200.
+///   * **`If-Range: <HTTP-date>`** → match against the resource's
+///     `Last-Modified` (if any) with second-level resolution; same
+///     on/off semantics.
+///
+/// `last_modified` is `None` when the caller is on a path that has
+/// no stored timestamp (the stream-range path for uncached large
+/// files). In that case the date form is treated as "no match" —
+/// safe default, the client just won't get a 206 from a date-form
+/// `If-Range` for uncached streams. They WILL still get a 206 from
+/// an ETag-form `If-Range` because CIDs are immutable.
+fn match_if_range(
+    headers: &axum::http::HeaderMap,
+    etag: &str,
+    last_modified: Option<std::time::SystemTime>,
+) -> bool {
+    let value = match headers.get(header::IF_RANGE).and_then(|v| v.to_str().ok()) {
+        Some(v) if !v.is_empty() => v,
+        _ => return true, // No If-Range → Range honored unconditionally.
+    };
+    // ETag form: literal comparison against our ETag. RFC 7233
+    // §3.2 requires *strong* comparison for If-Range; our ETag is
+    // always strong (no `W/` prefix — see `etag` construction in
+    // `get_media`), so bitwise equality IS the strong form. A
+    // client that sends `If-Range: W/"<cid>"` (e.g. a CDN that
+    // rewrites strong to weak) will correctly fail to match here
+    // and fall back to a full 200 — RFC-compliant.
+    if value == etag {
+        return true;
+    }
+    // HTTP-date form: parse and compare against last_modified at
+    // second resolution. RFC 7233 requires an *exact* validator
+    // match (no "newer-than" semantics here).
+    if let Some(lm) = last_modified {
+        if let Ok(parsed) = httpdate::parse_http_date(value) {
+            let lm_secs = lm.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs());
+            let in_secs = parsed.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs());
+            return lm_secs.is_some() && lm_secs == in_secs;
+        }
+    }
+    false
+}
+
+/// Determine the effective `Range` header value after applying any
+/// `If-Range` precondition. Returns `Some(range)` when the Range
+/// should be honored, `None` when it should be ignored (either
+/// because no Range was sent, or because If-Range invalidated it).
+fn determine_range(
+    headers: &axum::http::HeaderMap,
+    etag: &str,
+    last_modified: Option<std::time::SystemTime>,
+) -> Option<String> {
+    if !match_if_range(headers, etag, last_modified) {
+        return None;
+    }
+    headers
+        .get(header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_string())
 }
 
 /// Stream-range path: large uncached file + Range request. Fetches
@@ -4765,7 +4830,7 @@ mod media_tests {
     // Same pattern applies to the Partial Content branch (Range +
     // HEAD) — locked separately below.
 
-    use super::{serve_from_cached, CachedMedia};
+    use super::{match_if_range, serve_from_cached, CachedMedia};
     use axum::body::to_bytes;
     use bytes::Bytes;
 
@@ -4773,7 +4838,22 @@ mod media_tests {
         CachedMedia {
             bytes: Bytes::copy_from_slice(payload),
             content_type: ct.to_string(),
+            // Use a fixed historical timestamp so the
+            // httpdate-formatted Last-Modified is deterministic in
+            // assertions (no flakes from `SystemTime::now`).
+            last_modified: std::time::UNIX_EPOCH
+                + std::time::Duration::from_secs(1_700_000_000),
         }
+    }
+
+    fn empty_headers() -> axum::http::HeaderMap {
+        axum::http::HeaderMap::new()
+    }
+
+    fn headers_with_range(value: &str) -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("range", value.parse().unwrap());
+        h
     }
 
     #[tokio::test]
@@ -4785,7 +4865,7 @@ mod media_tests {
             "\"cid123\"".to_string(),
             "public, max-age=31536000, immutable",
             "cid123",
-            /* range */ None,
+            &empty_headers(),
         );
         assert_eq!(resp.status(), 200);
         let cl_count = resp
@@ -4801,6 +4881,11 @@ mod media_tests {
             .to_str()
             .unwrap();
         assert_eq!(cl, "11", "CL must reflect would-be GET body size");
+        // v0.42: Last-Modified must be present.
+        assert!(
+            resp.headers().get(axum::http::header::LAST_MODIFIED).is_some(),
+            "Last-Modified must be emitted on cached 200 responses",
+        );
         // Body must be empty for HEAD.
         let body_bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
         assert!(body_bytes.is_empty(), "HEAD response body must be empty");
@@ -4815,7 +4900,7 @@ mod media_tests {
             "\"cid123\"".to_string(),
             "public, max-age=31536000, immutable",
             "cid123",
-            Some("bytes=0-4"),
+            &headers_with_range("bytes=0-4"),
         );
         assert_eq!(resp.status(), 206);
         let cl_count = resp
@@ -4856,7 +4941,7 @@ mod media_tests {
             "\"cid\"".to_string(),
             "public, max-age=31536000, immutable",
             "cid",
-            None,
+            &empty_headers(),
         );
         assert_eq!(resp.status(), 200);
         let cl = resp
@@ -4879,7 +4964,7 @@ mod media_tests {
             "\"cid\"".to_string(),
             "public, max-age=31536000, immutable",
             "cid",
-            Some("bytes=6-10"),
+            &headers_with_range("bytes=6-10"),
         );
         assert_eq!(resp.status(), 206);
         let cr = resp
@@ -4893,15 +4978,153 @@ mod media_tests {
         assert_eq!(&body_bytes[..], b"world");
     }
 
-    // --- resolve_client_ip (v0.41 per-IP limiter) -------------------
+    // --- v0.42: Last-Modified + If-Range HTTP-date -------------------
+
+    #[tokio::test]
+    async fn cached_200_emits_last_modified_in_http_date_format() {
+        // The deterministic fixture timestamp is 2023-11-14 22:13:20 UTC.
+        let cached = make_cached(b"hello", "image/png");
+        let resp = serve_from_cached(
+            false,
+            cached,
+            "\"cid\"".to_string(),
+            "public, max-age=31536000, immutable",
+            "cid",
+            &empty_headers(),
+        );
+        let lm = resp
+            .headers()
+            .get(axum::http::header::LAST_MODIFIED)
+            .expect("Last-Modified emitted on cached 200")
+            .to_str()
+            .unwrap();
+        // RFC 7231 format: "Tue, 14 Nov 2023 22:13:20 GMT".
+        assert!(lm.ends_with("GMT"), "HTTP-date format ends with GMT: {}", lm);
+        assert!(lm.contains("2023"), "year present in fixture: {}", lm);
+    }
+
+    #[tokio::test]
+    async fn if_range_matching_etag_honors_range() {
+        let cached = make_cached(b"hello world", "image/png");
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("range", "bytes=0-4".parse().unwrap());
+        headers.insert("if-range", "\"cid\"".parse().unwrap());
+        let resp = serve_from_cached(
+            false,
+            cached,
+            "\"cid\"".to_string(),
+            "public, max-age=31536000, immutable",
+            "cid",
+            &headers,
+        );
+        // ETag matches → 206.
+        assert_eq!(resp.status(), 206);
+    }
+
+    #[tokio::test]
+    async fn if_range_mismatching_etag_drops_range_and_serves_full() {
+        let cached = make_cached(b"hello world", "image/png");
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("range", "bytes=0-4".parse().unwrap());
+        headers.insert("if-range", "\"different-cid\"".parse().unwrap());
+        let resp = serve_from_cached(
+            false,
+            cached,
+            "\"cid\"".to_string(),
+            "public, max-age=31536000, immutable",
+            "cid",
+            &headers,
+        );
+        // ETag doesn't match → fall back to 200 full body.
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn if_range_matching_http_date_honors_range() {
+        // Fixture last_modified = epoch + 1_700_000_000 secs.
+        let cached = make_cached(b"hello world", "image/png");
+        let date_str = httpdate::fmt_http_date(
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+        );
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("range", "bytes=0-4".parse().unwrap());
+        headers.insert("if-range", date_str.parse().unwrap());
+        let resp = serve_from_cached(
+            false,
+            cached,
+            "\"cid\"".to_string(),
+            "public, max-age=31536000, immutable",
+            "cid",
+            &headers,
+        );
+        assert_eq!(resp.status(), 206, "matching If-Range date honors Range");
+    }
+
+    #[tokio::test]
+    async fn if_range_mismatching_http_date_drops_range() {
+        let cached = make_cached(b"hello world", "image/png");
+        // Date one hour earlier than the fixture's last_modified.
+        let date_str = httpdate::fmt_http_date(
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000 - 3600),
+        );
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("range", "bytes=0-4".parse().unwrap());
+        headers.insert("if-range", date_str.parse().unwrap());
+        let resp = serve_from_cached(
+            false,
+            cached,
+            "\"cid\"".to_string(),
+            "public, max-age=31536000, immutable",
+            "cid",
+            &headers,
+        );
+        assert_eq!(resp.status(), 200, "stale date drops Range, serves full body");
+    }
+
+    #[test]
+    fn match_if_range_no_header_returns_true() {
+        // Baseline: absent If-Range means Range is unconditionally honored.
+        let headers = axum::http::HeaderMap::new();
+        assert!(match_if_range(&headers, "\"cid\"", None));
+    }
+
+    #[test]
+    fn match_if_range_etag_succeeds_without_last_modified() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("if-range", "\"cid\"".parse().unwrap());
+        // Streamed path: no last_modified available; ETag-form still works.
+        assert!(match_if_range(&headers, "\"cid\"", None));
+    }
+
+    #[test]
+    fn match_if_range_http_date_returns_false_without_last_modified() {
+        // Streamed path: no last_modified → date-form If-Range can't match.
+        let mut headers = axum::http::HeaderMap::new();
+        let date_str = httpdate::fmt_http_date(std::time::UNIX_EPOCH);
+        headers.insert("if-range", date_str.parse().unwrap());
+        assert!(!match_if_range(&headers, "\"cid\"", None));
+    }
+
+    #[test]
+    fn match_if_range_garbage_value_returns_false() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("if-range", "not-an-etag-or-date".parse().unwrap());
+        // Neither matches our ETag nor parses as a date → fail closed.
+        let lm = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        assert!(!match_if_range(&headers, "\"cid\"", Some(lm)));
+    }
+
+    // --- resolve_client_ip (v0.42 trusted_proxies integration) ------
     //
-    // Security boundary: trust `X-Forwarded-For` ONLY when the TCP
-    // peer is loopback (i.e. our reverse proxy on the same host
-    // forwarded the request). Trusting it from a non-loopback peer
-    // would let a remote attacker spoof their client IP and bypass
-    // per-IP rate limiting.
+    // Smoke tests at the routes.rs wrapper level — the underlying
+    // algorithm has exhaustive coverage in
+    // `crate::trusted_proxies::tests`. Tests here verify the wrapper
+    // correctly extracts the `Forwarded` + `X-Forwarded-For` headers
+    // and forwards them to the resolver with the right argument
+    // shape.
 
     use super::resolve_client_ip;
+    use crate::trusted_proxies::TrustedProxies;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     fn sock(ip: &str, port: u16) -> SocketAddr {
@@ -4914,52 +5137,65 @@ mod media_tests {
         h
     }
 
+    fn empty_proxies() -> TrustedProxies {
+        TrustedProxies::default()
+    }
+
     #[test]
     fn resolve_ip_uses_xff_when_peer_is_loopback() {
-        // Apache forwards the request; peer is 127.0.0.1, XFF carries
-        // the real client.
         let peer = sock("127.0.0.1", 50000);
         let headers = headers_with_xff("203.0.113.5");
         assert_eq!(
-            resolve_client_ip(peer, &headers),
+            resolve_client_ip(peer, &headers, &empty_proxies()),
             IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5))
         );
     }
 
     #[test]
-    fn resolve_ip_uses_first_xff_entry_on_proxy_chain() {
-        // Multi-hop XFF: `client, proxy1, proxy2`. First entry is
-        // the original client.
+    fn resolve_ip_multi_hop_returns_rightmost_untrusted() {
+        // v0.42 behaviour change: with no extra trusted_proxies, the
+        // walk stops at the rightmost untrusted entry (10.0.0.1 is
+        // NOT in the trust set by default — only loopback is). The
+        // earlier leftmost-trust behavior was unsafe in multi-proxy
+        // setups where intermediates could forge the leftmost entry.
+        // To recover the leftmost-original-client behavior, the
+        // operator adds the intermediate proxies to trusted_proxies.
         let peer = sock("127.0.0.1", 50000);
         let headers = headers_with_xff("198.51.100.7, 203.0.113.1, 10.0.0.1");
         assert_eq!(
-            resolve_client_ip(peer, &headers),
-            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7))
+            resolve_client_ip(peer, &headers, &empty_proxies()),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            "without trusted_proxies, the closest hop is the safest answer",
         );
     }
 
     #[test]
-    fn resolve_ip_trims_whitespace_in_xff() {
+    fn resolve_ip_multi_hop_with_trusted_intermediates_returns_client() {
+        // With every intermediate proxy in trusted_proxies, the walk
+        // converges on the original leftmost client.
         let peer = sock("127.0.0.1", 50000);
-        let headers = headers_with_xff("  198.51.100.7  , 10.0.0.1");
+        let headers = headers_with_xff("198.51.100.7, 203.0.113.1, 10.0.0.1");
+        let trusted = TrustedProxies::from_strings(&[
+            "10.0.0.0/8".to_string(),
+            "203.0.113.0/24".to_string(),
+        ])
+        .unwrap();
         assert_eq!(
-            resolve_client_ip(peer, &headers),
+            resolve_client_ip(peer, &headers, &trusted),
             IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7))
         );
     }
 
     #[test]
     fn resolve_ip_ignores_xff_when_peer_is_remote() {
-        // CRITICAL SECURITY: a non-loopback peer's XFF header is
-        // attacker-controlled and must be ignored. Without this,
-        // every remote client could spoof their IP to bypass the
-        // per-IP cap.
+        // CRITICAL SECURITY: a non-loopback, non-trusted peer's XFF
+        // header is attacker-controlled and must be ignored.
         let peer = sock("203.0.113.99", 50000);
         let headers = headers_with_xff("1.2.3.4");
         assert_eq!(
-            resolve_client_ip(peer, &headers),
+            resolve_client_ip(peer, &headers, &empty_proxies()),
             IpAddr::V4(Ipv4Addr::new(203, 0, 113, 99)),
-            "XFF from non-loopback peer must be ignored",
+            "XFF from non-loopback, non-trusted peer must be ignored",
         );
     }
 
@@ -4967,51 +5203,39 @@ mod media_tests {
     fn resolve_ip_falls_back_to_peer_when_no_xff() {
         let peer = sock("127.0.0.1", 50000);
         let headers = axum::http::HeaderMap::new();
-        assert_eq!(resolve_client_ip(peer, &headers), peer.ip());
+        assert_eq!(resolve_client_ip(peer, &headers, &empty_proxies()), peer.ip());
     }
 
     #[test]
     fn resolve_ip_falls_back_to_peer_on_unparseable_xff() {
         let peer = sock("127.0.0.1", 50000);
         let headers = headers_with_xff("not-an-ip");
-        assert_eq!(resolve_client_ip(peer, &headers), peer.ip());
-    }
-
-    #[test]
-    fn resolve_ip_handles_ipv6_loopback() {
-        // ::1 is the IPv6 loopback. XFF should still be trusted.
-        let peer: SocketAddr = "[::1]:50000".parse().unwrap();
-        let headers = headers_with_xff("203.0.113.5");
-        assert_eq!(
-            resolve_client_ip(peer, &headers),
-            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5))
-        );
+        assert_eq!(resolve_client_ip(peer, &headers, &empty_proxies()), peer.ip());
     }
 
     #[test]
     fn resolve_ip_handles_ipv4_mapped_ipv6_loopback() {
-        // CRITICAL: on dual-stack Linux listeners (bound to `::`)
-        // incoming IPv4 connections arrive as `::ffff:127.0.0.1`.
-        // Plain `IpAddr::is_loopback()` returns false for this form
-        // — so without canonicalization, a same-host Apache talking
-        // to a v6-bound node would have XFF silently ignored and
-        // every client funneled into one bucket. Audit warning W-1.
+        // Dual-stack Linux listener delivers loopback as
+        // `::ffff:127.0.0.1`. The wrapper must still trust XFF.
         let peer: SocketAddr = "[::ffff:127.0.0.1]:50000".parse().unwrap();
         let headers = headers_with_xff("203.0.113.5");
         assert_eq!(
-            resolve_client_ip(peer, &headers),
+            resolve_client_ip(peer, &headers, &empty_proxies()),
             IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5)),
-            "IPv4-mapped IPv6 loopback must be recognized as loopback",
         );
     }
 
     #[test]
-    fn resolve_ip_handles_ipv6_xff() {
+    fn resolve_ip_prefers_forwarded_over_xff() {
+        // v0.42: RFC 7239 Forwarded wins over X-Forwarded-For when
+        // both headers are present.
         let peer = sock("127.0.0.1", 50000);
-        let headers = headers_with_xff("2001:db8::1");
-        match resolve_client_ip(peer, &headers) {
-            IpAddr::V6(_) => {}
-            _ => panic!("expected IPv6 client from XFF"),
-        }
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("forwarded", "for=4.4.4.4".parse().unwrap());
+        headers.insert("x-forwarded-for", "9.9.9.9".parse().unwrap());
+        assert_eq!(
+            resolve_client_ip(peer, &headers, &empty_proxies()),
+            IpAddr::V4(Ipv4Addr::new(4, 4, 4, 4))
+        );
     }
 }

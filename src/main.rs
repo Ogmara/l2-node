@@ -17,6 +17,7 @@ mod ipfs;
 mod metrics;
 mod network;
 mod notifications;
+mod trusted_proxies;
 
 use std::path::PathBuf;
 

@@ -22,9 +22,9 @@
 //! until they re-create the entry. Race-free by construction.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -85,6 +85,13 @@ pub enum RejectReason {
     /// The semaphore is closed (only during shutdown). Caller maps
     /// to 503 Service Unavailable.
     Shutdown,
+    /// The per-IP tracking map has reached its hard cap (`max_tracked_ips`).
+    /// Returned only when an acquire would have to CREATE a new bucket
+    /// entry — existing buckets continue to be served normally. Caller
+    /// maps to 503 Service Unavailable. This is the v0.42 defense
+    /// against attackers rotating through millions of source /24s in a
+    /// short window to inflate the DashMap between sweeps.
+    CapacityExceeded,
 }
 
 /// Per-IP-bounded semaphore on top of a global Tokio semaphore.
@@ -99,19 +106,101 @@ pub struct PerIpSemaphore {
     /// Maximum concurrent permits any single IP may hold. Must be
     /// `<= global` capacity; validated at config-load time.
     per_ip_cap: usize,
+    /// Hard cap on the per-IP map size (v0.42). When acquire() would
+    /// create a NEW bucket entry beyond this many tracked IPs, the
+    /// limiter first runs an opportunistic inline sweep of
+    /// zero-counter entries; if the map is still at cap, the acquire
+    /// is rejected with `RejectReason::CapacityExceeded`. Existing
+    /// buckets are unaffected — legitimate sustained clients keep
+    /// flowing while an attacker burning through millions of source
+    /// /24s gets 503'd at the door.
+    max_tracked_ips: usize,
+    /// Monotonic timestamp (millis since limiter creation) of the
+    /// most recent inline sweep. Used to throttle inline sweeps so a
+    /// flood of concurrent fresh-/24 acquires can't each pay the
+    /// O(map_size) `retain()` cost on the request path (audit
+    /// hardening). `Acquire/Release` semantics give the
+    /// happens-before relationship between "I just swept" and "I see
+    /// the new timestamp". `0` is the sentinel meaning "no sweep
+    /// has run yet".
+    last_inline_sweep_ms: AtomicU64,
+    /// Start instant for the `last_inline_sweep_ms` reference frame.
+    /// Stored as `Instant` (not `SystemTime`) so it's monotonic
+    /// regardless of wall-clock adjustments.
+    sweep_clock_start: Instant,
 }
 
+/// Minimum interval between inline sweeps on the acquire hot path.
+/// Bounds worst-case CPU spent on `retain()` under a flood: at most
+/// one sweep per this many milliseconds, no matter how many parallel
+/// acquires hit the cap simultaneously. 100 ms is a tight enough
+/// floor that the cap drains quickly when entries free up, yet loose
+/// enough that 1000 concurrent acquires only trigger ~10 sweeps in a
+/// busy second instead of 1000.
+const INLINE_SWEEP_MIN_INTERVAL_MS: u64 = 100;
+
+/// Fill threshold at which `acquire` opportunistically triggers a
+/// throttled sweep even before the cap is reached. Without this,
+/// an attacker churning through fresh /24s at a low rate can keep
+/// the map saturated at the cap (between 5-minute background
+/// sweeps), denying new legitimate clients while existing ones flow
+/// through. Pre-emptive trim at 95% fill gives the map headroom to
+/// absorb a real-traffic burst on top of attack noise.
+const PRE_EMPTIVE_SWEEP_FILL_RATIO_PERCENT: u64 = 95;
+
 impl PerIpSemaphore {
-    /// Construct a new limiter with `global_permits` total slots and
-    /// `per_ip_cap` slots per client IP. The caller is responsible
-    /// for `per_ip_cap <= global_permits`; validation belongs at the
-    /// config layer.
-    pub fn new(global_permits: usize, per_ip_cap: usize) -> Arc<Self> {
+    /// Construct a new limiter with `global_permits` total slots,
+    /// `per_ip_cap` slots per client IP, and `max_tracked_ips` upper
+    /// bound on the per-IP tracking map. The caller is responsible
+    /// for `per_ip_cap <= global_permits` and `max_tracked_ips > 0`;
+    /// validation belongs at the config layer.
+    pub fn new(
+        global_permits: usize,
+        per_ip_cap: usize,
+        max_tracked_ips: usize,
+    ) -> Arc<Self> {
         Arc::new(Self {
             global: Arc::new(Semaphore::new(global_permits)),
             per_ip: Arc::new(DashMap::new()),
             per_ip_cap,
+            max_tracked_ips,
+            last_inline_sweep_ms: AtomicU64::new(0),
+            sweep_clock_start: Instant::now(),
         })
+    }
+
+    /// Attempt to run an inline sweep, but only if at least
+    /// `INLINE_SWEEP_MIN_INTERVAL_MS` has elapsed since the last
+    /// inline sweep. The CAS on `last_inline_sweep_ms` guarantees
+    /// at most one caller actually pays the `retain()` cost per
+    /// interval; concurrent callers see the updated timestamp and
+    /// skip. Audit hardening (Code-W2 / Security-W2).
+    fn try_throttled_sweep(&self) {
+        let now_ms = self.sweep_clock_start.elapsed().as_millis() as u64;
+        let last = self.last_inline_sweep_ms.load(Ordering::Acquire);
+        // `last == 0` is the "never swept yet" sentinel — allow the
+        // first sweep unconditionally so a brand-new limiter under
+        // immediate load isn't throttled by the gap check below
+        // (`now_ms - 0 < 100` would always be true in the first 100
+        // ms of process lifetime).
+        let allow = last == 0
+            || now_ms.saturating_sub(last) >= INLINE_SWEEP_MIN_INTERVAL_MS;
+        if !allow {
+            return;
+        }
+        // CAS: only the winning thread runs the sweep. A loser sees
+        // the new value and returns without sweeping — the winner's
+        // work covers them. Use `1` as the floor for the stored
+        // value so the sentinel-check above stays meaningful even on
+        // the first sweep within the first millisecond.
+        let new_value = now_ms.max(1);
+        if self
+            .last_inline_sweep_ms
+            .compare_exchange(last, new_value, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.sweep();
+        }
     }
 
     /// Acquire one global slot AND one per-IP slot. The returned
@@ -140,6 +229,62 @@ impl PerIpSemaphore {
         // attacker with a /64 allocation has 2^64 effective slots —
         // see `ip_to_bucket` doc.
         let bucket = ip_to_bucket(ip);
+
+        // Overflow-cap gate (v0.42, audit-hardened). Two tiers:
+        //
+        //   1. Pre-emptive trim at 95% fill — when the map is filling
+        //      up but not yet at cap, opportunistically run a
+        //      throttled sweep (at most once per
+        //      INLINE_SWEEP_MIN_INTERVAL_MS across the whole limiter).
+        //      Stops a low-rate /24-rotation flood from holding the
+        //      map at saturation indefinitely between 5-minute
+        //      background sweeps.
+        //   2. Hard cap on new buckets — if we'd create a fresh entry
+        //      and the map IS at cap, force a throttled sweep; if
+        //      still at cap, reject with `CapacityExceeded`.
+        //      Existing buckets bypass this gate so legitimate
+        //      sustained clients keep flowing.
+        //
+        // Race tolerance: `len()` is approximate and the contains-key
+        // check is unsynchronized against insertion. A handful of
+        // entries past the cap during contention is harmless — the
+        // cap is a *defense-in-depth* memory bound, not a strict
+        // upper limit. The hard invariant we uphold is "memory growth
+        // is bounded over any sustained window".
+        //
+        // CPU bound: `try_throttled_sweep` runs `retain()` at most
+        // once per INLINE_SWEEP_MIN_INTERVAL_MS regardless of how
+        // many concurrent acquires hit the gate, so the per-request
+        // overhead is amortized to O(1).
+        let current_len = self.per_ip.len();
+        let bucket_exists = self.per_ip.contains_key(&bucket);
+        if !bucket_exists {
+            // Tier 1: pre-emptive sweep when the map is filling but
+            // NOT yet at cap. This path is the perf-optimization
+            // path; we throttle it so a flood of concurrent
+            // acquires doesn't each pay the `retain()` cost.
+            let pre_emptive_threshold = self
+                .max_tracked_ips
+                .saturating_mul(PRE_EMPTIVE_SWEEP_FILL_RATIO_PERCENT as usize)
+                / 100;
+            if current_len >= pre_emptive_threshold
+                && current_len < self.max_tracked_ips
+            {
+                self.try_throttled_sweep();
+            }
+            // Tier 2: hard-cap correctness gate. At-cap acquires
+            // MUST sweep (not throttled) — throttling here would
+            // reject a request that an unthrottled sweep would have
+            // unblocked. Worst-case CPU under concurrent flood is
+            // bounded by DashMap's per-shard write locks serializing
+            // the `retain()` calls; per-request work stays O(map).
+            if self.per_ip.len() >= self.max_tracked_ips {
+                self.sweep();
+                if self.per_ip.len() >= self.max_tracked_ips {
+                    return Err(RejectReason::CapacityExceeded);
+                }
+            }
+        }
 
         // Get-or-create the per-bucket counter atomically. DashMap's
         // entry-locking serializes inserts for the same key, so even
@@ -218,6 +363,16 @@ impl PerIpSemaphore {
     /// Useful for ops + tests.
     pub fn tracked_ip_count(&self) -> usize {
         self.per_ip.len()
+    }
+
+    /// Hard cap on the per-IP map (v0.42). Reflects the
+    /// `media_max_tracked_ips` config field. Exposed so the dashboard
+    /// + ops metrics can compute saturation = count / max. Not yet
+    /// wired into a metrics endpoint — the `dead_code` allow keeps
+    /// the audit clean until the dashboard PR lands.
+    #[allow(dead_code)]
+    pub fn tracked_ip_max(&self) -> usize {
+        self.max_tracked_ips
     }
 
     /// Available global permits — equal to the Tokio semaphore's
@@ -345,7 +500,7 @@ mod tests {
 
     #[tokio::test]
     async fn single_ip_under_cap_succeeds() {
-        let limiter = PerIpSemaphore::new(8, 4);
+        let limiter = PerIpSemaphore::new(8, 4, usize::MAX);
         let _p1 = limiter.acquire(ip(1, 1, 1, 1)).await.unwrap();
         let _p2 = limiter.acquire(ip(1, 1, 1, 1)).await.unwrap();
         let _p3 = limiter.acquire(ip(1, 1, 1, 1)).await.unwrap();
@@ -355,7 +510,7 @@ mod tests {
 
     #[tokio::test]
     async fn single_ip_at_cap_is_rejected() {
-        let limiter = PerIpSemaphore::new(8, 2);
+        let limiter = PerIpSemaphore::new(8, 2, usize::MAX);
         let _p1 = limiter.acquire(ip(2, 2, 2, 2)).await.unwrap();
         let _p2 = limiter.acquire(ip(2, 2, 2, 2)).await.unwrap();
         let err = limiter.acquire(ip(2, 2, 2, 2)).await.unwrap_err();
@@ -367,7 +522,7 @@ mod tests {
         // Per-IP rejection happens BEFORE the global semaphore
         // queue, so other IPs are unaffected by an attacker burning
         // through their per-IP cap.
-        let limiter = PerIpSemaphore::new(4, 1);
+        let limiter = PerIpSemaphore::new(4, 1, usize::MAX);
         let _p1 = limiter.acquire(ip(3, 3, 3, 3)).await.unwrap();
         // Second attempt from same IP rejected fast.
         let err = limiter.acquire(ip(3, 3, 3, 3)).await.unwrap_err();
@@ -384,7 +539,7 @@ mod tests {
 
     #[tokio::test]
     async fn permit_drop_releases_per_ip_slot() {
-        let limiter = PerIpSemaphore::new(8, 2);
+        let limiter = PerIpSemaphore::new(8, 2, usize::MAX);
         {
             let _p1 = limiter.acquire(ip(7, 7, 7, 7)).await.unwrap();
             let _p2 = limiter.acquire(ip(7, 7, 7, 7)).await.unwrap();
@@ -401,7 +556,7 @@ mod tests {
         // Use IPs in DIFFERENT /24s — bucketing means same-/24
         // addresses share an entry. (10.0.0.x and 10.0.1.x are
         // in different /24 buckets.)
-        let limiter = PerIpSemaphore::new(8, 4);
+        let limiter = PerIpSemaphore::new(8, 4, usize::MAX);
         {
             let _p = limiter.acquire(ip(10, 0, 0, 1)).await.unwrap();
             let _q = limiter.acquire(ip(10, 0, 1, 1)).await.unwrap();
@@ -416,7 +571,7 @@ mod tests {
     #[tokio::test]
     async fn sweep_keeps_active_entries() {
         // Two different /24 buckets.
-        let limiter = PerIpSemaphore::new(8, 4);
+        let limiter = PerIpSemaphore::new(8, 4, usize::MAX);
         let _held = limiter.acquire(ip(11, 0, 0, 1)).await.unwrap();
         let _dropped = limiter.acquire(ip(11, 0, 1, 1)).await.unwrap();
         drop(_dropped);
@@ -431,7 +586,7 @@ mod tests {
         // Drop a permit, then race a sweep with a new acquire for
         // the same IP. The new acquire either sees the existing
         // entry (gets reused) or creates a fresh one — both correct.
-        let limiter = PerIpSemaphore::new(8, 4);
+        let limiter = PerIpSemaphore::new(8, 4, usize::MAX);
         {
             let _p = limiter.acquire(ip(12, 0, 0, 1)).await.unwrap();
         }
@@ -452,7 +607,7 @@ mod tests {
     #[tokio::test]
     async fn distinct_subnets_each_get_their_own_cap() {
         // Two IPs in different /24s. Cap=2 per bucket.
-        let limiter = PerIpSemaphore::new(16, 2);
+        let limiter = PerIpSemaphore::new(16, 2, usize::MAX);
         let _a1 = limiter.acquire(ip(20, 0, 0, 1)).await.unwrap();
         let _a2 = limiter.acquire(ip(20, 0, 0, 1)).await.unwrap();
         // 20.0.0.0/24 at cap.
@@ -471,7 +626,7 @@ mod tests {
     async fn ipv4_24_subnet_shares_per_ip_slot() {
         // 192.168.1.5 and 192.168.1.99 are in the same /24 bucket
         // (192.168.1.0/24) so they share one per-IP cap.
-        let limiter = PerIpSemaphore::new(16, 2);
+        let limiter = PerIpSemaphore::new(16, 2, usize::MAX);
         let _p1 = limiter.acquire(ip(192, 168, 1, 5)).await.unwrap();
         let _p2 = limiter.acquire(ip(192, 168, 1, 99)).await.unwrap();
         // Third request from ANY .1.0/24 → rejected.
@@ -484,7 +639,7 @@ mod tests {
     #[tokio::test]
     async fn ipv6_64_subnet_shares_per_ip_slot() {
         // Two IPv6 addresses with the same /64 prefix.
-        let limiter = PerIpSemaphore::new(16, 2);
+        let limiter = PerIpSemaphore::new(16, 2, usize::MAX);
         let a: IpAddr = "2001:db8:1::1".parse().unwrap();
         let b: IpAddr = "2001:db8:1::ffff:ffff:ffff:ffff".parse().unwrap();
         let c: IpAddr = "2001:db8:1::beef".parse().unwrap();
@@ -504,7 +659,7 @@ mod tests {
     async fn ipv4_mapped_ipv6_collapses_to_ipv4_bucket() {
         // ::ffff:127.0.0.1 should bucket as 127.0.0.0/24, not as a
         // separate IPv6 entity. Critical for dual-stack listeners.
-        let limiter = PerIpSemaphore::new(16, 2);
+        let limiter = PerIpSemaphore::new(16, 2, usize::MAX);
         let v4: IpAddr = "127.0.0.50".parse().unwrap();
         let v6_mapped: IpAddr = "::ffff:127.0.0.99".parse().unwrap();
         // Two requests via the mapped form fill the bucket.
@@ -534,6 +689,77 @@ mod tests {
         );
     }
 
+    // --- v0.42: overflow-cap on the per-IP map -------------------------
+
+    #[tokio::test]
+    async fn overflow_cap_rejects_new_buckets_when_full() {
+        // Cap of 2 distinct buckets, generous global+per-IP. Filling
+        // the map and then issuing from a THIRD /24 must 503.
+        let limiter = PerIpSemaphore::new(16, 4, 2);
+        let _p1 = limiter.acquire(ip(70, 0, 0, 1)).await.unwrap();
+        let _p2 = limiter.acquire(ip(70, 0, 1, 1)).await.unwrap();
+        assert_eq!(limiter.tracked_ip_count(), 2);
+        // Third distinct /24 → CapacityExceeded.
+        let err = limiter.acquire(ip(70, 0, 2, 1)).await.unwrap_err();
+        assert_eq!(err, RejectReason::CapacityExceeded);
+    }
+
+    #[tokio::test]
+    async fn overflow_cap_allows_existing_buckets() {
+        // Even at the map cap, requests from ALREADY-TRACKED buckets
+        // continue to be served normally. Closes the "legitimate
+        // client gets locked out by an unrelated flood" footgun.
+        let limiter = PerIpSemaphore::new(16, 4, 2);
+        let _p1 = limiter.acquire(ip(71, 0, 0, 1)).await.unwrap();
+        let _p2 = limiter.acquire(ip(71, 0, 1, 1)).await.unwrap();
+        // Map at cap. Re-acquire from /24 #1 → must succeed (existing
+        // bucket, no new entry).
+        let _p3 = limiter.acquire(ip(71, 0, 0, 50)).await.unwrap();
+        // But a fresh /24 → 503.
+        let err = limiter.acquire(ip(71, 0, 2, 1)).await.unwrap_err();
+        assert_eq!(err, RejectReason::CapacityExceeded);
+    }
+
+    #[tokio::test]
+    async fn overflow_cap_inline_sweep_reclaims_slots() {
+        // When the map is at cap but some buckets have zero counter
+        // (their permits all dropped), acquire() runs an inline
+        // sweep and frees the slot. A subsequent acquire from a new
+        // bucket succeeds.
+        let limiter = PerIpSemaphore::new(16, 4, 2);
+        {
+            let _p1 = limiter.acquire(ip(72, 0, 0, 1)).await.unwrap();
+            let _p2 = limiter.acquire(ip(72, 0, 1, 1)).await.unwrap();
+            // Both permits drop at end of scope; counters → 0; entries
+            // remain in the map until sweep (background or inline).
+        }
+        assert_eq!(limiter.tracked_ip_count(), 2);
+        // New /24. Acquire triggers inline sweep, reclaims both
+        // zero-counter entries, then inserts a fresh one.
+        let _p = limiter.acquire(ip(72, 0, 2, 1)).await.unwrap();
+        assert_eq!(limiter.tracked_ip_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn overflow_cap_inline_sweep_does_not_free_live_slots() {
+        // If every bucket is live (counter > 0), the inline sweep is
+        // a no-op and the acquire still fails. Confirms the cap is a
+        // hard upper bound under sustained attack.
+        let limiter = PerIpSemaphore::new(16, 4, 2);
+        let _p1 = limiter.acquire(ip(73, 0, 0, 1)).await.unwrap();
+        let _p2 = limiter.acquire(ip(73, 0, 1, 1)).await.unwrap();
+        // Both buckets have counter = 1. Inline sweep on the next
+        // acquire reclaims nothing.
+        let err = limiter.acquire(ip(73, 0, 2, 1)).await.unwrap_err();
+        assert_eq!(err, RejectReason::CapacityExceeded);
+    }
+
+    #[test]
+    fn tracked_ip_max_reflects_constructor() {
+        let limiter = PerIpSemaphore::new(8, 2, 1234);
+        assert_eq!(limiter.tracked_ip_max(), 1234);
+    }
+
     #[tokio::test]
     async fn cancellation_safety_rolls_back_per_ip_counter() {
         // Simulate the cancellation race: an attacker calls
@@ -541,7 +767,7 @@ mod tests {
         // before the global await resolves. Without the RAII guard
         // the per-IP counter would stay incremented forever; with
         // the guard, drop rolls it back.
-        let limiter = PerIpSemaphore::new(1, 4);
+        let limiter = PerIpSemaphore::new(1, 4, usize::MAX);
         // Hold the single global permit so the next acquire parks.
         let _hold = limiter.acquire(ip(50, 50, 50, 50)).await.unwrap();
 

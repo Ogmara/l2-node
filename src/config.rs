@@ -156,6 +156,17 @@ pub struct IpfsConfig {
     /// <= `media_handler_permits` (validated at config-load).
     #[serde(default = "default_media_per_ip_permits")]
     pub media_per_ip_permits: usize,
+    /// Hard cap on the per-IP limiter's tracking map (v0.42).
+    /// Bounds memory growth under an adversarial /24-rotation flood
+    /// — an attacker burning through millions of source subnets in
+    /// the 5 minutes between background sweeps would otherwise
+    /// inflate the DashMap to hundreds of MB. At this cap, the
+    /// limiter first runs an inline sweep; if still full, new
+    /// (untracked) buckets get 503 Service Unavailable until the map
+    /// drains. Existing buckets continue normally — legitimate
+    /// clients are never displaced. Default 65,536 ≈ 10 MiB resident.
+    #[serde(default = "default_media_max_tracked_ips")]
+    pub media_max_tracked_ips: usize,
 }
 
 impl Default for IpfsConfig {
@@ -169,6 +180,7 @@ impl Default for IpfsConfig {
             media_cache_item_mb: default_media_cache_item_mb(),
             media_handler_permits: default_media_handler_permits(),
             media_per_ip_permits: default_media_per_ip_permits(),
+            media_max_tracked_ips: default_media_max_tracked_ips(),
         }
     }
 }
@@ -191,6 +203,27 @@ pub struct ApiConfig {
     /// Rate limit per IP (requests per minute).
     #[serde(default = "default_rate_limit")]
     pub rate_limit_per_ip: u32,
+    /// Trusted-proxy CIDRs for client-IP resolution (v0.42).
+    ///
+    /// When the immediate TCP peer matches one of these CIDRs (or is
+    /// loopback, which is always implicitly trusted), the node walks
+    /// the `Forwarded` / `X-Forwarded-For` header right-to-left,
+    /// skipping addresses that are themselves trusted proxies, and
+    /// reports the first untrusted address as the real client.
+    ///
+    /// Each entry is a CIDR string (`"10.0.0.0/8"`,
+    /// `"2001:db8::/32"`) or a bare host address (`"192.0.2.5"`,
+    /// `"::1"`). Validated at config-load; a malformed entry aborts
+    /// startup rather than silently degrade to "trust nothing extra"
+    /// (which would change the security model from "behaves as
+    /// configured" to "behaves as misconfigured").
+    ///
+    /// Leave empty for the default single-host setup (Apache on
+    /// loopback in front of L2). Add CDN/edge ranges for multi-hop
+    /// CDN deployments where forwarding-header trust must extend
+    /// past the immediate proxy.
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
     /// Proof-of-Work anti-spam configuration.
     #[serde(default)]
     pub pow: PowConfig,
@@ -207,6 +240,7 @@ impl Default for ApiConfig {
             public_url: None,
             cors_origins: default_cors(),
             rate_limit_per_ip: default_rate_limit(),
+            trusted_proxies: Vec::new(),
             pow: PowConfig::default(),
             admin: AdminConfig::default(),
         }
@@ -740,6 +774,9 @@ fn default_media_handler_permits() -> usize {
 fn default_media_per_ip_permits() -> usize {
     4
 }
+fn default_media_max_tracked_ips() -> usize {
+    65_536
+}
 fn default_api_addr() -> String {
     "127.0.0.1".to_string()
 }
@@ -987,6 +1024,24 @@ impl Config {
             );
             self.ipfs.media_per_ip_permits = self.ipfs.media_handler_permits;
         }
+        // Per-IP tracking map cap (v0.42). HARD reject zero — would
+        // make every acquire from an untracked /24 fail-503 (no inline
+        // sweep can save it from cap=0). HARD reject absurd ceilings
+        // (>16M entries ≈ 2.4 GiB resident) — that's clearly a typo,
+        // not a tuning choice. Honest ceilings live well under 1M.
+        if self.ipfs.media_max_tracked_ips == 0 {
+            anyhow::bail!(
+                "ipfs.media_max_tracked_ips must be > 0 (zero would 503 every new client)",
+            );
+        }
+        const MAX_TRACKED_IPS_CEILING: usize = 16_777_216; // 2^24
+        if self.ipfs.media_max_tracked_ips > MAX_TRACKED_IPS_CEILING {
+            anyhow::bail!(
+                "ipfs.media_max_tracked_ips = {} exceeds the safety ceiling of {} entries",
+                self.ipfs.media_max_tracked_ips,
+                MAX_TRACKED_IPS_CEILING
+            );
+        }
         // 64 GiB is a generous ceiling for the total cache — beyond
         // this you're shifting the bottleneck to host memory. Configure
         // explicitly with a justification.
@@ -1028,6 +1083,19 @@ impl Config {
                 self.ipfs.media_cache_total_mb,
             );
             self.ipfs.media_cache_item_mb = self.ipfs.media_cache_total_mb;
+        }
+        // Trusted-proxy CIDRs (v0.42). Parse-validate each entry at
+        // load time; HARD reject on first malformed entry. Silently
+        // dropping a bad CIDR would flip the security model: an
+        // operator who typo'd "10.0.0/8" expecting it to cover
+        // "10.0.0.0/8" would have the immediate peer NOT trusted —
+        // requests from their proxy would return the proxy IP, not
+        // the real client, which the operator wouldn't notice until
+        // their rate-limit metrics looked off.
+        for (idx, entry) in self.api.trusted_proxies.iter().enumerate() {
+            crate::trusted_proxies::TrustedProxy::parse(entry).with_context(|| {
+                format!("api.trusted_proxies[{}] = {:?}", idx, entry)
+            })?;
         }
         Ok(())
     }
@@ -1288,5 +1356,69 @@ mod tests {
         let mut c = baseline_config();
         c.validate().expect("defaults pass");
         assert_eq!(c.ipfs.media_per_ip_permits, 4);
+    }
+
+    // --- v0.42 max_tracked_ips field --------------------------------
+
+    #[test]
+    fn validate_rejects_zero_max_tracked_ips() {
+        let mut c = baseline_config();
+        c.ipfs.media_max_tracked_ips = 0;
+        let err = c.validate().expect_err("zero must reject");
+        assert!(format!("{}", err).contains("media_max_tracked_ips"));
+    }
+
+    #[test]
+    fn validate_rejects_oversized_max_tracked_ips() {
+        let mut c = baseline_config();
+        c.ipfs.media_max_tracked_ips = 100_000_000; // way over ceiling
+        let err = c.validate().expect_err("oversized must reject");
+        assert!(format!("{}", err).contains("media_max_tracked_ips"));
+    }
+
+    #[test]
+    fn validate_passes_default_max_tracked_ips() {
+        let mut c = baseline_config();
+        c.validate().expect("defaults pass");
+        assert_eq!(c.ipfs.media_max_tracked_ips, 65_536);
+    }
+
+    // --- v0.42 trusted_proxies field --------------------------------
+
+    #[test]
+    fn validate_accepts_empty_trusted_proxies() {
+        let mut c = baseline_config();
+        assert!(c.api.trusted_proxies.is_empty());
+        c.validate().expect("empty list (= loopback-only) is fine");
+    }
+
+    #[test]
+    fn validate_accepts_well_formed_trusted_proxies() {
+        let mut c = baseline_config();
+        c.api.trusted_proxies = vec![
+            "10.0.0.0/8".to_string(),
+            "192.168.1.5".to_string(),
+            "2001:db8::/32".to_string(),
+            "::1".to_string(),
+        ];
+        c.validate().expect("all entries parse");
+    }
+
+    #[test]
+    fn validate_rejects_malformed_trusted_proxy() {
+        let mut c = baseline_config();
+        c.api.trusted_proxies = vec![
+            "10.0.0.0/8".to_string(),
+            "not-an-ip".to_string(),
+        ];
+        let err = c.validate().expect_err("garbage entry must reject");
+        assert!(format!("{:?}", err).contains("trusted_proxies"));
+    }
+
+    #[test]
+    fn validate_rejects_oversized_prefix() {
+        let mut c = baseline_config();
+        c.api.trusted_proxies = vec!["1.2.3.4/33".to_string()];
+        assert!(c.validate().is_err());
     }
 }

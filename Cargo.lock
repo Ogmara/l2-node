@@ -2687,7 +2687,7 @@ dependencies = [
 
 [[package]]
 name = "ogmara-node"
-version = "0.41.0"
+version = "0.42.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2705,6 +2705,7 @@ dependencies = [
  "hex",
  "hkdf",
  "hmac",
+ "httpdate",
  "libp2p",
  "moka",
  "rand 0.8.5",
