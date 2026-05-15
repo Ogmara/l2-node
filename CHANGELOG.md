@@ -5,6 +5,45 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.40.1] - 2026-05-15
+
+### Fixed
+- **Upgrade-time crash on pre-0.40 production configs.** v0.40.0's
+  `Config::validate` hard-rejected `media_cache_item_mb >
+  max_upload_size_mb` and `media_cache_item_mb >
+  media_cache_total_mb`. The new field's default is 16 MiB; any node
+  whose existing `[ipfs] max_upload_size_mb` was lower (e.g. the
+  production testnet node at `max_upload_size_mb = 10`) failed
+  validation at startup, exited 1, and the binary couldn't run at
+  all until the operator manually added a `media_cache_item_mb`
+  override to their TOML. `cargo build` happily produced a binary
+  that wouldn't start.
+
+  Fix: those two cross-field checks now AUTO-CLAMP the offending
+  value with an `eprintln` warning, instead of bailing. Items that
+  exceed `max_upload_size_mb` can't enter the system at upload time
+  anyway — the cache cap being slightly higher was always harmless
+  for runtime; treating it as a hard error was a misjudgement on
+  my part.
+
+  HARD rejects retained for values that actually break runtime:
+  zero permits (deadlocks), zero cache caps (degenerate),
+  oversized values (re-introduces the v0.39 DoS vector).
+
+### Tests
+- 9 new validation tests in `config::tests` covering the hard
+  rejects and the new soft-clamp regression. The clamp test
+  (`validate_clamps_item_to_max_upload_instead_of_failing`)
+  reproduces the exact `[ipfs] max_upload_size_mb = 10` /
+  `media_cache_item_mb = 16` combination that broke production.
+
+### Lesson learned
+Defaults for new config fields must be chosen so they pass
+validation against EXISTING (smaller-than-default) production
+configs. A cross-field check that's correct for `default vs
+default` can still reject `default vs lower-bound user value` —
+that's a regression, not a guard.
+
 ## [0.40.0] - 2026-05-15
 
 ### Added
