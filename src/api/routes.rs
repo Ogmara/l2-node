@@ -18,7 +18,7 @@ use rocksdb::WriteBatch;
 use crate::storage::schema::{cf, decode_users_by_name_key, encode_channel_msg_key, encode_dm_msg_key, state_keys};
 
 use super::auth::AuthUser;
-use super::state::{AppState, CachedMedia, MEDIA_CACHE_ITEM_BYTES};
+use super::state::{AppState, CachedMedia};
 
 /// Build a 429 response with a PoW challenge for the given wallet address.
 ///
@@ -2721,10 +2721,26 @@ pub async fn get_media(
         }
     };
 
-    let range_value = headers
-        .get(header::RANGE)
+    // `Range` is only honored when `If-Range` (if present) matches
+    // the current ETag. Per RFC 7233 §3.2: clients use `If-Range` to
+    // resume a partial download — they hold a stale slice and want
+    // a 206 if the resource hasn't changed, or the full 200 if it
+    // has. CIDs are content-addressed (the bytes never change), so
+    // ETag match is just CID match; on mismatch we drop the Range
+    // and serve the full body so the client can rebuild from scratch.
+    let if_range_matches = headers
+        .get(header::IF_RANGE)
         .and_then(|v| v.to_str().ok())
-        .map(|v| v.to_string());
+        .map(|v| v == etag)
+        .unwrap_or(true); // No If-Range header → Range is honored unconditionally.
+    let range_value = if if_range_matches {
+        headers
+            .get(header::RANGE)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.to_string())
+    } else {
+        None
+    };
 
     // ----- Cache hit fast path --------------------------------------
     if let Some(cached) = state.media_cache.get(&cid).await {
@@ -2753,7 +2769,7 @@ pub async fn get_media(
 
     // Stream-range path: large file + Range. No full buffer.
     if let Some(ref range_str) = range_value {
-        if total > MEDIA_CACHE_ITEM_BYTES as u64 {
+        if total > state.media_cache_item_bytes as u64 {
             return serve_range_streamed(
                 is_head, ipfs, &cid, range_str, total, etag, cache_control,
             )
@@ -2766,7 +2782,7 @@ pub async fn get_media(
     // requests for the same cold CID coalesce into a single IPFS
     // fetch (audit note N-4 security). For large files we go direct
     // — caching them would evict 16× more useful small items.
-    let cached: CachedMedia = if total <= MEDIA_CACHE_ITEM_BYTES as u64 {
+    let cached: CachedMedia = if total <= state.media_cache_item_bytes as u64 {
         // Closure captures `ipfs` and `cid` by reference. The future
         // is constructed each time but only the FIRST waiter's
         // future runs; subsequent waiters skip the IPFS round-trip.
@@ -4657,4 +4673,148 @@ mod media_tests {
         let d = media_content_disposition("image/png", "bafkrei123abc");
         assert!(d.contains("filename=\"bafkrei123abc\""));
     }
+
+    // --- HEAD tuple-form regression (v0.40) -------------------------
+    //
+    // Auditor v0.39 followup #5: lock the guarantee that HEAD
+    // responses use the `(status, headers)` IntoResponse form (no
+    // body in tuple). Without this guard a future contributor could
+    // re-introduce the double-Content-Length bug by adding an empty
+    // body to the HEAD branch. The test goes through `serve_from_cached`
+    // with `is_head=true` and asserts:
+    //   - exactly ONE `Content-Length` header is emitted
+    //   - that header's value matches what we explicitly set
+    //   - the response body is empty
+    //
+    // Same pattern applies to the Partial Content branch (Range +
+    // HEAD) — locked separately below.
+
+    use super::{serve_from_cached, CachedMedia};
+    use axum::body::to_bytes;
+    use bytes::Bytes;
+
+    fn make_cached(payload: &[u8], ct: &str) -> CachedMedia {
+        CachedMedia {
+            bytes: Bytes::copy_from_slice(payload),
+            content_type: ct.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn head_200_emits_single_content_length_and_no_body() {
+        let cached = make_cached(b"hello world", "image/png");
+        let resp = serve_from_cached(
+            /* is_head */ true,
+            cached,
+            "\"cid123\"".to_string(),
+            "public, max-age=31536000, immutable",
+            "cid123",
+            /* range */ None,
+        );
+        assert_eq!(resp.status(), 200);
+        let cl_count = resp
+            .headers()
+            .get_all(axum::http::header::CONTENT_LENGTH)
+            .iter()
+            .count();
+        assert_eq!(cl_count, 1, "HEAD must emit exactly one Content-Length");
+        let cl = resp
+            .headers()
+            .get(axum::http::header::CONTENT_LENGTH)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(cl, "11", "CL must reflect would-be GET body size");
+        // Body must be empty for HEAD.
+        let body_bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert!(body_bytes.is_empty(), "HEAD response body must be empty");
+    }
+
+    #[tokio::test]
+    async fn head_206_partial_emits_single_content_length_and_no_body() {
+        let cached = make_cached(b"hello world", "image/png");
+        let resp = serve_from_cached(
+            /* is_head */ true,
+            cached,
+            "\"cid123\"".to_string(),
+            "public, max-age=31536000, immutable",
+            "cid123",
+            Some("bytes=0-4"),
+        );
+        assert_eq!(resp.status(), 206);
+        let cl_count = resp
+            .headers()
+            .get_all(axum::http::header::CONTENT_LENGTH)
+            .iter()
+            .count();
+        assert_eq!(
+            cl_count, 1,
+            "HEAD 206 must emit exactly one Content-Length"
+        );
+        let cl = resp
+            .headers()
+            .get(axum::http::header::CONTENT_LENGTH)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(cl, "5", "CL on HEAD 206 must reflect would-be slice size");
+        // Content-Range must still be present even though body isn't —
+        // that's the whole point of HEAD-vs-GET parity on metadata.
+        let cr = resp
+            .headers()
+            .get(axum::http::header::CONTENT_RANGE)
+            .expect("Content-Range required on HEAD 206")
+            .to_str()
+            .unwrap();
+        assert_eq!(cr, "bytes 0-4/11");
+        let body_bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert!(body_bytes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_200_includes_body_with_content_length() {
+        let cached = make_cached(b"abcdef", "image/png");
+        let resp = serve_from_cached(
+            /* is_head */ false,
+            cached,
+            "\"cid\"".to_string(),
+            "public, max-age=31536000, immutable",
+            "cid",
+            None,
+        );
+        assert_eq!(resp.status(), 200);
+        let cl = resp
+            .headers()
+            .get(axum::http::header::CONTENT_LENGTH)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(cl, "6");
+        let body_bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert_eq!(&body_bytes[..], b"abcdef");
+    }
+
+    #[tokio::test]
+    async fn get_206_range_returns_slice() {
+        let cached = make_cached(b"hello world", "image/png");
+        let resp = serve_from_cached(
+            false,
+            cached,
+            "\"cid\"".to_string(),
+            "public, max-age=31536000, immutable",
+            "cid",
+            Some("bytes=6-10"),
+        );
+        assert_eq!(resp.status(), 206);
+        let cr = resp
+            .headers()
+            .get(axum::http::header::CONTENT_RANGE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(cr, "bytes 6-10/11");
+        let body_bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert_eq!(&body_bytes[..], b"world");
+    }
+
 }

@@ -5,6 +5,118 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.40.0] - 2026-05-15
+
+### Added
+- **Media handler tunables are now config-driven.** Three new fields
+  in `IpfsConfig`, with defaults matching the v0.39 hardcoded values:
+  - `media_cache_total_mb` (default 256) — total LRU weight
+  - `media_cache_item_mb` (default 16) — per-item cache cap
+  - `media_handler_permits` (default 32) — concurrent handlers
+  Operators can now tune these in `ogmara.toml` without a recompile;
+  existing TOMLs continue to work unchanged (all fields are
+  `#[serde(default)]`). Resource-constrained nodes can lower the
+  values; high-throughput nodes can raise them.
+- **`If-Range` support** (RFC 7233 §3.2). Clients resuming a partial
+  download can send `Range: bytes=N-` plus `If-Range: "<etag>"`; if
+  the ETag still matches the current resource, we return 206
+  Partial Content. If it doesn't, we ignore the Range and return the
+  full body so the client can rebuild from scratch. For
+  content-addressed CIDs the ETag is the CID itself, so a match is
+  guaranteed for the same content — this is mostly defensive
+  correctness against future ETag schemes.
+- **`src/lib.rs` library target** alongside the existing binary.
+  Re-exports `config` and `ipfs` modules so integration tests in
+  `tests/` can construct `IpfsClient` against a fake-Kubo server.
+  The binary's module tree is unchanged; this is additive.
+- **Integration test suite against a fake Kubo**
+  (`tests/ipfs_client_integration.rs`). Spawns an in-process axum
+  server mimicking Kubo's `/api/v0/cat` and `/api/v0/files/stat`
+  endpoints, then exercises `IpfsClient` end-to-end through
+  `reqwest`. 8 scenarios cover: full GET, ranged GET, truncated
+  range responses, `Size` field reading, `offline=true` flag flow,
+  and the two flavors of "not local" Kubo signalling (500 status
+  AND `200 + {"Error": ...}`).
+
+### Fixed (audit-driven hardening)
+- **`exists_local` now defends against future Kubo behavior changes.**
+  The pre-0.40 implementation trusted the HTTP status alone: 2xx
+  meant "local exists". Kubo has historically also signalled
+  "not local" with `200 OK + {"Error": ...}` in the response body,
+  and could plausibly flip back to that convention in a future
+  build. The new code reads the body (bounded to 8 KiB) and treats
+  any `Error` key as "not local", regardless of HTTP status —
+  closing a small confirmation-oracle window in the
+  `If-None-Match` 304 short-circuit.
+- **`exists_local` response also bounded at 8 KiB.** Same
+  defense-in-depth as `get_size`: a hostile/corrupted Kubo could
+  otherwise stream gigabytes of JSON into the lightweight probe.
+
+### Tests
+- **45 unit tests in `media_tests`** (was 41 in v0.39) — added 4
+  HEAD tuple-form regression tests locking the
+  no-double-Content-Length guarantee for both 200 and 206
+  responses. A future contributor re-adding a body to the HEAD
+  branch trips these immediately.
+- **8 integration tests in `ipfs_client_integration`** as above.
+
+### Migration notes
+- **Existing `ogmara.toml` files continue to work** — the new fields
+  default to the v0.39 hardcoded values. Operators wanting to tune
+  media handler resources can add an `[ipfs]` section with any of
+  the new fields, or leave the defaults.
+- **`AppState::with_broadcast` gained a `MediaTuning` parameter.**
+  Only `node.rs` calls this in production; `AppState::new()` passes
+  `MediaTuning::default()` for tests. Internal API change only —
+  no impact on external callers.
+
+### Security hardening (audit-driven)
+- **`Config::validate` now rejects degenerate / abusive media
+  tunables at startup.** A misconfigured `media_handler_permits = 0`
+  would have made every `/api/v1/media/:cid` request block forever
+  (the semaphore yields no permits); huge values like
+  `usize::MAX` would have reverted the v0.39 memory-amplification
+  mitigation. The new checks reject zero, oversized values
+  (`permits > 4096`, `cache_total > 64 GiB`), inconsistent
+  combinations (`item_mb > total_mb`, `item_mb > max_upload_mb`).
+  Audit critical fix.
+- **Streaming size cap on `get_size` + `exists_local` bodies.**
+  v0.39's post-buffer length check would still let a chunked-
+  transfer Kubo stream gigabytes before the 8 KiB cap fired (the
+  cheap Content-Length pre-check is skipped when no header is
+  declared). The new `read_body_capped` helper enforces the cap
+  INCREMENTALLY as bytes arrive, aborting the read at the boundary.
+  Audit warning W-2 (security) fix.
+- **`usize::try_from` for `media_cache_item_mb` → bytes
+  conversion** (node.rs). v0.39's `as usize` cast would have
+  silently truncated values larger than `u32::MAX` on 32-bit
+  targets (armv7, i686). Saturating-conversion via `try_from` is
+  a no-op on 64-bit and correct on 32-bit. Audit warning W-3
+  (security) fix.
+
+### Test cleanup
+- **Removed unnecessary startup sleep** in the fake-Kubo
+  integration test. `TcpListener::bind` is awaited before the
+  axum `serve` spawn, so the OS already has the socket listening
+  before any connection attempt — the sleep was cargo-cult and
+  slowed every test invocation. Audit warning W-3 (code) fix.
+- **Removed dead `fail_sniff_prefix` field** from the test
+  harness — referenced by `cat_handler` but never set by any
+  committed test. Sniff-failure handling is well-covered in the
+  unit test layer.
+
+### Deferred to v0.41 (or later)
+- Promote per-IP semaphore sub-cap to prevent single-IP
+  saturation of the configured permits. Apache rate-limit in
+  front (documented since v0.38) covers this in production.
+- Optional `Last-Modified` header — CIDs don't have a natural
+  modification time, so this would need to come from the upload
+  timestamp tracked elsewhere; not yet worth the wiring cost.
+- `If-Range` HTTP-date support — RFC 7233 §3.2 allows
+  `HTTP-date` as well as `entity-tag` in `If-Range`. The current
+  impl drops Range silently for date-form (safe fallback, full
+  body). Future enhancement, not a regression.
+
 ## [0.39.0] - 2026-05-15
 
 ### Fixed

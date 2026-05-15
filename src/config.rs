@@ -129,6 +129,24 @@ pub struct IpfsConfig {
     /// Auto-generate thumbnails for images/videos.
     #[serde(default = "default_true")]
     pub auto_thumbnail: bool,
+    /// Total bytes (in MiB) the media LRU cache may hold across all
+    /// entries (spec 4.1, v0.40 tunable). 256 MiB default — fits a few
+    /// thousand small thumbnails or a few hundred reasonable images.
+    /// Raise for high-readership nodes; lower on small VMs.
+    #[serde(default = "default_media_cache_total_mb")]
+    pub media_cache_total_mb: u64,
+    /// Per-item cap (in MiB) for the media cache. Items larger than
+    /// this are never inserted (large videos stream from IPFS instead).
+    /// 16 MiB default. Should be smaller than
+    /// `media_cache_total_mb` and `max_upload_size_mb`.
+    #[serde(default = "default_media_cache_item_mb")]
+    pub media_cache_item_mb: u64,
+    /// Max concurrent in-flight `/api/v1/media/:cid` handlers. Caps
+    /// peak transient RSS from the media endpoint at roughly
+    /// `permits * max_upload_size_mb` MiB. Default 32. Lower for
+    /// resource-constrained nodes; raise for high-throughput.
+    #[serde(default = "default_media_handler_permits")]
+    pub media_handler_permits: usize,
 }
 
 impl Default for IpfsConfig {
@@ -138,6 +156,9 @@ impl Default for IpfsConfig {
             gateway_url: default_ipfs_gateway(),
             max_upload_size_mb: default_max_upload(),
             auto_thumbnail: true,
+            media_cache_total_mb: default_media_cache_total_mb(),
+            media_cache_item_mb: default_media_cache_item_mb(),
+            media_handler_permits: default_media_handler_permits(),
         }
     }
 }
@@ -697,6 +718,15 @@ fn default_ipfs_gateway() -> String {
 fn default_max_upload() -> u64 {
     50
 }
+fn default_media_cache_total_mb() -> u64 {
+    256
+}
+fn default_media_cache_item_mb() -> u64 {
+    16
+}
+fn default_media_handler_permits() -> usize {
+    32
+}
 fn default_api_addr() -> String {
     "127.0.0.1".to_string()
 }
@@ -885,6 +915,64 @@ impl Config {
                     nid
                 );
             }
+        }
+        // Validate media-handler tunables (v0.40). These are read from
+        // IpfsConfig at AppState construction and feed directly into a
+        // moka cache + tokio Semaphore. A misconfigured value can break
+        // the media endpoint in ways that aren't recoverable at
+        // runtime — zero permits causes every request to block
+        // forever; absurdly large values revert the v0.39
+        // memory-amplification mitigation. Reject at config-load time.
+        //
+        // Upper bounds are deliberately wide enough that anyone with a
+        // legitimate tuning case can still pick a value, but narrow
+        // enough that a typo can't trigger an OOM-class regression.
+        if self.ipfs.media_handler_permits == 0 {
+            anyhow::bail!("ipfs.media_handler_permits must be > 0 (zero deadlocks the media endpoint)");
+        }
+        const MAX_MEDIA_PERMITS: usize = 4096;
+        if self.ipfs.media_handler_permits > MAX_MEDIA_PERMITS {
+            anyhow::bail!(
+                "ipfs.media_handler_permits = {} exceeds the safety cap of {}",
+                self.ipfs.media_handler_permits,
+                MAX_MEDIA_PERMITS
+            );
+        }
+        if self.ipfs.media_cache_total_mb == 0 {
+            anyhow::bail!("ipfs.media_cache_total_mb must be > 0");
+        }
+        if self.ipfs.media_cache_item_mb == 0 {
+            anyhow::bail!("ipfs.media_cache_item_mb must be > 0");
+        }
+        // Per-item cap larger than the total cache means every cached
+        // item evicts every other item. Functional but wasteful — and
+        // almost certainly a configuration typo.
+        if self.ipfs.media_cache_item_mb > self.ipfs.media_cache_total_mb {
+            anyhow::bail!(
+                "ipfs.media_cache_item_mb ({}) must be <= ipfs.media_cache_total_mb ({})",
+                self.ipfs.media_cache_item_mb,
+                self.ipfs.media_cache_total_mb
+            );
+        }
+        // Per-item cap larger than max upload makes no sense — items
+        // that large can't enter the system in the first place.
+        if self.ipfs.media_cache_item_mb > self.ipfs.max_upload_size_mb {
+            anyhow::bail!(
+                "ipfs.media_cache_item_mb ({}) must be <= ipfs.max_upload_size_mb ({})",
+                self.ipfs.media_cache_item_mb,
+                self.ipfs.max_upload_size_mb
+            );
+        }
+        // 64 GiB is a generous ceiling — even pathological tuning
+        // doesn't need more than this. Beyond, you're shifting the
+        // bottleneck to host memory; configure explicitly.
+        const MAX_MEDIA_CACHE_TOTAL_MB: u64 = 65_536;
+        if self.ipfs.media_cache_total_mb > MAX_MEDIA_CACHE_TOTAL_MB {
+            anyhow::bail!(
+                "ipfs.media_cache_total_mb = {} exceeds the safety cap of {} MiB",
+                self.ipfs.media_cache_total_mb,
+                MAX_MEDIA_CACHE_TOTAL_MB
+            );
         }
         Ok(())
     }

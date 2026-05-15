@@ -1,11 +1,15 @@
 [package]
 name = "ogmara-node"
-version = "0.39.0"
+version = "0.40.0"
 edition = "2021"
 authors = ["Ogmara Contributors"]
 license = "MIT"
 description = "Ogmara L2 network node — decentralized chat and news on Klever blockchain"
 publish = false
+
+[lib]
+name = "ogmara_node"
+path = "src/lib.rs"
 
 [[bin]]
 name = "ogmara-node"
