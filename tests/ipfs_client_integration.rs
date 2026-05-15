@@ -211,6 +211,7 @@ impl FakeKubo {
             media_cache_item_mb: 16,
             media_handler_permits: 32,
             media_per_ip_permits: 4,
+            media_max_tracked_ips: 65_536,
         };
         IpfsClient::new(&config).expect("ipfs client")
     }

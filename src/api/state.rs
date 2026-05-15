@@ -12,6 +12,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use super::media_limiter::PerIpSemaphore;
 
 use crate::ipfs::client::IpfsClient;
+use crate::trusted_proxies::TrustedProxies;
 use crate::messages::router::MessageRouter;
 use crate::metrics::counters::NetworkCounters;
 use crate::metrics::ring_buffer::RingBuffer;
@@ -64,6 +65,14 @@ pub const DEFAULT_MEDIA_HANDLER_PERMITS: usize = 32;
 /// Default per-IP concurrent media handler permits.
 pub const DEFAULT_MEDIA_PER_IP_PERMITS: usize = 4;
 
+/// Default hard cap on distinct IP buckets tracked by the per-IP
+/// limiter (v0.42). 65,536 entries at ~150 bytes apiece ≈ 10 MiB
+/// of resident DashMap state under worst-case fill — comfortable for
+/// any deployment that already provisioned enough RAM for the media
+/// cache. The cap engages only under adversarial /24 rotation; honest
+/// nodes typically sit well under 1,000 distinct buckets.
+pub const DEFAULT_MEDIA_MAX_TRACKED_IPS: usize = 65_536;
+
 /// Runtime values for media-handler resource caps. Built from
 /// `IpfsConfig` at node startup and passed into `AppState`; tests use
 /// `MediaTuning::default()` to get the documented defaults without
@@ -80,6 +89,11 @@ pub struct MediaTuning {
     /// can hold at most this many permits at once. Caps the
     /// single-IP DoS surface that the v0.39 audit flagged.
     pub per_ip_permits: usize,
+    /// Hard cap on the per-IP limiter's tracking map (v0.42). Bounds
+    /// memory growth under an adversarial /24-rotation flood that
+    /// would otherwise inflate the DashMap between the 5-minute
+    /// background sweeps.
+    pub max_tracked_ips: usize,
 }
 
 impl Default for MediaTuning {
@@ -89,6 +103,7 @@ impl Default for MediaTuning {
             cache_item_bytes: DEFAULT_MEDIA_CACHE_ITEM_BYTES,
             handler_permits: DEFAULT_MEDIA_HANDLER_PERMITS,
             per_ip_permits: DEFAULT_MEDIA_PER_IP_PERMITS,
+            max_tracked_ips: DEFAULT_MEDIA_MAX_TRACKED_IPS,
         }
     }
 }
@@ -100,10 +115,20 @@ impl Default for MediaTuning {
 /// 0 — without a cached type we'd otherwise have to fetch a 16-byte
 /// prefix just to sniff). The `Bytes` is reference-counted so cloning
 /// is O(1).
+///
+/// `last_modified` records when the entry was first cached. Used to
+/// emit `Last-Modified` on responses and to match `If-Range`
+/// HTTP-date validators (v0.42). CIDs are immutable so semantically
+/// the value is "when this node first observed the content"; on cache
+/// eviction + re-fetch the value updates, which means a client that
+/// got `Last-Modified: T1` from a previous request and tries to
+/// resume with `If-Range: T1` after eviction will see no match and
+/// fall back to a fresh 200 — correct per RFC 7233 §3.2.
 #[derive(Clone)]
 pub struct CachedMedia {
     pub bytes: Bytes,
     pub content_type: String,
+    pub last_modified: std::time::SystemTime,
 }
 
 /// Shared state accessible to all API handlers.
@@ -176,6 +201,12 @@ pub struct AppState {
     /// time. Read by `get_media` to decide between full-fetch and
     /// stream-range paths. Set from `IpfsConfig::media_cache_item_mb`.
     pub media_cache_item_bytes: usize,
+    /// Trusted-proxy set for client-IP resolution (v0.42). Built
+    /// from `api.trusted_proxies` at startup. The per-IP media
+    /// limiter and any future trust-the-proxy surface consult this
+    /// alongside the implicit loopback trust. Arc'd because handlers
+    /// hold cheap clones.
+    pub trusted_proxies: Arc<TrustedProxies>,
 }
 
 impl AppState {
@@ -220,6 +251,7 @@ impl AppState {
             String::new(), // node_address not needed in test constructor
             Arc::new(RwLock::new(None)), // snapshot cache — empty in tests
             MediaTuning::default(),
+            Arc::new(TrustedProxies::default()),
         )
     }
 
@@ -251,6 +283,7 @@ impl AppState {
         node_address: String,
         snapshot_cache: crate::network::snapshot::SharedSnapshotCache,
         media_tuning: MediaTuning,
+        trusted_proxies: Arc<TrustedProxies>,
     ) -> Self {
         // moka LRU with size-weighted eviction. `weigher` returns the
         // byte count of each value's body (content-type string is
@@ -269,6 +302,7 @@ impl AppState {
         let media_limiter = PerIpSemaphore::new(
             media_tuning.handler_permits,
             media_tuning.per_ip_permits,
+            media_tuning.max_tracked_ips,
         );
         Self {
             storage,
@@ -296,6 +330,7 @@ impl AppState {
             media_cache,
             media_limiter,
             media_cache_item_bytes: media_tuning.cache_item_bytes,
+            trusted_proxies,
         }
     }
 

@@ -1,6 +1,6 @@
 [package]
 name = "ogmara-node"
-version = "0.41.0"
+version = "0.42.0"
 edition = "2021"
 authors = ["Ogmara Contributors"]
 license = "MIT"
@@ -84,6 +84,7 @@ dashmap = "6.1"
 bs58 = "0.5"
 zstd = "0.13"                # Snapshot chunk compression (spec 11-snapshot-sync.md)
 moka = { version = "0.12", features = ["future"] }  # Bounded LRU for hot media (spec 4.1 §media)
+httpdate = "1.0"             # RFC 7231 HTTP-date parsing for If-Range / Last-Modified (v0.42)
 
 [dev-dependencies]
 tokio = { version = "1.50", features = ["test-util", "macros"] }
