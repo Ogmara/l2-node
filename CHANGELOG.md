@@ -5,6 +5,110 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.38.0] - 2026-05-15
+
+### Fixed
+- **`GET /api/v1/media/:cid` now supports HTTP `Range:` requests.**
+  Before this release every response was a single `200 OK` with the
+  full file body and no `Accept-Ranges` header. That made any
+  streaming-aware client (WebKitGTK `<video>`, VLC, mpv, ffplay,
+  hls.js, …) unable to play MP4 files whose `moov` atom is positioned
+  after `mdat` (the default for many encoders): the player needs to
+  seek to the end of the file to read the metadata box before it can
+  decode the data box, and a server that ignores Range makes that
+  seek impossible. Result: VLC and the WebKit-embedded `<video>`
+  element both errored with `mp4 stream error: no moov before mdat
+  and the stream is not seekable`, even though the bitstream itself
+  was perfectly valid. The handler now honours single-range requests
+  per RFC 7233 (`bytes=START-END`, `bytes=START-`, `bytes=-SUFFIX`),
+  returns `206 Partial Content` with proper `Content-Range` +
+  `Content-Length`, advertises `Accept-Ranges: bytes` on every
+  response (even the initial 200), and returns `416 Range Not
+  Satisfiable` on malformed or out-of-bounds ranges. Multi-range
+  requests (`bytes=0-99,200-299`) are not supported and fall through
+  to 416 — clients then retry with single-range. 14 new unit tests
+  in `media_tests` cover the parser.
+
+- **`detect_content_type` now recognises video and audio containers.**
+  Previously every non-image upload returned
+  `application/octet-stream`, which caused WebKit's `<video>` element
+  to refuse to even attempt decoding (the codec dispatcher reads
+  Content-Type before touching the bitstream). The detector now
+  identifies MP4/MOV/M4V/M4A (any `ftyp`-prefixed ISO Base Media file
+  → `video/mp4`), WebM/MKV (EBML signature → `video/webm`), Ogg
+  (`OggS` → `video/ogg`), AVI (`RIFF...AVI ` → `video/x-msvideo`),
+  MP3 (ID3 tag or MPEG audio sync word → `audio/mpeg`), WAV
+  (`RIFF...WAVE` → `audio/wav`), and FLAC (`fLaC` → `audio/flac`).
+  Existing PNG/JPEG/GIF/WebP/PDF detection is preserved. 9 new
+  detection tests in `media_tests`.
+
+### Why these matter together
+Either fix alone is insufficient. Without correct Content-Type the
+browser/player rejects the file at codec-dispatch time; without Range
+support the browser/player rejects it at demux time even when it
+knows the type. Both must be in place for an MP4 with an end-of-file
+`moov` atom (the typical encoder output) to play inline. With this
+release the desktop app's `VideoAttachment` should play H.264 in
+WebKitGTK directly (no "Open externally" fallback needed) on any
+Linux system whose GStreamer stack has `avdec_h264` registered.
+
+### Added (continued)
+- **`Vary: Range` header on every media response.** Without this,
+  intermediate caches (Apache `mod_cache`, Cloudflare, etc.) can
+  cache a 206 Partial Content under the same key as a 200 full
+  response, causing truncated bytes to be replayed to later
+  clients. Cache-poisoning vector identified in audit, now closed.
+- **`ETag: "<cid>"` + `If-None-Match` revalidation.** CIDs are
+  content-addressed (the bytes for a CID never change), making them
+  perfect strong validators per RFC 7232. Clients holding a fresh
+  copy can probe with `If-None-Match: "<cid>"` and receive `304
+  Not Modified` with no body — skips both the IPFS fetch and the
+  full-body transfer.
+- **`416 Range Not Satisfiable` response now includes
+  `Accept-Ranges: bytes`.** Older VLC builds otherwise give up
+  entirely on the first malformed-range response instead of
+  retrying with a corrected single-range request. Per RFC 9110
+  §15.5.17 recommendation.
+- **Defensive `usize::try_from` on byte-range bounds before
+  slicing.** No-op on 64-bit but guards correctness if anyone
+  cross-compiles for armv7 / wasm32, where a u64 → usize cast
+  would otherwise silently truncate and produce wrong slice bytes
+  (content confusion, panic, or both).
+
+### Deploy notes
+- **Apache reverse-proxy operators MUST disable gzip for the media
+  endpoint.** Range-byte semantics only work on the raw response
+  bytes; if `mod_deflate` re-encodes the body, the `Content-Range`
+  header's byte offsets no longer match what the client receives.
+  Add the following to your vhost (or to a `Location` block
+  scoped to `/api/v1/media/`):
+  ```apache
+  <Location /api/v1/media/>
+      SetEnv no-gzip 1
+      Header unset Content-Encoding
+  </Location>
+  ```
+- **Recommended: rate-limit `/api/v1/media/` at the proxy until
+  v0.39 ships.** See the security note below — until streaming
+  IPFS lands, the handler is a candidate DoS vector under sustained
+  load and should be throttled in front (e.g. `mod_ratelimit` /
+  `mod_qos` on Apache, or a Cloudflare rate-limiting rule).
+
+### Known security limitation (deferred — tracked for v0.39)
+- **Memory-amplification DoS vector on the media handler.** The
+  handler fetches the entire IPFS blob into memory before slicing
+  it for the Range response. Under sustained load this is a
+  candidate denial-of-service vector: ~200 concurrent clients
+  rolling Range requests against a 50 MB asset peaks at ~20 GB
+  transient RSS, more than enough to OOM-kill the node on most
+  deployments. Mitigated for now by the proxy-layer rate limit
+  above. Permanent fix in v0.39: switch to a streaming IPFS read
+  (`/api/v0/cat?offset=&length=`) + bounded LRU cache for hot
+  media + semaphore on concurrent handlers. This issue is not new
+  to 0.38 — the pre-0.38 handler had the same full-blob fetch
+  pattern — but the Range support makes per-request churn cheaper
+  to trigger, so the proxy-level cap matters more now.
+
 ## [0.37.0] - 2026-05-15
 
 ### Fixed
