@@ -654,6 +654,28 @@ impl Node {
             info!("Alert engine started");
         }
 
+        // Resolve media-handler tuning from IpfsConfig. Anything the
+        // operator left at default in ogmara.toml falls through to
+        // `default_media_*` (see `config.rs`). Conversion to bytes is
+        // saturating to guard against absurd config; values are also
+        // validated at config-load time (`Config::validate`) so this
+        // is double protection.
+        //
+        // `usize::try_from` is the 32-bit-correct cast (audit warning
+        // W-3 security). On 64-bit targets it's a no-op; on 32-bit it
+        // saturates at usize::MAX rather than silently truncating the
+        // high bits to zero.
+        let media_tuning = crate::api::state::MediaTuning {
+            cache_total_bytes: self
+                .config
+                .ipfs
+                .media_cache_total_mb
+                .saturating_mul(1024 * 1024),
+            cache_item_bytes: usize::try_from(self.config.ipfs.media_cache_item_mb)
+                .unwrap_or(usize::MAX)
+                .saturating_mul(1024 * 1024),
+            handler_permits: self.config.ipfs.media_handler_permits,
+        };
         let app_state = Arc::new(crate::api::state::AppState::with_broadcast(
             self.storage.clone(),
             api_router,
@@ -676,6 +698,7 @@ impl Node {
             pow_manager.clone(),
             node_address,
             snapshot_cache.clone(),
+            media_tuning,
         ));
         // Periodic cleanup task: evict stale rate limit entries and expired PoW challenges.
         // Runs every 5 minutes to prevent unbounded memory growth.

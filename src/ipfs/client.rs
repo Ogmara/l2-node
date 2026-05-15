@@ -21,6 +21,60 @@ const ALLOWED_MIME_PREFIXES: &[&str] = &[
     "text/plain",
 ];
 
+/// Maximum bytes to read from a stat-shaped IPFS response (files/stat,
+/// object/stat). Real Kubo responses are ~200 bytes JSON; this is
+/// generous headroom while still protecting against a hostile or
+/// corrupted daemon streaming gigabytes into our lightweight probes.
+const MAX_STAT_RESPONSE_BYTES: usize = 8 * 1024;
+
+/// Read a `reqwest::Response` body into a `Vec<u8>` with an
+/// INCREMENTAL size cap. The cap is enforced as bytes accumulate
+/// rather than after the full body is buffered — important because
+/// a `Content-Length`-less chunked-transfer response can otherwise
+/// stream unbounded data into the post-buffer length check before
+/// any limit fires.
+///
+/// Used by the stat-shaped endpoints (`get_size`, `exists_local`)
+/// where we always expect a tiny response and any large body is a
+/// signal that something is wrong with the upstream Kubo.
+///
+/// Returns `Err` if the response declares a `Content-Length` larger
+/// than `max_bytes`, OR if accumulated bytes exceed `max_bytes`
+/// during the streamed read, OR on transport-level read failures.
+async fn read_body_capped(
+    resp: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
+    // Cheap pre-check: reject early when the server declares an
+    // oversize Content-Length. Saves the streaming round-trip when
+    // the server is honest about its body size.
+    if let Some(declared) = resp.content_length() {
+        if declared > max_bytes as u64 {
+            anyhow::bail!(
+                "response too large: declared {} bytes (max {})",
+                declared,
+                max_bytes
+            );
+        }
+    }
+    let mut resp = resp;
+    let mut buf: Vec<u8> = Vec::with_capacity(max_bytes.min(8 * 1024));
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .context("reading body chunk")?
+    {
+        if buf.len() + chunk.len() > max_bytes {
+            anyhow::bail!(
+                "response exceeded {} bytes during streamed read",
+                max_bytes
+            );
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
 /// IPFS client for the Ogmara L2 node.
 #[derive(Clone)]
 pub struct IpfsClient {
@@ -274,11 +328,6 @@ impl IpfsClient {
     pub async fn get_size(&self, cid: &str) -> Result<u64> {
         validate_cid(cid)?;
 
-        // Cap the stat response — a malicious or corrupted Kubo could
-        // otherwise stream gigabytes of JSON. Real stat responses are
-        // ~200 bytes; 8 KiB is comfortable headroom.
-        const MAX_STAT_BYTES: usize = 8 * 1024;
-
         let url = format!(
             "{}/api/v0/files/stat?arg=/ipfs/{}&offline=true",
             self.api_url, cid
@@ -291,16 +340,15 @@ impl IpfsClient {
             .await
             .context("fetching IPFS files/stat")?;
 
-        if let Some(len) = resp.content_length() {
-            if len as usize > MAX_STAT_BYTES {
-                anyhow::bail!("IPFS stat response too large: {} bytes", len);
-            }
-        }
-
-        let body = resp.bytes().await.context("reading IPFS stat body")?;
-        if body.len() > MAX_STAT_BYTES {
-            anyhow::bail!("IPFS stat response too large: {} bytes", body.len());
-        }
+        // Stream-read with an INCREMENTAL cap. The v0.39 code buffered
+        // the full body and then checked size — fine when Kubo declares
+        // Content-Length, but a chunked-transfer response with no
+        // Content-Length could stream gigabytes before the post-buffer
+        // check fired (audit security warning W-2). `read_body_capped`
+        // aborts the read as soon as accumulated bytes exceed the cap.
+        let body = read_body_capped(resp, MAX_STAT_RESPONSE_BYTES)
+            .await
+            .context("reading IPFS stat body")?;
 
         let val: serde_json::Value = serde_json::from_slice(&body)
             .context("parsing IPFS files/stat response")?;
@@ -324,17 +372,19 @@ impl IpfsClient {
     /// failures (Kubo unreachable, etc.). A "not found" response is
     /// not treated as an error — it's the expected answer for an
     /// unknown CID.
+    ///
+    /// **Behavior across Kubo versions** (v0.40 audit hardening):
+    /// Kubo has historically signalled "not local" in two ways:
+    ///   * HTTP 500 + error JSON  (current convention)
+    ///   * HTTP 200 + `{"Error": "..."}` body (older builds, and a
+    ///     plausible future regression — Kubo's HTTP API has flipped
+    ///     between these before)
+    /// We treat BOTH as "not local" to make the probe stable across
+    /// Kubo upgrades. A successful response with no `Error` key is
+    /// the only path that reports the CID as local.
     pub async fn exists_local(&self, cid: &str) -> Result<bool> {
         validate_cid(cid)?;
 
-        // `files/stat` with `offline=true` returns:
-        //   * HTTP 200 + JSON when the CID is local
-        //   * HTTP 500 + error JSON when the CID isn't local (Kubo's
-        //     convention — the underlying error is "block not found
-        //     locally" which surfaces as 500 because Kubo's HTTP API
-        //     uses 500 for application-layer errors).
-        // Either response shape is small, so we read it via the same
-        // bounded helper as `get_size`.
         let url = format!(
             "{}/api/v0/files/stat?arg=/ipfs/{}&offline=true",
             self.api_url, cid
@@ -347,7 +397,42 @@ impl IpfsClient {
             .await
             .context("checking IPFS local existence")?;
 
-        Ok(resp.status().is_success())
+        // Non-success status → not local. The most common case is
+        // Kubo's "block not found locally" returned as 500.
+        if !resp.status().is_success() {
+            return Ok(false);
+        }
+
+        // 2xx body — parse to disambiguate between a real
+        // local-stat response and the older `200 + {"Error":...}`
+        // convention. Bounded INCREMENTAL read protects against a
+        // hostile chunked-transfer body that could otherwise stream
+        // gigabytes before a post-buffer check (audit security W-2).
+        let body = match read_body_capped(resp, MAX_STAT_RESPONSE_BYTES).await {
+            Ok(b) => b,
+            Err(e) => {
+                // Body too large or read error → conservative answer.
+                // Logging at debug — this is expected in some failure
+                // modes and isn't an action item for the operator.
+                debug!(cid = %cid, error = %e, "exists_local body read failed");
+                return Ok(false);
+            }
+        };
+        let val: serde_json::Value =
+            match serde_json::from_slice(&body) {
+                Ok(v) => v,
+                Err(_) => {
+                    // Unparseable success body — Kubo is misbehaving.
+                    // Conservative answer: not local.
+                    return Ok(false);
+                }
+            };
+        // Treat any `Error` key (string or nested object) as
+        // "not local", regardless of HTTP status.
+        if !val["Error"].is_null() {
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     /// Pin a CID on the local IPFS node.

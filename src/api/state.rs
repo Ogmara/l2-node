@@ -27,7 +27,7 @@ pub struct ConnectedPeerInfo {
     pub agent_version: String,
 }
 
-// --- Media handler tunables (v0.39) ----------------------------------------
+// --- Media handler tunables (v0.39, config-driven in v0.40) ----------------
 //
 // These caps shape the memory footprint of `/api/v1/media/:cid`. The
 // rationale is documented in CHANGELOG v0.39.0 — short version: the
@@ -35,29 +35,53 @@ pub struct ConnectedPeerInfo {
 // no concurrency cap, which made the endpoint a candidate DoS vector
 // under sustained load (200 concurrent clients × 50 MB ≈ 10 GB RSS).
 //
-// `MEDIA_CACHE_TOTAL_BYTES` bounds the LRU's total weight; moka evicts
-// least-recently-used entries when adding a new one pushes over the
-// cap. `MEDIA_CACHE_ITEM_BYTES` skips caching files larger than this
-// (large videos are streamed from IPFS each time — the
-// content-addressed property means client-side and Apache caches still
-// help on repeated viewers, and a single video doesn't push out
-// hundreds of small thumbnails).
+// `cache_total_bytes` bounds the moka LRU's total weight; entries are
+// evicted least-recently-used when adding pushes over the cap.
+// `cache_item_bytes` skips caching files larger than this (large
+// videos are streamed from IPFS each time — the content-addressed
+// property means Apache + browser caches still help on repeated
+// viewers, and a single video doesn't push out hundreds of small
+// thumbnails).
 //
-// `MEDIA_HANDLER_PERMITS` caps concurrent media handlers; further
-// requests queue on the semaphore. Combined with the per-fetch
+// `handler_permits` caps concurrent media handlers; further requests
+// queue on the semaphore. Combined with the per-fetch
 // `max_upload_bytes`, peak transient RSS is bounded at
 // permits × max_upload. With defaults (32 × 50 MB = 1.6 GB) this is
 // comfortably below a single-node OOM threshold.
 
-/// Total bytes the media LRU is allowed to hold across all entries.
-pub const MEDIA_CACHE_TOTAL_BYTES: u64 = 256 * 1024 * 1024; // 256 MB
+/// Default total bytes the media LRU is allowed to hold across all
+/// entries (used when no `IpfsConfig::media_cache_total_mb` is set).
+pub const DEFAULT_MEDIA_CACHE_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
 
-/// Maximum size of a single cacheable media item. Items larger than
-/// this are served from IPFS every time (streamed, not buffered).
-pub const MEDIA_CACHE_ITEM_BYTES: usize = 16 * 1024 * 1024; // 16 MB
+/// Default per-item cache cap.
+pub const DEFAULT_MEDIA_CACHE_ITEM_BYTES: usize = 16 * 1024 * 1024;
 
-/// Maximum concurrent in-flight `/api/v1/media/:cid` handlers.
-pub const MEDIA_HANDLER_PERMITS: usize = 32;
+/// Default concurrent media handler permits.
+pub const DEFAULT_MEDIA_HANDLER_PERMITS: usize = 32;
+
+/// Runtime values for media-handler resource caps. Built from
+/// `IpfsConfig` at node startup and passed into `AppState`; tests use
+/// `MediaTuning::default()` to get the documented defaults without
+/// dragging `IpfsConfig` into the test surface.
+#[derive(Debug, Clone, Copy)]
+pub struct MediaTuning {
+    /// Total LRU weight in bytes.
+    pub cache_total_bytes: u64,
+    /// Per-item cache cap in bytes.
+    pub cache_item_bytes: usize,
+    /// Concurrent media handler permits.
+    pub handler_permits: usize,
+}
+
+impl Default for MediaTuning {
+    fn default() -> Self {
+        Self {
+            cache_total_bytes: DEFAULT_MEDIA_CACHE_TOTAL_BYTES,
+            cache_item_bytes: DEFAULT_MEDIA_CACHE_ITEM_BYTES,
+            handler_permits: DEFAULT_MEDIA_HANDLER_PERMITS,
+        }
+    }
+}
 
 /// One cached media body + its sniffed Content-Type. Caching the type
 /// alongside the bytes avoids re-running `detect_content_type` on
@@ -126,15 +150,21 @@ pub struct AppState {
     pub snapshot_cache: crate::network::snapshot::SharedSnapshotCache,
     /// LRU cache of fully-fetched media (body + sniffed content-type),
     /// keyed by CID. Hot media (small thumbnails, frequently-accessed
-    /// images) serves from memory; items above `MEDIA_CACHE_ITEM_BYTES`
-    /// are never inserted and stream-from-IPFS on every request.
-    /// Bounded total weight at `MEDIA_CACHE_TOTAL_BYTES`.
+    /// images) serves from memory; items above
+    /// `media_cache_item_bytes` are never inserted and stream-from-IPFS
+    /// on every request. Bounded total weight at
+    /// `IpfsConfig::media_cache_total_mb` (in `with_broadcast`).
     pub media_cache: Cache<String, CachedMedia>,
     /// Semaphore bounding concurrent `/api/v1/media/:cid` handlers.
     /// Combined with per-fetch caps, this bounds peak transient RSS
     /// from the media endpoint to roughly
-    /// `MEDIA_HANDLER_PERMITS * max_upload_bytes`.
+    /// `permits * max_upload_size_mb` MiB.
     pub media_semaphore: Arc<Semaphore>,
+    /// Per-item cache cap (bytes). Items above this size are NOT
+    /// inserted into `media_cache`; they're streamed from IPFS each
+    /// time. Read by `get_media` to decide between full-fetch and
+    /// stream-range paths. Set from `IpfsConfig::media_cache_item_mb`.
+    pub media_cache_item_bytes: usize,
 }
 
 impl AppState {
@@ -178,6 +208,7 @@ impl AppState {
             None, // PoW disabled in test/simplified constructor
             String::new(), // node_address not needed in test constructor
             Arc::new(RwLock::new(None)), // snapshot cache — empty in tests
+            MediaTuning::default(),
         )
     }
 
@@ -208,22 +239,23 @@ impl AppState {
         pow: Option<Arc<PowManager>>,
         node_address: String,
         snapshot_cache: crate::network::snapshot::SharedSnapshotCache,
+        media_tuning: MediaTuning,
     ) -> Self {
         // moka LRU with size-weighted eviction. `weigher` returns the
         // byte count of each value's body (content-type string is
         // negligible); once `max_capacity` is reached, moka evicts
         // least-recently-used entries until the new insert fits. The
         // `try_into().unwrap_or(u32::MAX)` is defensive — we already
-        // gate inserts at `MEDIA_CACHE_ITEM_BYTES` so values can't
+        // gate inserts at `media_cache_item_bytes` so values can't
         // exceed u32::MAX, but a future bug that bypasses the gate
         // should saturate rather than panic on the cast.
         let media_cache: Cache<String, CachedMedia> = Cache::builder()
             .weigher(|_k: &String, v: &CachedMedia| {
                 v.bytes.len().try_into().unwrap_or(u32::MAX)
             })
-            .max_capacity(MEDIA_CACHE_TOTAL_BYTES)
+            .max_capacity(media_tuning.cache_total_bytes)
             .build();
-        let media_semaphore = Arc::new(Semaphore::new(MEDIA_HANDLER_PERMITS));
+        let media_semaphore = Arc::new(Semaphore::new(media_tuning.handler_permits));
         Self {
             storage,
             router,
@@ -249,6 +281,7 @@ impl AppState {
             snapshot_cache,
             media_cache,
             media_semaphore,
+            media_cache_item_bytes: media_tuning.cache_item_bytes,
         }
     }
 
