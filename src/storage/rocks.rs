@@ -1589,7 +1589,18 @@ impl Storage {
         self.put_cf(cf::EDIT_HISTORY, &key, edit_msg_id)
     }
 
-    /// Get the edit history for a message (returns edit_msg_ids in chronological order).
+    /// Get the edit history for a message.
+    ///
+    /// **Ordering contract:** returns entries in ASCENDING `(timestamp, edit_msg_id)`
+    /// order — the caller MUST rely on `vec.last()` being the most recent
+    /// edit. This is what `enrich_message_json` does to surface the latest
+    /// version of the message. The order is a consequence of the key
+    /// encoding `(original_msg_id || timestamp_be)`: RocksDB iterates
+    /// keys in lexicographic order, big-endian timestamps sort the same
+    /// way as numeric timestamps. Any change to the key encoding (e.g.
+    /// reversing the timestamp to make "newest first" O(1)) MUST also
+    /// reverse the iteration here, or every projection will surface the
+    /// oldest edit instead of the newest.
     pub fn get_edit_history(
         &self,
         original_msg_id: &[u8; 32],

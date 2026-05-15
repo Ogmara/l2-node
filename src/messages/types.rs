@@ -479,6 +479,25 @@ pub struct EditPayload {
     pub content: String,
     /// Timestamp of the edit.
     pub edited_at: u64,
+    // -- Optional field-level overrides (spec 3.7, added in L2 v0.37). --
+    // When `None`, the corresponding field on the original payload is preserved
+    // (this is what fixes the "edit drops title/tags/attachments" bug). When
+    // `Some(_)`, the original field is replaced wholesale during read-time
+    // projection in `enrich_message_json`. Per-type semantics:
+    //   - NewsEdit:        title, tags, attachments all applicable
+    //   - ChatEdit:        attachments applicable; title/tags ignored
+    //   - DirectMessageEdit: all ignored (encrypted ciphertext only)
+    // Trailing position + `#[serde(default)]` keeps msgpack wire-compat: old
+    // 4-element edit envelopes still decode into the new struct.
+    /// Optional new title (news posts only).
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Optional new tags (news posts only).
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+    /// Optional new attachments (news posts + chat messages).
+    #[serde(default)]
+    pub attachments: Option<Vec<Attachment>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -216,6 +216,12 @@ pub fn validate_profile_update(p: &ProfileUpdatePayload) -> Result<(), Validatio
 }
 
 /// Validate an edit payload (generic — applies to all edit types).
+///
+/// Only the router's per-type validators (`validate_chat_edit`,
+/// `validate_dm_edit`, `validate_news_edit`) are reached during normal
+/// dispatch; this remains as a defensive fallback for unforeseen msg_types.
+/// Treats title/tags/attachments under the **news** caps, since that is the
+/// most permissive of the three (chat/dm forbid them entirely).
 pub fn validate_edit(p: &EditPayload) -> Result<(), ValidationError> {
     if p.content.is_empty() {
         return Err(ValidationError("content must not be empty".into()));
@@ -223,13 +229,41 @@ pub fn validate_edit(p: &EditPayload) -> Result<(), ValidationError> {
     if p.content.len() > MAX_NEWS_CONTENT {
         return Err(ValidationError("content too long".into()));
     }
+    if let Some(ref title) = p.title {
+        if title.len() > MAX_NEWS_TITLE {
+            return Err(ValidationError("title too long".into()));
+        }
+    }
+    if let Some(ref tags) = p.tags {
+        if tags.len() > MAX_NEWS_TAGS {
+            return Err(ValidationError("too many tags".into()));
+        }
+        for tag in tags {
+            if tag.len() > MAX_TAG_LENGTH {
+                return Err(ValidationError("tag too long".into()));
+            }
+        }
+    }
+    if let Some(ref atts) = p.attachments {
+        if atts.len() > MAX_ATTACHMENTS {
+            return Err(ValidationError("too many attachments".into()));
+        }
+    }
     Ok(())
 }
 
-/// Validate a chat edit payload — content not empty, within chat length limits.
+/// Validate a chat edit payload — within chat length limits, with create-path parity.
+///
+/// `validate_chat_message` permits an empty content string when the
+/// message carries at least one attachment ("photo with no caption"). The
+/// edit validator must mirror that asymmetry, otherwise the user can
+/// upload an attach-only chat but then can't edit the text away without
+/// also removing the file. Empty content is rejected only when no
+/// non-empty attachment list is supplied.
 pub fn validate_chat_edit(p: &EditPayload) -> Result<(), ValidationError> {
-    if p.content.is_empty() {
-        return Err(ValidationError("content must not be empty".into()));
+    let has_attachments = matches!(p.attachments, Some(ref a) if !a.is_empty());
+    if p.content.is_empty() && !has_attachments {
+        return Err(ValidationError("content or attachments required".into()));
     }
     if p.content.len() > MAX_CHAT_CONTENT {
         return Err(ValidationError(format!(
@@ -237,6 +271,20 @@ pub fn validate_chat_edit(p: &EditPayload) -> Result<(), ValidationError> {
             p.content.len(),
             MAX_CHAT_CONTENT
         )));
+    }
+    // Chat edits cannot change title/tags (those fields don't exist on
+    // ChatMessagePayload). Reject explicit attempts so the client can't
+    // silently set values that the projection will ignore — easier debugging.
+    if p.title.is_some() {
+        return Err(ValidationError("title not allowed on chat edit".into()));
+    }
+    if p.tags.is_some() {
+        return Err(ValidationError("tags not allowed on chat edit".into()));
+    }
+    if let Some(ref atts) = p.attachments {
+        if atts.len() > MAX_ATTACHMENTS {
+            return Err(ValidationError("too many attachments".into()));
+        }
     }
     Ok(())
 }
@@ -261,6 +309,13 @@ pub fn validate_dm_edit(p: &EditPayload) -> Result<(), ValidationError> {
             MAX_CHAT_CONTENT
         )));
     }
+    // DMs are end-to-end encrypted ciphertext; field-level overrides have no
+    // meaning. Reject explicit attempts.
+    if p.title.is_some() || p.tags.is_some() || p.attachments.is_some() {
+        return Err(ValidationError(
+            "field overrides not allowed on DM edit".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -273,12 +328,36 @@ pub fn validate_dm_delete(p: &DeletePayload) -> Result<(), ValidationError> {
 }
 
 /// Validate a news edit payload — content not empty, within news length limits.
+///
+/// Field-level overrides (title/tags/attachments) — when present — must
+/// satisfy the same caps as `validate_news_post`. When absent the original
+/// post's value is preserved at read-time projection.
 pub fn validate_news_edit(p: &EditPayload) -> Result<(), ValidationError> {
     if p.content.is_empty() {
         return Err(ValidationError("content must not be empty".into()));
     }
     if p.content.len() > MAX_NEWS_CONTENT {
         return Err(ValidationError("content too long".into()));
+    }
+    if let Some(ref title) = p.title {
+        if title.len() > MAX_NEWS_TITLE {
+            return Err(ValidationError("title too long".into()));
+        }
+    }
+    if let Some(ref tags) = p.tags {
+        if tags.len() > MAX_NEWS_TAGS {
+            return Err(ValidationError("too many tags".into()));
+        }
+        for tag in tags {
+            if tag.len() > MAX_TAG_LENGTH {
+                return Err(ValidationError("tag too long".into()));
+            }
+        }
+    }
+    if let Some(ref atts) = p.attachments {
+        if atts.len() > MAX_ATTACHMENTS {
+            return Err(ValidationError("too many attachments".into()));
+        }
     }
     Ok(())
 }
@@ -712,6 +791,7 @@ pub fn validate_news_repost(author: &str, p: &NewsRepostPayload) -> Result<(), V
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Serialize;
 
     fn empty_update(channel_id: u64) -> ChannelUpdatePayload {
         ChannelUpdatePayload {
@@ -783,5 +863,152 @@ mod tests {
         assert!(validate_channel_update(&p).is_ok());
         p.threads_enabled = Some(false);
         assert!(validate_channel_update(&p).is_ok());
+    }
+
+    // --- Edit-payload field-override tests (spec 3.7 extension) ---
+
+    fn base_edit() -> EditPayload {
+        EditPayload {
+            target_id: [1u8; 32],
+            channel_id: None,
+            content: "updated".into(),
+            edited_at: 1_700_000_000_000,
+            title: None,
+            tags: None,
+            attachments: None,
+        }
+    }
+
+    #[test]
+    fn news_edit_accepts_optional_overrides() {
+        let mut p = base_edit();
+        p.title = Some("New Title".into());
+        p.tags = Some(vec!["a".into(), "b".into()]);
+        p.attachments = Some(vec![]);
+        assert!(validate_news_edit(&p).is_ok());
+    }
+
+    #[test]
+    fn news_edit_rejects_oversize_title() {
+        let mut p = base_edit();
+        p.title = Some("x".repeat(MAX_NEWS_TITLE + 1));
+        assert!(validate_news_edit(&p).is_err());
+    }
+
+    #[test]
+    fn news_edit_rejects_too_many_tags() {
+        let mut p = base_edit();
+        p.tags = Some(vec!["t".into(); MAX_NEWS_TAGS + 1]);
+        assert!(validate_news_edit(&p).is_err());
+    }
+
+    #[test]
+    fn news_edit_rejects_oversize_tag() {
+        let mut p = base_edit();
+        p.tags = Some(vec!["x".repeat(MAX_TAG_LENGTH + 1)]);
+        assert!(validate_news_edit(&p).is_err());
+    }
+
+    #[test]
+    fn news_edit_rejects_too_many_attachments() {
+        let mut p = base_edit();
+        p.attachments = Some(vec![
+            Attachment {
+                cid: "Qm".into(),
+                mime_type: "image/png".into(),
+                size_bytes: 0,
+                filename: None,
+                thumbnail_cid: None,
+            };
+            MAX_ATTACHMENTS + 1
+        ]);
+        assert!(validate_news_edit(&p).is_err());
+    }
+
+    #[test]
+    fn chat_edit_rejects_title_or_tags() {
+        let mut p = base_edit();
+        p.content = "c".into();
+        p.title = Some("nope".into());
+        assert!(validate_chat_edit(&p).is_err());
+        p.title = None;
+        p.tags = Some(vec!["nope".into()]);
+        assert!(validate_chat_edit(&p).is_err());
+    }
+
+    #[test]
+    fn chat_edit_accepts_attachments_within_cap() {
+        let mut p = base_edit();
+        p.content = "c".into();
+        p.attachments = Some(vec![]);
+        assert!(validate_chat_edit(&p).is_ok());
+    }
+
+    #[test]
+    fn chat_edit_accepts_empty_content_with_attachments() {
+        // Parity with `validate_chat_message`: attach-only messages are
+        // legal at create time, so the same must hold at edit time.
+        let mut p = base_edit();
+        p.content = "".into();
+        p.attachments = Some(vec![Attachment {
+            cid: "Qm".into(),
+            mime_type: "image/png".into(),
+            size_bytes: 100,
+            filename: None,
+            thumbnail_cid: None,
+        }]);
+        assert!(validate_chat_edit(&p).is_ok());
+    }
+
+    #[test]
+    fn chat_edit_rejects_empty_content_and_no_attachments() {
+        let mut p = base_edit();
+        p.content = "".into();
+        p.attachments = None;
+        assert!(validate_chat_edit(&p).is_err());
+        p.attachments = Some(vec![]);
+        assert!(validate_chat_edit(&p).is_err());
+    }
+
+    #[test]
+    fn dm_edit_rejects_any_override() {
+        let mut p = base_edit();
+        p.content = "c".into();
+        p.attachments = Some(vec![]);
+        assert!(validate_dm_edit(&p).is_err());
+    }
+
+    /// Wire-format compatibility: an old 4-element edit envelope must still
+    /// decode after the struct gains optional fields. This guards against an
+    /// accidental field reordering or removal of `#[serde(default)]`.
+    #[test]
+    fn edit_payload_decodes_legacy_four_field_msgpack() {
+        // Manually craft a 4-element msgpack array matching the pre-extension
+        // wire format: [target_id, channel_id, content, edited_at].
+        let legacy = EditPayloadLegacy {
+            target_id: [7u8; 32],
+            channel_id: Some(42),
+            content: "legacy".into(),
+            edited_at: 1_000,
+        };
+        let bytes = rmp_serde::to_vec(&legacy).expect("encode legacy");
+        let decoded: EditPayload = rmp_serde::from_slice(&bytes).expect("decode new struct");
+        assert_eq!(decoded.target_id, [7u8; 32]);
+        assert_eq!(decoded.channel_id, Some(42));
+        assert_eq!(decoded.content, "legacy");
+        assert_eq!(decoded.edited_at, 1_000);
+        assert!(decoded.title.is_none());
+        assert!(decoded.tags.is_none());
+        assert!(decoded.attachments.is_none());
+    }
+
+    // Replica of the pre-extension struct shape — used only by the test above
+    // to produce a wire-format we no longer write from production code.
+    #[derive(Serialize)]
+    struct EditPayloadLegacy {
+        target_id: [u8; 32],
+        channel_id: Option<u64>,
+        content: String,
+        edited_at: u64,
     }
 }

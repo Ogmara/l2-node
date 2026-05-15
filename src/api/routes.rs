@@ -170,6 +170,108 @@ fn envelope_to_json(
     val
 }
 
+/// Apply the latest edit envelope on top of the original message's payload
+/// and return the merged payload as fresh msgpack bytes. Returns `None` on
+/// any decode failure, when the original message is missing, or when the
+/// `msg_type` is one without a defined edit-merge rule — the caller treats
+/// `None` as "unrecoverable edit" and blanks the response's `payload` to
+/// avoid leaking pre-edit content (privacy fail-safe).
+///
+/// Per-type merge semantics (spec §3.7):
+///   - `NewsPost`     — content always; title/tags/attachments when `Some(_)`.
+///   - `ChatMessage`  — content always; attachments when `Some(_)`. mentions
+///                      stay untouched by edits (re-triggering @-notifications
+///                      from an edit would invite spam).
+///   - `DirectMessage`— rejected at validation (encrypted ciphertext blobs
+///                      have no field-level shape from the server's view);
+///                      returns `None` if it ever gets here.
+///   - Anything else  — including hypothetical comment-edits, returns `None`
+///                      until a corresponding `MessageType` variant and
+///                      router dispatch exist.
+fn project_edited_payload(
+    original_msg_id: &[u8; 32],
+    edit_msg_id: &[u8; 32],
+    storage: &crate::storage::rocks::Storage,
+) -> Option<Vec<u8>> {
+    use crate::messages::envelope::Envelope;
+    use crate::messages::types::{ChatMessagePayload, EditPayload, MessageType, NewsPostPayload};
+
+    // Helper: turn each decode/IO failure into a tracing warn so storage
+    // corruption is observable instead of presenting as "the edit just
+    // didn't apply". Using a closure for the trace tag avoids repeating
+    // the msg_ids in every log call.
+    let warn_decode = |stage: &'static str, err: &dyn std::fmt::Display| {
+        tracing::warn!(
+            stage = stage,
+            original = %hex::encode(original_msg_id),
+            edit = %hex::encode(edit_msg_id),
+            error = %err,
+            "edit projection failed",
+        );
+    };
+
+    // Pull both envelopes from storage. A failure at any step bails out —
+    // the caller treats `None` as "unrecoverable edit" and blanks the
+    // payload (so a redacting edit never reveals the pre-edit content).
+    let orig_bytes = match storage.get_message(original_msg_id) {
+        Ok(Some(b)) => b,
+        Ok(None) => { warn_decode("original_missing", &"not in storage"); return None; }
+        Err(e) => { warn_decode("original_read", &e); return None; }
+    };
+    let orig_env = match Envelope::from_bytes(&orig_bytes) {
+        Ok(e) => e,
+        Err(e) => { warn_decode("original_envelope_decode", &e); return None; }
+    };
+
+    let edit_bytes = match storage.get_message(edit_msg_id) {
+        Ok(Some(b)) => b,
+        Ok(None) => { warn_decode("edit_missing", &"not in storage"); return None; }
+        Err(e) => { warn_decode("edit_read", &e); return None; }
+    };
+    let edit_env = match Envelope::from_bytes(&edit_bytes) {
+        Ok(e) => e,
+        Err(e) => { warn_decode("edit_envelope_decode", &e); return None; }
+    };
+    let edit: EditPayload = match rmp_serde::from_slice(&edit_env.payload) {
+        Ok(e) => e,
+        Err(e) => { warn_decode("edit_payload_decode", &e); return None; }
+    };
+
+    // Only message types whose Rust struct EditPayload can target are
+    // handled. There is no `NewsCommentEdit` message type today (router
+    // dispatches only ChatEdit / DirectMessageEdit / NewsEdit), and DMs
+    // are encrypted ciphertext blobs whose validator forbids field
+    // overrides — so comments and DMs return None and the caller blanks
+    // the payload (consistent privacy fail-safe).
+    match orig_env.msg_type {
+        MessageType::NewsPost => {
+            let mut p: NewsPostPayload = match rmp_serde::from_slice(&orig_env.payload) {
+                Ok(v) => v,
+                Err(e) => { warn_decode("news_post_decode", &e); return None; }
+            };
+            p.content = edit.content;
+            if let Some(t) = edit.title { p.title = t; }
+            if let Some(t) = edit.tags { p.tags = t; }
+            if let Some(a) = edit.attachments { p.attachments = a; }
+            rmp_serde::to_vec(&p)
+                .map_err(|e| warn_decode("news_post_reencode", &e))
+                .ok()
+        }
+        MessageType::ChatMessage => {
+            let mut p: ChatMessagePayload = match rmp_serde::from_slice(&orig_env.payload) {
+                Ok(v) => v,
+                Err(e) => { warn_decode("chat_decode", &e); return None; }
+            };
+            p.content = edit.content;
+            if let Some(a) = edit.attachments { p.attachments = a; }
+            rmp_serde::to_vec(&p)
+                .map_err(|e| warn_decode("chat_reencode", &e))
+                .ok()
+        }
+        _ => None,
+    }
+}
+
 /// Enrich a message JSON value with deletion and edit status from storage.
 ///
 /// Checks the storage layer for soft-deletion markers and edit history,
@@ -212,23 +314,48 @@ fn enrich_message_json(msg: &mut serde_json::Value, storage: &crate::storage::ro
         }
     }
 
-    // Check edit status and replace payload with latest edit content
-    if let Ok(true) = storage.is_edited(&msg_id) {
-        if let serde_json::Value::Object(ref mut map) = msg {
-            map.insert("edited".into(), serde_json::json!(true));
-            if let Ok(edits) = storage.get_edit_history(&msg_id) {
-                if let Some((last_ts, edit_msg_id)) = edits.last() {
-                    map.insert("last_edited_at".into(), serde_json::json!(last_ts));
-                    // Fetch the edit envelope and replace payload with new content
-                    if let Ok(Some(edit_bytes)) = storage.get_message(edit_msg_id) {
-                        if let Ok(edit_env) = rmp_serde::from_slice::<
-                            crate::messages::envelope::Envelope,
-                        >(&edit_bytes) {
-                            if let Ok(edit_payload) = rmp_serde::from_slice::<
-                                crate::messages::types::EditPayload,
-                            >(&edit_env.payload) {
-                                // Replace payload with the edited content string
-                                map.insert("payload".into(), serde_json::json!(edit_payload.content));
+    // Check edit status and apply the latest edit on top of the original
+    // payload. Pre-0.37 this branch overwrote `payload` with just the edit's
+    // content string, which destroyed title/tags/attachments/mentions and
+    // forced every client to handle two payload shapes. The new behavior
+    // keeps `payload` as msgpack bytes (a JSON array of u8 in transit) and
+    // merges field-level overrides — see `project_edited_payload`.
+    //
+    // CRITICAL: must SKIP this branch entirely when the message is soft-
+    // deleted. The deletion branch above explicitly blanks `payload` to
+    // hide content. Without this guard, an edited-then-deleted message
+    // would have its payload re-populated here with the merged edit
+    // contents — exposing data the user intended to redact.
+    let is_deleted = storage.is_deleted(&msg_id).unwrap_or(false);
+    if !is_deleted {
+        if let Ok(true) = storage.is_edited(&msg_id) {
+            if let serde_json::Value::Object(ref mut map) = msg {
+                map.insert("edited".into(), serde_json::json!(true));
+                if let Ok(edits) = storage.get_edit_history(&msg_id) {
+                    if let Some((last_ts, edit_msg_id)) = edits.last() {
+                        map.insert("last_edited_at".into(), serde_json::json!(last_ts));
+                        match project_edited_payload(&msg_id, edit_msg_id, storage) {
+                            Some(merged) => {
+                                // Bytes form keeps the wire contract identical to a
+                                // never-edited message — clients msgpack-decode the
+                                // payload exactly the same way in both cases.
+                                map.insert("payload".into(), serde_json::json!(merged));
+                            }
+                            None => {
+                                // Privacy guard: an `edited` marker without a
+                                // recoverable edit envelope (orphaned index row,
+                                // corrupted bytes, etc.) would otherwise display
+                                // the PRE-edit content as if it were current. A
+                                // user who edited to redact ("never mind, here's
+                                // the correct statement") would see the original.
+                                // Blank the payload like the deletion path so
+                                // unrecoverable edits fail safe.
+                                tracing::warn!(
+                                    msg_id = %hex::encode(msg_id),
+                                    edit_msg_id = %hex::encode(edit_msg_id),
+                                    "edit projection returned None — blanking payload to avoid pre-edit leak",
+                                );
+                                map.insert("payload".into(), serde_json::Value::Null);
                             }
                         }
                     }
