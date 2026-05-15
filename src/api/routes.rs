@@ -2668,6 +2668,7 @@ pub async fn upload_media(
 ///      only one emitted — no double-header / smuggling risk.
 pub async fn get_media(
     Extension(state): Extension<Arc<AppState>>,
+    axum::extract::ConnectInfo(peer_addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
     Path(cid): Path<String>,
     method: axum::http::Method,
     headers: axum::http::HeaderMap,
@@ -2684,11 +2685,11 @@ pub async fn get_media(
     let etag = format!("\"{}\"", cid);
     let cache_control = "public, max-age=31536000, immutable";
 
-    // ----- If-None-Match short-circuit (NO semaphore yet) -----------
+    // ----- If-None-Match short-circuit (NO permit yet) --------------
     // Audit warning W-1 (code) + W-3 (security): both held the permit
     // through a `get_size` call that could hit the DHT for unknown
     // CIDs. We now check the cache (free) and then `exists_local`
-    // (offline-only) before paying the semaphore cost. The 304 path
+    // (offline-only) before paying the permit cost. The 304 path
     // is also the busiest in CDN-fronted deployments — every
     // periodic revalidator hits it.
     if let Some(if_none_match) = headers
@@ -2707,17 +2708,42 @@ pub async fn get_media(
         }
     }
 
-    // Acquire a semaphore permit before any body fetch. If permits are
-    // exhausted, requests queue (Tokio fairness). `acquire_owned`
-    // returns a permit that doesn't borrow from the semaphore, the
-    // right pattern when the permit must survive across awaits inside
-    // the handler.
-    let _permit = match state.media_semaphore.clone().acquire_owned().await {
+    // ----- Per-IP + global limiter (v0.41) -------------------------
+    // Resolve the real client IP, then acquire one per-IP slot AND
+    // one global slot. Per-IP cap exhaustion returns 429 fast (no
+    // global queue cost paid); global exhaustion queues FIFO.
+    //
+    // IP resolution rules (mirrors `admin_auth.rs`):
+    //   * TCP peer is loopback  → trust the X-Forwarded-For header
+    //     (proxy fronting us). First entry is the original client.
+    //   * TCP peer is non-loopback → use the peer directly.
+    //     X-Forwarded-For would be self-set by a remote attacker
+    //     and must be ignored.
+    let client_ip = resolve_client_ip(peer_addr, &headers);
+    let _permit = match state.media_limiter.acquire(client_ip).await {
         Ok(p) => p,
-        Err(_) => {
-            // Semaphore closed (shutdown in progress). Tell the client
-            // to retry rather than report a misleading 5xx.
-            return (StatusCode::SERVICE_UNAVAILABLE, "shutting down").into_response();
+        Err(crate::api::media_limiter::RejectReason::PerIpExceeded) => {
+            // 429 + Retry-After. The retry value is a best-effort
+            // hint — there's no way to know exactly when a permit
+            // will free; 5 seconds is "long enough that an honest
+            // burst client backs off, short enough that a real
+            // browser tab regains responsiveness quickly".
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                [
+                    (header::RETRY_AFTER, "5".to_string()),
+                    (
+                        header::CONTENT_TYPE,
+                        "text/plain; charset=utf-8".to_string(),
+                    ),
+                ],
+                "too many concurrent media requests from this client; retry shortly",
+            )
+                .into_response();
+        }
+        Err(crate::api::media_limiter::RejectReason::Shutdown) => {
+            return (StatusCode::SERVICE_UNAVAILABLE, "shutting down")
+                .into_response();
         }
     };
 
@@ -2876,6 +2902,56 @@ fn media_content_disposition(content_type: &str, cid: &str) -> String {
         format!("inline; filename=\"{}\"", cid)
     } else {
         format!("attachment; filename=\"{}\"", cid)
+    }
+}
+
+/// Resolve the real client IP for the per-IP media limiter (v0.41).
+///
+/// When the TCP peer is loopback we are clearly behind a local
+/// reverse proxy (Apache, nginx, etc.); the proxy sets
+/// `X-Forwarded-For` with the original client IP and we trust it.
+/// When the TCP peer is non-loopback, the request came directly to
+/// our port and any `X-Forwarded-For` header is attacker-controlled
+/// — we ignore it and use the peer.
+///
+/// The X-Forwarded-For value may be a comma-separated chain
+/// (`client, proxy1, proxy2`); the leftmost entry is the original
+/// client. We take the first parseable IP, fall back to the peer
+/// on any parse failure.
+///
+/// This mirrors the pattern used by `admin_auth_middleware` so the
+/// security boundary is identical across the two trust-the-proxy
+/// surfaces.
+fn resolve_client_ip(peer: std::net::SocketAddr, headers: &axum::http::HeaderMap) -> std::net::IpAddr {
+    let peer_ip = peer.ip();
+    if !is_loopback_canonical(peer_ip) {
+        return peer_ip;
+    }
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .map(str::trim)
+        .and_then(|s| s.parse::<std::net::IpAddr>().ok())
+        .unwrap_or(peer_ip)
+}
+
+/// Loopback detection that handles the IPv4-mapped IPv6 form
+/// (`::ffff:127.0.0.1`).
+///
+/// On dual-stack Linux listeners bound to `::`, incoming IPv4
+/// connections arrive as `::ffff:a.b.c.d` rather than as native
+/// IPv4. `IpAddr::is_loopback` returns `false` for that form even
+/// though the underlying IPv4 IS loopback — so a same-host Apache
+/// talking to a v6-bound node would have XFF silently ignored.
+/// This helper canonicalizes through `to_ipv4_mapped` first.
+fn is_loopback_canonical(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_loopback(),
+        std::net::IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(|v4| v4.is_loopback())
+            .unwrap_or_else(|| v6.is_loopback()),
     }
 }
 
@@ -4817,4 +4893,125 @@ mod media_tests {
         assert_eq!(&body_bytes[..], b"world");
     }
 
+    // --- resolve_client_ip (v0.41 per-IP limiter) -------------------
+    //
+    // Security boundary: trust `X-Forwarded-For` ONLY when the TCP
+    // peer is loopback (i.e. our reverse proxy on the same host
+    // forwarded the request). Trusting it from a non-loopback peer
+    // would let a remote attacker spoof their client IP and bypass
+    // per-IP rate limiting.
+
+    use super::resolve_client_ip;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    fn sock(ip: &str, port: u16) -> SocketAddr {
+        SocketAddr::new(ip.parse().unwrap(), port)
+    }
+
+    fn headers_with_xff(value: &str) -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("x-forwarded-for", value.parse().unwrap());
+        h
+    }
+
+    #[test]
+    fn resolve_ip_uses_xff_when_peer_is_loopback() {
+        // Apache forwards the request; peer is 127.0.0.1, XFF carries
+        // the real client.
+        let peer = sock("127.0.0.1", 50000);
+        let headers = headers_with_xff("203.0.113.5");
+        assert_eq!(
+            resolve_client_ip(peer, &headers),
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5))
+        );
+    }
+
+    #[test]
+    fn resolve_ip_uses_first_xff_entry_on_proxy_chain() {
+        // Multi-hop XFF: `client, proxy1, proxy2`. First entry is
+        // the original client.
+        let peer = sock("127.0.0.1", 50000);
+        let headers = headers_with_xff("198.51.100.7, 203.0.113.1, 10.0.0.1");
+        assert_eq!(
+            resolve_client_ip(peer, &headers),
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7))
+        );
+    }
+
+    #[test]
+    fn resolve_ip_trims_whitespace_in_xff() {
+        let peer = sock("127.0.0.1", 50000);
+        let headers = headers_with_xff("  198.51.100.7  , 10.0.0.1");
+        assert_eq!(
+            resolve_client_ip(peer, &headers),
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7))
+        );
+    }
+
+    #[test]
+    fn resolve_ip_ignores_xff_when_peer_is_remote() {
+        // CRITICAL SECURITY: a non-loopback peer's XFF header is
+        // attacker-controlled and must be ignored. Without this,
+        // every remote client could spoof their IP to bypass the
+        // per-IP cap.
+        let peer = sock("203.0.113.99", 50000);
+        let headers = headers_with_xff("1.2.3.4");
+        assert_eq!(
+            resolve_client_ip(peer, &headers),
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 99)),
+            "XFF from non-loopback peer must be ignored",
+        );
+    }
+
+    #[test]
+    fn resolve_ip_falls_back_to_peer_when_no_xff() {
+        let peer = sock("127.0.0.1", 50000);
+        let headers = axum::http::HeaderMap::new();
+        assert_eq!(resolve_client_ip(peer, &headers), peer.ip());
+    }
+
+    #[test]
+    fn resolve_ip_falls_back_to_peer_on_unparseable_xff() {
+        let peer = sock("127.0.0.1", 50000);
+        let headers = headers_with_xff("not-an-ip");
+        assert_eq!(resolve_client_ip(peer, &headers), peer.ip());
+    }
+
+    #[test]
+    fn resolve_ip_handles_ipv6_loopback() {
+        // ::1 is the IPv6 loopback. XFF should still be trusted.
+        let peer: SocketAddr = "[::1]:50000".parse().unwrap();
+        let headers = headers_with_xff("203.0.113.5");
+        assert_eq!(
+            resolve_client_ip(peer, &headers),
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5))
+        );
+    }
+
+    #[test]
+    fn resolve_ip_handles_ipv4_mapped_ipv6_loopback() {
+        // CRITICAL: on dual-stack Linux listeners (bound to `::`)
+        // incoming IPv4 connections arrive as `::ffff:127.0.0.1`.
+        // Plain `IpAddr::is_loopback()` returns false for this form
+        // — so without canonicalization, a same-host Apache talking
+        // to a v6-bound node would have XFF silently ignored and
+        // every client funneled into one bucket. Audit warning W-1.
+        let peer: SocketAddr = "[::ffff:127.0.0.1]:50000".parse().unwrap();
+        let headers = headers_with_xff("203.0.113.5");
+        assert_eq!(
+            resolve_client_ip(peer, &headers),
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5)),
+            "IPv4-mapped IPv6 loopback must be recognized as loopback",
+        );
+    }
+
+    #[test]
+    fn resolve_ip_handles_ipv6_xff() {
+        let peer = sock("127.0.0.1", 50000);
+        let headers = headers_with_xff("2001:db8::1");
+        match resolve_client_ip(peer, &headers) {
+            IpAddr::V6(_) => {}
+            _ => panic!("expected IPv6 client from XFF"),
+        }
+    }
 }

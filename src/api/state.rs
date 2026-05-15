@@ -7,7 +7,9 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use moka::future::Cache;
-use tokio::sync::{broadcast, mpsc, oneshot, Semaphore};
+use tokio::sync::{broadcast, mpsc, oneshot};
+
+use super::media_limiter::PerIpSemaphore;
 
 use crate::ipfs::client::IpfsClient;
 use crate::messages::router::MessageRouter;
@@ -59,6 +61,9 @@ pub const DEFAULT_MEDIA_CACHE_ITEM_BYTES: usize = 16 * 1024 * 1024;
 /// Default concurrent media handler permits.
 pub const DEFAULT_MEDIA_HANDLER_PERMITS: usize = 32;
 
+/// Default per-IP concurrent media handler permits.
+pub const DEFAULT_MEDIA_PER_IP_PERMITS: usize = 4;
+
 /// Runtime values for media-handler resource caps. Built from
 /// `IpfsConfig` at node startup and passed into `AppState`; tests use
 /// `MediaTuning::default()` to get the documented defaults without
@@ -69,8 +74,12 @@ pub struct MediaTuning {
     pub cache_total_bytes: u64,
     /// Per-item cache cap in bytes.
     pub cache_item_bytes: usize,
-    /// Concurrent media handler permits.
+    /// Concurrent media handler permits (global cap).
     pub handler_permits: usize,
+    /// Per-IP sub-cap on the global permits (v0.41). One client IP
+    /// can hold at most this many permits at once. Caps the
+    /// single-IP DoS surface that the v0.39 audit flagged.
+    pub per_ip_permits: usize,
 }
 
 impl Default for MediaTuning {
@@ -79,6 +88,7 @@ impl Default for MediaTuning {
             cache_total_bytes: DEFAULT_MEDIA_CACHE_TOTAL_BYTES,
             cache_item_bytes: DEFAULT_MEDIA_CACHE_ITEM_BYTES,
             handler_permits: DEFAULT_MEDIA_HANDLER_PERMITS,
+            per_ip_permits: DEFAULT_MEDIA_PER_IP_PERMITS,
         }
     }
 }
@@ -155,11 +165,12 @@ pub struct AppState {
     /// on every request. Bounded total weight at
     /// `IpfsConfig::media_cache_total_mb` (in `with_broadcast`).
     pub media_cache: Cache<String, CachedMedia>,
-    /// Semaphore bounding concurrent `/api/v1/media/:cid` handlers.
-    /// Combined with per-fetch caps, this bounds peak transient RSS
-    /// from the media endpoint to roughly
-    /// `permits * max_upload_size_mb` MiB.
-    pub media_semaphore: Arc<Semaphore>,
+    /// Per-IP-bounded semaphore limiting concurrent
+    /// `/api/v1/media/:cid` handlers (v0.41). Each request needs one
+    /// per-IP slot AND one global slot. Per-IP exhaustion → 429;
+    /// global exhaustion → FIFO queue. Closes the single-IP DoS
+    /// surface that the v0.39 audit flagged on the global-only design.
+    pub media_limiter: Arc<PerIpSemaphore>,
     /// Per-item cache cap (bytes). Items above this size are NOT
     /// inserted into `media_cache`; they're streamed from IPFS each
     /// time. Read by `get_media` to decide between full-fetch and
@@ -255,7 +266,10 @@ impl AppState {
             })
             .max_capacity(media_tuning.cache_total_bytes)
             .build();
-        let media_semaphore = Arc::new(Semaphore::new(media_tuning.handler_permits));
+        let media_limiter = PerIpSemaphore::new(
+            media_tuning.handler_permits,
+            media_tuning.per_ip_permits,
+        );
         Self {
             storage,
             router,
@@ -280,7 +294,7 @@ impl AppState {
             pow,
             snapshot_cache,
             media_cache,
-            media_semaphore,
+            media_limiter,
             media_cache_item_bytes: media_tuning.cache_item_bytes,
         }
     }

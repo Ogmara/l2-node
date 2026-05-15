@@ -675,6 +675,7 @@ impl Node {
                 .unwrap_or(usize::MAX)
                 .saturating_mul(1024 * 1024),
             handler_permits: self.config.ipfs.media_handler_permits,
+            per_ip_permits: self.config.ipfs.media_per_ip_permits,
         };
         let app_state = Arc::new(crate::api::state::AppState::with_broadcast(
             self.storage.clone(),
@@ -700,6 +701,21 @@ impl Node {
             snapshot_cache.clone(),
             media_tuning,
         ));
+        // Background sweep: drop zero-counter entries from the per-IP
+        // media limiter (v0.41). Without this, the DashMap accumulates
+        // an entry per IP that ever hit the media endpoint — under an
+        // IP-rotating attacker this grows unboundedly. Runs every 5
+        // minutes; that's slow enough to be negligible CPU but fast
+        // enough to keep memory bounded under sustained attack.
+        // JoinHandle dropped immediately — the spawned task lives via
+        // its own tokio task slot and exits on shutdown_rx signal.
+        // No need to await it during graceful shutdown; the sweep
+        // doesn't hold any resources that must be flushed.
+        let _ = app_state
+            .media_limiter
+            .clone()
+            .spawn_sweep_task(std::time::Duration::from_secs(300), self.shutdown_rx());
+
         // Periodic cleanup task: evict stale rate limit entries and expired PoW challenges.
         // Runs every 5 minutes to prevent unbounded memory growth.
         let cleanup_state = app_state.clone();

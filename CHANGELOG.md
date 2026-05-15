@@ -5,6 +5,164 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.41.0] - 2026-05-15
+
+### Added
+- **Per-IP concurrent-permit sub-cap on the media endpoint.**
+  Closes the single-IP DoS surface flagged by the v0.39 audit
+  (W-1 security). Pre-0.41, a single client IP could grab all 32
+  global `media_handler_permits` with slow requests and lock out
+  every other client — `tower_governor` caps requests per minute
+  but not concurrent in-flight permits, so a slow-loris-style
+  attack stayed under the rate limit while monopolizing the
+  endpoint. v0.41 adds a per-IP sub-cap (default **4 of 32**) so
+  one IP can never hold more than its share.
+- **`IpfsConfig::media_per_ip_permits`** — new tunable, default `4`.
+  HARD reject zero (would 429 every request); SOFT clamp when
+  larger than `media_handler_permits` (no effect — sub-cap can't
+  exceed global). Operators can tune in `ogmara.toml` without
+  recompile.
+- **`PerIpSemaphore` primitive** in `src/api/media_limiter.rs`.
+  Wraps a global `tokio::sync::Semaphore` plus a
+  `DashMap<IpAddr, Arc<AtomicUsize>>` for per-IP tracking. Acquire
+  checks the per-IP cap FIRST (cheap, no await) before queueing on
+  the global pool — an attacker burning through their per-IP cap
+  never takes global queue slots, so legitimate traffic stays
+  responsive even under attack. Per-IP entries are reaped by a
+  background sweep task; counters are reference-counted so a
+  permit dropped after a sweep correctly decrements the same
+  counter (no race-induced under/overflow).
+- **`429 Too Many Requests` with `Retry-After: 5`** when the
+  per-IP cap is exceeded. The retry hint helps honest burst
+  clients (multi-tab browsers, page-load racing) back off
+  gracefully.
+- **Secure X-Forwarded-For resolution.** `resolve_client_ip`
+  follows the same trust boundary as `admin_auth.rs`: XFF is
+  trusted ONLY when the TCP peer is loopback (Apache fronting us
+  on the same host). A non-loopback peer's XFF is ignored —
+  otherwise any remote client could spoof their IP to bypass the
+  per-IP cap.
+
+### Apache deploy
+No new config required. Apache's `mod_proxy_http` sets
+`X-Forwarded-For` automatically when proxying (`ProxyPass` does
+this by default since 2.4). The L2 node correctly parses and
+trusts this header now. If you're running the node directly
+exposed (no reverse proxy), the peer SocketAddr is used directly
+— XFF spoofing is impossible.
+
+### Tests
+- **8 new `PerIpSemaphore` unit tests** covering single-IP cap,
+  rejected-acquire-doesn't-consume-global, permit-drop releases
+  slots, sweep removes zero-counter entries, sweep keeps active
+  entries, sweep/acquire race safety, distinct-IPs each get own
+  cap.
+- **8 new `resolve_client_ip` security tests** locking the
+  loopback-only XFF trust boundary, including the critical
+  `resolve_ip_ignores_xff_when_peer_is_remote` regression test.
+- **3 new config-validation tests** for `media_per_ip_permits`
+  (hard reject zero, soft clamp when > global, defaults pass).
+
+### Tuning notes
+The default per-IP / global ratio is 4/32 = 1/8. For deployments
+expecting:
+- **Many distinct light users** (e.g. public-facing nodes): keep
+  the default. Most browsers hold ≤ 4 concurrent connections to
+  the same host.
+- **Few power users with many tabs**: bump `media_per_ip_permits`
+  to 8 or 12.
+- **Heavy embedding sites (websites that proxy media through
+  their own backend)**: their IP looks like a single client to
+  us — bump `media_per_ip_permits` to match their concurrency
+  pattern, OR have them proxy through their own caching layer.
+
+### Migration
+Zero-change for existing operators. The new field has a sane
+default; pre-v0.41 `ogmara.toml` files continue to work
+unmodified. The migration from v0.40.1's
+`AppState.media_semaphore` → v0.41's `AppState.media_limiter` is
+internal — no external API changes.
+
+### Security hardening (audit-driven)
+The v0.41 audit pass surfaced three critical issues that landed
+in this release before tagging:
+
+- **Background sweep task now actually runs.** The
+  `spawn_sweep_task` function was defined but never called from
+  `node.rs`, which meant the per-IP DashMap grew unbounded under
+  an IP-rotating attacker (every distinct IP that ever hit the
+  endpoint left a permanent entry, even after its counter hit
+  zero). `node.rs` now spawns the sweep on startup with a 5-minute
+  interval, wired into the node's shutdown signal.
+- **Cancellation safety via RAII guard.** The per-IP counter
+  increment between `fetch_add` and the global `acquire_owned`
+  await is now owned by a `PerIpReservation` guard. If the
+  request future is dropped (HTTP/2 RST_STREAM, client
+  disconnect) while parked on the await, the guard rolls back
+  the increment on Drop. Pre-fix, repeated cancellations could
+  inflate a target IP's counter to its cap with zero permits
+  actually held — permanent 429 until the next sweep.
+- **IPv6 prefix bucketing (`/64`) + IPv4 `/24` collapse.** The
+  initial per-IP keying used exact `IpAddr` values, which is
+  trivially bypassed on IPv6: a typical end-user has a `/64`
+  allocation (2^64 source addresses) and could rotate through
+  them faster than the sweep could clean up, defeating both the
+  per-IP cap AND the memory bound. v0.41 now buckets by routing
+  prefix: IPv4 `/24` (typical residential ISP allocation, 256
+  hosts) and IPv6 `/64` (RFC 6177 minimum end-site allocation).
+  IPv4-mapped IPv6 (`::ffff:a.b.c.d`) collapses to the IPv4
+  bucket for dual-stack listener correctness.
+
+Plus three warnings:
+
+- **IPv4-mapped IPv6 loopback recognized.** On dual-stack Linux
+  listeners (bound to `::`), incoming IPv4 connections arrive as
+  `::ffff:127.0.0.1`. Plain `IpAddr::is_loopback()` returns false
+  for that form — so a same-host Apache talking to a v6-bound
+  node would have had XFF silently ignored and every client
+  funneled into one bucket. Fixed via `is_loopback_canonical()`
+  helper.
+- **`debug_assert!` on `PerIpPermit::drop`** catches counter
+  underflow regressions in test builds (a future refactor
+  constructing a permit without a corresponding `fetch_add`
+  would wrap to `usize::MAX` and permanently lock the bucket).
+- **Tests expanded** for the audit fixes: `ip_to_bucket_zeroes_low_bits`,
+  `ipv4_24_subnet_shares_per_ip_slot`,
+  `ipv6_64_subnet_shares_per_ip_slot`,
+  `ipv4_mapped_ipv6_collapses_to_ipv4_bucket`,
+  `cancellation_safety_rolls_back_per_ip_counter`,
+  `resolve_ip_handles_ipv4_mapped_ipv6_loopback`.
+
+### Deployment notes
+
+- **Reverse proxy must run on the same host** for the per-IP
+  cap to work. The XFF trust boundary requires the TCP peer to
+  be loopback (Apache/nginx on `127.0.0.1` or `::1`). If your
+  proxy runs on a separate LAN host, all clients will appear to
+  the node as the proxy's LAN IP — bucketing into one shared
+  slot. Tracked for v0.42: `trusted_proxies` config field.
+- **CDN trust is transitive.** If a CDN (Cloudflare, Fastly)
+  sits in front of Apache: client → CDN → Apache → node. The
+  XFF chain is `client, cdn`; we take the leftmost entry as the
+  real client. This is correct IF the CDN is trusted to set XFF
+  honestly. A remote client that bypasses the CDN and sends a
+  spoofed XFF directly to Apache would still get caught — Apache
+  sees the remote peer as non-loopback and the node never reads
+  the spoofed XFF. So as long as the CDN is the only path to
+  Apache, trust is intact.
+- **Sweep interval is 5 minutes.** Under sustained IP-rotation
+  attack, the DashMap can grow between sweeps to roughly
+  `(attack_rate × 300s)` entries (~9 MB per 100k req/s × 5min).
+  Bounded by host memory. v0.42 will add a hard cap with
+  overflow-bucket spillover.
+- **`Forwarded` (RFC 7239) header is NOT consulted.** The
+  per-IP limiter reads `X-Forwarded-For` only. This is fine for
+  Apache, nginx, and HAProxy in their default configs (all emit
+  XFF). Some Caddy configurations emit only the RFC 7239
+  `Forwarded: for=...` form — those need to be explicitly told
+  to also emit XFF, or the per-IP cap collapses every request
+  into the proxy's loopback bucket. Tracked for v0.42.
+
 ## [0.40.1] - 2026-05-15
 
 ### Fixed
