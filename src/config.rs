@@ -147,6 +147,15 @@ pub struct IpfsConfig {
     /// resource-constrained nodes; raise for high-throughput.
     #[serde(default = "default_media_handler_permits")]
     pub media_handler_permits: usize,
+    /// Per-client-IP sub-cap on concurrent media handlers (v0.41).
+    /// Stops a single IP from grabbing all `media_handler_permits`
+    /// slots with slow requests and starving other clients. Defaults
+    /// to 4 of the 32 global permits — generous enough that a real
+    /// browser opening multiple tabs is fine, tight enough that one
+    /// IP can never monopolize the endpoint. Must be > 0 and
+    /// <= `media_handler_permits` (validated at config-load).
+    #[serde(default = "default_media_per_ip_permits")]
+    pub media_per_ip_permits: usize,
 }
 
 impl Default for IpfsConfig {
@@ -159,6 +168,7 @@ impl Default for IpfsConfig {
             media_cache_total_mb: default_media_cache_total_mb(),
             media_cache_item_mb: default_media_cache_item_mb(),
             media_handler_permits: default_media_handler_permits(),
+            media_per_ip_permits: default_media_per_ip_permits(),
         }
     }
 }
@@ -727,6 +737,9 @@ fn default_media_cache_item_mb() -> u64 {
 fn default_media_handler_permits() -> usize {
     32
 }
+fn default_media_per_ip_permits() -> usize {
+    4
+}
 fn default_api_addr() -> String {
     "127.0.0.1".to_string()
 }
@@ -953,6 +966,26 @@ impl Config {
         }
         if self.ipfs.media_cache_item_mb == 0 {
             anyhow::bail!("ipfs.media_cache_item_mb must be > 0");
+        }
+        // Per-IP permits (v0.41). HARD reject zero (would 429
+        // everyone — endpoint becomes unusable). HARD reject
+        // exceeding the global permits (no sub-cap effect; values
+        // larger than global silently degrade to "no per-IP cap"
+        // which defeats the feature). SOFT clamp the upper bound to
+        // global so a misconfigured `per_ip = 9999` with global = 32
+        // doesn't fail upgrade — it just gets pulled back to 32.
+        if self.ipfs.media_per_ip_permits == 0 {
+            anyhow::bail!("ipfs.media_per_ip_permits must be > 0 (zero rejects every media request as 429)");
+        }
+        if self.ipfs.media_per_ip_permits > self.ipfs.media_handler_permits {
+            eprintln!(
+                "[config] ipfs.media_per_ip_permits ({}) > ipfs.media_handler_permits ({}); \
+                 clamping to {} (per-IP cap can't exceed global cap).",
+                self.ipfs.media_per_ip_permits,
+                self.ipfs.media_handler_permits,
+                self.ipfs.media_handler_permits,
+            );
+            self.ipfs.media_per_ip_permits = self.ipfs.media_handler_permits;
         }
         // 64 GiB is a generous ceiling for the total cache — beyond
         // this you're shifting the bottleneck to host memory. Configure
@@ -1225,5 +1258,35 @@ mod tests {
         c.ipfs.media_cache_item_mb = 16;
         c.validate().expect("equality is fine");
         assert_eq!(c.ipfs.media_cache_item_mb, 16);
+    }
+
+    // --- v0.41 per-IP permit field ----------------------------------
+
+    #[test]
+    fn validate_rejects_zero_per_ip_permits() {
+        let mut c = baseline_config();
+        c.ipfs.media_per_ip_permits = 0;
+        let err = c.validate().expect_err("zero per-IP permits must reject");
+        assert!(format!("{}", err).contains("media_per_ip_permits"));
+    }
+
+    #[test]
+    fn validate_clamps_per_ip_to_global_permits() {
+        // Operator typo / pre-v0.41 config that explicitly set
+        // per_ip = 1000. The auto-clamp lets the node still boot
+        // while quietly pulling per_ip back to the global cap.
+        let mut c = baseline_config();
+        c.ipfs.media_handler_permits = 32;
+        c.ipfs.media_per_ip_permits = 1000;
+        c.validate().expect("must clamp, not bail");
+        assert_eq!(c.ipfs.media_per_ip_permits, 32);
+    }
+
+    #[test]
+    fn validate_passes_default_per_ip_permits() {
+        // Default per-IP (4) is well below default global (32).
+        let mut c = baseline_config();
+        c.validate().expect("defaults pass");
+        assert_eq!(c.ipfs.media_per_ip_permits, 4);
     }
 }
