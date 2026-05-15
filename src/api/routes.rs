@@ -2641,33 +2641,169 @@ pub async fn upload_media(
 }
 
 /// GET /api/v1/media/:cid — retrieve media from IPFS (public).
+///
+/// Supports HTTP `Range:` requests with `206 Partial Content` responses
+/// and always advertises `Accept-Ranges: bytes`. Without this, media
+/// players (WebKitGTK's `<video>` element, VLC, mpv) cannot stream MP4
+/// files whose `moov` atom sits after `mdat` — they need to seek to
+/// the end of the file to read metadata before they can play. The
+/// pre-0.38 handler ignored Range entirely and always returned the
+/// full body, which made every non-faststart MP4 unplayable.
 pub async fn get_media(
     Extension(state): Extension<Arc<AppState>>,
     Path(cid): Path<String>,
+    headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
     let ipfs = match &state.ipfs {
         Some(c) => c,
         None => return (StatusCode::SERVICE_UNAVAILABLE, "IPFS not configured").into_response(),
     };
 
-    match ipfs.get(&cid).await {
-        Ok(data) => {
-            // Detect content type from first bytes (basic magic number detection)
-            let content_type = detect_content_type(&data);
-            (
+    let data = match ipfs.get(&cid).await {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(cid = %cid, error = %e, "IPFS retrieval failed");
+            return (StatusCode::NOT_FOUND, "media not found").into_response();
+        }
+    };
+
+    let total = data.len() as u64;
+    let content_type = detect_content_type(&data);
+    let cache_control = "public, max-age=31536000, immutable".to_string();
+    // ETag from the CID. IPFS CIDs are content-addressed — the bytes
+    // for a given CID never change — so the CID itself is a perfect
+    // strong validator. Quoting per RFC 7232 §2.3. Future revision can
+    // honor `If-None-Match` and return 304 to skip the IPFS fetch.
+    let etag = format!("\"{}\"", cid);
+
+    // If-None-Match: clients holding a fresh copy can probe with
+    // `If-None-Match: "<cid>"` and we return 304 with no body. This
+    // is independent of Range — the CID alone guarantees identity.
+    //
+    // Per RFC 7232 §3.2, the wildcard `*` matches any current
+    // representation of the resource; since this handler only serves
+    // a successful response when the CID exists, `*` always matches
+    // when we reach this point.
+    if headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v == "*" || v == etag)
+        .unwrap_or(false)
+    {
+        return (
+            StatusCode::NOT_MODIFIED,
+            [
+                (header::ETAG, etag),
+                (header::ACCEPT_RANGES, "bytes".to_string()),
+                (header::CACHE_CONTROL, cache_control),
+            ],
+        )
+            .into_response();
+    }
+
+    // No Range header → full 200 OK response, but with `Accept-Ranges`
+    // unconditionally set so the next request can seek. Players probe
+    // this header on the initial HEAD/GET before issuing range
+    // requests; omitting it makes them assume the resource is
+    // non-seekable and fall back to start-to-end download.
+    let range_value = match headers.get(header::RANGE).and_then(|v| v.to_str().ok()) {
+        Some(v) => v.to_string(),
+        None => {
+            return (
                 StatusCode::OK,
                 [
                     (header::CONTENT_TYPE, content_type),
-                    (header::CACHE_CONTROL, "public, max-age=31536000, immutable".to_string()),
+                    (header::ACCEPT_RANGES, "bytes".to_string()),
+                    // `Vary: Range` signals to intermediate caches that
+                    // responses differ when Range differs — without it,
+                    // an intermediary might cache a 206 partial under
+                    // the same key as a 200 full response and replay
+                    // truncated bytes back to clients.
+                    (header::VARY, "Range".to_string()),
+                    (header::ETAG, etag),
+                    (header::CACHE_CONTROL, cache_control),
                     (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+                    (header::CONTENT_LENGTH, total.to_string()),
                 ],
                 data,
             )
+                .into_response();
+        }
+    };
+
+    match parse_byte_range(&range_value, total) {
+        Some((start, end)) => {
+            // 206 Partial Content. Slice is inclusive on both ends per
+            // RFC 7233. The defensive `usize::try_from` is a no-op on
+            // 64-bit (where `usize == u64`) but guards correctness if
+            // anyone ever cross-compiles for armv7 / wasm32: a silent
+            // u64→usize truncation would slice the wrong bytes and
+            // either panic or return content-confusion.
+            let start_usize = match usize::try_from(start) {
+                Ok(v) => v,
+                Err(_) => {
+                    return (
+                        StatusCode::RANGE_NOT_SATISFIABLE,
+                        [
+                            (header::ACCEPT_RANGES, "bytes".to_string()),
+                            (header::CONTENT_RANGE, format!("bytes */{}", total)),
+                        ],
+                    )
+                        .into_response();
+                }
+            };
+            let end_usize = match usize::try_from(end) {
+                Ok(v) => v,
+                Err(_) => {
+                    return (
+                        StatusCode::RANGE_NOT_SATISFIABLE,
+                        [
+                            (header::ACCEPT_RANGES, "bytes".to_string()),
+                            (header::CONTENT_RANGE, format!("bytes */{}", total)),
+                        ],
+                    )
+                        .into_response();
+                }
+            };
+            let slice = data[start_usize..=end_usize].to_vec();
+            let content_length = slice.len() as u64;
+            (
+                StatusCode::PARTIAL_CONTENT,
+                [
+                    (header::CONTENT_TYPE, content_type),
+                    (header::ACCEPT_RANGES, "bytes".to_string()),
+                    (header::VARY, "Range".to_string()),
+                    (header::ETAG, etag),
+                    (header::CACHE_CONTROL, cache_control),
+                    (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+                    (
+                        header::CONTENT_RANGE,
+                        format!("bytes {}-{}/{}", start, end, total),
+                    ),
+                    (header::CONTENT_LENGTH, content_length.to_string()),
+                ],
+                slice,
+            )
                 .into_response()
         }
-        Err(e) => {
-            tracing::warn!(cid = %cid, error = %e, "IPFS retrieval failed");
-            (StatusCode::NOT_FOUND, "media not found").into_response()
+        None => {
+            // Malformed or unsatisfiable Range. Per RFC 7233 §4.4 we
+            // SHOULD return 416 with a `Content-Range: bytes */<size>`
+            // header so the client can recover. Multi-range requests
+            // (which we deliberately don't support) also hit this
+            // branch — clients that need byte ranges will retry with
+            // a single range. RFC 9110 §15.5.17 also recommends
+            // `Accept-Ranges: bytes` so the client knows ranges ARE
+            // supported (the 416 was only about *this* request);
+            // without it older VLC builds give up entirely.
+            (
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                [
+                    (header::ACCEPT_RANGES, "bytes".to_string()),
+                    (header::CONTENT_RANGE, format!("bytes */{}", total)),
+                ],
+            )
+                .into_response()
         }
     }
 }
@@ -3408,6 +3544,7 @@ fn days_to_ymd(days: i64) -> (i64, i64, i64) {
 
 /// Basic content type detection from file magic bytes.
 fn detect_content_type(data: &[u8]) -> String {
+    // Images
     if data.starts_with(b"\x89PNG") {
         "image/png".to_string()
     } else if data.starts_with(b"\xFF\xD8\xFF") {
@@ -3416,11 +3553,112 @@ fn detect_content_type(data: &[u8]) -> String {
         "image/gif".to_string()
     } else if data.len() >= 12 && &data[0..4] == b"RIFF" && &data[8..12] == b"WEBP" {
         "image/webp".to_string()
-    } else if data.starts_with(b"%PDF") {
+    }
+    // Documents
+    else if data.starts_with(b"%PDF") {
         "application/pdf".to_string()
-    } else {
+    }
+    // Video / audio containers — these are the critical adds for inline
+    // playback. WebKit's `<video>` codec dispatch reads Content-Type
+    // before it touches the bitstream; an `application/octet-stream`
+    // response makes it bail with "format not supported" even when the
+    // file is perfectly playable MP4.
+    //
+    // MP4 / MOV / 3GP / M4V — all `ftyp`-prefixed ISO Base Media files.
+    // We return `video/mp4` uniformly: the spec-correct alternatives
+    // (`audio/mp4` for M4A, `video/quicktime` for MOV) are mostly
+    // distinguished by major_brand bytes 8-11, but browsers accept
+    // `video/mp4` for all of them inside `<video>` and `<audio>`, and
+    // splitting would just create more failure paths for callers that
+    // hardcode the MIME type.
+    else if data.len() >= 8 && &data[4..8] == b"ftyp" {
+        "video/mp4".to_string()
+    }
+    // WebM (and MKV — same EBML signature). Browsers play WebM inline
+    // in `<video>`; MKV is an out-of-scope edge case but the MIME is
+    // still useful for download dispatch.
+    else if data.starts_with(b"\x1A\x45\xDF\xA3") {
+        "video/webm".to_string()
+    }
+    // Ogg container (Theora video, Vorbis/Opus audio). Returning
+    // `video/ogg` works for both — `<audio>` accepts it as well.
+    else if data.starts_with(b"OggS") {
+        "video/ogg".to_string()
+    }
+    // AVI (RIFF AVI ).
+    else if data.len() >= 12 && &data[0..4] == b"RIFF" && &data[8..12] == b"AVI " {
+        "video/x-msvideo".to_string()
+    }
+    // MP3 — either ID3v2-tagged or raw frames with MPEG audio sync
+    // word (0xFFE0+). The latter check matches the first 11 bits of an
+    // MPEG-1/2/2.5 frame header, which is the universal "this is mp3"
+    // signal in untagged files.
+    else if data.starts_with(b"ID3")
+        || (data.len() >= 2 && data[0] == 0xFF && (data[1] & 0xE0) == 0xE0)
+    {
+        "audio/mpeg".to_string()
+    }
+    // WAV (RIFF WAVE).
+    else if data.len() >= 12 && &data[0..4] == b"RIFF" && &data[8..12] == b"WAVE" {
+        "audio/wav".to_string()
+    }
+    // FLAC.
+    else if data.starts_with(b"fLaC") {
+        "audio/flac".to_string()
+    }
+    // Fallback: opaque blob. Browsers will offer a download instead of
+    // attempting to render.
+    else {
         "application/octet-stream".to_string()
     }
+}
+
+/// Parse the value of a `Range:` request header into an inclusive
+/// `(start, end)` byte tuple given the total resource size.
+///
+/// Supported forms:
+///   - `bytes=START-END`  — explicit range
+///   - `bytes=START-`     — open-ended ("from START to EOF")
+///   - `bytes=-SUFFIX`    — suffix length ("last SUFFIX bytes")
+///
+/// Multi-range (`bytes=0-99,200-299`) and any malformed input return
+/// `None`; the caller falls back to a full-body response.
+///
+/// Returns `Some((start, end))` only when the range is fully inside
+/// the resource: `start <= end < total`. Out-of-range, zero-size, or
+/// inverted ranges return `None` — caller can choose 416 vs 200.
+fn parse_byte_range(value: &str, total: u64) -> Option<(u64, u64)> {
+    let s = value.trim().strip_prefix("bytes=")?;
+    if s.contains(',') {
+        // Multi-range — we don't emit multipart/byteranges responses;
+        // ignore and let caller decide on full body or 416.
+        return None;
+    }
+    let (start_str, end_str) = s.split_once('-')?;
+    if total == 0 {
+        return None;
+    }
+    let (start, end) = if start_str.is_empty() {
+        // Suffix-length form: `bytes=-N` means "last N bytes".
+        let suffix: u64 = end_str.parse().ok()?;
+        if suffix == 0 {
+            return None;
+        }
+        let clamped = suffix.min(total);
+        (total - clamped, total - 1)
+    } else if end_str.is_empty() {
+        // Open-ended form: `bytes=N-` means "from N to EOF".
+        let start: u64 = start_str.parse().ok()?;
+        (start, total - 1)
+    } else {
+        let start: u64 = start_str.parse().ok()?;
+        let end: u64 = end_str.parse().ok()?;
+        (start, end)
+    };
+    if start > end || end >= total {
+        return None;
+    }
+    Some((start, end))
 }
 
 // ---------------------------------------------------------------------------
@@ -3851,4 +4089,242 @@ pub async fn distribute_channel_keys(
 pub struct KeyParams {
     /// Specific epoch to fetch. If omitted, returns the latest.
     pub epoch: Option<u64>,
+}
+
+#[cfg(test)]
+mod media_tests {
+    use super::{detect_content_type, parse_byte_range};
+
+    // --- detect_content_type ---
+
+    #[test]
+    fn detects_png() {
+        assert_eq!(detect_content_type(b"\x89PNG\r\n\x1a\n..."), "image/png");
+    }
+
+    #[test]
+    fn detects_jpeg() {
+        assert_eq!(detect_content_type(b"\xFF\xD8\xFF\xE0..."), "image/jpeg");
+    }
+
+    #[test]
+    fn detects_mp4_via_ftyp_box() {
+        // Real MP4 starts with size(4) + "ftyp" + brand(4) + minor(4).
+        // The leading 4 bytes are the box size — opaque to our matcher.
+        let data = b"\x00\x00\x00\x20ftypisom\x00\x00\x02\x00";
+        assert_eq!(detect_content_type(data), "video/mp4");
+    }
+
+    #[test]
+    fn detects_mp4_with_quicktime_brand() {
+        // Different major_brand, same `ftyp` prefix → still video/mp4.
+        let data = b"\x00\x00\x00\x14ftypqt  \x00\x00\x02\x00";
+        assert_eq!(detect_content_type(data), "video/mp4");
+    }
+
+    #[test]
+    fn detects_webm() {
+        assert_eq!(
+            detect_content_type(b"\x1A\x45\xDF\xA3..."),
+            "video/webm"
+        );
+    }
+
+    #[test]
+    fn detects_ogg() {
+        assert_eq!(detect_content_type(b"OggS\x00\x02..."), "video/ogg");
+    }
+
+    #[test]
+    fn detects_mp3_id3v2() {
+        assert_eq!(detect_content_type(b"ID3\x03..."), "audio/mpeg");
+    }
+
+    #[test]
+    fn detects_mp3_raw_frame() {
+        // 0xFF 0xFB = MPEG-1 Layer 3 frame sync.
+        assert_eq!(detect_content_type(b"\xFF\xFB..."), "audio/mpeg");
+    }
+
+    #[test]
+    fn detects_wav() {
+        assert_eq!(
+            detect_content_type(b"RIFF\x00\x00\x00\x00WAVEfmt "),
+            "audio/wav"
+        );
+    }
+
+    #[test]
+    fn unknown_falls_back_to_octet_stream() {
+        assert_eq!(
+            detect_content_type(b"random garbage"),
+            "application/octet-stream"
+        );
+    }
+
+    #[test]
+    fn riff_without_recognized_form_is_opaque() {
+        // RIFF prefix with unknown form (e.g., "XYZ ") should NOT be
+        // misclassified. Guards against false positives.
+        assert_eq!(
+            detect_content_type(b"RIFF\x00\x00\x00\x00XYZ \x00\x00\x00\x00"),
+            "application/octet-stream"
+        );
+    }
+
+    // --- parse_byte_range ---
+
+    #[test]
+    fn explicit_range() {
+        assert_eq!(parse_byte_range("bytes=0-99", 1000), Some((0, 99)));
+        assert_eq!(parse_byte_range("bytes=100-199", 1000), Some((100, 199)));
+        assert_eq!(parse_byte_range("bytes=500-999", 1000), Some((500, 999)));
+    }
+
+    #[test]
+    fn open_ended_range() {
+        // `bytes=500-` means "from 500 to EOF".
+        assert_eq!(parse_byte_range("bytes=500-", 1000), Some((500, 999)));
+        assert_eq!(parse_byte_range("bytes=0-", 1000), Some((0, 999)));
+    }
+
+    #[test]
+    fn suffix_length_range() {
+        // `bytes=-N` means "last N bytes".
+        assert_eq!(parse_byte_range("bytes=-100", 1000), Some((900, 999)));
+        assert_eq!(parse_byte_range("bytes=-1", 1000), Some((999, 999)));
+    }
+
+    #[test]
+    fn suffix_length_clamps_to_total() {
+        // Suffix larger than file = "give me the whole thing".
+        assert_eq!(parse_byte_range("bytes=-99999", 1000), Some((0, 999)));
+    }
+
+    #[test]
+    fn whitespace_tolerant() {
+        assert_eq!(parse_byte_range(" bytes=0-99 ", 1000), Some((0, 99)));
+    }
+
+    #[test]
+    fn rejects_missing_bytes_prefix() {
+        assert_eq!(parse_byte_range("0-99", 1000), None);
+    }
+
+    #[test]
+    fn rejects_multi_range() {
+        // RFC 7233 allows multi-range responses (multipart/byteranges)
+        // but we deliberately don't emit them — return None so caller
+        // falls back to 416 or full body.
+        assert_eq!(parse_byte_range("bytes=0-99,200-299", 1000), None);
+    }
+
+    #[test]
+    fn rejects_inverted_range() {
+        assert_eq!(parse_byte_range("bytes=500-100", 1000), None);
+    }
+
+    #[test]
+    fn rejects_out_of_bounds_end() {
+        assert_eq!(parse_byte_range("bytes=0-1000", 1000), None);
+        assert_eq!(parse_byte_range("bytes=500-99999", 1000), None);
+    }
+
+    #[test]
+    fn rejects_zero_total() {
+        assert_eq!(parse_byte_range("bytes=0-0", 0), None);
+    }
+
+    #[test]
+    fn rejects_zero_suffix() {
+        assert_eq!(parse_byte_range("bytes=-0", 1000), None);
+    }
+
+    #[test]
+    fn rejects_garbage() {
+        assert_eq!(parse_byte_range("bytes=abc-def", 1000), None);
+        assert_eq!(parse_byte_range("bytes=", 1000), None);
+        assert_eq!(parse_byte_range("", 1000), None);
+    }
+
+    // --- Audit-derived edge cases ---
+
+    #[test]
+    fn rejects_open_ended_on_empty_resource() {
+        // `bytes=0-` on a zero-byte file must not underflow `total-1`.
+        // The `total == 0` short-circuit catches this — locked here.
+        assert_eq!(parse_byte_range("bytes=0-", 0), None);
+    }
+
+    #[test]
+    fn rejects_open_ended_at_eof() {
+        // `bytes=1000-` on a 1000-byte file: start == total → no bytes
+        // available. Caller would compute (1000, 999) and the
+        // `start > end` guard returns None.
+        assert_eq!(parse_byte_range("bytes=1000-", 1000), None);
+        assert_eq!(parse_byte_range("bytes=1001-", 1000), None);
+    }
+
+    #[test]
+    fn rejects_dash_only() {
+        // `bytes=-` is neither suffix-length nor explicit; parse fails.
+        assert_eq!(parse_byte_range("bytes=-", 1000), None);
+    }
+
+    // --- Additional detector parity ---
+
+    #[test]
+    fn detects_gif() {
+        assert_eq!(detect_content_type(b"GIF89a..."), "image/gif");
+        assert_eq!(detect_content_type(b"GIF87a..."), "image/gif");
+    }
+
+    #[test]
+    fn detects_webp() {
+        assert_eq!(
+            detect_content_type(b"RIFF\x00\x00\x00\x00WEBPVP8 "),
+            "image/webp"
+        );
+    }
+
+    #[test]
+    fn detects_pdf() {
+        assert_eq!(detect_content_type(b"%PDF-1.4..."), "application/pdf");
+    }
+
+    #[test]
+    fn detects_avi() {
+        assert_eq!(
+            detect_content_type(b"RIFF\x00\x00\x00\x00AVI LIST"),
+            "video/x-msvideo"
+        );
+    }
+
+    #[test]
+    fn detects_flac() {
+        assert_eq!(detect_content_type(b"fLaC\x00\x00..."), "audio/flac");
+    }
+
+    #[test]
+    fn empty_input_does_not_panic() {
+        // Edge case: a deleted-but-still-pinned IPFS object could return
+        // empty bytes. Detector must return octet-stream and not panic.
+        assert_eq!(detect_content_type(b""), "application/octet-stream");
+    }
+
+    #[test]
+    fn ftyp_at_exact_8_byte_boundary() {
+        // Smallest possible ftyp prefix: 8 bytes total. The matcher
+        // checks `data[4..8] == "ftyp"` which requires `len >= 8`.
+        let data: &[u8] = b"\x00\x00\x00\x08ftyp";
+        assert_eq!(detect_content_type(data), "video/mp4");
+    }
+
+    #[test]
+    fn short_inputs_do_not_panic() {
+        // None of the matchers should panic on a 1, 2, or 3-byte input.
+        assert_eq!(detect_content_type(b"\x89"), "application/octet-stream");
+        assert_eq!(detect_content_type(b"\xFF\xD8"), "application/octet-stream");
+        assert_eq!(detect_content_type(b"GIF"), "application/octet-stream");
+    }
 }
