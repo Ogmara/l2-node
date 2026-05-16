@@ -615,6 +615,30 @@ function esc(s) { const d = document.createElement('div'); d.textContent = s; re
 // refactor can extract them without touching DOM logic. v0.43.0 ships
 // English-only; full 7-language coverage lands when the dashboard's
 // i18n layer is built (see spec 12 §4.4).
+// Klever extension provider URLs by network — the extension defaults
+// to mainnet, so for SC TXs we MUST set `kleverWeb.provider` before
+// calling `initialize()` or the TX gets routed to the wrong chain
+// (manifests as a `400` on `/transaction/send` plus a downstream
+// "Cannot read properties of undefined (reading 'type')" parse error
+// in the extension's response handler).
+const KLEVER_PROVIDERS = {
+  testnet: { api: 'https://api.testnet.klever.org', node: 'https://node.testnet.klever.org' },
+  mainnet: { api: 'https://api.mainnet.klever.org', node: 'https://node.mainnet.klever.org' },
+};
+
+function applyKleverProvider(network) {
+  const p = KLEVER_PROVIDERS[network];
+  if (p && window.kleverWeb) {
+    // Some extension versions expose `setApi` / `setNode`; others
+    // read the `provider` property directly. Try both for compatibility.
+    try {
+      if (typeof window.kleverWeb.setApi === 'function') window.kleverWeb.setApi(p.api);
+      if (typeof window.kleverWeb.setNode === 'function') window.kleverWeb.setNode(p.node);
+    } catch (_) {}
+    try { window.kleverWeb.provider = p; } catch (_) {}
+  }
+}
+
 const ANCH_STRINGS = {
   reg_yes: 'Registered',
   reg_no: 'Not registered',
@@ -623,7 +647,22 @@ const ANCH_STRINGS = {
   state_a_title: 'Anchoring is disabled',
   state_a_body: 'Set <code>[anchoring] enabled = true</code> in your node config to start participating in the network truth layer. No on-chain action available from here.',
   state_b_title: 'Register your node on-chain to start anchoring',
-  state_b_body: (fee) => `One-time fee: <strong>${esc(fee)} KLV</strong>. Paid from your Klever extension wallet — the node never sees your private key.`,
+  state_b_body: (fee) => {
+    // Render in a way that doesn't read as broken when the contract
+    // owner hasn't set a fee yet (most fresh deploys), and that
+    // gracefully degrades when the fee view-call failed (`fee === null`).
+    let costLine;
+    if (fee === null || fee === undefined) {
+      costLine = `Fee currently unavailable (couldn't reach Klever).`;
+    } else if (fee === '0') {
+      // `fee_klv` is always a string from format_klv() server-side
+      // (or `null`); no numeric branch needed.
+      costLine = `<strong>Free registration</strong> (the contract owner has not set a fee). You only pay the standard Klever TX gas.`;
+    } else {
+      costLine = `One-time fee: <strong>${esc(fee)} KLV</strong>.`;
+    }
+    return `${costLine} Paid from your Klever extension wallet — the node never sees your private key.`;
+  },
   state_c_title: 'Registered. Awaiting first anchor.',
   state_c_body: 'Anchoring runs once per configured interval. The first attempt will appear here when complete.',
   state_d_title: 'Anchoring active ✓',
@@ -772,6 +811,11 @@ async function registerNodeOnChain() {
     return;
   }
 
+  // Point the extension at the right network BEFORE initialize();
+  // otherwise SC TXs default to mainnet and 400 against our testnet
+  // contract (or vice versa).
+  applyKleverProvider(anchState.klever_network);
+
   let walletAddress;
   try {
     await window.kleverWeb.initialize();
@@ -884,6 +928,7 @@ async function unregisterNodeOnChain() {
     return;
   }
   try {
+    applyKleverProvider(anchState.klever_network);
     await window.kleverWeb.initialize();
     const walletAddress = await window.kleverWeb.getWalletAddress();
     if (walletAddress !== anchState.wallet) {

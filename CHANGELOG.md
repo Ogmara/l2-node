@@ -5,6 +5,23 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.43.1] - 2026-05-16
+
+Hotfix to v0.43.0 — node registration was unusable because the dashboard
+never told the Klever extension which network to target, so SC TXs
+defaulted to mainnet (where the contract doesn't exist) instead of the
+node's actual network.
+
+### Fixed
+- **Klever network mismatch on registration.** The Klever extension's `kleverWeb.provider` is read at `initialize()` time; without setting it the extension defaults to mainnet. `registerNodeOnChain` / `unregisterNodeOnChain` in `dashboard.html` now call a new `applyKleverProvider(network)` helper before `initialize()`, pointing the extension at the testnet or mainnet endpoints depending on the node's configured network. Failure manifested as `POST https://node.mainnet.klever.org/transaction/send 400 (Bad Request)` followed by the extension's internal "Cannot read properties of undefined (reading 'type')" parse error.
+- **`/admin/node/registration`** now returns `klever_network` (`"testnet"` / `"mainnet"`) so the dashboard JS can route the extension correctly without parsing the node URL.
+
+### Changed
+- **"0 KLV" UX in the registration call-to-action.** When the contract owner hasn't set a registration fee yet (the SC's default is empty / zero), the dashboard now says "**Free registration** (the contract owner has not set a fee). You only pay the standard Klever TX gas." instead of the literally-correct-but-confusing "One-time fee: **0 KLV**". When the fee view RPC fails (`fee === null`), it falls back to "Fee currently unavailable (couldn't reach Klever)."
+
+### Operator notes
+- If you want to charge the recommended **100 KLV** registration fee on your contract, the owner wallet should call `setNodeRegistrationFee` post-deploy: `koperator sc invoke <contract_address> setNodeRegistrationFee --args u64:100000000 -k <owner_pem> -n https://node.testnet.klever.org --await -s`. Without this step, registration is free (which is fine for testnet bring-up).
+
 ## [0.43.0] - 2026-05-16
 
 Spec 12 Phase 1 (node side) — paired with smart-contract `0.3.0`.
