@@ -138,6 +138,8 @@ pub async fn node_registration(
         return Json(serde_json::json!({
             "wallet": wallet,
             "registered": false,
+            "registration_source": "none",
+            "registered_at": serde_json::Value::Null,
             "fee_klv": "0",
             "fee_klv_raw": "0",
             "contract_address": contract_address,
@@ -158,22 +160,45 @@ pub async fn node_registration(
     // per-request TLS-pool reallocation flagged by the v0.43.0 audit.
     let http = &state.klever_view_http;
 
-    // Issue all four view calls concurrently. Each is `Result<T>`; we
+    // Issue five view calls concurrently. Each is `Result<T>`; we
     // KEEP the `Result` so the JSON response can distinguish "RPC
     // unavailable" (serialized as `null`) from a genuine zero.
     // Without this distinction, the bootstrap banner would flash on
-    // every transient Klever RPC blip (audit W2).
-    let (registered_res, count_res, fee_res, canonical_height_res) = tokio::join!(
+    // every transient Klever RPC blip (v0.43.0 audit W2).
+    //
+    // The fifth call (`get_node_registered_at`) is what lets the
+    // dashboard tell apart "in v0.3+ permissionless registry"
+    // (timestamp > 0) from "only in the legacy authorized_anchorer
+    // allowlist" (timestamp == 0 but isNodeRegistered == true).
+    // `unregisterNode` only works for the former; the dashboard's
+    // State B′ (added in v0.43.3) routes legacy-only operators to a
+    // migrate path instead of a broken unregister button.
+    let (registered_res, count_res, fee_res, canonical_height_res, registered_at_res) = tokio::join!(
         crate::chain::sc_views::is_node_registered(http, &klever_node_url, &contract_address, &wallet),
         crate::chain::sc_views::get_node_count(http, &klever_node_url, &contract_address),
         crate::chain::sc_views::get_node_registration_fee(http, &klever_node_url, &contract_address),
         crate::chain::sc_views::get_latest_canonical_height(http, &klever_node_url, &contract_address),
+        crate::chain::sc_views::get_node_registered_at(http, &klever_node_url, &contract_address, &wallet),
     );
 
     // `registered` defaults to false on RPC error — surfacing it as
     // null here would confuse the action-area state machine. The
     // operator sees "Status unknown" via the dedicated error field.
     let registered = registered_res.unwrap_or(false);
+    let registered_at = registered_at_res.unwrap_or(0);
+
+    // Source classification — drives the dashboard's action-area branch:
+    //   "v3"     → in the permissionless registry; unregister works.
+    //   "legacy" → only in the deprecated `authorized_anchorer` allowlist;
+    //              unregister would fail with "Not registered" because
+    //              the SC's unregister_node only manages the v0.3+ map.
+    //              Dashboard offers a "Migrate to v0.3 registry" path instead.
+    //   "none"   → not registered anywhere; show the register CTA.
+    let registration_source = match (registered, registered_at) {
+        (true, n) if n > 0 => "v3",
+        (true, _)          => "legacy",
+        (false, _)         => "none",
+    };
 
     // `null` for unavailable so the dashboard can render a "—" rather
     // than misreporting as 0 (which would falsely trigger the
@@ -198,6 +223,12 @@ pub async fn node_registration(
     Json(serde_json::json!({
         "wallet": wallet,
         "registered": registered,
+        "registration_source": registration_source,
+        "registered_at": if registered_at > 0 {
+            serde_json::Value::Number(registered_at.into())
+        } else {
+            serde_json::Value::Null
+        },
         "fee_klv": fee_klv,
         "fee_klv_raw": fee_klv_raw,
         "contract_address": contract_address,
