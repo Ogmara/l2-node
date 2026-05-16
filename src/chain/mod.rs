@@ -3,5 +3,6 @@
 pub mod anchor_verify;
 pub mod anchoring;
 pub mod parser;
+pub mod sc_views;
 pub mod scanner;
 pub mod types;

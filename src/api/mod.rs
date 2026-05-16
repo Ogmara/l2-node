@@ -257,7 +257,8 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
             .route("/admin/peers/ban", post(admin::ban_peer))
             .route("/admin/channels/pin", post(admin::pin_channel))
             .route("/admin/state/latest", get(admin::state_latest))
-            .route("/admin/state/anchor", post(admin::trigger_anchor));
+            .route("/admin/state/anchor", post(admin::trigger_anchor))
+            .route("/admin/node/registration", get(admin::node_registration));
 
         if config.api.admin.dashboard {
             protected = protected

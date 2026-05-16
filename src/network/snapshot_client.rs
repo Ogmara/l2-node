@@ -1565,6 +1565,7 @@ mod tests {
             channel_count: 0,
             user_count: 0,
             node_id: "test".into(),
+            anchorer: String::new(),
             anchored_at: 0,
         }
     }

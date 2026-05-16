@@ -147,6 +147,16 @@ pub struct AppState {
     pub ws_broadcast: broadcast::Sender<String>,
     /// Klever network name ("testnet" or "mainnet"), derived from config.
     pub klever_network: String,
+    /// Klever node RPC URL (e.g. https://node.testnet.klever.org). Used
+    /// by admin handlers that need to make SC view calls — the node
+    /// itself anchors via the same URL but holds it inside
+    /// `StateAnchorer`, not in `AppState`.
+    pub klever_node_url: String,
+    /// Shared `reqwest::Client` for outbound Klever VM view calls from
+    /// admin handlers. One pooled client across all handlers — avoids
+    /// the per-request TLS-pool reallocation that the v0.43.0 code
+    /// audit flagged. 15s timeout matches the rest of the codebase.
+    pub klever_view_http: reqwest::Client,
     /// Ogmara KApp smart contract address (from config).
     pub contract_address: String,
     /// Node's Klever wallet address (klv1...).
@@ -215,6 +225,7 @@ impl AppState {
         router: MessageRouter,
         node_id: String,
         klever_network: String,
+        klever_node_url: String,
         contract_address: String,
         ipfs: Option<IpfsClient>,
         identity: IdentityResolver,
@@ -233,6 +244,7 @@ impl AppState {
             router,
             node_id,
             klever_network,
+            klever_node_url,
             contract_address,
             ipfs,
             identity,
@@ -265,6 +277,7 @@ impl AppState {
         router: MessageRouter,
         node_id: String,
         klever_network: String,
+        klever_node_url: String,
         contract_address: String,
         ipfs: Option<IpfsClient>,
         identity: IdentityResolver,
@@ -304,6 +317,14 @@ impl AppState {
             media_tuning.per_ip_permits,
             media_tuning.max_tracked_ips,
         );
+        // Pool one HTTP client for all admin-side Klever view calls.
+        // Falls back to `Client::new()` if the configured client fails
+        // to build (extremely unlikely — only known cause is missing
+        // TLS backend; default reqwest features include `default-tls`).
+        let klever_view_http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
             storage,
             router,
@@ -312,6 +333,8 @@ impl AppState {
             peers: peer_count,
             ws_broadcast,
             klever_network,
+            klever_node_url,
+            klever_view_http,
             contract_address,
             node_address,
             ipfs,

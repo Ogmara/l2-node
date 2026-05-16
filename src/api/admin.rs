@@ -115,6 +115,143 @@ pub async fn state_latest(
     }
 }
 
+/// GET /admin/node/registration — node-registration status (spec 12 §3.2).
+///
+/// Returns the operator-facing snapshot the dashboard's Anchoring tab
+/// needs to render: this node's anchorer wallet, on-chain registration
+/// state (live SC view), the current registration fee, network-wide
+/// node count (used for the bootstrap-quorum banner), and local anchor
+/// stats from RocksDB.
+///
+/// Wallet-authenticated because it exposes the anchorer wallet address.
+pub async fn node_registration(
+    Extension(state): Extension<Arc<AppState>>,
+) -> impl IntoResponse {
+    // If the node has no Klever node_url configured, anchoring is
+    // effectively disabled — surface a degraded payload instead of
+    // making bogus RPC calls.
+    let klever_node_url = state.klever_node_url.clone();
+    let contract_address = state.contract_address.clone();
+    let wallet = state.node_address.clone();
+
+    if klever_node_url.is_empty() || contract_address.is_empty() || wallet.is_empty() {
+        return Json(serde_json::json!({
+            "wallet": wallet,
+            "registered": false,
+            "fee_klv": "0",
+            "fee_klv_raw": "0",
+            "contract_address": contract_address,
+            "network_node_count": serde_json::Value::Null,
+            "last_canonical_height": serde_json::Value::Null,
+            "quorum_min": 3,
+            "anchor_count": serde_json::Value::Null,
+            "canonical_count": serde_json::Value::Null,
+            "last_successful_anchor": serde_json::Value::Null,
+            "anchoring_configured": false,
+            "error": "klever.node_url, klever.contract_address, or node anchor wallet not configured",
+        }))
+        .into_response();
+    }
+
+    // Reuse the pooled HTTP client built once at startup — avoids
+    // per-request TLS-pool reallocation flagged by the v0.43.0 audit.
+    let http = &state.klever_view_http;
+
+    // Issue all four view calls concurrently. Each is `Result<T>`; we
+    // KEEP the `Result` so the JSON response can distinguish "RPC
+    // unavailable" (serialized as `null`) from a genuine zero.
+    // Without this distinction, the bootstrap banner would flash on
+    // every transient Klever RPC blip (audit W2).
+    let (registered_res, count_res, fee_res, canonical_height_res) = tokio::join!(
+        crate::chain::sc_views::is_node_registered(http, &klever_node_url, &contract_address, &wallet),
+        crate::chain::sc_views::get_node_count(http, &klever_node_url, &contract_address),
+        crate::chain::sc_views::get_node_registration_fee(http, &klever_node_url, &contract_address),
+        crate::chain::sc_views::get_latest_canonical_height(http, &klever_node_url, &contract_address),
+    );
+
+    // `registered` defaults to false on RPC error — surfacing it as
+    // null here would confuse the action-area state machine. The
+    // operator sees "Status unknown" via the dedicated error field.
+    let registered = registered_res.unwrap_or(false);
+
+    // `null` for unavailable so the dashboard can render a "—" rather
+    // than misreporting as 0 (which would falsely trigger the
+    // bootstrap banner).
+    let network_node_count = count_res.ok().map(serde_json::Value::from).unwrap_or(serde_json::Value::Null);
+    let last_canonical_height = canonical_height_res.ok().map(serde_json::Value::from).unwrap_or(serde_json::Value::Null);
+
+    let (fee_klv, fee_klv_raw) = match fee_res {
+        Ok(raw) => (
+            serde_json::Value::String(format_klv(raw)),
+            serde_json::Value::String(raw.to_string()),
+        ),
+        Err(_) => (serde_json::Value::Null, serde_json::Value::Null),
+    };
+
+    // Local anchor stats from RocksDB.
+    let last_anchor_ts = state
+        .storage
+        .get_stat(crate::storage::schema::state_keys::LAST_ANCHOR_TS)
+        .unwrap_or(0);
+
+    Json(serde_json::json!({
+        "wallet": wallet,
+        "registered": registered,
+        "fee_klv": fee_klv,
+        "fee_klv_raw": fee_klv_raw,
+        "contract_address": contract_address,
+        "network_node_count": network_node_count,
+        "last_canonical_height": last_canonical_height,
+        "quorum_min": 3,
+        // anchor_count / canonical_count are local stats derived from
+        // RocksDB scans; v0.43 reports `null` placeholders because we
+        // haven't yet plumbed a per-anchorer counter through the
+        // scanner. The dashboard handles `null` by hiding the field.
+        "anchor_count": serde_json::Value::Null,
+        "canonical_count": serde_json::Value::Null,
+        "last_successful_anchor": if last_anchor_ts > 0 {
+            serde_json::Value::Number(last_anchor_ts.into())
+        } else {
+            serde_json::Value::Null
+        },
+        "anchoring_configured": true,
+    }))
+    .into_response()
+}
+
+/// Format a raw KLV amount (1 KLV = 10^6 raw units) as a human string.
+/// Uses up to 6 fractional digits, trimming trailing zeros and the
+/// decimal point when integer-valued. `100_000_000` → `"100"`,
+/// `100_500_000` → `"100.5"`, `0` → `"0"`.
+fn format_klv(raw: u128) -> String {
+    if raw == 0 {
+        return "0".to_string();
+    }
+    let whole = raw / 1_000_000;
+    let frac = raw % 1_000_000;
+    if frac == 0 {
+        return whole.to_string();
+    }
+    let frac_str = format!("{:06}", frac);
+    let trimmed = frac_str.trim_end_matches('0');
+    format!("{}.{}", whole, trimmed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_klv;
+
+    #[test]
+    fn klv_formatting() {
+        assert_eq!(format_klv(0), "0");
+        assert_eq!(format_klv(1_000_000), "1");
+        assert_eq!(format_klv(100_000_000), "100");
+        assert_eq!(format_klv(100_500_000), "100.5");
+        assert_eq!(format_klv(1), "0.000001");
+        assert_eq!(format_klv(123_456), "0.123456");
+    }
+}
+
 /// POST /admin/state/anchor — trigger immediate state anchoring.
 pub async fn trigger_anchor(
     Extension(state): Extension<Arc<AppState>>,

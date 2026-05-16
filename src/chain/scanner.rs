@@ -671,6 +671,7 @@ impl ChainScanner {
                 channel_count,
                 user_count,
                 node_id,
+                anchorer,
                 timestamp,
             } => {
                 let record = StateAnchorRecord {
@@ -680,6 +681,7 @@ impl ChainScanner {
                     channel_count,
                     user_count,
                     node_id,
+                    anchorer,
                     anchored_at: timestamp,
                 };
                 let bytes = serde_json::to_vec(&record)?;

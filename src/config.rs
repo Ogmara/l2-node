@@ -705,6 +705,13 @@ pub struct AlertThresholds {
     pub rate_limit_alert_per_min: u32,
     #[serde(default = "default_50")]
     pub failed_sig_alert_per_min: u32,
+    /// Number of consecutive canonicalized heights at which the local
+    /// computed root must differ from the on-chain canonical root
+    /// before the `anchor_divergence` alert fires (spec 12 §6.1,
+    /// spec 10 §9.2). Default 2 — one mismatch could be transient,
+    /// two consecutive is a real divergence signal.
+    #[serde(default = "default_anchor_divergence_consecutive")]
+    pub anchor_divergence_consecutive: u32,
 }
 
 impl Default for AlertThresholds {
@@ -719,6 +726,7 @@ impl Default for AlertThresholds {
             sc_sync_max_lag_blocks: 100,
             rate_limit_alert_per_min: 100,
             failed_sig_alert_per_min: 50,
+            anchor_divergence_consecutive: default_anchor_divergence_consecutive(),
         }
     }
 }
@@ -834,6 +842,10 @@ fn default_90() -> u8 {
 fn default_85() -> u8 {
     85
 }
+fn default_anchor_divergence_consecutive() -> u32 {
+    2
+}
+
 fn default_anchor_overdue() -> f64 {
     2.0
 }
@@ -1215,6 +1227,10 @@ seconds = 300
 min_peers = 3
 max_disk_usage_percent = 90
 max_memory_usage_percent = 85
+# Anchor divergence: fire `anchor_divergence` (critical) when this many
+# consecutive canonicalized heights show our local root differing from
+# the on-chain canonical root (spec 12 §6.1, spec 10 §9.2). Default: 2.
+anchor_divergence_consecutive = 2
 
 [logging]
 level = "info"

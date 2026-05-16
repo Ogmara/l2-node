@@ -692,6 +692,7 @@ impl Node {
             api_router,
             self.node_id.clone(),
             klever_network,
+            self.config.klever.node_url.clone(),
             self.config.klever.contract_address.clone(),
             ipfs_client,
             identity.clone(),

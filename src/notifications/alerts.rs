@@ -31,6 +31,15 @@ pub enum AlertType {
     DiskUsageHigh,
     MemoryUsageHigh,
     AnchorOverdue,
+    /// Local computed state root diverged from the on-chain canonical
+    /// root for ≥ `anchor_divergence_consecutive` consecutive
+    /// canonicalized heights (spec 12 §6.1, spec 10 §9.2).
+    ///
+    /// Critical because it means this node's state has materially
+    /// drifted from quorum — either a local bug, a corrupt RocksDB,
+    /// or (worst case) a colluding-anchorer attack on the canonical
+    /// root. Operator must investigate immediately.
+    AnchorDivergence,
     ScSyncBehind,
     HighRateLimitTriggers,
     FailedSignatureSpike,
@@ -40,7 +49,9 @@ pub enum AlertType {
 impl AlertType {
     pub fn severity(&self) -> AlertSeverity {
         match self {
-            AlertType::KleverDisconnected | AlertType::IpfsUnreachable => AlertSeverity::Critical,
+            AlertType::KleverDisconnected
+            | AlertType::IpfsUnreachable
+            | AlertType::AnchorDivergence => AlertSeverity::Critical,
             AlertType::LowPeerCount
             | AlertType::DiskUsageHigh
             | AlertType::MemoryUsageHigh
@@ -60,6 +71,7 @@ impl AlertType {
             AlertType::DiskUsageHigh => "Disk usage above threshold",
             AlertType::MemoryUsageHigh => "Memory usage above threshold",
             AlertType::AnchorOverdue => "State anchor overdue",
+            AlertType::AnchorDivergence => "State root diverged from canonical",
             AlertType::ScSyncBehind => "SC sync falling behind",
             AlertType::HighRateLimitTriggers => "High rate-limit trigger count",
             AlertType::FailedSignatureSpike => "Failed signature verification spike",
@@ -75,6 +87,7 @@ impl AlertType {
             AlertType::DiskUsageHigh => "high_disk",
             AlertType::MemoryUsageHigh => "high_memory",
             AlertType::AnchorOverdue => "anchor_overdue",
+            AlertType::AnchorDivergence => "anchor_divergence",
             AlertType::ScSyncBehind => "sc_sync_behind",
             AlertType::HighRateLimitTriggers => "high_rate_limits",
             AlertType::FailedSignatureSpike => "high_failed_sigs",
@@ -164,6 +177,7 @@ impl AlertEngine {
         let max_disk_pct = self.config.thresholds.max_disk_usage_percent;
         let max_mem_pct = self.config.thresholds.max_memory_usage_percent;
         let max_sync_lag = self.config.thresholds.sc_sync_max_lag_blocks;
+        let divergence_threshold = self.config.thresholds.anchor_divergence_consecutive;
 
         // IPFS unreachable
         if !snap.ipfs_connected {
@@ -210,6 +224,29 @@ impl AlertEngine {
                 &format!(
                     "Sync lag: {} blocks (threshold: {})",
                     snap.klever_sync_lag_blocks, max_sync_lag
+                ),
+            ).await;
+        }
+
+        // Anchor divergence — local state root drifted from quorum
+        // canonical for ≥ N consecutive heights (spec 12 §6.1).
+        //
+        // v0.43.0 SCAFFOLDING: the alert TYPE, severity, threshold, and
+        // taxonomy (spec 10 §9.2) are wired here so the system honors
+        // the alert contract today. The COUNTER (`snap.anchor_divergence_count`)
+        // is currently always zero — live divergence detection (a
+        // dedicated background task that compares submitted roots
+        // against `getCanonicalAnchor` once each height has had time
+        // to canonicalize) lands in v0.43.1. Until then this branch
+        // is dormant by construction.
+        if divergence_threshold > 0
+            && snap.anchor_divergence_count >= divergence_threshold
+        {
+            self.fire(
+                AlertType::AnchorDivergence,
+                &format!(
+                    "Anchor divergence: {} consecutive canonical heights diverge from local root (threshold: {})",
+                    snap.anchor_divergence_count, divergence_threshold
                 ),
             ).await;
         }

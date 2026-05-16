@@ -5,6 +5,47 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.43.0] - 2026-05-16
+
+Spec 12 Phase 1 (node side) — paired with smart-contract `0.3.0`.
+
+The node now refuses to enter its anchoring loop until the operator's
+anchorer wallet is registered on-chain via the new permissionless
+`registerNode` endpoint, and the embedded dashboard gains an
+**Anchoring** tab that walks the operator through the one-time
+registration with their Klever extension wallet. Quorum (3-anchorer
+agreement on a `(height, root)` pair) is now the source of canonical
+truth.
+
+### Added
+- **`chain/sc_views.rs`** — Klever VM view-call clients for the new SC v0.3.0 surface: `is_node_registered`, `get_node_count`, `get_node_registration_fee`, `get_node_registered_at`, `get_canonical_anchor`, `get_latest_canonical_height`. Reuses the established `/vm/hex` POST pattern with safe encoding helpers; bool/integer/`ManagedBuffer` decoding fully tested.
+- **Startup registration check** in `chain/anchoring.rs::run` (spec 12 §3.1) — calls `isNodeRegistered` for the node's anchor wallet; if `false`, logs a clear warning with the wallet address and re-polls every 60 s instead of entering the anchor loop blind. Shutdown-aware so the node still exits cleanly during a poll wait.
+- **`GET /admin/node/registration`** (spec 12 §3.2) — wallet-authenticated admin endpoint returning `{wallet, registered, fee_klv, fee_klv_raw, contract_address, network_node_count, quorum_min, last_successful_anchor, anchoring_configured}`. Issues the three view calls concurrently via `tokio::join!`; partial failures degrade the payload rather than failing the request.
+- **Dashboard Anchoring tab** (spec 12 §4) — new top-level tab positioned after Alerts. Educational collapsible block, network-health row (registered nodes / latest canonical / quorum threshold), node status panel (anchorer wallet with copy button, registration state, last anchor, smart contract), and a state-driven action area:
+  - State A (`enabled = false`): config-pointer message, no on-chain action.
+  - State B (enabled, not registered): "Register node on-chain" button — runs the Klever-extension build / sign / broadcast flow with a **hard wallet-alignment guard** (refuses to register when the extension address ≠ the node's anchorer address, no "register anyway" path), then polls `/admin/node/registration` every 3 s for up to 60 s until status flips.
+  - State C (registered, no anchors yet): "Awaiting first anchor" status with secondary unregister option.
+  - State D (registered + anchoring active): compact "Active ✓" status with secondary unregister option.
+- **`anchor_divergence` alert** (spec 12 §6.1, spec 10 §9.2) — new `AlertType::AnchorDivergence` (Critical) with `anchor_divergence_consecutive` threshold (default 2) and `MetricsSnapshot.anchor_divergence_count` field. Alert taxonomy + threshold scaffolding ships in 0.43.0; the live divergence-watcher task that compares submitted roots against `getCanonicalAnchor` once each height has had time to canonicalize lands in 0.43.1.
+- **Klever node URL** plumbed onto `AppState` as `klever_node_url` so admin handlers can issue SC view calls without reaching back into config.
+- **`StateAnchorRecord.anchorer`** — per-anchor attribution (`#[serde(default)]` for backwards compatibility with pre-upgrade records).
+
+### Changed
+- **Chain event scanner** now extracts the TX `sender` as the `anchorer` for every `stateAnchored` event and persists it on `StateAnchorRecord`. Call-data parsing in `chain/parser.rs` is unchanged because `anchorState` call args didn't change in SC v0.3.0; the new event-topic ordering is only a concern for separate event-topic parsers (which this codebase doesn't use), so the chain scanner stays compatible without further surgery.
+- **Dashboard tab bar** appends "Anchoring" after "Alerts" — previously: Overview | Network | Storage | Messages | Alerts.
+
+### Internationalization
+- Anchoring tab strings live in a single `ANCH_STRINGS` const at the top of the JS module so a future dashboard-i18n refactor (planned post-0.43) can extract them under a `dashboard.anchoring.*` namespace without touching DOM logic. v0.43 ships English-only (the dashboard frontend doesn't yet have an i18n layer; clients/desktop/mobile already cover all 7 languages).
+
+### Security
+- Wallet alignment **hard guard** in the dashboard registration modal — wrong-wallet registration is impossible by design (would burn 100 KLV and leave the node still unregistered).
+- Registration TX signing happens entirely in the Klever extension; the node never sees the operator's private key (matches the user-registration flow in the desktop / web clients).
+- New admin endpoint exposes the anchorer wallet, so it sits behind the existing wallet-auth middleware (same trust model as `state_latest`, `peers`, etc.).
+
+### Compatibility
+- **Requires smart-contract ≥ 0.3.0** for the new view calls. Against an older contract, the startup registration check fails view-call-with-error (logged, retried), so the node spins in the "waiting for registration" loop until the contract is upgraded — a clear operator signal that the contract upgrade is the next step.
+- Snapshot bootstrap continues to work unchanged across the upgrade thanks to the SC's `getStateRoot` shim (canonical-first / legacy-fallback).
+
 ## [0.42.0] - 2026-05-15
 
 ### Added
