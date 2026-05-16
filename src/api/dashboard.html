@@ -838,26 +838,36 @@ async function registerNodeOnChain() {
 
   setStatus('Building transaction…');
   const feeRaw = Number(anchState.fee_klv_raw) || 0;
-  const contract = {
-    type: 7,                       // Klever extension SDK: SmartContract type
-    scType: 0,                     // 0 = invoke
-    address: anchState.contract_address,
-    callValue: { KLV: feeRaw },
-    data: ['registerNode'],        // no args
-  };
+
+  // Klever extension buildTransaction signature (verified against the
+  // Ogmara web client + appscan KApp): one contract entry per item,
+  // each shaped as {type: 63, payload: {...}}, with call data as a
+  // SEPARATE second argument of base64-encoded "functionName@hexArg1@…"
+  // strings. The contract.type must be 63 (TransactionType.SmartContract,
+  // NOT the prior wrong value 7), payload.scType 0 = InvokeContract,
+  // and callValue uses STRING amounts ({ KLV: "100000000" }) or empty
+  // {} when no value is attached. Getting any of these wrong manifests
+  // as a 400 from /transaction/send.
+  const callValue = feeRaw > 0 ? { KLV: feeRaw.toString() } : {};
+  const callData = 'registerNode'; // no args
 
   let tx;
   try {
-    tx = await window.kleverWeb.buildTransaction([contract]);
+    tx = await window.kleverWeb.buildTransaction(
+      [{
+        type: 63,
+        payload: {
+          scType: 0,
+          address: anchState.contract_address,
+          callValue,
+        },
+      }],
+      [btoa(callData)],
+    );
   } catch (e) {
-    // Some extension versions accept a single contract object; retry.
-    try {
-      tx = await window.kleverWeb.buildTransaction(contract);
-    } catch (e2) {
-      setStatus('');
-      setError(esc(ANCH_STRINGS.err_build_fail) + ' ' + esc(e2.message || e2));
-      return;
-    }
+    setStatus('');
+    setError(esc(ANCH_STRINGS.err_build_fail) + ' ' + esc(e.message || e));
+    return;
   }
 
   setStatus('Sign in your Klever wallet…');
@@ -935,16 +945,19 @@ async function unregisterNodeOnChain() {
       alert(`Wallet mismatch: extension is ${walletAddress}, node is ${anchState.wallet}. Cancelled.`);
       return;
     }
-    const contract = {
-      type: 7,
-      scType: 0,
-      address: anchState.contract_address,
-      callValue: { KLV: 0 },
-      data: ['unregisterNode'],
-    };
-    let tx;
-    try { tx = await window.kleverWeb.buildTransaction([contract]); }
-    catch (_) { tx = await window.kleverWeb.buildTransaction(contract); }
+    // Same buildTransaction shape as registerNodeOnChain — see the
+    // long comment there for why this layout matters.
+    const tx = await window.kleverWeb.buildTransaction(
+      [{
+        type: 63,
+        payload: {
+          scType: 0,
+          address: anchState.contract_address,
+          callValue: {},
+        },
+      }],
+      [btoa('unregisterNode')],
+    );
     const signed = await window.kleverWeb.signTransaction(tx);
     await window.kleverWeb.broadcastTransactions([signed]);
     alert('Unregistration broadcast. Status will update on next refresh.');

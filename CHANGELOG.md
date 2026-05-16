@@ -5,6 +5,26 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.43.2] - 2026-05-16
+
+Second hotfix to v0.43.0 — the dashboard's `kleverWeb.buildTransaction`
+call shape was wrong (guessed at the API instead of mirroring the
+verified Ogmara web client + appscan KApp reference). After v0.43.1
+correctly routed SC TXs to testnet, the testnet node returned 400 on
+`/transaction/send` because the TX shape itself was malformed; the
+extension's internal parser then choked on the 400 response with
+"Cannot read properties of undefined (reading 'type')".
+
+### Fixed
+- **`registerNodeOnChain` + `unregisterNodeOnChain`** now call `kleverWeb.buildTransaction` with the **verified** Klever extension signature:
+  - Contract entry: `{ type: 63, payload: { scType: 0, address, callValue } }` (was `{ type: 7, scType, address, callValue, data }` — three fields in the wrong place).
+  - Call data: `[btoa('registerNode')]` as a SEPARATE second argument (was inside the contract object as `data: ['registerNode']`).
+  - `callValue`: `{ KLV: amount.toString() }` when non-zero, else `{}` (was `{ KLV: 0 }` — numeric, never empty).
+  - The hex value `type: 63` matches the Klever protocol's `TransactionType.SmartContract`.
+- Dropped the speculative "retry with single object" fallback in the build step — the correct shape works on the first try.
+
+Pattern verified against `web/src/lib/klever.ts:226-230` and `appscan-web/js/rating.js:129-136`. Saved to the project knowledge base so this isn't re-debugged in the next Klever extension caller.
+
 ## [0.43.1] - 2026-05-16
 
 Hotfix to v0.43.0 — node registration was unusable because the dashboard
