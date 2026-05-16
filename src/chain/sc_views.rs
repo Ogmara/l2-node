@@ -99,18 +99,31 @@ impl VmHexResponse {
 
 /// Like `vm_hex_call` but for views returning `MultiValueEncoded<...>`.
 ///
-/// Klever VM returns sequences as `data.data` = array-of-hex-strings,
-/// one entry per encoded value. For `MultiValueEncoded<MultiValue2<A, B>>`
-/// the SC flattens to `[a0, b0, a1, b1, ...]` so callers must consume
-/// in pairs (or triplets, etc.) per their expected tuple shape.
-async fn vm_hex_call_multi(
+/// **Endpoint:** `/vm/query` (NOT `/vm/hex`). Discovered during the
+/// SC v0.4.0 testnet bake-in: Klever's `/vm/hex` truncates multi-value
+/// returns to the first emitted ManagedBuffer (it's only correct for
+/// scalar single-value returns). `/vm/query` is the proper RPC for
+/// arrays of return values.
+///
+/// **Response shape:** items live at `.data.data.returnData` as an
+/// array of base64-encoded byte strings. Empty strings encode zero-
+/// length values (e.g., a u64 of 0 has minimal-BE encoding `[]`).
+/// For `MultiValueEncoded<MultiValue2<A, B>>` the SC flattens to
+/// `[a0_b64, b0_b64, a1_b64, b1_b64, ...]` so callers consume in pairs
+/// (or triplets, etc.) per their expected tuple shape.
+///
+/// **Error handling:** transport errors propagate as `Err`. SC-level
+/// `require!` failures show up as a non-Ok `returnCode` in the inner
+/// response — surfaced via the `error` field on the returned struct
+/// so callers can map them to `Ok(empty)` like before.
+async fn vm_query_multi(
     http: &reqwest::Client,
     klever_node_url: &str,
     contract_address: &str,
     func_name: &str,
     args: &[String],
-) -> Result<VmHexMultiResponse> {
-    let url = format!("{}/vm/hex", klever_node_url.trim_end_matches('/'));
+) -> Result<VmQueryMultiResponse> {
+    let url = format!("{}/vm/query", klever_node_url.trim_end_matches('/'));
     let body = serde_json::json!({
         "scAddress": contract_address,
         "funcName": func_name,
@@ -121,37 +134,77 @@ async fn vm_hex_call_multi(
         .json(&body)
         .send()
         .await
-        .with_context(|| format!("POST /vm/hex for {}", func_name))?
+        .with_context(|| format!("POST /vm/query for {}", func_name))?
         .json()
         .await
-        .with_context(|| format!("decoding /vm/hex response for {}", func_name))?;
+        .with_context(|| format!("decoding /vm/query response for {}", func_name))?;
 
-    let error = resp
+    // Two sources of error:
+    //   1. Top-level `.error` (transport / endpoint failure)
+    //   2. Inner `.data.data.returnCode` (SC require! / VMUserError)
+    let top_error = resp
         .get("error")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    // For multi-value returns, `data.data` is an array of hex strings.
-    // Klever VM emits an empty array (or missing field) for an empty
-    // result; treat both as Vec::new().
-    let items = resp
-        .pointer("/data/data")
+    let return_code = resp
+        .pointer("/data/data/returnCode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Ok")
+        .to_string();
+    let return_message = resp
+        .pointer("/data/data/returnMessage")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let error = if !top_error.is_empty() {
+        top_error
+    } else if return_code != "Ok" {
+        // Surface the SC's returnMessage (e.g., "Not registered") so
+        // callers can map known failures to benign `Ok(empty)`.
+        if return_message.is_empty() {
+            return_code
+        } else {
+            return_message
+        }
+    } else {
+        String::new()
+    };
+
+    // Decode returnData (array of base64 strings) into raw byte vectors.
+    // Empty string → empty Vec<u8> (legitimate for zero-value encodings).
+    let items_b64: Vec<&str> = resp
+        .pointer("/data/data/returnData")
         .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
         .unwrap_or_default();
-    Ok(VmHexMultiResponse { error, items })
+
+    use base64::Engine;
+    let b64_engine = base64::engine::general_purpose::STANDARD;
+    let mut items: Vec<Vec<u8>> = Vec::with_capacity(items_b64.len());
+    for b64 in items_b64 {
+        let bytes = if b64.is_empty() {
+            Vec::new()
+        } else {
+            b64_engine
+                .decode(b64)
+                .with_context(|| format!("base64-decoding {} returnData entry", func_name))?
+        };
+        items.push(bytes);
+    }
+
+    Ok(VmQueryMultiResponse { error, items })
 }
 
-struct VmHexMultiResponse {
+struct VmQueryMultiResponse {
     error: String,
-    items: Vec<String>,
+    /// Raw bytes for each return value, in order. Empty Vec = zero-
+    /// length encoding (e.g., u64 of 0).
+    items: Vec<Vec<u8>>,
 }
 
-impl VmHexMultiResponse {
+impl VmQueryMultiResponse {
     fn is_require_failure(&self) -> bool {
         !self.error.is_empty()
     }
@@ -447,7 +500,7 @@ pub async fn get_node_metadata(
 
     let address_hex = encode_address_hex(klv_address)
         .with_context(|| format!("invalid klv address: {}", klv_address))?;
-    let resp = vm_hex_call_multi(
+    let resp = vm_query_multi(
         http,
         klever_node_url,
         contract_address,
@@ -465,13 +518,11 @@ pub async fn get_node_metadata(
             MAX_RETURNED_ENTRIES
         );
     }
-    // ManagedBuffer items are wire-encoded as raw bytes (hex on the
-    // wire). The SC stores multiaddr strings as ASCII bytes, so each
-    // hex-decoded item is the multiaddr string.
+    // Each item is raw bytes of a ManagedBuffer. The SC stores
+    // multiaddr strings as ASCII bytes, so each item IS the multiaddr
+    // string in bytes.
     let mut out = Vec::with_capacity(resp.items.len());
-    for hex_item in &resp.items {
-        let bytes = hex::decode(hex_item)
-            .context("hex-decoding getNodeMetadata entry")?;
+    for bytes in resp.items {
         let s = String::from_utf8(bytes)
             .context("getNodeMetadata entry is not valid UTF-8")?;
         out.push(s);
@@ -504,7 +555,7 @@ pub async fn get_active_nodes(
     offset: u32,
     limit: u32,
 ) -> Result<Vec<ActiveNode>> {
-    let resp = vm_hex_call_multi(
+    let resp = vm_query_multi(
         http,
         klever_node_url,
         contract_address,
@@ -520,9 +571,10 @@ pub async fn get_active_nodes(
     }
 
     // Layout: `MultiValueEncoded<MultiValue2<Address, u64>>` flattens
-    // to [addr0_hex, ts0_hex, addr1_hex, ts1_hex, ...]. Consume in
-    // pairs; an odd-length response is a protocol mismatch and we
-    // surface it as an error rather than silently truncating.
+    // to [addr0_bytes, ts0_bytes, addr1_bytes, ts1_bytes, ...]. Each
+    // address is 32 raw bytes; each u64 is minimal-BE bytes (possibly
+    // empty for zero). Consume in pairs; an odd-length response is a
+    // protocol mismatch and we surface it as an error.
     if resp.items.len() % 2 != 0 {
         anyhow::bail!(
             "getActiveNodes returned odd-length sequence: {} items",
@@ -532,8 +584,7 @@ pub async fn get_active_nodes(
 
     let mut out = Vec::with_capacity(resp.items.len() / 2);
     for pair in resp.items.chunks_exact(2) {
-        let addr_bytes = hex::decode(&pair[0])
-            .context("hex-decoding getActiveNodes address")?;
+        let addr_bytes = &pair[0];
         if addr_bytes.len() != 32 {
             anyhow::bail!(
                 "getActiveNodes address has wrong length: got {}, expected 32",
@@ -541,12 +592,12 @@ pub async fn get_active_nodes(
             );
         }
         let mut key = [0u8; 32];
-        key.copy_from_slice(&addr_bytes);
+        key.copy_from_slice(addr_bytes);
         let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&key)
             .context("decoding getActiveNodes Ed25519 pubkey from raw bytes")?;
         let address = crate::crypto::pubkey_to_address(&verifying_key)
             .context("encoding getActiveNodes address as bech32")?;
-        let last_anchor_at = decode_u64_be(&pair[1]);
+        let last_anchor_at = decode_u64_be_bytes(&pair[1]);
         out.push(ActiveNode {
             address,
             last_anchor_at,
@@ -556,6 +607,19 @@ pub async fn get_active_nodes(
 }
 
 // ── Decoding helpers ────────────────────────────────────────────────
+
+/// Decode a u64 from minimal big-endian raw bytes (used by
+/// `vm_query_multi` consumers). Empty slice = 0. Oversize (> 8
+/// bytes) → 0 (safe-default to surface protocol issues as "no data"
+/// instead of panicking).
+fn decode_u64_be_bytes(bytes: &[u8]) -> u64 {
+    if bytes.is_empty() || bytes.len() > 8 {
+        return 0;
+    }
+    let mut padded = [0u8; 8];
+    padded[8 - bytes.len()..].copy_from_slice(bytes);
+    u64::from_be_bytes(padded)
+}
 
 /// Klever VM returns integers as big-endian minimal-length hex bytes
 /// (empty payload = 0). Decode safely; bad hex defaults to 0 so a
