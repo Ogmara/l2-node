@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::Config;
 use crate::crypto;
@@ -258,6 +258,19 @@ impl Node {
         let (snapshot_client_tx, snapshot_client_rx) =
             tokio::sync::mpsc::unbounded_channel::<crate::network::SnapshotClientCommand>();
 
+        // Spec 13 §4.3 stall-trigger signal — bumped by NetworkService
+        // on every successful Ogmara Identify, read once by sc_discovery
+        // at +60s post-startup. Cloned BEFORE NetworkService::new so the
+        // sc_discovery handle below shares the same counter.
+        let identify_success_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // Spec 13 §4.1 discovery-source classifier — sc_discovery
+        // pushes PeerIds it persists, NetworkService reads at
+        // Identify::Received time to tag the connected peer with `sc`
+        // tier. Owned outside both tasks; both get cloned Arcs.
+        let sc_added_peer_ids = std::sync::Arc::new(std::sync::RwLock::new(
+            std::collections::HashSet::<libp2p::PeerId>::new(),
+        ));
+
         // Start the network service
         let keypair = self.libp2p_keypair()?;
         let mut network = crate::network::NetworkService::new(
@@ -273,6 +286,8 @@ impl Node {
             network_counters.clone(),
             snapshot_cache.clone(),
             snapshot_client_rx,
+            identify_success_count.clone(),
+            sc_added_peer_ids.clone(),
         )
         .await
         .context("starting network service")?;
@@ -556,7 +571,12 @@ impl Node {
                 None
             };
 
-        // Start state anchorer (if enabled)
+        // Start state anchorer (if enabled).
+        // `anchor_task` is awaited explicitly on shutdown so a graceful
+        // pauseNode (when `pause_on_shutdown = true`) has time to
+        // broadcast before the rest of the node tears down. None when
+        // anchoring is disabled.
+        let mut anchor_task: Option<tokio::task::JoinHandle<()>> = None;
         let anchor_trigger_tx = if self.config.anchoring.enabled {
             let anchor_klever = self.config.klever.clone();
             let anchor_config = self.config.anchoring.clone();
@@ -565,8 +585,10 @@ impl Node {
             let anchor_divergence_for_task = anchor_divergence_counter.clone();
             let anchor_canonical_for_task = anchor_canonical_counter.clone();
 
-            // Resolve wallet key: env var > config file > node identity key
-            let wallet_key_hex = std::env::var("OGMARA_ANCHOR_WALLET_KEY")
+            // Resolve wallet key: env var > config file > node identity key.
+            // The hex string `wallet_key_hex` holds private-key material —
+            // zeroized after decoding (Security Audit W3).
+            let mut wallet_key_hex = std::env::var("OGMARA_ANCHOR_WALLET_KEY")
                 .unwrap_or_else(|_| anchor_config.wallet_key.clone());
 
             let anchor_key = if wallet_key_hex.is_empty() {
@@ -579,15 +601,32 @@ impl Node {
                     anyhow::anyhow!("anchor wallet key must be 32 bytes, got {}", bytes.len())
                 })?;
                 let key = SigningKey::from_bytes(&key_bytes);
-                // Zeroize the intermediate secret material
+                // Zeroize the intermediate secret material — both the
+                // decoded bytes AND the hex source. Note: `String` heap
+                // memory is freed without scrubbing by the allocator, so
+                // we overwrite-in-place before drop.
                 bytes.fill(0);
+                // SAFETY: we mutate the String's underlying bytes in place.
+                // We know they're valid UTF-8 (hex chars) on entry and we
+                // overwrite with '0' (0x30) which is also valid UTF-8.
+                unsafe {
+                    let v = wallet_key_hex.as_mut_vec();
+                    for b in v.iter_mut() {
+                        *b = b'0';
+                    }
+                }
                 info!("State anchoring using separate wallet key");
                 key
             };
+            drop(wallet_key_hex);
             let anchor_shutdown_rx = self.shutdown_rx();
             let (trigger_tx, trigger_rx) = tokio::sync::mpsc::channel(1);
             let anchor_alert_for_task = anchor_alert_tx.clone();
-            let _anchor_task = tokio::spawn(async move {
+            // Capture the JoinHandle so the main loop can `await` the
+            // anchor task on shutdown — when `pause_on_shutdown = true`
+            // we need its `submit_pause_for_shutdown()` call to finish
+            // broadcasting before we abort the rest of the node.
+            let handle = tokio::spawn(async move {
                 match crate::chain::anchoring::StateAnchorer::new(
                     anchor_klever,
                     anchor_config,
@@ -602,6 +641,7 @@ impl Node {
                     Err(e) => warn!(error = %e, "Failed to start state anchorer"),
                 }
             });
+            anchor_task = Some(handle);
             Some(trigger_tx)
         } else {
             None
@@ -736,6 +776,11 @@ impl Node {
         };
         let sc_disc_shutdown_rx = self.shutdown_rx();
         let sc_disc_reconnect_tx = sc_reconnect_tx.clone();
+        // Capture the staleness cutoff before the spawn so the async
+        // block doesn't need `self`.
+        let sc_disc_staleness_secs = (self.config.network.discovery.max_peer_staleness_days
+            as u64)
+            .saturating_mul(24 * 3600);
         tokio::spawn(async move {
             match crate::network::sc_discovery::ScDiscovery::new(
                 sc_disc_klever_url,
@@ -744,6 +789,12 @@ impl Node {
                 sc_disc_self_addr,
                 sc_disc_reconnect_tx,
                 sc_disc_alert_tx,
+                identify_success_count,
+                sc_added_peer_ids,
+                // Same staleness cutoff that `bootstrap-candidates`
+                // uses — spec 13 §7 mandates a single config-driven
+                // value across both consumers.
+                sc_disc_staleness_secs,
             ) {
                 Ok(disc) => disc.run(sc_disc_shutdown_rx).await,
                 Err(e) => warn!(error = %e, "Failed to start sc_discovery"),
@@ -815,6 +866,22 @@ impl Node {
             trusted_proxies,
             anchor_divergence_counter,
             anchor_canonical_counter,
+            self.config.network.listen_port,
+            self.config.anchoring.metadata.clone(),
+            self.config.anchoring.pause_on_shutdown,
+            // True if a key is configured either in the config file
+            // (legacy / non-recommended) or via the env var (preferred,
+            // per AnchoringConfig.wallet_key doc). Read-only check —
+            // the key itself never lands on AppState.
+            !self.config.anchoring.wallet_key.is_empty()
+                || std::env::var("OGMARA_ANCHOR_WALLET_KEY")
+                    .map(|v| !v.is_empty())
+                    .unwrap_or(false),
+            // [network.discovery] max_peer_staleness_days converted to
+            // seconds. Saturating mul guards against an absurd operator
+            // config (e.g. u32::MAX days). Default 7 days = 604_800s.
+            (self.config.network.discovery.max_peer_staleness_days as u64)
+                .saturating_mul(24 * 3600),
         ));
         // Background sweep: drop zero-counter entries from the per-IP
         // media limiter (v0.41). Without this, the DashMap accumulates
@@ -860,11 +927,33 @@ impl Node {
             }
         });
 
-        // Wait for shutdown signal (Ctrl+C)
+        // Wait for shutdown signal — SIGINT (Ctrl+C) or, on Unix,
+        // SIGTERM (systemd / docker stop). Both flow through the same
+        // shutdown_tx broadcast so every task observes the same
+        // shutdown event. The dedicated SIGTERM arm matters for
+        // v0.45.0's `pause_on_shutdown` flow because systemd sends
+        // SIGTERM (not SIGINT) by default.
         let mut shutdown_rx = self.shutdown_rx();
+        #[cfg(unix)]
+        let mut sigterm = tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::terminate(),
+        )
+        .context("registering SIGTERM handler")?;
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
-                info!("Received Ctrl+C, shutting down...");
+                info!("Received SIGINT (Ctrl+C), shutting down...");
+            }
+            _ = async {
+                #[cfg(unix)]
+                {
+                    let _ = sigterm.recv().await;
+                }
+                #[cfg(not(unix))]
+                {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                info!("Received SIGTERM, shutting down...");
             }
             _ = shutdown_rx.recv() => {
                 info!("Shutdown signal received");
@@ -876,6 +965,32 @@ impl Node {
         // Persist final Lamport counter
         let val = self.lamport_counter.load(Ordering::SeqCst);
         self.storage.set_lamport_counter(val)?;
+
+        // Give the anchor task a bounded window to broadcast its
+        // graceful `pauseNode` (v0.45.0 spec 13 §6.3) before we abort.
+        // 45s covers the worst-case 4-step Klever RPC chain (nonce +
+        // send + decode + broadcast) — each call has its own 15s
+        // reqwest timeout, so the chain can take up to 60s, but the
+        // SIGTERM-pause is best-effort and overflow is acceptable.
+        // Widened from 20s after Security Audit W4 flagged the
+        // 20s/15s-per-call inconsistency.
+        if let Some(handle) = anchor_task.take() {
+            match tokio::time::timeout(std::time::Duration::from_secs(45), handle).await {
+                Ok(Ok(())) => debug!("Anchor task finished cleanly on shutdown"),
+                Ok(Err(e)) => warn!(error = %e, "Anchor task panicked on shutdown"),
+                Err(elapsed) => {
+                    // The handle was moved into timeout(); on timeout
+                    // it's dropped, NOT aborted. Drop alone doesn't
+                    // cancel a tokio task. So we can't abort from
+                    // here — log truthfully instead (Code Audit W2).
+                    warn!(
+                        elapsed = ?elapsed,
+                        "Anchor task did not finish within 45s; continuing shutdown — \
+                         task may still be in flight, will be killed when the process exits"
+                    );
+                }
+            }
+        }
 
         lamport_task.abort();
         cleanup_task.abort();

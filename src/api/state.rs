@@ -23,11 +23,38 @@ use crate::pow::PowManager;
 use crate::storage::identity::IdentityResolver;
 use crate::storage::rocks::Storage;
 
+/// Which bootstrap tier produced a connected peer's dial chain *this
+/// session*. Set when libp2p Identify completes for the peer. The
+/// session-time property has no persisted byte — peers are not "from
+/// the book" until they actually connect on a subsequent startup,
+/// even if `PEER_DIRECTORY` holds an entry.
+///
+/// Spec 13 §4.1 / §8: drives the dashboard Network-tab peer-source
+/// breakdown column and the `bootstrap-candidates` REST response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DiscoverySource {
+    /// Tier 1 — peer was in `PEER_DIRECTORY` at startup (persisted
+    /// from a prior session) and connected on this startup.
+    Book,
+    /// Tier 2 — peer was in `[network] bootstrap_nodes` config and
+    /// connected from that dial.
+    Config,
+    /// Tier 3 — peer was added by sc_discovery (§4.3) this session.
+    Sc,
+    /// Tier 4 — peer was learned at runtime: Kademlia DHT, mDNS,
+    /// peer-exchange, or accepted as an inbound dial.
+    Runtime,
+}
+
 /// Info about a connected Ogmara peer (from libp2p Identify).
 #[derive(Debug, Clone)]
 pub struct ConnectedPeerInfo {
     /// Agent version string (e.g. "ogmara-node/0.21.0").
     pub agent_version: String,
+    /// Which bootstrap tier produced this peer's dial chain this
+    /// session (spec 13 §4.1). Set on Identify::Received.
+    pub source: DiscoverySource,
 }
 
 // --- Media handler tunables (v0.39, config-driven in v0.40) ----------------
@@ -230,6 +257,68 @@ pub struct AppState {
     /// the divergence watcher. Resets across node restarts —
     /// process-local counter, not persisted.
     pub anchor_canonical_counter: Arc<AtomicU64>,
+    /// libp2p listen port from `[network] listen_port`. Used by the
+    /// `/admin/node/metadata` endpoint to auto-derive the published
+    /// multiaddr when `[anchoring.metadata]` enables publish without
+    /// explicit multiaddrs (spec 12 §2.10 + spec 13 §6.1).
+    pub network_listen_port: u16,
+    /// Snapshot of `[anchoring.metadata]` (publish flag + explicit
+    /// multiaddrs). Drives `GET /admin/node/metadata`'s effective vs.
+    /// on-chain diff. Cloned at startup — operators must restart to
+    /// change.
+    pub anchor_metadata_config: crate::config::AnchorMetadataConfig,
+    /// Snapshot of `[anchoring] pause_on_shutdown`. Drives the
+    /// pause-status payload's `pause_on_shutdown` field. Cloned at
+    /// startup — operators must restart to change.
+    pub anchor_pause_on_shutdown: bool,
+    /// Whether `[anchoring] wallet_key` (or the
+    /// `OGMARA_ANCHOR_WALLET_KEY` env var) was set at startup. The
+    /// SIGTERM handler only signs `pauseNode` when this is true AND
+    /// `pause_on_shutdown` is true; the dashboard surfaces it so the
+    /// operator sees why a `pause_on_shutdown = true` config is inert.
+    /// Never holds the key itself.
+    pub anchor_wallet_key_configured: bool,
+    /// Cached `bootstrap-candidates` payload body + age tracking.
+    /// Spec 13 §4.5 — 5-min positive TTL, 60-s negative TTL.
+    ///
+    /// `tokio::sync::RwLock` so concurrent cache-hit readers never
+    /// serialize behind each other (Security Audit W2 + Code Audit
+    /// W1). Refresh writers also acquire write here, but only briefly
+    /// at the END of regeneration — the SC RPC fan-out happens
+    /// LOCK-FREE under the separate `bootstrap_candidates_refresh`
+    /// mutex below.
+    pub bootstrap_candidates_cache:
+        Arc<tokio::sync::RwLock<Option<CachedBootstrapCandidates>>>,
+    /// Single-flight gate for `bootstrap-candidates` regeneration.
+    /// Held across SC RPC calls; one regeneration in flight at a
+    /// time. Cache-hit readers do NOT touch this — they use the
+    /// RwLock above. Concurrent miss-readers serialize here, but the
+    /// one that wins the lock typically completes within seconds;
+    /// the rest re-check the cache after acquiring and skip the
+    /// fan-out if a sibling refresh populated it in the meantime.
+    pub bootstrap_candidates_refresh: Arc<tokio::sync::Mutex<()>>,
+    /// Snapshot of `[network.discovery] max_peer_staleness_days`,
+    /// converted to seconds. Used by the bootstrap-candidates handler
+    /// to filter out registry entries whose last anchor is too old to
+    /// be a useful dial target (spec 13 §7 + spec 13 §6.3 cap).
+    pub max_peer_staleness_secs: u64,
+}
+
+/// Cached bootstrap-candidates response (spec 13 §4.5).
+///
+/// Wraps the rendered JSON and the wall-clock generation timestamp.
+/// TTL check in the handler uses tokio's monotonic `Instant` for
+/// drift-immunity; the `generated_at_unix` field is the body's own
+/// timestamp so consumers can compute cache-age.
+#[derive(Clone)]
+pub struct CachedBootstrapCandidates {
+    /// Body of the cached response — already rendered. Cloned on
+    /// cache hit so the response handler never re-serializes.
+    pub payload: serde_json::Value,
+    /// `Instant` at generation — used for TTL comparison.
+    pub generated_at: Instant,
+    /// Unix-seconds at generation — embedded in `payload.generated_at`.
+    pub generated_at_unix: u64,
 }
 
 impl AppState {
@@ -288,6 +377,11 @@ impl AppState {
             Arc::new(TrustedProxies::default()),
             anchor_divergence_counter,
             anchor_canonical_counter,
+            0,                                              // network_listen_port — unused in tests
+            crate::config::AnchorMetadataConfig::default(), // anchor_metadata_config
+            false,                                          // anchor_pause_on_shutdown
+            false,                                          // anchor_wallet_key_configured
+            7 * 24 * 3600,                                  // max_peer_staleness_secs — 7d default
         )
     }
 
@@ -323,6 +417,11 @@ impl AppState {
         trusted_proxies: Arc<TrustedProxies>,
         anchor_divergence_counter: Arc<AtomicU32>,
         anchor_canonical_counter: Arc<AtomicU64>,
+        network_listen_port: u16,
+        anchor_metadata_config: crate::config::AnchorMetadataConfig,
+        anchor_pause_on_shutdown: bool,
+        anchor_wallet_key_configured: bool,
+        max_peer_staleness_secs: u64,
     ) -> Self {
         // moka LRU with size-weighted eviction. `weigher` returns the
         // byte count of each value's body (content-type string is
@@ -382,6 +481,13 @@ impl AppState {
             trusted_proxies,
             anchor_divergence_counter,
             anchor_canonical_counter,
+            network_listen_port,
+            anchor_metadata_config,
+            anchor_pause_on_shutdown,
+            anchor_wallet_key_configured,
+            bootstrap_candidates_cache: Arc::new(tokio::sync::RwLock::new(None)),
+            bootstrap_candidates_refresh: Arc::new(tokio::sync::Mutex::new(())),
+            max_peer_staleness_secs,
         }
     }
 

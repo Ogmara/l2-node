@@ -77,6 +77,12 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
         .route("/api/v1/health", get(routes::health))
         .route("/api/v1/network/stats", get(routes::network_stats))
         .route("/api/v1/network/nodes", get(routes::network_nodes))
+        // v0.45.0 — spec 13 §4.5: SC-derived bootstrap discovery for
+        // SDK clients and new nodes. Public, 5-min cache.
+        .route(
+            "/api/v1/network/discovery/bootstrap-candidates",
+            get(routes::network_bootstrap_candidates),
+        )
         // /users/search must be registered BEFORE /users/{address} so axum
         // matches the literal segment first instead of treating "search"
         // as an address parameter.
@@ -258,7 +264,14 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
             .route("/admin/channels/pin", post(admin::pin_channel))
             .route("/admin/state/latest", get(admin::state_latest))
             .route("/admin/state/anchor", post(admin::trigger_anchor))
-            .route("/admin/node/registration", get(admin::node_registration));
+            .route("/admin/node/registration", get(admin::node_registration))
+            // v0.45.0 — spec 12 §2.10 + §2.11 operator surface.
+            // All four return Klever-extension calldata; no node-side
+            // SC signing happens here. See admin::node_metadata doc.
+            .route("/admin/node/metadata", get(admin::node_metadata))
+            .route("/admin/node/pause-status", get(admin::node_pause_status))
+            .route("/admin/node/pause", post(admin::node_pause))
+            .route("/admin/node/resume", post(admin::node_resume));
 
         if config.api.admin.dashboard {
             protected = protected

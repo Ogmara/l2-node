@@ -148,8 +148,8 @@ td { padding: 8px; border-bottom: 1px solid var(--border); }
       <div class="chart-box"><h3>Bandwidth (last hour)</h3><div class="chart" id="chart-bw"></div></div>
     </div>
     <div class="card" style="margin-bottom:16px">
-      <h3>Connected Peers</h3>
-      <table id="peers-table"><thead><tr><th>Node ID</th><th>Agent Version</th></tr></thead><tbody id="peers-body"></tbody></table>
+      <h3>Connected Peers <span id="peers-source-summary" style="margin-left:12px;font-size:0.78em;color:var(--fg2);font-weight:normal"></span></h3>
+      <table id="peers-table"><thead><tr><th>Node ID</th><th>Agent Version</th><th>Source</th></tr></thead><tbody id="peers-body"></tbody></table>
     </div>
   </div>
 
@@ -254,6 +254,67 @@ td { padding: 8px; border-bottom: 1px solid var(--border); }
     <!-- Action area — content swapped via JS based on state -->
     <div class="card" id="anch-action">
       <div style="color:var(--fg2)">Loading registration status…</div>
+    </div>
+
+    <!-- v0.45.0 — Metadata publication (spec 12 §2.10). Lets the
+         operator publish or clear on-chain multiaddrs so other nodes
+         can discover this one via `getActiveNodes`. -->
+    <div class="card" id="anch-metadata-card" style="margin-top:16px;display:none">
+      <h3>On-chain metadata (peer discovery)</h3>
+      <p style="color:var(--fg2);line-height:1.5;margin-top:8px;font-size:0.92em">
+        Publish your node's libp2p multiaddrs to the smart contract so
+        other nodes can discover this one without relying on a hardcoded
+        seed. Optional — non-publishers still anchor and count toward
+        quorum, but won't appear in <code>getActiveNodes</code>
+        (privacy profile).
+      </p>
+      <table style="width:100%;margin-top:8px;font-size:0.93em">
+        <tr><td style="color:var(--fg2);width:200px">Publish enabled</td><td id="anch-meta-publish">--</td></tr>
+        <tr><td style="color:var(--fg2)">Effective multiaddrs</td><td id="anch-meta-effective" style="font-family:var(--mono);font-size:0.85em">--</td></tr>
+        <tr><td style="color:var(--fg2)">Currently on-chain</td><td id="anch-meta-onchain" style="font-family:var(--mono);font-size:0.85em">--</td></tr>
+        <tr><td style="color:var(--fg2)">In sync</td><td id="anch-meta-sync">--</td></tr>
+      </table>
+      <div style="margin-top:12px">
+        <button id="anch-meta-publish-btn" class="login-btn" onclick="publishMetadata()" disabled style="opacity:0.5">Publish multiaddrs</button>
+        <button id="anch-meta-clear-btn" onclick="clearMetadata()" disabled style="background:transparent;border:1px solid var(--border);color:var(--fg2);padding:6px 12px;border-radius:4px;font-size:0.85em;margin-left:8px;cursor:pointer;opacity:0.5">Clear on-chain metadata</button>
+        <span id="anch-meta-status" style="margin-left:12px;color:var(--fg2)"></span>
+      </div>
+      <div id="anch-meta-error" style="margin-top:8px;color:var(--red)"></div>
+    </div>
+
+    <!-- v0.45.0 — Pause / Resume controls (spec 12 §2.11). -->
+    <div class="card" id="anch-pause-card" style="margin-top:16px;display:none">
+      <h3>Pause / resume <span id="anch-pause-pill" style="margin-left:12px;font-size:0.7em;padding:2px 10px;border-radius:10px;background:var(--green);color:#000;vertical-align:middle">active</span></h3>
+      <p style="color:var(--fg2);line-height:1.5;margin-top:8px;font-size:0.92em">
+        Pausing tells the network this node is voluntarily offline. Other
+        anchorers stop counting it toward quorum and dashboards stop
+        listing it in <code>getActiveNodes</code> until resumed.
+      </p>
+      <table style="width:100%;margin-top:8px;font-size:0.93em">
+        <tr><td style="color:var(--fg2);width:230px">Pause on shutdown (config)</td><td id="anch-pause-shutdown">--</td></tr>
+        <tr><td style="color:var(--fg2)">Wallet key available</td><td id="anch-pause-wallet-key">--</td></tr>
+      </table>
+      <div style="margin-top:12px">
+        <button id="anch-pause-btn" onclick="pauseNodeOnChain()" disabled style="background:transparent;border:1px solid var(--yellow);color:var(--yellow);padding:6px 12px;border-radius:4px;font-size:0.85em;cursor:pointer;opacity:0.5">Pause node</button>
+        <button id="anch-resume-btn" onclick="resumeNodeOnChain()" disabled style="background:transparent;border:1px solid var(--green);color:var(--green);padding:6px 12px;border-radius:4px;font-size:0.85em;margin-left:8px;cursor:pointer;opacity:0.5">Resume node</button>
+        <span id="anch-pause-status" style="margin-left:12px;color:var(--fg2)"></span>
+      </div>
+      <div id="anch-pause-error" style="margin-top:8px;color:var(--red)"></div>
+    </div>
+
+    <!-- v0.45.0 — Escalated-divergence panel (spec 12 §2.8 / §6.1). -->
+    <div class="card" id="anch-divergence-card" style="margin-top:16px;display:none;border:1px solid var(--yellow)">
+      <h3 style="color:var(--yellow)">Anchor divergence detected</h3>
+      <p style="margin-top:8px;line-height:1.5;font-size:0.92em">
+        Your node submitted a state root that disagreed with the chain
+        canonical root on one or more recent heights. See the spec 12
+        §6.1 escalation flow.
+      </p>
+      <table style="width:100%;margin-top:8px;font-size:0.93em">
+        <tr><td style="color:var(--fg2);width:230px">Consecutive divergences</td><td id="anch-div-consecutive">--</td></tr>
+        <tr><td style="color:var(--fg2)">Latest height escalated</td><td id="anch-div-escalated">--</td></tr>
+        <tr><td style="color:var(--fg2)">Escalated threshold</td><td id="anch-div-threshold">--</td></tr>
+      </table>
     </div>
   </div>
 </div>
@@ -531,13 +592,37 @@ async function loadPeers() {
     body.innerHTML = '';
     for (const p of (data.peers||[])) {
       const tr = document.createElement('tr');
-      tr.innerHTML = `<td style="font-family:var(--mono);font-size:0.85em">${esc(p.node_id||'--')}</td><td>${esc(p.agent_version||'--')}</td>`;
+      tr.innerHTML = `<td style="font-family:var(--mono);font-size:0.85em">${esc(p.node_id||'--')}</td><td>${esc(p.agent_version||'--')}</td><td>${renderPeerSource(p.source)}</td>`;
       body.appendChild(tr);
     }
     if ((data.peers||[]).length === 0) {
-      body.innerHTML = '<tr><td colspan="2" style="color:var(--fg2)">No peers connected</td></tr>';
+      body.innerHTML = '<tr><td colspan="3" style="color:var(--fg2)">No peers connected</td></tr>';
+    }
+    // v0.45.0 — spec 13 §4.1 / §8: per-tier discovery-source summary
+    // above the peers table. Renders even with zero peers so operators
+    // see the labels they're about to learn about.
+    const by = data.by_source || {};
+    const sum = document.getElementById('peers-source-summary');
+    if (sum) {
+      sum.innerHTML =
+        `book ${Number(by.book||0)} · config ${Number(by.config||0)} · sc ${Number(by.sc||0)} · runtime ${Number(by.runtime||0)}`;
     }
   } catch(_) {}
+}
+
+// Spec 13 §4.1 — small coloured pill per tier so the operator can scan
+// the column at a glance. `unknown` fallback only if a malformed
+// payload arrives (defense in depth).
+function renderPeerSource(s) {
+  const colors = {
+    book: 'var(--green)',
+    config: 'var(--accent)',
+    sc: 'var(--yellow)',
+    runtime: 'var(--fg2)',
+  };
+  const label = (typeof s === 'string') ? s : 'unknown';
+  const c = colors[label] || 'var(--fg2)';
+  return `<span style="display:inline-block;padding:1px 8px;border-radius:8px;font-size:0.75em;background:${c};color:#000">${esc(label)}</span>`;
 }
 
 async function loadStorage() {
@@ -705,9 +790,167 @@ async function loadAnchoring() {
     const data = await resp.json();
     anchState = data;
     renderAnchoring(data);
+    renderDivergencePanel(data);
   } catch (e) {
     renderAnchoringError('Failed to load registration status: ' + (e.message || e));
   }
+  // Metadata + pause-status load in parallel — they're independent
+  // RPCs against different SC views, no need to serialize.
+  loadAnchoringMetadata();
+  loadAnchoringPause();
+}
+
+// v0.45.0 — load + render the on-chain metadata section.
+async function loadAnchoringMetadata() {
+  try {
+    const resp = await fetch('/admin/node/metadata');
+    if (!resp.ok) return;
+    const data = await resp.json();
+    renderAnchoringMetadata(data);
+  } catch (e) {
+    /* silent — non-critical sub-section */
+  }
+}
+
+let anchMetaState = null;
+function renderAnchoringMetadata(data) {
+  anchMetaState = data;
+  const card = document.getElementById('anch-metadata-card');
+  card.style.display = data.anchoring_configured === false ? 'none' : '';
+  if (data.anchoring_configured === false) return;
+
+  document.getElementById('anch-meta-publish').innerHTML = data.publish_enabled
+    ? '<span style="color:var(--green)">enabled</span>'
+    : '<span style="color:var(--fg2)">disabled in [anchoring.metadata]</span>';
+
+  const eff = Array.isArray(data.effective_multiaddrs) ? data.effective_multiaddrs : [];
+  const effEl = document.getElementById('anch-meta-effective');
+  if (eff.length) {
+    // Show the multiaddrs themselves with a small annotation when
+    // they were auto-derived from [api] public_url rather than
+    // explicitly configured — otherwise the operator gets surprised
+    // if public_url later changes and silently moves the published
+    // multiaddr.
+    effEl.textContent = eff.join('\n');
+    if (data.auto_derived === true) {
+      const note = document.createElement('div');
+      note.style.color = 'var(--fg2)';
+      note.style.fontSize = '0.82em';
+      note.style.marginTop = '4px';
+      note.textContent = '(auto-derived from [api] public_url + [network] listen_port)';
+      effEl.appendChild(note);
+    }
+  } else {
+    effEl.textContent = data.publish_enabled
+      ? '(none — cannot auto-derive without [api] public_url)'
+      : '—';
+  }
+
+  if (data.on_chain_multiaddrs === null || data.on_chain_multiaddrs === undefined) {
+    document.getElementById('anch-meta-onchain').textContent = '—';
+  } else {
+    const oc = data.on_chain_multiaddrs;
+    document.getElementById('anch-meta-onchain').textContent =
+      oc.length ? oc.join('\n') : '(none published)';
+  }
+
+  if (data.in_sync === null || data.in_sync === undefined) {
+    document.getElementById('anch-meta-sync').innerHTML = '<span style="color:var(--fg2)">unknown (RPC unavailable)</span>';
+  } else if (data.in_sync) {
+    document.getElementById('anch-meta-sync').innerHTML = '<span style="color:var(--green)">yes</span>';
+  } else {
+    document.getElementById('anch-meta-sync').innerHTML = '<span style="color:var(--yellow)">no — publish to update</span>';
+  }
+
+  const publishBtn = document.getElementById('anch-meta-publish-btn');
+  const clearBtn = document.getElementById('anch-meta-clear-btn');
+  const canPublish = !!data.set_calldata;
+  const canClear = !!data.clear_calldata;
+  publishBtn.disabled = !canPublish;
+  publishBtn.style.opacity = canPublish ? '1' : '0.5';
+  clearBtn.disabled = !canClear;
+  clearBtn.style.opacity = canClear ? '1' : '0.5';
+}
+
+// v0.45.0 — load + render the pause/resume section.
+async function loadAnchoringPause() {
+  try {
+    const resp = await fetch('/admin/node/pause-status');
+    if (!resp.ok) return;
+    const data = await resp.json();
+    renderAnchoringPause(data);
+  } catch (e) {
+    /* silent */
+  }
+}
+
+let anchPauseState = null;
+function renderAnchoringPause(data) {
+  anchPauseState = data;
+  const card = document.getElementById('anch-pause-card');
+  card.style.display = data.anchoring_configured === false ? 'none' : '';
+  if (data.anchoring_configured === false) return;
+
+  const pill = document.getElementById('anch-pause-pill');
+  if (data.paused === null || data.paused === undefined) {
+    pill.textContent = 'unknown';
+    pill.style.background = 'var(--fg2)';
+  } else if (data.paused === true) {
+    pill.textContent = 'paused';
+    pill.style.background = 'var(--yellow)';
+  } else {
+    pill.textContent = 'active';
+    pill.style.background = 'var(--green)';
+  }
+
+  document.getElementById('anch-pause-shutdown').innerHTML = data.pause_on_shutdown
+    ? '<span style="color:var(--green)">enabled</span>'
+    : '<span style="color:var(--fg2)">disabled (default)</span>';
+  // Surface the "config flag is set but no wallet key" failure mode so
+  // operators see why the SIGTERM pause never fires.
+  if (data.pause_on_shutdown && !data.wallet_key_configured) {
+    document.getElementById('anch-pause-wallet-key').innerHTML =
+      '<span style="color:var(--yellow)">no — pause_on_shutdown will not fire</span>';
+  } else {
+    document.getElementById('anch-pause-wallet-key').innerHTML = data.wallet_key_configured
+      ? '<span style="color:var(--green)">yes</span>'
+      : '<span style="color:var(--fg2)">no</span>';
+  }
+
+  const pauseBtn = document.getElementById('anch-pause-btn');
+  const resumeBtn = document.getElementById('anch-resume-btn');
+  const isPaused = data.paused === true;
+  // pause when active; resume when paused. Unknown state ⇒ disable both
+  // (we don't know which would be productive).
+  pauseBtn.disabled = data.paused !== false;
+  pauseBtn.style.opacity = data.paused === false ? '1' : '0.5';
+  resumeBtn.disabled = !isPaused;
+  resumeBtn.style.opacity = isPaused ? '1' : '0.5';
+}
+
+// v0.45.0 — render the escalated-divergence card. Hidden unless either
+// the local consecutive counter is > 0 OR the chain reports escalated.
+function renderDivergencePanel(data) {
+  const card = document.getElementById('anch-divergence-card');
+  const consec = Number(data.divergence_consecutive || 0);
+  const escalated = data.divergence_escalated === true;
+  if (consec === 0 && !escalated) {
+    card.style.display = 'none';
+    return;
+  }
+  card.style.display = '';
+  document.getElementById('anch-div-consecutive').textContent = String(consec);
+  if (data.divergence_escalated === null || data.divergence_escalated === undefined) {
+    document.getElementById('anch-div-escalated').textContent = '— (RPC unavailable)';
+  } else {
+    document.getElementById('anch-div-escalated').innerHTML = data.divergence_escalated
+      ? '<span style="color:var(--yellow)">yes</span>'
+      : '<span style="color:var(--fg2)">no</span>';
+  }
+  document.getElementById('anch-div-threshold').textContent =
+    (data.divergence_escalated_threshold === null || data.divergence_escalated_threshold === undefined)
+      ? '—'
+      : String(data.divergence_escalated_threshold);
 }
 
 function renderAnchoringError(msg) {
@@ -1004,6 +1247,141 @@ async function unregisterNodeOnChain() {
   } catch (e) {
     alert('Unregistration failed: ' + (e.message || e));
   }
+}
+
+// v0.45.0 — generic SC-invoke runner via the Klever extension. Used
+// by Publish/Clear metadata + Pause/Resume; the same buildTransaction
+// + sign + broadcast shape as registerNodeOnChain (see the long
+// comment there). `calldata` is the raw Klever VM string
+// (`fnName@hexArg…`); we b64-encode here.
+async function runScInvoke(calldata, opts) {
+  const { wallet, klever_network, contract_address, statusEl, errorEl, postBroadcast } = opts;
+  function setStatusLocal(t) { if (statusEl) statusEl.textContent = t; }
+  function setErrorLocal(t) { if (errorEl) errorEl.innerHTML = t; }
+  setErrorLocal('');
+
+  if (!window.kleverWeb) {
+    setErrorLocal(esc(ANCH_STRINGS.err_no_ext));
+    return false;
+  }
+  try { applyKleverProvider(klever_network); } catch (_) {}
+  try {
+    await window.kleverWeb.initialize();
+    const walletAddress = await window.kleverWeb.getWalletAddress();
+    if (walletAddress !== wallet) {
+      setErrorLocal(ANCH_STRINGS.err_wallet_mismatch(walletAddress, wallet));
+      return false;
+    }
+    setStatusLocal('Building transaction…');
+    const tx = await window.kleverWeb.buildTransaction(
+      [{
+        type: 63,
+        payload: {
+          scType: 0,
+          address: contract_address,
+          callValue: {},
+        },
+      }],
+      [btoa(calldata)],
+    );
+    setStatusLocal('Sign in your Klever wallet…');
+    const signed = await window.kleverWeb.signTransaction(tx);
+    setStatusLocal('Broadcasting…');
+    const r = await window.kleverWeb.broadcastTransactions([signed]);
+    const txHash = r?.data?.txsHashes?.[0] || r?.txsHashes?.[0] || '';
+    setStatusLocal(`Broadcast (tx: ${txHash.slice(0, 10)}…)`);
+    if (typeof postBroadcast === 'function') {
+      // Give the chain a moment to register the change before re-polling.
+      setTimeout(postBroadcast, 5000);
+    }
+    return true;
+  } catch (e) {
+    setStatusLocal('');
+    setErrorLocal(esc(String(e.message || e)));
+    return false;
+  }
+}
+
+async function publishMetadata() {
+  if (!anchMetaState || !anchMetaState.set_calldata) return;
+  await runScInvoke(anchMetaState.set_calldata, {
+    wallet: anchMetaState.wallet,
+    klever_network: anchMetaState.klever_network,
+    contract_address: anchMetaState.contract_address,
+    statusEl: document.getElementById('anch-meta-status'),
+    errorEl: document.getElementById('anch-meta-error'),
+    postBroadcast: loadAnchoringMetadata,
+  });
+}
+
+async function clearMetadata() {
+  if (!anchMetaState || !anchMetaState.clear_calldata) return;
+  if (!confirm('Clear on-chain multiaddrs for this node? Other nodes will no longer be able to discover it via getActiveNodes until you republish.')) {
+    return;
+  }
+  await runScInvoke(anchMetaState.clear_calldata, {
+    wallet: anchMetaState.wallet,
+    klever_network: anchMetaState.klever_network,
+    contract_address: anchMetaState.contract_address,
+    statusEl: document.getElementById('anch-meta-status'),
+    errorEl: document.getElementById('anch-meta-error'),
+    postBroadcast: loadAnchoringMetadata,
+  });
+}
+
+async function pauseNodeOnChain() {
+  if (!anchPauseState) return;
+  // Spec 12 §2.11 + spec 13 §6.3: pauseNode takes a reason argument
+  // that surfaces on the nodePaused event log + dashboards. Always
+  // prompt the operator — even an empty reason is allowed, but
+  // explicit-on-purpose ("Upgrading to l2-node 0.45.0") beats silent.
+  const reason = window.prompt(
+    'Pause this anchorer? Enter a short reason (≤ 256 chars) — it will be logged on-chain.\n\nLeave blank to cancel.',
+    'Upgrading'
+  );
+  if (reason === null || reason === '') {
+    return;
+  }
+  const statusEl = document.getElementById('anch-pause-status');
+  const errorEl = document.getElementById('anch-pause-error');
+  // Fetch calldata via POST so the backend builds pauseNode@<hex(reason)>.
+  let calldata;
+  try {
+    const resp = await fetch('/admin/node/pause', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ reason }),
+    });
+    if (!resp.ok) {
+      errorEl.textContent = `Failed to build pause calldata (HTTP ${resp.status}).`;
+      return;
+    }
+    const data = await resp.json();
+    calldata = data.calldata;
+  } catch (e) {
+    errorEl.textContent = 'Failed to build pause calldata: ' + (e.message || e);
+    return;
+  }
+  await runScInvoke(calldata, {
+    wallet: anchPauseState.wallet,
+    klever_network: anchPauseState.klever_network,
+    contract_address: anchPauseState.contract_address,
+    statusEl,
+    errorEl,
+    postBroadcast: loadAnchoringPause,
+  });
+}
+
+async function resumeNodeOnChain() {
+  if (!anchPauseState || !anchPauseState.resume_calldata) return;
+  await runScInvoke(anchPauseState.resume_calldata, {
+    wallet: anchPauseState.wallet,
+    klever_network: anchPauseState.klever_network,
+    contract_address: anchPauseState.contract_address,
+    statusEl: document.getElementById('anch-pause-status'),
+    errorEl: document.getElementById('anch-pause-error'),
+    postBroadcast: loadAnchoringPause,
+  });
 }
 
 // ─── Auth / Session ─────────────────────────────────────────────────

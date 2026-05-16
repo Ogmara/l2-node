@@ -635,6 +635,326 @@ pub async fn network_nodes(
     }
 }
 
+/// GET /api/v1/network/discovery/bootstrap-candidates
+///
+/// Public, no auth (spec 13 §4.5). Returns the node's current
+/// snapshot of SC-derived bootstrap candidates — clients (SDKs, new
+/// nodes) call this to discover peers without needing to query the
+/// Klever blockchain themselves.
+///
+/// Response is cached for 5 minutes (spec 13 §4.5). Concurrent
+/// regenerations are serialized via an async Mutex so a thundering
+/// herd doesn't trigger N parallel SC RPC bursts.
+///
+/// Filters per spec 13 §7:
+///   - Skip entries whose `last_anchor_at` is older than
+///     `[network.discovery] max_peer_staleness_days`.
+///   - Skip the node's own anchorer address (the caller already knows
+///     about us).
+///   - Skip entries whose `getNodeMetadata` is empty (privacy profile
+///     — operator opted out of publication; spec 13 §6).
+///
+/// Sorted by `last_anchor_at` descending. Tagged `source: "sc"` —
+/// future revisions may add `book`/`config` sources.
+pub async fn network_bootstrap_candidates(
+    Extension(state): Extension<Arc<AppState>>,
+) -> impl IntoResponse {
+    // 5-minute positive TTL per spec 13 §4.5. Constant rather than
+    // configurable because the spec ties it to client behaviour
+    // (clients are told 300s in the response body); changing it
+    // without a coordinated client update would just produce
+    // stale-cache mismatches.
+    const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+    // Shorter negative TTL — when the upstream is unhealthy and we
+    // serve an empty body, we want to recover quickly after the RPC
+    // comes back online (Security Audit N3 / Code Audit W1 follow-up).
+    const NEGATIVE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+    // Outer timeout around the whole refresh — a pathological Klever
+    // RPC can otherwise keep the refresh task running for ~64 min
+    // (256 metadata calls × 15s each). Surfaces as the negative-TTL
+    // empty payload.
+    const REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+    let max_age_header = format!("public, max-age={}", CACHE_TTL.as_secs());
+
+    // Fast path: cache hit under a read lock. Concurrent hits never
+    // serialize (Code Audit W1 + Security Audit W2 fix).
+    {
+        let read = state.bootstrap_candidates_cache.read().await;
+        if let Some(cached) = read.as_ref() {
+            if cached.generated_at.elapsed() < CACHE_TTL {
+                return (
+                    [(header::CACHE_CONTROL, max_age_header.clone())],
+                    Json(cached.payload.clone()),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    // Cache miss / stale — try to win the refresh slot. Single-flight
+    // gate: many readers can wait here, but only one actually runs
+    // the SC RPC fan-out.
+    let _refresh_guard = state.bootstrap_candidates_refresh.lock().await;
+    // Re-check the cache after acquiring — a sibling refresh may
+    // have just populated it. (This is the standard double-checked
+    // locking pattern for async caches and the reason we serialize
+    // only refreshers, never readers.)
+    {
+        let read = state.bootstrap_candidates_cache.read().await;
+        if let Some(cached) = read.as_ref() {
+            if cached.generated_at.elapsed() < CACHE_TTL {
+                return (
+                    [(header::CACHE_CONTROL, max_age_header.clone())],
+                    Json(cached.payload.clone()),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    let now_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    // Helper closure to record a payload into the cache and return
+    // the response — used by every termination branch below.
+    async fn cache_and_respond(
+        state: &Arc<AppState>,
+        payload: serde_json::Value,
+        now_unix: u64,
+        ttl_for_freshness: std::time::Duration,
+        max_age_header: String,
+    ) -> axum::response::Response {
+        // The "freshness duration" is used to set the Instant such
+        // that elapsed-since-write < TTL behaves correctly for both
+        // the positive (5min) and negative (60s) cache cases. We
+        // backdate `generated_at` by (CACHE_TTL - ttl_for_freshness)
+        // to achieve the effective shorter TTL while keeping a
+        // single comparison on the read side.
+        let backdate = CACHE_TTL.checked_sub(ttl_for_freshness).unwrap_or_default();
+        let mut write = state.bootstrap_candidates_cache.write().await;
+        *write = Some(crate::api::state::CachedBootstrapCandidates {
+            payload: payload.clone(),
+            generated_at: std::time::Instant::now()
+                .checked_sub(backdate)
+                .unwrap_or_else(std::time::Instant::now),
+            generated_at_unix: now_unix,
+        });
+        drop(write);
+        (
+            [(header::CACHE_CONTROL, max_age_header)],
+            Json(payload),
+        )
+            .into_response()
+    }
+
+    // Surface a degraded payload (still with a fresh `generated_at`)
+    // when the node isn't configured for SC views — saves SDKs from
+    // having to special-case the error path.
+    if state.klever_node_url.is_empty() || state.contract_address.is_empty() {
+        let payload = serde_json::json!({
+            "candidates": [],
+            "generated_at": now_unix,
+            "cache_ttl_seconds": NEGATIVE_CACHE_TTL.as_secs(),
+            "source_note": "this node is not configured to query the on-chain registry",
+        });
+        return cache_and_respond(&state, payload, now_unix, NEGATIVE_CACHE_TTL, max_age_header)
+            .await;
+    }
+
+    // Run the SC fan-out inside an outer timeout so a wedged RPC
+    // backend can't pin the refresh slot for the worst-case ~64
+    // minutes (Code Audit W1 + Security Audit W2 fix).
+    let fan_out_result = tokio::time::timeout(
+        REFRESH_TIMEOUT,
+        regenerate_bootstrap_candidates(&state),
+    )
+    .await;
+
+    match fan_out_result {
+        Ok(Ok(entries)) => {
+            let payload = serde_json::json!({
+                "candidates": entries,
+                "generated_at": now_unix,
+                "cache_ttl_seconds": CACHE_TTL.as_secs(),
+            });
+            cache_and_respond(&state, payload, now_unix, CACHE_TTL, max_age_header).await
+        }
+        Ok(Err(reason)) => {
+            tracing::debug!(reason = %reason, "bootstrap-candidates: regeneration failed");
+            let payload = serde_json::json!({
+                "candidates": [],
+                "generated_at": now_unix,
+                "cache_ttl_seconds": NEGATIVE_CACHE_TTL.as_secs(),
+                "source_note": reason,
+            });
+            cache_and_respond(&state, payload, now_unix, NEGATIVE_CACHE_TTL, max_age_header).await
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                timeout_secs = REFRESH_TIMEOUT.as_secs(),
+                "bootstrap-candidates: refresh timed out — caching negative response"
+            );
+            let payload = serde_json::json!({
+                "candidates": [],
+                "generated_at": now_unix,
+                "cache_ttl_seconds": NEGATIVE_CACHE_TTL.as_secs(),
+                "source_note": "refresh budget exceeded",
+            });
+            cache_and_respond(&state, payload, now_unix, NEGATIVE_CACHE_TTL, max_age_header).await
+        }
+    }
+}
+
+/// Run the SC fan-out for `bootstrap-candidates` and return the JSON
+/// entry list (sorted by `last_anchor_at` desc). Spec 13 §4.5.
+///
+/// Separated from the route handler so the outer `tokio::time::timeout`
+/// can bound the wall time without breaking the cache-and-respond
+/// branching. Returns `Err(reason)` for the soft-failure cases the
+/// handler should serialize as `source_note`.
+async fn regenerate_bootstrap_candidates(
+    state: &Arc<AppState>,
+) -> Result<Vec<serde_json::Value>, String> {
+    // Page getActiveNodes — same pagination + cap pattern as
+    // sc_discovery::fan_out_once. We don't need the full 256 here
+    // either; clients pick the freshest few, the rest is dead weight.
+    const PAGE_SIZE: u32 = 64;
+    const MAX_CANDIDATES: usize = 256;
+    // Spec 12 §2.10 cap: 256 bytes per multiaddr entry. Filter
+    // anything larger before publishing into the response — defense
+    // against a future SC bug or an attacker-controlled chain
+    // returning oversized payloads (Security Audit N2).
+    const MAX_MULTIADDR_LEN: usize = 256;
+    let now_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let staleness_cutoff = now_unix.saturating_sub(state.max_peer_staleness_secs);
+
+    let mut collected: Vec<crate::chain::sc_views::ActiveNode> = Vec::new();
+    let mut offset: u32 = 0;
+    let http = &state.klever_view_http;
+    loop {
+        match crate::chain::sc_views::get_active_nodes(
+            http,
+            &state.klever_node_url,
+            &state.contract_address,
+            offset,
+            PAGE_SIZE,
+        )
+        .await
+        {
+            Ok(page) => {
+                let page_len = page.len();
+                if page_len == 0 {
+                    break;
+                }
+                collected.extend(page);
+                if collected.len() >= MAX_CANDIDATES {
+                    collected.truncate(MAX_CANDIDATES);
+                    break;
+                }
+                if (page_len as u32) < PAGE_SIZE {
+                    break;
+                }
+                offset = offset.saturating_add(PAGE_SIZE);
+            }
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    "bootstrap-candidates: getActiveNodes failed; returning empty list"
+                );
+                return Err("on-chain registry temporarily unavailable".to_string());
+            }
+        }
+    }
+
+    // Filter staleness + self before the metadata fan-out so we don't
+    // burn one SC view call per skipped candidate.
+    let self_addr = state.node_address.clone();
+    let candidates: Vec<crate::chain::sc_views::ActiveNode> = collected
+        .into_iter()
+        .filter(|n| n.address != self_addr)
+        .filter(|n| n.last_anchor_at > 0 && n.last_anchor_at >= staleness_cutoff)
+        .collect();
+
+    // Fetch metadata per candidate (sequential — same shape as
+    // sc_discovery::fan_out_once). Bounded by MAX_CANDIDATES; under
+    // the steady-state assumption (≤ 100 active nodes) this is one
+    // burst of ≤ 100 RPCs every 5 minutes per asking node, comfortably
+    // within budget.
+    let mut entries: Vec<serde_json::Value> = Vec::with_capacity(candidates.len());
+    for cand in &candidates {
+        let multiaddrs = match crate::chain::sc_views::get_node_metadata(
+            http,
+            &state.klever_node_url,
+            &state.contract_address,
+            &cand.address,
+        )
+        .await
+        {
+            Ok(addrs) => addrs,
+            Err(_) => continue,
+        };
+        if multiaddrs.is_empty() {
+            // Privacy profile — operator chose not to publish (§6).
+            continue;
+        }
+        for raw_addr in multiaddrs {
+            // Sanitize before emit — reject oversized or control-
+            // character-bearing entries (Security Audit N2). The SC
+            // has a 256-byte per-entry cap but a malicious chain or
+            // a future SC bug could violate it.
+            if raw_addr.len() > MAX_MULTIADDR_LEN
+                || raw_addr.bytes().any(|b| b < 0x20 || b == 0x7f)
+            {
+                continue;
+            }
+            // Best-effort peer-id extraction so SDK clients can use
+            // the multiaddr without re-parsing. We trust the SC's
+            // string but don't depend on it being parseable —
+            // unparseable entries are still emitted because libp2p
+            // clients may still try to dial them.
+            let peer_id_str = raw_addr
+                .parse::<libp2p::Multiaddr>()
+                .ok()
+                .and_then(|m| {
+                    m.iter().find_map(|p| {
+                        if let libp2p::multiaddr::Protocol::P2p(id) = p {
+                            Some(id.to_string())
+                        } else {
+                            None
+                        }
+                    })
+                });
+            entries.push(serde_json::json!({
+                "multiaddr": raw_addr,
+                "peer_id": peer_id_str,
+                "last_anchor_at": cand.last_anchor_at,
+                "source": "sc",
+                // getActiveNodes excludes paused entries server-side
+                // (spec 12 §2.10), so we surface a hard false rather
+                // than recheck isNodePaused per candidate.
+                "paused": false,
+                "owner_address": cand.address,
+            }));
+        }
+    }
+
+    // Sort by last_anchor_at desc (spec 13 §4.5). For equal
+    // timestamps, no stable secondary key — operator order is
+    // intentional ambiguity, not a leak vector.
+    entries.sort_by(|a, b| {
+        let ta = a.get("last_anchor_at").and_then(|v| v.as_u64()).unwrap_or(0);
+        let tb = b.get("last_anchor_at").and_then(|v| v.as_u64()).unwrap_or(0);
+        tb.cmp(&ta)
+    });
+
+    Ok(entries)
+}
+
 /// GET /api/v1/channels
 ///
 /// Returns public/read-public channels for everyone. Private channels (type 2)
