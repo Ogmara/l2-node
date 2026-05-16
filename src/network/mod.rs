@@ -10,6 +10,7 @@
 pub mod behaviour;
 pub mod discovery;
 pub mod gossip;
+pub mod sc_discovery;
 pub mod snapshot;
 pub mod snapshot_client;
 pub mod sync;
@@ -318,6 +319,12 @@ impl NetworkService {
         mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
         mut channel_rx: tokio::sync::mpsc::UnboundedReceiver<u64>,
         mut gossip_rx: tokio::sync::mpsc::UnboundedReceiver<(String, Vec<u8>)>,
+        // v0.44.0: sc_discovery sends `()` here when it persists new
+        // multiaddrs from the on-chain registry. We respond by
+        // running `dial_persisted_peers` out-of-cycle so SC-discovered
+        // peers get dialed within seconds instead of waiting up to
+        // 30s for the next periodic bootstrap tick. Spec 13 §4.3.
+        mut sc_reconnect_rx: tokio::sync::mpsc::Receiver<()>,
     ) {
         info!(
             peer_id = %self.swarm.local_peer_id(),
@@ -369,6 +376,14 @@ impl NetworkService {
                 }
                 _ = reconnect_interval.tick() => {
                     self.process_reconnect_queue();
+                }
+                Some(_) = sc_reconnect_rx.recv() => {
+                    // sc_discovery persisted new multiaddrs from the
+                    // on-chain registry — dial them now. dial_persisted_peers
+                    // is already deduplication-aware (libp2p drops dial
+                    // attempts to peers we're already connected to).
+                    debug!("sc_discovery signaled new peers; dialing from book out-of-cycle");
+                    self.dial_persisted_peers();
                 }
                 Some(cmd) = self.snapshot_client_rx.recv() => {
                     self.handle_snapshot_client_command(cmd);

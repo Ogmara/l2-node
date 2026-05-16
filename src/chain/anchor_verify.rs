@@ -2,9 +2,11 @@
 //!
 //! The snapshot client trusts a peer's manifest only up to the highest
 //! anchor whose `state_root` matches what's actually on the Klever chain.
-//! This module wraps the Ogmara KApp's `getStateRoot(block_height)` view
-//! function (spec 02-onchain.md:745) so the bootstrap orchestrator can
-//! check anchors top-down and find the cutoff.
+//! Originally wrapped `getStateRoot(block_height)`; as of l2-node 0.44.0
+//! (spec 12 §5.2 LN2.7) the underlying SC call is `getCanonicalAnchor`
+//! — the quorum-confirmed root for v0.3+ heights. Pre-v0.3 heights
+//! become invisible to bootstrap verification, which is intentional:
+//! all live nodes are post-v0.3 by the time this release deploys.
 //!
 //! Compared to the chain scanner's batch event scanning, this is a
 //! point query: one HTTP roundtrip per anchor. With ~24 anchors/day at
@@ -12,25 +14,7 @@
 //! at most a few tens of requests — small even on a rate-limited
 //! Klever API.
 
-use anyhow::{Context, Result};
-
-/// Minimal big-endian even-length hex encoding of a u64 (Klever VM convention).
-///
-/// `0` → `"00"`, `1` → `"01"`, `256` → `"0100"`, `0xFF` → `"ff"`. The SC
-/// decodes each arg as raw big-endian bytes; using minimal form matches
-/// what the anchoring TX builder emits (`chain::anchoring::encode_u64_hex`)
-/// so both paths produce identical wire arguments.
-fn encode_u64_minimal_hex(v: u64) -> String {
-    if v == 0 {
-        return "00".to_string();
-    }
-    let trimmed = format!("{:016x}", v).trim_start_matches('0').to_string();
-    if trimmed.len() % 2 != 0 {
-        format!("0{}", trimmed)
-    } else {
-        trimmed
-    }
-}
+use anyhow::Result;
 
 /// Result of one anchor's verification round.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,91 +36,40 @@ pub enum AnchorVerifyOutcome {
     RpcError(String),
 }
 
-/// Query the Ogmara KApp's `getStateRoot(block_height)` view function.
+/// Query the canonical (quorum-confirmed) state root for a height.
+///
+/// **As of l2-node 0.44.0** this delegates to
+/// [`crate::chain::sc_views::get_canonical_anchor`], which calls the SC's
+/// `getCanonicalAnchor(block_height)` view. The function name is retained
+/// for caller stability — most call sites read this as "query Klever for
+/// what root it has at this height", which is exactly what's still happening,
+/// just against the hybrid-aware view instead of the legacy `getStateRoot`
+/// shim (spec 12 §5.2 LN2.7).
 ///
 /// Returns:
-/// - `Ok(Some(state_root_hex))` when the SC has an anchor at this height.
-///   The hex string is the same 64-character form stored in
-///   `StateAnchorRecord.state_root`.
-/// - `Ok(None)` when the SC reports no anchor at this height
-///   (`require!` failure on `state_root(block_height).is_empty()`).
+/// - `Ok(Some(state_root_hex))` when the SC has a canonical (quorum-
+///   confirmed) anchor at this height. For heights in hybrid-escalated
+///   mode, the SC returns the escalated_canonical OR the deterministic
+///   §2.9 tiebreak winner (read-only — no on-chain write triggered by
+///   this view call).
+/// - `Ok(None)` when the SC has no canonical anchor at this height —
+///   either because quorum hasn't been reached, OR (as of 0.44.0) the
+///   height pre-dates the SC v0.3.0 upgrade. Snapshot bootstrap treats
+///   both cases the same: walk DOWN looking for the next valid anchor.
 /// - `Err(...)` on transport/decoding errors.
-///
-/// **Note on encoding:** Klever VM args are hex-encoded bytes. A u64
-/// passes as the 8-byte big-endian representation (16 chars). The full
-/// 8-byte form is always even-length and unambiguous; minimal-encoding
-/// is unnecessary here. See feedback memory "Klever SC Call Data
-/// Encoding Patterns" for the broader rules.
 pub async fn query_klever_state_root_at(
     http: &reqwest::Client,
     klever_node_url: &str,
     contract_address: &str,
     block_height: u64,
 ) -> Result<Option<String>> {
-    let url = format!("{}/vm/hex", klever_node_url.trim_end_matches('/'));
-    // Klever VM args are minimal big-endian even-length hex bytes (matches
-    // the `encode_u64_hex` helper used by the anchoring TX path). Sending
-    // the full 8-byte form would also decode, but minimal-BE is the
-    // canonical form the SC sees on-chain, so we match it exactly.
-    let height_hex = encode_u64_minimal_hex(block_height);
-
-    let body = serde_json::json!({
-        "scAddress": contract_address,
-        "funcName": "getStateRoot",
-        "args": [height_hex],
-    });
-
-    // Client-level timeout is already 15s (set by the caller's
-    // reqwest::Client::builder()), no per-request override needed.
-    let resp: serde_json::Value = http
-        .post(&url)
-        .json(&body)
-        .send()
-        .await
-        .context("POST /vm/hex for getStateRoot")?
-        .json()
-        .await
-        .context("decoding /vm/hex response")?;
-
-    // Klever returns errors via top-level "error" or "code" != "successful".
-    // `require!` failures appear with a non-empty "error" string and
-    // an empty "data" payload. We treat "Anchor not found" as a normal
-    // "not present" answer, not a transport error.
-    if let Some(err) = resp.get("error").and_then(|v| v.as_str()) {
-        if !err.is_empty() {
-            if err.contains("Anchor not found") || err.contains("not found") {
-                return Ok(None);
-            }
-            anyhow::bail!("getStateRoot returned error: {}", err);
-        }
-    }
-
-    let hex_data = resp
-        .pointer("/data/data")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-
-    if hex_data.is_empty() {
-        // No data and no error = no anchor at this height.
-        return Ok(None);
-    }
-
-    // The SC stores `state_root: ManagedBuffer` whose `.len() == 64`,
-    // meaning the SC stores the ASCII-encoded hex string (not raw 32
-    // bytes). The VM /hex endpoint returns those ASCII bytes as hex,
-    // so two hex-encodings deep: hex::decode → ASCII bytes →
-    // String::from_utf8 → the 64-char hex string we'll compare.
-    let ascii_bytes =
-        hex::decode(hex_data).context("hex-decoding /vm/hex data payload")?;
-    let state_root = String::from_utf8(ascii_bytes)
-        .context("getStateRoot payload is not valid UTF-8")?;
-    if state_root.len() != 64 {
-        anyhow::bail!(
-            "getStateRoot returned unexpected length: got {}, expected 64",
-            state_root.len()
-        );
-    }
-    Ok(Some(state_root))
+    crate::chain::sc_views::get_canonical_anchor(
+        http,
+        klever_node_url,
+        contract_address,
+        block_height,
+    )
+    .await
 }
 
 /// Compare a snapshot's anchor against on-chain truth.
@@ -173,21 +106,10 @@ pub async fn verify_anchor(
 mod tests {
     use super::*;
 
-    #[test]
-    fn u64_minimal_hex_matches_anchoring_path() {
-        // Same expectations as `chain::anchoring::encode_u64_hex` tests —
-        // the two helpers MUST produce identical output so the receive path
-        // verifies against the same byte representation the producer
-        // emitted when anchoring on-chain.
-        assert_eq!(encode_u64_minimal_hex(0), "00");
-        assert_eq!(encode_u64_minimal_hex(1), "01");
-        assert_eq!(encode_u64_minimal_hex(100), "64");
-        assert_eq!(encode_u64_minimal_hex(256), "0100");
-        assert_eq!(encode_u64_minimal_hex(0xFF), "ff");
-        assert_eq!(encode_u64_minimal_hex(0xABCD), "abcd");
-        // u64::MAX is 16 hex chars (always even length).
-        assert_eq!(encode_u64_minimal_hex(u64::MAX), "ffffffffffffffff");
-    }
+    // Note: the `u64_minimal_hex_matches_anchoring_path` test moved to
+    // chain::sc_views::tests as of l2-node 0.44.0, when anchor_verify
+    // stopped owning its own encoding helper and delegated to
+    // sc_views::get_canonical_anchor instead. See spec 12 §5.2 LN2.7.
 
     #[test]
     fn outcomes_compare_correctly() {

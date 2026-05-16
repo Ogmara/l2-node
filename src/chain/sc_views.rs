@@ -97,14 +97,74 @@ impl VmHexResponse {
     }
 }
 
+/// Like `vm_hex_call` but for views returning `MultiValueEncoded<...>`.
+///
+/// Klever VM returns sequences as `data.data` = array-of-hex-strings,
+/// one entry per encoded value. For `MultiValueEncoded<MultiValue2<A, B>>`
+/// the SC flattens to `[a0, b0, a1, b1, ...]` so callers must consume
+/// in pairs (or triplets, etc.) per their expected tuple shape.
+async fn vm_hex_call_multi(
+    http: &reqwest::Client,
+    klever_node_url: &str,
+    contract_address: &str,
+    func_name: &str,
+    args: &[String],
+) -> Result<VmHexMultiResponse> {
+    let url = format!("{}/vm/hex", klever_node_url.trim_end_matches('/'));
+    let body = serde_json::json!({
+        "scAddress": contract_address,
+        "funcName": func_name,
+        "args": args,
+    });
+    let resp: serde_json::Value = http
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .with_context(|| format!("POST /vm/hex for {}", func_name))?
+        .json()
+        .await
+        .with_context(|| format!("decoding /vm/hex response for {}", func_name))?;
+
+    let error = resp
+        .get("error")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    // For multi-value returns, `data.data` is an array of hex strings.
+    // Klever VM emits an empty array (or missing field) for an empty
+    // result; treat both as Vec::new().
+    let items = resp
+        .pointer("/data/data")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(VmHexMultiResponse { error, items })
+}
+
+struct VmHexMultiResponse {
+    error: String,
+    items: Vec<String>,
+}
+
+impl VmHexMultiResponse {
+    fn is_require_failure(&self) -> bool {
+        !self.error.is_empty()
+    }
+}
+
 // ── Node registry views ─────────────────────────────────────────────
 
-/// Returns true if the address is authorized to anchor (either via the
-/// v0.3+ permissionless registry OR the legacy `authorized_anchorer`
-/// allowlist during the deprecation window). Mirrors the SC's
-/// `isNodeRegistered` view exactly.
+/// Returns true if the address is registered to anchor. Mirrors the
+/// SC's `isNodeRegistered` view exactly — with SC ≥ 0.4.0 this is the
+/// `registered_node` map only (the v0.3.x dual-OR with the legacy
+/// `authorized_anchorer` allowlist was removed in spec 12 Phase 2).
 ///
-/// Returns `Ok(false)` for any address not in either source. Returns
+/// Returns `Ok(false)` for any address not in the registry. Returns
 /// `Err` only on transport / decoding failure (the caller should retry).
 pub async fn is_node_registered(
     http: &reqwest::Client,
@@ -131,8 +191,9 @@ pub async fn is_node_registered(
     Ok(matches!(resp.data.as_str(), "01"))
 }
 
-/// Returns the count of v0.3+ registered nodes. Excludes the legacy
-/// `authorized_anchorer` allowlist by design (matches the SC view).
+/// Returns the count of permissionlessly-registered nodes. Equivalent
+/// to `node_count` on the SC. (With SC ≥ 0.4.0 the legacy allowlist
+/// is gone; this view is the only meaningful node-cardinality answer.)
 pub async fn get_node_count(
     http: &reqwest::Client,
     klever_node_url: &str,
@@ -256,6 +317,242 @@ pub async fn get_latest_canonical_height(
         return Ok(0);
     }
     Ok(decode_u64_be(&resp.data))
+}
+
+// ── Hybrid quorum / divergence views (SC v0.4.0, spec 12 §2.8) ──────
+
+/// Returns true if the SC has entered escalated mode for this height
+/// (a second distinct root reached `ANCHOR_QUORUM_MIN`). Consumed by
+/// the divergence-watcher in `chain::anchoring` to downgrade
+/// `anchor_divergence` alerts from critical to info when our root
+/// matches the escalated canonical (spec 12 §5.4).
+pub async fn is_divergence_escalated(
+    http: &reqwest::Client,
+    klever_node_url: &str,
+    contract_address: &str,
+    block_height: u64,
+) -> Result<bool> {
+    let resp = vm_hex_call(
+        http,
+        klever_node_url,
+        contract_address,
+        "isDivergenceEscalated",
+        &[encode_u64_minimal_hex(block_height)],
+    )
+    .await?;
+    if resp.is_require_failure() {
+        return Ok(false);
+    }
+    Ok(matches!(resp.data.as_str(), "01"))
+}
+
+/// Returns the snapshotted escalated quorum threshold for this height
+/// (`max(ANCHOR_QUORUM_MIN + 1, node_count/2 + 1)`). Returns 0 if the
+/// height never escalated. Useful for diagnostic display.
+pub async fn get_escalated_threshold(
+    http: &reqwest::Client,
+    klever_node_url: &str,
+    contract_address: &str,
+    block_height: u64,
+) -> Result<u32> {
+    let resp = vm_hex_call(
+        http,
+        klever_node_url,
+        contract_address,
+        "getEscalatedThreshold",
+        &[encode_u64_minimal_hex(block_height)],
+    )
+    .await?;
+    if resp.is_require_failure() {
+        return Ok(0);
+    }
+    // Threshold fits in u32 by construction (node_count is u64 but
+    // realistic networks stay well under u32::MAX / 2).
+    Ok(decode_u64_be(&resp.data) as u32)
+}
+
+// ── Node pause / metadata views (SC v0.4.0, spec 12 §2.10 + §2.11) ──
+
+/// Returns true if the address is registered AND currently paused
+/// (false for active OR unregistered addresses — callers needing to
+/// distinguish should pair with `is_node_registered`).
+pub async fn is_node_paused(
+    http: &reqwest::Client,
+    klever_node_url: &str,
+    contract_address: &str,
+    klv_address: &str,
+) -> Result<bool> {
+    let address_hex = encode_address_hex(klv_address)
+        .with_context(|| format!("invalid klv address: {}", klv_address))?;
+    let resp = vm_hex_call(
+        http,
+        klever_node_url,
+        contract_address,
+        "isNodePaused",
+        &[address_hex],
+    )
+    .await?;
+    if resp.is_require_failure() {
+        return Ok(false);
+    }
+    Ok(matches!(resp.data.as_str(), "01"))
+}
+
+/// Returns the `block_timestamp` of the address's most recent
+/// successful `anchorState` call (unix seconds), or 0 if they have
+/// never anchored. Drives client-side staleness filtering (spec 13 §7
+/// — default cutoff 7 days).
+pub async fn get_node_last_anchor_at(
+    http: &reqwest::Client,
+    klever_node_url: &str,
+    contract_address: &str,
+    klv_address: &str,
+) -> Result<u64> {
+    let address_hex = encode_address_hex(klv_address)
+        .with_context(|| format!("invalid klv address: {}", klv_address))?;
+    let resp = vm_hex_call(
+        http,
+        klever_node_url,
+        contract_address,
+        "getNodeLastAnchorAt",
+        &[address_hex],
+    )
+    .await?;
+    if resp.is_require_failure() {
+        return Ok(0);
+    }
+    Ok(decode_u64_be(&resp.data))
+}
+
+/// Returns the published multiaddr list for `address`. Empty result
+/// means the operator has not published (the registration may still
+/// be active; this view answers `getNodeMetadata`, not "is registered").
+///
+/// Each entry is the raw multiaddr string the operator submitted —
+/// caller parses (typically with libp2p::Multiaddr::from_str). The SC
+/// stores them opaquely so transport additions (QUIC variants,
+/// WebTransport, onion) ship without contract upgrades.
+pub async fn get_node_metadata(
+    http: &reqwest::Client,
+    klever_node_url: &str,
+    contract_address: &str,
+    klv_address: &str,
+) -> Result<Vec<String>> {
+    /// Consumer-side cap on `getNodeMetadata` returned entries —
+    /// defense in depth against a future SC change or a hostile RPC
+    /// returning oversized payloads. The SC enforces 8 entries
+    /// server-side (spec 12 §2.10 `NODE_METADATA_MAX_ENTRIES`); we
+    /// allow 2× headroom and reject larger as a protocol error.
+    const MAX_RETURNED_ENTRIES: usize = 16;
+
+    let address_hex = encode_address_hex(klv_address)
+        .with_context(|| format!("invalid klv address: {}", klv_address))?;
+    let resp = vm_hex_call_multi(
+        http,
+        klever_node_url,
+        contract_address,
+        "getNodeMetadata",
+        &[address_hex],
+    )
+    .await?;
+    if resp.is_require_failure() {
+        return Ok(Vec::new());
+    }
+    if resp.items.len() > MAX_RETURNED_ENTRIES {
+        anyhow::bail!(
+            "getNodeMetadata returned too many entries: {} > {}",
+            resp.items.len(),
+            MAX_RETURNED_ENTRIES
+        );
+    }
+    // ManagedBuffer items are wire-encoded as raw bytes (hex on the
+    // wire). The SC stores multiaddr strings as ASCII bytes, so each
+    // hex-decoded item is the multiaddr string.
+    let mut out = Vec::with_capacity(resp.items.len());
+    for hex_item in &resp.items {
+        let bytes = hex::decode(hex_item)
+            .context("hex-decoding getNodeMetadata entry")?;
+        let s = String::from_utf8(bytes)
+            .context("getNodeMetadata entry is not valid UTF-8")?;
+        out.push(s);
+    }
+    Ok(out)
+}
+
+/// One entry from `get_active_nodes` — a registered, non-paused node
+/// with its last-anchor timestamp (unix seconds, 0 if never anchored).
+#[derive(Debug, Clone)]
+pub struct ActiveNode {
+    /// The anchorer's klv1... address (bech32-encoded from on-chain
+    /// 32-byte raw key).
+    pub address: String,
+    /// `block_timestamp` of the address's most recent successful
+    /// `anchorState`. Zero if they have never anchored.
+    pub last_anchor_at: u64,
+}
+
+/// Returns a paginated list of active nodes (registered + not paused)
+/// from the SC. `limit` is hard-capped at 64 by the SC; passing > 64
+/// will trigger a `require!` failure (treated as empty result here).
+///
+/// Drives `network::sc_discovery` cold-start bootstrap (spec 13 §4.3)
+/// and the `bootstrap-candidates` REST endpoint.
+pub async fn get_active_nodes(
+    http: &reqwest::Client,
+    klever_node_url: &str,
+    contract_address: &str,
+    offset: u32,
+    limit: u32,
+) -> Result<Vec<ActiveNode>> {
+    let resp = vm_hex_call_multi(
+        http,
+        klever_node_url,
+        contract_address,
+        "getActiveNodes",
+        &[
+            encode_u64_minimal_hex(offset as u64),
+            encode_u64_minimal_hex(limit as u64),
+        ],
+    )
+    .await?;
+    if resp.is_require_failure() {
+        return Ok(Vec::new());
+    }
+
+    // Layout: `MultiValueEncoded<MultiValue2<Address, u64>>` flattens
+    // to [addr0_hex, ts0_hex, addr1_hex, ts1_hex, ...]. Consume in
+    // pairs; an odd-length response is a protocol mismatch and we
+    // surface it as an error rather than silently truncating.
+    if resp.items.len() % 2 != 0 {
+        anyhow::bail!(
+            "getActiveNodes returned odd-length sequence: {} items",
+            resp.items.len()
+        );
+    }
+
+    let mut out = Vec::with_capacity(resp.items.len() / 2);
+    for pair in resp.items.chunks_exact(2) {
+        let addr_bytes = hex::decode(&pair[0])
+            .context("hex-decoding getActiveNodes address")?;
+        if addr_bytes.len() != 32 {
+            anyhow::bail!(
+                "getActiveNodes address has wrong length: got {}, expected 32",
+                addr_bytes.len()
+            );
+        }
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&addr_bytes);
+        let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&key)
+            .context("decoding getActiveNodes Ed25519 pubkey from raw bytes")?;
+        let address = crate::crypto::pubkey_to_address(&verifying_key)
+            .context("encoding getActiveNodes address as bech32")?;
+        let last_anchor_at = decode_u64_be(&pair[1]);
+        out.push(ActiveNode {
+            address,
+            last_anchor_at,
+        });
+    }
+    Ok(out)
 }
 
 // ── Decoding helpers ────────────────────────────────────────────────
