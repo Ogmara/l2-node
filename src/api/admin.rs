@@ -166,13 +166,18 @@ pub async fn node_registration(
     // Without this distinction, the bootstrap banner would flash on
     // every transient Klever RPC blip (v0.43.0 audit W2).
     //
-    // The fifth call (`get_node_registered_at`) is what lets the
-    // dashboard tell apart "in v0.3+ permissionless registry"
+    // The fifth call (`get_node_registered_at`) is historically what
+    // let the dashboard distinguish "in v0.3+ permissionless registry"
     // (timestamp > 0) from "only in the legacy authorized_anchorer
-    // allowlist" (timestamp == 0 but isNodeRegistered == true).
-    // `unregisterNode` only works for the former; the dashboard's
-    // State B′ (added in v0.43.3) routes legacy-only operators to a
-    // migrate path instead of a broken unregister button.
+    // allowlist" (timestamp == 0 but isNodeRegistered == true). With
+    // SC v0.4.0+ that legacy state is no longer reachable — the SC
+    // collapsed `isNodeRegistered` to only consult `registered_node`,
+    // and `register_node` always writes the timestamp. We keep the
+    // call because it still drives the State C/D / "registered since"
+    // dashboard display; the "legacy" classification branch below is
+    // retained as defensive scaffolding but cannot fire against an
+    // SC ≥ 0.4.0. Dashboard State B′ (v0.43.3) is correspondingly
+    // unreachable post-upgrade; full removal scheduled for v0.45.0.
     let (registered_res, count_res, fee_res, canonical_height_res, registered_at_res) = tokio::join!(
         crate::chain::sc_views::is_node_registered(http, &klever_node_url, &contract_address, &wallet),
         crate::chain::sc_views::get_node_count(http, &klever_node_url, &contract_address),
@@ -193,6 +198,12 @@ pub async fn node_registration(
     //              unregister would fail with "Not registered" because
     //              the SC's unregister_node only manages the v0.3+ map.
     //              Dashboard offers a "Migrate to v0.3 registry" path instead.
+    //              **Unreachable against SC ≥ 0.4.0** — SC no longer
+    //              ORs in authorized_anchorer for isNodeRegistered, and
+    //              register_node always sets the timestamp. Kept as a
+    //              defensive arm so a downgraded SC would still classify
+    //              correctly; remove in v0.45.0 alongside the dashboard
+    //              State B′ cleanup.
     //   "none"   → not registered anywhere; show the register CTA.
     let registration_source = match (registered, registered_at) {
         (true, n) if n > 0 => "v3",

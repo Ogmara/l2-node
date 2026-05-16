@@ -5,6 +5,76 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.44.0] - 2026-05-16
+
+Spec 12 Phase 2 consumer-side integration + spec 13 on-chain peer
+discovery (tier 3 of the bootstrap layering). Requires smart-contract
+v0.4.0 live on the target Klever network — calls into views that don't
+exist on SC v0.3.x. Spec 12 §5.2 LN2.1 + LN2.2 + LN2.6 + LN2.7.
+
+### Added
+
+#### Spec 12 Phase 2 SC consumer surface ([`src/chain/sc_views.rs`](src/chain/sc_views.rs))
+- `is_divergence_escalated(height)` — checks the SC's `divergenceEscalated` flag for a height.
+- `get_escalated_threshold(height)` — returns the snapshotted `max(ANCHOR_QUORUM_MIN + 1, node_count/2 + 1)` threshold.
+- `is_node_paused(address)` — checks the SC's `nodePaused` flag.
+- `get_node_last_anchor_at(address)` — returns the `block_timestamp` of the address's most recent successful `anchorState`. Drives spec 13 §7 client-side staleness filtering.
+- `get_node_metadata(address)` — returns the published multiaddr list. Opaque ManagedBuffer entries — caller parses.
+- `get_active_nodes(offset, limit)` — paginated registry view returning `(address, last_anchor_at)` tuples. Limit ≤ 64 (capped SC-side).
+- New `ActiveNode` struct + `vm_hex_call_multi` helper for `MultiValueEncoded<...>` view returns (the prior scalar-only `vm_hex_call` couldn't decode array payloads).
+
+#### Spec 13 §4.3 tier-3 SC peer discovery ([`src/network/sc_discovery.rs`](src/network/sc_discovery.rs)) — NEW MODULE
+- `ScDiscovery` background task spawned alongside `NetworkService`. On startup, if the persisted peer book has < 3 entries, immediately fans out to the on-chain registry. Then runs a 1h-cadence steady-state refresh to keep the book aligned with operator churn.
+- Each run: pages `getActiveNodes` (up to 256 total entries), filters by `lastAnchorAt < (now - 7d)` and `isNodePaused`, fetches `getNodeMetadata` per candidate, parses multiaddrs, persists to `PEER_DIRECTORY` under the existing `pa:` prefix.
+- After persisting, sends a reconnect-trigger signal so `NetworkService` calls `dial_persisted_peers()` out-of-cycle (vs. waiting up to 30s for the next periodic bootstrap tick).
+- Constants exposed: `BOOTSTRAP_SC_FALLBACK_BOOK_THRESHOLD = 3`, `BOOTSTRAP_SC_REFRESH_INTERVAL = 1h`, `MAX_SC_DISCOVERY_TOTAL = 256`, `PEER_STALENESS_THRESHOLD = 7 days`.
+
+#### Alert taxonomy extensions ([`src/notifications/alerts.rs`](src/notifications/alerts.rs))
+- `AnchorDivergenceResolved` (info) — fires when the divergence-watcher observes that a previously-divergent height has gained an on-chain resolution via the SC's hybrid quorum (kind=1 escalated quorum OR kind=2 deterministic tiebreak). Observability signal, not action. Spec 12 §5.4.
+- `BootstrapScFallbackUsed` (info) — one-shot per startup, fires when `sc_discovery` successfully persists ≥ 1 new multiaddr from the on-chain registry. Confirms the SC-fallback tier engaged. Spec 12 §5.4 (canonical taxonomy) + spec 13 §9.3 (cross-spec ref).
+- New `AlertEvent` + `AlertEventSender` cross-task event channel. AlertEngine's `run` loop now `select!`s on either the 30s interval tick (threshold evaluation) or the events channel (one-shot event fires from background tasks). Same cooldown applies, so a burst of events still deduplicates within `cooldown.seconds`.
+- `AlertEngine::event_channel()` constructor for upstream channel pre-allocation — sender goes to background tasks that must start before AlertEngine itself (the state anchorer is constructed before the alert engine).
+
+#### Spec 12 Phase 2 hybrid-aware divergence-watcher ([`src/chain/anchoring.rs`](src/chain/anchoring.rs))
+- `StateAnchorer::poll_divergence_resolutions` — runs at the start of each `check_divergence` tick. Walks `divergence_observed` (heights where we previously observed a mismatch) and queries `isDivergenceEscalated` + `getCanonicalAnchor`. When the SC reports a resolution, fires `AnchorDivergenceResolved` (info) and removes the entry from tracking.
+- `divergence_observed: HashSet<u64>` field on `StateAnchorer`, capped at `MAX_DIVERGENCE_OBSERVED = 1000` with LIFO eviction.
+- `alert_event_tx: Option<AlertEventSender>` field on `StateAnchorer` for firing event-driven alerts; new arg on `StateAnchorer::new`.
+
+### Changed
+- **`query_klever_state_root_at` now calls `getCanonicalAnchor`** instead of the legacy `getStateRoot` shim (spec 12 §5.2 LN2.7). Function name retained for caller stability — most callers read this as "query Klever for what root it has at this height", which is still accurate just against the hybrid-aware view. Body now delegates to `chain::sc_views::get_canonical_anchor`. Pre-v0.3 heights become invisible to snapshot bootstrap verification; this is intentional and documented (all live nodes are post-v0.3 by the time 0.44.0 deploys).
+- `NetworkService::run` gains an `sc_reconnect_rx: mpsc::Receiver<()>` parameter. The `tokio::select!` loop adds a new arm that calls `dial_persisted_peers()` when sc_discovery signals fresh entries. Existing callers in `node.rs` updated.
+- `AlertEngine::new` signature changed: now takes `events_rx` as a third argument (was 2-arg). Channel creation lives in `AlertEngine::event_channel()`.
+- `is_node_registered` view doc-comment updated to reflect SC v0.4.0 collapse of the dual-OR (only consults `registered_node` now; legacy `authorized_anchorer` allowlist is gone).
+- `get_node_count` view doc-comment updated for same reason.
+- Admin endpoint `registration_source` classifier: the `"legacy"` branch is documented as unreachable against SC ≥ 0.4.0 but retained as defensive scaffolding (full removal scheduled for 0.45.0 alongside dashboard State B′ cleanup).
+
+### Removed
+- Unused `encode_u64_minimal_hex` from `chain/anchor_verify.rs` (and its test) — the function is now centralized in `chain/sc_views.rs` since the anchor-verify path delegates to `sc_views::get_canonical_anchor`. Anchor-verify's `outcomes_compare_correctly` test retained.
+
+### Deferred to 0.45.0 (paired with dashboard work)
+- Discovery-source tracking (`book | config | sc | runtime` 4-value session-time map per spec 13 §4.1). Requires invasive `NetworkService` instrumentation that overlaps the dashboard UI work; both ship together in 0.45.0.
+- `GET /api/v1/network/discovery/bootstrap-candidates` REST endpoint (spec 13 §4.5). Same rationale — its main SDK consumers (`sdk-js`, `sdk-rust`) ship after the dashboard surface is finalized.
+
+### Security
+- `sc_discovery` paused-filter is server-side only via `getActiveNodes` (single SC, single source of truth — a per-candidate `isNodePaused` recheck was dropped per Code Audit W1 / Security Audit N2 as redundant RPC load with no security benefit).
+- `sc_discovery::persist_multiaddr` enforces the 256-entry `PEER_DIRECTORY` cap (Security Audit W1 — prevents a Sybil registry attacker from crowding out organically-learned peers via setNodeMetadata refresh churn).
+- SC-supplied multiaddr strings are logged via `?` (Debug) formatting so newlines / control chars cannot forge log entries (Security Audit W2).
+- `get_node_metadata` caps returned entries at 16 (2× SC's spec-level cap of 8) and bails on oversized payloads — defense in depth against future SC bugs or hostile RPC (Security Audit N1).
+- `sc_discovery` skips parse-failed multiaddrs at debug log level (no panic, no propagation).
+- Alert event channel sized to 1024 (matches `MAX_DIVERGENCE_OBSERVED`) so a burst of divergence resolutions can be drained without dropping events (Security Audit N3).
+- `try_send` to the alert events channel never blocks the divergence-watcher or `sc_discovery` — if the channel is full or the engine is disabled, events drop silently (with a debug log).
+- `MAX_DIVERGENCE_OBSERVED = 1000` cap on the tracked-divergence HashSet bounds memory if Klever RPC stalls and many heights enter divergence without resolution. Lowest-numbered-height eviction (with a known limitation for backfilled snapshots — Security Audit N4).
+
+### Notes for operators
+- **Requires smart-contract v0.4.0 live** on the target network. Deploying 0.44.0 against an SC ≥ 0.3.x but < 0.4.0 will cause sc_discovery to fail on `getActiveNodes` (logged at debug, fan-out aborts) and the hybrid-aware divergence-watcher to fail on `isDivergenceEscalated` (same). Functionally degrades to v0.43.4 behavior — anchoring continues, just without on-chain peer discovery or hybrid-resolution observability.
+- The seed-node SPOF mitigation kicks in IMMEDIATELY for fresh nodes that have a peer book with < 3 entries. Existing nodes with healthy peer books defer to the 1h refresh cadence.
+- `bootstrap_sc_fallback_used` (info) alert fires ONCE per startup window — its appearance in the alerts log/dashboard is the operational confirmation that SC discovery actually engaged.
+
+### Known limitations
+- **Stall-trigger not implemented** (spec 13 §4.3 calls for a third trigger when tiers 1+2 produce zero successful Identify within 60s). Current implementation only wires cold-start (`book < 3`) + 1h periodic — a node with ≥3 stale unreachable peer-book entries waits up to 1h before its first SC fan-out. Acceptable for current operator pool (testnet bake-in); revisit in 0.45.0 alongside dashboard work.
+- **Per-address `getNodeMetadata` cache not implemented** (spec 13 §4.3 suggests 5-min cache). With 1h refresh cadence × ≤ 256 candidates per run, total view-call load is ≤ ~256 calls/hour — well within Klever RPC budgets without caching. Add only if a future scope bumps cadence.
+- **Pre-v0.3 snapshot heights become invisible** to bootstrap verification after the LN2.7 `getStateRoot → getCanonicalAnchor` switch. Intentional per spec 12 §5.2 — all live nodes are post-v0.3 by the time this release deploys.
+
 ## [0.43.4] - 2026-05-16
 
 Completes the v0.43.0 scaffold — `anchor_divergence` alert is now

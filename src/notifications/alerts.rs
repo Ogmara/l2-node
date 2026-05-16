@@ -8,10 +8,20 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
+use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::config::AlertsConfig;
 use crate::metrics::MetricsSnapshot;
+
+/// Capacity of the cross-task event channel feeding AlertEngine.
+/// Sized to absorb a sustained burst — `AnchorDivergenceResolved`
+/// can fire once per height in a tight window if the SC resolves
+/// many pending escalations simultaneously. Capacity matches the
+/// upper bound of `divergence_observed` (1000) so the watcher
+/// can drain its full tracking set without dropping events
+/// (Security Audit N3).
+const ALERT_EVENT_CHANNEL_CAPACITY: usize = 1024;
 
 /// Alert severity levels (spec 10-dashboard.md §9.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
@@ -40,10 +50,19 @@ pub enum AlertType {
     /// or (worst case) a colluding-anchorer attack on the canonical
     /// root. Operator must investigate immediately.
     AnchorDivergence,
+    /// A previously-divergent height resolved on-chain via the SC's
+    /// `anchorDivergenceResolved` event. Observability signal — no
+    /// action required (spec 12 §5.4, l2-node 0.44.0+).
+    AnchorDivergenceResolved,
     ScSyncBehind,
     HighRateLimitTriggers,
     FailedSignatureSpike,
     NodeStarted,
+    /// `network/sc_discovery` successfully dialed at least one new
+    /// peer from the on-chain registry during a cold-start window or
+    /// bootstrap-stall recovery (spec 13 §4.3, l2-node 0.44.0+).
+    /// Confirms the SC-fallback discovery layer engaged.
+    BootstrapScFallbackUsed,
 }
 
 impl AlertType {
@@ -59,7 +78,9 @@ impl AlertType {
             | AlertType::ScSyncBehind => AlertSeverity::Warning,
             AlertType::HighRateLimitTriggers
             | AlertType::FailedSignatureSpike
-            | AlertType::NodeStarted => AlertSeverity::Info,
+            | AlertType::NodeStarted
+            | AlertType::AnchorDivergenceResolved
+            | AlertType::BootstrapScFallbackUsed => AlertSeverity::Info,
         }
     }
 
@@ -72,10 +93,12 @@ impl AlertType {
             AlertType::MemoryUsageHigh => "Memory usage above threshold",
             AlertType::AnchorOverdue => "State anchor overdue",
             AlertType::AnchorDivergence => "State root diverged from canonical",
+            AlertType::AnchorDivergenceResolved => "Anchor divergence resolved on-chain",
             AlertType::ScSyncBehind => "SC sync falling behind",
             AlertType::HighRateLimitTriggers => "High rate-limit trigger count",
             AlertType::FailedSignatureSpike => "Failed signature verification spike",
             AlertType::NodeStarted => "Node started",
+            AlertType::BootstrapScFallbackUsed => "On-chain peer discovery engaged",
         }
     }
 
@@ -88,13 +111,31 @@ impl AlertType {
             AlertType::MemoryUsageHigh => "high_memory",
             AlertType::AnchorOverdue => "anchor_overdue",
             AlertType::AnchorDivergence => "anchor_divergence",
+            AlertType::AnchorDivergenceResolved => "anchor_divergence_resolved",
             AlertType::ScSyncBehind => "sc_sync_behind",
             AlertType::HighRateLimitTriggers => "high_rate_limits",
             AlertType::FailedSignatureSpike => "high_failed_sigs",
             AlertType::NodeStarted => "node_started",
+            AlertType::BootstrapScFallbackUsed => "bootstrap_sc_fallback_used",
         }
     }
 }
+
+/// One-shot event-driven alert request, sent from background tasks
+/// (divergence-watcher, sc_discovery) to AlertEngine via mpsc channel.
+///
+/// Unlike the threshold-based alerts evaluated on every 30s tick,
+/// event alerts fire once per observable occurrence. Cooldown still
+/// applies — the engine deduplicates within `cooldown.seconds`.
+#[derive(Debug, Clone)]
+pub struct AlertEvent {
+    pub alert_type: AlertType,
+    pub details: String,
+}
+
+/// Sender half of the AlertEngine event channel. Clone freely — it's
+/// an mpsc::Sender under the hood.
+pub type AlertEventSender = mpsc::Sender<AlertEvent>;
 
 /// An alert record for history tracking.
 #[derive(Debug, Clone, Serialize)]
@@ -122,16 +163,38 @@ pub struct AlertEngine {
     node_id: String,
     /// Shared alert history (last 1000 records), readable by the dashboard API.
     history: SharedAlertHistory,
+    /// Receive end of the event channel — background tasks push
+    /// one-shot info events (divergence_resolved, sc_fallback_used)
+    /// via the matching sender.
+    events_rx: mpsc::Receiver<AlertEvent>,
 }
 
 impl AlertEngine {
-    pub fn new(config: AlertsConfig, node_id: String) -> Self {
+    /// Pre-allocate the cross-task alert event channel. The sender
+    /// half is cloneable and goes to any task that needs to fire
+    /// event-driven alerts (divergence-watcher, sc_discovery). The
+    /// receiver goes into `AlertEngine::new` below. Separating channel
+    /// construction from engine construction lets callers wire the
+    /// sender into tasks that must start BEFORE the alert engine does.
+    pub fn event_channel() -> (AlertEventSender, mpsc::Receiver<AlertEvent>) {
+        mpsc::channel(ALERT_EVENT_CHANNEL_CAPACITY)
+    }
+
+    /// Construct the engine. `events_rx` must come from a paired call
+    /// to [`event_channel`]; the engine consumes events posted on the
+    /// matching sender.
+    pub fn new(
+        config: AlertsConfig,
+        node_id: String,
+        events_rx: mpsc::Receiver<AlertEvent>,
+    ) -> Self {
         Self {
             config,
             last_sent: HashMap::new(),
             http: reqwest::Client::new(),
             node_id,
             history: Arc::new(RwLock::new(VecDeque::new())),
+            events_rx,
         }
     }
 
@@ -161,6 +224,14 @@ impl AlertEngine {
                 _ = interval.tick() => {
                     let snap = latest.read().map(|s| *s).unwrap_or_default();
                     self.evaluate(&snap).await;
+                }
+                Some(event) = self.events_rx.recv() => {
+                    // Event-driven fire from a background task (e.g.,
+                    // sc_discovery success, divergence resolution).
+                    // `fire` applies the same cooldown as threshold
+                    // alerts so a burst of events still gets
+                    // deduplicated within `cooldown.seconds`.
+                    self.fire(event.alert_type, &event.details).await;
                 }
                 _ = shutdown_rx.recv() => {
                     debug!("Alert engine shutting down");

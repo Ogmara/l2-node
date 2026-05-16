@@ -10,7 +10,7 @@
 //! 3. Sign raw hash bytes with Ed25519
 //! 4. Broadcast via POST /transaction/broadcast
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -24,8 +24,15 @@ use tracing::{debug, error, info, warn};
 use crate::config::{AnchoringConfig, KleverConfig};
 use crate::crypto;
 use crate::crypto::signing;
+use crate::notifications::alerts::{AlertEvent, AlertEventSender, AlertType};
 use crate::storage::rocks::Storage;
 use crate::storage::schema::state_keys;
+
+/// Cap on `divergence_observed` HashSet — bounds memory if the SC
+/// stalls and lots of heights enter divergence without resolution.
+/// At a 1-hour anchor interval, 1000 entries ≈ 42 days of unresolved
+/// divergence before the oldest get pruned (logged at warn).
+const MAX_DIVERGENCE_OBSERVED: usize = 1000;
 
 /// A submission this node made that has not yet been observed reaching
 /// (or failing to reach) canonical status on-chain. The divergence
@@ -78,6 +85,17 @@ pub struct StateAnchorer {
     /// restarts. Exposed via `/admin/node/registration`'s
     /// `canonical_count` field.
     canonical_counter: Arc<AtomicU64>,
+    /// Heights where we observed a mismatch against the on-chain
+    /// canonical and which have not yet been resolved via hybrid
+    /// escalation. Polled each tick via `isDivergenceEscalated`; when
+    /// the SC reports escalation, the watcher fires the
+    /// `anchor_divergence_resolved` info alert and removes the entry.
+    /// Capped at `MAX_DIVERGENCE_OBSERVED` (oldest dropped on overflow).
+    divergence_observed: HashSet<u64>,
+    /// Optional sender for one-shot event alerts (resolved divergence).
+    /// `None` when the operator runs with `alerts.enabled = false` —
+    /// in that case the watcher logs but does not fire alerts.
+    alert_event_tx: Option<AlertEventSender>,
 }
 
 impl StateAnchorer {
@@ -94,6 +112,7 @@ impl StateAnchorer {
         node_id: String,
         divergence_counter: Arc<AtomicU32>,
         canonical_counter: Arc<AtomicU64>,
+        alert_event_tx: Option<AlertEventSender>,
     ) -> Result<Self> {
         let sender_address = crypto::pubkey_to_address(&signing_key.verifying_key())
             .map_err(|e| anyhow::anyhow!("computing anchor wallet address: {}", e))?;
@@ -113,6 +132,8 @@ impl StateAnchorer {
             pending_submissions: VecDeque::new(),
             divergence_counter,
             canonical_counter,
+            divergence_observed: HashSet::new(),
+            alert_event_tx,
         })
     }
 
@@ -215,6 +236,15 @@ impl StateAnchorer {
     /// the streak. Matches the spec 10 §9.2 alert semantics
     /// (`anchor_divergence_consecutive`).
     async fn check_divergence(&mut self) {
+        // Phase 2 (v0.44.0): first walk previously-divergent heights to
+        // see if the SC has now entered escalated mode and produced a
+        // resolution (escalated quorum OR §2.9 tiebreak). Fires the
+        // `anchor_divergence_resolved` info alert for each newly-
+        // resolved entry. Bounded by `MAX_DIVERGENCE_OBSERVED` —
+        // entries that stay unresolved indefinitely are pruned LIFO
+        // to keep the set finite.
+        self.poll_divergence_resolutions().await;
+
         if self.pending_submissions.is_empty() {
             return;
         }
@@ -250,6 +280,16 @@ impl StateAnchorer {
                             consecutive,
                             "ANCHOR DIVERGENCE: local root differs from on-chain canonical"
                         );
+                        // Phase 2 (v0.44.0): track this height in
+                        // `divergence_observed` so the next ticks can
+                        // detect when the SC resolves it via the §2.8
+                        // escalation path and fire the
+                        // `anchor_divergence_resolved` info alert.
+                        // Bounded — overflow drops the lowest height
+                        // (LIFO retention favors the most recent
+                        // disagreements, which are operationally most
+                        // interesting).
+                        self.track_observed_divergence(sub.block_height);
                     }
                     // Either way: this height has a definitive answer. Drop.
                 }
@@ -268,6 +308,120 @@ impl StateAnchorer {
             }
         }
         self.pending_submissions = keep;
+    }
+
+    /// Walk `divergence_observed` and check each height for hybrid-
+    /// escalation resolution. Fires `anchor_divergence_resolved` (info)
+    /// for each newly-resolved entry and removes it from the set.
+    /// Skipped silently when no entries are tracked (the common case
+    /// in a healthy network).
+    async fn poll_divergence_resolutions(&mut self) {
+        if self.divergence_observed.is_empty() {
+            return;
+        }
+        let heights: Vec<u64> = self.divergence_observed.iter().copied().collect();
+        for height in heights {
+            // Is this height now in escalated mode? If not, leave it
+            // tracked — the SC's `divergence_escalated` flag is
+            // one-shot per height and only flips once a SECOND root
+            // hits base quorum.
+            let escalated = match crate::chain::sc_views::is_divergence_escalated(
+                &self.http,
+                &self.klever.node_url,
+                &self.klever.contract_address,
+                height,
+            )
+            .await
+            {
+                Ok(b) => b,
+                Err(e) => {
+                    debug!(error = %e, height, "isDivergenceEscalated failed; will retry");
+                    continue;
+                }
+            };
+            if !escalated {
+                continue;
+            }
+            // Escalated. Fetch the (possibly now-resolved) canonical.
+            // `getCanonicalAnchor` returns escalated_canonical if set,
+            // the §2.9 tiebreak winner if not, or `None` if neither
+            // (escalated flag set with no candidates — defensive).
+            let canonical = match crate::chain::sc_views::get_canonical_anchor(
+                &self.http,
+                &self.klever.node_url,
+                &self.klever.contract_address,
+                height,
+            )
+            .await
+            {
+                Ok(Some(c)) => c,
+                Ok(None) => continue, // Still unresolved despite escalation flag — wait.
+                Err(e) => {
+                    debug!(error = %e, height, "getCanonicalAnchor failed during resolution poll");
+                    continue;
+                }
+            };
+            // Resolved. Remove from tracking and fire the info alert.
+            // Note: we don't know from views alone whether resolution
+            // was via escalated_quorum (kind=1) or tiebreak (kind=2);
+            // both look identical (escalated_canonical is set). The
+            // alert message keeps to the observability framing.
+            self.divergence_observed.remove(&height);
+            info!(
+                height,
+                canonical = %canonical,
+                "Hybrid quorum resolved a previously-divergent height"
+            );
+            self.fire_event_alert(
+                AlertType::AnchorDivergenceResolved,
+                format!(
+                    "Height {} resolved on-chain via hybrid quorum. Canonical root: {}",
+                    height, canonical
+                ),
+            );
+        }
+    }
+
+    /// Add a height to `divergence_observed`, evicting the
+    /// lowest-numbered height on overflow. Block heights increase
+    /// monotonically with chain progress, so "lowest" effectively
+    /// means "oldest" for normal anchoring traffic; the eviction
+    /// rule favors more-recent (= operationally more interesting)
+    /// divergences. Edge case: an operator who backfills via
+    /// snapshot bootstrap may see low-numbered historical heights
+    /// enter divergence later — those would be evicted first, which
+    /// is a known limitation flagged in Security Audit N4.
+    fn track_observed_divergence(&mut self, height: u64) {
+        if self.divergence_observed.len() >= MAX_DIVERGENCE_OBSERVED
+            && !self.divergence_observed.contains(&height)
+        {
+            if let Some(&lowest) = self.divergence_observed.iter().min() {
+                self.divergence_observed.remove(&lowest);
+                warn!(
+                    pruned_height = lowest,
+                    "divergence_observed full ({}), pruned oldest height",
+                    MAX_DIVERGENCE_OBSERVED
+                );
+            }
+        }
+        self.divergence_observed.insert(height);
+    }
+
+    /// Best-effort send to the AlertEngine's event channel. Uses
+    /// `try_send` so the watcher never blocks on a slow AlertEngine.
+    /// Drops the event (with a debug log) if the channel is full or
+    /// the engine is disabled.
+    fn fire_event_alert(&self, alert_type: AlertType, details: String) {
+        let Some(tx) = self.alert_event_tx.as_ref() else {
+            return;
+        };
+        let event = AlertEvent {
+            alert_type,
+            details,
+        };
+        if let Err(e) = tx.try_send(event) {
+            debug!(error = %e, "Alert event channel full or closed; dropping event");
+        }
     }
 
     /// Wait until the node's anchorer wallet is registered on-chain
@@ -689,6 +843,7 @@ mod tests {
             "TestNode123".to_string(),
             std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
             std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            None, // alert_event_tx — tests don't need the alert channel
         )
         .unwrap();
 

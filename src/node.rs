@@ -339,10 +339,21 @@ impl Node {
             }
         });
 
+        // v0.44.0: cross-task channel between sc_discovery (sender,
+        // spawned later once alert_event_tx and node_address are in
+        // scope) and NetworkService::run (receiver, attached here).
+        // The receiver is consumed by `network.run` to trigger out-of-
+        // cycle `dial_persisted_peers` calls when sc_discovery
+        // persists fresh entries. Capacity 4 is plenty — bursts
+        // coalesce because all we care about is "redial recently".
+        let (sc_reconnect_tx, sc_reconnect_rx) = tokio::sync::mpsc::channel::<()>(4);
+
         // Run network event loop in a task
         let network_shutdown_rx = self.shutdown_rx();
         let network_task = tokio::spawn(async move {
-            network.run(network_shutdown_rx, channel_rx, gossip_rx).await;
+            network
+                .run(network_shutdown_rx, channel_rx, gossip_rx, sc_reconnect_rx)
+                .await;
         });
 
         // Phase 2 snapshot bootstrap (opt-in). Blocks startup so the chain
@@ -526,6 +537,25 @@ impl Node {
         let anchor_canonical_counter =
             std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
 
+        // Pre-allocate the alert event channel so it's available to
+        // the state anchorer (constructed below) AND the sc_discovery
+        // task (constructed inside NetworkService). The receiver goes
+        // into AlertEngine further down. `events_tx` is cloneable; we
+        // wrap it in Option so callers can run with `alerts.enabled =
+        // false` and skip event firing entirely (channel-creation cost
+        // is negligible — single mpsc allocation — so we always create
+        // it and gate the wiring on the alerts.enabled check).
+        let (alert_event_tx, alert_event_rx) =
+            crate::notifications::alerts::AlertEngine::event_channel();
+        // Anchorer-side handle: cloned per-task. None when alerts
+        // disabled — tasks suppress event firing in that case.
+        let anchor_alert_tx: Option<crate::notifications::alerts::AlertEventSender> =
+            if self.config.alerts.enabled {
+                Some(alert_event_tx.clone())
+            } else {
+                None
+            };
+
         // Start state anchorer (if enabled)
         let anchor_trigger_tx = if self.config.anchoring.enabled {
             let anchor_klever = self.config.klever.clone();
@@ -556,6 +586,7 @@ impl Node {
             };
             let anchor_shutdown_rx = self.shutdown_rx();
             let (trigger_tx, trigger_rx) = tokio::sync::mpsc::channel(1);
+            let anchor_alert_for_task = anchor_alert_tx.clone();
             let _anchor_task = tokio::spawn(async move {
                 match crate::chain::anchoring::StateAnchorer::new(
                     anchor_klever,
@@ -565,6 +596,7 @@ impl Node {
                     anchor_node_id,
                     anchor_divergence_for_task,
                     anchor_canonical_for_task,
+                    anchor_alert_for_task,
                 ) {
                     Ok(mut anchorer) => anchorer.run(anchor_shutdown_rx, trigger_rx).await,
                     Err(e) => warn!(error = %e, "Failed to start state anchorer"),
@@ -655,12 +687,19 @@ impl Node {
         let alert_history: crate::notifications::alerts::SharedAlertHistory =
             std::sync::Arc::new(std::sync::RwLock::new(std::collections::VecDeque::new()));
 
-        // Start alert engine (if enabled, spec 10-dashboard.md §9)
+        // Start alert engine (if enabled, spec 10-dashboard.md §9).
+        // The events_rx half of the cross-task event channel was
+        // allocated upstream (see `alert_event_tx` block). When alerts
+        // are disabled we drop `alert_event_rx` here; the matching
+        // `anchor_alert_tx`/`sc_alert_tx` handles passed to background
+        // tasks were already gated to `None`, so they no-op cleanly.
         if self.config.alerts.enabled {
-            let mut alert_engine = crate::notifications::alerts::AlertEngine::new(
-                self.config.alerts.clone(),
-                self.node_id.clone(),
-            );
+            let mut alert_engine =
+                crate::notifications::alerts::AlertEngine::new(
+                    self.config.alerts.clone(),
+                    self.node_id.clone(),
+                    alert_event_rx,
+                );
             alert_engine.set_history(alert_history.clone());
             let alert_metrics = metrics_latest.clone();
             let alert_shutdown_rx = self.shutdown_rx();
@@ -668,7 +707,53 @@ impl Node {
                 alert_engine.run(alert_metrics, alert_shutdown_rx).await;
             });
             info!("Alert engine started");
+        } else {
+            // Explicit drop of the unused receiver so reviewers don't
+            // wonder why it's unused. Channel sender clones already
+            // gated on alerts.enabled => None upstream.
+            drop(alert_event_rx);
         }
+        // Suppress unused-warning on the always-allocated sender until
+        // sc_discovery wiring lands later in this method.
+        // v0.44.0: SC peer-discovery background task (spec 13 §4.3
+        // tier 3). Runs an immediate cold-start fan-out if the peer
+        // book is below threshold, then a 1h-cadence steady-state
+        // refresh. Disabled cleanly if klever.node_url or
+        // contract_address are unset (warned + idle until shutdown).
+        //
+        // Sender side of the reconnect channel is consumed here; the
+        // matching receiver was attached to `network.run` earlier so
+        // out-of-cycle dial-persisted-peers triggers fire within
+        // seconds of a fresh persist.
+        let sc_disc_klever_url = self.config.klever.node_url.clone();
+        let sc_disc_contract = self.config.klever.contract_address.clone();
+        let sc_disc_storage = self.storage.clone();
+        let sc_disc_self_addr = node_address.clone();
+        let sc_disc_alert_tx = if self.config.alerts.enabled {
+            Some(alert_event_tx.clone())
+        } else {
+            None
+        };
+        let sc_disc_shutdown_rx = self.shutdown_rx();
+        let sc_disc_reconnect_tx = sc_reconnect_tx.clone();
+        tokio::spawn(async move {
+            match crate::network::sc_discovery::ScDiscovery::new(
+                sc_disc_klever_url,
+                sc_disc_contract,
+                sc_disc_storage,
+                sc_disc_self_addr,
+                sc_disc_reconnect_tx,
+                sc_disc_alert_tx,
+            ) {
+                Ok(disc) => disc.run(sc_disc_shutdown_rx).await,
+                Err(e) => warn!(error = %e, "Failed to start sc_discovery"),
+            }
+        });
+        // Suppress unused-warning on the original sender — we only
+        // need the clone we passed to the task; the parent's copy
+        // would just sit idle.
+        drop(sc_reconnect_tx);
+        let _ = &alert_event_tx;
 
         // Resolve media-handler tuning from IpfsConfig. Anything the
         // operator left at default in ogmara.toml falls through to
