@@ -141,6 +141,7 @@ pub async fn node_registration(
             "fee_klv": "0",
             "fee_klv_raw": "0",
             "contract_address": contract_address,
+            "klever_network": state.klever_network,
             "network_node_count": serde_json::Value::Null,
             "last_canonical_height": serde_json::Value::Null,
             "quorum_min": 3,
@@ -200,6 +201,11 @@ pub async fn node_registration(
         "fee_klv": fee_klv,
         "fee_klv_raw": fee_klv_raw,
         "contract_address": contract_address,
+        // v0.43.1 — the dashboard needs to hand the right provider
+        // (testnet vs mainnet) to the Klever extension BEFORE calling
+        // initialize(); without this the extension defaults to mainnet
+        // and any SC TX goes to the wrong chain.
+        "klever_network": state.klever_network,
         "network_node_count": network_node_count,
         "last_canonical_height": last_canonical_height,
         "quorum_min": 3,
