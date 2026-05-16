@@ -27,7 +27,7 @@ pub fn parse_sc_call(call_data: &str, sender: &str, timestamp: u64) -> Option<Sc
         "transferChannel" => parse_transfer_channel(args, sender),
         "delegateDevice" => parse_delegate_device(args, sender, timestamp),
         "revokeDevice" => parse_revoke_device(args, sender, timestamp),
-        "anchorState" => parse_anchor_state(args, timestamp),
+        "anchorState" => parse_anchor_state(args, sender, timestamp),
         "tip" => parse_tip(args, sender, timestamp),
         // init, upgrade, admin endpoints — not events we need to track
         _ => None,
@@ -132,9 +132,14 @@ fn parse_revoke_device(args: &[&str], sender: &str, timestamp: u64) -> Option<Sc
     })
 }
 
-fn parse_anchor_state(args: &[&str], timestamp: u64) -> Option<ScEvent> {
+fn parse_anchor_state(args: &[&str], sender: &str, timestamp: u64) -> Option<ScEvent> {
     // anchorState(block_height: u64, state_root: hex64, message_count: u64,
     //             channel_count: u32, user_count: u32, node_id: String)
+    //
+    // Call args unchanged in SC v0.3.0; the new `anchorer` value comes
+    // from the TX sender (which the SC also surfaces as an indexed
+    // event topic). Per-anchorer tracking starts being meaningful with
+    // SC 0.3.0's quorum logic.
     if args.len() < 6 {
         return None;
     }
@@ -145,6 +150,7 @@ fn parse_anchor_state(args: &[&str], timestamp: u64) -> Option<ScEvent> {
         channel_count: u32::try_from(decode_hex_u64(args[3])?).ok()?,
         user_count: u32::try_from(decode_hex_u64(args[4])?).ok()?,
         node_id: decode_hex_string(args[5])?,
+        anchorer: sender.to_string(),
         timestamp,
     })
 }

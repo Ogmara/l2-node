@@ -83,6 +83,19 @@ impl StateAnchorer {
             return;
         }
 
+        // Spec 12 §3.1 — wait for on-chain registration before entering
+        // the anchor loop. The SC would reject our `anchorState` calls
+        // anyway, but checking up front gives the operator a clear
+        // log message and avoids a 1-hour wait + failure cycle.
+        //
+        // This is a best-effort check — the SC view calls might fail
+        // (transport, contract not yet upgraded, etc.). On failure we
+        // proceed into the loop and rely on per-anchor failure backoff.
+        if !self.wait_for_registration(&mut shutdown_rx).await {
+            info!("State anchorer shutting down (waiting for registration)");
+            return;
+        }
+
         info!(
             address = %self.sender_address,
             interval_seconds = self.config.interval_seconds,
@@ -120,6 +133,66 @@ impl StateAnchorer {
                     info!("State anchorer shutting down");
                     break;
                 }
+            }
+        }
+    }
+
+    /// Wait until the node's anchorer wallet is registered on-chain
+    /// (spec 12 §3.1). Returns `true` to proceed into the anchor loop,
+    /// `false` if the caller should bail (shutdown signal received).
+    ///
+    /// On a registered network the first call typically returns `true`
+    /// immediately and we incur a single SC view RPC. On a fresh node
+    /// this loops with a 60-second cadence until the operator registers
+    /// via the dashboard.
+    ///
+    /// View-call failures (transport errors, contract not yet upgraded
+    /// to v0.3.0) are logged and treated as "registered=false" — we
+    /// keep polling rather than entering the anchor loop blind. The
+    /// dashboard's /admin/node/registration endpoint surfaces the
+    /// same status to the operator.
+    async fn wait_for_registration(
+        &self,
+        shutdown_rx: &mut tokio::sync::broadcast::Receiver<()>,
+    ) -> bool {
+        let mut first = true;
+        loop {
+            match crate::chain::sc_views::is_node_registered(
+                &self.http,
+                &self.klever.node_url,
+                &self.klever.contract_address,
+                &self.sender_address,
+            )
+            .await
+            {
+                Ok(true) => return true,
+                Ok(false) => {
+                    if first {
+                        warn!(
+                            address = %self.sender_address,
+                            contract = %self.klever.contract_address,
+                            "Anchor wallet is NOT registered on-chain. Anchoring will not start \
+                             until the operator registers via the dashboard's Anchoring tab. \
+                             Re-checking every 60s.",
+                        );
+                        first = false;
+                    } else {
+                        debug!(address = %self.sender_address, "Still not registered; will re-check");
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        address = %self.sender_address,
+                        contract = %self.klever.contract_address,
+                        error = %e,
+                        "Failed to query isNodeRegistered (treated as not-registered for now); will retry"
+                    );
+                }
+            }
+            // Sleep with shutdown awareness — 60s default re-poll cadence.
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(60)) => continue,
+                _ = shutdown_rx.recv() => return false,
             }
         }
     }

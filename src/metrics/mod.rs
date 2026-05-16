@@ -78,6 +78,16 @@ pub struct MetricsSnapshot {
     // Wallet
     /// Node's KLV balance in KLV units (balance / 1_000_000 for display).
     pub wallet_balance_klv: u64,
+
+    // Anchor divergence (spec 12 §6.1, spec 10 §9.2)
+    /// Consecutive canonicalized heights at which our submitted root
+    /// differed from the on-chain canonical root. Zero on a match;
+    /// reaches `anchor_divergence_consecutive` triggers the
+    /// `anchor_divergence` alert.
+    ///
+    /// v0.43.0 SCAFFOLDING: always zero. Live counter lands in v0.43.1
+    /// when the dedicated divergence-watcher task is plumbed.
+    pub anchor_divergence_count: u32,
 }
 
 /// Cached storage statistics (refreshed at storage_interval).
@@ -287,6 +297,9 @@ impl MetricsCollector {
             last_anchor_age_seconds: anchor_age,
             total_anchors: ss.total_anchors,
             wallet_balance_klv: self.wallet_balance,
+            // v0.43.0 scaffolding — see MetricsSnapshot doc-comment.
+            // Updated by the divergence-watcher task in v0.43.1.
+            anchor_divergence_count: 0,
         };
 
         if let Ok(mut latest) = self.latest.write() {

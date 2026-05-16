@@ -106,6 +106,7 @@ td { padding: 8px; border-bottom: 1px solid var(--border); }
   <button data-tab="storage">Storage</button>
   <button data-tab="messages">Messages</button>
   <button data-tab="alerts">Alerts</button>
+  <button data-tab="anchoring">Anchoring</button>
 </div>
 
 <div class="content">
@@ -199,6 +200,60 @@ td { padding: 8px; border-bottom: 1px solid var(--border); }
     <div class="card" style="margin-bottom:16px">
       <h3>Alert History</h3>
       <table><thead><tr><th>Time</th><th>Severity</th><th>Condition</th><th>Message</th></tr></thead><tbody id="alerts-body"><tr><td colspan="4" style="color:var(--fg2)">Loading...</td></tr></tbody></table>
+    </div>
+  </div>
+
+  <!-- ANCHORING TAB (spec 12) -->
+  <div class="tab" id="tab-anchoring">
+    <!-- What is anchoring (collapsible educational block) -->
+    <div class="card" style="margin-bottom:16px">
+      <h3 style="cursor:pointer;user-select:none" onclick="toggleAnchoringInfo()">
+        <span id="anchoring-info-arrow">▼</span> What is anchoring?
+      </h3>
+      <div id="anchoring-info-body">
+        <p style="color:var(--fg);line-height:1.5;margin-top:8px">
+          Every hour your node computes a Merkle root of its current L2 state
+          (users, channels, messages, anchors) and submits it to the Klever
+          blockchain. When at least <strong>three independent nodes</strong>
+          submit the same root for the same block height, that root becomes
+          the network's <strong>canonical truth</strong> — provable on-chain,
+          auditable by anyone.
+        </p>
+        <ul style="color:var(--fg);line-height:1.7;margin:8px 0 0 20px">
+          <li><strong>Why it matters:</strong> tamper-evidence. Once canonical, the root cannot be revised without contradicting on-chain history.</li>
+          <li><strong>What it costs:</strong> standard Klever transaction fees, paid by your node's anchorer wallet.</li>
+          <li><strong>Who runs it:</strong> any registered node — including yours, after one-time on-chain registration.</li>
+        </ul>
+      </div>
+    </div>
+
+    <!-- Network anchoring health -->
+    <div class="card" style="margin-bottom:16px">
+      <h3>Network anchoring health</h3>
+      <div class="grid" style="margin-top:8px">
+        <div><div class="label">Registered nodes</div><div class="metric" id="anch-net-count">--</div></div>
+        <div><div class="label">Latest canonical height</div><div class="metric" id="anch-canonical-h">--</div></div>
+        <div><div class="label">Quorum threshold</div><div class="metric">3</div></div>
+      </div>
+      <div id="anch-bootstrap-banner" style="display:none;margin-top:12px;padding:10px;border-radius:6px;background:var(--yellow-bg,#3a2f00);color:var(--yellow);border:1px solid var(--yellow)">
+        <strong>Network is in bootstrap.</strong> Fewer than 3 registered anchorers exist — until quorum is possible, anchors are trusted singly with a logged warning. This window closes automatically as more nodes register.
+      </div>
+    </div>
+
+    <!-- Your node's status -->
+    <div class="card" style="margin-bottom:16px">
+      <h3>Your node's status</h3>
+      <table style="width:100%;margin-top:8px">
+        <tr><td style="color:var(--fg2);width:180px">Anchorer wallet</td><td><span id="anch-wallet" style="font-family:var(--mono);word-break:break-all">--</span> <button class="copy-btn" onclick="copyAnchorWallet()" style="margin-left:8px;padding:2px 8px;font-size:0.75em;cursor:pointer">Copy</button></td></tr>
+        <tr><td style="color:var(--fg2)">Registration</td><td id="anch-reg-status">--</td></tr>
+        <tr><td style="color:var(--fg2)">Last successful anchor</td><td id="anch-last">--</td></tr>
+        <tr><td style="color:var(--fg2)">Smart contract</td><td><span id="anch-contract" style="font-family:var(--mono);word-break:break-all">--</span></td></tr>
+      </table>
+    </div>
+
+    <!-- Action area — content swapped via JS based on state -->
+    <div class="card" id="anch-action">
+      <div style="color:var(--fg2)">Loading registration status…</div>
     </div>
   </div>
 </div>
@@ -312,6 +367,7 @@ document.getElementById('nav').addEventListener('click', (e) => {
     loadRejections();
   }
   if (e.target.dataset.tab === 'alerts') loadAlerts();
+  if (e.target.dataset.tab === 'anchoring') loadAnchoring();
 });
 
 // ─── Theme Toggle ───────────────────────────────────────────────────
@@ -552,6 +608,306 @@ async function loadAlerts() {
 }
 
 function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
+// ─── Anchoring tab (spec 12) ────────────────────────────────────────
+//
+// All operator-visible strings live in one place so a future i18n
+// refactor can extract them without touching DOM logic. v0.43.0 ships
+// English-only; full 7-language coverage lands when the dashboard's
+// i18n layer is built (see spec 12 §4.4).
+const ANCH_STRINGS = {
+  reg_yes: 'Registered',
+  reg_no: 'Not registered',
+  reg_unknown: 'Status unknown — check Klever connectivity',
+  last_none: 'No anchor submitted yet',
+  state_a_title: 'Anchoring is disabled',
+  state_a_body: 'Set <code>[anchoring] enabled = true</code> in your node config to start participating in the network truth layer. No on-chain action available from here.',
+  state_b_title: 'Register your node on-chain to start anchoring',
+  state_b_body: (fee) => `One-time fee: <strong>${esc(fee)} KLV</strong>. Paid from your Klever extension wallet — the node never sees your private key.`,
+  state_c_title: 'Registered. Awaiting first anchor.',
+  state_c_body: 'Anchoring runs once per configured interval. The first attempt will appear here when complete.',
+  state_d_title: 'Anchoring active ✓',
+  state_d_body: 'This node is participating in the network truth layer. Your submitted roots count toward quorum.',
+  btn_register: 'Register node on-chain',
+  btn_unregister: 'Unregister node',
+  err_no_ext: 'Klever Extension not found. Install it from klever.org.',
+  err_locked: 'Could not get wallet address. Unlock your Klever wallet.',
+  err_addr_invalid: 'Invalid wallet address from extension.',
+  err_wallet_mismatch: (got, expected) =>
+    `Wallet mismatch. Extension is connected as <code>${esc(got)}</code> but this node anchors as <code>${esc(expected)}</code>. Switch the extension to the correct account, or set <code>[anchoring] wallet_key</code> in the node config.`,
+  err_build_fail: 'Failed to build registration transaction.',
+  err_sign_fail: 'Signing cancelled or failed.',
+  err_broadcast_fail: 'Failed to broadcast transaction.',
+  err_timeout: 'Transaction broadcast but not yet confirmed on-chain. Check the Klever explorer.',
+  bootstrap_banner: 'Network is in bootstrap (fewer than 3 registered nodes). Anchors are trusted singly until quorum is possible.',
+};
+
+let anchState = null;  // last loaded /admin/node/registration payload
+
+async function loadAnchoring() {
+  try {
+    const resp = await fetch('/admin/node/registration');
+    if (!resp.ok) {
+      renderAnchoringError('Failed to load registration status (HTTP ' + resp.status + ').');
+      return;
+    }
+    const data = await resp.json();
+    anchState = data;
+    renderAnchoring(data);
+  } catch (e) {
+    renderAnchoringError('Failed to load registration status: ' + (e.message || e));
+  }
+}
+
+function renderAnchoringError(msg) {
+  document.getElementById('anch-action').innerHTML =
+    `<div style="color:var(--red)">${esc(msg)}</div>`;
+}
+
+function renderAnchoring(data) {
+  // Network row — distinguish "null = RPC unavailable" from "real number"
+  // so a Klever blip doesn't make the dashboard misreport as 0 / show
+  // the bootstrap banner spuriously (audit fix).
+  document.getElementById('anch-net-count').textContent =
+    (data.network_node_count === null || data.network_node_count === undefined) ? '—' : data.network_node_count;
+  if (data.last_canonical_height === null || data.last_canonical_height === undefined) {
+    document.getElementById('anch-canonical-h').textContent = '—';
+  } else if (data.last_canonical_height === 0) {
+    document.getElementById('anch-canonical-h').textContent = '--';
+  } else {
+    document.getElementById('anch-canonical-h').textContent = '#' + Number(data.last_canonical_height).toLocaleString();
+  }
+  // Bootstrap banner ONLY when we have a confirmed count AND it's
+  // below the quorum threshold. Null (RPC down) suppresses the banner.
+  const count = data.network_node_count;
+  const bootstrap = (typeof count === 'number') && count < (data.quorum_min || 3);
+  document.getElementById('anch-bootstrap-banner').style.display =
+    bootstrap ? '' : 'none';
+
+  // Your node
+  document.getElementById('anch-wallet').textContent = data.wallet || '--';
+  document.getElementById('anch-contract').textContent = data.contract_address || '--';
+  let regStatus = ANCH_STRINGS.reg_unknown;
+  if (data.registered === true) regStatus = ANCH_STRINGS.reg_yes;
+  else if (data.registered === false) regStatus = ANCH_STRINGS.reg_no;
+  document.getElementById('anch-reg-status').textContent = regStatus;
+
+  if (data.last_successful_anchor) {
+    const d = new Date(data.last_successful_anchor * 1000);
+    document.getElementById('anch-last').textContent = d.toLocaleString();
+  } else {
+    document.getElementById('anch-last').textContent = ANCH_STRINGS.last_none;
+  }
+
+  // Action area — state machine
+  const action = document.getElementById('anch-action');
+  if (data.anchoring_configured === false) {
+    action.innerHTML = `<h3>${esc(ANCH_STRINGS.state_a_title)}</h3><p>${ANCH_STRINGS.state_a_body}</p>`;
+  } else if (!data.registered) {
+    action.innerHTML = `
+      <h3>${esc(ANCH_STRINGS.state_b_title)}</h3>
+      <p style="margin-top:8px">${ANCH_STRINGS.state_b_body(data.fee_klv)}</p>
+      <div style="margin-top:16px">
+        <button class="login-btn" onclick="registerNodeOnChain()">${esc(ANCH_STRINGS.btn_register)}</button>
+        <span id="anch-modal-status" style="margin-left:12px;color:var(--fg2)"></span>
+      </div>
+      <div id="anch-modal-error" style="margin-top:8px;color:var(--red)"></div>
+    `;
+  } else if (!data.last_successful_anchor) {
+    action.innerHTML = `
+      <h3>${esc(ANCH_STRINGS.state_c_title)}</h3>
+      <p>${esc(ANCH_STRINGS.state_c_body)}</p>
+      <div style="margin-top:16px">
+        <button onclick="unregisterNodeOnChain()" style="background:transparent;border:1px solid var(--border);color:var(--fg2);padding:6px 12px;border-radius:4px;font-size:0.85em;cursor:pointer">${esc(ANCH_STRINGS.btn_unregister)}</button>
+      </div>
+    `;
+  } else {
+    action.innerHTML = `
+      <h3 style="color:var(--green)">${esc(ANCH_STRINGS.state_d_title)}</h3>
+      <p>${esc(ANCH_STRINGS.state_d_body)}</p>
+      <div style="margin-top:16px">
+        <button onclick="unregisterNodeOnChain()" style="background:transparent;border:1px solid var(--border);color:var(--fg2);padding:6px 12px;border-radius:4px;font-size:0.85em;cursor:pointer">${esc(ANCH_STRINGS.btn_unregister)}</button>
+      </div>
+    `;
+  }
+}
+
+function toggleAnchoringInfo() {
+  const body = document.getElementById('anchoring-info-body');
+  const arrow = document.getElementById('anchoring-info-arrow');
+  if (body.style.display === 'none') {
+    body.style.display = '';
+    arrow.textContent = '▼';
+  } else {
+    body.style.display = 'none';
+    arrow.textContent = '▶';
+  }
+}
+
+function copyAnchorWallet() {
+  const w = document.getElementById('anch-wallet').textContent;
+  if (w && w !== '--') navigator.clipboard.writeText(w).catch(() => {});
+}
+
+// Register node — builds + signs + broadcasts via Klever extension,
+// then polls /admin/node/registration until status flips. Hard-fails
+// if the extension wallet doesn't match the node's anchorer wallet
+// (spec 12 §4.3 step 2 — never offer "register anyway").
+async function registerNodeOnChain() {
+  const setStatus = (msg) => { const el = document.getElementById('anch-modal-status'); if (el) el.textContent = msg; };
+  const setError = (msg) => { const el = document.getElementById('anch-modal-error'); if (el) el.innerHTML = msg; };
+  setError('');
+  setStatus('Connecting to wallet…');
+
+  // SC invocation requires the desktop extension's `kleverWeb`
+  // (build/sign/broadcast surface). The mobile `window.klever` provider
+  // doesn't expose buildTransaction in compatible form. Refuse rather
+  // than half-attempt — a confusing "build failed" diagnostic during a
+  // 100 KLV TX flow is the wrong UX.
+  if (!window.kleverWeb) {
+    setStatus('');
+    setError(window.klever
+      ? 'Node registration requires the Klever <strong>desktop extension</strong>. The mobile in-app browser does not expose the smart-contract signing API in a compatible form. Please open this dashboard in a desktop browser with the Klever extension installed.'
+      : esc(ANCH_STRINGS.err_no_ext));
+    return;
+  }
+
+  let walletAddress;
+  try {
+    await window.kleverWeb.initialize();
+    walletAddress = await window.kleverWeb.getWalletAddress();
+  } catch (e) {
+    setStatus(''); setError(esc(ANCH_STRINGS.err_locked)); return;
+  }
+  if (!walletAddress || !walletAddress.startsWith('klv1')) {
+    setStatus(''); setError(esc(ANCH_STRINGS.err_addr_invalid)); return;
+  }
+
+  // HARD GUARD — no "register anyway" path. Wrong wallet would
+  // register a different address than the one this node anchors with,
+  // leaving the node still unregistered after a paid TX.
+  if (walletAddress !== anchState.wallet) {
+    setStatus('');
+    setError(ANCH_STRINGS.err_wallet_mismatch(walletAddress, anchState.wallet));
+    return;
+  }
+
+  setStatus('Building transaction…');
+  const feeRaw = Number(anchState.fee_klv_raw) || 0;
+  const contract = {
+    type: 7,                       // Klever extension SDK: SmartContract type
+    scType: 0,                     // 0 = invoke
+    address: anchState.contract_address,
+    callValue: { KLV: feeRaw },
+    data: ['registerNode'],        // no args
+  };
+
+  let tx;
+  try {
+    tx = await window.kleverWeb.buildTransaction([contract]);
+  } catch (e) {
+    // Some extension versions accept a single contract object; retry.
+    try {
+      tx = await window.kleverWeb.buildTransaction(contract);
+    } catch (e2) {
+      setStatus('');
+      setError(esc(ANCH_STRINGS.err_build_fail) + ' ' + esc(e2.message || e2));
+      return;
+    }
+  }
+
+  setStatus('Sign in your Klever wallet…');
+  let signed;
+  try {
+    signed = await window.kleverWeb.signTransaction(tx);
+  } catch (e) {
+    setStatus('');
+    setError(esc(ANCH_STRINGS.err_sign_fail) + ' ' + esc(e.message || e));
+    return;
+  }
+
+  setStatus('Broadcasting…');
+  let broadcastResult;
+  try {
+    broadcastResult = await window.kleverWeb.broadcastTransactions([signed]);
+  } catch (e) {
+    setStatus('');
+    setError(esc(ANCH_STRINGS.err_broadcast_fail) + ' ' + esc(e.message || e));
+    return;
+  }
+  // Only trust hash shapes from the broadcast response — the signed
+  // object's `.hash` field is not a stable Klever extension contract
+  // and varies by SDK version.
+  const txHash = broadcastResult?.data?.txsHashes?.[0]
+    || broadcastResult?.txsHashes?.[0]
+    || '';
+
+  setStatus(`Broadcast (tx: ${txHash.slice(0, 10)}…). Waiting for on-chain confirmation…`);
+
+  // Poll every 3s for up to 60s — same cadence as spec §4.3 step 5.
+  for (let i = 0; i < 20; i++) {
+    await new Promise(r => setTimeout(r, 3000));
+    try {
+      const r = await fetch('/admin/node/registration');
+      if (r.ok) {
+        const d = await r.json();
+        if (d.registered === true) {
+          anchState = d;
+          setStatus('');
+          setError('');
+          renderAnchoring(d);
+          return;
+        }
+      }
+    } catch (_) { /* keep polling */ }
+  }
+  setStatus('');
+  setError(esc(ANCH_STRINGS.err_timeout) + (txHash ? ` (tx: <code>${esc(txHash)}</code>)` : ''));
+}
+
+// Unregister — typed-confirmation gate, then same signing flow.
+async function unregisterNodeOnChain() {
+  if (!anchState || !anchState.wallet) return;
+  const typed = window.prompt(
+    `Type the node's klv1 address to confirm unregistration:\n\n${anchState.wallet}\n\nThis cannot be undone except by re-registering and paying the fee again.`,
+    ''
+  );
+  if (typed !== anchState.wallet) {
+    if (typed !== null) alert('Address did not match. Unregistration cancelled.');
+    return;
+  }
+
+  if (!window.kleverWeb) {
+    alert(window.klever
+      ? 'Unregistration requires the Klever desktop extension (the mobile provider does not expose smart-contract signing). Cancelled.'
+      : ANCH_STRINGS.err_no_ext);
+    return;
+  }
+  try {
+    await window.kleverWeb.initialize();
+    const walletAddress = await window.kleverWeb.getWalletAddress();
+    if (walletAddress !== anchState.wallet) {
+      alert(`Wallet mismatch: extension is ${walletAddress}, node is ${anchState.wallet}. Cancelled.`);
+      return;
+    }
+    const contract = {
+      type: 7,
+      scType: 0,
+      address: anchState.contract_address,
+      callValue: { KLV: 0 },
+      data: ['unregisterNode'],
+    };
+    let tx;
+    try { tx = await window.kleverWeb.buildTransaction([contract]); }
+    catch (_) { tx = await window.kleverWeb.buildTransaction(contract); }
+    const signed = await window.kleverWeb.signTransaction(tx);
+    await window.kleverWeb.broadcastTransactions([signed]);
+    alert('Unregistration broadcast. Status will update on next refresh.');
+    setTimeout(loadAnchoring, 5000);
+  } catch (e) {
+    alert('Unregistration failed: ' + (e.message || e));
+  }
+}
 
 // ─── Auth / Session ─────────────────────────────────────────────────
 let sessionToken = null;

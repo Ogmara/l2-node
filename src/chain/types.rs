@@ -50,6 +50,12 @@ pub enum ScEvent {
         channel_count: u32,
         user_count: u32,
         node_id: String,
+        /// klv1... address of the wallet that signed the `anchorState`
+        /// TX. In SC v0.3.0+ this is also surfaced as an indexed event
+        /// topic; the chain scanner reads it from the TX `sender` since
+        /// they are the same value (caller == anchorer) and the scanner
+        /// here parses call data, not event topics.
+        anchorer: String,
         timestamp: u64,
     },
     TipSent {
@@ -127,6 +133,12 @@ pub struct StateAnchorRecord {
     pub channel_count: u32,
     pub user_count: u32,
     pub node_id: String,
+    /// klv1... wallet that submitted this anchor (added in v0.43.0 to
+    /// support per-anchorer attribution alongside the SC v0.3.0 quorum
+    /// model). Older records persisted before the upgrade may carry
+    /// an empty string here — readers must handle that case.
+    #[serde(default)]
+    pub anchorer: String,
     pub anchored_at: u64,
 }
 
