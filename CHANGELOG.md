@@ -5,6 +5,54 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.44.1] - 2026-05-16
+
+Hotfix: `chain/sc_views::vm_query_multi` (formerly `vm_hex_call_multi`)
+now uses the correct Klever RPC endpoint for `MultiValueEncoded<...>`
+view returns. Discovered during the SC v0.4.0 testnet bake-in (see
+[docs/testing/v0.4.0-bake-in-runbook.md](../docs/testing/v0.4.0-bake-in-runbook.md)
+Test 2 diagnostic).
+
+### Fixed
+- `getActiveNodes`, `getNodeMetadata` (and any other `MultiValueEncoded`
+  view) now decode their full return payload. Previously they silently
+  returned an empty result because:
+  - The helper called `/vm/hex`, which truncates multi-value returns to
+    the first emitted ManagedBuffer's bytes (only correct for scalar
+    single-value views).
+  - The response parser then looked for `.data.data` as a JSON array
+    and got a string, falling through to `unwrap_or_default()` → empty.
+  - End effect: `sc_discovery::fan_out_once` saw zero candidates
+    regardless of registry size; `getNodeMetadata` returned an empty
+    list for every operator regardless of publication state.
+- New endpoint: `/vm/query`. Returns `data.data.returnData` as an array
+  of base64-encoded byte strings (one per emitted value, with
+  zero-length payloads encoded as empty strings — preserved as empty
+  `Vec<u8>` on the consumer side).
+- Helper renamed `vm_hex_call_multi` → `vm_query_multi`; response type
+  renamed `VmHexMultiResponse` → `VmQueryMultiResponse`; `items` field
+  type changed `Vec<String>` (hex-encoded) → `Vec<Vec<u8>>` (raw bytes).
+- New decode helper `decode_u64_be_bytes(&[u8]) -> u64` for u64 values
+  consumed from `vm_query_multi`. Existing `decode_u64_be(&str) -> u64`
+  stays for `/vm/hex` scalar callers.
+- Surfaces SC `require!` failures via `returnCode` + `returnMessage`
+  in the inner JSON; previously only top-level `.error` was checked.
+
+### Tested
+- `getActiveNodes` curl against testnet SC v0.4.0 returns 8 entries
+  (4 with non-zero `lastAnchorAt`, 4 with zero — matches the bake-in
+  test wallet state at the time of patching).
+
+### Notes for operators
+- **No SC change required** — SC v0.4.0 was correct all along. Only
+  the l2-node consumer was hitting the wrong endpoint. Restart the
+  l2-node after upgrading the binary; sc_discovery will pick up the
+  fix on its next refresh tick (≤ 1h) or immediately on cold-start.
+- After restart, expect to see `sc_discovery: persisted N multiaddrs
+  from SC registry` in the logs (where N > 0 if any registered
+  operator has published metadata), followed by the
+  `bootstrap_sc_fallback_used` info alert.
+
 ## [0.44.0] - 2026-05-16
 
 Spec 12 Phase 2 consumer-side integration + spec 13 on-chain peer
