@@ -5,6 +5,28 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.43.3] - 2026-05-16
+
+UX fix for operators authorized under the pre-v0.3.0 contract.
+
+The dashboard previously showed "Already registered" + an Unregister
+button for operators in the SC's deprecated `authorized_anchorer`
+allowlist, because the `isNodeRegistered` view OR's the two registries
+together. Clicking Unregister then VMUserError'd with "Not registered"
+because `unregisterNode` only manages the v0.3+ map. Confusing.
+
+### Added
+- **`registration_source`** field on `/admin/node/registration`: one of `"v3"` (in the permissionless v0.3+ registry), `"legacy"` (only in the deprecated `authorized_anchorer` allowlist, carried over from the pre-v0.3 contract state), or `"none"` (not registered anywhere). Derived from `isNodeRegistered` + `getNodeRegisteredAt` (5th view call, added concurrent to the existing 4 via `tokio::join!`).
+- **`registered_at`** field — unix timestamp from `getNodeRegisteredAt`, or `null` if not in the v0.3+ registry.
+- **Dashboard State B′** ("Legacy authorization detected"). Renders when `registration_source === 'legacy'`. Suppresses the broken Unregister button and offers a **Migrate to v0.3 registry** button that runs the same `registerNode` flow — after migration the operator is in BOTH registries, can self-unregister, and gains the full v0.3+ UX. Existing legacy anchoring keeps working throughout.
+
+### Changed
+- Dashboard state machine now branches on `registration_source` (with inline fallback derivation for forward-compat with cached-JS-against-newer-backend deployments).
+
+### Operator notes
+- If you see State B′ in the dashboard: your address is in the legacy allowlist (most likely transferred from the pre-v0.3 contract state). The migrate button is the recommended path — one TX to add yourself to the v0.3+ registry, then full self-service.
+- If you want to fully remove a legacy entry without migrating, the contract owner runs: `koperator sc invoke <addr> removeAnchorer --args address:klv1... -k <owner_pem> -n https://node.testnet.klever.org --await -s`.
+
 ## [0.43.2] - 2026-05-16
 
 Second hotfix to v0.43.0 — the dashboard's `kleverWeb.buildTransaction`

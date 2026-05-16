@@ -647,6 +647,18 @@ const ANCH_STRINGS = {
   state_a_title: 'Anchoring is disabled',
   state_a_body: 'Set <code>[anchoring] enabled = true</code> in your node config to start participating in the network truth layer. No on-chain action available from here.',
   state_b_title: 'Register your node on-chain to start anchoring',
+  state_b_prime_title: 'Legacy authorization detected — migration recommended',
+  state_b_prime_body: (wallet) =>
+    `Your address (<code>${esc(wallet)}</code>) is in the contract's pre-v0.3 ` +
+    `<code>authorized_anchorer</code> allowlist, not in the new permissionless registry. ` +
+    `Anchoring already works (your submissions count toward quorum), but you can't ` +
+    `<em>self-unregister</em> from this dashboard — only the contract owner can remove ` +
+    `legacy allowlist entries (via <code>removeAnchorer</code>).` +
+    `<br><br>To gain self-service control, click <strong>Migrate</strong> below — ` +
+    `this calls <code>registerNode</code> from your anchorer wallet, adding you to ` +
+    `the v0.3+ registry alongside your existing legacy entry. After migration the ` +
+    `Unregister button works normally.`,
+  btn_migrate: 'Migrate to v0.3 registry',
   state_b_body: (fee) => {
     // Render in a way that doesn't read as broken when the contract
     // owner hasn't set a fee yet (most fresh deploys), and that
@@ -738,11 +750,36 @@ function renderAnchoring(data) {
     document.getElementById('anch-last').textContent = ANCH_STRINGS.last_none;
   }
 
-  // Action area — state machine
+  // Action area — state machine.
+  // v0.43.3: branch on registration_source so legacy-only operators
+  // see the migrate path (State B′) instead of a broken Unregister
+  // button that would VMUserError with "Not registered" from the SC.
+  //
+  // Fallback resolves the source from `registered + registered_at`
+  // when `registration_source` is missing (new-JS + old-backend mix).
+  // If `registered_at` is also missing (truly old backend), default
+  // to 'v3' to preserve the pre-v0.43.3 behavior (Unregister button
+  // visible) — its failure mode is the same VMUserError the operator
+  // saw before, no regression vs. that legacy baseline.
+  const source = data.registration_source
+    || (data.registered_at !== undefined
+        ? (data.registered_at ? 'v3' : 'legacy')
+        : (data.registered ? 'v3' : 'none'));
+
   const action = document.getElementById('anch-action');
   if (data.anchoring_configured === false) {
     action.innerHTML = `<h3>${esc(ANCH_STRINGS.state_a_title)}</h3><p>${ANCH_STRINGS.state_a_body}</p>`;
-  } else if (!data.registered) {
+  } else if (source === 'legacy') {
+    action.innerHTML = `
+      <h3 style="color:var(--yellow)">${esc(ANCH_STRINGS.state_b_prime_title)}</h3>
+      <p style="margin-top:8px;line-height:1.5">${ANCH_STRINGS.state_b_prime_body(data.wallet)}</p>
+      <div style="margin-top:16px">
+        <button class="login-btn" onclick="registerNodeOnChain()">${esc(ANCH_STRINGS.btn_migrate)}</button>
+        <span id="anch-modal-status" style="margin-left:12px;color:var(--fg2)"></span>
+      </div>
+      <div id="anch-modal-error" style="margin-top:8px;color:var(--red)"></div>
+    `;
+  } else if (source === 'none') {
     action.innerHTML = `
       <h3>${esc(ANCH_STRINGS.state_b_title)}</h3>
       <p style="margin-top:8px">${ANCH_STRINGS.state_b_body(data.fee_klv)}</p>
@@ -753,6 +790,7 @@ function renderAnchoring(data) {
       <div id="anch-modal-error" style="margin-top:8px;color:var(--red)"></div>
     `;
   } else if (!data.last_successful_anchor) {
+    // source === 'v3', no anchors yet
     action.innerHTML = `
       <h3>${esc(ANCH_STRINGS.state_c_title)}</h3>
       <p>${esc(ANCH_STRINGS.state_c_body)}</p>
@@ -761,6 +799,7 @@ function renderAnchoring(data) {
       </div>
     `;
   } else {
+    // source === 'v3', active
     action.innerHTML = `
       <h3 style="color:var(--green)">${esc(ANCH_STRINGS.state_d_title)}</h3>
       <p>${esc(ANCH_STRINGS.state_d_body)}</p>
