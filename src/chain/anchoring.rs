@@ -10,6 +10,9 @@
 //! 3. Sign raw hash bytes with Ed25519
 //! 4. Broadcast via POST /transaction/broadcast
 
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -24,6 +27,30 @@ use crate::crypto::signing;
 use crate::storage::rocks::Storage;
 use crate::storage::schema::state_keys;
 
+/// A submission this node made that has not yet been observed reaching
+/// (or failing to reach) canonical status on-chain. The divergence
+/// watcher walks this list every `DIVERGENCE_CHECK_INTERVAL` and
+/// resolves each entry by querying `getCanonicalAnchor(height)`.
+#[derive(Debug, Clone)]
+struct PendingSubmission {
+    block_height: u64,
+    our_root: String,
+}
+
+/// Cap on `pending_submissions` size — bounds memory under sustained
+/// Klever RPC failure. Each entry is ~80 bytes; 100 entries ≈ 8 KB.
+/// At a 1-hour anchor interval that's ~4 days of unresolved
+/// submissions before the oldest get dropped (logged at warn).
+const MAX_PENDING_SUBMISSIONS: usize = 100;
+
+/// How often the divergence watcher walks `pending_submissions` and
+/// queries `getCanonicalAnchor` for each. 5 minutes is well below
+/// the default 1-hour anchor interval, fast enough that an alert
+/// fires within a few minutes of a real divergence, and slow enough
+/// that the Klever RPC load is bounded (~12 walks/hour × ≤ 100
+/// entries = ≤ 1200 view calls/hour worst-case per node).
+const DIVERGENCE_CHECK_INTERVAL: Duration = Duration::from_secs(300);
+
 /// Background service that anchors L2 state to the Klever blockchain.
 pub struct StateAnchorer {
     klever: KleverConfig,
@@ -34,16 +61,39 @@ pub struct StateAnchorer {
     node_id: String,
     sender_address: String,
     consecutive_failures: u32,
+    /// Submissions awaiting on-chain canonical resolution. Pushed by
+    /// `perform_anchor` on success; drained by `check_divergence`
+    /// each `DIVERGENCE_CHECK_INTERVAL` tick. Capped to
+    /// `MAX_PENDING_SUBMISSIONS` so a long Klever outage doesn't
+    /// inflate node memory — oldest entries dropped with a warn.
+    pending_submissions: VecDeque<PendingSubmission>,
+    /// Consecutive canonicalized heights at which our submitted root
+    /// disagreed with the on-chain canonical root (spec 12 §6.1).
+    /// Shared with `AppState` and `MetricsCollector` so the alert
+    /// engine can fire `anchor_divergence` when this crosses
+    /// `anchor_divergence_consecutive`.
+    divergence_counter: Arc<AtomicU32>,
+    /// Lifetime count of our submissions that reached canonical
+    /// status with a matching root. Process-local; resets across
+    /// restarts. Exposed via `/admin/node/registration`'s
+    /// `canonical_count` field.
+    canonical_counter: Arc<AtomicU64>,
 }
 
 impl StateAnchorer {
     /// Create a new state anchorer.
+    ///
+    /// `divergence_counter` and `canonical_counter` are typically
+    /// cloned from `AppState` so the metrics collector and admin
+    /// endpoint observe the same values the watcher writes.
     pub fn new(
         klever: KleverConfig,
         config: AnchoringConfig,
         storage: Storage,
         signing_key: SigningKey,
         node_id: String,
+        divergence_counter: Arc<AtomicU32>,
+        canonical_counter: Arc<AtomicU64>,
     ) -> Result<Self> {
         let sender_address = crypto::pubkey_to_address(&signing_key.verifying_key())
             .map_err(|e| anyhow::anyhow!("computing anchor wallet address: {}", e))?;
@@ -60,6 +110,9 @@ impl StateAnchorer {
             node_id,
             sender_address,
             consecutive_failures: 0,
+            pending_submissions: VecDeque::new(),
+            divergence_counter,
+            canonical_counter,
         })
     }
 
@@ -108,6 +161,16 @@ impl StateAnchorer {
         // Skip the first immediate tick — let the node settle before first anchor
         interval.tick().await;
 
+        // Independent divergence-watcher tick. Compares our recent
+        // submissions against `getCanonicalAnchor` once each height
+        // has had time to canonicalize. Runs more frequently than the
+        // anchor interval so the `anchor_divergence` alert can fire
+        // within a few minutes of a real divergence (spec 12 §6.1).
+        let mut divergence_check = tokio::time::interval(DIVERGENCE_CHECK_INTERVAL);
+        // Skip the first immediate tick — let the node anchor at least
+        // once before we start asking the chain for canonical roots.
+        divergence_check.tick().await;
+
         loop {
             tokio::select! {
                 _ = interval.tick() => {
@@ -129,12 +192,82 @@ impl StateAnchorer {
                         }
                     }
                 }
+                _ = divergence_check.tick() => {
+                    self.check_divergence().await;
+                }
                 _ = shutdown_rx.recv() => {
                     info!("State anchorer shutting down");
                     break;
                 }
             }
         }
+    }
+
+    /// Walk `pending_submissions` and resolve each entry against
+    /// `getCanonicalAnchor(height)`:
+    ///   - Match → reset `divergence_counter` to 0, bump `canonical_counter`, drop entry.
+    ///   - Divergence → bump `divergence_counter`, log warn, drop entry.
+    ///   - Not yet canonical (Ok(None)) → keep entry for the next tick.
+    ///   - Transport error → keep entry, log debug.
+    ///
+    /// The divergence counter tracks **consecutive** canonicalized
+    /// heights at which our root disagreed — so a single match resets
+    /// the streak. Matches the spec 10 §9.2 alert semantics
+    /// (`anchor_divergence_consecutive`).
+    async fn check_divergence(&mut self) {
+        if self.pending_submissions.is_empty() {
+            return;
+        }
+        // Drain into a new deque, push-back the ones we keep.
+        let drained: Vec<PendingSubmission> = self.pending_submissions.drain(..).collect();
+        let mut keep: VecDeque<PendingSubmission> = VecDeque::with_capacity(drained.len());
+        for sub in drained {
+            match crate::chain::sc_views::get_canonical_anchor(
+                &self.http,
+                &self.klever.node_url,
+                &self.klever.contract_address,
+                sub.block_height,
+            )
+            .await
+            {
+                Ok(Some(canonical)) => {
+                    if canonical.eq_ignore_ascii_case(&sub.our_root) {
+                        // Reset the consecutive-divergence streak; bump
+                        // the lifetime canonical counter.
+                        self.divergence_counter.store(0, Ordering::Relaxed);
+                        self.canonical_counter.fetch_add(1, Ordering::Relaxed);
+                        info!(
+                            block_height = sub.block_height,
+                            "Anchor canonicalized — our root matches"
+                        );
+                    } else {
+                        let consecutive =
+                            self.divergence_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                        warn!(
+                            block_height = sub.block_height,
+                            ours = %sub.our_root,
+                            canonical = %canonical,
+                            consecutive,
+                            "ANCHOR DIVERGENCE: local root differs from on-chain canonical"
+                        );
+                    }
+                    // Either way: this height has a definitive answer. Drop.
+                }
+                Ok(None) => {
+                    // Not yet canonicalized; keep waiting.
+                    keep.push_back(sub);
+                }
+                Err(e) => {
+                    debug!(
+                        error = %e,
+                        block_height = sub.block_height,
+                        "getCanonicalAnchor failed; will retry on next divergence-check tick"
+                    );
+                    keep.push_back(sub);
+                }
+            }
+        }
+        self.pending_submissions = keep;
     }
 
     /// Wait until the node's anchorer wallet is registered on-chain
@@ -230,7 +363,10 @@ impl StateAnchorer {
     }
 
     /// Perform a single state anchor: compute root, build TX, sign, broadcast.
-    async fn perform_anchor(&self) -> Result<String> {
+    /// On success the (block_height, our_root) tuple is pushed onto
+    /// `pending_submissions` so the divergence watcher can later
+    /// resolve it against the on-chain canonical anchor.
+    async fn perform_anchor(&mut self) -> Result<String> {
         // Step 1: Compute state root (blocking operation — iterate RocksDB)
         let storage = self.storage.clone();
         let (state_root, message_count, channel_count, user_count) =
@@ -380,6 +516,24 @@ impl StateAnchorer {
             user_count,
             "State anchor broadcast"
         );
+
+        // Record submission for the divergence watcher. Capped to
+        // MAX_PENDING_SUBMISSIONS so a long Klever RPC outage doesn't
+        // inflate node memory — oldest entries dropped with a warn so
+        // the operator notices their pending queue is overflowing.
+        self.pending_submissions.push_back(PendingSubmission {
+            block_height,
+            our_root: state_root_hex.clone(),
+        });
+        while self.pending_submissions.len() > MAX_PENDING_SUBMISSIONS {
+            if let Some(dropped) = self.pending_submissions.pop_front() {
+                warn!(
+                    dropped_height = dropped.block_height,
+                    pending_size = self.pending_submissions.len(),
+                    "Divergence-watcher pending queue overflow — Klever RPC has been unreachable for a long time; oldest submission dropped (will not be checked for canonical agreement)"
+                );
+            }
+        }
 
         Ok(tx_hash_hex.to_string())
     }
@@ -533,6 +687,8 @@ mod tests {
             storage,
             signing_key,
             "TestNode123".to_string(),
+            std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         )
         .unwrap();
 

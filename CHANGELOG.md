@@ -5,6 +5,42 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.43.4] - 2026-05-16
+
+Completes the v0.43.0 scaffold — `anchor_divergence` alert is now
+**live**, and `/admin/node/registration` reports real local
+`anchor_count` / `canonical_count`. Originally slotted as v0.43.1 in
+spec 12 §5.2; the three intervening patches (.1 network routing,
+.2 buildTransaction shape, .3 State B′) all consumed earlier
+PATCH slots first.
+
+### Added
+- **`StateAnchorer::check_divergence`** — background watcher built into the existing anchor loop. Every 5 minutes (independent tick alongside the anchor interval) walks the node's pending-submission queue and resolves each entry by querying `getCanonicalAnchor(height)`:
+  - **Match** → reset consecutive-divergence counter to 0, bump lifetime canonical counter, drop entry.
+  - **Divergence** → bump consecutive counter, log warn, drop entry.
+  - **Not yet canonical** → keep entry for the next tick.
+  - **RPC error** → keep entry, log debug, retry next tick.
+- **`StateAnchorer.pending_submissions: VecDeque<PendingSubmission>`** capped at `MAX_PENDING_SUBMISSIONS = 100` (≈4 days at the default 1h anchor interval). Overflow drops oldest with a warn so the operator notices a long Klever RPC outage.
+- **Shared counters** plumbed via `Arc<AtomicU32>` / `Arc<AtomicU64>`:
+  - `AppState.anchor_divergence_counter` — consecutive divergences (alert-driving).
+  - `AppState.anchor_canonical_counter` — process-local lifetime canonical matches.
+  - Both written by the StateAnchorer, read by the MetricsCollector (divergence into snapshot) and the admin endpoint (canonical into JSON).
+- **`/admin/node/registration`** `anchor_count` field now populated from `Storage::get_self_anchor_status(node_id)` (RocksDB scan of `ANCHOR_BY_NODE`). Null on storage error, not zero — so the dashboard doesn't misreport on a transient failure.
+- **`/admin/node/registration`** `canonical_count` field now populated from the shared `Arc<AtomicU64>` counter. Resets across node restarts — process-local by design; documented in spec 12 §3.2.
+
+### Changed
+- `MetricsSnapshot.anchor_divergence_count` is now live (was always 0 in v0.43.0–v0.43.3 scaffolding). The `anchor_divergence` alert will actually fire when the counter crosses `anchor_divergence_consecutive` (default 2).
+- `StateAnchorer::new` signature gains two `Arc` parameters for the shared counters. Internal callers (node.rs startup, in-file test) updated. No public API change beyond the constructor.
+- `perform_anchor` is now `&mut self` (was `&self`) so it can push to `pending_submissions` on success — no behavioral change in the TX flow, just lets the watcher see what we anchored.
+
+### Security
+- Divergence watcher closes the spec 12 §6.1 alert loop — wrong-root quorum (3 colluding anchorers forging a canonical root) is now detectable by every honest node, surfaced as `anchor_divergence` critical alert. Mitigation remains off-chain (operator inspection); slashing is still future work.
+- Pending-submission queue cap means a sustained Klever RPC outage cannot inflate node memory unboundedly.
+
+### Operator notes
+- The default 5-minute divergence-check cadence means the alert fires within ~5 min of a real divergence — fast enough for operator response, slow enough that Klever RPC load stays bounded (≤ 1200 view calls/hour per node worst-case).
+- `canonical_count` resets to 0 on each node restart. If you want a persistent counter, scrape the dashboard JSON to your own time-series store. Cross-restart persistence is deferred — process-local was the simpler honest implementation.
+
 ## [0.43.3] - 2026-05-16
 
 UX fix for operators authorized under the pre-v0.3.0 contract.

@@ -231,14 +231,12 @@ impl AlertEngine {
         // Anchor divergence — local state root drifted from quorum
         // canonical for ≥ N consecutive heights (spec 12 §6.1).
         //
-        // v0.43.0 SCAFFOLDING: the alert TYPE, severity, threshold, and
-        // taxonomy (spec 10 §9.2) are wired here so the system honors
-        // the alert contract today. The COUNTER (`snap.anchor_divergence_count`)
-        // is currently always zero — live divergence detection (a
-        // dedicated background task that compares submitted roots
-        // against `getCanonicalAnchor` once each height has had time
-        // to canonicalize) lands in v0.43.1. Until then this branch
-        // is dormant by construction.
+        // Live as of v0.43.4: `StateAnchorer::check_divergence` walks
+        // its pending-submission queue every 5 minutes, querying
+        // `getCanonicalAnchor` for each height; on mismatch it bumps
+        // the divergence counter (shared via Arc<AtomicU32>), on
+        // match it resets the counter. MetricsCollector reads the
+        // counter into `snap.anchor_divergence_count` per snapshot.
         if divergence_threshold > 0
             && snap.anchor_divergence_count >= divergence_threshold
         {
