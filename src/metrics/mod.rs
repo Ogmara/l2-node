@@ -85,8 +85,10 @@ pub struct MetricsSnapshot {
     /// reaches `anchor_divergence_consecutive` triggers the
     /// `anchor_divergence` alert.
     ///
-    /// v0.43.0 SCAFFOLDING: always zero. Live counter lands in v0.43.1
-    /// when the dedicated divergence-watcher task is plumbed.
+    /// v0.43.4+: live. Written by `StateAnchorer::check_divergence`
+    /// every 5 minutes (resolving pending submissions against
+    /// `getCanonicalAnchor`); read by `MetricsCollector` into each
+    /// snapshot, then by the alert engine.
     pub anchor_divergence_count: u32,
 }
 
@@ -129,6 +131,12 @@ pub struct MetricsCollector {
     node_address: String,
     /// HTTP client for Klever API queries.
     http: reqwest::Client,
+    /// Consecutive anchor-divergence counter (spec 12 §6.1).
+    /// Shared with `StateAnchorer` (writer) and `AppState` (reader
+    /// via the admin endpoint). Read into `MetricsSnapshot` so the
+    /// alert engine can fire `anchor_divergence` when the count
+    /// crosses `anchor_divergence_consecutive`.
+    anchor_divergence_counter: Arc<AtomicU32>,
 
     // Internal state
     system_collector: SystemCollector,
@@ -154,6 +162,7 @@ impl MetricsCollector {
         node_id: String,
         klever_api_url: String,
         node_address: String,
+        anchor_divergence_counter: Arc<AtomicU32>,
     ) -> Self {
         // Clamp capacity: min 60 (1 hour), max 10080 (1 week at 1-min resolution)
         let capacity = (config.history_capacity as usize).clamp(60, 10080);
@@ -170,6 +179,7 @@ impl MetricsCollector {
                 .timeout(std::time::Duration::from_secs(10))
                 .build()
                 .unwrap_or_default(),
+            anchor_divergence_counter,
             system_collector: SystemCollector::new(data_dir),
             prev_counter_snapshot: CounterSnapshot::default(),
             prev_counter_time: Instant::now(),
@@ -297,9 +307,11 @@ impl MetricsCollector {
             last_anchor_age_seconds: anchor_age,
             total_anchors: ss.total_anchors,
             wallet_balance_klv: self.wallet_balance,
-            // v0.43.0 scaffolding — see MetricsSnapshot doc-comment.
-            // Updated by the divergence-watcher task in v0.43.1.
-            anchor_divergence_count: 0,
+            // Live (v0.43.4+) — `StateAnchorer::check_divergence` writes
+            // this every 5 minutes; we read it for the alert engine.
+            anchor_divergence_count: self
+                .anchor_divergence_counter
+                .load(Ordering::Relaxed),
         };
 
         if let Ok(mut latest) = self.latest.write() {

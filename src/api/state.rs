@@ -1,7 +1,7 @@
 //! Shared application state for the API layer.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
@@ -217,9 +217,29 @@ pub struct AppState {
     /// alongside the implicit loopback trust. Arc'd because handlers
     /// hold cheap clones.
     pub trusted_proxies: Arc<TrustedProxies>,
+    /// Consecutive canonicalized heights at which our submitted root
+    /// disagreed with the on-chain canonical root (spec 12 §6.1).
+    /// Reset to 0 on every match; reaching `anchor_divergence_consecutive`
+    /// trips the `anchor_divergence` alert. Written by the divergence
+    /// watcher in `chain::anchoring::StateAnchorer::check_divergence`,
+    /// read by both the metrics collector (into `MetricsSnapshot`) and
+    /// the admin registration endpoint.
+    pub anchor_divergence_counter: Arc<AtomicU32>,
+    /// Lifetime count of our submissions that reached canonical
+    /// (quorum-confirmed) status. Increments per match observed by
+    /// the divergence watcher. Resets across node restarts —
+    /// process-local counter, not persisted.
+    pub anchor_canonical_counter: Arc<AtomicU64>,
 }
 
 impl AppState {
+    /// Simplified test constructor. **Production goes through
+    /// `with_broadcast`** because that's where the StateAnchorer and
+    /// MetricsCollector get clones of the same shared counters / channels.
+    /// Anchor-divergence and canonical counters created here are
+    /// process-local to the returned AppState — writers (StateAnchorer,
+    /// not constructed by this fn) won't share them, so the dashboard
+    /// will always read 0. Fine for tests; do not use in production.
     pub fn new(
         storage: Storage,
         router: MessageRouter,
@@ -239,6 +259,8 @@ impl AppState {
         let metrics_latest = Arc::new(RwLock::new(MetricsSnapshot::default()));
         let metrics_history = Arc::new(RwLock::new(RingBuffer::new(1440)));
         let alert_history = Arc::new(RwLock::new(std::collections::VecDeque::new()));
+        let anchor_divergence_counter = Arc::new(AtomicU32::new(0));
+        let anchor_canonical_counter = Arc::new(AtomicU64::new(0));
         Self::with_broadcast(
             storage,
             router,
@@ -264,6 +286,8 @@ impl AppState {
             Arc::new(RwLock::new(None)), // snapshot cache — empty in tests
             MediaTuning::default(),
             Arc::new(TrustedProxies::default()),
+            anchor_divergence_counter,
+            anchor_canonical_counter,
         )
     }
 
@@ -297,6 +321,8 @@ impl AppState {
         snapshot_cache: crate::network::snapshot::SharedSnapshotCache,
         media_tuning: MediaTuning,
         trusted_proxies: Arc<TrustedProxies>,
+        anchor_divergence_counter: Arc<AtomicU32>,
+        anchor_canonical_counter: Arc<AtomicU64>,
     ) -> Self {
         // moka LRU with size-weighted eviction. `weigher` returns the
         // byte count of each value's body (content-type string is
@@ -354,6 +380,8 @@ impl AppState {
             media_limiter,
             media_cache_item_bytes: media_tuning.cache_item_bytes,
             trusted_proxies,
+            anchor_divergence_counter,
+            anchor_canonical_counter,
         }
     }
 

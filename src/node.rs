@@ -515,12 +515,25 @@ impl Node {
             });
         }
 
+        // Shared anchor-divergence + canonical counters. Written by
+        // `StateAnchorer::check_divergence`, read by `MetricsCollector`
+        // (for the `anchor_divergence` alert) and by `AppState` (for
+        // the `/admin/node/registration` admin endpoint). Spec 12 §6.1
+        // — process-local counters; reset across node restarts is
+        // intentional and documented.
+        let anchor_divergence_counter =
+            std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let anchor_canonical_counter =
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
         // Start state anchorer (if enabled)
         let anchor_trigger_tx = if self.config.anchoring.enabled {
             let anchor_klever = self.config.klever.clone();
             let anchor_config = self.config.anchoring.clone();
             let anchor_storage = self.storage.clone();
             let anchor_node_id = self.node_id.clone();
+            let anchor_divergence_for_task = anchor_divergence_counter.clone();
+            let anchor_canonical_for_task = anchor_canonical_counter.clone();
 
             // Resolve wallet key: env var > config file > node identity key
             let wallet_key_hex = std::env::var("OGMARA_ANCHOR_WALLET_KEY")
@@ -550,6 +563,8 @@ impl Node {
                     anchor_storage,
                     anchor_key,
                     anchor_node_id,
+                    anchor_divergence_for_task,
+                    anchor_canonical_for_task,
                 ) {
                     Ok(mut anchorer) => anchorer.run(anchor_shutdown_rx, trigger_rx).await,
                     Err(e) => warn!(error = %e, "Failed to start state anchorer"),
@@ -623,6 +638,7 @@ impl Node {
             self.node_id.clone(),
             self.config.klever.api_url.clone(),
             node_address.clone(),
+            anchor_divergence_counter.clone(),
         );
         let metrics_latest = metrics_collector.latest_handle();
         let metrics_history = metrics_collector.history_handle();
@@ -712,6 +728,8 @@ impl Node {
             snapshot_cache.clone(),
             media_tuning,
             trusted_proxies,
+            anchor_divergence_counter,
+            anchor_canonical_counter,
         ));
         // Background sweep: drop zero-counter entries from the per-IP
         // media limiter (v0.41). Without this, the DashMap accumulates

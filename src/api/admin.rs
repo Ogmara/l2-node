@@ -219,6 +219,23 @@ pub async fn node_registration(
         .storage
         .get_stat(crate::storage::schema::state_keys::LAST_ANCHOR_TS)
         .unwrap_or(0);
+    // v0.43.4: anchor_count is the count of submissions this node has
+    // made (from the chain scanner's index by our node_id). Falls back
+    // to null on storage error rather than 0 so the dashboard doesn't
+    // misreport "0 anchors" when the lookup failed.
+    let anchor_count = state
+        .storage
+        .get_self_anchor_status(&state.node_id)
+        .ok()
+        .map(|s| serde_json::Value::from(s.total_anchors))
+        .unwrap_or(serde_json::Value::Null);
+    // v0.43.4: canonical_count is the process-local count of our
+    // submissions that reached canonical (quorum-confirmed) status,
+    // written by the divergence watcher (StateAnchorer::check_divergence).
+    // Resets across restarts — that's intentional and documented.
+    let canonical_count = state
+        .anchor_canonical_counter
+        .load(std::sync::atomic::Ordering::Relaxed);
 
     Json(serde_json::json!({
         "wallet": wallet,
@@ -240,12 +257,14 @@ pub async fn node_registration(
         "network_node_count": network_node_count,
         "last_canonical_height": last_canonical_height,
         "quorum_min": 3,
-        // anchor_count / canonical_count are local stats derived from
-        // RocksDB scans; v0.43 reports `null` placeholders because we
-        // haven't yet plumbed a per-anchorer counter through the
-        // scanner. The dashboard handles `null` by hiding the field.
-        "anchor_count": serde_json::Value::Null,
-        "canonical_count": serde_json::Value::Null,
+        // v0.43.4+: live local stats.
+        // anchor_count: total submissions this node has made (from the
+        // chain scanner's per-node index). null on storage error.
+        // canonical_count: process-local count of our submissions that
+        // reached canonical (quorum-confirmed) status. Resets across
+        // node restarts; documented in spec 12 §3.2.
+        "anchor_count": anchor_count,
+        "canonical_count": canonical_count,
         "last_successful_anchor": if last_anchor_ts > 0 {
             serde_json::Value::Number(last_anchor_ts.into())
         } else {
