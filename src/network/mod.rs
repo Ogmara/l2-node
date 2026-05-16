@@ -15,8 +15,8 @@ pub mod snapshot;
 pub mod snapshot_client;
 pub mod sync;
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -108,6 +108,28 @@ pub struct NetworkService {
     /// Outstanding outbound snapshot requests awaiting a response.
     pending_snapshot_requests:
         HashMap<libp2p::request_response::OutboundRequestId, tokio::sync::oneshot::Sender<SnapshotClientResult>>,
+    /// Successful-Identify counter (spec 13 §4.3 stall trigger).
+    /// Incremented every time we accept an Identify::Received event
+    /// from a peer with our network protocol. Shared with
+    /// `sc_discovery::ScDiscovery::run` so its 60s post-startup check
+    /// can detect total isolation (zero peers identified ⇒ tier 1 +
+    /// tier 2 came up empty ⇒ fire SC fan-out).
+    identify_success_count: Arc<AtomicU64>,
+    /// Snapshot of peer IDs present in `PEER_DIRECTORY` at startup —
+    /// used to classify Identify::Received events as `book` tier
+    /// (spec 13 §4.1). Not updated after startup: peers persisted
+    /// later in the session were not "from the book" on this startup,
+    /// they came from whichever tier produced their first dial.
+    startup_book_peer_ids: HashSet<PeerId>,
+    /// Peer IDs extracted from `[network] bootstrap_nodes` config —
+    /// used to classify Identify::Received events as `config` tier.
+    config_peer_ids: HashSet<PeerId>,
+    /// Peer IDs that `sc_discovery::ScDiscovery::persist_multiaddr`
+    /// has written to `PEER_DIRECTORY` this session. Cross-task
+    /// shared so the Identify handler can classify them as `sc` tier
+    /// (spec 13 §4.1 / §4.3). Population happens in sc_discovery, so
+    /// the lock is acquired only briefly (HashSet insert / contains).
+    sc_added_peer_ids: Arc<RwLock<HashSet<PeerId>>>,
 }
 
 /// Result delivered back to the snapshot client for one outbound request.
@@ -157,6 +179,8 @@ impl NetworkService {
         counters: Arc<NetworkCounters>,
         snapshot_cache: SharedSnapshotCache,
         snapshot_client_rx: tokio::sync::mpsc::UnboundedReceiver<SnapshotClientCommand>,
+        identify_success_count: Arc<AtomicU64>,
+        sc_added_peer_ids: Arc<RwLock<HashSet<PeerId>>>,
     ) -> Result<Self> {
         let mut swarm = behaviour::build_swarm(config, keypair)
             .context("building libp2p swarm")?;
@@ -189,8 +213,12 @@ impl NetworkService {
             "Network listening"
         );
 
-        // Connect to bootstrap nodes and add them to Kademlia
+        // Connect to bootstrap nodes and add them to Kademlia.
+        // Peer IDs are accumulated into `config_peer_ids` for spec 13
+        // §4.1 discovery-source classification — any Identify::Received
+        // matching one of these PeerIds is tagged `config` tier.
         let mut bootstrap_addrs = Vec::new();
+        let mut config_peer_ids: HashSet<PeerId> = HashSet::new();
         for addr_str in &config.network.bootstrap_nodes {
             match addr_str.parse::<Multiaddr>() {
                 Ok(addr) => {
@@ -214,6 +242,7 @@ impl NetworkService {
                             .behaviour_mut()
                             .kademlia
                             .add_address(&pid, transport_addr);
+                        config_peer_ids.insert(pid);
                     }
 
                     if let Err(e) = swarm.dial(addr.clone()) {
@@ -228,6 +257,32 @@ impl NetworkService {
                 }
             }
         }
+
+        // Snapshot PEER_DIRECTORY peer IDs for the `book` discovery-source
+        // tier (spec 13 §4.1). One-shot at startup — peers persisted later
+        // by sc_discovery this session do NOT belong to the book tier;
+        // they belong to whichever tier put them there. Bounded by
+        // PEER_DIRECTORY's own 256-entry cap so the HashSet stays small.
+        let startup_book_peer_ids: HashSet<PeerId> = storage
+            .prefix_iter_cf(
+                crate::storage::schema::cf::PEER_DIRECTORY,
+                b"pa:",
+                256,
+            )
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(k, _v)| {
+                // Key format: `pa:<peer_id_str>`. Strip prefix and parse.
+                let suffix = k.strip_prefix(b"pa:")?;
+                let s = std::str::from_utf8(suffix).ok()?;
+                s.parse::<PeerId>().ok()
+            })
+            .collect();
+        debug!(
+            count = startup_book_peer_ids.len(),
+            config_count = config_peer_ids.len(),
+            "Discovery-source snapshots captured (spec 13 §4.1)"
+        );
 
         // Create topic manager and subscribe to default topics
         let mut topics = TopicManager::new(config.network_id());
@@ -268,7 +323,42 @@ impl NetworkService {
             snapshot_chunk_semaphore,
             snapshot_client_rx,
             pending_snapshot_requests: HashMap::new(),
+            identify_success_count,
+            startup_book_peer_ids,
+            config_peer_ids,
+            sc_added_peer_ids,
         })
+    }
+
+    /// Classify a connected peer by which bootstrap tier dialed it
+    /// this session (spec 13 §4.1).
+    ///
+    /// Precedence — `config` > `book` > `sc` > `runtime`. Reasoning:
+    ///   - `config` is the operator's explicit intent and the most
+    ///     stable label across sessions; surface it when it applies.
+    ///   - `book` is historical (carried over from a prior session);
+    ///     preferred over sc when both apply because the book
+    ///     supplied a working entry first.
+    ///   - `sc` is the on-chain fallback for this session.
+    ///   - `runtime` covers everything else (DHT, mDNS, inbound).
+    fn classify_discovery_source(&self, peer_id: &PeerId) -> crate::api::state::DiscoverySource {
+        use crate::api::state::DiscoverySource;
+        if self.config_peer_ids.contains(peer_id) {
+            return DiscoverySource::Config;
+        }
+        if self.startup_book_peer_ids.contains(peer_id) {
+            return DiscoverySource::Book;
+        }
+        // sc_added_peer_ids is shared with sc_discovery — read lock is
+        // held only for the contains() call. Lock poisoning is
+        // tolerated by falling through to runtime; corruption-free
+        // operation of this set is not a correctness requirement.
+        if let Ok(sc_set) = self.sc_added_peer_ids.read() {
+            if sc_set.contains(peer_id) {
+                return DiscoverySource::Sc;
+            }
+        }
+        DiscoverySource::Runtime
     }
 
     /// Get the local peer ID.
@@ -518,6 +608,11 @@ impl NetworkService {
                     listen_addrs = info.listen_addrs.len(),
                     "Identified Ogmara peer"
                 );
+                // Spec 13 §4.3 stall-trigger signal: every successful
+                // Ogmara Identify bumps this counter, which sc_discovery
+                // reads at +60s post-startup. Zero ⇒ we are isolated
+                // (tier 1 + 2 produced nothing) ⇒ fire SC fan-out.
+                self.identify_success_count.fetch_add(1, Ordering::Relaxed);
 
                 // Add identified peer's addresses to Kademlia and store the
                 // first address for reconnection after disconnect.
@@ -551,6 +646,9 @@ impl NetworkService {
                     let hash = Sha256::digest(ed25519_pk.to_bytes());
                     let node_id = bs58::encode(&hash[..20]).into_string();
                     self.peer_node_ids.insert(peer_id, node_id.clone());
+                    // Spec 13 §4.1 — classify which bootstrap tier
+                    // produced this peer's dial chain this session.
+                    let source = self.classify_discovery_source(&peer_id);
                     // Note: do not hold this lock across .await points
                     match self.connected_peers.write() {
                         Ok(mut peers) => {
@@ -562,6 +660,7 @@ impl NetworkService {
                                     } else {
                                         agent_ver
                                     },
+                                    source,
                                 });
                             }
                         }

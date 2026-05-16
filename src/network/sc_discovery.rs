@@ -46,10 +46,12 @@
 //! At realistic scale (≤ 100 registered nodes, 1h cadence) total view-
 //! call load is ≤ ~200 calls/hour, well within Klever RPC budgets.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use libp2p::Multiaddr;
+use libp2p::{Multiaddr, PeerId};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info, warn};
 
@@ -69,13 +71,23 @@ pub const BOOTSTRAP_SC_REFRESH_INTERVAL: Duration = Duration::from_secs(3600);
 /// book can hold.
 pub const MAX_SC_DISCOVERY_TOTAL: usize = 256;
 
-/// Filter cutoff for `lastAnchorAt` — addresses that haven't anchored
-/// within this window are skipped. Matches spec 13 §7 default.
-pub const PEER_STALENESS_THRESHOLD: Duration = Duration::from_secs(7 * 24 * 3600);
+/// Filter cutoff for `lastAnchorAt` when no operator config is supplied —
+/// addresses that haven't anchored within this window are skipped.
+/// Matches spec 13 §7 default. Production callers should always pass
+/// `[network.discovery] max_peer_staleness_days` through to
+/// `ScDiscovery::new` so operators can tune it.
+pub const DEFAULT_PEER_STALENESS_THRESHOLD: Duration = Duration::from_secs(7 * 24 * 3600);
 
 /// Page size for `getActiveNodes` — must match the SC's
 /// `GET_ACTIVE_NODES_MAX_LIMIT = 64`.
 const PAGE_SIZE: u32 = 64;
+
+/// Spec 13 §4.3 stall trigger window. If no successful Identify from
+/// tier 1 / tier 2 fires within this window, sc_discovery runs an
+/// out-of-cycle fan-out to recover from total isolation (stale book +
+/// dead bootstrap seeds — the post-2026-05-16 testnet failure mode the
+/// resilience pack is designed for).
+pub const STALL_TRIGGER_WINDOW: Duration = Duration::from_secs(60);
 
 /// Key prefix for persisted peer addresses in `PEER_DIRECTORY`.
 /// **Must match** `NetworkService::PEER_ADDR_PREFIX` — keep these two
@@ -107,6 +119,23 @@ pub struct ScDiscovery {
     /// startup keeps the alert from spamming once steady-state
     /// operation kicks in.
     fallback_alert_fired: bool,
+    /// Shared counter incremented by `NetworkService` on every
+    /// successful Identify::Received event. Read once at
+    /// `STALL_TRIGGER_WINDOW` post-startup to decide whether tier 1 +
+    /// tier 2 produced any peers; zero ⇒ fire SC fan-out (spec 13
+    /// §4.3 stall trigger).
+    identify_success_count: Arc<AtomicU64>,
+    /// Cross-task shared set of PeerIds this task has persisted to
+    /// `PEER_DIRECTORY` this session — used by `NetworkService` to
+    /// classify the corresponding Identify::Received events as `sc`
+    /// tier (spec 13 §4.1). Push-only here; NetworkService reads it
+    /// under a brief read-lock.
+    sc_added_peer_ids: Arc<RwLock<HashSet<PeerId>>>,
+    /// Spec 13 §7 staleness cutoff — entries older than this in seconds
+    /// are filtered out. Mirrors `AppState::max_peer_staleness_secs` so
+    /// `sc_discovery` and `bootstrap-candidates` agree on the cutoff
+    /// (Spec Compliance gap #3).
+    peer_staleness_secs: u64,
 }
 
 impl ScDiscovery {
@@ -117,6 +146,9 @@ impl ScDiscovery {
         self_address: String,
         reconnect_trigger_tx: mpsc::Sender<()>,
         alert_event_tx: Option<AlertEventSender>,
+        identify_success_count: Arc<AtomicU64>,
+        sc_added_peer_ids: Arc<RwLock<HashSet<PeerId>>>,
+        peer_staleness_secs: u64,
     ) -> anyhow::Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
@@ -130,6 +162,9 @@ impl ScDiscovery {
             reconnect_trigger_tx,
             alert_event_tx,
             fallback_alert_fired: false,
+            identify_success_count,
+            sc_added_peer_ids,
+            peer_staleness_secs,
         })
     }
 
@@ -148,7 +183,7 @@ impl ScDiscovery {
         info!(
             contract = %self.contract_address,
             refresh_interval_secs = BOOTSTRAP_SC_REFRESH_INTERVAL.as_secs(),
-            staleness_threshold_days = PEER_STALENESS_THRESHOLD.as_secs() / 86400,
+            staleness_threshold_days = self.peer_staleness_secs / 86400,
             "sc_discovery started (spec 13 §4.3 tier 3)"
         );
 
@@ -190,10 +225,51 @@ impl ScDiscovery {
         // above OR deliberately skipped it; either way, don't double-fire.
         interval.tick().await;
 
+        // Spec 13 §4.3 third trigger: 60s post-startup, if tier 1 +
+        // tier 2 have produced zero successful Identify events, fire
+        // an out-of-cycle fan-out. The cold-start branch above handles
+        // an empty book; the stall trigger handles the harder case
+        // where the book has entries but every one of them is stale /
+        // unreachable (the failure mode the spec calls out as the
+        // motivation for this whole resilience pack).
+        let stall_check = tokio::time::sleep(STALL_TRIGGER_WINDOW);
+        tokio::pin!(stall_check);
+        let mut stall_check_done = false;
+
         loop {
             tokio::select! {
                 _ = interval.tick() => {
                     self.fan_out_once().await;
+                }
+                _ = &mut stall_check, if !stall_check_done => {
+                    stall_check_done = true;
+                    // Spec 13 §4.3 third trigger fires unless we have a
+                    // robust set of peers identified. A single Identify
+                    // is NOT enough — a hostile peer that completes
+                    // Identify quickly could otherwise suppress the
+                    // fallback indefinitely and pin the node in a
+                    // 1-peer partition with itself (Security Audit W1).
+                    // 2 is the smallest threshold that defeats a
+                    // single-attacker suppression and still avoids
+                    // false positives on legitimate sparse-network
+                    // bootstraps (where 2+ peers in 60s is normal).
+                    const STALL_MIN_IDENTIFIES: u64 = 2;
+                    let identifies = self.identify_success_count.load(Ordering::Relaxed);
+                    if identifies < STALL_MIN_IDENTIFIES {
+                        info!(
+                            identifies,
+                            min_identifies = STALL_MIN_IDENTIFIES,
+                            window_secs = STALL_TRIGGER_WINDOW.as_secs(),
+                            "sc_discovery: stall trigger — insufficient Identify events from \
+                             tiers 1+2 within window, firing SC fan-out"
+                        );
+                        self.fan_out_once().await;
+                    } else {
+                        debug!(
+                            identifies,
+                            "sc_discovery: stall check OK, tiers 1+2 produced peers"
+                        );
+                    }
                 }
                 _ = shutdown_rx.recv() => {
                     debug!("sc_discovery shutting down");
@@ -217,7 +293,7 @@ impl ScDiscovery {
                 return;
             }
         };
-        let staleness_cutoff = now.saturating_sub(PEER_STALENESS_THRESHOLD.as_secs());
+        let staleness_cutoff = now.saturating_sub(self.peer_staleness_secs);
 
         // Paginate getActiveNodes. Cap total across all pages at
         // MAX_SC_DISCOVERY_TOTAL to stay within the peer book's own
@@ -467,6 +543,15 @@ impl ScDiscovery {
                 "sc_discovery: failed to persist multiaddr"
             );
             return false;
+        }
+
+        // Spec 13 §4.1 — mark this PeerId as `sc` tier so the next
+        // Identify event NetworkService observes for it can be
+        // classified correctly. Lock contention is negligible: this
+        // task writes a few hundred entries per startup at most, and
+        // the read side touches the set once per Identify.
+        if let Ok(mut set) = self.sc_added_peer_ids.write() {
+            set.insert(peer_id);
         }
         true
     }

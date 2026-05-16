@@ -5,6 +5,139 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.45.0] - 2026-05-16
+
+Network-resilience operator surface (spec 12 Phase 2 + spec 13).
+Bundles every consumer-side feature of the resilience pack that SC
+v0.4.0 introduced: dashboard pause/resume, on-chain metadata
+publication, sc_discovery stall trigger, discovery-source tracking,
+and a new public `bootstrap-candidates` REST endpoint for SDK clients
+and new nodes.
+
+This release fulfills the four CHANGELOG-flagged deferred items from
+v0.44.0 ("Known Limitations" + "Deferred to 0.45.0"): stall trigger,
+discovery-source map, bootstrap-candidates REST, and metadata
+publication. Also adds the v0.45.0 row of spec 12 §5.2 — the first
+node-side SC-signing path (SIGTERM `pauseNode`) is opt-in and
+security-audited.
+
+### Added
+- `[anchoring.metadata]` config block (spec 12 §2.10):
+  - `publish` (bool, default false). Opt-in flag.
+  - `multiaddrs` (list, default empty). When empty + `publish = true`,
+    auto-derives `/dns4/<host>/tcp/<listen_port>` (or `/ip4/…`) from
+    `[api] public_url` + `[network] listen_port`.
+- `[anchoring] pause_on_shutdown` (bool, default false; spec 13 §6.3).
+  When enabled together with `wallet_key`, the SIGTERM handler signs
+  + broadcasts a `pauseNode` TX before exit. Bounded 45s shutdown
+  window in `Node::run` so the pause TX gets time to broadcast
+  (covers the 4-step Klever RPC chain — nonce, send, decode,
+  broadcast — each with a 15s reqwest timeout). First node-side
+  SC-signing path — `submit_pause_for_shutdown` reuses the same
+  signed-invoke pipeline as `perform_anchor` (extracted into a
+  shared `submit_signed_sc_invoke` helper). SIGTERM-initiated pauses
+  always carry the fixed reason `"graceful-shutdown"` so consumers
+  can distinguish auto-pauses from operator-initiated ones.
+- `[network.discovery] max_peer_staleness_days` (default 7; spec 13
+  §7). Drops `getActiveNodes` candidates older than this from the
+  dial set and the `bootstrap-candidates` response.
+- SIGTERM signal handler in `Node::run` (Unix only). Previously only
+  SIGINT/Ctrl+C triggered graceful shutdown; systemd / docker stop
+  send SIGTERM, so the prior code path skipped the graceful pause
+  flow entirely.
+- New admin endpoints (calldata-returning; dashboard signs via the
+  Klever extension, the node never sees a private key):
+  - `GET  /admin/node/metadata` — publish state, configured vs
+    effective vs on-chain multiaddrs, in-sync indicator,
+    pre-built `setNodeMetadata` / `unsetNodeMetadata` calldata.
+  - `GET  /admin/node/pause-status` — live `isNodePaused`,
+    pause-on-shutdown config, wallet-key-configured flag, pause +
+    resume calldata.
+  - `POST /admin/node/pause` — returns `pauseNode` calldata.
+  - `POST /admin/node/resume` — returns `resumeNode` calldata.
+- New public REST endpoint (spec 13 §4.5):
+  - `GET /api/v1/network/discovery/bootstrap-candidates` — paginated
+    SC-derived bootstrap candidates with their multiaddrs +
+    last-anchor timestamps, sorted by recency. 5-minute cache,
+    no-auth, `public, max-age=300` for HTTP caches.
+- Discovery-source tracking (spec 13 §4.1):
+  - 4-value `DiscoverySource` enum (`book` / `config` / `sc` /
+    `runtime`) attached to every `ConnectedPeerInfo` at
+    Identify::Received time.
+  - Cross-task `Arc<RwLock<HashSet<PeerId>>>` shared with
+    `sc_discovery::ScDiscovery` so peers it persists this session
+    classify as `sc`.
+  - `/admin/metrics/peers` adds per-row `source` and a `by_source`
+    summary.
+- sc_discovery stall trigger (spec 13 §4.3 third trigger): 60s
+  post-startup, if `NetworkService` has observed zero successful
+  Identify events, sc_discovery fires an out-of-cycle `fan_out_once`.
+  Counter shared via `Arc<AtomicU64>`.
+- `/admin/node/registration` extended with `divergence_consecutive`,
+  `divergence_escalated`, `divergence_escalated_threshold` so the
+  Anchoring tab's new escalated-divergence panel renders without a
+  second round-trip.
+- Dashboard Anchoring tab — three new sub-sections (spec 12 §4.2
+  update): on-chain metadata card with publish/clear buttons, pause
+  / resume card with state pill and buttons, escalated-divergence
+  panel (hidden unless consecutive > 0 or chain reports escalated
+  for the latest canonical height).
+- Dashboard Network tab — peer-source pill column on the connected
+  peers table + per-tier summary above it.
+
+### Changed
+- `AnchoringConfig.wallet_key` doc-comment notes the on-disk
+  requirement when `pause_on_shutdown = true`.
+
+### Deferred
+- Multi-mirror bootstrap defaults (spec 13 §4.2). `default_bootstrap_nodes()`
+  still returns the single `node.ogmara.org` pair pending the
+  community-mirror peer-ID coordination. Will land in 0.46.0
+  alongside the seed-host launch comms.
+- IPv6 host auto-derivation in `[anchoring.metadata]` (operators on
+  v6-only hosts must set `multiaddrs` explicitly). Tracked for 0.46.0.
+- `bootstrap-candidates` response is **SC-only** in 0.45.0. Spec 13
+  §4.5 mandates a union across tier 1 (peer book), tier 2 (config),
+  and tier 3 (SC). The book + config tiers will be added in 0.46.0
+  once the persisted-peer-book schema gains a stable `peer_id ↔ multiaddr`
+  mapping for export. Workaround: clients fall back to the same
+  `[network] bootstrap_nodes` defaults the node uses.
+- 1-hour `[anchoring.metadata]` reconciliation timer (spec 13 §6.1
+  "compares its desired list against the on-chain `getNodeMetadata`
+  on each startup and on a 1-hour timer"). Dashboard surfaces the
+  diff on every load, but no background task drives auto-republish
+  yet. Tracked for 0.46.0.
+
+### Security
+- `submit_pause_for_shutdown` is the first feature where the node
+  signs a SC TX rather than the dashboard signing client-side. Threat
+  model: the `wallet_key` (configured via `[anchoring] wallet_key` or
+  `OGMARA_ANCHOR_WALLET_KEY`) lives in process memory for the
+  lifetime of `StateAnchorer` — same as the anchor loop — only when
+  `pause_on_shutdown = true`. Operators who want the key scoped to
+  the anchor loop only must keep `pause_on_shutdown = false` (the
+  default). The shutdown invocation carries the fixed reason
+  `"graceful-shutdown"` as the SC's `reason: ManagedBuffer` argument
+  — no caller-provided or attacker-controlled input is signed.
+- **Wallet-key residency:** the local hex-string variable holding
+  the decoded key in `Node::run` is now zeroized after `SigningKey`
+  is derived (was not in 0.44.x). The `self.config.anchoring.wallet_key`
+  source field is still process-resident for the lifetime of the
+  node — operators who require strict secret hygiene should use the
+  `OGMARA_ANCHOR_WALLET_KEY` env var (transient, never read back)
+  rather than the config file. Full `SecretString`-based handling
+  of the `Config` field is tracked for 0.46.0.
+- **sc_discovery stall trigger** requires `>= 2` distinct Identify
+  events within the 60-s window before suppressing the SC fan-out
+  (was: `> 0`). Prevents a single hostile peer that completes
+  Identify quickly from pinning a freshly-started node in a 1-peer
+  adversarial partition with itself (Security Audit W1).
+- **`bootstrap-candidates`** sanitizes SC-returned multiaddrs before
+  emitting (rejects entries > 256 bytes or containing control
+  characters). Defense against a future SC bug or hostile chain
+  returning oversized payloads that downstream SDK consumers might
+  render unsafely.
+
 ## [0.44.1] - 2026-05-16
 
 Hotfix: `chain/sc_views::vm_query_multi` (formerly `vm_hex_call_multi`)

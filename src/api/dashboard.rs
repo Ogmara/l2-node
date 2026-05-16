@@ -233,18 +233,40 @@ pub async fn metrics_history(
 }
 
 /// GET /admin/metrics/peers — detailed connected peers table.
+///
+/// v0.45.0: emits each peer's `source` (spec 13 §4.1 discovery tier
+/// breakdown — `book` / `config` / `sc` / `runtime`) so the Network
+/// tab can render the new peer-source column + per-tier counts.
 pub async fn metrics_peers(
     Extension(state): Extension<Arc<AppState>>,
 ) -> impl IntoResponse {
+    // Aggregated per-tier counters for a small at-a-glance summary
+    // (rendered above the peers table). Same data the per-row column
+    // shows, but pre-aggregated so the dashboard doesn't need to
+    // recount on every render.
+    let mut count_book = 0u32;
+    let mut count_config = 0u32;
+    let mut count_sc = 0u32;
+    let mut count_runtime = 0u32;
     let peers = if let Ok(map) = state.connected_peers.read() {
-        map.iter()
+        use crate::api::state::DiscoverySource;
+        let v: Vec<_> = map
+            .iter()
             .map(|(node_id, info)| {
+                match info.source {
+                    DiscoverySource::Book => count_book += 1,
+                    DiscoverySource::Config => count_config += 1,
+                    DiscoverySource::Sc => count_sc += 1,
+                    DiscoverySource::Runtime => count_runtime += 1,
+                }
                 serde_json::json!({
                     "node_id": node_id,
                     "agent_version": info.agent_version,
+                    "source": info.source,
                 })
             })
-            .collect::<Vec<_>>()
+            .collect();
+        v
     } else {
         Vec::new()
     };
@@ -252,6 +274,12 @@ pub async fn metrics_peers(
     Json(serde_json::json!({
         "peers": peers,
         "total": state.peer_count(),
+        "by_source": {
+            "book": count_book,
+            "config": count_config,
+            "sc": count_sc,
+            "runtime": count_runtime,
+        },
     }))
 }
 
