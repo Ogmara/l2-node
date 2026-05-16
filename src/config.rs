@@ -68,6 +68,9 @@ pub struct NetworkConfig {
     /// If not set, auto-detected from klever.node_url at startup.
     #[serde(default)]
     pub network_id: Option<String>,
+    /// On-chain peer-discovery tuning (spec 13 §7). Added in v0.45.0.
+    #[serde(default)]
+    pub discovery: DiscoveryConfig,
 }
 
 impl Default for NetworkConfig {
@@ -78,8 +81,36 @@ impl Default for NetworkConfig {
             max_peers: default_max_peers(),
             enable_mdns: true,
             network_id: None,
+            discovery: DiscoveryConfig::default(),
         }
     }
+}
+
+/// On-chain peer-discovery tuning. All fields are optional with
+/// spec-aligned defaults; operators only need to override for local
+/// deployments or unusually-tight networks.
+///
+/// Reference: [docs/specs/13-node-discovery.md §7](../../docs/specs/13-node-discovery.md#7-client-side-filtering-rules).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoveryConfig {
+    /// Drop dial-candidate peers whose on-chain `lastAnchorAt` is
+    /// older than this many days. Default 7 (spec 13 §7). Local
+    /// dev/test deployments may want a longer threshold; production-
+    /// facing nodes should stick with the default.
+    #[serde(default = "default_max_peer_staleness_days")]
+    pub max_peer_staleness_days: u32,
+}
+
+impl Default for DiscoveryConfig {
+    fn default() -> Self {
+        Self {
+            max_peer_staleness_days: default_max_peer_staleness_days(),
+        }
+    }
+}
+
+fn default_max_peer_staleness_days() -> u32 {
+    7
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -394,12 +425,31 @@ pub struct AnchoringConfig {
     pub interval_seconds: u64,
     /// Optional: hex-encoded 32-byte Ed25519 private key for the anchor wallet.
     /// If empty, uses the node's identity key. The corresponding klv1... address
-    /// must be authorized on the smart contract via `authorizeAnchorer`.
+    /// must be registered on the smart contract via `registerNode` (spec 12 §2.3).
     ///
     /// **Security:** Prefer using `OGMARA_ANCHOR_WALLET_KEY` environment variable
-    /// instead of putting the key in the config file.
+    /// instead of putting the key in the config file. The key must be on-disk if
+    /// `pause_on_shutdown = true` — the SIGTERM handler signs `pauseNode` from
+    /// this key without operator interaction.
     #[serde(default, skip_serializing)]
     pub wallet_key: String,
+    /// v0.45.0 (spec 13 §6.3): if `true`, the SIGTERM handler signs and
+    /// broadcasts a `pauseNode` TX before exit, signaling to other
+    /// nodes + clients that this anchorer is going offline gracefully.
+    /// Requires `wallet_key` set (env or config) — otherwise the
+    /// handler logs a warn and exits without pausing.
+    ///
+    /// Default false. Enabling this is opt-in because it broadens the
+    /// wallet-key threat surface: instead of the key only being used
+    /// once-per-hour by the anchoring loop, it's also held in process
+    /// memory for shutdown signing. See spec 13 §6.3 wallet-safety
+    /// note + the v0.45.0 security audit.
+    #[serde(default)]
+    pub pause_on_shutdown: bool,
+    /// v0.45.0 (spec 12 §2.10): optional metadata publication for
+    /// on-chain peer discovery (spec 13 §4.3 / §6.1).
+    #[serde(default)]
+    pub metadata: AnchorMetadataConfig,
 }
 
 impl std::fmt::Debug for AnchoringConfig {
@@ -408,6 +458,8 @@ impl std::fmt::Debug for AnchoringConfig {
             .field("enabled", &self.enabled)
             .field("interval_seconds", &self.interval_seconds)
             .field("wallet_key", &if self.wallet_key.is_empty() { "<none>" } else { "<redacted>" })
+            .field("pause_on_shutdown", &self.pause_on_shutdown)
+            .field("metadata", &self.metadata)
             .finish()
     }
 }
@@ -418,8 +470,36 @@ impl Default for AnchoringConfig {
             enabled: false,
             interval_seconds: default_anchor_interval(),
             wallet_key: String::new(),
+            pause_on_shutdown: false,
+            metadata: AnchorMetadataConfig::default(),
         }
     }
+}
+
+/// Optional on-chain metadata publication for the anchorer wallet
+/// (spec 12 §2.10 `setNodeMetadata`).
+///
+/// Opt-in (`publish = false` by default) because spec 13 §6.2 treats
+/// non-publication as a first-class operator profile — operators can
+/// register + anchor without ever appearing in `getActiveNodes` for
+/// privacy / regulatory-resilience reasons.
+///
+/// When `publish = true` and `multiaddrs = []`, the node auto-derives
+/// a multiaddr from `[network] listen_port` + `[api] public_url` so
+/// the operator doesn't have to hand-construct the string. Operators
+/// with non-trivial topology (NAT, anonymizer front, onion) set
+/// `multiaddrs` explicitly instead.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AnchorMetadataConfig {
+    /// Opt-in flag. Default false — node anchors silently without
+    /// appearing in `getActiveNodes`.
+    #[serde(default)]
+    pub publish: bool,
+    /// Explicit multiaddr list (≤ 8 entries, each ≤ 256 bytes per
+    /// SC caps). When empty AND `publish = true`, the node
+    /// auto-derives a single multiaddr from `[api] public_url`.
+    #[serde(default)]
+    pub multiaddrs: Vec<String>,
 }
 
 /// Snapshot bootstrap configuration (spec 11-snapshot-sync.md).
