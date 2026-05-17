@@ -5,6 +5,95 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.46.1] - 2026-05-17
+
+Config discoverability + docker bootstrap UX patch. No runtime
+behavior change — `serde(default)` on every field means existing
+configs continue to load identically. Pure operator-UX fix
+surfaced during v0.46.0 release prep: the default config emitted
+by `ogmara-node init` and shipped as `ogmara.example.toml` was
+missing several v0.45.0 / v0.46.0 sections, so operators using
+docker or the `init` subcommand couldn't discover knobs like
+`[anchoring.metadata] publish`, `[api] public_url` (required by
+Phase D IPv6 auto-derive), or `[network.discovery]
+max_peer_staleness_days`.
+
+### Added
+- **`Config::default_toml()` now includes every operator-tunable
+  section** with sample values + inline comments explaining each
+  knob. New sections / fields exposed (all existed in code with
+  defaults; this is pure discoverability):
+  - `[network.discovery] max_peer_staleness_days` (spec 13 §7)
+  - `[ipfs]` media tuning fields: `media_cache_total_mb`,
+    `media_cache_item_mb`, `media_handler_permits`,
+    `media_per_ip_permits`, `media_max_tracked_ips`
+  - `[api] public_url` (commented — operator-specific). Required
+    by `[anchoring.metadata]` auto-derive (spec 13 §6.1). With
+    v0.46.0 Phase D, supports bracketed IPv6 form
+    `http://[2001:db8::1]:41721`.
+  - `[api] trusted_proxies` (commented — reverse-proxy IP
+    resolution per v0.42)
+  - `[anchoring] pause_on_shutdown` (commented — spec 13 §6.3
+    SIGTERM graceful-pause)
+  - `[anchoring.metadata]` block with `publish = false` +
+    `multiaddrs = []` and the auto-derive doc comment
+  - `[alerts.telegram]` / `[alerts.discord]` / `[alerts.webhook]`
+    backend blocks (spec 10 §9.4). Each ships `enabled = false`
+    with commented env-var guidance for the secret field
+    (`$TELEGRAM_BOT_TOKEN`, `$DISCORD_WEBHOOK_URL`) so operators
+    don't accidentally put bot tokens / webhook URLs into the
+    config file. Closes the same discoverability bug class this
+    patch targets (caught by the Code Audit on the first draft).
+- **`ogmara.example.toml` regenerated from `default_toml()`** —
+  195 lines, single source of truth. New test
+  `ogmara_example_toml_matches_default_toml` in `src/config.rs`
+  enforces byte-for-byte equality so future `default_toml()`
+  edits don't silently let the static example file drift.
+  Regenerate when the test fails:
+  `cargo run --release -- init -o ogmara.example.toml`
+- **Docker auto-init entrypoint** (`scripts/docker-entrypoint.sh`):
+  fresh containers without a mounted `ogmara.toml` now auto-run
+  `ogmara-node init --output /etc/ogmara/ogmara.toml` on first
+  start, so operators using the default `docker run ogmara/ogmara:l2-node-0.46.1`
+  invocation get a working starter config without manual setup.
+  Operators mounting their own config via `-v $(pwd)/ogmara.toml:
+  /etc/ogmara/ogmara.toml:ro` see no change.
+- **Two new config discoverability tests** in `src/config.rs`:
+  `default_toml_includes_all_operator_tunable_sections` (every
+  one of 22 `[section]` headers is present, including the new
+  alert backends) and `default_toml_documents_v046_knobs`
+  (sentinel field names are present so a future
+  field-without-default_toml-update fails CI). Catches the exact
+  class of bug this patch fixes.
+
+### Changed
+- **Dockerfile**: `chown` extended to `/etc/ogmara` (was only
+  `/data`) so the auto-init entrypoint can write the config as
+  the `ogmara` user. `ENTRYPOINT` changed to the new
+  `docker-entrypoint.sh` wrapper. Docker run command in the
+  Dockerfile header comment updated for the new auto-init flow.
+- **Docker entrypoint readable-config check**: if a bind-mounted
+  `/etc/ogmara/ogmara.toml` exists but isn't readable by the
+  container's `ogmara` user (common footgun: host file owned by
+  `root:root` without world-readable bit), the entrypoint now
+  exits with a clear "config exists but is not readable by user
+  X (uid N) — chmod a+r ./ogmara.toml on the host" message
+  instead of letting the node fail with an opaque "Permission
+  denied (os error 13)".
+
+### Migration
+- No config-format changes. Existing operators see no behavior
+  change — `serde(default)` on every config field means missing
+  knobs have always loaded with sensible defaults.
+- Operators using docker who relied on the previous fail-on-
+  missing-config behavior should mount their config explicitly:
+  `docker run -v $(pwd)/ogmara.toml:/etc/ogmara/ogmara.toml:ro ...`.
+  Without a mount the entrypoint will now auto-generate a default.
+- Operators wanting to discover the full set of available knobs:
+  run `ogmara-node init -o /tmp/full-config.toml` against this
+  binary OR read the new `ogmara.example.toml` shipped with the
+  release.
+
 ## [0.46.0] - 2026-05-17
 
 Closes the spec 12 §5.x / spec 13 backlog deferred from 0.45.x plus the
