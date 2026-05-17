@@ -261,6 +261,14 @@ td { padding: 8px; border-bottom: 1px solid var(--border); }
          can discover this one via `getActiveNodes`. -->
     <div class="card" id="anch-metadata-card" style="margin-top:16px;display:none">
       <h3>On-chain metadata (peer discovery)</h3>
+      <!-- v0.46.0 — drift banner. Surfaced by the background
+           metadata_reconcile task (spec 13 §6.1) when the on-chain
+           list diverges from the desired list between dashboard
+           page loads. Hidden when in sync. -->
+      <div id="anch-meta-drift-banner" style="display:none;margin-top:8px;padding:8px 12px;background:var(--yellow);color:#000;border-radius:4px;font-size:0.9em">
+        On-chain metadata is out of sync. <strong>Click Publish</strong> below to update.
+        <span id="anch-meta-drift-since" style="margin-left:8px;color:#333;font-size:0.85em"></span>
+      </div>
       <p style="color:var(--fg2);line-height:1.5;margin-top:8px;font-size:0.92em">
         Publish your node's libp2p multiaddrs to the smart contract so
         other nodes can discover this one without relying on a hardcoded
@@ -294,6 +302,18 @@ td { padding: 8px; border-bottom: 1px solid var(--border); }
         <tr><td style="color:var(--fg2);width:230px">Pause on shutdown (config)</td><td id="anch-pause-shutdown">--</td></tr>
         <tr><td style="color:var(--fg2)">Wallet key available</td><td id="anch-pause-wallet-key">--</td></tr>
       </table>
+      <!-- v0.46.0 Phase B3: pause_on_shutdown is read once at startup
+           (cloned into AppState). Operators who toggle it in the
+           config file need a full restart for the change to take
+           effect; until then the in-process snapshot continues to
+           drive the SIGTERM handler. Documented as a UX note here
+           rather than fixed with an Arc<RwLock<Config>> live-reload
+           refactor (plan OPEN 3 resolution 2026-05-17). -->
+      <div style="margin-top:8px;padding:6px 10px;background:var(--bg2);border-left:3px solid var(--yellow);color:var(--fg2);font-size:0.85em;line-height:1.4">
+        Changes to <code>[anchoring] pause_on_shutdown</code> require a
+        full node restart to take effect. The in-process config snapshot
+        is captured at startup.
+      </div>
       <div style="margin-top:12px">
         <button id="anch-pause-btn" onclick="pauseNodeOnChain()" disabled style="background:transparent;border:1px solid var(--yellow);color:var(--yellow);padding:6px 12px;border-radius:4px;font-size:0.85em;cursor:pointer;opacity:0.5">Pause node</button>
         <button id="anch-resume-btn" onclick="resumeNodeOnChain()" disabled style="background:transparent;border:1px solid var(--green);color:var(--green);padding:6px 12px;border-radius:4px;font-size:0.85em;margin-left:8px;cursor:pointer;opacity:0.5">Resume node</button>
@@ -302,18 +322,39 @@ td { padding: 8px; border-bottom: 1px solid var(--border); }
       <div id="anch-pause-error" style="margin-top:8px;color:var(--red)"></div>
     </div>
 
-    <!-- v0.45.0 — Escalated-divergence panel (spec 12 §2.8 / §6.1). -->
-    <div class="card" id="anch-divergence-card" style="margin-top:16px;display:none;border:1px solid var(--yellow)">
-      <h3 style="color:var(--yellow)">Anchor divergence detected</h3>
+    <!-- v0.46.0 — Divergence panel split into two distinct cards
+         (Phase B1 / plan OPEN 5 resolution 2026-05-17). The local
+         card calls out THIS NODE's divergence (second-person voice,
+         gated on consec > 0). The network card surfaces chain-level
+         escalation history at the latest canonical height (neutral
+         voice, gated on divergence_escalated === true) — independent
+         of whether this node contributed to that history. Pre-0.46.0
+         these were collapsed into one card whose framing
+         misattributed chain history to the local node whenever
+         consec=0 && escalated=true. -->
+    <div class="card" id="anch-divergence-local-card" style="margin-top:16px;display:none;border:1px solid var(--yellow)">
+      <h3 style="color:var(--yellow)">Anchor divergence — your node</h3>
       <p style="margin-top:8px;line-height:1.5;font-size:0.92em">
         Your node submitted a state root that disagreed with the chain
         canonical root on one or more recent heights. See the spec 12
-        §6.1 escalation flow.
+        §2.8 escalation flow and §6.1 wrong-root security notes.
       </p>
       <table style="width:100%;margin-top:8px;font-size:0.93em">
         <tr><td style="color:var(--fg2);width:230px">Consecutive divergences</td><td id="anch-div-consecutive">--</td></tr>
-        <tr><td style="color:var(--fg2)">Latest height escalated</td><td id="anch-div-escalated">--</td></tr>
-        <tr><td style="color:var(--fg2)">Escalated threshold</td><td id="anch-div-threshold">--</td></tr>
+      </table>
+    </div>
+
+    <div class="card" id="anch-divergence-network-card" style="margin-top:16px;display:none;border:1px solid var(--yellow)">
+      <h3>Network divergence history <span id="anch-div-net-height" style="color:var(--fg2);font-size:0.7em;font-weight:normal;margin-left:8px"></span></h3>
+      <p style="margin-top:8px;line-height:1.5;font-size:0.92em;color:var(--fg2)">
+        The smart contract reports the latest canonical height is in
+        escalated quorum (spec 12 §2.8). This is a network-level event
+        observed from the chain — it is independent of whether this
+        node contributed to the divergence. Resolution is automatic
+        per the deterministic tiebreak rule (spec 12 §2.9).
+      </p>
+      <table style="width:100%;margin-top:8px;font-size:0.93em">
+        <tr><td style="color:var(--fg2);width:230px">Escalated threshold</td><td id="anch-div-threshold">--</td></tr>
       </table>
     </div>
   </div>
@@ -862,10 +903,52 @@ function renderAnchoringMetadata(data) {
     document.getElementById('anch-meta-sync').innerHTML = '<span style="color:var(--yellow)">no — publish to update</span>';
   }
 
+  // v0.46.0 — surface the background reconciler's drift snapshot.
+  // `drift_detected` is the authoritative signal (it covers cases
+  // where the on-chain list changed between page loads); when the
+  // server reports drift we render the banner above the table even
+  // if `in_sync` is also rendering its yellow "no — publish to
+  // update" text below. Belt + suspenders is intentional: the banner
+  // is more eye-catching for the click-to-fix action.
+  const driftBanner = document.getElementById('anch-meta-drift-banner');
+  if (data.drift_detected === true) {
+    driftBanner.style.display = '';
+    const since = document.getElementById('anch-meta-drift-since');
+    if (typeof data.drift_detected_at === 'number') {
+      const ageSec = Math.max(0, Math.floor(Date.now() / 1000) - data.drift_detected_at);
+      const ageStr = ageSec < 60
+        ? `${ageSec}s ago`
+        : ageSec < 3600
+          ? `${Math.floor(ageSec / 60)}m ago`
+          : `${Math.floor(ageSec / 3600)}h ago`;
+      since.textContent = `(observed ${ageStr})`;
+    } else {
+      since.textContent = '';
+    }
+  } else {
+    driftBanner.style.display = 'none';
+  }
+
   const publishBtn = document.getElementById('anch-meta-publish-btn');
   const clearBtn = document.getElementById('anch-meta-clear-btn');
-  const canPublish = !!data.set_calldata;
+  // Phase B2 (v0.46.0): require BOTH a valid set_calldata AND a
+  // confirmed not-in-sync state before enabling Publish. The
+  // strict `=== false` matters: `null`/`undefined` mean the
+  // on-chain RPC was unavailable, in which case we don't know
+  // whether a publish would be a no-op or a real update, so we
+  // refuse to enable the button (avoid burning operator gas on
+  // a guess). Operator who really wants to force-publish despite
+  // unknown sync state can click after the next dashboard refresh
+  // recovers `in_sync`.
+  const canPublish = !!data.set_calldata && data.in_sync === false;
   const canClear = !!data.clear_calldata;
+  if (data.set_calldata && data.in_sync === true) {
+    publishBtn.title = 'No changes to publish — on-chain list is already in sync.';
+  } else if (data.set_calldata && data.in_sync === null) {
+    publishBtn.title = 'On-chain RPC unavailable — sync state unknown. Refresh to retry.';
+  } else {
+    publishBtn.title = '';
+  }
   publishBtn.disabled = !canPublish;
   publishBtn.style.opacity = canPublish ? '1' : '0.5';
   clearBtn.disabled = !canClear;
@@ -928,29 +1011,46 @@ function renderAnchoringPause(data) {
   resumeBtn.style.opacity = isPaused ? '1' : '0.5';
 }
 
-// v0.45.0 — render the escalated-divergence card. Hidden unless either
-// the local consecutive counter is > 0 OR the chain reports escalated.
+// v0.46.0 — render the divergence panel as two independent cards.
+// Local card: gated on `divergence_consecutive > 0` (this node
+// submitted a disagreeing root). Network card: gated on
+// `divergence_escalated === true` (the chain reports escalation at
+// the latest canonical height — independent of our submissions).
+// Either or both can be visible at once; either or both can be
+// hidden. Phase B1 / plan OPEN 5 resolution 2026-05-17.
 function renderDivergencePanel(data) {
-  const card = document.getElementById('anch-divergence-card');
+  const localCard = document.getElementById('anch-divergence-local-card');
+  const netCard = document.getElementById('anch-divergence-network-card');
   const consec = Number(data.divergence_consecutive || 0);
   const escalated = data.divergence_escalated === true;
-  if (consec === 0 && !escalated) {
-    card.style.display = 'none';
-    return;
-  }
-  card.style.display = '';
-  document.getElementById('anch-div-consecutive').textContent = String(consec);
-  if (data.divergence_escalated === null || data.divergence_escalated === undefined) {
-    document.getElementById('anch-div-escalated').textContent = '— (RPC unavailable)';
+
+  // Local — second-person voice for this node's own behaviour.
+  if (consec > 0) {
+    localCard.style.display = '';
+    document.getElementById('anch-div-consecutive').textContent = String(consec);
   } else {
-    document.getElementById('anch-div-escalated').innerHTML = data.divergence_escalated
-      ? '<span style="color:var(--yellow)">yes</span>'
-      : '<span style="color:var(--fg2)">no</span>';
+    localCard.style.display = 'none';
   }
-  document.getElementById('anch-div-threshold').textContent =
-    (data.divergence_escalated_threshold === null || data.divergence_escalated_threshold === undefined)
-      ? '—'
-      : String(data.divergence_escalated_threshold);
+
+  // Network — neutral voice for chain-state observation. Strict
+  // `=== true` so a null/undefined `divergence_escalated` (RPC
+  // unavailable) doesn't surface the card with an "unknown" state.
+  if (escalated) {
+    netCard.style.display = '';
+    const heightEl = document.getElementById('anch-div-net-height');
+    if (typeof data.last_canonical_height === 'number') {
+      heightEl.textContent = `(height ${data.last_canonical_height})`;
+    } else {
+      heightEl.textContent = '';
+    }
+    document.getElementById('anch-div-threshold').textContent =
+      (data.divergence_escalated_threshold === null
+        || data.divergence_escalated_threshold === undefined)
+        ? '—'
+        : String(data.divergence_escalated_threshold);
+  } else {
+    netCard.style.display = 'none';
+  }
 }
 
 function renderAnchoringError(msg) {

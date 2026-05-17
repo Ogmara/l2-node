@@ -637,16 +637,29 @@ pub async fn network_nodes(
 
 /// GET /api/v1/network/discovery/bootstrap-candidates
 ///
-/// Public, no auth (spec 13 §4.5). Returns the node's current
-/// snapshot of SC-derived bootstrap candidates — clients (SDKs, new
-/// nodes) call this to discover peers without needing to query the
-/// Klever blockchain themselves.
+/// Public, no auth (spec 13 §4.5). Returns the node's union of known
+/// bootstrap candidates across three tiers:
+///   - **tier 1 — peer book** (`PEER_DIRECTORY` CF, persisted peers
+///     dialed in prior sessions). `last_anchor_at` is null — the book
+///     doesn't track anchor recency.
+///   - **tier 2 — config** (`[network] bootstrap_nodes`). Same null
+///     `last_anchor_at` semantics.
+///   - **tier 3 — SC registry** (`getActiveNodes` + `getNodeMetadata`).
+///     `last_anchor_at` is the on-chain timestamp.
 ///
-/// Response is cached for 5 minutes (spec 13 §4.5). Concurrent
-/// regenerations are serialized via an async Mutex so a thundering
-/// herd doesn't trigger N parallel SC RPC bursts.
+/// Dedupes by exact multiaddr string. Collisions across tiers resolved
+/// by: highest `last_anchor_at` wins (null treated as 0); on tie,
+/// SC > book > config (locked v0.46.0 plan OPEN 4 resolution,
+/// 2026-05-17). The winning entry's source label is reported.
+/// Different multiaddrs sharing the same peer_id (TCP + QUIC variants)
+/// are intentionally preserved as separate entries — SDK consumers
+/// want both transports to dial.
 ///
-/// Filters per spec 13 §7:
+/// Response cached for 5 minutes (spec 13 §4.5). Concurrent
+/// regenerations serialized via async Mutex so a thundering herd
+/// doesn't trigger N parallel SC RPC bursts.
+///
+/// Filters per spec 13 §7 (tier 3 only):
 ///   - Skip entries whose `last_anchor_at` is older than
 ///     `[network.discovery] max_peer_staleness_days`.
 ///   - Skip the node's own anchorer address (the caller already knows
@@ -654,8 +667,12 @@ pub async fn network_nodes(
 ///   - Skip entries whose `getNodeMetadata` is empty (privacy profile
 ///     — operator opted out of publication; spec 13 §6).
 ///
-/// Sorted by `last_anchor_at` descending. Tagged `source: "sc"` —
-/// future revisions may add `book`/`config` sources.
+/// Sort: entries with non-null `last_anchor_at` first (desc); then
+/// null entries by source order [book, config]. Capped at 256 total.
+///
+/// When SC is unconfigured or the RPC fan-out fails / times out, tier
+/// 1+2 entries are still emitted with a `source_note` describing the
+/// SC condition; cache TTL drops to 60s for fast recovery.
 pub async fn network_bootstrap_candidates(
     Extension(state): Extension<Arc<AppState>>,
 ) -> impl IntoResponse {
@@ -749,84 +766,227 @@ pub async fn network_bootstrap_candidates(
             .into_response()
     }
 
-    // Surface a degraded payload (still with a fresh `generated_at`)
-    // when the node isn't configured for SC views — saves SDKs from
-    // having to special-case the error path.
-    if state.klever_node_url.is_empty() || state.contract_address.is_empty() {
-        let payload = serde_json::json!({
-            "candidates": [],
-            "generated_at": now_unix,
-            "cache_ttl_seconds": NEGATIVE_CACHE_TTL.as_secs(),
-            "source_note": "this node is not configured to query the on-chain registry",
-        });
-        return cache_and_respond(&state, payload, now_unix, NEGATIVE_CACHE_TTL, max_age_header)
-            .await;
+    // Gather tier 1 (peer book) and tier 2 (config) synchronously —
+    // both are local reads (RocksDB prefix iter, in-memory Vec) and
+    // never need a network RPC. Doing this OUTSIDE the SC timeout
+    // means we always have a useful response even when the on-chain
+    // registry is unreachable (spec 13 §4.5 union requirement).
+    let book = gather_book_candidates(&state);
+    let config = gather_config_candidates(&state);
+
+    // Tier 3 (SC) — wrapped in an outer timeout so a wedged Klever
+    // RPC can't pin the refresh slot for the worst-case ~64 minutes
+    // (256 metadata calls × 15s each; Code Audit W1 + Security Audit
+    // W2 fix). On unconfigured / failure / timeout we still serve
+    // tier 1+2 with a `source_note` describing the SC condition.
+    let (sc, sc_failure_note) = if state.klever_node_url.is_empty()
+        || state.contract_address.is_empty()
+    {
+        (
+            Vec::new(),
+            Some("this node is not configured to query the on-chain registry".to_string()),
+        )
+    } else {
+        match tokio::time::timeout(REFRESH_TIMEOUT, gather_sc_candidates(&state)).await {
+            Ok(Ok(entries)) => (entries, None),
+            Ok(Err(reason)) => {
+                tracing::debug!(reason = %reason, "bootstrap-candidates: SC fan-out failed");
+                (Vec::new(), Some(reason))
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    timeout_secs = REFRESH_TIMEOUT.as_secs(),
+                    "bootstrap-candidates: SC fan-out timed out"
+                );
+                (Vec::new(), Some("refresh budget exceeded".to_string()))
+            }
+        }
+    };
+
+    let candidates = merge_candidates(book, config, sc);
+
+    // Positive TTL when SC contributed; negative TTL when SC was
+    // unavailable so we re-poll soon. Tier 1+2 are stable within
+    // either window — the shorter TTL just speeds SC recovery.
+    let ttl = if sc_failure_note.is_some() {
+        NEGATIVE_CACHE_TTL
+    } else {
+        CACHE_TTL
+    };
+    let mut payload = serde_json::json!({
+        "candidates": candidates,
+        "generated_at": now_unix,
+        "cache_ttl_seconds": ttl.as_secs(),
+    });
+    if let Some(note) = sc_failure_note {
+        payload["source_note"] = serde_json::Value::String(note);
     }
+    cache_and_respond(&state, payload, now_unix, ttl, max_age_header).await
+}
 
-    // Run the SC fan-out inside an outer timeout so a wedged RPC
-    // backend can't pin the refresh slot for the worst-case ~64
-    // minutes (Code Audit W1 + Security Audit W2 fix).
-    let fan_out_result = tokio::time::timeout(
-        REFRESH_TIMEOUT,
-        regenerate_bootstrap_candidates(&state),
-    )
-    .await;
+/// Internal candidate type carried through the merge pipeline. Built
+/// per-tier by the `gather_*_candidates` helpers and turned into JSON
+/// by `merge_candidates` after dedupe + sort + cap.
+#[derive(Debug, Clone)]
+struct CandidateEntry {
+    multiaddr: String,
+    peer_id: Option<String>,
+    last_anchor_at: Option<u64>,
+    /// Tier label — `"book"`, `"config"`, or `"sc"`.
+    source: &'static str,
+    paused: bool,
+    /// Set only for SC-tier entries (the on-chain wallet that
+    /// published the multiaddr). `None` for book/config — those
+    /// tiers carry no wallet binding.
+    owner_address: Option<String>,
+}
 
-    match fan_out_result {
-        Ok(Ok(entries)) => {
-            let payload = serde_json::json!({
-                "candidates": entries,
-                "generated_at": now_unix,
-                "cache_ttl_seconds": CACHE_TTL.as_secs(),
-            });
-            cache_and_respond(&state, payload, now_unix, CACHE_TTL, max_age_header).await
+impl CandidateEntry {
+    fn into_json(self) -> serde_json::Value {
+        let mut v = serde_json::json!({
+            "multiaddr": self.multiaddr,
+            "peer_id": self.peer_id,
+            "last_anchor_at": self.last_anchor_at,
+            "source": self.source,
+            "paused": self.paused,
+        });
+        if let Some(owner) = self.owner_address {
+            v["owner_address"] = serde_json::Value::String(owner);
         }
-        Ok(Err(reason)) => {
-            tracing::debug!(reason = %reason, "bootstrap-candidates: regeneration failed");
-            let payload = serde_json::json!({
-                "candidates": [],
-                "generated_at": now_unix,
-                "cache_ttl_seconds": NEGATIVE_CACHE_TTL.as_secs(),
-                "source_note": reason,
-            });
-            cache_and_respond(&state, payload, now_unix, NEGATIVE_CACHE_TTL, max_age_header).await
-        }
-        Err(_elapsed) => {
-            tracing::warn!(
-                timeout_secs = REFRESH_TIMEOUT.as_secs(),
-                "bootstrap-candidates: refresh timed out — caching negative response"
-            );
-            let payload = serde_json::json!({
-                "candidates": [],
-                "generated_at": now_unix,
-                "cache_ttl_seconds": NEGATIVE_CACHE_TTL.as_secs(),
-                "source_note": "refresh budget exceeded",
-            });
-            cache_and_respond(&state, payload, now_unix, NEGATIVE_CACHE_TTL, max_age_header).await
-        }
+        v
     }
 }
 
-/// Run the SC fan-out for `bootstrap-candidates` and return the JSON
-/// entry list (sorted by `last_anchor_at` desc). Spec 13 §4.5.
+/// Reject multiaddr strings that exceed 256 bytes or contain any
+/// non-printable-ASCII byte. Applied uniformly across all three tiers
+/// — defense against a future SC bug or hostile chain returning
+/// oversized payloads, AND against operator-config typos that smuggle
+/// control characters into the response.
 ///
-/// Separated from the route handler so the outer `tokio::time::timeout`
-/// can bound the wall time without breaking the cache-and-respond
-/// branching. Returns `Err(reason)` for the soft-failure cases the
-/// handler should serialize as `source_note`.
-async fn regenerate_bootstrap_candidates(
+/// The full byte filter (`0x20..=0x7e` only) is intentionally narrower
+/// than just stripping ASCII controls: real libp2p multiaddrs are
+/// ASCII per spec (DNS names use Punycode for IDN, /p2p/ payloads
+/// are base58, /onion3/ is lowercase base32). Permitting bytes ≥ 0x80
+/// would let a hostile SC publish multiaddrs containing bidi-override
+/// / zero-width / RTL marks that render deceptively in operator
+/// dashboards or terminals (Phase A Security Audit N2 v0.46.0).
+fn sanitize_multiaddr_str(s: &str) -> bool {
+    const MAX_MULTIADDR_LEN: usize = 256;
+    s.len() <= MAX_MULTIADDR_LEN && s.bytes().all(|b| (0x20..=0x7e).contains(&b))
+}
+
+/// Extract the `/p2p/<peer_id>` suffix from a multiaddr string, if
+/// parseable. Returns `None` for malformed multiaddrs or those without
+/// a `/p2p/` component (legal but unhelpful for the dedupe key).
+fn extract_peer_id(multiaddr_str: &str) -> Option<String> {
+    multiaddr_str
+        .parse::<libp2p::Multiaddr>()
+        .ok()
+        .and_then(|m| {
+            m.iter().find_map(|p| {
+                if let libp2p::multiaddr::Protocol::P2p(id) = p {
+                    Some(id.to_string())
+                } else {
+                    None
+                }
+            })
+        })
+}
+
+/// Tier 1 — read `PEER_DIRECTORY` (key `pa:<peer_id>` → multiaddr).
+/// Capped at the same 256 as the persistence cap (`network/mod.rs`
+/// `persist_peer_addr`). `last_anchor_at` is always `None` — the book
+/// does not track anchor recency.
+fn gather_book_candidates(state: &Arc<AppState>) -> Vec<CandidateEntry> {
+    const PEER_ADDR_PREFIX: &[u8] = b"pa:";
+    const MAX_BOOK_ENTRIES: usize = 256;
+    let rows = match state.storage.prefix_iter_cf(
+        crate::storage::schema::cf::PEER_DIRECTORY,
+        PEER_ADDR_PREFIX,
+        MAX_BOOK_ENTRIES,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!(error = %e, "bootstrap-candidates: peer-book read failed");
+            return Vec::new();
+        }
+    };
+    let mut out = Vec::with_capacity(rows.len());
+    for (key, value) in rows {
+        // Key shape: `pa:<peer_id_str>`. Strip prefix AND require
+        // the suffix decodes as UTF-8 — both are guaranteed by the
+        // writer (`network/mod.rs::persist_peer_addr`), so a failure
+        // means a corrupt row. Skip entirely rather than emit with
+        // `peer_id: None`, which would silently break the dedupe
+        // contract that callers rely on (Phase A Code Audit W2).
+        let Some(peer_id) = key
+            .strip_prefix(PEER_ADDR_PREFIX)
+            .and_then(|suffix| std::str::from_utf8(suffix).ok())
+            .map(|s| s.to_string())
+        else {
+            continue;
+        };
+        let multiaddr_str = match std::str::from_utf8(&value) {
+            Ok(s) => s.to_string(),
+            Err(_) => continue,
+        };
+        if !sanitize_multiaddr_str(&multiaddr_str) {
+            continue;
+        }
+        out.push(CandidateEntry {
+            multiaddr: multiaddr_str,
+            peer_id: Some(peer_id),
+            last_anchor_at: None,
+            source: "book",
+            paused: false,
+            owner_address: None,
+        });
+    }
+    out
+}
+
+/// Tier 2 — convert `[network] bootstrap_nodes` (snapshotted into
+/// `AppState` at startup) to candidate entries. Multiaddrs without
+/// a parseable `/p2p/` are still emitted so libp2p clients can dial
+/// them; `peer_id` is then `None` (which also disables cross-tier
+/// dedupe for that entry — acceptable because dedupe is by multiaddr
+/// string, not by peer_id).
+///
+/// Capped at 256 entries to mirror the tier-1 cap. Defense against an
+/// operator-misconfig that pastes a 100k-entry list, which would
+/// otherwise push 100k allocations through `merge_candidates` before
+/// the final 256-truncate (Phase A Security Audit W1).
+fn gather_config_candidates(state: &Arc<AppState>) -> Vec<CandidateEntry> {
+    const MAX_CONFIG_ENTRIES: usize = 256;
+    let take = state.bootstrap_nodes.len().min(MAX_CONFIG_ENTRIES);
+    let mut out = Vec::with_capacity(take);
+    for raw in state.bootstrap_nodes.iter().take(MAX_CONFIG_ENTRIES) {
+        if !sanitize_multiaddr_str(raw) {
+            continue;
+        }
+        out.push(CandidateEntry {
+            multiaddr: raw.clone(),
+            peer_id: extract_peer_id(raw),
+            last_anchor_at: None,
+            source: "config",
+            paused: false,
+            owner_address: None,
+        });
+    }
+    out
+}
+
+/// Tier 3 — page `getActiveNodes`, fetch metadata per candidate,
+/// build entries. Returns `Err(reason)` on hard SC failure so the
+/// handler can surface it as `source_note` while still serving tier
+/// 1+2.
+async fn gather_sc_candidates(
     state: &Arc<AppState>,
-) -> Result<Vec<serde_json::Value>, String> {
-    // Page getActiveNodes — same pagination + cap pattern as
-    // sc_discovery::fan_out_once. We don't need the full 256 here
-    // either; clients pick the freshest few, the rest is dead weight.
+) -> Result<Vec<CandidateEntry>, String> {
+    // Same pagination + cap as sc_discovery::fan_out_once.
     const PAGE_SIZE: u32 = 64;
     const MAX_CANDIDATES: usize = 256;
-    // Spec 12 §2.10 cap: 256 bytes per multiaddr entry. Filter
-    // anything larger before publishing into the response — defense
-    // against a future SC bug or an attacker-controlled chain
-    // returning oversized payloads (Security Audit N2).
-    const MAX_MULTIADDR_LEN: usize = 256;
+
     let now_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -864,7 +1024,7 @@ async fn regenerate_bootstrap_candidates(
             Err(e) => {
                 tracing::debug!(
                     error = %e,
-                    "bootstrap-candidates: getActiveNodes failed; returning empty list"
+                    "bootstrap-candidates: getActiveNodes failed"
                 );
                 return Err("on-chain registry temporarily unavailable".to_string());
             }
@@ -880,12 +1040,7 @@ async fn regenerate_bootstrap_candidates(
         .filter(|n| n.last_anchor_at > 0 && n.last_anchor_at >= staleness_cutoff)
         .collect();
 
-    // Fetch metadata per candidate (sequential — same shape as
-    // sc_discovery::fan_out_once). Bounded by MAX_CANDIDATES; under
-    // the steady-state assumption (≤ 100 active nodes) this is one
-    // burst of ≤ 100 RPCs every 5 minutes per asking node, comfortably
-    // within budget.
-    let mut entries: Vec<serde_json::Value> = Vec::with_capacity(candidates.len());
+    let mut entries: Vec<CandidateEntry> = Vec::with_capacity(candidates.len());
     for cand in &candidates {
         let multiaddrs = match crate::chain::sc_views::get_node_metadata(
             http,
@@ -903,56 +1058,89 @@ async fn regenerate_bootstrap_candidates(
             continue;
         }
         for raw_addr in multiaddrs {
-            // Sanitize before emit — reject oversized or control-
-            // character-bearing entries (Security Audit N2). The SC
-            // has a 256-byte per-entry cap but a malicious chain or
-            // a future SC bug could violate it.
-            if raw_addr.len() > MAX_MULTIADDR_LEN
-                || raw_addr.bytes().any(|b| b < 0x20 || b == 0x7f)
-            {
+            if !sanitize_multiaddr_str(&raw_addr) {
                 continue;
             }
-            // Best-effort peer-id extraction so SDK clients can use
-            // the multiaddr without re-parsing. We trust the SC's
-            // string but don't depend on it being parseable —
-            // unparseable entries are still emitted because libp2p
-            // clients may still try to dial them.
-            let peer_id_str = raw_addr
-                .parse::<libp2p::Multiaddr>()
-                .ok()
-                .and_then(|m| {
-                    m.iter().find_map(|p| {
-                        if let libp2p::multiaddr::Protocol::P2p(id) = p {
-                            Some(id.to_string())
-                        } else {
-                            None
-                        }
-                    })
-                });
-            entries.push(serde_json::json!({
-                "multiaddr": raw_addr,
-                "peer_id": peer_id_str,
-                "last_anchor_at": cand.last_anchor_at,
-                "source": "sc",
+            entries.push(CandidateEntry {
+                peer_id: extract_peer_id(&raw_addr),
+                multiaddr: raw_addr,
+                last_anchor_at: Some(cand.last_anchor_at),
+                source: "sc",
                 // getActiveNodes excludes paused entries server-side
                 // (spec 12 §2.10), so we surface a hard false rather
                 // than recheck isNodePaused per candidate.
-                "paused": false,
-                "owner_address": cand.address,
-            }));
+                paused: false,
+                owner_address: Some(cand.address.clone()),
+            });
         }
     }
 
-    // Sort by last_anchor_at desc (spec 13 §4.5). For equal
-    // timestamps, no stable secondary key — operator order is
-    // intentional ambiguity, not a leak vector.
-    entries.sort_by(|a, b| {
-        let ta = a.get("last_anchor_at").and_then(|v| v.as_u64()).unwrap_or(0);
-        let tb = b.get("last_anchor_at").and_then(|v| v.as_u64()).unwrap_or(0);
-        tb.cmp(&ta)
-    });
-
     Ok(entries)
+}
+
+/// Source ranking for tie-break when two entries share an identical
+/// multiaddr AND identical `last_anchor_at` (including both being
+/// `None`/0). Higher rank wins. Locked v0.46.0 plan OPEN 4 resolution
+/// (2026-05-17): SC > book > config.
+fn source_rank(s: &str) -> u8 {
+    match s {
+        "sc" => 2,
+        "book" => 1,
+        "config" => 0,
+        _ => 0,
+    }
+}
+
+/// Merge tier 1/2/3 candidate vectors into the final JSON list.
+///
+/// Dedupe key is the **exact multiaddr string** — a stronger key than
+/// the spec 13 §4.5 model wording "by `(peer_id, transport)`". The
+/// multiaddr embeds both the peer_id (`/p2p/<id>`) and the transport
+/// (`/tcp/<port>` vs `/udp/<port>/quic-v1`), so the full-string key
+/// entails the `(peer_id, transport)` model: TCP+QUIC variants of the
+/// same peer have distinct multiaddrs and survive dedupe, while two
+/// identical multiaddrs collapse. Collisions across tiers resolved
+/// by: higher `last_anchor_at` wins (`None` treated as 0); on tie,
+/// `source_rank` decides (SC > book > config).
+///
+/// Sort: entries with non-null `last_anchor_at` first, descending;
+/// then null entries by `source_rank` descending (book before config)
+/// for a stable, predictable dial order. Capped at 256.
+fn merge_candidates(
+    book: Vec<CandidateEntry>,
+    config: Vec<CandidateEntry>,
+    sc: Vec<CandidateEntry>,
+) -> Vec<serde_json::Value> {
+    const MAX_TOTAL_ENTRIES: usize = 256;
+    use std::collections::HashMap;
+    let mut by_multiaddr: HashMap<String, CandidateEntry> = HashMap::new();
+    for entry in sc.into_iter().chain(book.into_iter()).chain(config.into_iter()) {
+        match by_multiaddr.get(&entry.multiaddr) {
+            None => {
+                by_multiaddr.insert(entry.multiaddr.clone(), entry);
+            }
+            Some(existing) => {
+                let existing_anchor = existing.last_anchor_at.unwrap_or(0);
+                let new_anchor = entry.last_anchor_at.unwrap_or(0);
+                let new_wins = new_anchor > existing_anchor
+                    || (new_anchor == existing_anchor
+                        && source_rank(entry.source) > source_rank(existing.source));
+                if new_wins {
+                    by_multiaddr.insert(entry.multiaddr.clone(), entry);
+                }
+            }
+        }
+    }
+
+    let mut merged: Vec<CandidateEntry> = by_multiaddr.into_values().collect();
+    merged.sort_by(|a, b| match (a.last_anchor_at, b.last_anchor_at) {
+        (Some(ta), Some(tb)) => tb.cmp(&ta),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => source_rank(b.source).cmp(&source_rank(a.source)),
+    });
+    merged.truncate(MAX_TOTAL_ENTRIES);
+    merged.into_iter().map(CandidateEntry::into_json).collect()
 }
 
 /// GET /api/v1/channels
@@ -5557,5 +5745,209 @@ mod media_tests {
             resolve_client_ip(peer, &headers, &empty_proxies()),
             IpAddr::V4(Ipv4Addr::new(4, 4, 4, 4))
         );
+    }
+}
+
+#[cfg(test)]
+mod bootstrap_candidates_tests {
+    use super::{
+        extract_peer_id, merge_candidates, sanitize_multiaddr_str, source_rank, CandidateEntry,
+    };
+
+    // Real-shaped peer_id (the production default in `default_bootstrap_nodes()`).
+    const REAL_PEER_ID: &str = "12D3KooWNx9TnsmVQux3fMm6sUUe5tFdeXjECUSyDqYtYfsbt3Mo";
+
+    fn entry(multiaddr: &str, last: Option<u64>, source: &'static str) -> CandidateEntry {
+        CandidateEntry {
+            multiaddr: multiaddr.to_string(),
+            peer_id: extract_peer_id(multiaddr),
+            last_anchor_at: last,
+            source,
+            paused: false,
+            owner_address: if source == "sc" {
+                Some("klv1testowner".to_string())
+            } else {
+                None
+            },
+        }
+    }
+
+    #[test]
+    fn merge_unions_book_config_sc() {
+        let book = vec![entry(
+            &format!("/dns4/a.org/tcp/41720/p2p/{}", REAL_PEER_ID),
+            None,
+            "book",
+        )];
+        let config = vec![entry(
+            &format!("/dns4/b.org/tcp/41720/p2p/{}", REAL_PEER_ID),
+            None,
+            "config",
+        )];
+        let sc = vec![entry(
+            &format!("/dns4/c.org/tcp/41720/p2p/{}", REAL_PEER_ID),
+            Some(1000),
+            "sc",
+        )];
+        let out = merge_candidates(book, config, sc);
+        assert_eq!(out.len(), 3);
+        // SC has the only non-null last_anchor_at; appears first.
+        assert_eq!(out[0]["source"], "sc");
+    }
+
+    #[test]
+    fn merge_dedupes_by_peer_id_prefers_freshest() {
+        // Same multiaddr in book and SC — collapses to one entry.
+        // SC has the higher `last_anchor_at` so it wins.
+        let addr = format!("/dns4/x.org/tcp/41720/p2p/{}", REAL_PEER_ID);
+        let book = vec![entry(&addr, None, "book")];
+        let sc = vec![entry(&addr, Some(2000), "sc")];
+        let out = merge_candidates(book, Vec::new(), sc);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["source"], "sc");
+        assert_eq!(out[0]["last_anchor_at"], 2000);
+    }
+
+    #[test]
+    fn merge_tie_breaks_on_source_rank_sc_over_book() {
+        // Same multiaddr, both with last_anchor_at = 0 (book is None,
+        // SC has Some(0) which normalises to 0). SC wins by source rank.
+        let addr = format!("/dns4/y.org/tcp/41720/p2p/{}", REAL_PEER_ID);
+        let book = vec![entry(&addr, None, "book")];
+        let sc = vec![entry(&addr, Some(0), "sc")];
+        let out = merge_candidates(book, Vec::new(), sc);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["source"], "sc");
+    }
+
+    #[test]
+    fn merge_preserves_tcp_and_quic_for_same_peer_id() {
+        // Same peer_id, different transports — both retained because
+        // SDK consumers want to dial either.
+        let tcp = format!("/dns4/z.org/tcp/41720/p2p/{}", REAL_PEER_ID);
+        let quic = format!("/dns4/z.org/udp/41720/quic-v1/p2p/{}", REAL_PEER_ID);
+        let sc = vec![entry(&tcp, Some(1000), "sc"), entry(&quic, Some(1000), "sc")];
+        let out = merge_candidates(Vec::new(), Vec::new(), sc);
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn merge_caps_at_256() {
+        let sc: Vec<CandidateEntry> = (0..300)
+            .map(|i| CandidateEntry {
+                // Multiaddrs are distinct strings — peer_id parsing
+                // can fail (test fixture); dedupe is by multiaddr
+                // string so distinctness is what matters.
+                multiaddr: format!("/dns4/host{}.org/tcp/41720", i),
+                peer_id: None,
+                last_anchor_at: Some(1000 + i as u64),
+                source: "sc",
+                paused: false,
+                owner_address: Some("klv1testowner".to_string()),
+            })
+            .collect();
+        let out = merge_candidates(Vec::new(), Vec::new(), sc);
+        assert_eq!(out.len(), 256);
+        // After sort, the highest last_anchor_at (1299) is first.
+        assert_eq!(out[0]["last_anchor_at"], 1299);
+    }
+
+    #[test]
+    fn merge_orders_nulls_after_timestamps_book_before_config() {
+        let book = vec![CandidateEntry {
+            multiaddr: "/dns4/book.org/tcp/41720".to_string(),
+            peer_id: None,
+            last_anchor_at: None,
+            source: "book",
+            paused: false,
+            owner_address: None,
+        }];
+        let config = vec![CandidateEntry {
+            multiaddr: "/dns4/cfg.org/tcp/41720".to_string(),
+            peer_id: None,
+            last_anchor_at: None,
+            source: "config",
+            paused: false,
+            owner_address: None,
+        }];
+        let sc = vec![CandidateEntry {
+            multiaddr: "/dns4/sc.org/tcp/41720".to_string(),
+            peer_id: None,
+            last_anchor_at: Some(1000),
+            source: "sc",
+            paused: false,
+            owner_address: Some("klv1testowner".to_string()),
+        }];
+        let out = merge_candidates(book, config, sc);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0]["source"], "sc"); // non-null timestamp first
+        assert_eq!(out[1]["source"], "book"); // then book (rank 1)
+        assert_eq!(out[2]["source"], "config"); // then config (rank 0)
+    }
+
+    #[test]
+    fn merge_emits_owner_address_only_for_sc_entries() {
+        let book = vec![CandidateEntry {
+            multiaddr: "/dns4/book.org/tcp/41720".to_string(),
+            peer_id: None,
+            last_anchor_at: None,
+            source: "book",
+            paused: false,
+            owner_address: None,
+        }];
+        let sc = vec![CandidateEntry {
+            multiaddr: "/dns4/sc.org/tcp/41720".to_string(),
+            peer_id: None,
+            last_anchor_at: Some(1000),
+            source: "sc",
+            paused: false,
+            owner_address: Some("klv1ownerxyz".to_string()),
+        }];
+        let out = merge_candidates(book, Vec::new(), sc);
+        // SC entry is first (non-null last_anchor_at).
+        assert_eq!(out[0]["owner_address"], "klv1ownerxyz");
+        // Book entry must NOT carry owner_address (absent, not null).
+        assert!(out[1].get("owner_address").is_none());
+    }
+
+    #[test]
+    fn sanitize_rejects_oversized_multiaddr() {
+        let big = "x".repeat(257);
+        assert!(!sanitize_multiaddr_str(&big));
+    }
+
+    #[test]
+    fn sanitize_rejects_control_chars() {
+        assert!(!sanitize_multiaddr_str("/dns4/x.org\n/tcp/41720"));
+        assert!(!sanitize_multiaddr_str("/dns4/x.org\x00/tcp/41720"));
+        assert!(!sanitize_multiaddr_str("/dns4/x.org\x7f/tcp/41720"));
+    }
+
+    #[test]
+    fn sanitize_accepts_normal_multiaddr() {
+        let addr = format!("/dns4/x.org/tcp/41720/p2p/{}", REAL_PEER_ID);
+        assert!(sanitize_multiaddr_str(&addr));
+    }
+
+    #[test]
+    fn extract_peer_id_returns_p2p_suffix() {
+        let addr = format!("/dns4/x.org/tcp/41720/p2p/{}", REAL_PEER_ID);
+        assert_eq!(extract_peer_id(&addr), Some(REAL_PEER_ID.to_string()));
+    }
+
+    #[test]
+    fn extract_peer_id_returns_none_without_p2p() {
+        assert_eq!(extract_peer_id("/dns4/x.org/tcp/41720"), None);
+    }
+
+    #[test]
+    fn extract_peer_id_returns_none_for_malformed() {
+        assert_eq!(extract_peer_id("not a multiaddr"), None);
+    }
+
+    #[test]
+    fn source_rank_orders_sc_over_book_over_config() {
+        assert!(source_rank("sc") > source_rank("book"));
+        assert!(source_rank("book") > source_rank("config"));
     }
 }

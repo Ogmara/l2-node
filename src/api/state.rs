@@ -309,6 +309,17 @@ pub struct AppState {
     /// to filter out registry entries whose last anchor is too old to
     /// be a useful dial target (spec 13 §7 + spec 13 §6.3 cap).
     pub max_peer_staleness_secs: u64,
+    /// Snapshot of `[network] bootstrap_nodes` at startup. Powers the
+    /// tier-2 source in the `bootstrap-candidates` REST union (spec 13
+    /// §4.5). Cloned once — operators must restart to change.
+    pub bootstrap_nodes: Vec<String>,
+    /// Shared drift snapshot written by the
+    /// [`crate::chain::metadata_reconcile::MetadataReconciler`] task
+    /// (spec 13 §6.1) and read by the `node_metadata` admin endpoint.
+    /// `None` when no drift has been observed, when the reconciler is
+    /// not spawned (anchoring or publish disabled), or when the most
+    /// recent reconcile pass found the on-chain list in sync.
+    pub metadata_drift: crate::chain::metadata_reconcile::SharedMetadataDrift,
 }
 
 /// Cached bootstrap-candidates response (spec 13 §4.5).
@@ -390,6 +401,8 @@ impl AppState {
             false,                                          // anchor_pause_on_shutdown
             false,                                          // anchor_wallet_key_configured
             7 * 24 * 3600,                                  // max_peer_staleness_secs — 7d default
+            Vec::new(),                                     // bootstrap_nodes — empty in tests
+            crate::chain::metadata_reconcile::shared_metadata_drift(),
         )
     }
 
@@ -431,6 +444,8 @@ impl AppState {
         anchor_pause_on_shutdown: bool,
         anchor_wallet_key_configured: bool,
         max_peer_staleness_secs: u64,
+        bootstrap_nodes: Vec<String>,
+        metadata_drift: crate::chain::metadata_reconcile::SharedMetadataDrift,
     ) -> Self {
         // moka LRU with size-weighted eviction. `weigher` returns the
         // byte count of each value's body (content-type string is
@@ -498,6 +513,8 @@ impl AppState {
             bootstrap_candidates_cache: Arc::new(tokio::sync::RwLock::new(None)),
             bootstrap_candidates_refresh: Arc::new(tokio::sync::Mutex::new(())),
             max_peer_staleness_secs,
+            bootstrap_nodes,
+            metadata_drift,
         }
     }
 

@@ -6,6 +6,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 
 /// Top-level node configuration.
@@ -424,15 +425,25 @@ pub struct AnchoringConfig {
     #[serde(default = "default_anchor_interval")]
     pub interval_seconds: u64,
     /// Optional: hex-encoded 32-byte Ed25519 private key for the anchor wallet.
-    /// If empty, uses the node's identity key. The corresponding klv1... address
-    /// must be registered on the smart contract via `registerNode` (spec 12 §2.3).
+    /// If absent (or empty string), uses the node's identity key. The
+    /// corresponding klv1... address must be registered on the smart contract
+    /// via `registerNode` (spec 12 §2.3).
     ///
-    /// **Security:** Prefer using `OGMARA_ANCHOR_WALLET_KEY` environment variable
-    /// instead of putting the key in the config file. The key must be on-disk if
+    /// **Security:** Prefer the `OGMARA_ANCHOR_WALLET_KEY` environment variable
+    /// over putting the key in the config file. The key must be on-disk if
     /// `pause_on_shutdown = true` — the SIGTERM handler signs `pauseNode` from
     /// this key without operator interaction.
-    #[serde(default, skip_serializing)]
-    pub wallet_key: String,
+    ///
+    /// **Residency:** the field is wrapped in [`secrecy::SecretString`] so the
+    /// hex-string source is zeroized on drop and redacted by `Debug` /
+    /// log-formatting paths. `Serialize` is intentionally skipped — the field
+    /// must never round-trip through any config-dump output. Consumers reach
+    /// the inner `&str` via [`SecretString::expose_secret`] at the two
+    /// signing-key derivation callsites only (v0.46.0 Phase C / plan C1).
+    /// Empty-string TOML values deserialize to `None`, mirroring pre-0.46.0
+    /// behavior where empty meant absent.
+    #[serde(default, deserialize_with = "deserialize_wallet_key", skip_serializing)]
+    pub wallet_key: Option<SecretString>,
     /// v0.45.0 (spec 13 §6.3): if `true`, the SIGTERM handler signs and
     /// broadcasts a `pauseNode` TX before exit, signaling to other
     /// nodes + clients that this anchorer is going offline gracefully.
@@ -444,6 +455,16 @@ pub struct AnchoringConfig {
     /// once-per-hour by the anchoring loop, it's also held in process
     /// memory for shutdown signing. See spec 13 §6.3 wallet-safety
     /// note + the v0.45.0 security audit.
+    ///
+    /// **Restart required for changes:** this flag is read once at
+    /// node startup and cloned into `AppState`. Toggling it in the
+    /// config file (and sending SIGHUP, or relying on any reload
+    /// flow) does NOT update the in-process value — the SIGTERM
+    /// handler continues to use whatever was set when the process
+    /// started. Operators must restart the node for a change to
+    /// take effect. v0.46.0 Phase B3 surfaces this as a banner in
+    /// the dashboard Pause card; the live-reload refactor is
+    /// deliberately out-of-scope (plan OPEN 3 resolution 2026-05-17).
     #[serde(default)]
     pub pause_on_shutdown: bool,
     /// v0.45.0 (spec 12 §2.10): optional metadata publication for
@@ -454,10 +475,18 @@ pub struct AnchoringConfig {
 
 impl std::fmt::Debug for AnchoringConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `<configured>` rather than `<redacted>` — distinguishes
+        // "operator set the field, value hidden" from `<none>` ("field
+        // absent, no key configured"). The wrapped `SecretString`'s own
+        // Debug impl is also redacting, but we keep the manual line for
+        // a uniform two-state representation.
         f.debug_struct("AnchoringConfig")
             .field("enabled", &self.enabled)
             .field("interval_seconds", &self.interval_seconds)
-            .field("wallet_key", &if self.wallet_key.is_empty() { "<none>" } else { "<redacted>" })
+            .field(
+                "wallet_key",
+                &if self.wallet_key.is_some() { "<configured>" } else { "<none>" },
+            )
             .field("pause_on_shutdown", &self.pause_on_shutdown)
             .field("metadata", &self.metadata)
             .finish()
@@ -469,10 +498,54 @@ impl Default for AnchoringConfig {
         Self {
             enabled: false,
             interval_seconds: default_anchor_interval(),
-            wallet_key: String::new(),
+            wallet_key: None,
             pause_on_shutdown: false,
             metadata: AnchorMetadataConfig::default(),
         }
+    }
+}
+
+/// Field-level custom deserializer for `AnchoringConfig.wallet_key`.
+/// Accepts a TOML string; empty string maps to `None` (preserves the
+/// pre-0.46.0 contract where `wallet_key = ""` and an absent field
+/// both meant "use the node identity key"); non-empty wraps in
+/// `SecretString` so the source is zeroized on drop.
+///
+/// The `#[serde(default)]` on the field handles the absent-field case
+/// without invoking this function; this is only called when TOML
+/// actually contains `wallet_key = "..."`.
+///
+/// **Residency note (Phase C Security Audit N1):** between the
+/// `String::deserialize` call and `SecretString::from(s)` consuming
+/// the owned `String`, the hex value briefly lives in a plain heap
+/// allocation. `SecretString::from(String)` calls `into_boxed_str()`
+/// which reuses the allocation when `capacity == len` but reallocates
+/// + copies otherwise — the discarded allocation is freed without
+/// zeroize. The window is brief and the threat model already assumes
+/// config-file confidentiality on disk (an attacker with heap-residue
+/// access typically also has the config), so we accept this gap. The
+/// env-var path in `Node::run` has the same property by construction.
+fn deserialize_wallet_key<'de, D>(deserializer: D) -> Result<Option<SecretString>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    Ok(if s.is_empty() {
+        None
+    } else {
+        Some(SecretString::from(s))
+    })
+}
+
+/// Convenience accessor — returns `Some(&str)` for the hex-encoded key
+/// when configured, `None` when absent. Crosses the `ExposeSecret`
+/// boundary so callers don't need to handle the `secrecy` type
+/// directly. The returned `&str` borrows from the `SecretString`'s
+/// internal `Box<str>` and lives for the lifetime of the `AnchoringConfig`
+/// reference.
+impl AnchoringConfig {
+    pub fn wallet_key_hex(&self) -> Option<&str> {
+        self.wallet_key.as_ref().map(|s| s.expose_secret())
     }
 }
 
@@ -1516,5 +1589,101 @@ mod tests {
         let mut c = baseline_config();
         c.api.trusted_proxies = vec!["1.2.3.4/33".to_string()];
         assert!(c.validate().is_err());
+    }
+
+    // --- AnchoringConfig.wallet_key SecretString round-trip (v0.46.0 Phase C) ---
+
+    #[test]
+    fn wallet_key_default_is_none() {
+        let cfg = AnchoringConfig::default();
+        assert!(cfg.wallet_key.is_none());
+        assert_eq!(cfg.wallet_key_hex(), None);
+    }
+
+    #[test]
+    fn wallet_key_absent_in_toml_is_none() {
+        let toml = "enabled = false\ninterval_seconds = 3600\n";
+        let cfg: AnchoringConfig = toml::from_str(toml).expect("parses");
+        assert!(cfg.wallet_key.is_none());
+    }
+
+    #[test]
+    fn wallet_key_empty_string_in_toml_is_none() {
+        // Pre-0.46.0 contract: explicit `wallet_key = ""` meant "absent".
+        // The custom deserializer must preserve that for backwards compat.
+        let toml = "enabled = false\ninterval_seconds = 3600\nwallet_key = \"\"\n";
+        let cfg: AnchoringConfig = toml::from_str(toml).expect("parses");
+        assert!(cfg.wallet_key.is_none());
+        assert_eq!(cfg.wallet_key_hex(), None);
+    }
+
+    #[test]
+    fn wallet_key_non_empty_string_wraps_in_secret() {
+        let hex = "deadbeef".repeat(8); // 64 hex chars = 32 bytes
+        let toml = format!(
+            "enabled = true\ninterval_seconds = 3600\nwallet_key = \"{}\"\n",
+            hex
+        );
+        let cfg: AnchoringConfig = toml::from_str(&toml).expect("parses");
+        assert!(cfg.wallet_key.is_some());
+        // expose_secret round-trips the exact string the operator put in.
+        assert_eq!(cfg.wallet_key_hex(), Some(hex.as_str()));
+    }
+
+    #[test]
+    fn wallet_key_debug_redacts_when_configured() {
+        let hex = "ab".repeat(32);
+        let toml = format!(
+            "enabled = true\ninterval_seconds = 3600\nwallet_key = \"{}\"\n",
+            hex
+        );
+        let cfg: AnchoringConfig = toml::from_str(&toml).expect("parses");
+        let rendered = format!("{:?}", cfg);
+        // Must NOT contain the hex string itself.
+        assert!(
+            !rendered.contains(&hex),
+            "Debug rendering must not leak wallet_key; got: {}",
+            rendered
+        );
+        // Must report the configured-vs-absent state.
+        assert!(rendered.contains("\"<configured>\""));
+    }
+
+    #[test]
+    fn wallet_key_debug_shows_none_when_absent() {
+        let cfg = AnchoringConfig::default();
+        let rendered = format!("{:?}", cfg);
+        assert!(rendered.contains("\"<none>\""));
+    }
+
+    #[test]
+    fn wallet_key_rejects_non_string_toml() {
+        // `String::deserialize` rejects non-string TOML values. Guards
+        // against a future refactor that swaps `String` for a more
+        // permissive type (e.g., serde_json::Value) that would silently
+        // accept integers or booleans (Phase C Code Audit / Security
+        // Audit N4).
+        let toml = "enabled = false\ninterval_seconds = 3600\nwallet_key = 42\n";
+        assert!(toml::from_str::<AnchoringConfig>(toml).is_err());
+
+        let toml = "enabled = false\ninterval_seconds = 3600\nwallet_key = true\n";
+        assert!(toml::from_str::<AnchoringConfig>(toml).is_err());
+    }
+
+    #[test]
+    fn wallet_key_clone_preserves_secret() {
+        // `SecretString` implements `Clone`; the cloned struct must
+        // expose the same secret. Both copies zeroize independently on
+        // drop (verified at runtime by Drop; the test just confirms
+        // semantic equality).
+        let hex = "1234567890abcdef".repeat(4);
+        let toml = format!(
+            "enabled = true\ninterval_seconds = 3600\nwallet_key = \"{}\"\n",
+            hex
+        );
+        let cfg: AnchoringConfig = toml::from_str(&toml).expect("parses");
+        let cloned = cfg.clone();
+        assert_eq!(cfg.wallet_key_hex(), cloned.wallet_key_hex());
+        assert_eq!(cloned.wallet_key_hex(), Some(hex.as_str()));
     }
 }

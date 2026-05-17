@@ -5,6 +5,177 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.46.0] - 2026-05-17
+
+Closes the spec 12 §5.x / spec 13 backlog deferred from 0.45.x plus the
+UX and security-hardening observations from the v0.45.0 bake-in. Four
+sub-phases (A: spec-13 completion, B: dashboard polish, C: secret
+residency, D: IPv6 auto-derive) all passed the full audit pipeline
+(Code + Security in parallel → Spec Compliance → Auditor) per
+`docs/planning/l2-node-v0.46.0-plan.md`. 277 unit tests + 8 integration
+tests green.
+
+Spec 12 §2.8 + spec 13 §4.5 / §6.1 / §7 received clarifying amendments
+during the Phase A/B compliance audits; no protocol breakage. Spec 10
+§9.2 gains one new `metadata_drift_detected` alert row.
+
+**A1 (multi-mirror default `bootstrap_nodes`) is held for 0.46.1 PATCH**
+pending community-mirror coordination per plan R1. Until 0.46.1, the
+single-DNS `node.ogmara.org` default still applies.
+
+### Added
+- **`bootstrap-candidates` REST union (spec 13 §4.5, Phase A2).** The
+  endpoint now returns a union across tier 1 (`PEER_DIRECTORY` peer
+  book) + tier 2 (`[network] bootstrap_nodes` config) + tier 3 (SC
+  registry — already done in 0.44.0). Dedupes by `(peer_id, transport)`
+  so TCP+QUIC variants of the same peer survive (SDK consumers want
+  both transports to dial). Collisions across tiers resolved by:
+  highest `last_anchor_at` wins (null treated as 0), SC > book >
+  config on tie. Sort: non-null timestamps descending, then null
+  entries by source-rank `[book, config]`. Capped at 256 total.
+  Per-candidate `owner_address` field surfaced for SC-tier entries.
+  Tier 1+2 entries continue to serve even when SC is unconfigured /
+  failed / timed out, accompanied by `source_note` describing the SC
+  condition (60s negative TTL for fast recovery, vs the 5min positive
+  TTL when SC contributes).
+- **1-hour metadata reconcile timer (spec 13 §6.1, Phase A3).** New
+  `chain/metadata_reconcile.rs` background task that compares the
+  desired effective multiaddr list against `getNodeMetadata(self)` on
+  startup + every hour. **Detect-only**: no proxy signing (spec 12
+  §6.2). On drift, writes a `MetadataDriftSnapshot` into shared state
+  so `/admin/node/metadata` surfaces `drift_detected: bool` +
+  `drift_detected_at: <unix>`, and fires the
+  `metadata_drift_detected` info alert (cooldown bounded). Operator
+  must click Publish in the dashboard to reconcile. Spawn-gated on
+  `[anchoring] enabled = true && [anchoring.metadata] publish = true`.
+  60s startup grace before the first tick avoids spurious alerts on
+  freshly-registered nodes whose initial `registerNode` TX hasn't
+  confirmed yet.
+- **Dashboard drift banner (Phase A3).** Yellow banner appears in the
+  on-chain metadata card when `drift_detected === true`, with relative
+  "observed Xs ago" timestamp.
+- **`metadata_drift_detected` alert taxonomy entry (Phase A4 + spec 10
+  §9.2 amendment).** Info severity. Cooldown inherits from
+  `[alerts.cooldown.seconds]` (default 300s); the natural 1-hour
+  reconcile cadence dominates.
+- **Split divergence panel (Phase B1, plan OPEN 5).** The pre-0.46.0
+  `#anch-divergence-card` is split into `#anch-divergence-local-card`
+  (second-person voice, gated strictly on `consec > 0`) and
+  `#anch-divergence-network-card` (neutral voice, gated strictly on
+  `divergence_escalated === true`). Pre-fix wording misattributed
+  chain-history escalation to the local node when only the network
+  condition was true (`escalated=true && consec=0` was the
+  bake-in-observed case at low anchorer counts). Each card mounts and
+  unmounts independently; either or both can be visible.
+- **`pause_on_shutdown` restart-required cue (Phase B3, plan OPEN 3).**
+  Yellow-border info note inside the pause card explaining that
+  `[anchoring] pause_on_shutdown` changes require a full node restart.
+  The doc-comment on the config field carries the same explanation
+  with a cross-ref to spec 13 §6.3.
+- **IPv6-literal auto-derive (Phase D1).** Operators on v6-only hosts
+  can now set `[anchoring.metadata] publish = true, multiaddrs = []`
+  and have the node auto-derive `/ip6/<addr>/tcp/<port>/p2p/<peer_id>`
+  + the QUIC variant. Bracketed `[2001:db8::1]:port` form required in
+  `[api] public_url`. Non-routable IPv6 (loopback, link-local
+  `fe80::/10`, multicast `ff00::/8`, unspecified, IPv4-mapped) is
+  silently dropped from the auto-derive output to avoid burning
+  operator gas on an on-chain unreachable address (plan R5).
+  Internal `HostKind { Dns, Ipv4, Ipv6 }` enum carries the parsed
+  authority through `compute_effective_multiaddrs`.
+
+### Changed
+- **`bootstrap-candidates` cache semantics.** Successful responses
+  still use the 5min positive TTL; degraded responses (SC missing or
+  failed, tier 1+2 only) now use a 60s negative TTL so the upstream
+  recovery loop is fast. The `source_note` field on degraded
+  responses describes the SC condition. Spec 13 §4.5 amended to
+  formally allow the 60s degraded TTL.
+- **Publish button gating (Phase B2, plan OPEN 5).** Now gated on
+  `!!data.set_calldata && data.in_sync === false` (strict `=== false`,
+  so `null`/`undefined` "RPC unavailable" never enables). Tooltips
+  explain the two disabled-but-set-calldata states.
+- **Spec 13 §4.5 dedupe wording.** Was "Dedupes by peer ID";
+  amended to "Dedupes by `(peer_id, transport)`" with TCP/QUIC
+  rationale. Plan OPEN 4 resolution. No protocol change — the
+  implementation always reflected the new wording; the spec catches up.
+- **Spec 13 §7 filter applicability.** Clarifies that timestamp /
+  wallet-dependent filters (pause, staleness, empty-metadata, self)
+  apply only to SC-tier entries; tier 1 (peer book) and tier 2
+  (config) are not subject to them. Implementation always behaved this
+  way; spec catches up.
+- **Spec 12 §2.8 `isDivergenceEscalated` view doc.** Added "Dashboard
+  scope" paragraph clarifying that operator-facing dashboards SHOULD
+  surface the view only for `latest_canonical_height` — historical
+  escalation at non-latest heights is queryable via the same view but
+  is out-of-scope for operator-level UI (Phase B Spec Compliance N2).
+
+### Fixed
+- **Auto-derive accepts IPv6.** Previously `extract_host_from_url`
+  rejected bracketed `[::1]`-style hosts, forcing v6-only operators
+  to set `multiaddrs` explicitly. Now accepted (with non-routable
+  filtering).
+- **Local card cross-reference.** The divergence local card body now
+  cites spec 12 §2.8 + §6.1 (was §6.1 alone — §2.8 is where the
+  escalation flow is actually defined).
+
+### Security
+- **`AnchoringConfig.wallet_key` wrapped in `secrecy::SecretString`
+  (Phase C1, spec 13 §6.3 follow-through).** Type changed from
+  `String` → `Option<secrecy::SecretString>`. Source-field residency
+  is now bounded by `SecretString::Drop` (zeroize on drop) rather
+  than living for the whole `Config` lifetime. `Debug` redacts to
+  `<configured>` / `<none>`; `Serialize` is intentionally not
+  implemented (the field cannot round-trip through any config-dump
+  output). Custom field deserializer preserves backwards compat
+  with existing `wallet_key = ""` (treated as absent) and
+  `wallet_key = "deadbeef..."` (wrapped) operator configs — no
+  TOML format change. The v0.45.0-era `unsafe { as_mut_vec ... }`
+  manual zeroize hot-loop in `node.rs` is GONE; `SecretString` Drop
+  replaces it. New dependency: `secrecy = "0.10"` (bumped from
+  plan's 0.8 per Latest-Crates rule — 0.10 has a different API
+  surface, see [docs/planning/l2-node-v0.46.0-plan.md](../docs/planning/l2-node-v0.46.0-plan.md)
+  C1.1 row for details).
+- **Raw-key intermediate buffer zeroize (Phase C audit N2).** Both
+  `Vec<u8>` (from `hex::decode`) AND `[u8; 32]` (from `try_into`)
+  now explicitly zeroized after `SigningKey::from_bytes()` at BOTH
+  derivation sites: the anchor-wallet resolver in `Node::run` AND
+  the sibling `load_or_generate_key` site. `SigningKey` itself is
+  `ZeroizeOnDrop` per ed25519-dalek 2.x.
+- **`bootstrap-candidates` tier-2 length cap (Phase A audit W1).**
+  `gather_config_candidates` now caps tier 2 at 256 entries (same as
+  tier 1's `PEER_DIRECTORY` cap). An operator misconfig with a 100k-
+  entry `bootstrap_nodes` list would previously have allocated 100k
+  `CandidateEntry` objects through `merge_candidates` before the
+  final 256-truncate.
+- **Multiaddr sanitisation tightened to printable ASCII only (Phase
+  A audit N2).** `sanitize_multiaddr_str` now rejects bytes ≥ 0x80
+  uniformly across all three tiers. Libp2p multiaddrs are ASCII per
+  spec (DNS uses Punycode for IDN, /p2p/ is base58, /onion3/ is
+  lowercase base32); permitting bytes ≥ 0x80 would let a hostile SC
+  publish multiaddrs containing bidi-override / zero-width / RTL
+  marks that render deceptively in operator UIs.
+- **Corrupt-row `pa:` peer-book entry skip (Phase A audit W2).**
+  `gather_book_candidates` now `continue`s when a row's `pa:`-stripped
+  key doesn't decode as UTF-8 (was: silently emitted the multiaddr
+  with `peer_id: None`, which weakened the dedupe contract). Corruption
+  signals drop rather than degrade.
+
+### Deferred to 0.46.1
+- **Multi-mirror default `bootstrap_nodes`** (spec 13 §4.2 / plan A1).
+  Blocked on community-mirror coordination — needs ≥3 independent
+  operator-controlled DNS hostnames + libp2p peer IDs. Current
+  default remains the single-DNS `node.ogmara.org` pair unchanged.
+  Re-evaluate when mirrors are ready per plan R1 cut criteria.
+
+### Migration
+- No config-format changes. Operators upgrading from 0.45.x do not
+  need to edit `ogmara.toml`.
+- `[anchoring] wallet_key = "deadbeef..."` continues to work
+  unchanged — the SecretString migration is transparent.
+- Operators currently running with `publish = true, multiaddrs = []`
+  on an IPv4 or DNS host see no change. v6-only operators can now
+  drop their explicit `multiaddrs` entry (auto-derive will work).
+
 ## [0.45.1] - 2026-05-17
 
 Hotfix discovered during v0.45.0 bake-in (Test 4 sc_discovery stall
