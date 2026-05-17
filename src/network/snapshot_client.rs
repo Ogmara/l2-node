@@ -979,7 +979,14 @@ pub async fn run_bootstrap(
             warn!(
                 connected = peers.len(),
                 quorum_min = config.quorum_min_peers,
-                "Snapshot bootstrap aborting: not enough peers within discovery timeout"
+                discovery_timeout_secs = config.discovery_timeout_secs,
+                "Snapshot bootstrap aborting: only {} peer(s) reachable within discovery timeout, \
+                 need at least {}. On a small / private network (e.g. a 2-node testnet) you can \
+                 set [snapshot] quorum_min_peers = 1 in ogmara.toml to allow bootstrap from a \
+                 single trusted peer. Trades off the quorum-vote sybil resistance — only do this \
+                 when you trust your immediate peer set.",
+                peers.len(),
+                config.quorum_min_peers,
             );
             return Ok(None);
         }

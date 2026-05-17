@@ -389,7 +389,11 @@ impl Node {
                 info!(
                     cursor,
                     start_block = self.config.klever.start_block,
-                    "Snapshot bootstrap enabled but node is not fresh — skipping (set bootstrap_only_if_fresh=false to force)"
+                    "Snapshot bootstrap enabled but node is NOT FRESH (chain_cursor > 0) — skipping. \
+                     To force a fresh bootstrap on this node: stop it, delete the data_dir's `db/` \
+                     subdirectory, restart. Alternatively set `bootstrap_only_if_fresh = false` in \
+                     ogmara.toml under [snapshot] (will overwrite ALL existing local L2 state with \
+                     the snapshot — only do this if you understand the implications)."
                 );
             } else if !is_fresh && !self.config.snapshot.allow_apply_over_existing {
                 warn!(

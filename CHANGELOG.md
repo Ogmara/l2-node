@@ -5,6 +5,39 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.46.3] - 2026-05-17
+
+Small-network operator UX patch. Snapshot bootstrap requires
+`quorum_min_peers` (default 3) reachable peers before it'll even
+attempt the discovery probe. On a 2-node testnet or single-tenant
+rollout that requirement can never be satisfied, so bootstrap just
+silently never runs and the operator is left wondering why their
+fresh node has no profiles / no device→wallet mappings. This patch
+makes the failure mode visible and the recovery path obvious.
+
+### Changed
+- **Discovery-timeout warning now actionable.** [src/network/snapshot_client.rs](src/network/snapshot_client.rs)
+  was already logging "not enough peers within discovery timeout"
+  but with no hint what to do. The log now names the exact knob
+  (`[snapshot] quorum_min_peers = 1`), explains the trade-off
+  (giving up quorum-vote sybil resistance) and reassures that
+  Klever anchor re-verification still applies regardless.
+- **Non-fresh-DB skip log names the recovery path.** [src/node.rs](src/node.rs)
+  logged "Snapshot bootstrap enabled but node is not fresh" without
+  telling the operator how to make it fresh. Now spells out the
+  data-dir / db-subdirectory wipe sequence, and mentions the
+  `bootstrap_only_if_fresh = false` opt-in for the dangerous
+  apply-over-existing path.
+- **`quorum_min_peers` config comment** in both [src/config.rs](src/config.rs)
+  (`default_toml()`) and [ogmara.example.toml](ogmara.example.toml)
+  explains the small-network use case and the security trade-off
+  inline. Documents that the anchor re-verification against Klever
+  is what actually defends the chain, not the quorum size.
+
+No runtime behaviour changes outside log text and config comments.
+`default_toml()` ↔ `ogmara.example.toml` byte-for-byte equality test
+still passes.
+
 ## [0.46.2] - 2026-05-17
 
 Hotfix for the v0.37.0 partial-edit projection: the merged payload

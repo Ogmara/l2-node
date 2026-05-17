@@ -138,6 +138,15 @@ bootstrap_only_if_fresh = true           # Refuse to overwrite an existing node'
 allow_apply_over_existing = false        # Force operator override to apply over data
 
 quorum_sample_size = 5
+# Minimum agreeing peers required for the bootstrap quorum. The default
+# of 3 is production-safe (no single peer can foist a poisoned snapshot
+# on a new node). On a SMALL / PRIVATE NETWORK — local dev box pair,
+# 2-node testnet, single-tenant rollout — bootstrap will silently never
+# run because fewer than 3 peers exist to even probe. Lower to 1 or 2
+# for those setups; understand that you're trading the quorum vote for
+# trust in your immediate peer. The anchor re-verification against
+# Klever still applies regardless, so a single dishonest peer can't
+# trick you into accepting state that doesn't match the chain.
 quorum_min_peers = 3
 parallel_fetches = 3
 chunk_retries = 5
