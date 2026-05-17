@@ -396,25 +396,37 @@ mod tests {
         );
     }
 
+    // Stable test peer-id — base58 of an arbitrary 32-byte key.
+    // Real values look like this; tests don't need cryptographic
+    // significance, just shape.
+    const TEST_PEER_ID: &str = "12D3KooWNx9TnsmVQux3fMm6sUUe5tFdeXjECUSyDqYtYfsbt3Mo";
+
     #[test]
     fn effective_multiaddrs_publish_off() {
         let cfg = AnchorMetadataConfig {
             publish: false,
             multiaddrs: vec!["/dns4/x/tcp/1".into()],
         };
-        let (eff, derived) =
-            compute_effective_multiaddrs(&cfg, 41720, Some("https://node.ogmara.org"));
+        let (eff, derived) = compute_effective_multiaddrs(
+            &cfg,
+            41720,
+            Some("https://node.ogmara.org"),
+            TEST_PEER_ID,
+        );
         assert!(eff.is_empty());
         assert!(!derived);
     }
 
     #[test]
     fn effective_multiaddrs_explicit_pass_through() {
+        // Explicit multiaddrs are returned VERBATIM — the operator
+        // is responsible for including /p2p/ when explicit (we don't
+        // mutate their input).
         let cfg = AnchorMetadataConfig {
             publish: true,
             multiaddrs: vec!["/dns4/x/tcp/1".into(), "/ip4/1.2.3.4/tcp/2".into()],
         };
-        let (eff, derived) = compute_effective_multiaddrs(&cfg, 41720, None);
+        let (eff, derived) = compute_effective_multiaddrs(&cfg, 41720, None, TEST_PEER_ID);
         assert_eq!(eff.len(), 2);
         assert_eq!(eff[0], "/dns4/x/tcp/1");
         assert!(!derived);
@@ -426,15 +438,21 @@ mod tests {
             publish: true,
             multiaddrs: vec![],
         };
-        let (eff, derived) =
-            compute_effective_multiaddrs(&cfg, 41720, Some("https://node.ogmara.org:8443/x"));
+        let (eff, derived) = compute_effective_multiaddrs(
+            &cfg,
+            41720,
+            Some("https://node.ogmara.org:8443/x"),
+            TEST_PEER_ID,
+        );
         assert!(derived);
-        // Spec 13 §6.1 — auto-derive emits TCP + QUIC variants.
+        // Spec 13 §6.1 — auto-derive emits TCP + QUIC variants WITH
+        // `/p2p/<peer_id>` so consumers (sc_discovery) can persist
+        // them as complete dial targets (v0.45.1 fix).
         assert_eq!(
             eff,
             vec![
-                "/dns4/node.ogmara.org/tcp/41720".to_string(),
-                "/dns4/node.ogmara.org/udp/41720/quic-v1".to_string(),
+                format!("/dns4/node.ogmara.org/tcp/41720/p2p/{}", TEST_PEER_ID),
+                format!("/dns4/node.ogmara.org/udp/41720/quic-v1/p2p/{}", TEST_PEER_ID),
             ]
         );
     }
@@ -445,14 +463,18 @@ mod tests {
             publish: true,
             multiaddrs: vec![],
         };
-        let (eff, derived) =
-            compute_effective_multiaddrs(&cfg, 9000, Some("http://203.0.113.7:1234"));
+        let (eff, derived) = compute_effective_multiaddrs(
+            &cfg,
+            9000,
+            Some("http://203.0.113.7:1234"),
+            TEST_PEER_ID,
+        );
         assert!(derived);
         assert_eq!(
             eff,
             vec![
-                "/ip4/203.0.113.7/tcp/9000".to_string(),
-                "/ip4/203.0.113.7/udp/9000/quic-v1".to_string(),
+                format!("/ip4/203.0.113.7/tcp/9000/p2p/{}", TEST_PEER_ID),
+                format!("/ip4/203.0.113.7/udp/9000/quic-v1/p2p/{}", TEST_PEER_ID),
             ]
         );
     }
@@ -463,10 +485,27 @@ mod tests {
             publish: true,
             multiaddrs: vec![],
         };
-        let (eff, derived) = compute_effective_multiaddrs(&cfg, 41720, None);
+        let (eff, derived) = compute_effective_multiaddrs(&cfg, 41720, None, TEST_PEER_ID);
         // auto_derived flagged true so the dashboard can surface
         // "publish enabled but no public_url" diagnostic, but the
         // effective list stays empty so we don't push junk on-chain.
+        assert!(derived);
+        assert!(eff.is_empty());
+    }
+
+    #[test]
+    fn effective_multiaddrs_auto_derive_missing_peer_id() {
+        // v0.45.1 hotfix path: peer_id empty (e.g. test constructor)
+        // ⇒ auto-derive returns empty with derived=true so the
+        // dashboard surfaces "publish enabled but peer_id missing"
+        // rather than pushing a /p2p-less multiaddr that sc_discovery
+        // would silently reject downstream.
+        let cfg = AnchorMetadataConfig {
+            publish: true,
+            multiaddrs: vec![],
+        };
+        let (eff, derived) =
+            compute_effective_multiaddrs(&cfg, 41720, Some("https://node.ogmara.org"), "");
         assert!(derived);
         assert!(eff.is_empty());
     }
@@ -521,6 +560,7 @@ fn compute_effective_multiaddrs(
     cfg: &crate::config::AnchorMetadataConfig,
     network_listen_port: u16,
     api_public_url: Option<&str>,
+    network_peer_id: &str,
 ) -> (Vec<String>, bool) {
     if !cfg.publish {
         return (Vec::new(), false);
@@ -528,13 +568,22 @@ fn compute_effective_multiaddrs(
     if !cfg.multiaddrs.is_empty() {
         return (cfg.multiaddrs.clone(), false);
     }
-    // Auto-derive. Pull the hostname from `[api] public_url` and pair
-    // it with the libp2p listen_port. We deliberately don't include a
-    // /p2p/<peer_id> suffix here — the consuming side (sc_discovery)
-    // dials the multiaddr and uses libp2p Identify to learn the peer
-    // id, matching how the seed list in `[network] bootstrap_peers`
-    // works today. Operators with non-trivial topology should set
-    // `multiaddrs` explicitly.
+    // Spec 13 §6.1 requires `/p2p/<peer_id>` in the auto-derived
+    // multiaddr — without it, `sc_discovery::persist_multiaddr` can't
+    // extract the storage key and silently drops the entry, defeating
+    // the whole tier 3 discovery path (v0.45.0 → 0.45.1 hotfix).
+    // Empty peer_id ⇒ auto-derive returns empty with the flag set so
+    // the dashboard can surface "publish enabled but peer_id missing".
+    if network_peer_id.is_empty() {
+        return (Vec::new(), true);
+    }
+    // Auto-derive. Pull the hostname from `[api] public_url`, pair it
+    // with the libp2p `[network] listen_port`, and suffix `/p2p/<peer_id>`
+    // (spec 13 §6.1). The peer_id is required by `sc_discovery::persist_multiaddr`
+    // which uses it as the PEER_DIRECTORY storage key — without it, the
+    // consumer silently drops the entry (v0.45.1 fix). Operators with
+    // non-trivial topology (NAT, anonymizer front, onion) set
+    // `multiaddrs` explicitly instead.
     let host = api_public_url.and_then(extract_host_from_url);
     let Some(host) = host else {
         // `publish=true` but we can't infer a host — return empty
@@ -553,9 +602,18 @@ fn compute_effective_multiaddrs(
     // Spec 13 §6.1: emit BOTH TCP and QUIC variants so dual-transport
     // dialers can choose. The libp2p listener binds both transports
     // on the same port (see NetworkService::new), so this is correct
-    // even though `listen_port` is single-valued in config.
-    let tcp = format!("/{}/{}/tcp/{}", proto, host, network_listen_port);
-    let quic = format!("/{}/{}/udp/{}/quic-v1", proto, host, network_listen_port);
+    // even though `listen_port` is single-valued in config. Each
+    // variant carries `/p2p/<self_peer_id>` so consumers can use the
+    // multiaddr as a complete dial target (v0.45.1 fix — without
+    // /p2p/, sc_discovery::persist_multiaddr rejects the entry).
+    let tcp = format!(
+        "/{}/{}/tcp/{}/p2p/{}",
+        proto, host, network_listen_port, network_peer_id
+    );
+    let quic = format!(
+        "/{}/{}/udp/{}/quic-v1/p2p/{}",
+        proto, host, network_listen_port, network_peer_id
+    );
     (vec![tcp, quic], true)
 }
 
@@ -651,6 +709,7 @@ pub async fn node_metadata(
         &state.anchor_metadata_config,
         state.network_listen_port,
         state.public_url.as_deref(),
+        &state.network_peer_id,
     );
 
     let on_chain_res = crate::chain::sc_views::get_node_metadata(

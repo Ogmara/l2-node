@@ -262,6 +262,13 @@ pub struct AppState {
     /// multiaddr when `[anchoring.metadata]` enables publish without
     /// explicit multiaddrs (spec 12 §2.10 + spec 13 §6.1).
     pub network_listen_port: u16,
+    /// Local libp2p peer-id (base58, e.g. `12D3KooW...`). Required by
+    /// the `[anchoring.metadata]` auto-derive path so the published
+    /// multiaddr includes `/p2p/<peer_id>` — without it,
+    /// `sc_discovery::persist_multiaddr` rejects the entry at the
+    /// consumer side (v0.45.0 → 0.45.1 hotfix: every consumer of the
+    /// multiaddr needs the peer_id at storage-key time).
+    pub network_peer_id: String,
     /// Snapshot of `[anchoring.metadata]` (publish flag + explicit
     /// multiaddrs). Drives `GET /admin/node/metadata`'s effective vs.
     /// on-chain diff. Cloned at startup — operators must restart to
@@ -378,6 +385,7 @@ impl AppState {
             anchor_divergence_counter,
             anchor_canonical_counter,
             0,                                              // network_listen_port — unused in tests
+            String::new(),                                  // network_peer_id — unused in tests
             crate::config::AnchorMetadataConfig::default(), // anchor_metadata_config
             false,                                          // anchor_pause_on_shutdown
             false,                                          // anchor_wallet_key_configured
@@ -418,6 +426,7 @@ impl AppState {
         anchor_divergence_counter: Arc<AtomicU32>,
         anchor_canonical_counter: Arc<AtomicU64>,
         network_listen_port: u16,
+        network_peer_id: String,
         anchor_metadata_config: crate::config::AnchorMetadataConfig,
         anchor_pause_on_shutdown: bool,
         anchor_wallet_key_configured: bool,
@@ -482,6 +491,7 @@ impl AppState {
             anchor_divergence_counter,
             anchor_canonical_counter,
             network_listen_port,
+            network_peer_id,
             anchor_metadata_config,
             anchor_pause_on_shutdown,
             anchor_wallet_key_configured,
