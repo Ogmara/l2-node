@@ -1284,6 +1284,14 @@ enable_mdns = true
 # Valid values: "testnet", "mainnet".
 # network_id = "testnet"
 
+[network.discovery]
+# Drop dial-candidate peers whose on-chain `lastAnchorAt` is older than
+# this many days (spec 13 §7). Tier 3 (SC registry) entries only; tier
+# 1 (peer book) and tier 2 (config bootstrap) carry no anchor timestamp.
+# Default 7. Local-only dev deployments may want a longer threshold;
+# production nodes should stick with the default.
+max_peer_staleness_days = 7
+
 [klever]
 node_url = ""
 api_url = ""
@@ -1299,13 +1307,35 @@ api_url = "http://127.0.0.1:5001"
 gateway_url = "http://127.0.0.1:8080"
 max_upload_size_mb = 50
 auto_thumbnail = true
+# Media handler tuning (v0.39+). All optional with sensible defaults
+# for a ~4 GiB-RAM VPS. Lower for resource-constrained nodes; raise
+# for high-readership deployments. See IpfsConfig field docs for the
+# safety constraints (validated at config-load).
+media_cache_total_mb = 256        # Total LRU weight cap
+media_cache_item_mb = 16          # Per-item insert cap; larger items stream
+media_handler_permits = 32        # Concurrent /api/v1/media/:cid handlers (global)
+media_per_ip_permits = 4          # Per-client-IP sub-cap (must be <= handler_permits)
+media_max_tracked_ips = 65536     # Hard cap on the per-IP limiter map
 
 [api]
 # Set to "0.0.0.0" to accept connections from all interfaces
 listen_addr = "127.0.0.1"
 listen_port = 41721
+# Public URL where this node's API is reachable from the public internet
+# (e.g. "https://node.example.org"). REQUIRED for:
+#   - inclusion in `/api/v1/network/nodes` advertising
+#   - [anchoring.metadata] auto-derive (spec 13 §6.1) to compute the
+#     /dns4|/ip4|/ip6 multiaddr the SC publishes on chain
+# v0.46.0 Phase D supports bracketed IPv6 (`http://[2001:db8::1]:41721`).
+# public_url = "https://node.example.org"
 cors_origins = ["http://localhost:*"]
 rate_limit_per_ip = 100
+# Trusted-proxy CIDRs for client-IP resolution behind a reverse proxy
+# (v0.42). Each entry is a CIDR (`"10.0.0.0/8"`, `"2001:db8::/32"`) or
+# a bare address (`"192.0.2.5"`, `"::1"`). Loopback is always implicitly
+# trusted. Leave empty for single-host deployments where Apache/nginx
+# sits on loopback in front of the node. Malformed entries abort startup.
+# trusted_proxies = []
 
 [api.pow]
 enabled = true
@@ -1336,7 +1366,29 @@ auth_token = ""
 [anchoring]
 enabled = false
 interval_seconds = 3600
-# wallet_key = ""  # optional, defaults to node identity key
+# wallet_key = ""  # optional, defaults to node identity key. Prefer
+# the OGMARA_ANCHOR_WALLET_KEY env var over putting the key in the
+# config file. v0.46.0 wraps this field in `secrecy::SecretString` so
+# the source is zeroized on drop and redacted in logs.
+# pause_on_shutdown = false  # spec 13 §6.3: if true, SIGTERM signs +
+# broadcasts pauseNode before exit. Requires wallet_key set. Opt-in
+# because it broadens the wallet-key threat surface (key held in
+# process memory for shutdown signing, not just during the anchor loop).
+
+[anchoring.metadata]
+# On-chain peer-discovery publication (spec 12 §2.10, spec 13 §6.1).
+# Opt-in — non-publishers still anchor and count toward quorum but
+# do not appear in `getActiveNodes` discovery output. This is the
+# first-class privacy mode per spec 13 §6.2.
+publish = false
+# When `publish = true` AND this list is empty, the node auto-derives
+# from [api] public_url + [network] listen_port:
+#   /dns4/<hostname>/tcp/<port>/p2p/<peer_id> + QUIC variant for DNS
+#   /ip4/<addr>/...                              for IPv4 literals
+#   /ip6/<addr>/...                              for routable IPv6 literals
+# Operators with non-trivial topology (NAT, load-balancer, anonymizer,
+# onion) set this explicitly. Cap: 8 entries × 256 bytes each (SC limit).
+multiaddrs = []
 
 [snapshot]
 # Peer-to-peer state snapshots (spec 11-snapshot-sync.md).
@@ -1384,6 +1436,28 @@ max_memory_usage_percent = 85
 # consecutive canonicalized heights show our local root differing from
 # the on-chain canonical root (spec 12 §6.1, spec 10 §9.2). Default: 2.
 anchor_divergence_consecutive = 2
+
+# --- Alert dispatcher backends (spec 10 §9.4) -------------------------
+# Each backend is independent; enable any subset. Secrets (bot_token,
+# webhook_url) should be loaded from environment variables in production
+# rather than written to the config file. The shipping pattern: leave
+# `enabled = false` here, set the secret env var, then flip enabled to
+# `true` in a deployment overlay or before container start.
+
+[alerts.telegram]
+enabled = false
+# chat_id = "-100123456789"
+# bot_token loaded from $TELEGRAM_BOT_TOKEN env var (preferred) —
+# avoid putting the token in this file.
+
+[alerts.discord]
+enabled = false
+# webhook_url loaded from $DISCORD_WEBHOOK_URL env var (preferred) —
+# avoid putting the URL in this file (it grants post-as-channel rights).
+
+[alerts.webhook]
+enabled = false
+# url = "https://example.org/ogmara-alert"
 
 [logging]
 level = "info"
@@ -1685,5 +1759,91 @@ mod tests {
         let cloned = cfg.clone();
         assert_eq!(cfg.wallet_key_hex(), cloned.wallet_key_hex());
         assert_eq!(cloned.wallet_key_hex(), Some(hex.as_str()));
+    }
+
+    // --- Config discoverability (v0.46.1) ----------------------------------
+    //
+    // `default_toml()` is the operator-facing surface: `ogmara-node init`
+    // writes it, the docker entrypoint auto-creates it, and `ogmara.example.toml`
+    // is regenerated from it. The tests below guard the discoverability
+    // contract — every operator-tunable section must be visible (commented
+    // or set) in the default, and the static example file must stay in sync.
+
+    #[test]
+    fn default_toml_includes_all_operator_tunable_sections() {
+        let s = Config::default_toml();
+        for section in &[
+            "[node]",
+            "[network]",
+            "[network.discovery]",
+            "[klever]",
+            "[ipfs]",
+            "[api]",
+            "[api.pow]",
+            "[api.admin]",
+            "[storage]",
+            "[cache]",
+            "[push_gateway]",
+            "[anchoring]",
+            "[anchoring.metadata]",
+            "[snapshot]",
+            "[metrics]",
+            "[alerts]",
+            "[alerts.cooldown]",
+            "[alerts.thresholds]",
+            "[alerts.telegram]",
+            "[alerts.discord]",
+            "[alerts.webhook]",
+            "[logging]",
+        ] {
+            assert!(
+                s.contains(section),
+                "default_toml must include `{}` section — operators rely on \
+                 `ogmara-node init` to expose every tunable surface",
+                section
+            );
+        }
+    }
+
+    #[test]
+    fn default_toml_documents_v046_knobs() {
+        // Sentinel field names that must appear (commented or set) so
+        // operators using `ogmara-node init` can discover the v0.45/v0.46
+        // surface area. Missing means the section header is there but
+        // a critical field inside isn't.
+        let s = Config::default_toml();
+        for needle in &[
+            "max_peer_staleness_days",   // [network.discovery]
+            "public_url",                // [api] — needed by auto-derive
+            "trusted_proxies",           // [api] — reverse-proxy IP resolution
+            "media_cache_total_mb",      // [ipfs]
+            "media_per_ip_permits",      // [ipfs] — v0.41 DoS mitigation
+            "pause_on_shutdown",         // [anchoring] — spec 13 §6.3
+            "publish",                   // [anchoring.metadata]
+        ] {
+            assert!(
+                s.contains(needle),
+                "default_toml must mention `{}` (commented is fine) so \
+                 operators can discover the knob",
+                needle
+            );
+        }
+    }
+
+    #[test]
+    fn ogmara_example_toml_matches_default_toml() {
+        // The static `ogmara.example.toml` shipped in the repo and the
+        // docker image MUST stay in sync with `default_toml()` (the
+        // single source of truth used by `ogmara-node init` and the
+        // docker entrypoint). When this test fails after changing
+        // `default_toml()`, regenerate the example file:
+        //   cargo run --release -- init -o ogmara.example.toml
+        let example = include_str!("../ogmara.example.toml");
+        let generated = Config::default_toml();
+        assert_eq!(
+            example, generated,
+            "ogmara.example.toml is out of sync with `Config::default_toml()`. \
+             Regenerate: `cargo run --release -- init -o ogmara.example.toml`"
+        );
     }
 }
