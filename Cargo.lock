@@ -2687,7 +2687,7 @@ dependencies = [
 
 [[package]]
 name = "ogmara-node"
-version = "0.45.1"
+version = "0.46.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2712,6 +2712,7 @@ dependencies = [
  "reqwest",
  "rmp-serde",
  "rocksdb",
+ "secrecy",
  "serde",
  "serde_json",
  "sha2",
@@ -3498,6 +3499,16 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
+
+[[package]]
+name = "secrecy"
+version = "0.10.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e891af845473308773346dc847b2c23ee78fe442e0472ac50e22a18a93d3ae5a"
+dependencies = [
+ "serde",
+ "zeroize",
+]
 
 [[package]]
 name = "security-framework"

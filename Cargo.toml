@@ -1,6 +1,6 @@
 [package]
 name = "ogmara-node"
-version = "0.45.1"
+version = "0.46.0"
 edition = "2021"
 authors = ["Ogmara Contributors"]
 license = "MIT"
@@ -71,6 +71,11 @@ toml = "1.1"
 
 # CLI
 clap = { version = "4.6", features = ["derive"] }
+
+# Secret-bearing strings — zeroize on drop, redact in Debug, no Serialize impl
+# by default. Wraps `AnchoringConfig.wallet_key` so the source field is not
+# process-resident beyond `expose_secret()` callsites (v0.46.0 Phase C / plan C1).
+secrecy = { version = "0.10", features = ["serde"] }
 
 # System metrics
 sysinfo = "0.34"

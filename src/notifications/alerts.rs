@@ -63,6 +63,14 @@ pub enum AlertType {
     /// bootstrap-stall recovery (spec 13 §4.3, l2-node 0.44.0+).
     /// Confirms the SC-fallback discovery layer engaged.
     BootstrapScFallbackUsed,
+    /// `[anchoring.metadata]` background reconciler detected that the
+    /// on-chain `getNodeMetadata(self)` differs from the desired
+    /// (configured / auto-derived) multiaddr list (spec 13 §6.1, spec
+    /// 10 §9.2, l2-node 0.46.0+). Detect-only — operator must click
+    /// Publish in the dashboard to reconcile (spec 12 §6.2 no-proxy-
+    /// signing rule). Cooldown bounds re-fire to one per hour even
+    /// though the reconcile tick is hourly too.
+    MetadataDriftDetected,
 }
 
 impl AlertType {
@@ -80,7 +88,8 @@ impl AlertType {
             | AlertType::FailedSignatureSpike
             | AlertType::NodeStarted
             | AlertType::AnchorDivergenceResolved
-            | AlertType::BootstrapScFallbackUsed => AlertSeverity::Info,
+            | AlertType::BootstrapScFallbackUsed
+            | AlertType::MetadataDriftDetected => AlertSeverity::Info,
         }
     }
 
@@ -99,6 +108,7 @@ impl AlertType {
             AlertType::FailedSignatureSpike => "Failed signature verification spike",
             AlertType::NodeStarted => "Node started",
             AlertType::BootstrapScFallbackUsed => "On-chain peer discovery engaged",
+            AlertType::MetadataDriftDetected => "On-chain metadata drifted from configured list",
         }
     }
 
@@ -117,6 +127,7 @@ impl AlertType {
             AlertType::FailedSignatureSpike => "high_failed_sigs",
             AlertType::NodeStarted => "node_started",
             AlertType::BootstrapScFallbackUsed => "bootstrap_sc_fallback_used",
+            AlertType::MetadataDriftDetected => "metadata_drift_detected",
         }
     }
 }

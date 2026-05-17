@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
+use secrecy::ExposeSecret;
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
@@ -587,39 +588,52 @@ impl Node {
             let anchor_canonical_for_task = anchor_canonical_counter.clone();
 
             // Resolve wallet key: env var > config file > node identity key.
-            // The hex string `wallet_key_hex` holds private-key material —
-            // zeroized after decoding (Security Audit W3).
-            let mut wallet_key_hex = std::env::var("OGMARA_ANCHOR_WALLET_KEY")
-                .unwrap_or_else(|_| anchor_config.wallet_key.clone());
+            // Both candidate sources are wrapped in `SecretString` so the
+            // hex source zeroizes on drop when this scope exits — no
+            // manual zeroize dance, no `unsafe` (v0.46.0 Phase C / plan C1
+            // replaces the v0.45.0 manual zeroize hot-loop).
+            let wallet_key_secret: Option<secrecy::SecretString> =
+                std::env::var("OGMARA_ANCHOR_WALLET_KEY")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .map(secrecy::SecretString::from)
+                    .or_else(|| anchor_config.wallet_key.clone());
 
-            let anchor_key = if wallet_key_hex.is_empty() {
-                info!("State anchoring using node identity key");
-                self.signing_key.clone()
-            } else {
-                let mut bytes = hex::decode(&wallet_key_hex)
-                    .context("decoding anchor wallet key hex")?;
-                let key_bytes: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
-                    anyhow::anyhow!("anchor wallet key must be 32 bytes, got {}", bytes.len())
-                })?;
-                let key = SigningKey::from_bytes(&key_bytes);
-                // Zeroize the intermediate secret material — both the
-                // decoded bytes AND the hex source. Note: `String` heap
-                // memory is freed without scrubbing by the allocator, so
-                // we overwrite-in-place before drop.
-                bytes.fill(0);
-                // SAFETY: we mutate the String's underlying bytes in place.
-                // We know they're valid UTF-8 (hex chars) on entry and we
-                // overwrite with '0' (0x30) which is also valid UTF-8.
-                unsafe {
-                    let v = wallet_key_hex.as_mut_vec();
-                    for b in v.iter_mut() {
-                        *b = b'0';
-                    }
+            let anchor_key = match wallet_key_secret.as_ref() {
+                None => {
+                    info!("State anchoring using node identity key");
+                    self.signing_key.clone()
                 }
-                info!("State anchoring using separate wallet key");
-                key
+                Some(secret) => {
+                    let hex_str = secret.expose_secret();
+                    let mut bytes = hex::decode(hex_str)
+                        .context("decoding anchor wallet key hex")?;
+                    let mut key_bytes: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+                        anyhow::anyhow!(
+                            "anchor wallet key must be 32 bytes, got {}",
+                            bytes.len()
+                        )
+                    })?;
+                    let key = SigningKey::from_bytes(&key_bytes);
+                    // Zeroize BOTH the decoded `bytes` Vec AND the
+                    // intermediate `[u8; 32]` array — neither is wrapped
+                    // by secrecy, both currently hold the raw private
+                    // key. SigningKey itself ZeroizeOnDrop per
+                    // ed25519-dalek 2.x, so `key`'s residence is bounded
+                    // by its own scope. The hex source drops + zeroizes
+                    // when `wallet_key_secret` falls out at the end of
+                    // this block (Phase C Security Audit N2).
+                    bytes.fill(0);
+                    key_bytes.fill(0);
+                    info!("State anchoring using separate wallet key");
+                    key
+                }
             };
-            drop(wallet_key_hex);
+            // Explicit drop is documentation-of-intent — `wallet_key_secret`
+            // would naturally scope-exit at the next `}`, but making the
+            // zeroize boundary visible at the line a reviewer looks for
+            // is worth the line (Phase C Code Audit N).
+            drop(wallet_key_secret);
             let anchor_shutdown_rx = self.shutdown_rx();
             let (trigger_tx, trigger_rx) = tokio::sync::mpsc::channel(1);
             let anchor_alert_for_task = anchor_alert_tx.clone();
@@ -807,6 +821,52 @@ impl Node {
         drop(sc_reconnect_tx);
         let _ = &alert_event_tx;
 
+        // Shared metadata-drift snapshot (spec 13 §6.1). Always
+        // allocated so the `node_metadata` admin endpoint can read
+        // unconditionally even when the reconciler is not spawned
+        // (anchoring disabled or `[anchoring.metadata] publish =
+        // false`). Reconciler — when spawned — is the sole writer.
+        let metadata_drift_handle =
+            crate::chain::metadata_reconcile::shared_metadata_drift();
+        if self.config.anchoring.enabled && self.config.anchoring.metadata.publish {
+            let recon_klever_url = self.config.klever.node_url.clone();
+            let recon_contract = self.config.klever.contract_address.clone();
+            let recon_node_addr = node_address.clone();
+            let recon_metadata_cfg = self.config.anchoring.metadata.clone();
+            let recon_listen_port = self.config.network.listen_port;
+            let recon_peer_id = network_peer_id.clone();
+            let recon_public_url = self.config.api.public_url.clone();
+            let recon_drift = metadata_drift_handle.clone();
+            let recon_alert_tx = if self.config.alerts.enabled {
+                Some(alert_event_tx.clone())
+            } else {
+                None
+            };
+            let recon_shutdown_rx = self.shutdown_rx();
+            tokio::spawn(async move {
+                match crate::chain::metadata_reconcile::MetadataReconciler::new(
+                    recon_klever_url,
+                    recon_contract,
+                    recon_node_addr,
+                    recon_metadata_cfg,
+                    recon_listen_port,
+                    recon_peer_id,
+                    recon_public_url,
+                    recon_drift,
+                    recon_alert_tx,
+                ) {
+                    Ok(recon) => recon.run(recon_shutdown_rx).await,
+                    Err(e) => warn!(error = %e, "Failed to start metadata_reconcile"),
+                }
+            });
+        } else {
+            debug!(
+                anchoring_enabled = self.config.anchoring.enabled,
+                publish_enabled = self.config.anchoring.metadata.publish,
+                "metadata_reconcile not spawned (anchoring or publish disabled)"
+            );
+        }
+
         // Resolve media-handler tuning from IpfsConfig. Anything the
         // operator left at default in ogmara.toml falls through to
         // `default_media_*` (see `config.rs`). Conversion to bytes is
@@ -874,8 +934,11 @@ impl Node {
             // True if a key is configured either in the config file
             // (legacy / non-recommended) or via the env var (preferred,
             // per AnchoringConfig.wallet_key doc). Read-only check —
-            // the key itself never lands on AppState.
-            !self.config.anchoring.wallet_key.is_empty()
+            // the key itself never lands on AppState. Uses
+            // `wallet_key_hex().is_some()` which returns true iff the
+            // SecretString-wrapped field deserialized to non-empty
+            // (custom deserializer normalises empty string to None).
+            self.config.anchoring.wallet_key_hex().is_some()
                 || std::env::var("OGMARA_ANCHOR_WALLET_KEY")
                     .map(|v| !v.is_empty())
                     .unwrap_or(false),
@@ -884,6 +947,16 @@ impl Node {
             // config (e.g. u32::MAX days). Default 7 days = 604_800s.
             (self.config.network.discovery.max_peer_staleness_days as u64)
                 .saturating_mul(24 * 3600),
+            // [network] bootstrap_nodes — feeds the tier-2 source in
+            // bootstrap-candidates union (spec 13 §4.5). Cloned once;
+            // operators restart to change.
+            self.config.network.bootstrap_nodes.clone(),
+            // Shared drift snapshot — written by the
+            // `metadata_reconcile` task (when spawned), read by the
+            // `node_metadata` admin endpoint. Always allocated even
+            // when the reconciler is not spawned so the admin
+            // endpoint can read unconditionally.
+            metadata_drift_handle.clone(),
         ));
         // Background sweep: drop zero-counter entries from the per-IP
         // media limiter (v0.41). Without this, the DashMap accumulates
@@ -1011,10 +1084,16 @@ fn load_or_generate_key(storage: &Storage) -> Result<SigningKey> {
         crate::storage::schema::cf::NODE_STATE,
         state_keys::NODE_PRIVATE_KEY,
     )? {
-        Some(bytes) if bytes.len() == 32 => {
+        Some(mut bytes) if bytes.len() == 32 => {
             let mut key_bytes = [0u8; 32];
             key_bytes.copy_from_slice(&bytes);
             let key = SigningKey::from_bytes(&key_bytes);
+            // Zeroize both copies of the raw private key — the storage
+            // Vec and the intermediate stack array. `SigningKey` itself
+            // is ZeroizeOnDrop per ed25519-dalek 2.x (Phase C Security
+            // Audit N2 sibling-site fix).
+            bytes.fill(0);
+            key_bytes.fill(0);
             info!("Loaded existing node identity key");
             Ok(key)
         }

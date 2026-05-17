@@ -348,9 +348,10 @@ fn format_klv(raw: u128) -> String {
 mod tests {
     use super::{
         build_set_metadata_calldata, compute_effective_multiaddrs, extract_host_from_url,
-        format_klv,
+        format_klv, is_ipv6_non_routable, HostKind,
     };
     use crate::config::AnchorMetadataConfig;
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
     #[test]
     fn klv_formatting() {
@@ -363,37 +364,97 @@ mod tests {
     }
 
     #[test]
-    fn host_extraction_basic() {
+    fn host_extraction_dns() {
         assert_eq!(
             extract_host_from_url("https://node.ogmara.org:1234/path"),
-            Some("node.ogmara.org".to_string())
+            Some(HostKind::Dns("node.ogmara.org".to_string()))
         );
         assert_eq!(
             extract_host_from_url("http://node.ogmara.org"),
-            Some("node.ogmara.org".to_string())
+            Some(HostKind::Dns("node.ogmara.org".to_string()))
         );
-        assert_eq!(
-            extract_host_from_url("https://1.2.3.4:8080"),
-            Some("1.2.3.4".to_string())
-        );
-        // IPv6 bracketed form rejected — operator must set multiaddrs explicitly.
-        assert_eq!(extract_host_from_url("http://[::1]:8080"), None);
-        // Unbracketed IPv6 — the previous trailing-port rsplit would
-        // have leaked through; now rejected (Code Audit W7).
-        assert_eq!(extract_host_from_url("http://::1:8080"), None);
-        // Control characters anywhere in the host (newline injection
-        // defense, Security Audit N4).
-        assert_eq!(extract_host_from_url("https://host\n.attacker.com"), None);
         // No scheme — treat the whole thing as authority.
         assert_eq!(
             extract_host_from_url("node.ogmara.org:9000"),
-            Some("node.ogmara.org".to_string())
+            Some(HostKind::Dns("node.ogmara.org".to_string()))
         );
         // Userinfo stripped.
         assert_eq!(
             extract_host_from_url("https://user:pass@node.ogmara.org:8443/x"),
-            Some("node.ogmara.org".to_string())
+            Some(HostKind::Dns("node.ogmara.org".to_string()))
         );
+    }
+
+    #[test]
+    fn host_extraction_ipv4() {
+        assert_eq!(
+            extract_host_from_url("https://1.2.3.4:8080"),
+            Some(HostKind::Ipv4(Ipv4Addr::new(1, 2, 3, 4)))
+        );
+        assert_eq!(
+            extract_host_from_url("http://203.0.113.7"),
+            Some(HostKind::Ipv4(Ipv4Addr::new(203, 0, 113, 7)))
+        );
+    }
+
+    #[test]
+    fn host_extraction_ipv6_bracketed() {
+        // v0.46.0 Phase D — bracketed IPv6 with port is now accepted.
+        assert_eq!(
+            extract_host_from_url("http://[::1]:8080"),
+            Some(HostKind::Ipv6(Ipv6Addr::LOCALHOST))
+        );
+        // Bracketed IPv6 without port.
+        assert_eq!(
+            extract_host_from_url("http://[2001:db8::1]"),
+            Some(HostKind::Ipv6("2001:db8::1".parse().unwrap()))
+        );
+        // Bracketed with path.
+        assert_eq!(
+            extract_host_from_url("http://[2001:db8::1]:9000/admin"),
+            Some(HostKind::Ipv6("2001:db8::1".parse().unwrap()))
+        );
+    }
+
+    #[test]
+    fn host_extraction_ipv6_malformed_rejected() {
+        // Missing closing bracket.
+        assert_eq!(extract_host_from_url("http://[::1:8080"), None);
+        // Garbage after closing bracket.
+        assert_eq!(extract_host_from_url("http://[::1]garbage"), None);
+        // Non-numeric port after closing bracket.
+        assert_eq!(extract_host_from_url("http://[::1]:abc"), None);
+        // Invalid IPv6 inside brackets.
+        assert_eq!(extract_host_from_url("http://[not-an-ipv6]:80"), None);
+    }
+
+    #[test]
+    fn host_extraction_unbracketed_ipv6_still_rejected() {
+        // Unbracketed IPv6 — the rsplit-on-colon port-strip would
+        // mis-truncate, so we reject. Operators must use bracketed form.
+        assert_eq!(extract_host_from_url("http://::1:8080"), None);
+    }
+
+    #[test]
+    fn host_extraction_control_chars_rejected() {
+        // Control characters anywhere in the host (newline injection
+        // defense, Security Audit N4).
+        assert_eq!(extract_host_from_url("https://host\n.attacker.com"), None);
+    }
+
+    #[test]
+    fn ipv6_routable_classification() {
+        // Routable — must pass.
+        assert!(!is_ipv6_non_routable(&"2001:db8::1".parse().unwrap()));
+        assert!(!is_ipv6_non_routable(&"fc00::1".parse().unwrap())); // ULA — allowed
+        assert!(!is_ipv6_non_routable(&"2620:0:2d0:200::7".parse().unwrap()));
+
+        // Non-routable — must reject.
+        assert!(is_ipv6_non_routable(&Ipv6Addr::LOCALHOST)); // ::1
+        assert!(is_ipv6_non_routable(&Ipv6Addr::UNSPECIFIED)); // ::
+        assert!(is_ipv6_non_routable(&"fe80::1".parse().unwrap())); // link-local
+        assert!(is_ipv6_non_routable(&"ff02::1".parse().unwrap())); // multicast
+        assert!(is_ipv6_non_routable(&"::ffff:1.2.3.4".parse().unwrap())); // IPv4-mapped
     }
 
     // Stable test peer-id — base58 of an arbitrary 32-byte key.
@@ -480,6 +541,59 @@ mod tests {
     }
 
     #[test]
+    fn effective_multiaddrs_auto_derive_ipv6() {
+        // v0.46.0 Phase D — v6-only operator can now use auto-derive
+        // (was: forced to set `multiaddrs` explicitly).
+        let cfg = AnchorMetadataConfig {
+            publish: true,
+            multiaddrs: vec![],
+        };
+        let (eff, derived) = compute_effective_multiaddrs(
+            &cfg,
+            41720,
+            Some("http://[2001:db8::1]:8443"),
+            TEST_PEER_ID,
+        );
+        assert!(derived);
+        assert_eq!(
+            eff,
+            vec![
+                format!("/ip6/2001:db8::1/tcp/41720/p2p/{}", TEST_PEER_ID),
+                format!("/ip6/2001:db8::1/udp/41720/quic-v1/p2p/{}", TEST_PEER_ID),
+            ]
+        );
+    }
+
+    #[test]
+    fn effective_multiaddrs_auto_derive_ipv6_non_routable_rejected() {
+        // Non-routable IPv6 returns empty + auto_derived=true so the
+        // dashboard can surface the same diagnostic shape as the
+        // missing-peer_id branch — emitting a link-local multiaddr on
+        // chain would waste consumer dial cycles (Phase A R5).
+        let cfg = AnchorMetadataConfig {
+            publish: true,
+            multiaddrs: vec![],
+        };
+        for unreachable in &[
+            "[::1]:8080",            // loopback
+            "[fe80::1]:8080",        // link-local
+            "[ff02::1]:8080",        // multicast
+            "[::]:8080",             // unspecified
+            "[::ffff:1.2.3.4]:8080", // IPv4-mapped — libp2p routes via v4 anyway
+        ] {
+            let url = format!("http://{}", unreachable);
+            let (eff, derived) =
+                compute_effective_multiaddrs(&cfg, 41720, Some(&url), TEST_PEER_ID);
+            assert!(derived, "auto_derived should stay true for {}", unreachable);
+            assert!(
+                eff.is_empty(),
+                "non-routable IPv6 {} must not emit a multiaddr",
+                unreachable
+            );
+        }
+    }
+
+    #[test]
     fn effective_multiaddrs_auto_derive_missing_url() {
         let cfg = AnchorMetadataConfig {
             publish: true,
@@ -556,7 +670,7 @@ mod tests {
 /// libp2p listen_port. Returns empty when `publish=false` or when
 /// auto-derive is requested but the host can't be parsed out of
 /// `public_url`.
-fn compute_effective_multiaddrs(
+pub(crate) fn compute_effective_multiaddrs(
     cfg: &crate::config::AnchorMetadataConfig,
     network_listen_port: u16,
     api_public_url: Option<&str>,
@@ -577,7 +691,7 @@ fn compute_effective_multiaddrs(
     if network_peer_id.is_empty() {
         return (Vec::new(), true);
     }
-    // Auto-derive. Pull the hostname from `[api] public_url`, pair it
+    // Auto-derive. Pull the host from `[api] public_url`, pair it
     // with the libp2p `[network] listen_port`, and suffix `/p2p/<peer_id>`
     // (spec 13 §6.1). The peer_id is required by `sc_discovery::persist_multiaddr`
     // which uses it as the PEER_DIRECTORY storage key — without it, the
@@ -591,13 +705,27 @@ fn compute_effective_multiaddrs(
         // SC's `Invalid multiaddr length` / parse check later.
         return (Vec::new(), true);
     };
-    // Prefer /dns4 for hostnames; /ip4 for literal IPv4. We don't
-    // attempt to detect IPv6 here — operators who run on a v6-only
-    // host must set `multiaddrs` explicitly.
-    let proto = if host.parse::<std::net::Ipv4Addr>().is_ok() {
-        "ip4"
-    } else {
-        "dns4"
+    // Branch by host kind. `/dns4` for hostnames, `/ip4` for IPv4
+    // literals, `/ip6` for routable IPv6 literals (v0.46.0 Phase D).
+    // Non-routable IPv6 (loopback, link-local, multicast, unspecified,
+    // IPv4-mapped) returns empty with auto_derived=true so the
+    // dashboard surfaces the diagnostic (matches the missing-peer_id
+    // branch shape) — emitting `/ip6/fe80::1/...` on chain would burn
+    // operator gas and waste consumers' dial cycles on an unreachable
+    // address (Phase A Risk R5 from the v0.46.0 plan).
+    let (proto, host_str) = match host {
+        HostKind::Dns(s) => ("dns4", s),
+        HostKind::Ipv4(ip) => ("ip4", ip.to_string()),
+        HostKind::Ipv6(ip) => {
+            if is_ipv6_non_routable(&ip) {
+                tracing::debug!(
+                    address = %ip,
+                    "compute_effective_multiaddrs: auto-derive skipped non-routable IPv6"
+                );
+                return (Vec::new(), true);
+            }
+            ("ip6", ip.to_string())
+        }
     };
     // Spec 13 §6.1: emit BOTH TCP and QUIC variants so dual-transport
     // dialers can choose. The libp2p listener binds both transports
@@ -608,21 +736,76 @@ fn compute_effective_multiaddrs(
     // /p2p/, sc_discovery::persist_multiaddr rejects the entry).
     let tcp = format!(
         "/{}/{}/tcp/{}/p2p/{}",
-        proto, host, network_listen_port, network_peer_id
+        proto, host_str, network_listen_port, network_peer_id
     );
     let quic = format!(
         "/{}/{}/udp/{}/quic-v1/p2p/{}",
-        proto, host, network_listen_port, network_peer_id
+        proto, host_str, network_listen_port, network_peer_id
     );
     (vec![tcp, quic], true)
 }
 
+/// Tagged host kind returned by [`extract_host_from_url`]. Drives the
+/// `/dns4` vs `/ip4` vs `/ip6` multiaddr-protocol selection in
+/// [`compute_effective_multiaddrs`]. Added in v0.46.0 Phase D so v6-only
+/// operators can run with `[anchoring.metadata] publish = true,
+/// multiaddrs = []` instead of being forced to set `multiaddrs`
+/// explicitly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HostKind {
+    /// Hostname (parsed as DNS — could be Punycode-encoded IDN).
+    Dns(String),
+    /// IPv4 literal.
+    Ipv4(std::net::Ipv4Addr),
+    /// IPv6 literal. Routability check (loopback / link-local /
+    /// multicast / unspecified / IPv4-mapped rejection) is the
+    /// consumer's responsibility — `extract_host_from_url` returns
+    /// every well-formed parse.
+    Ipv6(std::net::Ipv6Addr),
+}
+
+/// True iff the IPv6 address is in a non-routable range that would
+/// be useless to publish on-chain as a dial target. Rejects:
+/// - `::1/128` loopback
+/// - `::/128` unspecified
+/// - `ff00::/8` multicast
+/// - `fe80::/10` link-local
+/// - `::ffff:0:0/96` IPv4-mapped (libp2p dials those via IPv4 anyway)
+///
+/// Does NOT reject ULA (`fc00::/7`) or documentation (`2001:db8::/32`)
+/// — operators on private networks legitimately publish ULA, and
+/// documentation ranges are technically dialable on lab nets. Phase D
+/// design: false-positives (rejecting a valid addr) hurt operators;
+/// false-negatives (passing a bogus addr) only waste consumer dial
+/// cycles, which is recoverable.
+fn is_ipv6_non_routable(addr: &std::net::Ipv6Addr) -> bool {
+    addr.is_unspecified()
+        || addr.is_loopback()
+        || addr.is_multicast()
+        // Link-local fe80::/10 — first 10 bits are 1111111010.
+        || (addr.segments()[0] & 0xffc0 == 0xfe80)
+        // IPv4-mapped ::ffff:0:0/96 — libp2p would route via IPv4 anyway,
+        // so an operator publishing /ip6/::ffff:1.2.3.4 is misconfigured.
+        || addr.to_ipv4_mapped().is_some()
+}
+
 /// Extract the host portion of a URL like `https://node.ogmara.org:1234/path`.
 /// Returns `None` if no host can be found. Strips the userinfo (`user@`),
-/// the port (`:1234`), and the path. Bracketed IPv6 hosts (`[::1]`) are
-/// rejected — operators with an IPv6 endpoint must set `multiaddrs`
-/// explicitly because the libp2p multiaddr form differs.
-fn extract_host_from_url(url: &str) -> Option<String> {
+/// the port (`:1234`), and the path.
+///
+/// Three host kinds recognised:
+///   - **DNS name** — any non-empty ASCII-printable string without `:`
+///     or `[`. Punycode-encoded IDN works (it's ASCII).
+///   - **IPv4 literal** — auto-detected via `Ipv4Addr` parse on the
+///     extracted host.
+///   - **IPv6 literal** — bracketed form REQUIRED (`[::1]:8080`,
+///     `[2001:db8::1]/path`, etc.). Unbracketed forms are rejected
+///     because the rsplit-on-colon port-strip would mis-truncate them
+///     (and unbracketed IPv6 is non-standard in URLs anyway). Routability
+///     filtering is left to the caller (`compute_effective_multiaddrs`
+///     rejects loopback / link-local / multicast / unspecified /
+///     IPv4-mapped before emitting an on-chain multiaddr).
+fn extract_host_from_url(url: &str) -> Option<HostKind> {
     // Skip the scheme (everything up to "://").
     let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
     // Stop at the first '/', '?', or '#' — those start the path / query / fragment.
@@ -635,19 +818,44 @@ fn extract_host_from_url(url: &str) -> Option<String> {
         .rsplit_once('@')
         .map(|(_, h)| h)
         .unwrap_or(authority);
-    // Reject bracketed IPv6 — see fn-doc.
-    if host_port.starts_with('[') {
-        return None;
+
+    // Bracketed IPv6: `[<addr>]` or `[<addr>]:<port>`. Find the
+    // matching `]` and parse what's inside as an Ipv6Addr.
+    if let Some(stripped) = host_port.strip_prefix('[') {
+        let Some(end) = stripped.find(']') else {
+            // `[` without matching `]` — malformed.
+            return None;
+        };
+        let inner = &stripped[..end];
+        // Self-documenting guard: `[]` has empty inner and `parse`
+        // would also reject, but the early return makes the intent
+        // explicit (Phase D Security Audit N1).
+        if inner.is_empty() {
+            return None;
+        }
+        // Anything after `]` must be empty or `:<port>` — reject
+        // garbage like `[::1]xyz`. Port digit count is intentionally
+        // unbounded: the port from `public_url` is NEVER extracted
+        // here (the multiaddr port comes from `[network] listen_port`
+        // config), so an oversized or zero-padded port string is just
+        // ignored after the syntax check (Phase D Security Audit N2).
+        let trailing = &stripped[end + 1..];
+        if !(trailing.is_empty()
+            || (trailing.starts_with(':') && trailing[1..].chars().all(|c| c.is_ascii_digit())))
+        {
+            return None;
+        }
+        return inner.parse::<std::net::Ipv6Addr>().ok().map(HostKind::Ipv6);
     }
-    // Strip the port. rsplit_once on ':' so an IPv6 literal without
-    // brackets (already rejected above) wouldn't mis-truncate.
+
+    // Non-bracketed: strip the trailing `:<port>` if present.
     let host = host_port.rsplit_once(':').map(|(h, _)| h).unwrap_or(host_port);
     if host.is_empty() {
         return None;
     }
     // Reject any residual colon — unbracketed IPv6 like `http://::1:8080`
     // would otherwise leak through and produce an invalid multiaddr
-    // the SC rejects at publish time (Code Audit W7).
+    // the SC rejects at publish time (Code Audit W7 carried forward).
     if host.contains(':') {
         return None;
     }
@@ -658,7 +866,11 @@ fn extract_host_from_url(url: &str) -> Option<String> {
     if host.bytes().any(|b| !(0x21..=0x7e).contains(&b)) {
         return None;
     }
-    Some(host.to_string())
+    // IPv4 literal vs DNS name — try parsing as Ipv4Addr first.
+    if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
+        return Some(HostKind::Ipv4(ip));
+    }
+    Some(HostKind::Dns(host.to_string()))
 }
 
 /// Build the Klever-VM calldata string for `setNodeMetadata(multiaddrs)`.
@@ -750,6 +962,19 @@ pub async fn node_metadata(
         _ => serde_json::Value::Null,
     };
 
+    // Background reconciler's most-recent observation (spec 13 §6.1).
+    // `drift_detected` lets the dashboard render a yellow "On-chain
+    // metadata is out of sync — click Publish to update" banner even
+    // between operator-driven page loads; `drift_detected_at` lets
+    // the operator see how long the divergence has persisted.
+    let (drift_detected, drift_detected_at) = {
+        let snap = state.metadata_drift.read().await;
+        match snap.as_ref() {
+            Some(s) => (true, Some(s.detected_at)),
+            None => (false, None),
+        }
+    };
+
     Json(serde_json::json!({
         "wallet": wallet,
         "klever_network": state.klever_network,
@@ -763,6 +988,8 @@ pub async fn node_metadata(
         "in_sync": in_sync,
         "set_calldata": set_calldata,
         "clear_calldata": clear_calldata,
+        "drift_detected": drift_detected,
+        "drift_detected_at": drift_detected_at,
     }))
     .into_response()
 }
