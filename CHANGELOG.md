@@ -107,6 +107,16 @@ security-audited.
   on each startup and on a 1-hour timer"). Dashboard surfaces the
   diff on every load, but no background task drives auto-republish
   yet. Tracked for 0.46.0.
+- Divergence-panel framing on the Anchoring tab. When the network's
+  `last_canonical_height` is stuck at a historically-escalated height
+  (e.g. with < 3 active anchorers, the chain can't advance canonical),
+  the panel correctly reports `divergence_escalated = yes` but the
+  second-person wording ("Your node submitted a state root that
+  disagreed") incorrectly attributes the divergence to the operator's
+  local node. v0.46.0 will split the panel into a strictly-local
+  "Your node disagreed" section (gated on `consec > 0`) and a
+  neutral "Network divergence history at height H" section for the
+  chain-state read.
 
 ### Security
 - `submit_pause_for_shutdown` is the first feature where the node
