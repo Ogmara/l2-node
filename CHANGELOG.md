@@ -5,6 +5,56 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.45.1] - 2026-05-17
+
+Hotfix discovered during v0.45.0 bake-in (Test 4 sc_discovery stall
+trigger). Auto-derived multiaddrs from `[anchoring.metadata]
+publish = true` + empty `multiaddrs` omitted the `/p2p/<peer_id>`
+suffix, which caused `sc_discovery::persist_multiaddr` to reject
+every candidate at the consumer side ("multiaddr lacks /p2p/<peer_id>;
+skipping"). End effect: tier 3 (on-chain) discovery was broken for
+ANY operator using auto-derive — the documented happy path of
+spec 13 §6.1.
+
+Pre-fix bake-in observation: Odroid's cold-start fan-out fetched 7
+candidates from `getActiveNodes`, fetched their metadata, then
+persisted zero. The stall trigger fired correctly at +60s (security-
+hardened threshold-2 floor working), fetched the same 7 candidates,
+persisted zero again. Connectivity recovery via SC was effectively
+disabled.
+
+### Fixed
+- `compute_effective_multiaddrs` now appends `/p2p/<self_peer_id>`
+  to both auto-derived TCP and QUIC variants (spec 13 §6.1 compliance).
+  Empty peer_id is surfaced as `auto_derived=true, effective_multiaddrs=[]`
+  so the dashboard can render "publish enabled but peer_id missing"
+  rather than pushing a /p2p-less multiaddr.
+- `AppState` gains `network_peer_id: String` (base58 form), captured
+  from `NetworkService::local_peer_id()` post-construction.
+- Existing tests updated; new `effective_multiaddrs_auto_derive_missing_peer_id`
+  guards the empty-peer-id branch.
+
+### Migration
+- Operators currently published with v0.45.0 auto-derived multiaddrs
+  (missing `/p2p/`) should re-publish after upgrading to v0.45.1.
+  Existing published entries can be replaced via the dashboard's
+  "Clear on-chain metadata" → "Publish multiaddrs" round-trip, or by
+  calling `setNodeMetadata` with the new TCP+QUIC+/p2p form.
+
+### Security
+- **Privacy implication of auto-derive** (Security Audit W1 note):
+  Now that auto-derived multiaddrs include `/p2p/<peer_id>`, the
+  on-chain `getNodeMetadata` view exposes a *wallet ↔ libp2p peer_id*
+  binding readable by any chain observer without ever dialing the
+  node. Before v0.45.1 the same binding existed but was only learnable
+  via active dial + Identify. This is load-bearing for tier 3
+  discovery (and matches spec 13 §6.1's intent), but operators who
+  require *wallet/peer-id unlinkability* must keep
+  `[anchoring.metadata] publish = false` and rely on tier 1+2
+  discovery only. The first-class privacy profile defined in spec 13
+  §6.2 (non-publication) is unchanged and remains the way to opt
+  out of the binding entirely.
+
 ## [0.45.0] - 2026-05-16
 
 Network-resilience operator surface (spec 12 Phase 2 + spec 13).

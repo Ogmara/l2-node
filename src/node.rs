@@ -292,8 +292,9 @@ impl Node {
         .await
         .context("starting network service")?;
 
+        let network_peer_id = network.local_peer_id().to_string();
         info!(
-            peer_id = %network.local_peer_id(),
+            peer_id = %network_peer_id,
             "Network service started"
         );
 
@@ -867,6 +868,7 @@ impl Node {
             anchor_divergence_counter,
             anchor_canonical_counter,
             self.config.network.listen_port,
+            network_peer_id,
             self.config.anchoring.metadata.clone(),
             self.config.anchoring.pause_on_shutdown,
             // True if a key is configured either in the config file
