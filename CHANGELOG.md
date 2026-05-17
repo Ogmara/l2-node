@@ -5,6 +5,46 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.46.2] - 2026-05-17
+
+Hotfix for the v0.37.0 partial-edit projection: the merged payload
+was re-emitted with `rmp_serde::to_vec`, which encodes structs as
+msgpack **arrays** (positional). The original (non-edited) post is
+authored by the JS SDK using `@msgpack/msgpack`, which emits
+**maps** (named fields). JS clients decode by name, so every
+edited news post and edited chat message rendered blank in the UI
+— title, content, tags, and attachments all read `undefined` —
+even though the projection itself was correctly preserving the
+field values.
+
+### Fixed
+- **Edit projection now re-emits the merged payload as a msgpack
+  map.** `project_edited_payload` in `src/api/routes.rs` uses
+  `rmp_serde::to_vec_named` for both `NewsPost` and `ChatMessage`
+  branches. Rust clients continue to decode happily (rmp_serde
+  accepts both map and array struct encodings); JS clients now see
+  field names and render the merged title/content/tags/attachments
+  exactly as they appear on never-edited posts. Symptoms before
+  the fix on the desktop / web / mobile clients: every edited post
+  loses its topic, body text, attachments, and tags after the
+  client re-fetches. No on-disk migration needed — the projection
+  runs at read time off the stored edit envelope, so the next
+  request after this binary lands serves correct map-encoded
+  bytes for every existing edit in storage.
+
+### Added
+- **Four regression tests in `edit_projection_tests`**
+  (`src/api/routes.rs`):
+  - `news_post_reencodes_as_msgpack_map_not_array` — first byte in
+    fixmap range (0x80-0x8f) rather than fixarray (0x90-0x9f).
+  - `news_post_named_roundtrip_preserves_every_field` — round-trip
+    safety after the encoding swap.
+  - `attachments_inner_struct_is_also_map_encoded` — guards
+    against partial fixes that flip the outer struct but keep the
+    nested `Attachment` as a positional array.
+  - `chat_message_reencodes_as_msgpack_map_not_array` — same
+    invariant for chat edits, which share the projection branch.
+
 ## [0.46.1] - 2026-05-17
 
 Config discoverability + docker bootstrap UX patch. No runtime

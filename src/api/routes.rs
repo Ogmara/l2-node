@@ -244,6 +244,15 @@ fn project_edited_payload(
     // are encrypted ciphertext blobs whose validator forbids field
     // overrides — so comments and DMs return None and the caller blanks
     // the payload (consistent privacy fail-safe).
+    // Re-encode with `to_vec_named` (struct → msgpack MAP), not `to_vec`
+    // (struct → msgpack ARRAY). JS clients (`@msgpack/msgpack`) decode the
+    // payload by field name — an array-encoded merge result deserializes as
+    // a positional JS array, so `.title`, `.content`, `.tags`, `.attachments`
+    // all read `undefined` and every edited post renders blank. The original
+    // posts arrive map-encoded because they're authored by the SDK, which
+    // emits maps; for parity we must re-emit maps here too. (Rust clients
+    // accept both forms, so existing rmp_serde::from_slice callers stay
+    // happy.) Same fix applies to ChatMessage edits below.
     match orig_env.msg_type {
         MessageType::NewsPost => {
             let mut p: NewsPostPayload = match rmp_serde::from_slice(&orig_env.payload) {
@@ -254,7 +263,7 @@ fn project_edited_payload(
             if let Some(t) = edit.title { p.title = t; }
             if let Some(t) = edit.tags { p.tags = t; }
             if let Some(a) = edit.attachments { p.attachments = a; }
-            rmp_serde::to_vec(&p)
+            rmp_serde::to_vec_named(&p)
                 .map_err(|e| warn_decode("news_post_reencode", &e))
                 .ok()
         }
@@ -265,7 +274,7 @@ fn project_edited_payload(
             };
             p.content = edit.content;
             if let Some(a) = edit.attachments { p.attachments = a; }
-            rmp_serde::to_vec(&p)
+            rmp_serde::to_vec_named(&p)
                 .map_err(|e| warn_decode("chat_reencode", &e))
                 .ok()
         }
@@ -5744,6 +5753,99 @@ mod media_tests {
         assert_eq!(
             resolve_client_ip(peer, &headers, &empty_proxies()),
             IpAddr::V4(Ipv4Addr::new(4, 4, 4, 4))
+        );
+    }
+}
+
+#[cfg(test)]
+mod edit_projection_tests {
+    //! Regression guards for the read-time edit projection in
+    //! `project_edited_payload`. The bug they catch: re-emitting the merged
+    //! payload with `rmp_serde::to_vec` (struct → msgpack ARRAY) instead of
+    //! `rmp_serde::to_vec_named` (struct → msgpack MAP). JS clients decode
+    //! by field name; the array form makes every field on an edited post
+    //! read `undefined` and the post renders blank in the UI.
+    use crate::messages::types::{
+        Attachment, ChatMessagePayload, ContentRating, NewsPostPayload, Visibility,
+    };
+
+    fn sample_news() -> NewsPostPayload {
+        NewsPostPayload {
+            title: "T".into(),
+            content: "C".into(),
+            content_rating: ContentRating::General,
+            tags: vec!["a".into()],
+            attachments: vec![Attachment {
+                cid: "Qm".into(),
+                mime_type: "image/png".into(),
+                size_bytes: 1,
+                filename: Some("p.png".into()),
+                thumbnail_cid: None,
+            }],
+            visibility: Visibility::default(),
+        }
+    }
+
+    fn sample_chat() -> ChatMessagePayload {
+        ChatMessagePayload {
+            channel_id: 1,
+            content: "C".into(),
+            content_rating: ContentRating::General,
+            reply_to: None,
+            mentions: vec![],
+            attachments: vec![],
+        }
+    }
+
+    #[test]
+    fn news_post_reencodes_as_msgpack_map_not_array() {
+        let bytes = rmp_serde::to_vec_named(&sample_news()).expect("encode named");
+        // 0x80-0x8f = fixmap, 0xde = map16, 0xdf = map32. NewsPostPayload
+        // has ≤15 fields so fixmap is the expected prefix. Array would be
+        // 0x90-0x9f and trigger the bug this test guards.
+        assert!(
+            (0x80..=0x8f).contains(&bytes[0]),
+            "expected msgpack map (0x80..=0x8f), got 0x{:02x} (array would be 0x90..=0x9f)",
+            bytes[0]
+        );
+    }
+
+    #[test]
+    fn news_post_named_roundtrip_preserves_every_field() {
+        let p = sample_news();
+        let bytes = rmp_serde::to_vec_named(&p).expect("encode named");
+        let decoded: NewsPostPayload = rmp_serde::from_slice(&bytes).expect("decode");
+        assert_eq!(decoded.title, p.title);
+        assert_eq!(decoded.content, p.content);
+        assert_eq!(decoded.tags, p.tags);
+        assert_eq!(decoded.attachments.len(), p.attachments.len());
+    }
+
+    #[test]
+    fn attachments_inner_struct_is_also_map_encoded() {
+        // `to_vec_named` is recursive; the nested Attachment must serialize
+        // with named fields too. A partial fix that only swapped the outer
+        // call but kept arrays for nested values would still render blank
+        // attachments client-side.
+        let bytes = rmp_serde::to_vec_named(&sample_news()).expect("encode named");
+        for needle in ["cid", "mime_type", "size_bytes", "filename", "thumbnail_cid"] {
+            assert!(
+                bytes.windows(needle.len()).any(|w| w == needle.as_bytes()),
+                "attachment field name {:?} missing from named encoding",
+                needle
+            );
+        }
+    }
+
+    #[test]
+    fn chat_message_reencodes_as_msgpack_map_not_array() {
+        // ChatMessagePayload is reached via the same projection branch in
+        // `project_edited_payload`; same fix applies.
+        let bytes = rmp_serde::to_vec_named(&sample_chat()).expect("encode named");
+        assert!(
+            (0x80..=0x8f).contains(&bytes[0]) || bytes[0] == 0xde || bytes[0] == 0xdf,
+            "expected msgpack map, got 0x{:02x}",
+            bytes[0]
         );
     }
 }
