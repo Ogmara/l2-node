@@ -5,6 +5,67 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.46.4] - 2026-05-18
+
+Small-network anchor-verification opt-out, re-introducing v0.35's
+`experimental_skip_anchor_verify` flag that was removed in v0.36.
+
+### Why
+
+Phase 3 made Klever anchor re-verification mandatory because in a
+real multi-anchorer network it is the strongest defense against a
+malicious snapshot producer. The receiver calls `getStateRoot(height)`
+on the SC for each anchor in the snapshot — but `getStateRoot`
+returns only the quorum-canonical root, and the SC promotes a
+height's root to `canonical_anchor` only when `ANCHOR_QUORUM_MIN`
+(=3) distinct anchorers have all submitted the same root for that
+height.
+
+On a single-anchorer testnet (or any deployment with fewer than 3
+active anchorers) that precondition is **structurally
+unsatisfiable**: production anchors at height H → SC records it in
+`anchor_submission(H, anchorer)` ✓ but never promotes to
+`canonical_anchor(H)` because the quorum size of 1 < 3.
+`getStateRoot(H)` then returns `Anchor not found` for every recent
+height. The receiver's anti-downgrade ratchet (audit Sec W1)
+correctly refuses after >2 NotAnchored newer claims, and snapshot
+bootstrap fails on every fresh node — a hard wall for any
+small-network testing or initial mainnet rollout before quorum is
+reached.
+
+### Added
+- **`[snapshot] experimental_skip_anchor_verify` flag** (default
+  `false`). When `true`, the snapshot client short-circuits the
+  Klever anchor-verification loop entirely. The remaining trust
+  chain is **quorum agreement + per-chunk hash + Merkle re-rollup
+  + producer Ed25519 signature** — what v0.35 shipped before Phase 3
+  added the on-chain layer.
+- **Loud `warn!` log** whenever the flag is true, naming the
+  `manifest.block_height` and `last_verified_anchor_height` of the
+  applied snapshot so operators always see they're running in
+  trust-the-producer mode.
+- **`cutoff_height` fallback to `manifest.block_height`** when
+  skipping verification (vs. the verified-anchor-height that the
+  Klever path returns). Chain scanner picks up from the snapshot's
+  capture height.
+
+### Changed
+- **The "Anchor verification failed" warning** now mentions the
+  flag explicitly so single-anchorer testnet operators don't have
+  to grep the source to find the escape hatch: `… If you're on a
+  single-anchorer testnet, this is expected because the SC requires
+  3+ distinct anchorers to canonicalize. Set [snapshot]
+  experimental_skip_anchor_verify = true to bypass.`
+- **`default_toml()` and `ogmara.example.toml`** carry an inline
+  comment block explaining the trade-off so operators can't enable
+  this flag without understanding what they're giving up.
+
+### Pairs with
+- smart-contract is unchanged. `ANCHOR_QUORUM_MIN = 3` stays as-is.
+  This patch is purely L2-side and lets the receiver explicitly
+  trust the snapshot's producer-signed claims when on-chain quorum
+  cannot exist by design.
+
 ## [0.46.3] - 2026-05-17
 
 Small-network operator UX patch. Snapshot bootstrap requires

@@ -155,6 +155,17 @@ manifest_timeout_secs = 10
 chunk_timeout_secs = 60
 max_total_bytes = 2147483648             # 2 GiB hard cap on snapshot size
 
+# DANGEROUS — TESTNET / SMALL-NETWORK ONLY. Skip the Klever
+# `getStateRoot` re-verification of every anchor in the received
+# snapshot. The SC requires ANCHOR_QUORUM_MIN=3 distinct anchorers
+# to agree on a state root before promoting it to canonical, so
+# `getStateRoot` returns "Anchor not found" on networks with fewer
+# than 3 active anchorers. Setting this true short-circuits the
+# anchor loop while still requiring quorum + Merkle + producer
+# signature. Leave false in production. A loud warning is logged
+# at startup whenever this is true.
+experimental_skip_anchor_verify = false
+
 [metrics]
 enabled = true
 system_interval_seconds = 10

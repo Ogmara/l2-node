@@ -1065,21 +1065,49 @@ pub async fn run_bootstrap(
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .context("building HTTP client for Klever anchor verify")?;
-    let anchor_result = match verify_anchors_against_klever(
-        anchor_chunks,
-        &http,
-        klever_node_url,
-        contract_address,
-    )
-    .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            warn!(error = %e, "Anchor verification failed — falling back to chain scan");
-            return Ok(None);
-        }
+    // Small-network escape hatch (re-introduced in v0.46.4). On a
+    // network with fewer than ANCHOR_QUORUM_MIN (=3) active anchorers,
+    // the SC's `getStateRoot` returns "Anchor not found" for every
+    // recent height — no quorum has been reached, so no
+    // canonical_anchor entry exists. The anti-downgrade ratchet then
+    // correctly refuses the snapshot. Operators who control all the
+    // anchorers (testnet, dev pair) can opt out of the Klever check
+    // explicitly. Quorum + Merkle + producer Ed25519 sig still apply.
+    let cutoff_height = if config.experimental_skip_anchor_verify {
+        warn!(
+            block_height = manifest.block_height,
+            last_verified_anchor_height = manifest.last_verified_anchor_height,
+            "experimental_skip_anchor_verify=true — bypassing Klever anchor re-verification. \
+             Use ONLY when you control every anchorer and the SC quorum precondition can't \
+             be satisfied. Production deployments must leave this flag false."
+        );
+        // Without Klever verification, the safe cutoff is the
+        // manifest's block_height (where the snapshot was captured).
+        // The chain scanner picks up from there.
+        manifest.block_height
+    } else {
+        let anchor_result = match verify_anchors_against_klever(
+            anchor_chunks,
+            &http,
+            klever_node_url,
+            contract_address,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "Anchor verification failed — falling back to chain scan. \
+                     If you're on a single-anchorer testnet, this is expected because \
+                     the SC requires 3+ distinct anchorers to canonicalize. Set \
+                     [snapshot] experimental_skip_anchor_verify = true to bypass."
+                );
+                return Ok(None);
+            }
+        };
+        anchor_result.cutoff_height
     };
-    let cutoff_height = anchor_result.cutoff_height;
 
     // Run apply in spawn_blocking — multi-CF clear+write is not async.
     let storage_for_apply = storage.clone();

@@ -652,6 +652,37 @@ pub struct SnapshotConfig {
     /// (sum of `CfManifest.total_bytes`). Reject manifests beyond this.
     #[serde(default = "default_snapshot_max_total_bytes")]
     pub max_total_bytes: u64,
+    /// **DANGEROUS — TESTNET / SMALL-NETWORK ONLY.** Skip the Klever
+    /// `getStateRoot` re-verification of every anchor in the received
+    /// snapshot before applying it.
+    ///
+    /// Phase 3 (v0.36) made anchor verification mandatory because in a
+    /// real multi-anchorer network it's the strongest defense against
+    /// a malicious snapshot producer — `getStateRoot` returns only the
+    /// quorum-canonical root (`ANCHOR_QUORUM_MIN` = 3 distinct
+    /// anchorers must agree on the same root for any given height
+    /// before the SC promotes it to canonical). On a single-anchorer
+    /// testnet that threshold can never be satisfied → `getStateRoot`
+    /// always returns "Anchor not found" → the receiver's
+    /// anti-downgrade ratchet (audit Sec W1) trips after >2 newer
+    /// NotAnchored claims and the apply is refused.
+    ///
+    /// Setting this flag to `true` short-circuits the entire anchor
+    /// loop. The receiver still verifies quorum (the snapshot root
+    /// must be agreed by `quorum_min_peers` peers), Merkle (every
+    /// chunk hash-checked + rolled up to the manifest's
+    /// `snapshot_root`), and the producer's Ed25519 signature. What
+    /// is given up is the on-chain truth check — if your single
+    /// trusted producer is dishonest, you have no Klever-based
+    /// independent witness.
+    ///
+    /// Use this exclusively on networks where you control every
+    /// participant and the SC's quorum precondition is genuinely
+    /// unsatisfiable. Production deployments must leave this `false`
+    /// (the default). A loud warning is logged at startup whenever
+    /// it is `true`.
+    #[serde(default)]
+    pub experimental_skip_anchor_verify: bool,
 }
 
 impl Default for SnapshotConfig {
@@ -672,6 +703,7 @@ impl Default for SnapshotConfig {
             manifest_timeout_secs: default_snapshot_manifest_timeout(),
             chunk_timeout_secs: default_snapshot_chunk_timeout(),
             max_total_bytes: default_snapshot_max_total_bytes(),
+            experimental_skip_anchor_verify: false,
         }
     }
 }
@@ -1423,6 +1455,17 @@ discovery_timeout_secs = 30
 manifest_timeout_secs = 10
 chunk_timeout_secs = 60
 max_total_bytes = 2147483648             # 2 GiB hard cap on snapshot size
+
+# DANGEROUS — TESTNET / SMALL-NETWORK ONLY. Skip the Klever
+# `getStateRoot` re-verification of every anchor in the received
+# snapshot. The SC requires ANCHOR_QUORUM_MIN=3 distinct anchorers
+# to agree on a state root before promoting it to canonical, so
+# `getStateRoot` returns "Anchor not found" on networks with fewer
+# than 3 active anchorers. Setting this true short-circuits the
+# anchor loop while still requiring quorum + Merkle + producer
+# signature. Leave false in production. A loud warning is logged
+# at startup whenever this is true.
+experimental_skip_anchor_verify = false
 
 [metrics]
 enabled = true
