@@ -313,6 +313,13 @@ pub struct AppState {
     /// tier-2 source in the `bootstrap-candidates` REST union (spec 13
     /// §4.5). Cloned once — operators must restart to change.
     pub bootstrap_nodes: Vec<String>,
+    /// Snapshot of `[network.sc_discovery] enabled` at startup. When
+    /// `false`, the `bootstrap-candidates` handler MUST NOT call any
+    /// Klever SC views for the tier-3 source — the operator is in
+    /// isolated-subnet mode (spec 13 §4.2, l2-node 0.46.5+) and the
+    /// audit invariant requires zero on-chain RPC traffic from the
+    /// discovery path.
+    pub sc_discovery_enabled: bool,
     /// Shared drift snapshot written by the
     /// [`crate::chain::metadata_reconcile::MetadataReconciler`] task
     /// (spec 13 §6.1) and read by the `node_metadata` admin endpoint.
@@ -402,6 +409,7 @@ impl AppState {
             false,                                          // anchor_wallet_key_configured
             7 * 24 * 3600,                                  // max_peer_staleness_secs — 7d default
             Vec::new(),                                     // bootstrap_nodes — empty in tests
+            true,                                           // sc_discovery_enabled — on by default
             crate::chain::metadata_reconcile::shared_metadata_drift(),
         )
     }
@@ -445,6 +453,7 @@ impl AppState {
         anchor_wallet_key_configured: bool,
         max_peer_staleness_secs: u64,
         bootstrap_nodes: Vec<String>,
+        sc_discovery_enabled: bool,
         metadata_drift: crate::chain::metadata_reconcile::SharedMetadataDrift,
     ) -> Self {
         // moka LRU with size-weighted eviction. `weigher` returns the
@@ -514,6 +523,7 @@ impl AppState {
             bootstrap_candidates_refresh: Arc::new(tokio::sync::Mutex::new(())),
             max_peer_staleness_secs,
             bootstrap_nodes,
+            sc_discovery_enabled,
             metadata_drift,
         }
     }

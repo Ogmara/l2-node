@@ -774,51 +774,80 @@ impl Node {
         }
         // Suppress unused-warning on the always-allocated sender until
         // sc_discovery wiring lands later in this method.
-        // v0.44.0: SC peer-discovery background task (spec 13 §4.3
-        // tier 3). Runs an immediate cold-start fan-out if the peer
-        // book is below threshold, then a 1h-cadence steady-state
-        // refresh. Disabled cleanly if klever.node_url or
-        // contract_address are unset (warned + idle until shutdown).
+        // SC peer-discovery background task (spec 13 §4.3 tier 3,
+        // promoted to primary boot path in 0.46.5 per spec 13 §4.2).
+        // Runs an immediate cold-start fan-out if the peer book is
+        // below threshold, then a 1h-cadence steady-state refresh. In
+        // pure-SC mode (`bootstrap_nodes = []`) the cold-start fan-out
+        // retries every `retry_interval_secs` until a peer is found.
+        //
+        // Disabled cleanly when:
+        //   - `[network.sc_discovery] enabled = false` (isolated subnet
+        //     mode — operator opt-out; the config validator already
+        //     rejects the both-empty case, so this implies non-empty
+        //     `bootstrap_nodes`).
+        //   - `klever.node_url` or `contract_address` are unset (no
+        //     way to query the SC — the task warns and idles internally).
         //
         // Sender side of the reconnect channel is consumed here; the
         // matching receiver was attached to `network.run` earlier so
         // out-of-cycle dial-persisted-peers triggers fire within
         // seconds of a fresh persist.
-        let sc_disc_klever_url = self.config.klever.node_url.clone();
-        let sc_disc_contract = self.config.klever.contract_address.clone();
-        let sc_disc_storage = self.storage.clone();
-        let sc_disc_self_addr = node_address.clone();
-        let sc_disc_alert_tx = if self.config.alerts.enabled {
-            Some(alert_event_tx.clone())
+        if !self.config.network.sc_discovery.enabled {
+            // Isolated-subnet mode (spec 13 §4.2). Audit invariant:
+            // no Klever API call paths for peer discovery in this
+            // mode — log loudly so the operator sees confirmation.
+            tracing::info!(
+                bootstrap_nodes_count = self.config.network.bootstrap_nodes.len(),
+                "sc_discovery: disabled by config (isolated subnet mode — \
+                 the on-chain registry will NOT be queried for peer discovery)"
+            );
         } else {
-            None
-        };
-        let sc_disc_shutdown_rx = self.shutdown_rx();
-        let sc_disc_reconnect_tx = sc_reconnect_tx.clone();
-        // Capture the staleness cutoff before the spawn so the async
-        // block doesn't need `self`.
-        let sc_disc_staleness_secs = (self.config.network.discovery.max_peer_staleness_days
-            as u64)
-            .saturating_mul(24 * 3600);
-        tokio::spawn(async move {
-            match crate::network::sc_discovery::ScDiscovery::new(
-                sc_disc_klever_url,
-                sc_disc_contract,
-                sc_disc_storage,
-                sc_disc_self_addr,
-                sc_disc_reconnect_tx,
-                sc_disc_alert_tx,
-                identify_success_count,
-                sc_added_peer_ids,
-                // Same staleness cutoff that `bootstrap-candidates`
-                // uses — spec 13 §7 mandates a single config-driven
-                // value across both consumers.
-                sc_disc_staleness_secs,
-            ) {
-                Ok(disc) => disc.run(sc_disc_shutdown_rx).await,
-                Err(e) => warn!(error = %e, "Failed to start sc_discovery"),
-            }
-        });
+            let sc_disc_klever_url = self.config.klever.node_url.clone();
+            let sc_disc_contract = self.config.klever.contract_address.clone();
+            let sc_disc_storage = self.storage.clone();
+            let sc_disc_self_addr = node_address.clone();
+            let sc_disc_alert_tx = if self.config.alerts.enabled {
+                Some(alert_event_tx.clone())
+            } else {
+                None
+            };
+            let sc_disc_shutdown_rx = self.shutdown_rx();
+            let sc_disc_reconnect_tx = sc_reconnect_tx.clone();
+            // Capture the staleness cutoff before the spawn so the async
+            // block doesn't need `self`.
+            let sc_disc_staleness_secs = (self.config.network.discovery.max_peer_staleness_days
+                as u64)
+                .saturating_mul(24 * 3600);
+            let sc_disc_retry_interval = std::time::Duration::from_secs(
+                self.config.network.sc_discovery.retry_interval_secs,
+            );
+            let sc_disc_bootstrap_empty = self.config.network.bootstrap_nodes.is_empty();
+            let sc_disc_max_candidates =
+                self.config.network.sc_discovery.max_candidates as usize;
+            tokio::spawn(async move {
+                match crate::network::sc_discovery::ScDiscovery::new(
+                    sc_disc_klever_url,
+                    sc_disc_contract,
+                    sc_disc_storage,
+                    sc_disc_self_addr,
+                    sc_disc_reconnect_tx,
+                    sc_disc_alert_tx,
+                    identify_success_count,
+                    sc_added_peer_ids,
+                    // Same staleness cutoff that `bootstrap-candidates`
+                    // uses — spec 13 §7 mandates a single config-driven
+                    // value across both consumers.
+                    sc_disc_staleness_secs,
+                    sc_disc_retry_interval,
+                    sc_disc_bootstrap_empty,
+                    sc_disc_max_candidates,
+                ) {
+                    Ok(disc) => disc.run(sc_disc_shutdown_rx).await,
+                    Err(e) => warn!(error = %e, "Failed to start sc_discovery"),
+                }
+            });
+        }
         // Suppress unused-warning on the original sender — we only
         // need the clone we passed to the task; the parent's copy
         // would just sit idle.
@@ -955,6 +984,12 @@ impl Node {
             // bootstrap-candidates union (spec 13 §4.5). Cloned once;
             // operators restart to change.
             self.config.network.bootstrap_nodes.clone(),
+            // [network.sc_discovery] enabled — when false (isolated
+            // subnet mode, spec 13 §4.2), the bootstrap-candidates
+            // handler skips tier-3 entirely so no Klever SC views
+            // are called from the discovery path. Audit invariant
+            // for the politically-resilient operator profile.
+            self.config.network.sc_discovery.enabled,
             // Shared drift snapshot — written by the
             // `metadata_reconcile` task (when spawned), read by the
             // `node_metadata` admin endpoint. Always allocated even

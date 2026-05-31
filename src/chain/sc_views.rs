@@ -606,6 +606,182 @@ pub async fn get_active_nodes(
     Ok(out)
 }
 
+// ── Transport classifier (spec 13 §4.5, l2-node 0.46.5+) ────────────
+
+/// Coarse transport tag derived from a multiaddr's protocol stack.
+/// Used to surface "high-resilience mode available" in dashboards and
+/// to let SDK consumers filter peer candidates by reachability profile
+/// without having to parse multiaddrs themselves (spec 13 §4.5).
+///
+/// Classification is client-side and intentionally permissive:
+/// unrecognized protocol stacks degrade to [`TransportKind::Unknown`]
+/// rather than triggering an error so a forward-compat SC change
+/// (new transport string published via `setNodeMetadata`) does not
+/// break older nodes — they just emit `unknown` until they're upgraded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TransportKind {
+    /// Public-internet transport: `/ip4`, `/ip6`, `/dns4`, `/dns6`,
+    /// `/dns` followed by `/tcp` or `/udp + /quic-v1`.
+    Clearnet,
+    /// Tor onion service: `/onion` or `/onion3`.
+    Onion,
+    /// I2P garlic routing: `/garlic` (reserved — no current
+    /// implementation; emit if and when an operator publishes one).
+    I2p,
+    /// Anything else (loopback `/ip4/127.0.0.1`, future protocols,
+    /// malformed payloads). Caller decides whether to dial these.
+    Unknown,
+}
+
+impl TransportKind {
+    /// Lowercase wire string used by REST responses and dashboards.
+    /// Stable identifier — clients pin against these values, so any
+    /// rename here is a breaking API change.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TransportKind::Clearnet => "clearnet",
+            TransportKind::Onion => "onion",
+            TransportKind::I2p => "i2p",
+            TransportKind::Unknown => "unknown",
+        }
+    }
+}
+
+/// Classify a multiaddr string by its outermost transport-meaningful
+/// protocol prefix. Routable-clearnet detection parses the multiaddr's
+/// IP component (when present) and rejects all non-routable ranges,
+/// not just loopback — defense against a hostile node operator who
+/// publishes a private-network or cloud-metadata multiaddr via
+/// `setNodeMetadata` to trick SDK consumers into surfacing or dialing
+/// internal targets (Security Audit W1, 0.46.5).
+///
+/// Rules (first match wins, scanned left-to-right):
+/// - Contains `/onion3/` or `/onion/` → [`TransportKind::Onion`]
+/// - Contains `/garlic/` → [`TransportKind::I2p`]
+/// - `/ip4/<addr>/...` or `/ip6/<addr>/...` with `<addr>` in any
+///   non-routable range (loopback, RFC1918, link-local + AWS/Azure
+///   metadata endpoint at 169.254.169.254, ULA, unspecified,
+///   broadcast, CGNAT, IPv4-mapped IPv6, multicast) →
+///   [`TransportKind::Unknown`]. The dial decision still belongs to
+///   libp2p; we just refuse to *advertise* internal targets as
+///   "clearnet" via the discovery API.
+/// - `/dns4/`, `/dns6/`, `/dns/`, or routable `/ip4|6/` host + `/tcp/`
+///   or (`/udp/` + `/quic`) → [`TransportKind::Clearnet`]
+/// - Anything else → [`TransportKind::Unknown`]
+///
+/// NOTE: `/webrtc-direct/`, `/wss/`, `/ws/` and other browser-oriented
+/// transports are intentionally not yet classified as `Clearnet` —
+/// they degrade to `Unknown` until a future revision adds explicit
+/// handling. SDK consumers filtering on `clearnet` therefore see only
+/// TCP / QUIC, which is the v0.46.5 deployment surface.
+pub fn classify_transport(multiaddr_str: &str) -> TransportKind {
+    // Onion check first — onion multiaddrs may also include /tcp/, but
+    // they should classify as Onion regardless.
+    if multiaddr_str.contains("/onion3/") || multiaddr_str.contains("/onion/") {
+        return TransportKind::Onion;
+    }
+    if multiaddr_str.contains("/garlic/") {
+        return TransportKind::I2p;
+    }
+
+    // For /ip4/ and /ip6/ multiaddrs, parse the IP literal and require
+    // it to be in a publicly-routable range. Anything else (private,
+    // link-local incl. metadata-endpoint 169.254.169.254, ULA,
+    // loopback, multicast, unspecified, broadcast, IPv4-mapped IPv6,
+    // CGNAT) classifies as Unknown rather than Clearnet (Security
+    // Audit W1 0.46.5: prevents a hostile node operator from
+    // publishing a private-network target as a discovery candidate
+    // that dashboards / SDKs would surface as a normal-looking peer).
+    let host_routable = if let Some(rest) = multiaddr_str.strip_prefix("/ip4/") {
+        let lit = rest.split('/').next().unwrap_or("");
+        match lit.parse::<std::net::Ipv4Addr>() {
+            Ok(ip) => ipv4_is_publicly_routable(&ip),
+            Err(_) => false,
+        }
+    } else if let Some(rest) = multiaddr_str.strip_prefix("/ip6/") {
+        let lit = rest.split('/').next().unwrap_or("");
+        match lit.parse::<std::net::Ipv6Addr>() {
+            Ok(ip) => ipv6_is_publicly_routable(&ip),
+            Err(_) => false,
+        }
+    } else if multiaddr_str.starts_with("/dns4/")
+        || multiaddr_str.starts_with("/dns6/")
+        || multiaddr_str.starts_with("/dns/")
+    {
+        // DNS names: we don't resolve here (would leak to a DNS
+        // provider and add latency to every classification). Treat
+        // as routable for the transport tag; libp2p / the dialer is
+        // still responsible for honouring SOCKS5 / refusing private
+        // resolutions at dial time.
+        true
+    } else {
+        false
+    };
+    let has_transport = multiaddr_str.contains("/tcp/")
+        || (multiaddr_str.contains("/udp/") && multiaddr_str.contains("/quic"));
+    if host_routable && has_transport {
+        return TransportKind::Clearnet;
+    }
+    TransportKind::Unknown
+}
+
+/// True iff the IPv4 address is in a globally-routable unicast range.
+/// Rejects loopback, RFC1918 private, link-local (incl. cloud
+/// metadata endpoints), unspecified, broadcast, and CGNAT
+/// (100.64.0.0/10). `is_unique_local` / `is_shared` are
+/// nightly-only on `Ipv4Addr`, so the CGNAT check is inlined.
+fn ipv4_is_publicly_routable(ip: &std::net::Ipv4Addr) -> bool {
+    if ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || ip.is_unspecified()
+        || ip.is_broadcast()
+        || ip.is_multicast()
+        || ip.is_documentation()
+    {
+        return false;
+    }
+    let o = ip.octets();
+    // CGNAT 100.64.0.0/10 — RFC6598. `Ipv4Addr::is_shared` is unstable.
+    if o[0] == 100 && (o[1] & 0xc0) == 0x40 {
+        return false;
+    }
+    true
+}
+
+/// True iff the IPv6 address is in a globally-routable unicast range.
+/// Rejects loopback, unspecified, ULA `fc00::/7`, link-local
+/// `fe80::/10`, multicast `ff00::/8`, and IPv4-mapped `::ffff:0:0/96`.
+fn ipv6_is_publicly_routable(ip: &std::net::Ipv6Addr) -> bool {
+    if ip.is_loopback() || ip.is_unspecified() {
+        return false;
+    }
+    let s = ip.segments();
+    // Multicast ff00::/8
+    if (s[0] & 0xff00) == 0xff00 {
+        return false;
+    }
+    // ULA fc00::/7 (`is_unique_local` is unstable).
+    if (s[0] & 0xfe00) == 0xfc00 {
+        return false;
+    }
+    // Link-local fe80::/10 (`is_unicast_link_local` is unstable).
+    if (s[0] & 0xffc0) == 0xfe80 {
+        return false;
+    }
+    // IPv4-mapped ::ffff:0:0/96 — accidentally classifying these as
+    // routable IPv6 would re-introduce the IPv4 attack surface this
+    // function is meant to close.
+    if s[0..5].iter().all(|&x| x == 0) && s[5] == 0xffff {
+        return false;
+    }
+    // Documentation 2001:db8::/32.
+    if s[0] == 0x2001 && s[1] == 0x0db8 {
+        return false;
+    }
+    true
+}
+
 // ── Decoding helpers ────────────────────────────────────────────────
 
 /// Decode a u64 from minimal big-endian raw bytes (used by
@@ -692,5 +868,196 @@ mod tests {
             let encoded = encode_u64_minimal_hex(v);
             assert_eq!(decode_u64_be(&encoded), v, "round-trip for {}", v);
         }
+    }
+
+    // --- Transport classifier (spec 13 §4.5, 0.46.5+) ----------------
+
+    #[test]
+    fn classify_clearnet_dns_tcp() {
+        assert_eq!(
+            classify_transport("/dns4/example.org/tcp/41720/p2p/12D3KooW..."),
+            TransportKind::Clearnet
+        );
+    }
+
+    #[test]
+    fn classify_clearnet_dns_quic() {
+        assert_eq!(
+            classify_transport("/dns4/example.org/udp/41720/quic-v1/p2p/12D3KooW..."),
+            TransportKind::Clearnet
+        );
+    }
+
+    #[test]
+    fn classify_clearnet_ip4_tcp() {
+        // 1.1.1.1 (Cloudflare DNS) — unambiguously routable public IPv4.
+        assert_eq!(
+            classify_transport("/ip4/1.1.1.1/tcp/41720/p2p/12D3KooW..."),
+            TransportKind::Clearnet
+        );
+    }
+
+    #[test]
+    fn classify_onion3() {
+        assert_eq!(
+            classify_transport("/onion3/abc123/tcp/41720/p2p/12D3KooW..."),
+            TransportKind::Onion
+        );
+    }
+
+    #[test]
+    fn classify_onion_legacy() {
+        assert_eq!(
+            classify_transport("/onion/abc123/tcp/41720/p2p/12D3KooW..."),
+            TransportKind::Onion
+        );
+    }
+
+    #[test]
+    fn classify_garlic_is_i2p() {
+        assert_eq!(
+            classify_transport("/garlic/abc123/tcp/41720/p2p/12D3KooW..."),
+            TransportKind::I2p
+        );
+    }
+
+    #[test]
+    fn classify_loopback_is_unknown() {
+        // Loopback isn't useful as a cross-node bootstrap candidate.
+        assert_eq!(
+            classify_transport("/ip4/127.0.0.1/tcp/41720/p2p/12D3KooW..."),
+            TransportKind::Unknown
+        );
+        assert_eq!(
+            classify_transport("/ip6/::1/tcp/41720/p2p/12D3KooW..."),
+            TransportKind::Unknown
+        );
+    }
+
+    #[test]
+    fn classify_rfc1918_is_unknown() {
+        // Security Audit W1 (0.46.5): hostile node operators must not
+        // be able to publish a private-network multiaddr that the
+        // discovery API surfaces as "clearnet" and an SDK would dial.
+        for raw in [
+            "/ip4/10.0.0.1/tcp/41720/p2p/12D3KooW...",
+            "/ip4/172.16.0.1/tcp/41720/p2p/12D3KooW...",
+            "/ip4/172.31.255.254/tcp/41720/p2p/12D3KooW...",
+            "/ip4/192.168.1.1/tcp/41720/p2p/12D3KooW...",
+        ] {
+            assert_eq!(
+                classify_transport(raw),
+                TransportKind::Unknown,
+                "RFC1918 must be Unknown, not Clearnet: {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_link_local_and_metadata_endpoint_is_unknown() {
+        // The cloud-metadata endpoint at 169.254.169.254 lives inside
+        // the link-local range — explicitly tested because a hostile
+        // SC publisher pointing here against an unsuspecting SDK
+        // consumer would otherwise smuggle metadata-endpoint queries.
+        assert_eq!(
+            classify_transport("/ip4/169.254.169.254/tcp/80/p2p/12D3KooW..."),
+            TransportKind::Unknown
+        );
+        assert_eq!(
+            classify_transport("/ip4/169.254.0.1/tcp/41720/p2p/12D3KooW..."),
+            TransportKind::Unknown
+        );
+        // IPv6 link-local + ULA + multicast + unspecified.
+        assert_eq!(
+            classify_transport("/ip6/fe80::1/tcp/41720/p2p/12D3KooW..."),
+            TransportKind::Unknown
+        );
+        assert_eq!(
+            classify_transport("/ip6/fc00::1/tcp/41720/p2p/12D3KooW..."),
+            TransportKind::Unknown
+        );
+        assert_eq!(
+            classify_transport("/ip6/fd12:3456::1/tcp/41720/p2p/12D3KooW..."),
+            TransportKind::Unknown
+        );
+        assert_eq!(
+            classify_transport("/ip6/ff02::1/tcp/41720/p2p/12D3KooW..."),
+            TransportKind::Unknown
+        );
+        assert_eq!(
+            classify_transport("/ip6/::/tcp/41720/p2p/12D3KooW..."),
+            TransportKind::Unknown
+        );
+        // IPv4-mapped IPv6 must NOT smuggle a private IPv4 back in.
+        assert_eq!(
+            classify_transport("/ip6/::ffff:10.0.0.1/tcp/41720/p2p/12D3KooW..."),
+            TransportKind::Unknown
+        );
+    }
+
+    #[test]
+    fn classify_special_ip4_ranges_are_unknown() {
+        // CGNAT, unspecified, broadcast, documentation, multicast.
+        for raw in [
+            "/ip4/100.64.0.1/tcp/41720/p2p/12D3KooW...",
+            "/ip4/100.127.255.254/tcp/41720/p2p/12D3KooW...",
+            "/ip4/0.0.0.0/tcp/41720/p2p/12D3KooW...",
+            "/ip4/255.255.255.255/tcp/41720/p2p/12D3KooW...",
+            "/ip4/192.0.2.1/tcp/41720/p2p/12D3KooW...",     // RFC5737 doc
+            "/ip4/224.0.0.1/tcp/41720/p2p/12D3KooW...",     // multicast
+        ] {
+            assert_eq!(
+                classify_transport(raw),
+                TransportKind::Unknown,
+                "special-range IPv4 must be Unknown: {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_routable_ipv4_is_clearnet() {
+        // 203.0.113.5 lives in RFC5737 TEST-NET-3 (documentation
+        // range), so it correctly classifies as Unknown — covers the
+        // doc-range exclusion path. 8.8.8.8 below is the true-positive
+        // boundary for routable public IPv4.
+        assert_eq!(
+            classify_transport("/ip4/203.0.113.5/tcp/41720/p2p/12D3KooW..."),
+            TransportKind::Unknown
+        );
+        // 8.8.8.8 is unambiguously public.
+        assert_eq!(
+            classify_transport("/ip4/8.8.8.8/tcp/41720/p2p/12D3KooW..."),
+            TransportKind::Clearnet
+        );
+        // Routable IPv6 (Cloudflare).
+        assert_eq!(
+            classify_transport("/ip6/2606:4700::1111/tcp/41720/p2p/12D3KooW..."),
+            TransportKind::Clearnet
+        );
+    }
+
+    #[test]
+    fn classify_garbage_is_unknown() {
+        assert_eq!(classify_transport(""), TransportKind::Unknown);
+        assert_eq!(classify_transport("not-a-multiaddr"), TransportKind::Unknown);
+        // Future protocol with no /tcp or /quic transport.
+        assert_eq!(
+            classify_transport("/dns4/example.org/webrtc-direct/p2p/12D3KooW..."),
+            TransportKind::Unknown
+        );
+        // Malformed IP literal — must NOT default to Clearnet.
+        assert_eq!(
+            classify_transport("/ip4/not.an.ip/tcp/41720/p2p/12D3KooW..."),
+            TransportKind::Unknown
+        );
+    }
+
+    #[test]
+    fn transport_kind_as_str_stable() {
+        // Wire string contract — clients pin these.
+        assert_eq!(TransportKind::Clearnet.as_str(), "clearnet");
+        assert_eq!(TransportKind::Onion.as_str(), "onion");
+        assert_eq!(TransportKind::I2p.as_str(), "i2p");
+        assert_eq!(TransportKind::Unknown.as_str(), "unknown");
     }
 }

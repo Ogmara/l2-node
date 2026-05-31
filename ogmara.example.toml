@@ -3,12 +3,15 @@ data_dir = "./data"
 
 [network]
 listen_port = 41720
-# Official Ogmara bootstrap nodes — required for peer discovery.
-# New nodes must connect to at least one bootstrap node to join the network.
-bootstrap_nodes = [
-    "/dns4/node.ogmara.org/tcp/41720/p2p/12D3KooWNx9TnsmVQux3fMm6sUUe5tFdeXjECUSyDqYtYfsbt3Mo",
-    "/dns4/node.ogmara.org/udp/41720/quic-v1/p2p/12D3KooWNx9TnsmVQux3fMm6sUUe5tFdeXjECUSyDqYtYfsbt3Mo",
-]
+# Bootstrap peer multiaddrs (spec 13 §4.2).
+#
+# Empty default → pure SC-driven discovery: the node queries
+# getActiveNodes + getNodeMetadata on the Ogmara KApp to find peers.
+# Populate with explicit peer multiaddrs (including /p2p/<peer_id>) to
+# either supplement SC discovery (hybrid mode, sc_discovery.enabled =
+# true) or replace it entirely (isolated subnet, sc_discovery.enabled
+# = false). See [network.sc_discovery] below.
+bootstrap_nodes = []
 max_peers = 50
 enable_mdns = true
 # Network isolation: auto-detected from klever.node_url if not set.
@@ -22,6 +25,25 @@ enable_mdns = true
 # Default 7. Local-only dev deployments may want a longer threshold;
 # production nodes should stick with the default.
 max_peer_staleness_days = 7
+
+[network.sc_discovery]
+# SC-driven bootstrap control surface (spec 13 §4.2, l2-node 0.46.5+).
+# `enabled = true` (default) keeps the node discovering peers from the
+# on-chain registry. Set `enabled = false` together with an explicit
+# `bootstrap_nodes` list to run an isolated subnet that never queries
+# Klever for peer discovery (useful where Klever endpoints are
+# geo-blocked or surveilled). The both-empty case is rejected at
+# config-load.
+enabled = true
+# Cold-start retry cadence (seconds). When bootstrap_nodes is empty
+# and the peer book is empty, the discovery task retries on this
+# cadence until at least one peer is persisted. Once warm, it falls
+# back to the steady-state 1-hour periodic refresh.
+retry_interval_secs = 60
+# Maximum peers to dial per cold-start fan-out. The fan-out still
+# PERSISTS up to 256 peers (matches PEER_DIRECTORY cap); this knob
+# caps the immediate dial set so a fresh node doesn't burst-connect.
+max_candidates = 5
 
 [klever]
 node_url = ""

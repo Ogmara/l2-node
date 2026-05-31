@@ -13,6 +13,13 @@
 //!   - On startup (early — within ~60s of `NetworkService::run`
 //!     entering its loop) if the peer book has fewer than
 //!     `BOOTSTRAP_SC_FALLBACK_BOOK_THRESHOLD` entries.
+//!   - **Cold-start retry loop (0.46.5+)** — when
+//!     `bootstrap_nodes = []` AND the peer book is empty AND the
+//!     initial fan-out persisted zero peers, the task retries every
+//!     `retry_interval` (default 60s) until at least one peer is
+//!     persisted OR `identify_success_count > 0` (some other discovery
+//!     path produced a peer). This makes tier 3 the primary boot path
+//!     when no static peers are configured (spec 13 §4.2 / §4.3).
 //!   - Periodically every `BOOTSTRAP_SC_REFRESH_INTERVAL` (1h) during
 //!     steady-state operation to keep the persisted book in sync with
 //!     operator churn (new registrations, paused nodes, unregistrations).
@@ -136,9 +143,31 @@ pub struct ScDiscovery {
     /// `sc_discovery` and `bootstrap-candidates` agree on the cutoff
     /// (Spec Compliance gap #3).
     peer_staleness_secs: u64,
+    /// Cold-start retry cadence (0.46.5+). Only consulted when
+    /// `bootstrap_nodes_empty == true` — that's the case where tier 3
+    /// is the only bootstrap path and the task must keep trying if
+    /// Klever RPC is briefly unreachable. Default 60s
+    /// (`[network.sc_discovery] retry_interval_secs`).
+    cold_start_retry_interval: Duration,
+    /// True iff the operator left `bootstrap_nodes = []` (pure-SC
+    /// mode). Drives whether the cold-start branch retries or one-shots
+    /// — in hybrid mode (`bootstrap_nodes` non-empty) the explicit
+    /// peers are the primary path and the existing 60s stall-trigger
+    /// handles the "all bootstrap peers unreachable" recovery.
+    bootstrap_nodes_empty: bool,
+    /// Per-fan-out cap on candidates evaluated. Default 5
+    /// (`[network.sc_discovery] max_candidates`). The `getActiveNodes`
+    /// pagination still pulls up to `MAX_SC_DISCOVERY_TOTAL = 256`
+    /// total, but after the staleness / self-exclusion filter the
+    /// list is truncated to this cap before per-candidate metadata
+    /// fetches — keeps the cold-start initial dial set small while
+    /// preserving the larger candidate pool for the steady-state 1h
+    /// refresh (which uses `usize::MAX` as cap).
+    cold_start_max_candidates: usize,
 }
 
 impl ScDiscovery {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         klever_node_url: String,
         contract_address: String,
@@ -149,10 +178,28 @@ impl ScDiscovery {
         identify_success_count: Arc<AtomicU64>,
         sc_added_peer_ids: Arc<RwLock<HashSet<PeerId>>>,
         peer_staleness_secs: u64,
+        cold_start_retry_interval: Duration,
+        bootstrap_nodes_empty: bool,
+        cold_start_max_candidates: usize,
     ) -> anyhow::Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
             .build()?;
+        // Defense-in-depth: `Config::validate` already rejects
+        // `max_candidates == 0` at config-load, but if a future
+        // caller constructs `ScDiscovery` directly the bad value
+        // would otherwise make the cold-start loop spin forever
+        // persisting nothing. Clamp loudly so the misconfiguration
+        // is visible in journald.
+        let cold_start_max_candidates = if cold_start_max_candidates == 0 {
+            warn!(
+                "sc_discovery: cold_start_max_candidates was 0 (should have been rejected \
+                 by config validation); clamping to 5"
+            );
+            5
+        } else {
+            cold_start_max_candidates
+        };
         Ok(Self {
             klever_node_url,
             contract_address,
@@ -165,6 +212,9 @@ impl ScDiscovery {
             identify_success_count,
             sc_added_peer_ids,
             peer_staleness_secs,
+            cold_start_retry_interval,
+            bootstrap_nodes_empty,
+            cold_start_max_candidates,
         })
     }
 
@@ -184,6 +234,8 @@ impl ScDiscovery {
             contract = %self.contract_address,
             refresh_interval_secs = BOOTSTRAP_SC_REFRESH_INTERVAL.as_secs(),
             staleness_threshold_days = self.peer_staleness_secs / 86400,
+            cold_start_retry_secs = self.cold_start_retry_interval.as_secs(),
+            bootstrap_nodes_empty = self.bootstrap_nodes_empty,
             "sc_discovery started (spec 13 §4.3 tier 3)"
         );
 
@@ -209,7 +261,44 @@ impl ScDiscovery {
                 threshold = BOOTSTRAP_SC_FALLBACK_BOOK_THRESHOLD,
                 "sc_discovery: cold-start detected, running immediate SC fan-out"
             );
-            self.fan_out_once().await;
+            // Pure-SC mode (`bootstrap_nodes = []`): tier 3 is the only
+            // boot path, so retry on `cold_start_retry_interval` until
+            // we either persist a peer OR another discovery path
+            // (DHT/mDNS/inbound) produces one. Hybrid mode
+            // (`bootstrap_nodes` non-empty) keeps the original one-shot
+            // behaviour — the 60s stall-trigger handles the recovery
+            // case where the explicit peers are unreachable.
+            if self.bootstrap_nodes_empty {
+                let cap = self.cold_start_max_candidates;
+                loop {
+                    let persisted = self.fan_out_once(cap).await;
+                    let identified =
+                        self.identify_success_count.load(Ordering::Relaxed);
+                    if persisted > 0 || identified > 0 {
+                        debug!(
+                            persisted,
+                            identified,
+                            "sc_discovery: cold-start retry loop exiting — \
+                             tier 3 or another discovery path produced peers"
+                        );
+                        break;
+                    }
+                    warn!(
+                        retry_secs = self.cold_start_retry_interval.as_secs(),
+                        "sc_discovery: cold-start fan-out produced 0 peers; \
+                         retrying (pure-SC mode, bootstrap_nodes = [])"
+                    );
+                    tokio::select! {
+                        _ = tokio::time::sleep(self.cold_start_retry_interval) => {}
+                        _ = shutdown_rx.recv() => {
+                            debug!("sc_discovery: shutdown during cold-start retry");
+                            return;
+                        }
+                    }
+                }
+            } else {
+                self.fan_out_once(self.cold_start_max_candidates).await;
+            }
         } else {
             debug!(
                 book_count,
@@ -239,7 +328,9 @@ impl ScDiscovery {
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    self.fan_out_once().await;
+                    // Steady-state refresh uses an uncapped fan-out so
+                    // newly-registered operators flow into the book.
+                    let _ = self.fan_out_once(usize::MAX).await;
                 }
                 _ = &mut stall_check, if !stall_check_done => {
                     stall_check_done = true;
@@ -263,7 +354,7 @@ impl ScDiscovery {
                             "sc_discovery: stall trigger — insufficient Identify events from \
                              tiers 1+2 within window, firing SC fan-out"
                         );
-                        self.fan_out_once().await;
+                        let _ = self.fan_out_once(usize::MAX).await;
                     } else {
                         debug!(
                             identifies,
@@ -282,15 +373,25 @@ impl ScDiscovery {
     /// Execute a single fan-out: query the SC for active nodes, fetch
     /// metadata, filter, persist new multiaddrs, signal reconnect.
     ///
+    /// `max_candidates` caps the post-filter candidate set evaluated
+    /// for metadata fetch + persist. Cold-start passes
+    /// `cold_start_max_candidates` (default 5) for a small initial
+    /// dial set; steady-state passes `usize::MAX` so the full
+    /// `getActiveNodes` page flows into the book.
+    ///
+    /// Returns the number of new multiaddrs persisted in this run.
+    /// Used by the cold-start retry loop to decide whether another
+    /// attempt is needed.
+    ///
     /// Errors from any SC call are logged at debug level and skipped
     /// — sc_discovery is best-effort and shouldn't take the node down
     /// if Klever RPC is briefly unreachable.
-    async fn fan_out_once(&mut self) {
+    async fn fan_out_once(&mut self, max_candidates: usize) -> usize {
         let now = match SystemTime::now().duration_since(UNIX_EPOCH) {
             Ok(d) => d.as_secs(),
             Err(_) => {
                 debug!("sc_discovery: system clock before epoch, skipping");
-                return;
+                return 0;
             }
         };
         let staleness_cutoff = now.saturating_sub(self.peer_staleness_secs);
@@ -332,14 +433,14 @@ impl ScDiscovery {
                         offset,
                         "sc_discovery: getActiveNodes failed; aborting this run"
                     );
-                    return;
+                    return 0;
                 }
             }
         }
 
         if collected.is_empty() {
             debug!("sc_discovery: SC returned 0 active nodes");
-            return;
+            return 0;
         }
 
         // Filter by staleness and self-exclusion. The SC's
@@ -370,11 +471,34 @@ impl ScDiscovery {
 
         if candidates.is_empty() {
             debug!("sc_discovery: 0 candidates survived filtering");
-            return;
+            return 0;
+        }
+
+        // Apply caller-supplied cap on candidates evaluated. Cold-start
+        // passes a small cap (default 5) for a focused initial dial
+        // set; steady-state passes `usize::MAX`.
+        //
+        // Security Audit W3 (0.46.5): randomize before truncating so
+        // a coordinated attacker who controls early `getActiveNodes`
+        // ordering (e.g., by registering + anchoring first) cannot
+        // deterministically dominate every fresh node's cold-start
+        // dial set with a 5-node clique. Steady-state (`usize::MAX`
+        // cap) is unaffected — every node is evaluated regardless of
+        // order.
+        if candidates.len() > max_candidates {
+            use rand::seq::SliceRandom;
+            candidates.shuffle(&mut rand::thread_rng());
+            debug!(
+                full = candidates.len(),
+                cap = max_candidates,
+                "sc_discovery: shuffling + capping candidate set"
+            );
+            candidates.truncate(max_candidates);
         }
 
         info!(
             count = candidates.len(),
+            uncapped = (max_candidates == usize::MAX),
             "sc_discovery: fetched candidate set, fetching metadata"
         );
 
@@ -437,7 +561,7 @@ impl ScDiscovery {
 
         if persisted_count == 0 {
             debug!("sc_discovery: no new multiaddrs persisted");
-            return;
+            return 0;
         }
 
         info!(
@@ -467,6 +591,7 @@ impl ScDiscovery {
                 ),
             );
         }
+        persisted_count
     }
 
     /// Write a multiaddr to `PEER_DIRECTORY` under the shared `pa:`

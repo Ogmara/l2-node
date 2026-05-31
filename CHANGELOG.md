@@ -5,6 +5,89 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.46.5] - 2026-05-31
+
+SC-driven bootstrap is now the primary boot path (spec 13 §4.2). The
+legacy hardcoded `node.ogmara.org` seed list has been removed from
+`default_bootstrap_nodes()`; fresh installs discover peers via the
+on-chain registry (`getActiveNodes` + `getNodeMetadata`) without
+needing any out-of-band peer-ID coordination.
+
+### Why
+
+The previous default baked a single `node.ogmara.org` operator into
+every fresh install, creating a single point of failure and tying
+mirror addition to a code release. The on-chain SC view surface
+shipped in v0.4.0 / Phase 2 already exposes every registered
+operator's multiaddrs with a 7-day anchor-recency filter — making the
+hardcoded list redundant and harmful. From 0.46.5 the default
+`bootstrap_nodes = []` triggers pure SC-driven discovery; operators
+who want explicit fallback peers can populate the list as before; and
+the new `[network.sc_discovery] enabled = false` toggle supports
+isolated-subnet deployments for operators in regions where Klever
+endpoints must not be queried (politically-resilient mode).
+
+### Added
+
+- **`[network.sc_discovery]` config block** — `enabled` (default
+  `true`), `retry_interval_secs` (default `60`), `max_candidates`
+  (default `5`). Controls the new SC-discovery primary boot path
+  (spec 13 §4.2 + §4.3).
+- **Isolated-subnet mode** — `enabled = false` together with a non-
+  empty `bootstrap_nodes` list runs a protocol-compatible Ogmara
+  mesh that is independently bootstrapped from the main network.
+  The bootstrap-candidates API surface and the `sc_discovery`
+  background task both honour this flag — no Klever SC views are
+  called from the discovery path when isolated mode is active.
+- **Cold-start retry loop in `sc_discovery`** — when
+  `bootstrap_nodes = []` AND the peer book is empty AND a fan-out
+  persists zero peers, the task retries every `retry_interval_secs`
+  until at least one peer is found (or another discovery path
+  produces one). Replaces the previous one-shot cold-start behaviour
+  that could leave a fresh install stuck if the first SC call failed.
+- **Transport-tag classifier** (spec 13 §4.5) —
+  `chain::sc_views::classify_transport(&str)` returns one of
+  `Clearnet`, `Onion`, `I2p`, `Unknown` from a multiaddr's protocol
+  prefix. Surfaced as the new `transport` field on every
+  `bootstrap-candidates` entry; dashboards can filter or surface a
+  "high-resilience mode available" indicator based on the tag.
+- **Config validator** — refuses to start when `bootstrap_nodes = []`
+  AND `sc_discovery.enabled = false` (both-empty case — no way to
+  discover peers). Surfaces the three supported modes in the error
+  message.
+
+### Changed
+
+- **`default_bootstrap_nodes()` returns `Vec::new()`** (was a
+  two-entry list pointing at `node.ogmara.org`). The default toml
+  template now ships an empty `bootstrap_nodes = []`.
+- **Auto-fill migration removed.** Configs from <0.27.2 that have
+  `bootstrap_nodes = []` are no longer silently populated with the
+  legacy seeds on each boot — empty is now the intentional default
+  signalling pure SC discovery. Operators with an explicit legacy
+  entry in their config.toml retain it (hybrid mode); operators who
+  relied on the previous auto-fill transition into pure SC
+  discovery on first 0.46.5 boot (the desired behaviour for the
+  on-chain operator economy).
+
+### Spec touches
+
+- `docs/specs/13-node-discovery.md` §4.2 (tier 2 rewritten — no
+  defaults, override semantics, multiaddr-must-include-`/p2p/`
+  requirement, self-service mirror addition) and §4.3 (cold-start
+  retry semantics for the empty-`bootstrap_nodes` case).
+
+### Upgrade notes
+
+- **Operators currently relying on the legacy `node.ogmara.org`
+  auto-fill** (i.e., they never set `bootstrap_nodes` in their
+  config) should ensure `klever.node_url` is set and reachable.
+  Their node will discover peers via SC on first 0.46.5 boot.
+- **Operators with hand-curated `bootstrap_nodes` lists** keep
+  their current behaviour (hybrid mode). No config change needed.
+- **Mirror operators** can now ship peer-ID changes without a code
+  release — call `setNodeMetadata` with the new multiaddrs.
+
 ## [0.46.4] - 2026-05-18
 
 Small-network anchor-verification opt-out, re-introducing v0.35's
