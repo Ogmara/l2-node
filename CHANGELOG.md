@@ -5,6 +5,149 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.47.0] - 2026-05-31
+
+B1: channel-history reconciliation. Fresh nodes joining an
+existing channel now backfill the missing history from peers
+instead of waiting indefinitely for gossip to catch them up. The
+mainnet-GA blocker on B1 is closed.
+
+### Why
+
+Before 0.47.0, the first `subscribe_channel(channel_id)` on a
+fresh node left `CHANNEL_MSGS` empty. GossipSub propagates future
+messages, but the historical content is gone — users on the fresh
+node see a channel that "started" the moment their node first
+subscribed, with no way to discover what was said before. v0.47.0
+ships the cold-join backfill: on first subscribe-with-empty-index,
+the node requests history from up to `[backfill] fanout` peers
+concurrently, applies the first non-empty response through the
+standard router pipeline (signature verify, dedupe, indexes), and
+pages via cursor batches until the responding peer signals
+`has_more = false`.
+
+### Added
+
+- **`/ogmara/<network>/channel-reconcile/1.0.0` libp2p protocol**
+  — third request-response codec alongside the existing `sync` and
+  `snapshot` codecs (`crate::network::behaviour`). CBOR encoding.
+  45 s request timeout.
+- **`crate::network::reconcile` module** — `ReconcileRequest` /
+  `ReconcileResponse` wire types, `ReconcileCursor` opaque-to-the-
+  wire paging cursor, server-side `ResponderLimits` (Arc<Mutex>
+  with per-peer + per-(peer, channel) counters), `build_response`
+  that scans `CHANNEL_MSGS` forward from cursor with window-filter
+  + cap, `capped_response` for rate-limit fast path. 6 unit tests
+  cover the rate-limit guards, cursor ordering, and capped-
+  response shape.
+- **`[backfill]` config block** (spec 1 §8.3): `enabled`,
+  `max_age_days` (`u64::MAX` for archive mode), `fanout`,
+  `server_max_concurrent_per_peer`, `server_max_concurrent_per_channel`,
+  `max_envelopes_per_response`, `total_envelopes_cap`,
+  `force_resync_if_stale_days`. 8 validator tests cover zero-value
+  rejection paths and the disabled escape hatch.
+- **`NetworkService::subscribe_channel` trigger**: on empty
+  `CHANNEL_MSGS`, dispatches `ReconcileRequest`s to up to `fanout`
+  shuffled candidate peers (gossip mesh first, fallback to
+  connected peers). First non-empty non-`server_capped` response
+  wins; sibling pending entries dropped.
+- **`NetworkService::handle_reconcile_event`** — full server +
+  client event handling. Server side: rate-limit, scan, send;
+  client side: apply envelopes via `MessageRouter::process_synced_message`,
+  continue paging on `has_more`.
+- **Forward-compat wire fields**: `fingerprint` (Vec<u8>) and
+  `epoch_root_known` / `epoch_root` (Option<[u8; 32]>) reserved for
+  future range-based set-reconciliation and spec 14 epoch-anchor
+  completeness proofs. v0.47.0 always sends empty / None;
+  responders treat empty fingerprint as "bulk-send everything in
+  window". Same wire protocol; future versions populate fields
+  without breaking changes.
+
+### Changed
+
+- **`OgmaraBehaviour` gains a `reconcile` field** —
+  `libp2p::request_response::cbor::Behaviour<ReconcileRequest,
+  ReconcileResponse>`. Inbound support gated on `[backfill]
+  enabled`; outbound always available so operators can still
+  trigger backfills from peers even if they themselves disabled
+  serving.
+- **`NetworkService::new` signature gains `backfill_config:
+  BackfillConfig`** — cloned at startup, drives both the trigger
+  and the responder-side rate limits.
+
+### Security
+
+- **No fast-path bypass for backfilled envelopes.** Every received
+  envelope routes through `MessageRouter::process_synced_message`
+  — signature verify, msg_id dedupe, payload validation,
+  `update_indexes`. A malicious responder cannot poison the local
+  store; the worst they can do is waste the receiver's CPU.
+- **Per-peer + per-(peer, channel) rate limits** on the responder
+  side. RAII guard (`ResponderGuard`) releases counters on drop,
+  including panic paths. Excess requests get a clean
+  `server_capped = true` response, not a queue.
+- **Hard ceiling on `max_envelopes_per_response`** (50 000) at the
+  validator AND at the build_response surface. A misconfigured
+  `usize::MAX` cannot OOM the responder.
+- **Total envelopes per (peer, channel) session cap**
+  (`total_envelopes_cap`, default 200 000) enforced through
+  `ResponderLimits::add_served` — refuses subsequent paginated
+  requests once cumulative envelopes-served exceeds the cap. Reset
+  on process restart.
+- **Randomised candidate selection**: candidates are shuffled
+  before being capped at `fanout`, defeating any attempt to pin a
+  fresh node to a malicious clique by controlling the gossip-
+  mesh-peer ordering.
+
+### Pre-tag audit-driven fixes
+
+The code + security audit pipeline caught five issues before tag.
+All fixed in the v0.47.0 commit, before any wire traffic ships:
+
+- **Paging was structurally broken** (code-audit C1). The earlier
+  implementation used `prefix_iter_cf` on every paginated request
+  and then post-skipped the cursor — which returned the SAME first
+  batch of rows every time, so a cold-join terminated after
+  ~1000 envelopes regardless of channel size. Fixed by switching
+  to `Storage::prefix_iter_cf_after`, which RocksDB-seeks to the
+  cursor key in O(log N) and walks `cap` rows forward. Paging is
+  now O(cap) per page regardless of depth, fixing the
+  functional regression that would have made the release useless.
+- **Private-channel history exfiltration** (security audit C1).
+  `build_response` performed no membership check; any peer could
+  request a private channel's full ciphertext history. Fixed by
+  refusing every channel marked `channel_type = 2` in the CHANNELS
+  CF — the responder returns `server_capped = true` with no
+  envelopes (and no disclosure of whether the channel exists).
+  Authenticated private-channel backfill stays on the existing
+  `network::sync::PrivateChannelMessages` path, which carries the
+  required `requester` + `proof` fields.
+- **`total_envelopes_cap` was dead config** (security audit C2).
+  The 200k per-(peer, channel) session cap was parsed, validated,
+  and documented but never enforced. Fixed by adding a
+  `served: HashMap<(PeerId, channel), u64>` field to
+  `ResponderLimits` and gating `try_acquire` on the cumulative
+  total.
+- **Cross-channel smuggling** (security audit W1). A malicious
+  responder could return envelopes for channel B in response to a
+  request for channel A; the router would happily index them under
+  B in our local CHANNEL_MSGS. Fixed by a payload-`channel_id`
+  match check in `handle_reconcile_event` before each envelope
+  reaches the router. Mismatches are dropped with a
+  `cross_channel_dropped` counter in the per-batch log line.
+- **Chain-scanner trigger bypass** (code audit W2). The
+  chain-scanner-discovered channels arm called
+  `Topics::subscribe_channel` directly, bypassing
+  `NetworkService::subscribe_channel` and its backfill trigger.
+  Fixed by routing through `Self::subscribe_channel` (idempotent
+  via `reconcile_triggered`).
+
+### Spec touches
+
+- `docs/specs/01-protocol.md` §8.3 (new section): trigger,
+  wire protocol, reserved fields, client/server behaviour, trust
+  model, bandwidth profile.
+
 ## [0.46.9] - 2026-05-31
 
 Onion transport — Phase 1. Ships the security-critical SOCKS5

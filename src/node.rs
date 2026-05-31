@@ -316,6 +316,10 @@ impl Node {
             } else {
                 None
             },
+            // Spec 1 §channel-history-reconciliation (l2-node 0.47.0+) —
+            // cloned snapshot used both for the cold-join trigger
+            // (subscribe_channel) and the responder-side rate limits.
+            self.config.backfill.clone(),
         )
         .await
         .context("starting network service")?;

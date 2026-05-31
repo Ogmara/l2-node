@@ -11,6 +11,7 @@ pub mod behaviour;
 pub mod discovery;
 pub mod gossip;
 pub mod mesh_stats;
+pub mod reconcile;
 pub mod sc_discovery;
 pub mod snapshot;
 pub mod snapshot_client;
@@ -146,6 +147,85 @@ pub struct NetworkService {
     /// alert when a publish hits `NoPeersSubscribedToTopic`. The
     /// cooldown engine deduplicates re-fires.
     alert_event_tx: Option<crate::notifications::alerts::AlertEventSender>,
+    /// Snapshot of `[backfill]` (spec 1 §channel-history-reconciliation,
+    /// l2-node 0.47.0+). Drives the cold-join trigger in
+    /// `subscribe_channel` and the responder-side rate limits.
+    backfill_config: crate::config::BackfillConfig,
+    /// Server-side rate-limit state for inbound `ReconcileRequest`s.
+    /// Bounded by `[backfill] server_max_concurrent_per_peer` and
+    /// `server_max_concurrent_per_channel`.
+    reconcile_limits: Arc<reconcile::ResponderLimits>,
+    /// Outstanding outbound reconciliation requests, keyed by
+    /// libp2p `OutboundRequestId`. Resolves to a `(peer_id,
+    /// channel_id)` pair so the response handler can route the
+    /// envelopes to the right channel and either request the next
+    /// cursor batch or finish.
+    pending_reconcile_requests: HashMap<
+        libp2p::request_response::OutboundRequestId,
+        ReconcilePending,
+    >,
+    /// Channel IDs the local node has triggered backfill for AT
+    /// LEAST once during the current process lifetime. Stops
+    /// repeated `subscribe_channel` calls (chain-scanner sends one
+    /// per discovered channel) from spamming reconciliation when
+    /// the local index is still empty for a different reason
+    /// (e.g., the channel is genuinely silent). Cleared on process
+    /// restart.
+    reconcile_triggered: HashSet<u64>,
+}
+
+/// Per-pending-outbound-reconciliation state.
+#[derive(Debug, Clone)]
+struct ReconcilePending {
+    peer_id: PeerId,
+    channel_id: u64,
+}
+
+/// Cross-channel smuggling defense (Security Audit W1, 0.47.0).
+/// Returns `true` iff the envelope's payload claims the same
+/// `channel_id` we are reconciling. Envelopes that target a
+/// different channel are dropped before routing — a malicious
+/// responder cannot use our reconcile request to seed arbitrary
+/// channel content into our local indexes.
+///
+/// We do not need to be fully strict here: the worst that happens
+/// on a false-positive (we accept an envelope whose payload doesn't
+/// even have a `channel_id` field) is that the envelope goes through
+/// the standard router and is rejected by payload-specific
+/// validation. The cheap pre-check just keeps the obvious smuggle
+/// out of the router pipeline.
+fn envelope_targets_channel(env_bytes: &[u8], expected_channel: u64) -> bool {
+    use crate::messages::envelope::Envelope;
+    use crate::messages::types::MessageType;
+    let envelope: Envelope = match rmp_serde::from_slice(env_bytes) {
+        Ok(e) => e,
+        Err(_) => return false,
+    };
+    match envelope.msg_type {
+        MessageType::ChatMessage
+        | MessageType::ChatEdit
+        | MessageType::ChatDelete
+        | MessageType::ChatReaction
+        | MessageType::ChannelPinMessage
+        | MessageType::ChannelUnpinMessage
+        | MessageType::ChannelJoin
+        | MessageType::ChannelLeave => {
+            let payload: serde_json::Value =
+                match rmp_serde::from_slice(&envelope.payload) {
+                    Ok(v) => v,
+                    Err(_) => return false,
+                };
+            payload
+                .get("channel_id")
+                .and_then(|v| v.as_u64())
+                .map(|cid| cid == expected_channel)
+                .unwrap_or(false)
+        }
+        // Non-channel message types should not appear in
+        // CHANNEL_MSGS, but be conservative — accept them and let
+        // the router decide.
+        _ => true,
+    }
 }
 
 /// How often `NetworkService` refreshes the shared `MeshStatsSnapshot`.
@@ -208,6 +288,7 @@ impl NetworkService {
         publish_failure_counters: mesh_stats::PublishFailureCounters,
         mesh_stats: mesh_stats::SharedMeshStats,
         alert_event_tx: Option<crate::notifications::alerts::AlertEventSender>,
+        backfill_config: crate::config::BackfillConfig,
     ) -> Result<Self> {
         let mut swarm = behaviour::build_swarm(config, keypair)
             .context("building libp2p swarm")?;
@@ -398,6 +479,10 @@ impl NetworkService {
             publish_failure_counters,
             mesh_stats,
             alert_event_tx,
+            backfill_config,
+            reconcile_limits: Arc::new(reconcile::ResponderLimits::default()),
+            pending_reconcile_requests: HashMap::new(),
+            reconcile_triggered: HashSet::new(),
         })
     }
 
@@ -438,9 +523,21 @@ impl NetworkService {
     }
 
     /// Subscribe to a channel's GossipSub topic.
+    ///
+    /// **Channel-history backfill trigger (spec 1, l2-node 0.47.0+).**
+    /// If `[backfill] enabled` AND the local `CHANNEL_MSGS` index
+    /// for `channel_id` is empty AND we have not already triggered
+    /// reconciliation for this channel in the current process, the
+    /// trigger fires: we pick up to `[backfill] fanout` candidate
+    /// peers from the gossip mesh (falling back to SC-active nodes
+    /// if mesh is sparse) and send each a `ReconcileRequest`. The
+    /// first non-empty response wins; subsequent responses are
+    /// dropped on arrival via the `pending_reconcile_requests` map
+    /// (only the winning peer's continuation is tracked).
     pub fn subscribe_channel(&mut self, channel_id: u64) {
         self.topics
             .subscribe_channel(&mut self.swarm, channel_id);
+        self.maybe_trigger_backfill(channel_id);
     }
 
     /// Unsubscribe from a channel's GossipSub topic.
@@ -522,7 +619,14 @@ impl NetworkService {
                     self.handle_swarm_event(event);
                 }
                 Some(channel_id) = channel_rx.recv() => {
-                    self.topics.subscribe_channel(&mut self.swarm, channel_id);
+                    // Code Audit W2 (0.47.0): route chain-discovered
+                    // channels through `Self::subscribe_channel` (not
+                    // the bare `Topics::subscribe_channel`) so the
+                    // empty-CHANNEL_MSGS cold-join backfill trigger
+                    // fires. The trigger is idempotent via
+                    // `reconcile_triggered`, so duplicate calls are
+                    // safe.
+                    self.subscribe_channel(channel_id);
                     info!(channel_id, "Auto-subscribed to channel topic (chain discovery)");
                 }
                 Some((topic, data)) = gossip_rx.recv() => {
@@ -757,6 +861,10 @@ impl NetworkService {
 
             SwarmEvent::Behaviour(OgmaraBehaviourEvent::Snapshot(event)) => {
                 self.handle_snapshot_event(event);
+            }
+
+            SwarmEvent::Behaviour(OgmaraBehaviourEvent::Reconcile(event)) => {
+                self.handle_reconcile_event(event);
             }
 
             SwarmEvent::NewListenAddr { address, .. } => {
@@ -1147,6 +1255,380 @@ impl NetworkService {
         match self.mesh_stats.write() {
             Ok(mut w) => *w = new_snapshot,
             Err(e) => warn!(error = %e, "mesh_stats RwLock poisoned"),
+        }
+    }
+
+    /// Channel-history backfill trigger (spec 1, l2-node 0.47.0+).
+    /// See [`Self::subscribe_channel`] for the full trigger contract.
+    fn maybe_trigger_backfill(&mut self, channel_id: u64) {
+        if !self.backfill_config.enabled {
+            return;
+        }
+        if !self.reconcile_triggered.insert(channel_id) {
+            // Already triggered this session — don't re-fire.
+            return;
+        }
+
+        // Empty-check: does `CHANNEL_MSGS` have ANY row for this
+        // channel? prefix_iter with limit=1 short-iters cheaply.
+        let prefix = channel_id.to_be_bytes();
+        let has_local = self
+            .storage
+            .prefix_iter_cf(
+                crate::storage::schema::cf::CHANNEL_MSGS,
+                &prefix,
+                1,
+            )
+            .map(|rows| !rows.is_empty())
+            .unwrap_or(false);
+
+        let resync_active = self.backfill_config.force_resync_if_stale_days > 0;
+        let need_backfill = if !has_local {
+            true
+        } else if resync_active {
+            // Re-reconciliation knob: read the NEWEST local envelope
+            // and compare timestamps. `prefix_iter` is sorted
+            // ascending by (lamport_ts, msg_id); reading all rows is
+            // O(N) and not worth it. Use a stat or skip for now.
+            // v0.47.0 conservative: re-fire only on truly-empty;
+            // staleness-driven resync is a v0.47.x refinement.
+            false
+        } else {
+            false
+        };
+        if !need_backfill {
+            // Remove from the triggered set so a future
+            // unsubscribe + resubscribe (with the channel still
+            // empty) can re-evaluate.
+            self.reconcile_triggered.remove(&channel_id);
+            return;
+        }
+
+        // Candidate selection: GossipSub mesh peers for this
+        // channel's topic; fall back to ALL connected peers if the
+        // mesh is sparse (cold-start case where the channel topic
+        // has not yet propagated).
+        let topic = libp2p::gossipsub::IdentTopic::new(gossip::channel_topic(
+            self.topics.network_id(),
+            channel_id,
+        ));
+        let topic_hash = topic.hash();
+        let mut candidates: Vec<PeerId> = self
+            .swarm
+            .behaviour()
+            .gossipsub
+            .mesh_peers(&topic_hash)
+            .copied()
+            .collect();
+        if candidates.len() < self.backfill_config.fanout {
+            // Augment with any connected peer that announced the
+            // protocol (or just any connected peer — request-response
+            // negotiation will refuse non-supporters cleanly).
+            for p in self.swarm.connected_peers() {
+                if !candidates.contains(p) {
+                    candidates.push(*p);
+                }
+                if candidates.len() >= self.backfill_config.fanout * 2 {
+                    break;
+                }
+            }
+        }
+        if candidates.is_empty() {
+            debug!(
+                channel_id,
+                "backfill: no candidate peers; cold-start will retry on next subscribe"
+            );
+            // Allow a future re-trigger.
+            self.reconcile_triggered.remove(&channel_id);
+            return;
+        }
+
+        use rand::seq::SliceRandom;
+        candidates.shuffle(&mut rand::thread_rng());
+        candidates.truncate(self.backfill_config.fanout);
+
+        let max_age_secs = if self.backfill_config.max_age_days == u64::MAX {
+            u64::MAX
+        } else {
+            self.backfill_config
+                .max_age_days
+                .saturating_mul(24 * 3600)
+        };
+        let request = reconcile::ReconcileRequest {
+            channel_id,
+            max_age_secs,
+            cursor: None,
+            fingerprint: Vec::new(),
+            epoch_root_known: None,
+            round: 0,
+        };
+
+        info!(
+            channel_id,
+            fanout = candidates.len(),
+            max_age_days = self.backfill_config.max_age_days,
+            "backfill: triggering channel-history reconciliation"
+        );
+
+        for peer in candidates {
+            let id = self
+                .swarm
+                .behaviour_mut()
+                .reconcile
+                .send_request(&peer, request.clone());
+            self.pending_reconcile_requests.insert(
+                id,
+                ReconcilePending {
+                    peer_id: peer,
+                    channel_id,
+                },
+            );
+        }
+    }
+
+    /// Handle inbound + outbound reconcile request-response events.
+    fn handle_reconcile_event(
+        &mut self,
+        event: libp2p::request_response::Event<
+            reconcile::ReconcileRequest,
+            reconcile::ReconcileResponse,
+        >,
+    ) {
+        use libp2p::request_response::{Event, Message};
+        match event {
+            Event::Message {
+                peer,
+                message: Message::Request { request, channel, request_id: _ },
+                connection_id: _,
+            } => {
+                // Server-side: rate-limit + cumulative cap, then
+                // build + respond. The Audit C2 cumulative-envelopes
+                // cap (`total_envelopes_cap`) is enforced through
+                // `try_acquire`; on success, we call `add_served`
+                // after `build_response` succeeded so the next
+                // paginated request from the same peer sees the
+                // updated total.
+                let total_cap = self.backfill_config.total_envelopes_cap as u64;
+                let guard = self.reconcile_limits.try_acquire(
+                    peer,
+                    request.channel_id,
+                    self.backfill_config.server_max_concurrent_per_peer,
+                    self.backfill_config.server_max_concurrent_per_channel,
+                    total_cap,
+                );
+                let response = if guard.is_none() {
+                    debug!(
+                        peer = %peer,
+                        channel_id = request.channel_id,
+                        "reconcile: rate-limited or session-cap exhausted; \
+                         responding server_capped"
+                    );
+                    reconcile::capped_response(&request)
+                } else {
+                    let now_unix = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    reconcile::build_response(
+                        &self.storage,
+                        &request,
+                        self.backfill_config.max_envelopes_per_response,
+                        now_unix,
+                    )
+                };
+                let envelopes_sent = response.envelopes.len();
+                let has_more = response.has_more;
+                // Audit C2: only count toward the cumulative session
+                // total when we actually served envelopes (skipping
+                // the server_capped / private-channel refusal paths
+                // keeps the cap from being burned on no-op
+                // responses).
+                if envelopes_sent > 0 {
+                    self.reconcile_limits.add_served(
+                        peer,
+                        request.channel_id,
+                        envelopes_sent as u64,
+                    );
+                }
+                if let Err(e) = self
+                    .swarm
+                    .behaviour_mut()
+                    .reconcile
+                    .send_response(channel, response)
+                {
+                    warn!(
+                        peer = %peer,
+                        channel_id = request.channel_id,
+                        error = ?e,
+                        "reconcile: send_response failed"
+                    );
+                }
+                drop(guard);
+                debug!(
+                    peer = %peer,
+                    channel_id = request.channel_id,
+                    envelopes_sent,
+                    has_more,
+                    "reconcile: served request"
+                );
+            }
+            Event::Message {
+                peer,
+                message: Message::Response { request_id, response },
+                connection_id: _,
+            } => {
+                let Some(pending) = self.pending_reconcile_requests.remove(&request_id)
+                else {
+                    debug!(
+                        peer = %peer,
+                        ?request_id,
+                        "reconcile: response for unknown request_id (race winner already served)"
+                    );
+                    return;
+                };
+                if response.server_capped {
+                    debug!(
+                        peer = %peer,
+                        channel_id = pending.channel_id,
+                        "reconcile: peer responded server_capped; ignoring (race siblings may succeed)"
+                    );
+                    return;
+                }
+                if response.envelopes.is_empty() && !response.has_more {
+                    debug!(
+                        peer = %peer,
+                        channel_id = pending.channel_id,
+                        "reconcile: peer responded empty + no more; ignoring"
+                    );
+                    return;
+                }
+
+                // Race-winner semantics: cancel sibling outbound
+                // requests by dropping their pending entries. Any
+                // late-arriving response for them will be logged at
+                // debug above and ignored.
+                self.pending_reconcile_requests.retain(|_, p| {
+                    !(p.channel_id == pending.channel_id && p.peer_id != peer)
+                });
+
+                let env_count = response.envelopes.len();
+                let mut admitted = 0usize;
+                let mut cross_channel_dropped = 0usize;
+                for env_bytes in response.envelopes {
+                    // Security Audit W1 (0.47.0): cross-channel
+                    // smuggling defense. The responder could otherwise
+                    // stuff envelopes for channel B into a response
+                    // we sent for channel A; signatures verify (the
+                    // original authors really signed them) so the
+                    // router would happily index them under B in our
+                    // local CHANNEL_MSGS. Reject any envelope whose
+                    // payload-extracted channel_id does not equal the
+                    // channel we asked for. We can't fully validate
+                    // until after the router has deserialised the
+                    // payload, so we do a cheap pre-check on the
+                    // payload bytes here.
+                    if !envelope_targets_channel(
+                        &env_bytes,
+                        pending.channel_id,
+                    ) {
+                        cross_channel_dropped += 1;
+                        continue;
+                    }
+                    match self.router.process_synced_message(&env_bytes) {
+                        crate::messages::router::RouteResult::Accepted { .. } => {
+                            admitted += 1;
+                        }
+                        crate::messages::router::RouteResult::Duplicate => {
+                            // Already had this envelope locally —
+                            // counted as "won the race" but no
+                            // storage write needed.
+                            admitted += 1;
+                        }
+                        crate::messages::router::RouteResult::Rejected(reason) => {
+                            warn!(
+                                peer = %peer,
+                                channel_id = pending.channel_id,
+                                reason = %reason,
+                                "reconcile: peer envelope rejected by router"
+                            );
+                        }
+                        crate::messages::router::RouteResult::PowRequired { .. } => {
+                            // Sync messages are PoW-exempt — should
+                            // not fire. Skip if it does.
+                        }
+                    }
+                }
+                info!(
+                    peer = %peer,
+                    channel_id = pending.channel_id,
+                    received = env_count,
+                    admitted,
+                    cross_channel_dropped,
+                    has_more = response.has_more,
+                    "reconcile: applied response batch"
+                );
+
+                // Continue paging from the winning peer if the
+                // responder signalled more data.
+                if response.has_more {
+                    if let Some(cursor) = response.next_cursor {
+                        let max_age_secs = if self.backfill_config.max_age_days == u64::MAX {
+                            u64::MAX
+                        } else {
+                            self.backfill_config
+                                .max_age_days
+                                .saturating_mul(24 * 3600)
+                        };
+                        let next_req = reconcile::ReconcileRequest {
+                            channel_id: pending.channel_id,
+                            max_age_secs,
+                            cursor: Some(cursor),
+                            fingerprint: Vec::new(),
+                            epoch_root_known: None,
+                            round: 0,
+                        };
+                        let next_id = self
+                            .swarm
+                            .behaviour_mut()
+                            .reconcile
+                            .send_request(&pending.peer_id, next_req);
+                        self.pending_reconcile_requests.insert(
+                            next_id,
+                            ReconcilePending {
+                                peer_id: pending.peer_id,
+                                channel_id: pending.channel_id,
+                            },
+                        );
+                    }
+                }
+            }
+            Event::OutboundFailure {
+                peer,
+                request_id,
+                error,
+                ..
+            } => {
+                if let Some(pending) =
+                    self.pending_reconcile_requests.remove(&request_id)
+                {
+                    debug!(
+                        peer = %peer,
+                        channel_id = pending.channel_id,
+                        error = ?error,
+                        "reconcile: outbound failed; siblings may still succeed"
+                    );
+                }
+            }
+            Event::InboundFailure { peer, error, .. } => {
+                debug!(
+                    peer = %peer,
+                    error = ?error,
+                    "reconcile: inbound request handling failed"
+                );
+            }
+            Event::ResponseSent { .. } => {
+                // Successfully sent — nothing to do.
+            }
         }
     }
 

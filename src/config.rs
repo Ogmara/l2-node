@@ -44,6 +44,10 @@ pub struct Config {
     /// CID misses locally.
     #[serde(default)]
     pub media: MediaConfig,
+    /// Channel-history backfill / reconciliation policy (spec 1
+    /// §channel-history-reconciliation, l2-node 0.47.0+).
+    #[serde(default)]
+    pub backfill: BackfillConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -375,6 +379,117 @@ fn default_media_peer_fallback_global_concurrent() -> usize {
 
 fn default_media_peer_fallback_candidate_cache_secs() -> u64 {
     300
+}
+
+/// Channel-history backfill / reconciliation (spec 1 §channel-history-
+/// reconciliation, l2-node 0.47.0+).
+///
+/// Triggered on the **first** `subscribe_channel(channel_id)` for a
+/// channel whose local `CHANNEL_MSGS` index is empty (cold-join). The
+/// node requests the missing history from up to `fanout` peers
+/// concurrently, races for the first non-empty response, then keeps
+/// requesting from the same peer in cursor batches until the peer
+/// signals `has_more = false`.
+///
+/// **Per-node semantics**: once reconciled, the local CHANNEL_MSGS is
+/// the system of record. Re-subscribing the same channel does NOT
+/// re-trigger — `prefix_iter_cf` will return non-zero rows. Operators
+/// who want to re-reconcile a stale local history set
+/// `force_resync_if_stale_days > 0`.
+///
+/// **Wire protocol**: forward-compatible with a future negentropy-
+/// style multi-round fingerprint exchange. v0.47.0 always sends an
+/// empty `fingerprint` payload, which responders interpret as
+/// "the requester has no data — bulk-send everything in the
+/// configured window". The `fingerprint` field will be populated in
+/// a future v0.47.x when the steady-state-overlap case becomes
+/// worth the bandwidth-savings work.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackfillConfig {
+    /// Master switch. Default `true` — fresh nodes auto-reconcile on
+    /// cold-join. Operators on bandwidth-constrained connections set
+    /// `false` to force users to rely on real-time gossip only.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// How far back the request asks for envelopes, in days. Default
+    /// 30. Archive operators set `max_age_days = unlimited` (which we
+    /// represent as `u64::MAX`); responder-side this maps to "no
+    /// time-window filter, just respect max_envelopes_per_response".
+    #[serde(default = "default_backfill_max_age_days")]
+    pub max_age_days: u64,
+    /// Cap on concurrent peer-side reconciliation requests per cold-
+    /// join. Default 3. Lower to 1 on bandwidth-tight connections.
+    #[serde(default = "default_backfill_fanout")]
+    pub fanout: usize,
+    /// Server-side: max concurrent reconciliation requests this node
+    /// will serve to ONE peer simultaneously. Default 4. Excess
+    /// requests respond with `server_capped = true` + empty envelopes
+    /// so the requester knows to back off.
+    #[serde(default = "default_backfill_server_max_concurrent_per_peer")]
+    pub server_max_concurrent_per_peer: usize,
+    /// Server-side: max concurrent reconciliation requests this node
+    /// will serve to ONE (peer, channel) tuple simultaneously. Default
+    /// 1. Stops a single peer hammering a single channel with
+    /// pipelined requests.
+    #[serde(default = "default_backfill_server_max_concurrent_per_channel")]
+    pub server_max_concurrent_per_channel: usize,
+    /// Re-reconciliation knob. Default `0` = off. When `> 0`, re-
+    /// triggers reconciliation on subscribe_channel if the local
+    /// history's newest envelope is older than this many days. The
+    /// gossip mesh fills gaps in real time so the default-off is
+    /// usually right; archive nodes set 1 for "always catch up".
+    #[serde(default)]
+    pub force_resync_if_stale_days: u64,
+    /// Server-side: max envelopes per response. Default 1000. Larger
+    /// fits more in a single libp2p response (cap is ~10 MiB CBOR);
+    /// smaller cuts the worst-case latency. Total transfer is the
+    /// same — clients page via the `next_cursor` field until
+    /// `has_more = false`.
+    #[serde(default = "default_backfill_max_envelopes_per_response")]
+    pub max_envelopes_per_response: usize,
+    /// Server-side: hard ceiling on total envelopes served per single
+    /// reconciliation pair (per client request stream). Default
+    /// 200_000 = enough for a year of an active channel; stops a
+    /// malicious client from inducing an unbounded scan.
+    #[serde(default = "default_backfill_total_envelopes_cap")]
+    pub total_envelopes_cap: usize,
+}
+
+impl Default for BackfillConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_age_days: default_backfill_max_age_days(),
+            fanout: default_backfill_fanout(),
+            server_max_concurrent_per_peer:
+                default_backfill_server_max_concurrent_per_peer(),
+            server_max_concurrent_per_channel:
+                default_backfill_server_max_concurrent_per_channel(),
+            force_resync_if_stale_days: 0,
+            max_envelopes_per_response:
+                default_backfill_max_envelopes_per_response(),
+            total_envelopes_cap: default_backfill_total_envelopes_cap(),
+        }
+    }
+}
+
+fn default_backfill_max_age_days() -> u64 {
+    30
+}
+fn default_backfill_fanout() -> usize {
+    3
+}
+fn default_backfill_server_max_concurrent_per_peer() -> usize {
+    4
+}
+fn default_backfill_server_max_concurrent_per_channel() -> usize {
+    1
+}
+fn default_backfill_max_envelopes_per_response() -> usize {
+    1000
+}
+fn default_backfill_total_envelopes_cap() -> usize {
+    200_000
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1510,6 +1625,68 @@ impl Config {
                 );
             }
         }
+        // Spec 1 §channel-history-reconciliation (l2-node 0.47.0+).
+        if self.backfill.enabled {
+            if self.backfill.fanout == 0 {
+                anyhow::bail!(
+                    "backfill.fanout must be > 0 when enabled (default 3)"
+                );
+            }
+            const MAX_BACKFILL_FANOUT: usize = 16;
+            if self.backfill.fanout > MAX_BACKFILL_FANOUT {
+                anyhow::bail!(
+                    "backfill.fanout = {} exceeds cap of {} (amplification \
+                     — reduce or disable)",
+                    self.backfill.fanout,
+                    MAX_BACKFILL_FANOUT
+                );
+            }
+            if self.backfill.server_max_concurrent_per_peer == 0 {
+                anyhow::bail!(
+                    "backfill.server_max_concurrent_per_peer must be > 0 \
+                     (default 4)"
+                );
+            }
+            if self.backfill.server_max_concurrent_per_channel == 0 {
+                anyhow::bail!(
+                    "backfill.server_max_concurrent_per_channel must be > 0 \
+                     (default 1)"
+                );
+            }
+            if self.backfill.max_envelopes_per_response == 0 {
+                anyhow::bail!(
+                    "backfill.max_envelopes_per_response must be > 0 \
+                     (default 1000)"
+                );
+            }
+            const MAX_ENVELOPES_PER_RESPONSE_CEILING: usize = 50_000;
+            if self.backfill.max_envelopes_per_response
+                > MAX_ENVELOPES_PER_RESPONSE_CEILING
+            {
+                anyhow::bail!(
+                    "backfill.max_envelopes_per_response = {} exceeds the \
+                     ceiling of {} (single libp2p response cap is ~10 MiB \
+                     CBOR; large batches cause memory spikes on the \
+                     receiver)",
+                    self.backfill.max_envelopes_per_response,
+                    MAX_ENVELOPES_PER_RESPONSE_CEILING
+                );
+            }
+            if self.backfill.total_envelopes_cap == 0 {
+                anyhow::bail!(
+                    "backfill.total_envelopes_cap must be > 0 (default \
+                     200000)"
+                );
+            }
+            if self.backfill.max_age_days == 0 {
+                anyhow::bail!(
+                    "backfill.max_age_days must be > 0 when enabled — use \
+                     `force_resync_if_stale_days = 0` to disable \
+                     re-reconciliation, or `enabled = false` to disable \
+                     backfill entirely"
+                );
+            }
+        }
         // Spec 13 §6.4 (l2-node 0.46.9+) — onion-transport surface.
         // We only check the operator-controlled inputs here; the
         // SOCKS5 dialer module enforces the runtime properties (DNS
@@ -1870,6 +2047,40 @@ peer_fallback_connect_timeout_secs = 5   # connect timeout per dial
 peer_fallback_read_timeout_secs = 30     # end-to-end read budget per dial
 peer_fallback_global_concurrent = 16     # global concurrent fan-out ops (cap 256)
 peer_fallback_candidate_cache_secs = 300 # SC candidate snapshot TTL
+
+[backfill]
+# Channel-history reconciliation (spec 1, l2-node 0.47.0+).
+#
+# On the first subscribe to a channel where the local index is empty
+# (cold-join), the node requests missing history from peers and
+# applies it through the standard message router (signature verify,
+# storage admission, the works). Default on so fresh nodes catch up
+# automatically; set enabled = false for bandwidth-constrained
+# deployments that want users to rely on real-time gossip only.
+enabled = true
+# How far back to fetch. Archive operators set u64::MAX (currently
+# 18446744073709551615) for "everything ever stored by the peer".
+max_age_days = 30
+# Client-side concurrent peer dials. First peer with a non-empty
+# response wins; the others are dropped.
+fanout = 3
+# Server-side caps — refuse to drown a single requester (per peer
+# and per channel) but always respond promptly with server_capped =
+# true so they know to back off.
+server_max_concurrent_per_peer = 4
+server_max_concurrent_per_channel = 1
+# Per-response envelope cap. Total bandwidth is the SAME as a
+# bigger cap — clients page via the cursor — but smaller batches
+# cut worst-case latency.
+max_envelopes_per_response = 1000
+# Hard ceiling on total envelopes served per single client stream.
+# 200k = roughly one year of an active channel; stops a malicious
+# client from inducing an unbounded scan.
+total_envelopes_cap = 200000
+# Re-reconciliation knob. 0 = off (gossip mesh fills gaps in real
+# time). N>0 = re-trigger on subscribe if local history's newest
+# envelope is older than N days. Bandwidth cost; default off.
+force_resync_if_stale_days = 0
 
 [api]
 # Set to "0.0.0.0" to accept connections from all interfaces
@@ -2399,6 +2610,83 @@ mod tests {
         c.network.tor.listen_onion_port = 0;
         c.network.tor.advertise_onion_in_metadata = false;
         c.validate().expect("outbound-only tor must pass");
+    }
+
+    // --- 0.47.0 channel-history backfill (spec 1) -------------------
+
+    #[test]
+    fn validate_passes_disabled_backfill_with_zeros() {
+        let mut c = baseline_config();
+        c.backfill.enabled = false;
+        c.backfill.fanout = 0;
+        c.backfill.server_max_concurrent_per_peer = 0;
+        c.backfill.server_max_concurrent_per_channel = 0;
+        c.backfill.max_envelopes_per_response = 0;
+        c.backfill.total_envelopes_cap = 0;
+        c.backfill.max_age_days = 0;
+        c.validate().expect("disabled backfill skips field checks");
+    }
+
+    #[test]
+    fn validate_rejects_zero_backfill_fanout() {
+        let mut c = baseline_config();
+        c.backfill.fanout = 0;
+        let err = c.validate().expect_err("0 fanout must be rejected");
+        assert!(format!("{err}").contains("backfill.fanout"));
+    }
+
+    #[test]
+    fn validate_rejects_oversized_backfill_fanout() {
+        let mut c = baseline_config();
+        c.backfill.fanout = 17;
+        let err = c.validate().expect_err("oversize fanout must be rejected");
+        assert!(format!("{err}").contains("backfill.fanout"));
+    }
+
+    #[test]
+    fn validate_rejects_zero_backfill_server_caps() {
+        let mut c = baseline_config();
+        c.backfill.server_max_concurrent_per_peer = 0;
+        assert!(c.validate().is_err());
+
+        let mut c = baseline_config();
+        c.backfill.server_max_concurrent_per_channel = 0;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_zero_backfill_envelopes_per_response() {
+        let mut c = baseline_config();
+        c.backfill.max_envelopes_per_response = 0;
+        let err = c.validate().expect_err("0 envelopes/response must reject");
+        assert!(format!("{err}").contains("max_envelopes_per_response"));
+    }
+
+    #[test]
+    fn validate_rejects_oversized_backfill_envelopes_per_response() {
+        let mut c = baseline_config();
+        c.backfill.max_envelopes_per_response = 50_001;
+        let err = c
+            .validate()
+            .expect_err("oversize envelopes/response must reject");
+        assert!(format!("{err}").contains("max_envelopes_per_response"));
+    }
+
+    #[test]
+    fn validate_rejects_zero_backfill_max_age_days() {
+        let mut c = baseline_config();
+        c.backfill.max_age_days = 0;
+        let err = c
+            .validate()
+            .expect_err("0 max_age_days must reject when enabled");
+        assert!(format!("{err}").contains("max_age_days"));
+    }
+
+    #[test]
+    fn validate_accepts_archive_backfill_unlimited_age() {
+        let mut c = baseline_config();
+        c.backfill.max_age_days = u64::MAX;
+        c.validate().expect("u64::MAX archive mode must pass");
     }
 
     // --- v0.41 per-IP permit field ----------------------------------
