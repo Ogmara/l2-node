@@ -888,6 +888,7 @@ impl Node {
             let recon_listen_port = self.config.network.listen_port;
             let recon_peer_id = network_peer_id.clone();
             let recon_public_url = self.config.api.public_url.clone();
+            let recon_tor_cfg = self.config.network.tor.clone();
             let recon_drift = metadata_drift_handle.clone();
             let recon_alert_tx = if self.config.alerts.enabled {
                 Some(alert_event_tx.clone())
@@ -904,6 +905,7 @@ impl Node {
                     recon_listen_port,
                     recon_peer_id,
                     recon_public_url,
+                    recon_tor_cfg,
                     recon_drift,
                     recon_alert_tx,
                 ) {
@@ -1055,6 +1057,11 @@ impl Node {
             } else {
                 None
             },
+            // Spec 13 §6.4 — onion-transport config snapshot. Cloned
+            // into AppState so the `node_metadata` admin endpoint can
+            // append the onion multiaddr to the desired list when
+            // `advertise_onion_in_metadata = true`.
+            self.config.network.tor.clone(),
         ));
         // Background sweep: drop zero-counter entries from the per-IP
         // media limiter (v0.41). Without this, the DashMap accumulates

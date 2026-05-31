@@ -85,6 +85,13 @@ pub struct NetworkConfig {
     /// false` + non-empty `bootstrap_nodes`.
     #[serde(default)]
     pub sc_discovery: ScDiscoveryConfig,
+    /// Onion transport — external Tor daemon + SOCKS5 wrapper (spec
+    /// 13 §6.4, l2-node 0.46.9+). Operator-facing knobs for hosting
+    /// a hidden service and (in v0.46.10) dialling onion peers
+    /// through a local Tor SOCKS proxy. Disabled by default —
+    /// operators with regulatory-resilience requirements opt in.
+    #[serde(default)]
+    pub tor: TorConfig,
 }
 
 impl Default for NetworkConfig {
@@ -97,6 +104,7 @@ impl Default for NetworkConfig {
             network_id: None,
             discovery: DiscoveryConfig::default(),
             sc_discovery: ScDiscoveryConfig::default(),
+            tor: TorConfig::default(),
         }
     }
 }
@@ -184,6 +192,99 @@ fn default_sc_retry_interval_secs() -> u64 {
 
 fn default_sc_max_candidates() -> u32 {
     5
+}
+
+/// Onion-transport configuration (spec 13 §6.4, l2-node 0.46.9+).
+///
+/// We integrate with an **external** Tor daemon (the operator manages
+/// the daemon lifecycle) via a SOCKS5 dialer + an inbound TCP listen
+/// for the hidden-service forward. No embedded Tor (arti) dependency
+/// in v0.46.9 — keeps the build minimal and the audit surface
+/// focused on the small hand-rolled SOCKS5 module
+/// ([`crate::network::tor`]).
+///
+/// **v0.46.9 scope (this release):**
+/// - Config surface fully wired.
+/// - SOCKS5 dialer module shipped with security-critical properties
+///   (DNS-leak prevention, no IP-fallthrough, RFC 1928 compliance).
+/// - **Inbound onion support**: when `listen_onion_hostname` is set
+///   AND `listen_onion_port` is non-zero, the swarm listens on
+///   `/ip4/127.0.0.1/tcp/listen_onion_port` so the operator's Tor
+///   hidden-service can forward traffic to it.
+/// - Outbound onion multiaddrs are still refused by the libp2p
+///   dialer in v0.46.9 — the SOCKS5-backed libp2p `Transport` lands
+///   in v0.46.10. Peers that publish onion-only addresses are not
+///   yet dialable, but ARE discoverable (their multiaddrs appear in
+///   `bootstrap-candidates` with `transport: "onion"`).
+///
+/// **Operator workflow:** see spec 13 §6.4.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TorConfig {
+    /// Master switch. Default `false` — onion support is opt-in.
+    /// Enabling this:
+    /// 1. Validates `socks_proxy` parses cleanly.
+    /// 2. (v0.46.10+) Registers the SOCKS5-backed libp2p Transport
+    ///    for outbound `/onion3/...` dials.
+    /// 3. Configures inbound listen on the loopback TCP port that
+    ///    the operator's external Tor service forwards the hidden
+    ///    service to.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Address of the local Tor SOCKS5 proxy. Default
+    /// `127.0.0.1:9050` (the Tor daemon default). Operators with
+    /// non-standard Tor setups override.
+    ///
+    /// The dialer enforces a localhost-only check at config-load:
+    /// non-loopback SOCKS proxies are refused because they would
+    /// route every onion dial through a remote SOCKS server,
+    /// breaking the deanonymisation model. Operators with genuine
+    /// remote-SOCKS needs document an override path in a future
+    /// release.
+    #[serde(default = "default_tor_socks_proxy")]
+    pub socks_proxy: String,
+    /// Loopback TCP port the swarm listens on when
+    /// `listen_onion_hostname` is set. The operator's Tor service
+    /// forwards `<listen_onion_hostname>:<onion_virtual_port>` to
+    /// this port (typically `127.0.0.1:<listen_onion_port>` in the
+    /// `HiddenServicePort` torrc directive). Zero disables the
+    /// inbound listen even when other tor fields are set.
+    #[serde(default)]
+    pub listen_onion_port: u16,
+    /// `.onion` hostname of this node's hidden service, copied from
+    /// `/var/lib/tor/<hs_dir>/hostname` after the Tor daemon
+    /// generates it. Empty disables both the inbound listen and any
+    /// `setNodeMetadata` advertisement. The string is validated at
+    /// config-load: must end in `.onion`, must be ASCII, must parse
+    /// as a v3 onion address (56-char base32 plus the suffix) when
+    /// non-empty.
+    #[serde(default)]
+    pub listen_onion_hostname: String,
+    /// When `true`, the metadata reconciler appends the onion
+    /// multiaddr (`/onion3/<hostname-without-suffix>:<port>`) to the
+    /// desired list it compares against the on-chain
+    /// `getNodeMetadata(self)`. The operator still has to click
+    /// Publish in the dashboard to actually broadcast — no proxy
+    /// signing (spec 12 §6.2). Default `false` so operators opt
+    /// into the advertisement separately from running the hidden
+    /// service.
+    #[serde(default)]
+    pub advertise_onion_in_metadata: bool,
+}
+
+impl Default for TorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            socks_proxy: default_tor_socks_proxy(),
+            listen_onion_port: 0,
+            listen_onion_hostname: String::new(),
+            advertise_onion_in_metadata: false,
+        }
+    }
+}
+
+fn default_tor_socks_proxy() -> String {
+    "127.0.0.1:9050".to_string()
 }
 
 /// Cross-node media-fetch fallback policy (spec 3 §media-fetch,
@@ -1409,6 +1510,90 @@ impl Config {
                 );
             }
         }
+        // Spec 13 §6.4 (l2-node 0.46.9+) — onion-transport surface.
+        // We only check the operator-controlled inputs here; the
+        // SOCKS5 dialer module enforces the runtime properties (DNS
+        // leak, IP fallthrough).
+        if self.network.tor.enabled {
+            // socks_proxy must parse as `host:port` AND host must be
+            // a loopback address. A remote SOCKS proxy would route
+            // every onion connection through that server, which the
+            // operator must not unwittingly do — it inverts the
+            // deanonymisation model. Operators with a real cross-
+            // host SOCKS5 need have a documented future override
+            // path; v0.46.9 keeps the rule strict.
+            let socks = self.network.tor.socks_proxy.trim();
+            let parsed: std::net::SocketAddr = socks.parse().with_context(|| {
+                format!(
+                    "network.tor.socks_proxy = {:?} must be a valid host:port \
+                     SocketAddr (default is 127.0.0.1:9050)",
+                    socks
+                )
+            })?;
+            if !parsed.ip().is_loopback() {
+                anyhow::bail!(
+                    "network.tor.socks_proxy = {} must point at a loopback \
+                     address (default 127.0.0.1:9050). A non-loopback SOCKS \
+                     proxy would route every onion dial through a remote \
+                     server, breaking the deanonymisation model. If you \
+                     genuinely need a remote SOCKS proxy, raise an issue \
+                     describing the threat model.",
+                    parsed
+                );
+            }
+            // Hidden-service hostname format check (v3 onion is
+            // 56 base32 chars + ".onion" = 62 chars). Allow empty —
+            // operators may enable Tor for outbound only (v0.46.10).
+            let host = self.network.tor.listen_onion_hostname.trim();
+            if !host.is_empty() {
+                if !host.is_ascii() {
+                    anyhow::bail!(
+                        "network.tor.listen_onion_hostname must be ASCII"
+                    );
+                }
+                if !host.ends_with(".onion") {
+                    anyhow::bail!(
+                        "network.tor.listen_onion_hostname = {:?} must end in \
+                         '.onion'",
+                        host
+                    );
+                }
+                // v3 onion: 56 base32 + ".onion" — v2 is dead since
+                // 2021 (Tor 0.4.6). Refuse anything else.
+                let stem = &host[..host.len() - ".onion".len()];
+                if stem.len() != 56 || !stem.bytes().all(|b| {
+                    matches!(b, b'a'..=b'z' | b'2'..=b'7')
+                }) {
+                    anyhow::bail!(
+                        "network.tor.listen_onion_hostname = {:?} must be a \
+                         v3 onion address (56 lowercase-base32 chars + \
+                         '.onion'); v2 onions were deprecated by Tor in 2021",
+                        host
+                    );
+                }
+                if self.network.tor.listen_onion_port == 0 {
+                    anyhow::bail!(
+                        "network.tor.listen_onion_port must be > 0 when \
+                         listen_onion_hostname is set — the inbound listen \
+                         needs a non-zero loopback port for the Tor service \
+                         to forward to"
+                    );
+                }
+            }
+            // advertise_onion_in_metadata requires a hostname AND a
+            // port — refuse the case where advertise is on but no
+            // hostname is configured (would advertise an empty
+            // multiaddr).
+            if self.network.tor.advertise_onion_in_metadata
+                && (host.is_empty() || self.network.tor.listen_onion_port == 0)
+            {
+                anyhow::bail!(
+                    "network.tor.advertise_onion_in_metadata = true requires \
+                     both listen_onion_hostname and listen_onion_port to be \
+                     set — cannot advertise an empty onion multiaddr"
+                );
+            }
+        }
         if self.network.listen_port == 0 {
             anyhow::bail!("network.listen_port must be > 0");
         }
@@ -1590,6 +1775,36 @@ enable_mdns = true
 # Default 7. Local-only dev deployments may want a longer threshold;
 # production nodes should stick with the default.
 max_peer_staleness_days = 7
+
+[network.tor]
+# Onion-transport surface — external Tor daemon + SOCKS5 wrapper
+# (spec 13 §6.4, l2-node 0.46.9+). Disabled by default; operators
+# with regulatory-resilience requirements opt in.
+#
+# When enabled = true, the operator MUST already run a Tor daemon
+# (apt install tor / brew install tor / etc.). The L2 node uses the
+# daemon's local SOCKS proxy for outbound onion dials (v0.46.10+)
+# and accepts inbound connections forwarded by the daemon's hidden-
+# service definition for the loopback port below.
+enabled = false
+# Local Tor SOCKS5 proxy. Must be a loopback host (validator refuses
+# non-loopback to prevent operators from unwittingly routing onion
+# traffic through a remote SOCKS server).
+socks_proxy = "127.0.0.1:9050"
+# Loopback TCP port the swarm listens on when an onion hostname is
+# configured. The torrc HiddenServicePort directive forwards
+# `<onion_virtual_port>` to `127.0.0.1:<listen_onion_port>`. Zero
+# disables inbound onion listen.
+listen_onion_port = 0
+# .onion hostname from /var/lib/tor/<hs_dir>/hostname. Must be a v3
+# onion (56 base32 chars + ".onion"). Empty disables inbound onion
+# listen and metadata advertisement.
+listen_onion_hostname = ""
+# When true, the metadata reconciler appends the onion multiaddr to
+# the desired list it compares against on-chain getNodeMetadata(self).
+# Operator still has to click Publish in the dashboard to broadcast
+# (spec 12 §6.2 no-proxy-signing rule).
+advertise_onion_in_metadata = false
 
 [network.sc_discovery]
 # SC-driven bootstrap control surface (spec 13 §4.2, l2-node 0.46.5+).
@@ -2076,6 +2291,114 @@ mod tests {
             .validate()
             .expect_err("oversize global concurrent cap must be rejected");
         assert!(format!("{err}").contains("peer_fallback_global_concurrent"));
+    }
+
+    // --- 0.46.9 Tor / onion transport (spec 13 §6.4) -----------------
+
+    #[test]
+    fn validate_passes_disabled_tor_with_any_values() {
+        // When `enabled = false`, none of the Tor knobs are checked.
+        // Operators can leave a stale config that referenced
+        // network.tor in place without the validator complaining.
+        let mut c = baseline_config();
+        c.network.tor.enabled = false;
+        c.network.tor.socks_proxy = "not even a valid address".to_string();
+        c.network.tor.listen_onion_hostname = "garbage".to_string();
+        c.network.tor.listen_onion_port = 0;
+        c.network.tor.advertise_onion_in_metadata = true;
+        c.validate().expect("disabled tor skips field-level checks");
+    }
+
+    #[test]
+    fn validate_rejects_non_loopback_socks_proxy() {
+        let mut c = baseline_config();
+        c.network.tor.enabled = true;
+        c.network.tor.socks_proxy = "8.8.8.8:9050".to_string();
+        let err = c
+            .validate()
+            .expect_err("non-loopback SOCKS proxy must be rejected");
+        let msg = format!("{err}");
+        assert!(msg.contains("loopback"), "error must mention loopback: {msg}");
+    }
+
+    #[test]
+    fn validate_rejects_malformed_socks_proxy() {
+        let mut c = baseline_config();
+        c.network.tor.enabled = true;
+        c.network.tor.socks_proxy = "not-a-socket".to_string();
+        let err = c.validate().expect_err("malformed socks_proxy must reject");
+        assert!(format!("{err}").contains("socks_proxy"));
+    }
+
+    #[test]
+    fn validate_rejects_short_onion_hostname() {
+        let mut c = baseline_config();
+        c.network.tor.enabled = true;
+        c.network.tor.listen_onion_hostname = "tooshort.onion".to_string();
+        c.network.tor.listen_onion_port = 41720;
+        let err = c
+            .validate()
+            .expect_err("non-v3 hostname must be rejected");
+        assert!(format!("{err}").contains("v3 onion"));
+    }
+
+    #[test]
+    fn validate_rejects_v3_onion_with_zero_port() {
+        let mut c = baseline_config();
+        c.network.tor.enabled = true;
+        c.network.tor.listen_onion_hostname =
+            format!("{}.onion", "a".repeat(56));
+        c.network.tor.listen_onion_port = 0;
+        let err = c
+            .validate()
+            .expect_err("zero port with hostname set must be rejected");
+        assert!(format!("{err}").contains("listen_onion_port"));
+    }
+
+    #[test]
+    fn validate_rejects_advertise_without_hostname() {
+        let mut c = baseline_config();
+        c.network.tor.enabled = true;
+        c.network.tor.advertise_onion_in_metadata = true;
+        c.network.tor.listen_onion_hostname = String::new();
+        c.network.tor.listen_onion_port = 41720;
+        let err = c
+            .validate()
+            .expect_err("advertise without hostname must be rejected");
+        assert!(format!("{err}").contains("advertise_onion_in_metadata"));
+    }
+
+    #[test]
+    fn validate_accepts_v3_onion_hostname() {
+        // 56 lowercase-base32 chars + ".onion".
+        let mut c = baseline_config();
+        c.network.tor.enabled = true;
+        c.network.tor.listen_onion_hostname =
+            format!("{}.onion", "a".repeat(56));
+        c.network.tor.listen_onion_port = 41720;
+        c.validate().expect("valid v3 onion config must pass");
+    }
+
+    #[test]
+    fn validate_rejects_non_ascii_onion_hostname() {
+        let mut c = baseline_config();
+        c.network.tor.enabled = true;
+        c.network.tor.listen_onion_hostname = "ünicode.onion".to_string();
+        c.network.tor.listen_onion_port = 41720;
+        let err = c.validate().expect_err("non-ASCII onion must be rejected");
+        assert!(format!("{err}").contains("ASCII"));
+    }
+
+    #[test]
+    fn validate_passes_outbound_only_tor() {
+        // Tor enabled but no inbound listen — outbound-only mode.
+        let mut c = baseline_config();
+        c.network.tor.enabled = true;
+        c.network.tor.socks_proxy = "127.0.0.1:9050".to_string();
+        c.network.tor.listen_onion_hostname = String::new();
+        c.network.tor.listen_onion_port = 0;
+        c.network.tor.advertise_onion_in_metadata = false;
+        c.validate().expect("outbound-only tor must pass");
     }
 
     // --- v0.41 per-IP permit field ----------------------------------

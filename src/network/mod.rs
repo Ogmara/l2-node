@@ -15,6 +15,7 @@ pub mod sc_discovery;
 pub mod snapshot;
 pub mod snapshot_client;
 pub mod sync;
+pub mod tor;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -233,9 +234,50 @@ impl NetworkService {
             .listen_on(tcp_addr.clone())
             .context("listening on TCP")?;
 
+        // Inbound onion listen (spec 13 §6.4, l2-node 0.46.9+). When
+        // the operator runs an external Tor daemon with a
+        // HiddenServicePort directive forwarding to
+        // 127.0.0.1:<listen_onion_port>, we open an extra loopback TCP
+        // listener so the forwarded traffic terminates in our swarm
+        // and goes through the standard Noise/yamux pipeline.
+        //
+        // The bind is loopback-only — the kernel's port is not exposed
+        // on any external interface. Inbound traffic comes exclusively
+        // from the Tor daemon's hidden-service forward (which the
+        // operator configured to point here). Crucially, this means
+        // even if the loopback address is wrong (e.g., Tor configured
+        // to forward to a non-loopback port the operator typed by
+        // mistake), the listener does NOT accept clearnet connections
+        // — the misconfigured Tor service is what would carry them.
+        if config.network.tor.enabled
+            && !config.network.tor.listen_onion_hostname.is_empty()
+            && config.network.tor.listen_onion_port != 0
+        {
+            let onion_local_addr: Multiaddr = format!(
+                "/ip4/127.0.0.1/tcp/{}",
+                config.network.tor.listen_onion_port
+            )
+            .parse()
+            .context("parsing onion-inbound loopback listen address")?;
+            match swarm.listen_on(onion_local_addr.clone()) {
+                Ok(_) => info!(
+                    onion_hostname = %config.network.tor.listen_onion_hostname,
+                    loopback = %onion_local_addr,
+                    "Onion inbound listener up (Tor hidden service forwards here)"
+                ),
+                Err(e) => warn!(
+                    onion_hostname = %config.network.tor.listen_onion_hostname,
+                    loopback = %onion_local_addr,
+                    error = %e,
+                    "Onion inbound listen failed; continuing without onion inbound"
+                ),
+            }
+        }
+
         info!(
             quic = %quic_addr,
             tcp = %tcp_addr,
+            onion_enabled = config.network.tor.enabled,
             "Network listening"
         );
 
