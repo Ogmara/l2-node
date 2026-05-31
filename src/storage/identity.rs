@@ -75,7 +75,47 @@ impl IdentityResolver {
     }
 
     /// Register a device and update the cache.
+    ///
+    /// **Cross-wallet hijack defense (Security Audit C1, 0.46.8).**
+    /// Before writing, we look up the current forward-map entry for
+    /// `claim.device_address`. If the device is already mapped to a
+    /// DIFFERENT wallet, the registration is refused with an
+    /// `Err`. The legitimate path to re-assign a device to a new
+    /// wallet is: the old wallet publishes a `DeviceRevocation`
+    /// envelope (which removes the forward-map entry), then the new
+    /// wallet publishes a `DeviceDelegation`. Without this check, a
+    /// wallet B publishing a `DeviceDelegation` envelope that names
+    /// a device key D currently registered under wallet A would
+    /// silently overwrite the forward map and "steal" device D
+    /// across the entire mesh — `DeviceDelegationPayload` does not
+    /// carry a proof-of-possession of the device's private key, so
+    /// the wallet's signature on the envelope is not by itself
+    /// authorisation to claim an arbitrary device pubkey. Closing
+    /// the hijack vector at the storage boundary protects both the
+    /// local `register_device` HTTP path AND the cross-node
+    /// `update_indexes` apply arm with a single guard.
+    ///
+    /// Same-wallet re-registrations (legitimate claim refresh) and
+    /// fresh registrations into an unmapped device address both
+    /// proceed normally.
     pub fn register_device(&self, claim: &DeviceClaim) -> Result<()> {
+        // Resolve directly against storage (not the cache) to avoid
+        // racing with concurrent revocations that may have just
+        // invalidated a cached entry.
+        if let Some(existing_wallet) =
+            self.storage.resolve_wallet(&claim.device_address)?
+        {
+            if existing_wallet != claim.wallet_address {
+                anyhow::bail!(
+                    "device {} is already mapped to wallet {}; refuse to \
+                     reassign to {} without an explicit revocation first \
+                     (cross-wallet device-hijack defense)",
+                    claim.device_address,
+                    existing_wallet,
+                    claim.wallet_address,
+                );
+            }
+        }
         self.storage.register_device(claim)?;
         // Update cache — always insert for existing keys (update), but respect
         // MAX_CACHE_ENTRIES for new entries to bound memory growth.
@@ -208,6 +248,79 @@ mod tests {
 
         let result = resolver.resolve("klv1device333").unwrap();
         assert_eq!(result, "klv1device333"); // falls back to device address
+    }
+
+    #[test]
+    fn register_same_wallet_again_is_idempotent_update() {
+        // Re-registering the same (wallet, device) tuple just updates
+        // the claim row — this is the legitimate refresh path, e.g.
+        // when a wallet rotates the claim signature with a fresher
+        // timestamp.
+        let (storage, _dir) = test_storage();
+        let resolver = IdentityResolver::new(storage);
+        let claim1 = test_claim("klv1deviceREFRESH", "klv1walletREFRESH");
+        resolver.register_device(&claim1).unwrap();
+        let mut claim2 = claim1.clone();
+        claim2.registered_at = claim1.registered_at + 1000;
+        resolver
+            .register_device(&claim2)
+            .expect("same-wallet refresh must succeed");
+        assert_eq!(
+            resolver.resolve("klv1deviceREFRESH").unwrap(),
+            "klv1walletREFRESH"
+        );
+    }
+
+    #[test]
+    fn register_blocks_cross_wallet_overwrite() {
+        // Security Audit C1 (0.46.8): a second wallet cannot
+        // overwrite the forward map for a device already owned by
+        // the first wallet, regardless of timestamp. The legitimate
+        // path to reassign is: original wallet revokes, then new
+        // wallet registers.
+        let (storage, _dir) = test_storage();
+        let resolver = IdentityResolver::new(storage);
+
+        let claim_a = test_claim("klv1deviceHIJACK", "klv1walletA");
+        resolver.register_device(&claim_a).unwrap();
+
+        let claim_b = test_claim("klv1deviceHIJACK", "klv1walletB");
+        let err = resolver
+            .register_device(&claim_b)
+            .expect_err("cross-wallet overwrite must be refused");
+        let msg = format!("{err}");
+        assert!(msg.contains("already mapped"), "error must explain: {msg}");
+        assert!(msg.contains("hijack"), "error must reference hijack: {msg}");
+
+        // Forward map is intact.
+        assert_eq!(
+            resolver.resolve("klv1deviceHIJACK").unwrap(),
+            "klv1walletA"
+        );
+    }
+
+    #[test]
+    fn register_after_revoke_allows_new_wallet() {
+        // Sanity: the cross-wallet defense allows reassignment after
+        // an explicit revocation — the legitimate operator path.
+        let (storage, _dir) = test_storage();
+        let resolver = IdentityResolver::new(storage);
+
+        let claim_a = test_claim("klv1deviceREVOKED", "klv1walletA");
+        resolver.register_device(&claim_a).unwrap();
+        let revoked = resolver
+            .revoke_device("klv1deviceREVOKED", "klv1walletA")
+            .unwrap();
+        assert!(revoked);
+
+        let claim_b = test_claim("klv1deviceREVOKED", "klv1walletB");
+        resolver
+            .register_device(&claim_b)
+            .expect("post-revocation registration must succeed");
+        assert_eq!(
+            resolver.resolve("klv1deviceREVOKED").unwrap(),
+            "klv1walletB"
+        );
     }
 
     #[test]

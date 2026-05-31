@@ -1624,6 +1624,149 @@ impl MessageRouter {
                     debug!(author = %resolved_author, "Settings synced");
                 }
             }
+            MessageType::DeviceDelegation => {
+                // B2 propagation arm (l2-node 0.46.8+, spec 1 §device-
+                // delegation, spec 3 §router).
+                //
+                // A wallet-signed DeviceDelegation envelope reaches this
+                // arm via two paths:
+                //   1. The owning wallet POSTed a wallet-signed envelope
+                //      through `/api/v1/messages` (or the augmented
+                //      `register_device` path) on this node — local
+                //      apply.
+                //   2. Another node received the same envelope on
+                //      `topic_network` and relayed it via gossip — remote
+                //      apply, the cross-node propagation case B2 was
+                //      tracking before this version.
+                //
+                // Both paths converge here. We compute the device address
+                // from the payload's pubkey, look up any existing claim
+                // for this (wallet, device) tuple, and apply only when
+                // the incoming envelope is newer than what we already
+                // have. Idempotency is keyed on (envelope.author = wallet,
+                // payload.device_pub_key, envelope.timestamp): equal-or-
+                // older timestamps are no-ops so cross-node gossip
+                // replays don't churn the index. Different wallets
+                // claiming the same device key cannot happen for an
+                // honest client (the same Ed25519 key cannot be signed
+                // for by two distinct wallets without sharing the
+                // private key); the existing forward-map last-write-wins
+                // would otherwise leak the device under whichever wallet
+                // got there last.
+                if let Ok(payload) =
+                    rmp_serde::from_slice::<DeviceDelegationPayload>(&envelope.payload)
+                {
+                    let pubkey_bytes = hex::decode(&payload.device_pub_key)
+                        .context("invalid device_pub_key hex")?;
+                    let pubkey_array: [u8; 32] = pubkey_bytes.try_into()
+                        .map_err(|_| anyhow::anyhow!("device_pub_key must be 32 bytes"))?;
+                    let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&pubkey_array)
+                        .map_err(|e| anyhow::anyhow!("invalid Ed25519 public key: {}", e))?;
+                    let device_address = crypto::device_pubkey_to_address(&verifying_key)
+                        .map_err(|e| anyhow::anyhow!("failed to encode device address: {}", e))?;
+
+                    // Code Audit W1 (0.46.8): bail on storage faults
+                    // rather than falling through to the apply path.
+                    // A storage error in `list_devices` previously
+                    // resolved to "no existing claim found", which
+                    // would overwrite a newer claim with an older
+                    // gossip replay — inverting the LWW guard. With
+                    // `?` propagation, the storage fault aborts the
+                    // arm cleanly and the envelope is retried on the
+                    // next gossip arrival.
+                    let existing_claim = self
+                        .identity
+                        .list_devices(resolved_author)
+                        .context("list_devices for DeviceDelegation idempotency check")?
+                        .into_iter()
+                        .find(|c| c.device_address == device_address);
+
+                    // Idempotency check: same (wallet, device) tuple
+                    // with greater-or-equal timestamp = no-op. First
+                    // writer wins on equal ms; documented behaviour.
+                    if let Some(ref existing) = existing_claim {
+                        if existing.registered_at >= envelope.timestamp {
+                            debug!(
+                                device = %device_address,
+                                wallet = %resolved_author,
+                                existing_ts = existing.registered_at,
+                                incoming_ts = envelope.timestamp,
+                                "DeviceDelegation older or equal — no-op"
+                            );
+                            return Ok(());
+                        }
+                    }
+
+                    // Security Audit W1 (0.46.8): enforce
+                    // MAX_DEVICES_PER_WALLET on the receive side too.
+                    // The local `register_device` HTTP path already
+                    // enforces this (routes.rs), but a wallet pushing
+                    // DeviceDelegation envelopes directly to gossip
+                    // bypassed that check pre-0.46.8 because there
+                    // was no apply arm; now there is, the cap belongs
+                    // here as well. Excludes the current (wallet,
+                    // device) tuple from the count so an in-place
+                    // refresh always succeeds.
+                    const MAX_DEVICES_PER_WALLET: usize = 10;
+                    let existing_count = self
+                        .identity
+                        .list_devices(resolved_author)
+                        .context("list_devices for DeviceDelegation cap check")?
+                        .into_iter()
+                        .filter(|c| c.device_address != device_address)
+                        .count();
+                    if existing_count >= MAX_DEVICES_PER_WALLET {
+                        warn!(
+                            wallet = %resolved_author,
+                            existing_count,
+                            cap = MAX_DEVICES_PER_WALLET,
+                            "DeviceDelegation arrival exceeded per-wallet device cap; dropping"
+                        );
+                        return Ok(());
+                    }
+
+                    let claim = crate::storage::rocks::DeviceClaim {
+                        device_address: device_address.clone(),
+                        wallet_address: resolved_author.to_string(),
+                        device_pubkey_hex: payload.device_pub_key.to_ascii_lowercase(),
+                        // The envelope itself carries the wallet
+                        // signature; we don't have it as a separate
+                        // hex string here. The local-API
+                        // register_device path stores the original
+                        // claim signature; gossip-received delegations
+                        // rely on the envelope signature as the
+                        // proof, so an empty marker is correct here.
+                        wallet_signature: String::new(),
+                        registered_at: envelope.timestamp,
+                    };
+                    // `identity.register_device` enforces the
+                    // cross-wallet-hijack defense from Security Audit
+                    // C1 (0.46.8) — if a different wallet currently
+                    // owns this device address, the call errors out
+                    // and we log + drop. The wallet whose gossip
+                    // envelope arrived second cannot steal a device
+                    // already mapped to wallet A without an
+                    // intervening DeviceRevocation.
+                    match self.identity.register_device(&claim) {
+                        Ok(()) => {
+                            debug!(
+                                device = %device_address,
+                                wallet = %resolved_author,
+                                ts = envelope.timestamp,
+                                "Device delegation applied"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                device = %device_address,
+                                attempted_wallet = %resolved_author,
+                                error = %e,
+                                "DeviceDelegation refused by identity layer (cross-wallet hijack defense or storage fault)"
+                            );
+                        }
+                    }
+                }
+            }
             MessageType::DeviceRevocation => {
                 if let Ok(payload) =
                     rmp_serde::from_slice::<DeviceRevocationPayload>(&envelope.payload)
