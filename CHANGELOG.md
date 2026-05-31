@@ -5,6 +5,111 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.46.9] - 2026-05-31
+
+Onion transport — Phase 1. Ships the security-critical SOCKS5
+dialer module (hand-rolled, with full security audit), the
+`[network.tor]` config surface, inbound hidden-service listen
+support, and the `setNodeMetadata` onion-advertisement
+integration. Operators can now host a Tor hidden service and
+advertise the onion multiaddr on chain; their nodes are
+reachable by Tor-aware clients. Outbound onion dial (the libp2p
+Transport composition for `/onion3/...` multiaddrs) is Phase 2,
+shipping in v0.46.10.
+
+### Why
+
+Spec 13 §6.4's regulatory-resilience profile depends on operators
+being able to publish onion-only multiaddrs and have nodes serve
+inbound onion traffic. Before 0.46.9 the L2 node had no config
+surface, no SOCKS5 wrapper, and no inbound onion listener — even
+operators who set up Tor themselves had no way for the node to
+participate in the onion overlay. v0.46.9 fills the gaps that
+don't depend on the libp2p Transport-trait composition (which is
+v0.46.10's larger refactor).
+
+### Added
+
+- **`[network.tor]` config block** (spec 13 §6.4): `enabled`
+  (default `false`), `socks_proxy` (default `127.0.0.1:9050` —
+  loopback-only enforced at config-load), `listen_onion_port`
+  (loopback TCP port the hidden service forwards to),
+  `listen_onion_hostname` (v3 onion address, 56 lowercase-base32
+  + `.onion`), `advertise_onion_in_metadata` (opt-in append to
+  `setNodeMetadata` calldata). 10 unit tests cover the validator
+  paths (non-loopback proxy refused, v2 onion refused, non-ASCII
+  hostname refused, advertise-without-hostname refused, outbound-
+  only mode accepted, disabled-with-garbage-fields ignored).
+- **`crate::network::tor`** — hand-rolled SOCKS5 dialer
+  (`Socks5Dialer`) with audited security properties:
+  - No DNS leak. RFC 1928 ATYP=0x03 (DOMAINNAME) — the `.onion`
+    hostname is forwarded to the proxy as bytes; never resolved
+    locally.
+  - No IP fallthrough. Proxy unreachable / wrong-version /
+    CONNECT-refused / handshake-timeout → `Err`; never falls back
+    to a direct TCP connect.
+  - Loopback-only proxy. Constructor refuses non-loopback
+    addresses.
+  - Bounded reads, fixed-size buffers; no attacker-controlled
+    length feeds an unbounded allocation.
+  - Connect (5s) and handshake (5s) timeouts wrap every wire-
+    protocol round trip.
+  - 10 unit tests covering empty / overlong / non-ASCII hostnames,
+    proxy unreachable, wrong-version response, method refusal,
+    CONNECT refusal, every ATYP variant in the reply, full
+    handshake + byte-forwarding via a mock server.
+- **Inbound onion listen path** in `network/mod.rs::new`. When
+  `tor.enabled && !listen_onion_hostname.is_empty() &&
+  listen_onion_port != 0`, the swarm listens on
+  `/ip4/127.0.0.1/tcp/<listen_onion_port>` so the operator's Tor
+  hidden-service forward terminates in the swarm and goes through
+  the standard Noise / yamux pipeline.
+- **`compute_onion_advertisement` helper** in `api/admin.rs`. Both
+  the `node_metadata` admin endpoint and the metadata reconciler
+  call it to append `/onion3/<stem>:<port>/p2p/<peer_id>` to the
+  desired multiaddr list when the operator opts in.
+- **Spec 13 §6.4.1** — complete operator workflow including
+  `/etc/tor/torrc` snippets, the 56-char-base32 + `.onion`
+  validation rules, the onion-multiaddr canonical format, the
+  five SOCKS5-dialer audit invariants, and the v0.46.10 follow-up
+  scope.
+
+### Changed
+
+- **`AppState` carries a `tor_config: TorConfig` snapshot** so the
+  admin endpoint can render the desired-multiaddr list with the
+  onion entry on every poll.
+- **`MetadataReconciler::new`** signature gains a `tor_config:
+  TorConfig` argument. The reconciler's per-tick desired list now
+  includes the onion multiaddr when configured.
+
+### Security
+
+- **DNS leak prevention** is the headline SOCKS5 audit property —
+  enforced by always using ATYP=0x03 and the absence of any
+  IP-target overload on the dialer's public surface.
+- **IP fallthrough refusal**: any proxy failure surfaces as `Err`;
+  there is no `if let Err(_) = socks_connect { tcp_connect(...) }`
+  path in the codebase.
+- **Loopback-only SOCKS proxy** is enforced at TWO layers:
+  `Config::validate` rejects non-loopback `socks_proxy` at
+  config-load, and `Socks5Dialer::new` re-checks at construction
+  time for in-process callers.
+- **v3 onion hostname validation**: rejects non-ASCII, wrong
+  length, non-base32 chars, missing port pairing. v2 onions are
+  explicitly refused (deprecated by Tor in 2021).
+- **Loopback-only inbound listen**: the inbound onion listener
+  binds `127.0.0.1` only; even if the operator's Tor service
+  forwards to a different port by mistake, the listener does NOT
+  accept clearnet connections — the misconfigured service is what
+  would carry them.
+
+### Spec touches
+
+- `docs/specs/13-node-discovery.md` §6.4.1 (new subsection):
+  full onion-transport workflow + v0.46.9 scope + v0.46.10
+  follow-up scope.
+
 ## [0.46.8] - 2026-05-31
 
 B2: cross-node device-delegation propagation. The router now applies

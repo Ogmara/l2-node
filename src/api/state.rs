@@ -345,6 +345,11 @@ pub struct AppState {
     /// branches on this — fallback runs only when all conditions
     /// align.
     pub media_fallback: Option<crate::api::media_fallback::MediaFallbackState>,
+    /// Snapshot of `[network.tor]` taken at startup (spec 13 §6.4,
+    /// l2-node 0.46.9+). Used by the `node_metadata` admin endpoint
+    /// to append the onion multiaddr to the desired list when the
+    /// operator has opted in. Operators restart to change.
+    pub tor_config: crate::config::TorConfig,
 }
 
 /// Cached bootstrap-candidates response (spec 13 §4.5).
@@ -432,6 +437,7 @@ impl AppState {
             crate::network::mesh_stats::shared_empty(),     // mesh_stats — empty in tests
             crate::network::mesh_stats::PublishFailureCounters::default(), // publish_failure_counters
             None,                                           // media_fallback — disabled in tests
+            crate::config::TorConfig::default(),            // tor_config — disabled in tests
         )
     }
 
@@ -479,6 +485,7 @@ impl AppState {
         mesh_stats: crate::network::mesh_stats::SharedMeshStats,
         publish_failure_counters: crate::network::mesh_stats::PublishFailureCounters,
         media_fallback: Option<crate::api::media_fallback::MediaFallbackState>,
+        tor_config: crate::config::TorConfig,
     ) -> Self {
         // moka LRU with size-weighted eviction. `weigher` returns the
         // byte count of each value's body (content-type string is
@@ -552,6 +559,7 @@ impl AppState {
             mesh_stats,
             publish_failure_counters,
             media_fallback,
+            tor_config,
         }
     }
 

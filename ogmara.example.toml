@@ -26,6 +26,36 @@ enable_mdns = true
 # production nodes should stick with the default.
 max_peer_staleness_days = 7
 
+[network.tor]
+# Onion-transport surface — external Tor daemon + SOCKS5 wrapper
+# (spec 13 §6.4, l2-node 0.46.9+). Disabled by default; operators
+# with regulatory-resilience requirements opt in.
+#
+# When enabled = true, the operator MUST already run a Tor daemon
+# (apt install tor / brew install tor / etc.). The L2 node uses the
+# daemon's local SOCKS proxy for outbound onion dials (v0.46.10+)
+# and accepts inbound connections forwarded by the daemon's hidden-
+# service definition for the loopback port below.
+enabled = false
+# Local Tor SOCKS5 proxy. Must be a loopback host (validator refuses
+# non-loopback to prevent operators from unwittingly routing onion
+# traffic through a remote SOCKS server).
+socks_proxy = "127.0.0.1:9050"
+# Loopback TCP port the swarm listens on when an onion hostname is
+# configured. The torrc HiddenServicePort directive forwards
+# `<onion_virtual_port>` to `127.0.0.1:<listen_onion_port>`. Zero
+# disables inbound onion listen.
+listen_onion_port = 0
+# .onion hostname from /var/lib/tor/<hs_dir>/hostname. Must be a v3
+# onion (56 base32 chars + ".onion"). Empty disables inbound onion
+# listen and metadata advertisement.
+listen_onion_hostname = ""
+# When true, the metadata reconciler appends the onion multiaddr to
+# the desired list it compares against on-chain getNodeMetadata(self).
+# Operator still has to click Publish in the dashboard to broadcast
+# (spec 12 §6.2 no-proxy-signing rule).
+advertise_onion_in_metadata = false
+
 [network.sc_discovery]
 # SC-driven bootstrap control surface (spec 13 §4.2, l2-node 0.46.5+).
 # `enabled = true` (default) keeps the node discovering peers from the

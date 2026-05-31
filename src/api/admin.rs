@@ -822,6 +822,50 @@ pub(crate) fn compute_effective_multiaddrs(
     (vec![tcp, quic], true)
 }
 
+/// Compute the onion multiaddr to append to the desired metadata
+/// list when `[network.tor] advertise_onion_in_metadata = true` and a
+/// hidden-service hostname + port are configured. Returns `None` when
+/// onion advertisement is off, when Tor is not enabled, or when the
+/// hostname/port are missing.
+///
+/// Multiaddr format: `/onion3/<stem>:<port>/p2p/<peer_id>` where
+/// `<stem>` is the 56-char base32 portion of the v3 onion address
+/// (the part before `.onion`). The `/p2p/<peer_id>` suffix is
+/// required by the v0.46.5 SC-driven bootstrap rules (spec 13 §4.2)
+/// — without it, consumers reject the entry as undialable.
+///
+/// Spec 13 §6.4 (l2-node 0.46.9+).
+pub(crate) fn compute_onion_advertisement(
+    tor: &crate::config::TorConfig,
+    network_peer_id: &str,
+) -> Option<String> {
+    if !tor.enabled || !tor.advertise_onion_in_metadata {
+        return None;
+    }
+    if tor.listen_onion_port == 0 {
+        return None;
+    }
+    if network_peer_id.is_empty() {
+        // Same rule as `compute_effective_multiaddrs`: an empty
+        // peer_id means we couldn't produce a dialable multiaddr, so
+        // omit the entry rather than emit something the consumer will
+        // reject.
+        return None;
+    }
+    let host = tor.listen_onion_hostname.trim();
+    let stem = host.strip_suffix(".onion")?;
+    if stem.len() != 56 {
+        // Defensive — `validate` already enforced this, but the
+        // helper is called from contexts that may have skipped
+        // validation (unit tests constructing config by hand).
+        return None;
+    }
+    Some(format!(
+        "/onion3/{}:{}/p2p/{}",
+        stem, tor.listen_onion_port, network_peer_id
+    ))
+}
+
 /// Tagged host kind returned by [`extract_host_from_url`]. Drives the
 /// `/dns4` vs `/ip4` vs `/ip6` multiaddr-protocol selection in
 /// [`compute_effective_multiaddrs`]. Added in v0.46.0 Phase D so v6-only
@@ -994,12 +1038,23 @@ pub async fn node_metadata(
         .into_response();
     }
 
-    let (effective, auto_derived) = compute_effective_multiaddrs(
+    let (mut effective, auto_derived) = compute_effective_multiaddrs(
         &state.anchor_metadata_config,
         state.network_listen_port,
         state.public_url.as_deref(),
         &state.network_peer_id,
     );
+    // Spec 13 §6.4 (l2-node 0.46.9+) — append the onion multiaddr
+    // when the operator has opted into advertising it. This runs
+    // regardless of whether the clearnet multiaddrs were configured
+    // explicitly or auto-derived, so onion-only operators see the
+    // entry too.
+    if let Some(onion) = compute_onion_advertisement(
+        &state.tor_config,
+        &state.network_peer_id,
+    ) {
+        effective.push(onion);
+    }
 
     let on_chain_res = crate::chain::sc_views::get_node_metadata(
         &state.klever_view_http,

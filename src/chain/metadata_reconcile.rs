@@ -151,6 +151,10 @@ pub struct MetadataReconciler {
     network_listen_port: u16,
     network_peer_id: String,
     api_public_url: Option<String>,
+    /// Snapshot of `[network.tor]` (spec 13 §6.4, l2-node 0.46.9+).
+    /// Drives the onion-multiaddr append on each desired-list
+    /// computation when `advertise_onion_in_metadata = true`.
+    tor_config: crate::config::TorConfig,
     /// Writer half of the shared drift snapshot.
     drift: SharedMetadataDrift,
     /// Alert sender — `None` when alerts are disabled. Sender is
@@ -170,6 +174,7 @@ impl MetadataReconciler {
         network_listen_port: u16,
         network_peer_id: String,
         api_public_url: Option<String>,
+        tor_config: crate::config::TorConfig,
         drift: SharedMetadataDrift,
         alert_event_tx: Option<AlertEventSender>,
     ) -> anyhow::Result<Self> {
@@ -185,6 +190,7 @@ impl MetadataReconciler {
             network_listen_port,
             network_peer_id,
             api_public_url,
+            tor_config,
             drift,
             alert_event_tx,
         })
@@ -255,12 +261,20 @@ impl MetadataReconciler {
             .unwrap_or_default()
             .as_secs();
 
-        let (desired, _auto_derived) = compute_effective_multiaddrs(
+        let (mut desired, _auto_derived) = compute_effective_multiaddrs(
             &self.metadata_config,
             self.network_listen_port,
             self.api_public_url.as_deref(),
             &self.network_peer_id,
         );
+        // Spec 13 §6.4 (l2-node 0.46.9+) — append the onion multiaddr
+        // when the operator has opted into advertising it.
+        if let Some(onion) = crate::api::admin::compute_onion_advertisement(
+            &self.tor_config,
+            &self.network_peer_id,
+        ) {
+            desired.push(onion);
+        }
 
         let on_chain = match sc_views::get_node_metadata(
             &self.klever_view_http,
