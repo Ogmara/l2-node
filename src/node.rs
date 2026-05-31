@@ -272,6 +272,22 @@ impl Node {
             std::collections::HashSet::<libp2p::PeerId>::new(),
         ));
 
+        // Spec 10 §9.2 (l2-node 0.46.6+) — B4 instrumentation. Both
+        // shared between `NetworkService` (writer) and `AppState`
+        // (reader for the `/admin/network/mesh-stats` endpoint).
+        let mesh_stats_handle = crate::network::mesh_stats::shared_empty();
+        let publish_failure_counters =
+            crate::network::mesh_stats::PublishFailureCounters::default();
+
+        // Pre-allocate the alert event channel so `NetworkService`
+        // (the `publish_failed_insufficient_peers` alert firer) and
+        // the rest of the task graph share the same handle. Receiver
+        // is consumed by `AlertEngine` later in this method. Channel
+        // allocation is cheap; the senders are cloned per-task and
+        // gated on `[alerts] enabled`.
+        let (alert_event_tx, alert_event_rx) =
+            crate::notifications::alerts::AlertEngine::event_channel();
+
         // Start the network service
         let keypair = self.libp2p_keypair()?;
         let mut network = crate::network::NetworkService::new(
@@ -289,6 +305,17 @@ impl Node {
             snapshot_client_rx,
             identify_success_count.clone(),
             sc_added_peer_ids.clone(),
+            publish_failure_counters.clone(),
+            mesh_stats_handle.clone(),
+            // Alert sender — gated on `[alerts] enabled` so the network
+            // task does not hold a live channel half against a missing
+            // engine. The same gate is used elsewhere in this method
+            // (sc_discovery, metadata reconciler).
+            if self.config.alerts.enabled {
+                Some(alert_event_tx.clone())
+            } else {
+                None
+            },
         )
         .await
         .context("starting network service")?;
@@ -558,18 +585,10 @@ impl Node {
         let anchor_canonical_counter =
             std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
 
-        // Pre-allocate the alert event channel so it's available to
-        // the state anchorer (constructed below) AND the sc_discovery
-        // task (constructed inside NetworkService). The receiver goes
-        // into AlertEngine further down. `events_tx` is cloneable; we
-        // wrap it in Option so callers can run with `alerts.enabled =
-        // false` and skip event firing entirely (channel-creation cost
-        // is negligible — single mpsc allocation — so we always create
-        // it and gate the wiring on the alerts.enabled check).
-        let (alert_event_tx, alert_event_rx) =
-            crate::notifications::alerts::AlertEngine::event_channel();
-        // Anchorer-side handle: cloned per-task. None when alerts
-        // disabled — tasks suppress event firing in that case.
+        // Anchorer-side alert handle: cloned per-task. The channel
+        // itself was pre-allocated above (before `NetworkService::new`)
+        // so the network task could also receive a sender. None when
+        // alerts disabled — tasks suppress event firing in that case.
         let anchor_alert_tx: Option<crate::notifications::alerts::AlertEventSender> =
             if self.config.alerts.enabled {
                 Some(alert_event_tx.clone())
@@ -996,6 +1015,11 @@ impl Node {
             // when the reconciler is not spawned so the admin
             // endpoint can read unconditionally.
             metadata_drift_handle.clone(),
+            // Spec 10 §9.2 — B4 instrumentation surface. Shared with
+            // `NetworkService`; written every 30s by the network task,
+            // read by the `/admin/network/mesh-stats` endpoint.
+            mesh_stats_handle.clone(),
+            publish_failure_counters.clone(),
         ));
         // Background sweep: drop zero-counter entries from the per-IP
         // media limiter (v0.41). Without this, the DashMap accumulates

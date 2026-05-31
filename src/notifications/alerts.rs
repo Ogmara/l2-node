@@ -71,6 +71,14 @@ pub enum AlertType {
     /// signing rule). Cooldown bounds re-fire to one per hour even
     /// though the reconcile tick is hourly too.
     MetadataDriftDetected,
+    /// A GossipSub publish failed because no peers were subscribed to
+    /// the target topic — the
+    /// [`libp2p::gossipsub::PublishError::NoPeersSubscribedToTopic`]
+    /// case (spec 10 §9.2, l2-node 0.46.6+). Surfaced as B4
+    /// instrumentation for the asymmetric-propagation diagnosis that
+    /// gates the proper fix in v0.46.10. Cooldown bounds re-fire so
+    /// a topic with no subscribers does not flood the alert log.
+    PublishFailedInsufficientPeers,
 }
 
 impl AlertType {
@@ -83,7 +91,8 @@ impl AlertType {
             | AlertType::DiskUsageHigh
             | AlertType::MemoryUsageHigh
             | AlertType::AnchorOverdue
-            | AlertType::ScSyncBehind => AlertSeverity::Warning,
+            | AlertType::ScSyncBehind
+            | AlertType::PublishFailedInsufficientPeers => AlertSeverity::Warning,
             AlertType::HighRateLimitTriggers
             | AlertType::FailedSignatureSpike
             | AlertType::NodeStarted
@@ -109,6 +118,9 @@ impl AlertType {
             AlertType::NodeStarted => "Node started",
             AlertType::BootstrapScFallbackUsed => "On-chain peer discovery engaged",
             AlertType::MetadataDriftDetected => "On-chain metadata drifted from configured list",
+            AlertType::PublishFailedInsufficientPeers => {
+                "GossipSub publish failed — no peers subscribed to topic"
+            }
         }
     }
 
@@ -128,6 +140,7 @@ impl AlertType {
             AlertType::NodeStarted => "node_started",
             AlertType::BootstrapScFallbackUsed => "bootstrap_sc_fallback_used",
             AlertType::MetadataDriftDetected => "metadata_drift_detected",
+            AlertType::PublishFailedInsufficientPeers => "publish_failed_insufficient_peers",
         }
     }
 }
