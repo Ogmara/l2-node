@@ -3828,6 +3828,26 @@ pub struct RegisterDeviceRequest {
     pub wallet_signature: String,
     /// Unix timestamp (ms) from the claim string.
     pub timestamp: u64,
+    /// **OPTIONAL** (l2-node 0.46.8+): hex-encoded MessagePack
+    /// serialisation of a wallet-signed [`DeviceDelegation`] envelope.
+    ///
+    /// When present, the node validates the envelope (signature
+    /// against `envelope.author` = the wallet) and publishes it on
+    /// the network-coordination gossip topic so peer nodes receive
+    /// the delegation and update their device→wallet maps. Without
+    /// this field the registration is **local-only** — peers will
+    /// not learn about it until they happen to see a message signed
+    /// by the device, at which point they fall back to treating the
+    /// device address as its own wallet identity.
+    ///
+    /// Closes B2 in `docs/planning/mainnet-blockers-fix-plan.md`.
+    /// Existing clients that don't fill this field keep working at
+    /// the old local-only semantics; new clients that have wallet-
+    /// key access (Klever Extension on desktop, K5 mobile flows
+    /// that already collect the claim signature) should populate
+    /// it.
+    #[serde(default)]
+    pub signed_envelope_hex: Option<String>,
 }
 
 /// POST /api/v1/devices/register — register a device key under a wallet.
@@ -4022,22 +4042,216 @@ pub async fn register_device(
                 }
             }
 
+            // B2 propagation (spec 1 §device-delegation, l2-node
+            // 0.46.8+): if the client supplied a wallet-signed
+            // DeviceDelegation envelope, route it through the message
+            // router and publish on the network gossip topic so peer
+            // nodes update their device→wallet maps. The router-side
+            // apply arm is what makes the propagated envelope durable
+            // on receivers (`messages/router.rs::update_indexes`).
+            //
+            // Failures here DO NOT fail the request — local registration
+            // already succeeded, and a malformed envelope from a buggy
+            // client should not undo that. We log loudly so operator
+            // metrics surface the drift.
+            let mut propagated = false;
+            if let Some(envelope_hex) = body.signed_envelope_hex.as_deref() {
+                propagated = propagate_device_delegation(
+                    &state,
+                    envelope_hex,
+                    &device_address,
+                    &body.wallet_address,
+                )
+                .await;
+            }
+
             tracing::info!(
                 device = %device_address,
                 wallet = %body.wallet_address,
                 registered_by = %auth_user.signing_address,
+                propagated,
                 "Device registered"
             );
             Json(serde_json::json!({
                 "ok": true,
                 "device_address": device_address,
                 "wallet_address": body.wallet_address,
+                "propagated": propagated,
             }))
             .into_response()
         }
         Err(e) => {
             tracing::error!(error = %e, "Failed to register device");
             (StatusCode::INTERNAL_SERVER_ERROR, "registration failed").into_response()
+        }
+    }
+}
+
+/// Decode a hex-encoded wallet-signed `DeviceDelegation` envelope,
+/// validate it through the standard router pipeline, and publish on
+/// the network-coordination gossip topic. Returns `true` iff the
+/// envelope was accepted by the router AND a gossip publish was
+/// queued.
+///
+/// Local registration is intentionally NOT undone on any failure of
+/// this path — operators see the `propagated = false` field on the
+/// response and the structured log line for debugging.
+///
+/// Sanity bounds:
+/// - Envelope hex is capped at `MAX_ENVELOPE_HEX_LEN` (32 KiB hex =
+///   16 KiB bytes) to prevent an unbounded body smuggle through the
+///   JSON layer.
+/// - The decoded envelope's `msg_type` must equal
+///   [`MessageType::DeviceDelegation`] — refuses to publish other
+///   message types via this convenience endpoint.
+/// - The decoded envelope's `author` must equal the registration's
+///   `wallet_address` — refuses to publish delegations for a
+///   different wallet than the one the operator just authorised
+///   storage for.
+/// - The decoded envelope's payload `device_pub_key` must match the
+///   `device_address` derived from the request — refuses to publish
+///   a delegation for a different device key than the one just
+///   registered.
+async fn propagate_device_delegation(
+    state: &Arc<AppState>,
+    envelope_hex: &str,
+    expected_device_address: &str,
+    expected_wallet_address: &str,
+) -> bool {
+    use crate::messages::router::RouteResult;
+    use crate::messages::types::{DeviceDelegationPayload, MessageType};
+
+    // Code Audit N1 (0.46.8): client-side input errors log at
+    // `info!`; only true server-side faults (gossip_tx failure,
+    // unexpected PowRequired, router rejection of a structurally
+    // valid envelope) escalate to `warn!`. Operator dashboards stay
+    // quiet under a steady stream of buggy clients.
+    const MAX_ENVELOPE_HEX_LEN: usize = 32 * 1024;
+    if envelope_hex.len() > MAX_ENVELOPE_HEX_LEN {
+        tracing::info!(
+            len = envelope_hex.len(),
+            cap = MAX_ENVELOPE_HEX_LEN,
+            wallet = %expected_wallet_address,
+            "signed_envelope_hex exceeds cap; refusing to publish (local-only registration stands)"
+        );
+        return false;
+    }
+    let envelope_bytes = match hex::decode(envelope_hex) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::info!(error = %e, wallet = %expected_wallet_address,
+                "signed_envelope_hex is not valid hex; refusing to publish");
+            return false;
+        }
+    };
+
+    // Quick structural pre-check — `process_message` will repeat the
+    // full validation including signature, but the binding checks
+    // (msg_type, author, device_pub_key) belong on this surface so a
+    // wrong-wallet or wrong-device envelope cannot ride a successful
+    // local registration into the network.
+    let envelope: crate::messages::envelope::Envelope =
+        match rmp_serde::from_slice(&envelope_bytes) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::info!(error = %e, wallet = %expected_wallet_address,
+                    "signed_envelope_hex is not a well-formed envelope; refusing to publish");
+                return false;
+            }
+        };
+    if envelope.msg_type != MessageType::DeviceDelegation {
+        tracing::info!(
+            msg_type = ?envelope.msg_type,
+            wallet = %expected_wallet_address,
+            "signed_envelope_hex must be a DeviceDelegation envelope; refusing to publish"
+        );
+        return false;
+    }
+    if envelope.author != expected_wallet_address {
+        tracing::info!(
+            envelope_author = %envelope.author,
+            expected = %expected_wallet_address,
+            "signed_envelope_hex author does not match registered wallet; refusing to publish"
+        );
+        return false;
+    }
+    let payload: DeviceDelegationPayload =
+        match rmp_serde::from_slice(&envelope.payload) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::info!(error = %e, wallet = %expected_wallet_address,
+                    "DeviceDelegation payload decode failed; refusing to publish");
+                return false;
+            }
+        };
+    // Resolve the payload's pubkey → ogd1 device address and compare
+    // against the registered device_address. Prevents cross-device
+    // smuggling.
+    let pubkey_bytes = match hex::decode(&payload.device_pub_key) {
+        Ok(b) if b.len() == 32 => b,
+        _ => {
+            tracing::info!(wallet = %expected_wallet_address,
+                "DeviceDelegation device_pub_key is not 32-byte hex; refusing to publish");
+            return false;
+        }
+    };
+    let pubkey_array: [u8; 32] = match pubkey_bytes.try_into() {
+        Ok(a) => a,
+        Err(_) => return false,
+    };
+    let verifying_key = match ed25519_dalek::VerifyingKey::from_bytes(&pubkey_array) {
+        Ok(k) => k,
+        Err(_) => {
+            tracing::info!(wallet = %expected_wallet_address,
+                "DeviceDelegation device_pub_key is not a valid Ed25519 key; refusing to publish");
+            return false;
+        }
+    };
+    let envelope_device_address =
+        match crate::crypto::device_pubkey_to_address(&verifying_key) {
+            Ok(a) => a,
+            Err(_) => return false,
+        };
+    if envelope_device_address != expected_device_address {
+        tracing::info!(
+            envelope_device = %envelope_device_address,
+            expected = %expected_device_address,
+            "signed_envelope_hex device does not match registered device; refusing to publish"
+        );
+        return false;
+    }
+
+    // Full validation + storage via the router. On Accepted, publish
+    // to gossip. On Duplicate, treat as a successful no-op (the
+    // delegation is already locally known and was already relayed by
+    // whoever pushed it first). On any other branch, log and decline.
+    match state.router.process_message(&envelope_bytes) {
+        RouteResult::Accepted { raw_bytes, .. } => {
+            let topic = crate::network::gossip::topic_network(&state.klever_network);
+            if let Err(e) = state.gossip_tx.send((topic, raw_bytes)) {
+                tracing::warn!(error = %e, wallet = %expected_wallet_address,
+                    "Failed to enqueue DeviceDelegation envelope for gossip publish");
+                return false;
+            }
+            true
+        }
+        RouteResult::Duplicate => {
+            tracing::debug!(wallet = %expected_wallet_address,
+                "DeviceDelegation envelope already known; treating as propagated");
+            true
+        }
+        RouteResult::Rejected(reason) => {
+            tracing::warn!(reason = %reason, wallet = %expected_wallet_address,
+                "Router rejected signed DeviceDelegation envelope; refusing to publish");
+            false
+        }
+        RouteResult::PowRequired { .. } => {
+            // DeviceDelegation is PoW-exempt at the router (see
+            // process_message_inner step 4e); this branch should not
+            // fire. Log and decline if it ever does.
+            tracing::warn!(wallet = %expected_wallet_address,
+                "DeviceDelegation unexpectedly required PoW; refusing to publish");
+            false
         }
     }
 }

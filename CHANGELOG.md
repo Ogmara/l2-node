@@ -5,6 +5,94 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.46.8] - 2026-05-31
+
+B2: cross-node device-delegation propagation. The router now applies
+incoming `DeviceDelegation` envelopes to the local device→wallet
+identity map, and `POST /api/v1/devices/register` can publish a
+wallet-signed envelope on the network-coordination gossip topic so
+peer nodes pick up the same mapping. Mobile/web `@klv1...`
+auto-complete and cross-node mention notifications now work for
+devices registered on any single node, where previously they only
+resolved on the registration host.
+
+### Why
+
+Before 0.46.8 the L2 node's `update_indexes` arm for
+`MessageType::DeviceDelegation` was a no-op — the gossip topic
+routing already directed delegations to `topic_network`, but the
+receive-side persistence step was missing. As a result a device
+registered on node A was invisible to node B until the device
+itself signed a message that B happened to observe and route, at
+which point B's `IdentityResolver::resolve` fall-through quietly
+treated the device address as its own wallet. The two-sided fix
+the mainnet-blockers plan tracks as B2 closes that gap.
+
+### Added
+
+- **`MessageType::DeviceDelegation` arm in `messages/router.rs::update_indexes`**.
+  Derives the device address from `payload.device_pub_key`, looks up
+  any existing claim for the `(wallet, device)` tuple, applies only
+  when the envelope's `timestamp` is strictly newer than the stored
+  `registered_at`, and writes via `IdentityResolver::register_device`
+  (which already updates both the forward map and the reverse
+  index atomically).
+- **`signed_envelope_hex` optional field on `POST /api/v1/devices/register`**.
+  When present, the server hex-decodes a wallet-signed
+  `DeviceDelegation` envelope, validates it (msg_type =
+  `DeviceDelegation`, author = the registered wallet,
+  payload.device_pub_key derives to the registered device,
+  full router pipeline including signature), and publishes it on
+  the `/ogmara/{network}/v1/network` topic via the existing gossip
+  bridge. The response surfaces a new `propagated: bool` field so
+  clients know whether peers were notified.
+- **`propagate_device_delegation` helper** in `routes.rs`: structural
+  pre-checks (length cap 32 KiB hex, wallet binding, device binding,
+  msg_type binding) before the router pipeline; logs decline reasons
+  at `warn!` so operators see drift between local storage and
+  network state.
+
+### Changed
+
+- **Local registration is still local-only when `signed_envelope_hex`
+  is absent** — pre-0.46.8 SDK clients keep working at the original
+  semantics. Migration is voluntary: only clients with wallet-key
+  access (Klever Extension on desktop; K5 mobile flows that already
+  collect the claim signature) gain cross-node propagation by
+  populating the field.
+
+### Spec touches
+
+- `docs/specs/01-protocol.md` §3.10 `DeviceDelegationPayload`:
+  documents the receive-side apply rules + the two propagation
+  paths (envelope POST, gossip relay).
+- `docs/specs/03-l2-node.md` §3.4: adds the
+  `DeviceDelegation → topic_network` row to the API → GossipSub
+  table; adds a B2 cross-node propagation block describing the
+  `update_indexes` arm and the `signed_envelope_hex` convenience.
+
+### Security
+
+- **Wallet-binding check on publish path**: the server refuses to
+  publish a `signed_envelope_hex` whose `author` does not match the
+  registered wallet, blocking a malicious client from smuggling
+  someone else's delegation through their own registration call.
+- **Device-binding check on publish path**: the server refuses to
+  publish a `signed_envelope_hex` whose payload `device_pub_key`
+  does not derive to the registered device address, blocking
+  cross-device smuggling under the same wallet.
+- **MessageType-binding check on publish path**: only
+  `MessageType::DeviceDelegation` envelopes are publishable through
+  the convenience endpoint; anything else (chat, news, profile,
+  etc.) is rejected before the router pipeline runs.
+- **32 KiB hex length cap** on `signed_envelope_hex` defeats an
+  unbounded body smuggle through the JSON layer.
+- **Idempotency / replay defense**: timestamp-based monotonicity in
+  the `update_indexes` arm prevents an attacker from re-applying an
+  older delegation after a revocation. Same-wallet, same-device
+  replays are silent no-ops; gossip dedup at the GossipSub layer
+  handles the re-emission economics.
+
 ## [0.46.7] - 2026-05-31
 
 B3: cross-node media fallback. When `/api/v1/media/:cid` misses the
