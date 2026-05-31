@@ -72,6 +72,12 @@ pub struct NetworkConfig {
     /// On-chain peer-discovery tuning (spec 13 §7). Added in v0.45.0.
     #[serde(default)]
     pub discovery: DiscoveryConfig,
+    /// SC-driven bootstrap control surface (spec 13 §4.2, l2-node
+    /// 0.46.5+). Tier 3 is the primary boot path when
+    /// `bootstrap_nodes = []`; isolated-subnet mode is `enabled =
+    /// false` + non-empty `bootstrap_nodes`.
+    #[serde(default)]
+    pub sc_discovery: ScDiscoveryConfig,
 }
 
 impl Default for NetworkConfig {
@@ -83,6 +89,7 @@ impl Default for NetworkConfig {
             enable_mdns: true,
             network_id: None,
             discovery: DiscoveryConfig::default(),
+            sc_discovery: ScDiscoveryConfig::default(),
         }
     }
 }
@@ -112,6 +119,64 @@ impl Default for DiscoveryConfig {
 
 fn default_max_peer_staleness_days() -> u32 {
     7
+}
+
+/// SC-driven bootstrap control surface (spec 13 §4.2, l2-node 0.46.5+).
+///
+/// Reference: [docs/specs/13-node-discovery.md §4.2](../../docs/specs/13-node-discovery.md#42-tier-2--bootstrap_nodes-config-override-no-defaults-l2-node-0465).
+///
+/// Three operating modes by combination with `[network] bootstrap_nodes`:
+///
+/// | `bootstrap_nodes` | `enabled` | Mode |
+/// |---|---|---|
+/// | `[]` (default) | `true` (default) | Pure SC — tier 3 is the only boot path; cold-start retries every `retry_interval_secs` if Klever RPC is unreachable. |
+/// | non-empty | `true` | Hybrid — dial explicit peers; SC supplements the book in parallel. |
+/// | non-empty | `false` | Isolated subnet — dial explicit peers only; Klever API never queried for discovery. |
+/// | `[]` | `false` | **Rejected at config-load** — no way to discover peers. |
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScDiscoveryConfig {
+    /// Whether the SC-discovery background task runs at all. Default
+    /// `true`. Set `false` for an isolated subnet that never queries
+    /// Klever for peer discovery — useful for operators in regions
+    /// where Klever endpoints are geo-blocked or surveilled. Note: on-
+    /// chain identity resolution (`klv1...` → wallet) is unavailable
+    /// in this mode; users on the subnet operate as ephemeral
+    /// `ogd1...` identities until they can reach the chain layer.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Cold-start retry cadence in seconds — how often the discovery
+    /// task retries `getActiveNodes` when `bootstrap_nodes = []` AND
+    /// the peer book is empty AND the previous fan-out persisted zero
+    /// new peers. Default 60 seconds. Only applies during cold-start;
+    /// once at least one peer is persisted, the task transitions to
+    /// the steady-state 1-hour periodic cadence.
+    #[serde(default = "default_sc_retry_interval_secs")]
+    pub retry_interval_secs: u64,
+    /// Maximum number of SC-discovered peers to dial per cold-start
+    /// fan-out. Default 5. The fan-out still PERSISTS up to 256 peers
+    /// (matches `PEER_DIRECTORY` cap); this knob caps the immediate
+    /// dial set so a fresh node doesn't burst-connect to dozens of
+    /// peers it doesn't have routes for yet.
+    #[serde(default = "default_sc_max_candidates")]
+    pub max_candidates: u32,
+}
+
+impl Default for ScDiscoveryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            retry_interval_secs: default_sc_retry_interval_secs(),
+            max_candidates: default_sc_max_candidates(),
+        }
+    }
+}
+
+fn default_sc_retry_interval_secs() -> u64 {
+    60
+}
+
+fn default_sc_max_candidates() -> u32 {
+    5
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -938,10 +1003,13 @@ fn default_max_peers() -> u32 {
     50
 }
 fn default_bootstrap_nodes() -> Vec<String> {
-    vec![
-        "/dns4/node.ogmara.org/tcp/41720/p2p/12D3KooWNx9TnsmVQux3fMm6sUUe5tFdeXjECUSyDqYtYfsbt3Mo".to_string(),
-        "/dns4/node.ogmara.org/udp/41720/quic-v1/p2p/12D3KooWNx9TnsmVQux3fMm6sUUe5tFdeXjECUSyDqYtYfsbt3Mo".to_string(),
-    ]
+    // Empty default — SC-driven discovery (tier 3 per spec 13 §4.3) is
+    // the primary boot path from l2-node 0.46.5+. Operators with a
+    // non-empty `bootstrap_nodes` list run in hybrid mode (explicit
+    // peers + SC supplementary); operators with both empty and
+    // `network.sc_discovery.enabled = false` run an isolated subnet
+    // (validated at config-load — see `validate`).
+    Vec::new()
 }
 fn default_scan_interval() -> u64 {
     3000
@@ -1083,16 +1151,18 @@ impl Config {
 
     /// Apply runtime migrations for configs created by older versions.
     ///
-    /// This ensures existing node operators get critical defaults (like bootstrap
-    /// nodes) without manually editing their config files after upgrades.
+    /// This ensures existing node operators get critical defaults (like
+    /// `network_id` auto-detection) without manually editing their config
+    /// files after upgrades.
     fn apply_migrations(&mut self) {
-        // Migration: populate empty bootstrap_nodes with official defaults.
-        // Configs created before v0.27.2 have `bootstrap_nodes = []` which
-        // prevents the node from joining the network.
-        if self.network.bootstrap_nodes.is_empty() {
-            tracing::info!("Config migration: adding default bootstrap nodes (empty bootstrap_nodes list)");
-            self.network.bootstrap_nodes = default_bootstrap_nodes();
-        }
+        // NOTE: prior versions (<0.46.5) auto-filled an empty
+        // `bootstrap_nodes` with the legacy `node.ogmara.org` seed list.
+        // That migration is removed in 0.46.5 because empty is now the
+        // intentional default — it triggers pure SC-driven discovery
+        // (spec 13 §4.2 / §4.3). Existing operators with an explicit
+        // legacy entry in their config.toml retain it (hybrid mode);
+        // operators who relied on the previous auto-fill behaviour
+        // transition into pure SC discovery on first 0.46.5 boot.
 
         // Migration: auto-detect network_id from klever.node_url if not set.
         // Configs created before v0.28.0 have no network_id field.
@@ -1145,6 +1215,45 @@ impl Config {
 
     pub fn validate(&mut self) -> Result<()> {
         self.warn_if_non_https_klever_url();
+        // Spec 13 §4.2 (l2-node 0.46.5+): refuse to start in the
+        // both-empty case. An operator with `bootstrap_nodes = []` AND
+        // `sc_discovery.enabled = false` has no way to discover peers
+        // at all — the node would idle silently, never joining any
+        // network. Fail loudly with a config-fix pointer instead.
+        if self.network.bootstrap_nodes.is_empty() && !self.network.sc_discovery.enabled {
+            anyhow::bail!(
+                "network.bootstrap_nodes = [] AND network.sc_discovery.enabled = false: \
+                 no way to discover peers. Either (a) leave sc_discovery.enabled = true \
+                 (default) so the node discovers peers from the on-chain registry, or \
+                 (b) populate bootstrap_nodes with explicit peer multiaddrs for an \
+                 isolated subnet. See docs/specs/13-node-discovery.md §4.2 for the \
+                 three supported modes."
+            );
+        }
+        // Spec 13 §4.2: an operator typo of `retry_interval_secs = 0`
+        // would yield `tokio::time::sleep(Duration::ZERO)` in the
+        // cold-start retry loop and a hot-spin against the Klever
+        // endpoint at full thread speed (Security Audit W2, 0.46.5).
+        // Floor at 5 seconds — fast enough for any realistic
+        // bootstrap recovery, slow enough to never melt an RPC.
+        const MIN_SC_DISCOVERY_RETRY_SECS: u64 = 5;
+        if self.network.sc_discovery.retry_interval_secs < MIN_SC_DISCOVERY_RETRY_SECS {
+            anyhow::bail!(
+                "network.sc_discovery.retry_interval_secs = {} is too small \
+                 (minimum {} seconds — values lower would hot-spin the SC RPC). \
+                 Default is 60.",
+                self.network.sc_discovery.retry_interval_secs,
+                MIN_SC_DISCOVERY_RETRY_SECS,
+            );
+        }
+        // Code Audit W2: a `max_candidates = 0` would otherwise be
+        // silently clamped at construction time. Reject loudly so
+        // operator misconfiguration surfaces at config-load.
+        if self.network.sc_discovery.max_candidates == 0 {
+            anyhow::bail!(
+                "network.sc_discovery.max_candidates must be > 0 (default is 5)"
+            );
+        }
         if self.network.listen_port == 0 {
             anyhow::bail!("network.listen_port must be > 0");
         }
@@ -1304,12 +1413,15 @@ data_dir = "./data"
 
 [network]
 listen_port = 41720
-# Official Ogmara bootstrap nodes — required for peer discovery.
-# New nodes must connect to at least one bootstrap node to join the network.
-bootstrap_nodes = [
-    "/dns4/node.ogmara.org/tcp/41720/p2p/12D3KooWNx9TnsmVQux3fMm6sUUe5tFdeXjECUSyDqYtYfsbt3Mo",
-    "/dns4/node.ogmara.org/udp/41720/quic-v1/p2p/12D3KooWNx9TnsmVQux3fMm6sUUe5tFdeXjECUSyDqYtYfsbt3Mo",
-]
+# Bootstrap peer multiaddrs (spec 13 §4.2).
+#
+# Empty default → pure SC-driven discovery: the node queries
+# getActiveNodes + getNodeMetadata on the Ogmara KApp to find peers.
+# Populate with explicit peer multiaddrs (including /p2p/<peer_id>) to
+# either supplement SC discovery (hybrid mode, sc_discovery.enabled =
+# true) or replace it entirely (isolated subnet, sc_discovery.enabled
+# = false). See [network.sc_discovery] below.
+bootstrap_nodes = []
 max_peers = 50
 enable_mdns = true
 # Network isolation: auto-detected from klever.node_url if not set.
@@ -1323,6 +1435,25 @@ enable_mdns = true
 # Default 7. Local-only dev deployments may want a longer threshold;
 # production nodes should stick with the default.
 max_peer_staleness_days = 7
+
+[network.sc_discovery]
+# SC-driven bootstrap control surface (spec 13 §4.2, l2-node 0.46.5+).
+# `enabled = true` (default) keeps the node discovering peers from the
+# on-chain registry. Set `enabled = false` together with an explicit
+# `bootstrap_nodes` list to run an isolated subnet that never queries
+# Klever for peer discovery (useful where Klever endpoints are
+# geo-blocked or surveilled). The both-empty case is rejected at
+# config-load.
+enabled = true
+# Cold-start retry cadence (seconds). When bootstrap_nodes is empty
+# and the peer book is empty, the discovery task retries on this
+# cadence until at least one peer is persisted. Once warm, it falls
+# back to the steady-state 1-hour periodic refresh.
+retry_interval_secs = 60
+# Maximum peers to dial per cold-start fan-out. The fan-out still
+# PERSISTS up to 256 peers (matches PEER_DIRECTORY cap); this knob
+# caps the immediate dial set so a fresh node doesn't burst-connect.
+max_candidates = 5
 
 [klever]
 node_url = ""
@@ -1621,6 +1752,88 @@ mod tests {
         c.ipfs.media_cache_item_mb = 16;
         c.validate().expect("equality is fine");
         assert_eq!(c.ipfs.media_cache_item_mb, 16);
+    }
+
+    // --- 0.46.5 SC-driven bootstrap (spec 13 §4.2) -------------------
+
+    #[test]
+    fn validate_rejects_empty_bootstrap_and_disabled_sc() {
+        // Both-empty case: no way to discover peers.
+        let mut c = baseline_config();
+        c.network.bootstrap_nodes.clear();
+        c.network.sc_discovery.enabled = false;
+        let err = c
+            .validate()
+            .expect_err("both-empty must be rejected");
+        let msg = format!("{err}");
+        assert!(msg.contains("bootstrap_nodes"), "error should mention bootstrap_nodes: {msg}");
+        assert!(msg.contains("sc_discovery"), "error should mention sc_discovery: {msg}");
+    }
+
+    #[test]
+    fn validate_accepts_empty_bootstrap_with_sc_enabled() {
+        // Pure SC mode — the new default. Must pass.
+        let mut c = baseline_config();
+        c.network.bootstrap_nodes.clear();
+        c.network.sc_discovery.enabled = true;
+        c.validate().expect("pure SC mode must validate");
+    }
+
+    #[test]
+    fn validate_accepts_explicit_peers_with_sc_disabled() {
+        // Isolated subnet mode — explicit peers + SC disabled. Must pass.
+        let mut c = baseline_config();
+        c.network.bootstrap_nodes =
+            vec!["/dns4/example.invalid/tcp/41720/p2p/12D3KooWNx9TnsmVQux3fMm6sUUe5tFdeXjECUSyDqYtYfsbt3Mo".to_string()];
+        c.network.sc_discovery.enabled = false;
+        c.validate().expect("isolated subnet mode must validate");
+    }
+
+    #[test]
+    fn default_bootstrap_nodes_is_empty() {
+        // Spec 13 §4.2: 0.46.5+ ships an empty default. The legacy
+        // node.ogmara.org seed list MUST NOT be reintroduced via the
+        // default helper.
+        assert!(super::default_bootstrap_nodes().is_empty());
+    }
+
+    #[test]
+    fn validate_rejects_zero_sc_retry_interval() {
+        // Security Audit W2: 0 would hot-spin the SC RPC.
+        let mut c = baseline_config();
+        c.network.sc_discovery.retry_interval_secs = 0;
+        let err = c.validate().expect_err("0 retry must be rejected");
+        assert!(format!("{err}").contains("retry_interval_secs"));
+    }
+
+    #[test]
+    fn validate_rejects_below_floor_sc_retry_interval() {
+        // 1, 2, 3, 4 are all below the 5-second floor.
+        for v in 1..=4 {
+            let mut c = baseline_config();
+            c.network.sc_discovery.retry_interval_secs = v;
+            assert!(
+                c.validate().is_err(),
+                "retry_interval_secs = {v} must be rejected",
+            );
+        }
+    }
+
+    #[test]
+    fn validate_accepts_floor_sc_retry_interval() {
+        let mut c = baseline_config();
+        c.network.sc_discovery.retry_interval_secs = 5;
+        c.validate().expect("floor value must pass");
+    }
+
+    #[test]
+    fn validate_rejects_zero_max_candidates() {
+        // Code Audit W2: silently clamping operator misconfig is
+        // worse than failing loudly at config-load.
+        let mut c = baseline_config();
+        c.network.sc_discovery.max_candidates = 0;
+        let err = c.validate().expect_err("0 max_candidates must be rejected");
+        assert!(format!("{err}").contains("max_candidates"));
     }
 
     // --- v0.41 per-IP permit field ----------------------------------

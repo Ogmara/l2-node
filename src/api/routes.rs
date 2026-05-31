@@ -788,9 +788,23 @@ pub async fn network_bootstrap_candidates(
     // (256 metadata calls × 15s each; Code Audit W1 + Security Audit
     // W2 fix). On unconfigured / failure / timeout we still serve
     // tier 1+2 with a `source_note` describing the SC condition.
-    let (sc, sc_failure_note) = if state.klever_node_url.is_empty()
-        || state.contract_address.is_empty()
-    {
+    //
+    // Isolated-subnet mode (l2-node 0.46.5+, spec 13 §4.2): when
+    // `[network.sc_discovery] enabled = false`, skip the SC call
+    // path entirely so this handler does not generate any Klever
+    // RPC traffic from the discovery surface. Audit invariant for
+    // operators in regions where Klever endpoints must not be
+    // queried.
+    let (sc, sc_failure_note) = if !state.sc_discovery_enabled {
+        (
+            Vec::new(),
+            Some(
+                "sc_discovery disabled (isolated-subnet mode — the on-chain \
+                 registry is not queried by this node)"
+                    .to_string(),
+            ),
+        )
+    } else if state.klever_node_url.is_empty() || state.contract_address.is_empty() {
         (
             Vec::new(),
             Some("this node is not configured to query the on-chain registry".to_string()),
@@ -848,6 +862,14 @@ struct CandidateEntry {
     /// published the multiaddr). `None` for book/config — those
     /// tiers carry no wallet binding.
     owner_address: Option<String>,
+    /// Coarse transport tag derived from the multiaddr's protocol
+    /// stack (spec 13 §4.5, l2-node 0.46.5+). One of `"clearnet"`,
+    /// `"onion"`, `"i2p"`, `"unknown"`. SDK consumers use this to
+    /// filter peer candidates by reachability profile without
+    /// re-parsing the multiaddr; dashboards surface a "high-
+    /// resilience mode available" indicator when at least one peer
+    /// reports `"onion"`.
+    transport: &'static str,
 }
 
 impl CandidateEntry {
@@ -858,6 +880,7 @@ impl CandidateEntry {
             "last_anchor_at": self.last_anchor_at,
             "source": self.source,
             "paused": self.paused,
+            "transport": self.transport,
         });
         if let Some(owner) = self.owner_address {
             v["owner_address"] = serde_json::Value::String(owner);
@@ -942,6 +965,8 @@ fn gather_book_candidates(state: &Arc<AppState>) -> Vec<CandidateEntry> {
         if !sanitize_multiaddr_str(&multiaddr_str) {
             continue;
         }
+        let transport =
+            crate::chain::sc_views::classify_transport(&multiaddr_str).as_str();
         out.push(CandidateEntry {
             multiaddr: multiaddr_str,
             peer_id: Some(peer_id),
@@ -949,6 +974,7 @@ fn gather_book_candidates(state: &Arc<AppState>) -> Vec<CandidateEntry> {
             source: "book",
             paused: false,
             owner_address: None,
+            transport,
         });
     }
     out
@@ -973,6 +999,7 @@ fn gather_config_candidates(state: &Arc<AppState>) -> Vec<CandidateEntry> {
         if !sanitize_multiaddr_str(raw) {
             continue;
         }
+        let transport = crate::chain::sc_views::classify_transport(raw).as_str();
         out.push(CandidateEntry {
             multiaddr: raw.clone(),
             peer_id: extract_peer_id(raw),
@@ -980,6 +1007,7 @@ fn gather_config_candidates(state: &Arc<AppState>) -> Vec<CandidateEntry> {
             source: "config",
             paused: false,
             owner_address: None,
+            transport,
         });
     }
     out
@@ -1070,6 +1098,8 @@ async fn gather_sc_candidates(
             if !sanitize_multiaddr_str(&raw_addr) {
                 continue;
             }
+            let transport =
+                crate::chain::sc_views::classify_transport(&raw_addr).as_str();
             entries.push(CandidateEntry {
                 peer_id: extract_peer_id(&raw_addr),
                 multiaddr: raw_addr,
@@ -1080,6 +1110,7 @@ async fn gather_sc_candidates(
                 // than recheck isNodePaused per candidate.
                 paused: false,
                 owner_address: Some(cand.address.clone()),
+                transport,
             });
         }
     }
