@@ -271,7 +271,11 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
             .route("/admin/node/metadata", get(admin::node_metadata))
             .route("/admin/node/pause-status", get(admin::node_pause_status))
             .route("/admin/node/pause", post(admin::node_pause))
-            .route("/admin/node/resume", post(admin::node_resume));
+            .route("/admin/node/resume", post(admin::node_resume))
+            // v0.46.6 — spec 10 §9.2 B4 instrumentation. Per-topic
+            // mesh size + subscriber count + cumulative publish-
+            // failure counters partitioned by PublishError variant.
+            .route("/admin/network/mesh-stats", get(admin::mesh_stats));
 
         if config.api.admin.dashboard {
             protected = protected

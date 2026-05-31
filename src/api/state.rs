@@ -327,6 +327,17 @@ pub struct AppState {
     /// not spawned (anchoring or publish disabled), or when the most
     /// recent reconcile pass found the on-chain list in sync.
     pub metadata_drift: crate::chain::metadata_reconcile::SharedMetadataDrift,
+    /// Shared GossipSub mesh-state snapshot — refreshed by
+    /// `NetworkService` every 30s, read by the
+    /// `/admin/network/mesh-stats` endpoint (spec 10 §9.2, l2-node
+    /// 0.46.6+). Default-initialized to an empty snapshot before the
+    /// first refresh so the endpoint always returns valid JSON.
+    pub mesh_stats: crate::network::mesh_stats::SharedMeshStats,
+    /// Cumulative publish-failure counters partitioned by
+    /// `PublishError` variant. Mirrors the snapshot fields but lives
+    /// in `Arc<AtomicU64>` so the endpoint reads live values without
+    /// waiting for the next 30s tick.
+    pub publish_failure_counters: crate::network::mesh_stats::PublishFailureCounters,
 }
 
 /// Cached bootstrap-candidates response (spec 13 §4.5).
@@ -411,6 +422,8 @@ impl AppState {
             Vec::new(),                                     // bootstrap_nodes — empty in tests
             true,                                           // sc_discovery_enabled — on by default
             crate::chain::metadata_reconcile::shared_metadata_drift(),
+            crate::network::mesh_stats::shared_empty(),     // mesh_stats — empty in tests
+            crate::network::mesh_stats::PublishFailureCounters::default(), // publish_failure_counters
         )
     }
 
@@ -455,6 +468,8 @@ impl AppState {
         bootstrap_nodes: Vec<String>,
         sc_discovery_enabled: bool,
         metadata_drift: crate::chain::metadata_reconcile::SharedMetadataDrift,
+        mesh_stats: crate::network::mesh_stats::SharedMeshStats,
+        publish_failure_counters: crate::network::mesh_stats::PublishFailureCounters,
     ) -> Self {
         // moka LRU with size-weighted eviction. `weigher` returns the
         // byte count of each value's body (content-type string is
@@ -525,6 +540,8 @@ impl AppState {
             bootstrap_nodes,
             sc_discovery_enabled,
             metadata_drift,
+            mesh_stats,
+            publish_failure_counters,
         }
     }
 

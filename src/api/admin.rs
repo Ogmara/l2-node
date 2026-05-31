@@ -40,6 +40,83 @@ pub async fn list_peers(
     }))
 }
 
+/// GET /admin/network/mesh-stats — GossipSub mesh-state instrumentation
+/// (spec 10 §9.2, l2-node 0.46.6+).
+///
+/// Returns a snapshot of per-topic mesh size + subscriber count plus
+/// the cumulative publish-failure counters partitioned by
+/// `PublishError` variant. Used to diagnose B4 (asymmetric GossipSub
+/// propagation, `docs/planning/mainnet-blockers-fix-plan.md` step 2)
+/// and gate the proper fix that ships in v0.46.10.
+///
+/// The snapshot is refreshed by the network task every 30s
+/// ([`crate::network::MESH_STATS_REFRESH_INTERVAL`]); poll less
+/// frequently than that to avoid serving stale-but-changing data.
+/// Publish-failure counters are read live from `Arc<AtomicU64>` so
+/// they're always current, separately from the 30s topic snapshot.
+///
+/// Operator runbook for full diagnosis:
+///
+/// ```text
+/// # Capture 30 minutes of mesh control messages alongside polled snapshots.
+/// RUST_LOG="info,libp2p_gossipsub=trace" ogmara-node --config ogmara.toml
+/// watch -n5 'curl -s http://127.0.0.1:41721/admin/network/mesh-stats | jq'
+/// ```
+///
+/// Response shape:
+/// ```json
+/// {
+///   "generated_at_unix": 1748707200,
+///   "topics": [
+///     { "topic": "...", "mesh_size": 2, "subscribers": 3 }
+///   ],
+///   "total_mesh_slots": 4,
+///   "publish_failures": {
+///     "total": 12,
+///     "no_peers_subscribed": 7,
+///     "all_queues_full": 1,
+///     "other": 4
+///   }
+/// }
+/// ```
+pub async fn mesh_stats(
+    Extension(state): Extension<Arc<AppState>>,
+) -> impl IntoResponse {
+    // Live counter read — these are atomics so the response always
+    // reflects the latest increment, even between the 30s topic-
+    // snapshot refresh ticks.
+    let (total, no_peers, all_queues_full, other) =
+        state.publish_failure_counters.snapshot();
+
+    // Topic snapshot under a brief read lock. If poisoned (shouldn't
+    // happen — the writer never panics inside the critical section),
+    // serve an empty topic list with `generated_at_unix = 0` to
+    // signal "no fresh data" rather than 500ing the diagnostic
+    // endpoint (it's most-needed when something is wrong).
+    let topic_payload = match state.mesh_stats.read() {
+        Ok(snap) => serde_json::json!({
+            "generated_at_unix": snap.generated_at_unix,
+            "topics": snap.topics,
+            "total_mesh_slots": snap.total_mesh_slots,
+        }),
+        Err(_) => serde_json::json!({
+            "generated_at_unix": 0,
+            "topics": [],
+            "total_mesh_slots": 0,
+            "note": "mesh_stats lock poisoned — serving live counters only"
+        }),
+    };
+
+    let mut body = topic_payload;
+    body["publish_failures"] = serde_json::json!({
+        "total": total,
+        "no_peers_subscribed": no_peers,
+        "all_queues_full": all_queues_full,
+        "other": other,
+    });
+    Json(body)
+}
+
 /// GET /admin/storage/stats — disk usage and message counts.
 pub async fn storage_stats(
     Extension(_state): Extension<Arc<AppState>>,

@@ -5,6 +5,69 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.46.6] - 2026-05-31
+
+B4 GossipSub-propagation instrumentation: a new
+`/admin/network/mesh-stats` endpoint, per-failure structured logging
+upgraded from `warn!` to `error!`, cumulative publish-failure
+counters partitioned by `PublishError` variant, and a new
+`publish_failed_insufficient_peers` alert. No mesh-config change —
+v0.46.6 is data capture; the proper fix is gated on this data and
+ships in v0.46.10 per
+`docs/planning/mainnet-blockers-fix-plan.md` step 6.
+
+### Why
+
+B4 (`docs/planning/mainnet-blockers-fix-plan.md`) is the asymmetric
+GossipSub propagation observed on the Odroid ↔ prod testnet pair —
+the operator's local node receives but never delivers, even though
+both ends agree on a non-empty mesh. The previous publish-failure
+path logged a single `warn!` with the error message and nothing
+else: enough to know "something failed", not enough to determine
+which mesh-config parameter is wrong. v0.46.6 captures the
+peer-count + topic-subscriber-count + mesh-size triple at the
+moment of failure and surfaces them both per-failure (in logs)
+and cumulatively (via the new endpoint + counters).
+
+### Added
+
+- **`/admin/network/mesh-stats` endpoint** (spec 10 §9.5). Returns a
+  snapshot of per-topic mesh size + subscriber count plus
+  cumulative publish-failure counters partitioned by `PublishError`
+  variant (`NoPeersSubscribedToTopic`, `AllQueuesFull`, other).
+  Counters read live from `Arc<AtomicU64>`; topic snapshot refreshed
+  every 30 seconds.
+- **`AlertType::PublishFailedInsufficientPeers`** (spec 10 §9.2,
+  severity Warning, condition name
+  `publish_failed_insufficient_peers`). Fires from the gossip-rx
+  publish path when the error is `NoPeersSubscribedToTopic`. Cooldown
+  bounds re-fire so a chronically empty topic does not flood the
+  alert log. `NodeAnnouncement` failures during cold start bump the
+  counter but do NOT fire this alert (structurally expected before
+  any peer connects).
+- **`crate::network::mesh_stats` module**: `TopicMeshStats`,
+  `MeshStatsSnapshot`, `PublishFailureCounters`. Shared between
+  `NetworkService` (writer) and `AppState` (reader for the endpoint).
+  Unit tests cover the four `PublishError` classification paths plus
+  the `Arc<AtomicU64>` clone-shared semantics.
+- **Operator runbook for B4 diagnosis** (spec 10 §9.5). Documents
+  the `RUST_LOG="info,libp2p_gossipsub=trace"` filter for a 30-min
+  bracketed capture window paired with mesh-stats snapshots.
+
+### Changed
+
+- **GossipSub publish-failure logging upgraded from `warn!` to
+  `error!`** with `topic`, `connected_peers`, `topic_subscribers`,
+  and `mesh_size` structured fields. Applies to the gossip-rx
+  publish path (application data). The NodeAnnouncement publish
+  path keeps its `debug!` level (cold-start failures are expected)
+  but bumps the same counters for accurate stats.
+
+### Spec touches
+
+- `docs/specs/10-dashboard.md` §9.2 (new alert row) + new §9.5
+  (mesh-stats endpoint + runbook).
+
 ## [0.46.5] - 2026-05-31
 
 SC-driven bootstrap is now the primary boot path (spec 13 §4.2). The

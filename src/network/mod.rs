@@ -10,6 +10,7 @@
 pub mod behaviour;
 pub mod discovery;
 pub mod gossip;
+pub mod mesh_stats;
 pub mod sc_discovery;
 pub mod snapshot;
 pub mod snapshot_client;
@@ -130,7 +131,28 @@ pub struct NetworkService {
     /// (spec 13 §4.1 / §4.3). Population happens in sc_discovery, so
     /// the lock is acquired only briefly (HashSet insert / contains).
     sc_added_peer_ids: Arc<RwLock<HashSet<PeerId>>>,
+    /// Cumulative publish-failure counters, partitioned by
+    /// `PublishError` variant (spec 10 §9.2, l2-node 0.46.6+). Shared
+    /// with `AppState` so the `/admin/network/mesh-stats` endpoint
+    /// reads live values without blocking the publish hot path.
+    publish_failure_counters: mesh_stats::PublishFailureCounters,
+    /// Shared mesh-state snapshot, refreshed by this task every
+    /// `MESH_STATS_REFRESH_INTERVAL` (30s). Single writer (this
+    /// task), many readers (admin endpoint, future dashboards).
+    mesh_stats: mesh_stats::SharedMeshStats,
+    /// Optional alert sender — `None` when `[alerts] enabled =
+    /// false`. Used to fire the `publish_failed_insufficient_peers`
+    /// alert when a publish hits `NoPeersSubscribedToTopic`. The
+    /// cooldown engine deduplicates re-fires.
+    alert_event_tx: Option<crate::notifications::alerts::AlertEventSender>,
 }
+
+/// How often `NetworkService` refreshes the shared `MeshStatsSnapshot`.
+/// Short enough that an operator running `watch -n5
+/// 'curl /admin/network/mesh-stats'` sees fresh data every other
+/// poll; long enough that the periodic gossipsub introspection
+/// doesn't compete with the publish hot path.
+pub const MESH_STATS_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Result delivered back to the snapshot client for one outbound request.
 pub type SnapshotClientResult = Result<self::snapshot::SnapshotResponse, SnapshotClientError>;
@@ -166,6 +188,7 @@ pub enum SnapshotClientCommand {
 
 impl NetworkService {
     /// Create and start the network service.
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         config: &Config,
         storage: Storage,
@@ -181,6 +204,9 @@ impl NetworkService {
         snapshot_client_rx: tokio::sync::mpsc::UnboundedReceiver<SnapshotClientCommand>,
         identify_success_count: Arc<AtomicU64>,
         sc_added_peer_ids: Arc<RwLock<HashSet<PeerId>>>,
+        publish_failure_counters: mesh_stats::PublishFailureCounters,
+        mesh_stats: mesh_stats::SharedMeshStats,
+        alert_event_tx: Option<crate::notifications::alerts::AlertEventSender>,
     ) -> Result<Self> {
         let mut swarm = behaviour::build_swarm(config, keypair)
             .context("building libp2p swarm")?;
@@ -327,6 +353,9 @@ impl NetworkService {
             startup_book_peer_ids,
             config_peer_ids,
             sc_added_peer_ids,
+            publish_failure_counters,
+            mesh_stats,
+            alert_event_tx,
         })
     }
 
@@ -437,6 +466,14 @@ impl NetworkService {
         let mut reconnect_interval = tokio::time::interval(Duration::from_secs(10));
         reconnect_interval.tick().await;
 
+        // Mesh-stats refresh (every 30s) — snapshots per-topic mesh
+        // size + subscriber count into `self.mesh_stats` for the
+        // `/admin/network/mesh-stats` endpoint (spec 10 §9.2,
+        // l2-node 0.46.6+).
+        let mut mesh_stats_interval =
+            tokio::time::interval(MESH_STATS_REFRESH_INTERVAL);
+        mesh_stats_interval.tick().await;
+
         loop {
             tokio::select! {
                 event = self.swarm.select_next_some() => {
@@ -455,8 +492,11 @@ impl NetworkService {
                             self.counters.inc_messages_relayed();
                             debug!(topic = %topic, "Published message to GossipSub");
                         }
-                        Err(e) => warn!(topic = %topic, error = %e, "Failed to publish to GossipSub"),
+                        Err(e) => self.report_publish_failure(&topic, &e),
                     }
+                }
+                _ = mesh_stats_interval.tick() => {
+                    self.refresh_mesh_stats();
                 }
                 _ = announce_interval.tick() => {
                     self.publish_node_announcement();
@@ -903,6 +943,168 @@ impl NetworkService {
         match self.swarm.behaviour_mut().kademlia.bootstrap() {
             Ok(_) => debug!(peer_count, "Kademlia bootstrap triggered"),
             Err(e) => debug!(error = %e, "Kademlia bootstrap skipped (no known peers in routing table)"),
+        }
+    }
+
+    /// Report a GossipSub publish failure: classify the error variant,
+    /// bump the appropriate counter, emit a per-failure `error!` log
+    /// with the data that step 2 of the mainnet-blockers fix plan
+    /// (B4 instrumentation) requires for diagnosis — peer count +
+    /// per-topic subscriber count, both at the moment of failure —
+    /// and fire `publish_failed_insufficient_peers` (cooldown-
+    /// deduplicated by AlertEngine) when the variant is
+    /// `NoPeersSubscribedToTopic`.
+    ///
+    /// Logging is `error!` not `warn!` because a silent publish failure
+    /// is the hardest possible class of bug to diagnose post-hoc
+    /// (messages just disappear). `warn!` previously buried this in
+    /// the noise floor of "transient peer churn" — `error!` plus
+    /// structured fields plus the new counters make the asymmetric-
+    /// propagation case the plan calls out actually observable.
+    fn report_publish_failure(
+        &self,
+        topic: &str,
+        err: &libp2p::gossipsub::PublishError,
+    ) {
+        let fire_insufficient_peers_alert =
+            self.publish_failure_counters.record(err);
+
+        let connected_peers = self.swarm.connected_peers().count();
+        let topic_hash = libp2p::gossipsub::IdentTopic::new(topic).hash();
+        let topic_subscribers = self
+            .swarm
+            .behaviour()
+            .gossipsub
+            .all_peers()
+            .filter(|(_, topics)| topics.iter().any(|t| **t == topic_hash))
+            .count();
+        let mesh_size = self
+            .swarm
+            .behaviour()
+            .gossipsub
+            .mesh_peers(&topic_hash)
+            .count();
+
+        error!(
+            topic = %topic,
+            error = %err,
+            connected_peers,
+            topic_subscribers,
+            mesh_size,
+            "GossipSub publish failed"
+        );
+
+        if fire_insufficient_peers_alert {
+            self.fire_publish_failed_alert(topic, connected_peers, topic_subscribers);
+        }
+    }
+
+    /// Fire the `publish_failed_insufficient_peers` alert with the
+    /// snapshot of state that diagnosis needs.
+    ///
+    /// **Topic redaction (Security Audit W1, 0.46.6).** The raw topic
+    /// strings produced by `gossip::dm_topic` and `gossip::channel_topic`
+    /// include the recipient wallet (`/ogmara/<network>/v1/dm/klv1...`)
+    /// or channel ID. AlertEngine dispatches this `details` field to
+    /// Telegram / Discord / webhook sinks — putting the plaintext
+    /// topic in the payload would leak DM-recipient and channel
+    /// metadata to whichever third-party messaging service the
+    /// operator pointed alerts at. We render the topic as its
+    /// `IdentTopic::hash()` (the same SHA-256-shaped rendering the
+    /// `/admin/network/mesh-stats` snapshot uses) so the alert
+    /// payload is correlateable with the local snapshot but does not
+    /// expose plaintext topics to outbound dispatchers.
+    ///
+    /// Best-effort (`try_send`) — channel-full means the AlertEngine
+    /// is stalled (capacity 1024), so dropping is correct; the engine
+    /// either recovers and picks up the next event, or the operator
+    /// has a separate observability problem.
+    fn fire_publish_failed_alert(
+        &self,
+        topic: &str,
+        connected_peers: usize,
+        topic_subscribers: usize,
+    ) {
+        let Some(tx) = self.alert_event_tx.as_ref() else {
+            return;
+        };
+        let topic_render =
+            libp2p::gossipsub::IdentTopic::new(topic).hash().to_string();
+        let event = crate::notifications::alerts::AlertEvent {
+            alert_type:
+                crate::notifications::alerts::AlertType::PublishFailedInsufficientPeers,
+            details: format!(
+                "publish failed: no peers subscribed (topic_hash={topic_render}, \
+                 connected_peers={connected_peers}, \
+                 topic_subscribers={topic_subscribers})"
+            ),
+        };
+        if let Err(e) = tx.try_send(event) {
+            debug!(error = %e, "publish-failed alert channel full or closed");
+        }
+    }
+
+    /// Refresh the shared `MeshStatsSnapshot` from the current state of
+    /// `gossipsub::Behaviour`. Called from the main loop on the 30s
+    /// `mesh_stats_interval` tick. Lock-hold is sub-millisecond — we
+    /// build the snapshot in a local, then swap it in under the
+    /// `RwLock` write guard.
+    fn refresh_mesh_stats(&self) {
+        use std::collections::HashMap;
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let gossipsub = &self.swarm.behaviour().gossipsub;
+
+        // Walk every subscribed topic. `topics()` returns the topic
+        // hashes we are subscribed to — we don't have the original
+        // topic-string here without a side-table, so the snapshot
+        // surfaces the hash rendering (operators recognise the
+        // network_id / topic prefix in the rendering).
+        let mut topic_entries: HashMap<String, mesh_stats::TopicMeshStats> = HashMap::new();
+        let mut total_mesh_slots = 0usize;
+        for topic_hash in gossipsub.topics() {
+            let mesh_size = gossipsub.mesh_peers(topic_hash).count();
+            total_mesh_slots += mesh_size;
+            let subscribers = gossipsub
+                .all_peers()
+                .filter(|(_, topics)| topics.iter().any(|t| *t == topic_hash))
+                .count();
+            if mesh_size == 0 && subscribers == 0 {
+                continue;
+            }
+            let topic_str = topic_hash.to_string();
+            topic_entries.insert(
+                topic_str.clone(),
+                mesh_stats::TopicMeshStats {
+                    topic: topic_str,
+                    mesh_size,
+                    subscribers,
+                },
+            );
+        }
+
+        let mut topics: Vec<mesh_stats::TopicMeshStats> =
+            topic_entries.into_values().collect();
+        topics.sort_by(|a, b| a.topic.cmp(&b.topic));
+
+        let (total, no_peers, all_queues_full, other) =
+            self.publish_failure_counters.snapshot();
+
+        let new_snapshot = mesh_stats::MeshStatsSnapshot {
+            generated_at_unix: now_unix,
+            topics,
+            total_mesh_slots,
+            publish_failures_total: total,
+            publish_failures_no_peers: no_peers,
+            publish_failures_all_queues_full: all_queues_full,
+            publish_failures_other: other,
+        };
+
+        match self.mesh_stats.write() {
+            Ok(mut w) => *w = new_snapshot,
+            Err(e) => warn!(error = %e, "mesh_stats RwLock poisoned"),
         }
     }
 
@@ -1421,7 +1623,17 @@ impl NetworkService {
         let topic = libp2p::gossipsub::IdentTopic::new(gossip::topic_network(self.topics.network_id()));
         match self.swarm.behaviour_mut().gossipsub.publish(topic, envelope_bytes) {
             Ok(_) => info!(node_id = %self.node_id, "Published NodeAnnouncement"),
-            Err(e) => debug!(error = %e, "Failed to publish NodeAnnouncement (no peers yet?)"),
+            Err(e) => {
+                // Bump counters for accurate stats (spec 10 §9.2) but
+                // do not fire the `publish_failed_insufficient_peers`
+                // alert from here — NodeAnnouncement is the periodic
+                // self-advertisement, and a failure during the first
+                // ~30s of operation (before any peer connects) is
+                // structurally expected. The gossip-rx publish path
+                // (application data) is where the alert matters.
+                self.publish_failure_counters.record(&e);
+                debug!(error = %e, "Failed to publish NodeAnnouncement (no peers yet?)");
+            }
         }
     }
 

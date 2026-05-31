@@ -5891,6 +5891,7 @@ mod bootstrap_candidates_tests {
     const REAL_PEER_ID: &str = "12D3KooWNx9TnsmVQux3fMm6sUUe5tFdeXjECUSyDqYtYfsbt3Mo";
 
     fn entry(multiaddr: &str, last: Option<u64>, source: &'static str) -> CandidateEntry {
+        let transport = crate::chain::sc_views::classify_transport(multiaddr).as_str();
         CandidateEntry {
             multiaddr: multiaddr.to_string(),
             peer_id: extract_peer_id(multiaddr),
@@ -5902,6 +5903,7 @@ mod bootstrap_candidates_tests {
             } else {
                 None
             },
+            transport,
         }
     }
 
@@ -5977,6 +5979,7 @@ mod bootstrap_candidates_tests {
                 source: "sc",
                 paused: false,
                 owner_address: Some("klv1testowner".to_string()),
+                transport: "clearnet",
             })
             .collect();
         let out = merge_candidates(Vec::new(), Vec::new(), sc);
@@ -5994,6 +5997,7 @@ mod bootstrap_candidates_tests {
             source: "book",
             paused: false,
             owner_address: None,
+            transport: "clearnet",
         }];
         let config = vec![CandidateEntry {
             multiaddr: "/dns4/cfg.org/tcp/41720".to_string(),
@@ -6002,6 +6006,7 @@ mod bootstrap_candidates_tests {
             source: "config",
             paused: false,
             owner_address: None,
+            transport: "clearnet",
         }];
         let sc = vec![CandidateEntry {
             multiaddr: "/dns4/sc.org/tcp/41720".to_string(),
@@ -6010,6 +6015,7 @@ mod bootstrap_candidates_tests {
             source: "sc",
             paused: false,
             owner_address: Some("klv1testowner".to_string()),
+            transport: "clearnet",
         }];
         let out = merge_candidates(book, config, sc);
         assert_eq!(out.len(), 3);
@@ -6027,6 +6033,7 @@ mod bootstrap_candidates_tests {
             source: "book",
             paused: false,
             owner_address: None,
+            transport: "clearnet",
         }];
         let sc = vec![CandidateEntry {
             multiaddr: "/dns4/sc.org/tcp/41720".to_string(),
@@ -6035,6 +6042,7 @@ mod bootstrap_candidates_tests {
             source: "sc",
             paused: false,
             owner_address: Some("klv1ownerxyz".to_string()),
+            transport: "clearnet",
         }];
         let out = merge_candidates(book, Vec::new(), sc);
         // SC entry is first (non-null last_anchor_at).
