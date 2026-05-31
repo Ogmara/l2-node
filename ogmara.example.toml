@@ -70,6 +70,27 @@ media_handler_permits = 32        # Concurrent /api/v1/media/:cid handlers (glob
 media_per_ip_permits = 4          # Per-client-IP sub-cap (must be <= handler_permits)
 media_max_tracked_ips = 65536     # Hard cap on the per-IP limiter map
 
+[media]
+# Cross-node media-fetch fallback (spec 3, l2-node 0.46.7+).
+#
+# When a media request misses the local Kubo, the node optionally
+# fans out to SC-registered peers (from getActiveNodes filtered by
+# anchor recency) and races their /api/v1/media/:cid responses.
+# Trust set is strict at launch: only on-chain-registered, anchoring,
+# unpaused peers. The retrieved content is re-added to the local
+# Kubo, content-verified against the requested CID, and pinned for
+# future requests.
+#
+# Set peer_fallback_enabled = false for strictly-local serving
+# (privacy-conscious archive nodes that should not generate outbound
+# HTTP requests to peers).
+peer_fallback_enabled = true
+peer_fallback_fanout = 3                 # parallel dials per fetch (cap 16)
+peer_fallback_connect_timeout_secs = 5   # connect timeout per dial
+peer_fallback_read_timeout_secs = 30     # end-to-end read budget per dial
+peer_fallback_global_concurrent = 16     # global concurrent fan-out ops (cap 256)
+peer_fallback_candidate_cache_secs = 300 # SC candidate snapshot TTL
+
 [api]
 # Set to "0.0.0.0" to accept connections from all interfaces
 listen_addr = "127.0.0.1"

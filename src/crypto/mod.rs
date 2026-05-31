@@ -103,6 +103,26 @@ pub fn is_device_address(address: &str) -> bool {
     address.starts_with("ogd1")
 }
 
+/// Derive the Ogmara `node_id` (Base58-encoded SHA-256[..20] of the
+/// 32-byte raw public key) from a bech32 wallet/device address. This
+/// matches the derivation used by `NodeAnnouncement` (verifying that
+/// `payload.node_id == derived(author)` in
+/// [`crate::messages::router`]), the snapshot envelope authorship
+/// path, and the on-startup `node_id` computation in
+/// [`crate::node`]. Centralised in one helper so callers don't drift.
+///
+/// Used by the v0.46.7 media peer-fallback path: SC `getActiveNodes`
+/// returns klv1 wallet addresses; the local `PEER_DIRECTORY` (where
+/// `NodeAnnouncement` REST-endpoint records live) is keyed by
+/// `node_id`. This helper bridges the two ID spaces deterministically
+/// without any round-trip.
+pub fn address_to_node_id(address: &str) -> Result<String, CryptoError> {
+    use sha2::{Digest, Sha256};
+    let pubkey_bytes = address_to_pubkey_bytes(address)?;
+    let hash = Sha256::digest(pubkey_bytes);
+    Ok(bs58::encode(&hash[..20]).into_string())
+}
+
 /// Generate a new random Ed25519 key pair for node identity.
 pub fn generate_keypair() -> SigningKey {
     SigningKey::generate(&mut rand::rngs::OsRng)

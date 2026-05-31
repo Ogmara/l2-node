@@ -10,6 +10,7 @@ pub mod admin;
 pub mod admin_auth;
 pub mod auth;
 pub mod dashboard;
+pub mod media_fallback;
 pub mod media_limiter;
 pub mod routes;
 pub mod state;

@@ -338,6 +338,13 @@ pub struct AppState {
     /// in `Arc<AtomicU64>` so the endpoint reads live values without
     /// waiting for the next 30s tick.
     pub publish_failure_counters: crate::network::mesh_stats::PublishFailureCounters,
+    /// Cross-node media-fetch fallback policy + shared state (spec 3
+    /// §media-fetch, l2-node 0.46.7+). `None` when the operator
+    /// disabled `[media] peer_fallback_enabled`, when the Klever
+    /// wiring is unset, or when IPFS is unconfigured. `get_media`
+    /// branches on this — fallback runs only when all conditions
+    /// align.
+    pub media_fallback: Option<crate::api::media_fallback::MediaFallbackState>,
 }
 
 /// Cached bootstrap-candidates response (spec 13 §4.5).
@@ -424,6 +431,7 @@ impl AppState {
             crate::chain::metadata_reconcile::shared_metadata_drift(),
             crate::network::mesh_stats::shared_empty(),     // mesh_stats — empty in tests
             crate::network::mesh_stats::PublishFailureCounters::default(), // publish_failure_counters
+            None,                                           // media_fallback — disabled in tests
         )
     }
 
@@ -470,6 +478,7 @@ impl AppState {
         metadata_drift: crate::chain::metadata_reconcile::SharedMetadataDrift,
         mesh_stats: crate::network::mesh_stats::SharedMeshStats,
         publish_failure_counters: crate::network::mesh_stats::PublishFailureCounters,
+        media_fallback: Option<crate::api::media_fallback::MediaFallbackState>,
     ) -> Self {
         // moka LRU with size-weighted eviction. `weigher` returns the
         // byte count of each value's body (content-type string is
@@ -542,6 +551,7 @@ impl AppState {
             metadata_drift,
             mesh_stats,
             publish_failure_counters,
+            media_fallback,
         }
     }
 

@@ -1,6 +1,6 @@
 [package]
 name = "ogmara-node"
-version = "0.46.6"
+version = "0.46.7"
 edition = "2021"
 authors = ["Ogmara Contributors"]
 license = "MIT"
@@ -56,7 +56,8 @@ tower_governor = "0.8"           # Axum middleware for governor
 base64 = "0.22"
 
 # HTTP client (for Klever RPC + IPFS API)
-reqwest = { version = "0.13", features = ["json", "multipart"] }
+reqwest = { version = "0.13", features = ["json", "multipart", "stream"] }
+url = "2.5"                      # peer-fallback URL parsing (SSRF guard, 0.46.7+)
 
 # Logging
 tracing = "0.1"

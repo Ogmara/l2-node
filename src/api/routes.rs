@@ -3335,11 +3335,68 @@ pub async fn get_media(
     // returns the ACTUAL file size (not `CumulativeSize`), so the
     // `total` we report in Content-Range matches what `get_range`
     // can deliver. Audit warning W-2 (security) / #3 (code).
+    //
+    // Local-miss: try cross-node peer fallback BEFORE 404-ing (spec
+    // 3 §media-fetch, l2-node 0.46.7+). The fallback may pin a
+    // verified copy into the local Kubo, so we re-stat after success
+    // to pick up the now-present blob via the normal path. Disabled
+    // cleanly if [media] peer_fallback_enabled = false or Klever is
+    // unconfigured — `state.media_fallback` is None in that case.
     let total = match ipfs.get_size(&cid).await {
         Ok(s) => s,
         Err(e) => {
-            tracing::warn!(cid = %cid, error = %e, "IPFS stat failed");
-            return (StatusCode::NOT_FOUND, "media not found").into_response();
+            tracing::debug!(cid = %cid, error = %e, "IPFS stat failed (local miss)");
+            // Peer fallback attempt. Returns `Some(bytes)` only when
+            // a peer returned 200 AND the IPFS add+verify succeeded.
+            // Bytes are already pinned locally as a side effect.
+            let fallback_bytes = match state.media_fallback.as_ref() {
+                Some(fb) => {
+                    crate::api::media_fallback::fetch_via_peers(
+                        fb,
+                        &state.storage,
+                        ipfs,
+                        &cid,
+                        ipfs.max_upload_bytes(),
+                    )
+                    .await
+                }
+                None => None,
+            };
+            match fallback_bytes {
+                Some(bytes) => {
+                    // Bytes are now pinned locally. Build a cached
+                    // response directly instead of round-tripping
+                    // back through Kubo for size: we already have
+                    // the bytes in hand.
+                    let content_type = detect_content_type(&bytes).to_string();
+                    let cached = CachedMedia {
+                        bytes,
+                        content_type,
+                        last_modified: std::time::SystemTime::now(),
+                    };
+                    // Insert into the LRU for subsequent requests
+                    // (small files only — large files stream from
+                    // the now-pinned local copy on the next request).
+                    if (cached.bytes.len() as u64) <= state.media_cache_item_bytes as u64 {
+                        state.media_cache.insert(cid.clone(), cached.clone()).await;
+                    }
+                    return serve_from_cached(
+                        is_head,
+                        cached,
+                        etag,
+                        cache_control,
+                        &cid,
+                        &headers,
+                    );
+                }
+                None => {
+                    tracing::warn!(
+                        cid = %cid,
+                        "media not found locally and peer fallback declined or failed"
+                    );
+                    return (StatusCode::NOT_FOUND, "media not found").into_response();
+                }
+            }
         }
     };
 

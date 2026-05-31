@@ -382,6 +382,88 @@ impl IpfsClient {
     /// We treat BOTH as "not local" to make the probe stable across
     /// Kubo upgrades. A successful response with no `Error` key is
     /// the only path that reports the CID as local.
+    /// Add untrusted bytes received from a peer to the local Kubo,
+    /// pin them, and verify the returned CID matches `expected_cid`.
+    /// Used by the v0.46.7 media peer-fallback path
+    /// ([`crate::api::media_fallback`]).
+    ///
+    /// **Security property.** Content-addressed verification: a peer
+    /// cannot substitute a different file for the requested CID
+    /// because Kubo's `add` computes the CID from the bytes; a
+    /// mismatch is hard-rejected by this function. The pin side
+    /// effect is desired — once verified, subsequent local lookups
+    /// hit and no further fallback is needed.
+    ///
+    /// **CID version handling.** Kubo's `add` defaults to CIDv0 for
+    /// dag-pb leaves and CIDv1 with `cid-version=1`. We invoke with
+    /// the version that matches the expected CID's prefix (`Qm...`
+    /// → v0; everything else → v1) so the comparison is direct
+    /// string-equality. If the expected CID format is exotic we
+    /// fall back to v1 (the multibase prefix space is well-defined
+    /// for v1).
+    ///
+    /// On CID mismatch we DO NOT attempt to unpin — Kubo's add was
+    /// successful for the actual content, the bytes are just not
+    /// what the caller asked for. Background GC will reclaim them;
+    /// keeping the side-effect simple avoids fragile cleanup paths
+    /// on the hot security boundary.
+    /// Exposed for the peer-fallback streaming path
+    /// ([`crate::api::media_fallback::fetch_one`]) which streams the
+    /// peer's response body and aborts mid-stream once this cap is
+    /// reached. Defense-in-depth against a hostile peer streaming an
+    /// oversized body to exhaust requester memory before
+    /// [`Self::add_and_verify_cid`] gets to reject it.
+    pub fn max_upload_bytes(&self) -> u64 {
+        self.max_upload_bytes
+    }
+
+    pub async fn add_and_verify_cid(
+        &self,
+        expected_cid: &str,
+        data: Vec<u8>,
+    ) -> Result<()> {
+        validate_cid(expected_cid)?;
+        if data.len() as u64 > self.max_upload_bytes {
+            anyhow::bail!(
+                "peer-fallback bytes exceed max_upload_bytes: {} > {}",
+                data.len(),
+                self.max_upload_bytes
+            );
+        }
+        // Pick CID version matching the expected form. CIDv0 is the
+        // legacy base58 form starting with "Qm"; everything else is
+        // CIDv1 (multibase-prefixed).
+        let cid_version = if expected_cid.starts_with("Qm") { 0 } else { 1 };
+        let url = format!(
+            "{}/api/v0/add?pin=true&cid-version={}",
+            self.api_url, cid_version
+        );
+
+        let part = reqwest::multipart::Part::bytes(data).file_name("peer-fallback");
+        let form = reqwest::multipart::Form::new().part("file", part);
+
+        let resp: IpfsAddResponse = self
+            .http
+            .post(&url)
+            .multipart(form)
+            .send()
+            .await
+            .context("peer-fallback add to IPFS")?
+            .json()
+            .await
+            .context("parsing IPFS add response for peer-fallback")?;
+
+        if resp.hash != expected_cid {
+            anyhow::bail!(
+                "peer-fallback CID mismatch: peer delivered content for CID {} \
+                 but caller asked for {}",
+                resp.hash,
+                expected_cid
+            );
+        }
+        Ok(())
+    }
+
     pub async fn exists_local(&self, cid: &str) -> Result<bool> {
         validate_cid(cid)?;
 
