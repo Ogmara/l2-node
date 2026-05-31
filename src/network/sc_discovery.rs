@@ -640,18 +640,62 @@ impl ScDiscovery {
         key.extend_from_slice(PEER_ADDR_PREFIX);
         key.extend_from_slice(peer_id.to_string().as_bytes());
 
-        // Already present? Skip — `dial_persisted_peers` will pick it
-        // up on the next reconnect signal. The reconnect signal we
-        // send below still triggers a dial against pre-existing
-        // entries, which is fine (libp2p dedups by peer_id).
-        let already_present = matches!(self.storage.get_cf(cf, &key), Ok(Some(_)));
-        if already_present {
-            return false;
+        let new_value = multiaddr.to_string();
+        let new_value_bytes = new_value.as_bytes();
+
+        // l2-node 0.47.1 fix: previously this code short-circuited
+        // on any existing entry, which meant a stale PEER_DIRECTORY
+        // row (e.g., `pa:<peer_id> → /ip4/127.0.0.1/tcp/41720` left
+        // over from a colocated test) was NEVER updated even when
+        // the SC returned the correct current address. Now we
+        // compare against the stored value:
+        //   * identical → return false (no-op, no reconnect needed)
+        //   * different → overwrite + return true (cures the stale
+        //                 row and re-triggers dial via reconnect_tx)
+        //   * missing   → insert (subject to the cap check below)
+        // Discovered during the Odroid testnet bake-in 2026-05-31.
+        match self.storage.get_cf(cf, &key) {
+            Ok(Some(existing)) if existing == new_value_bytes => {
+                // Identical — already up-to-date.
+                return false;
+            }
+            Ok(Some(_existing)) => {
+                // Stale value, overwrite. UPDATE does NOT grow the
+                // set so the cap check is skipped on this branch.
+                debug!(
+                    owner = %owner_addr,
+                    peer_id = %peer_id,
+                    new_multiaddr = %new_value,
+                    "sc_discovery: updating stale PEER_DIRECTORY entry"
+                );
+                if let Err(e) = self.storage.put_cf(cf, &key, new_value_bytes) {
+                    warn!(
+                        owner = %owner_addr,
+                        error = %e,
+                        "sc_discovery: failed to update stale multiaddr"
+                    );
+                    return false;
+                }
+                if let Ok(mut set) = self.sc_added_peer_ids.write() {
+                    set.insert(peer_id);
+                }
+                return true;
+            }
+            Ok(None) => {
+                // Falls through to the cap check + fresh insert below.
+            }
+            Err(e) => {
+                warn!(
+                    owner = %owner_addr,
+                    error = %e,
+                    "sc_discovery: failed to read existing PEER_DIRECTORY entry"
+                );
+                return false;
+            }
         }
 
-        // Cap check: an UPDATE to an existing key doesn't grow the
-        // set (handled by the `already_present` short-circuit above);
-        // only fresh inserts need to respect the cap.
+        // Fresh insert path — enforce the per-CF cap so the SC
+        // registry can't crowd out organically-learned peers.
         if existing_count >= PEER_DIRECTORY_CAP {
             debug!(
                 cap = PEER_DIRECTORY_CAP,
@@ -660,8 +704,7 @@ impl ScDiscovery {
             return false;
         }
 
-        let value = multiaddr.to_string();
-        if let Err(e) = self.storage.put_cf(cf, &key, value.as_bytes()) {
+        if let Err(e) = self.storage.put_cf(cf, &key, new_value_bytes) {
             warn!(
                 owner = ?owner_addr,
                 error = %e,
