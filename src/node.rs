@@ -973,7 +973,7 @@ impl Node {
             metrics_history,
             alert_history,
             pow_manager.clone(),
-            node_address,
+            node_address.clone(),
             snapshot_cache.clone(),
             media_tuning,
             trusted_proxies,
@@ -1020,6 +1020,41 @@ impl Node {
             // read by the `/admin/network/mesh-stats` endpoint.
             mesh_stats_handle.clone(),
             publish_failure_counters.clone(),
+            // Spec 3 §media-fetch (l2-node 0.46.7+) — peer-fallback
+            // state. Built only when both Klever wiring is set AND
+            // the operator enabled `[media] peer_fallback_enabled`.
+            // The state owns its own reqwest::Client (separate
+            // timeouts and policy from the rest of the node) and a
+            // global concurrent-fanout semaphore.
+            if self.config.media.peer_fallback_enabled
+                && !self.config.klever.node_url.is_empty()
+                && !self.config.klever.contract_address.is_empty()
+            {
+                let staleness_secs = (self
+                    .config
+                    .network
+                    .discovery
+                    .max_peer_staleness_days as u64)
+                    .saturating_mul(24 * 3600);
+                match crate::api::media_fallback::MediaFallbackState::new(
+                    self.config.media.clone(),
+                    node_address.clone(),
+                    self.config.klever.node_url.clone(),
+                    self.config.klever.contract_address.clone(),
+                    staleness_secs,
+                ) {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            "media-fallback init failed; disabling fallback"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            },
         ));
         // Background sweep: drop zero-counter entries from the per-IP
         // media limiter (v0.41). Without this, the DashMap accumulates

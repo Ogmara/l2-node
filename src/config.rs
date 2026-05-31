@@ -37,6 +37,13 @@ pub struct Config {
     pub alerts: AlertsConfig,
     #[serde(default)]
     pub metrics: MetricsConfig,
+    /// Cross-node media fallback policy (spec 3 §media-fetch, l2-node
+    /// 0.46.7+). Separate from `[ipfs]` because the concerns are
+    /// distinct: `[ipfs]` is local-Kubo connection + handler resource
+    /// caps; `[media]` is the SC-registered-peer fallback used when a
+    /// CID misses locally.
+    #[serde(default)]
+    pub media: MediaConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -177,6 +184,96 @@ fn default_sc_retry_interval_secs() -> u64 {
 
 fn default_sc_max_candidates() -> u32 {
     5
+}
+
+/// Cross-node media-fetch fallback policy (spec 3 §media-fetch,
+/// l2-node 0.46.7+).
+///
+/// When a `/api/v1/media/:cid` request misses the local Kubo, the
+/// node optionally fans out to SC-registered peers to retrieve the
+/// content. Trust set is strict at launch (spec 3, D2 of the
+/// mainnet-blockers plan): only nodes returned by the SC's
+/// `getActiveNodes` AND with `lastAnchorAt` within the
+/// `[network.discovery] max_peer_staleness_days` window AND with a
+/// usable `api_endpoint` known to the local peer directory. No
+/// unregistered-peer fallback at launch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MediaConfig {
+    /// Master switch. Default `true` — enables the fallback for fresh
+    /// installs. Operators who want strictly-local serving (e.g.
+    /// privacy-conscious archive nodes that should not generate
+    /// outbound HTTP requests to peers) set this to `false`.
+    #[serde(default = "default_true")]
+    pub peer_fallback_enabled: bool,
+    /// Max number of peer candidates to dial in parallel per fallback
+    /// fetch. Each candidate is dialed concurrently; the first 200
+    /// response wins, the others are cancelled. Default 3 (spec 3,
+    /// D2 of the mainnet-blockers plan).
+    #[serde(default = "default_media_peer_fallback_fanout")]
+    pub peer_fallback_fanout: usize,
+    /// Connect timeout per peer fallback dial, in seconds. Default 5.
+    /// Short enough that a dead peer doesn't stall the request; long
+    /// enough that a healthy peer behind moderate latency still
+    /// responds in time.
+    #[serde(default = "default_media_peer_fallback_connect_secs")]
+    pub peer_fallback_connect_timeout_secs: u64,
+    /// End-to-end read budget per peer fallback dial, in seconds.
+    /// Default 30 — accommodates a large image transfer over a slow
+    /// link. The overall fallback fetch is bounded by this timeout
+    /// for the racing future as well.
+    #[serde(default = "default_media_peer_fallback_read_secs")]
+    pub peer_fallback_read_timeout_secs: u64,
+    /// Global cap on concurrent fan-out operations across all
+    /// clients. Bounds the node's outbound network footprint when
+    /// many clients trigger fallbacks simultaneously. Default 16
+    /// (spec 3, mainnet-blockers plan §3 step 3).
+    #[serde(default = "default_media_peer_fallback_global_concurrent")]
+    pub peer_fallback_global_concurrent: usize,
+    /// How long the SC-active-nodes candidate snapshot is cached
+    /// before the next fallback request triggers a refresh. Bounds
+    /// SC view-call load — at the default 300s, a node serving
+    /// continuous fallback fetches makes at most ~12 calls/hour
+    /// against `getActiveNodes`. Spec 3, mainnet-blockers plan §3
+    /// step 3.
+    #[serde(default = "default_media_peer_fallback_candidate_cache_secs")]
+    pub peer_fallback_candidate_cache_secs: u64,
+}
+
+impl Default for MediaConfig {
+    fn default() -> Self {
+        Self {
+            peer_fallback_enabled: true,
+            peer_fallback_fanout: default_media_peer_fallback_fanout(),
+            peer_fallback_connect_timeout_secs:
+                default_media_peer_fallback_connect_secs(),
+            peer_fallback_read_timeout_secs:
+                default_media_peer_fallback_read_secs(),
+            peer_fallback_global_concurrent:
+                default_media_peer_fallback_global_concurrent(),
+            peer_fallback_candidate_cache_secs:
+                default_media_peer_fallback_candidate_cache_secs(),
+        }
+    }
+}
+
+fn default_media_peer_fallback_fanout() -> usize {
+    3
+}
+
+fn default_media_peer_fallback_connect_secs() -> u64 {
+    5
+}
+
+fn default_media_peer_fallback_read_secs() -> u64 {
+    30
+}
+
+fn default_media_peer_fallback_global_concurrent() -> usize {
+    16
+}
+
+fn default_media_peer_fallback_candidate_cache_secs() -> u64 {
+    300
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1254,6 +1351,64 @@ impl Config {
                 "network.sc_discovery.max_candidates must be > 0 (default is 5)"
             );
         }
+        // Spec 3 §media-fetch (l2-node 0.46.7+) — media peer-fallback
+        // tunables. Zero values would either deadlock (fanout=0 fans
+        // out to nothing) or hot-spin (timeouts=0 fail immediately).
+        // Hard ceilings prevent operator misconfig from amplifying
+        // load onto the peer mesh.
+        if self.media.peer_fallback_enabled {
+            if self.media.peer_fallback_fanout == 0 {
+                anyhow::bail!(
+                    "media.peer_fallback_fanout must be > 0 when \
+                     peer_fallback_enabled = true (default is 3)"
+                );
+            }
+            const MAX_MEDIA_PEER_FALLBACK_FANOUT: usize = 16;
+            if self.media.peer_fallback_fanout > MAX_MEDIA_PEER_FALLBACK_FANOUT {
+                anyhow::bail!(
+                    "media.peer_fallback_fanout = {} exceeds the cap of {} \
+                     (per-fetch amplification — reduce or disable)",
+                    self.media.peer_fallback_fanout,
+                    MAX_MEDIA_PEER_FALLBACK_FANOUT
+                );
+            }
+            if self.media.peer_fallback_connect_timeout_secs == 0 {
+                anyhow::bail!(
+                    "media.peer_fallback_connect_timeout_secs must be > 0 \
+                     (default is 5)"
+                );
+            }
+            if self.media.peer_fallback_read_timeout_secs == 0 {
+                anyhow::bail!(
+                    "media.peer_fallback_read_timeout_secs must be > 0 \
+                     (default is 30)"
+                );
+            }
+            if self.media.peer_fallback_global_concurrent == 0 {
+                anyhow::bail!(
+                    "media.peer_fallback_global_concurrent must be > 0 \
+                     (default is 16)"
+                );
+            }
+            const MAX_MEDIA_PEER_FALLBACK_GLOBAL: usize = 256;
+            if self.media.peer_fallback_global_concurrent
+                > MAX_MEDIA_PEER_FALLBACK_GLOBAL
+            {
+                anyhow::bail!(
+                    "media.peer_fallback_global_concurrent = {} exceeds the \
+                     cap of {} (global outbound footprint — reduce)",
+                    self.media.peer_fallback_global_concurrent,
+                    MAX_MEDIA_PEER_FALLBACK_GLOBAL
+                );
+            }
+            if self.media.peer_fallback_candidate_cache_secs == 0 {
+                anyhow::bail!(
+                    "media.peer_fallback_candidate_cache_secs must be > 0 \
+                     — would hammer the SC RPC on every fallback fetch \
+                     (default is 300)"
+                );
+            }
+        }
         if self.network.listen_port == 0 {
             anyhow::bail!("network.listen_port must be > 0");
         }
@@ -1479,6 +1634,27 @@ media_cache_item_mb = 16          # Per-item insert cap; larger items stream
 media_handler_permits = 32        # Concurrent /api/v1/media/:cid handlers (global)
 media_per_ip_permits = 4          # Per-client-IP sub-cap (must be <= handler_permits)
 media_max_tracked_ips = 65536     # Hard cap on the per-IP limiter map
+
+[media]
+# Cross-node media-fetch fallback (spec 3, l2-node 0.46.7+).
+#
+# When a media request misses the local Kubo, the node optionally
+# fans out to SC-registered peers (from getActiveNodes filtered by
+# anchor recency) and races their /api/v1/media/:cid responses.
+# Trust set is strict at launch: only on-chain-registered, anchoring,
+# unpaused peers. The retrieved content is re-added to the local
+# Kubo, content-verified against the requested CID, and pinned for
+# future requests.
+#
+# Set peer_fallback_enabled = false for strictly-local serving
+# (privacy-conscious archive nodes that should not generate outbound
+# HTTP requests to peers).
+peer_fallback_enabled = true
+peer_fallback_fanout = 3                 # parallel dials per fetch (cap 16)
+peer_fallback_connect_timeout_secs = 5   # connect timeout per dial
+peer_fallback_read_timeout_secs = 30     # end-to-end read budget per dial
+peer_fallback_global_concurrent = 16     # global concurrent fan-out ops (cap 256)
+peer_fallback_candidate_cache_secs = 300 # SC candidate snapshot TTL
 
 [api]
 # Set to "0.0.0.0" to accept connections from all interfaces
@@ -1834,6 +2010,72 @@ mod tests {
         c.network.sc_discovery.max_candidates = 0;
         let err = c.validate().expect_err("0 max_candidates must be rejected");
         assert!(format!("{err}").contains("max_candidates"));
+    }
+
+    // --- 0.46.7 media peer-fallback (spec 3) -------------------------
+
+    #[test]
+    fn validate_passes_disabled_media_fallback_with_zeros() {
+        // When peer_fallback_enabled = false, zero-valued tunables are
+        // ignored (the path is unused). Don't make operators set
+        // bookkeeping values they will never exercise.
+        let mut c = baseline_config();
+        c.media.peer_fallback_enabled = false;
+        c.media.peer_fallback_fanout = 0;
+        c.media.peer_fallback_connect_timeout_secs = 0;
+        c.media.peer_fallback_read_timeout_secs = 0;
+        c.media.peer_fallback_global_concurrent = 0;
+        c.media.peer_fallback_candidate_cache_secs = 0;
+        c.validate().expect("zero values are fine when disabled");
+    }
+
+    #[test]
+    fn validate_rejects_zero_media_fanout_when_enabled() {
+        let mut c = baseline_config();
+        c.media.peer_fallback_enabled = true;
+        c.media.peer_fallback_fanout = 0;
+        let err = c.validate().expect_err("0 fanout must be rejected when enabled");
+        assert!(format!("{err}").contains("peer_fallback_fanout"));
+    }
+
+    #[test]
+    fn validate_rejects_oversized_media_fanout() {
+        let mut c = baseline_config();
+        c.media.peer_fallback_fanout = 17;
+        let err = c.validate().expect_err("oversize fanout must be rejected");
+        assert!(format!("{err}").contains("peer_fallback_fanout"));
+    }
+
+    #[test]
+    fn validate_rejects_zero_media_timeouts() {
+        let mut c = baseline_config();
+        c.media.peer_fallback_connect_timeout_secs = 0;
+        assert!(c.validate().is_err(), "0 connect timeout must be rejected");
+
+        let mut c = baseline_config();
+        c.media.peer_fallback_read_timeout_secs = 0;
+        assert!(c.validate().is_err(), "0 read timeout must be rejected");
+    }
+
+    #[test]
+    fn validate_rejects_zero_media_candidate_cache() {
+        // 0 cache would hammer the SC RPC on every fallback fetch.
+        let mut c = baseline_config();
+        c.media.peer_fallback_candidate_cache_secs = 0;
+        let err = c
+            .validate()
+            .expect_err("0 candidate cache TTL must be rejected when enabled");
+        assert!(format!("{err}").contains("peer_fallback_candidate_cache_secs"));
+    }
+
+    #[test]
+    fn validate_rejects_oversized_media_global_concurrent() {
+        let mut c = baseline_config();
+        c.media.peer_fallback_global_concurrent = 257;
+        let err = c
+            .validate()
+            .expect_err("oversize global concurrent cap must be rejected");
+        assert!(format!("{err}").contains("peer_fallback_global_concurrent"));
     }
 
     // --- v0.41 per-IP permit field ----------------------------------

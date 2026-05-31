@@ -5,6 +5,97 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.46.7] - 2026-05-31
+
+B3: cross-node media fallback. When `/api/v1/media/:cid` misses the
+local Kubo, the node now optionally fans out to SC-registered peers
+and races their responses, with content verification via Kubo's
+`add` (so a peer cannot substitute different content for the
+requested CID). Closes the cross-node media correctness gap that
+made historical attachments unreachable on fresh nodes.
+
+### Why
+
+Before 0.46.7, a fresh node serving a channel with historical media
+returned 404 for any CID that was not yet local. The IPFS Bitswap
+network would eventually pick it up on cold paths, but in practice
+clients saw broken images for an indefinitely long warmup window.
+The fix is structurally constrained: peer-fallback fetches go only
+to SC-registered, anchoring, unpaused operators (strict trust set
+per D2 of the mainnet-blockers fix plan), URLs pass an SSRF
+classifier matching the v0.46.5 transport rules, and the returned
+bytes are re-added through the local Kubo so the CID is verified
+before any client sees them.
+
+### Added
+
+- **`[media]` config block** (spec 3 §3.3.1):
+  - `peer_fallback_enabled` (default `true`) — master switch.
+  - `peer_fallback_fanout` (default 3, cap 16) — parallel dials per fetch.
+  - `peer_fallback_connect_timeout_secs` (default 5).
+  - `peer_fallback_read_timeout_secs` (default 30).
+  - `peer_fallback_global_concurrent` (default 16, cap 256) —
+    global concurrent fan-out semaphore.
+  - `peer_fallback_candidate_cache_secs` (default 300) — SC
+    candidate-snapshot TTL.
+- **`crate::api::media_fallback` module** with `MediaFallbackState`,
+  `CandidateSnapshot`, `CandidateEntry`, `PeerDirectoryRecord`,
+  `classify_api_endpoint`, `resolve_endpoint`, `resolve_endpoints`,
+  `fetch_via_peers`. 7 unit tests cover the SSRF classifier
+  (RFC1918, link-local incl. 169.254.169.254 metadata, ULA,
+  CGNAT, IPv4-mapped IPv6, doc ranges, `.onion`, non-http schemes),
+  the `PeerDirectoryRecord` expiry semantics with the 60s floor,
+  and the JSON decoder.
+- **`crypto::address_to_node_id`** helper — canonical klv1 →
+  Base58(SHA-256(pubkey)[..20]) derivation, centralised so the SC
+  → PEER_DIRECTORY bridge doesn't repeat the derivation inline.
+- **`IpfsClient::add_and_verify_cid`** — adds untrusted bytes to
+  the local Kubo via `/api/v0/add?pin=true&cid-version={0|1}` and
+  hard-rejects any CID mismatch. CIDv0 (`Qm…`) and CIDv1
+  (`bafy…`) are handled by version-matched add.
+- **Spec 3 §3.3.1 + §3.3.2 + §3.3.3** — full documentation of the
+  trust set, resource controls, content verification, SSRF
+  classifier, and operator opt-out.
+- **Spec 4 §4 cross-reference** — retrieval flow updated to
+  reflect the new step between local-cache miss and Bitswap.
+
+### Changed
+
+- **`get_media` handler** branches on local-Kubo miss: if peer
+  fallback is enabled and a candidate returns verified bytes, the
+  response is served from those bytes (and inserted into the LRU
+  for small files); otherwise the original 404 path is preserved.
+  The local `get_size` failure path is downgraded from `warn!`
+  (which fired on every cold-cache fetch) to `debug!` — the
+  warning-level signal now comes from the post-fallback path so
+  operators see real misses, not normal cache warmups.
+
+### Security
+
+- **SSRF classifier on peer URLs**: refuses non-routable IP
+  literals (RFC1918, loopback, link-local incl.
+  169.254.169.254, ULA, CGNAT, multicast, IPv4-mapped IPv6,
+  RFC5737/RFC3849 doc ranges) and `.onion` hosts (until v0.46.9).
+  Defense-in-depth on top of the SC-registration trust constraint.
+- **Outbound `reqwest::Client` policy**: no redirects
+  (`redirect::Policy::none()`); reqwest's default features do not
+  enable `cookies`, so no cookie persistence is possible.
+- **Content verification on every fallback hit**: the bytes are
+  re-added to Kubo, which computes the CID from the bytes;
+  mismatch is a hard reject. A hostile peer cannot poison the
+  local store with content that does not match the requested CID.
+- **`peer_fallback_candidate_cache_secs`** rejected at zero by
+  the validator so an operator misconfig cannot hammer the SC RPC
+  on every fallback request.
+
+### Spec touches
+
+- `docs/specs/03-l2-node.md` §3.3.1 (cross-node media fallback,
+  full trust model + resource controls), §3.3.2 (peer-URL SSRF
+  classifier), §3.3.3 (operator opt-out).
+- `docs/specs/04-ipfs.md` §4 (retrieval flow step inserted +
+  cross-reference to spec 3 §3.3.1).
+
 ## [0.46.6] - 2026-05-31
 
 B4 GossipSub-propagation instrumentation: a new
