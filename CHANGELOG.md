@@ -5,6 +5,57 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.47.1] - 2026-05-31
+
+Bug-fix release for two issues exposed during the v0.46.5–v0.47.0
+testnet bake-in on 2026-05-31. Both prevented a node from peering
+with another node it had a stale PEER_DIRECTORY row for.
+
+### Fixed
+
+- **`sc_discovery::persist_multiaddr` no longer ignores stale
+  PEER_DIRECTORY entries.** Previously, the "already present, skip"
+  short-circuit meant that any stale `pa:<peer_id> → multiaddr`
+  row pinned forever, even when the SC returned the correct
+  current address for the same peer_id. Symptom: a node had the
+  prod operator's peer_id pinned at `127.0.0.1:41720` from an old
+  colocated test, kept dialing localhost expecting prod's
+  identity, Noise handshake always failed, peers stayed 0. Fix:
+  read the existing row's bytes; identical = no-op; different =
+  overwrite + mark for reconnect; missing = fresh insert subject
+  to the cap. The cap is only enforced on fresh inserts (updates
+  do not grow the set).
+
+### Added
+
+- **`ogmara-node clear-peer-directory` CLI command.** Operator
+  recovery path for nodes with poisoned PEER_DIRECTORY state.
+  Requires the node to be stopped (RocksDB write lock); prompts
+  for confirmation by default, takes `--yes` to skip in
+  automation. On next startup, `sc_discovery` re-populates the
+  directory from on-chain metadata.
+
+### Upgrade notes
+
+Operators upgrading from v0.47.0 do NOT need to run
+`clear-peer-directory`. The `sc_discovery::persist_multiaddr` fix
+self-heals: on the next sc_discovery refresh (default 1-hour
+cadence, or immediately on the first cold-start fan-out after
+upgrade) any stale `pa:<peer_id> → multiaddr` row will be
+overwritten with the correct value from the SC. The CLI command is
+only needed when a node is in a stuck state and the operator wants
+to force the fastest possible recovery without waiting for the next
+refresh tick.
+
+### Diagnostic playbook
+
+See the new website tutorial
+[Onion Transport (optional)](https://ogmara.org/tutorials/onion-transport.html)
+and the updated `feedback_peer_discovery_pitfalls` operator memory
+for the full peers=0 diagnostic ladder
+(bootstrap-candidates → reachability → PEER_DIRECTORY staleness →
+operator-hostname pollution).
+
 ## [0.47.0] - 2026-05-31
 
 B1: channel-history reconciliation. Fresh nodes joining an

@@ -90,6 +90,29 @@ enum Commands {
         #[arg(short, long)]
         input: PathBuf,
     },
+    /// Clear all peer-directory entries (operator recovery from stale
+    /// PEER_DIRECTORY state).
+    ///
+    /// Deletes every `pa:<peer_id> → multiaddr` row in the PEER_DIRECTORY
+    /// column family. Use this when a stale entry has poisoned dial
+    /// behaviour (e.g., a peer's recorded address points at localhost or
+    /// some other unreachable host because of an old test colocation, or
+    /// the operator-published metadata was wrong at the time it was
+    /// persisted). On next startup `sc_discovery` re-populates the
+    /// directory from on-chain metadata.
+    ///
+    /// **Requires the node to be stopped** — RocksDB cannot be opened
+    /// for writes while the node holds the lock. Re-start the node after
+    /// running this command.
+    ///
+    /// Shipped in l2-node 0.47.1 alongside the
+    /// `sc_discovery::persist_multiaddr` overwrite-stale fix that
+    /// prevents the same poisoning from recurring.
+    ClearPeerDirectory {
+        /// Skip the confirmation prompt. Use only in automation.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[tokio::main]
@@ -256,6 +279,85 @@ async fn main() -> Result<()> {
             println!("New address:      {}", imported_address);
             println!();
             println!("Restart the node for the new identity to take effect.");
+            Ok(())
+        }
+
+        Commands::ClearPeerDirectory { yes } => {
+            let config_path = resolve_config(&cli.config);
+            let cfg = config::Config::load(&config_path)?;
+            let db_path = cfg.node.data_dir.join("db");
+
+            if !yes {
+                println!(
+                    "About to clear ALL peer-directory entries in {}.",
+                    db_path.display()
+                );
+                println!(
+                    "On next startup, sc_discovery will re-populate \
+                     the directory from on-chain metadata."
+                );
+                print!("Continue? [y/N]: ");
+                use std::io::Write;
+                std::io::stdout().flush().ok();
+                let mut line = String::new();
+                std::io::stdin().read_line(&mut line)?;
+                let answer = line.trim().to_ascii_lowercase();
+                if answer != "y" && answer != "yes" {
+                    println!("Aborted.");
+                    return Ok(());
+                }
+            }
+
+            // Storage::open() takes a write lock; if the node is
+            // running, this errors with a clear message.
+            let storage = storage::rocks::Storage::open(&db_path)
+                .context(
+                    "opening database for write — is the node still running? \
+                     Stop it first with `sudo systemctl stop ogmara-node` and \
+                     re-run this command.",
+                )?;
+
+            // Iterate the `pa:<peer_id>` prefix and delete each row.
+            // We cap at 10_000 entries for safety — the v0.46.5 cap is
+            // 256, so anything beyond that is a corruption signal but
+            // we still want a finite bound.
+            const SCAN_CAP: usize = 10_000;
+            let rows = storage.prefix_iter_cf(
+                storage::schema::cf::PEER_DIRECTORY,
+                b"pa:",
+                SCAN_CAP,
+            )?;
+
+            let total = rows.len();
+            let mut deleted = 0usize;
+            let mut failed = 0usize;
+            for (key, _value) in rows {
+                match storage.delete_cf(
+                    storage::schema::cf::PEER_DIRECTORY,
+                    &key,
+                ) {
+                    Ok(()) => deleted += 1,
+                    Err(e) => {
+                        failed += 1;
+                        eprintln!(
+                            "warning: failed to delete row (continuing): {}",
+                            e
+                        );
+                    }
+                }
+            }
+
+            println!(
+                "Cleared {} of {} peer-directory entries{}.",
+                deleted,
+                total,
+                if failed > 0 {
+                    format!(" ({} failed)", failed)
+                } else {
+                    String::new()
+                }
+            );
+            println!("Start the node to re-populate via sc_discovery.");
             Ok(())
         }
     }
