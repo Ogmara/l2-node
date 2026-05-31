@@ -121,6 +121,40 @@ peer_fallback_read_timeout_secs = 30     # end-to-end read budget per dial
 peer_fallback_global_concurrent = 16     # global concurrent fan-out ops (cap 256)
 peer_fallback_candidate_cache_secs = 300 # SC candidate snapshot TTL
 
+[backfill]
+# Channel-history reconciliation (spec 1, l2-node 0.47.0+).
+#
+# On the first subscribe to a channel where the local index is empty
+# (cold-join), the node requests missing history from peers and
+# applies it through the standard message router (signature verify,
+# storage admission, the works). Default on so fresh nodes catch up
+# automatically; set enabled = false for bandwidth-constrained
+# deployments that want users to rely on real-time gossip only.
+enabled = true
+# How far back to fetch. Archive operators set u64::MAX (currently
+# 18446744073709551615) for "everything ever stored by the peer".
+max_age_days = 30
+# Client-side concurrent peer dials. First peer with a non-empty
+# response wins; the others are dropped.
+fanout = 3
+# Server-side caps — refuse to drown a single requester (per peer
+# and per channel) but always respond promptly with server_capped =
+# true so they know to back off.
+server_max_concurrent_per_peer = 4
+server_max_concurrent_per_channel = 1
+# Per-response envelope cap. Total bandwidth is the SAME as a
+# bigger cap — clients page via the cursor — but smaller batches
+# cut worst-case latency.
+max_envelopes_per_response = 1000
+# Hard ceiling on total envelopes served per single client stream.
+# 200k = roughly one year of an active channel; stops a malicious
+# client from inducing an unbounded scan.
+total_envelopes_cap = 200000
+# Re-reconciliation knob. 0 = off (gossip mesh fills gaps in real
+# time). N>0 = re-trigger on subscribe if local history's newest
+# envelope is older than N days. Bandwidth cost; default off.
+force_resync_if_stale_days = 0
+
 [api]
 # Set to "0.0.0.0" to accept connections from all interfaces
 listen_addr = "127.0.0.1"

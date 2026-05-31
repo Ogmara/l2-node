@@ -14,6 +14,7 @@ use libp2p::{kad, Swarm, SwarmBuilder};
 
 use crate::config::Config;
 
+use super::reconcile::ReconcileCodec;
 use super::snapshot::SnapshotCodec;
 use super::sync::SyncCodec;
 
@@ -39,6 +40,11 @@ pub struct OgmaraBehaviour {
     /// (spec 11-snapshot-sync.md). Serves cached state snapshots so new
     /// nodes can skip block-by-block Klever scanning.
     pub snapshot: SnapshotCodec,
+    /// Request-Response for the channel-history reconciliation
+    /// protocol (spec 1 §channel-history-reconciliation, l2-node
+    /// 0.47.0+). Used to backfill an empty `CHANNEL_MSGS` index on
+    /// cold-join. Wire types in [`super::reconcile`].
+    pub reconcile: ReconcileCodec,
 }
 
 /// Build the libp2p swarm with all configured behaviours.
@@ -152,6 +158,33 @@ pub fn build_swarm(config: &Config, keypair: Keypair) -> Result<Swarm<OgmaraBeha
             .with_request_timeout(Duration::from_secs(60)),
     );
 
+    // Channel-history reconciliation protocol (spec 1, l2-node
+    // 0.47.0+). Third request-response codec alongside `sync` and
+    // `snapshot`. Inbound is gated on `[backfill] enabled` so
+    // operators who disabled backfill don't serve requests; outbound
+    // stays available regardless.
+    let reconcile_protocol = format!(
+        "/ogmara/{}/channel-reconcile/1.0.0",
+        config.network_id()
+    );
+    let reconcile_support = if config.backfill.enabled {
+        libp2p::request_response::ProtocolSupport::Full
+    } else {
+        libp2p::request_response::ProtocolSupport::Outbound
+    };
+    let reconcile = libp2p::request_response::cbor::Behaviour::<
+        super::reconcile::ReconcileRequest,
+        super::reconcile::ReconcileResponse,
+    >::new(
+        [(
+            libp2p::StreamProtocol::try_from_owned(reconcile_protocol)
+                .map_err(|e| anyhow::anyhow!("invalid reconcile protocol string: {}", e))?,
+            reconcile_support,
+        )],
+        libp2p::request_response::Config::default()
+            .with_request_timeout(Duration::from_secs(45)),
+    );
+
     let behaviour = OgmaraBehaviour {
         connection_limits,
         gossipsub,
@@ -160,6 +193,7 @@ pub fn build_swarm(config: &Config, keypair: Keypair) -> Result<Swarm<OgmaraBeha
         identify,
         request_response,
         snapshot,
+        reconcile,
     };
 
     let swarm = SwarmBuilder::with_existing_identity(keypair)
