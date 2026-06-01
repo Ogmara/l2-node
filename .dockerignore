@@ -2,6 +2,10 @@ target/
 .git/
 *.md
 docs/
-scripts/
+# Exclude everything in scripts/ EXCEPT the entrypoint that the
+# Dockerfile COPYs in. update-node.sh and other operator-side helpers
+# don't belong in the runtime image.
+scripts/*
+!scripts/docker-entrypoint.sh
 tests/
 .github/
