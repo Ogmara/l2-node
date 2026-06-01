@@ -28,6 +28,26 @@ if [ ! -f "$CONFIG_PATH" ]; then
     # the init writer (main.rs::Commands::Init) is not atomic, so parallel
     # first-starts could clobber each other. One node per data-dir.
     ogmara-node init --output "$CONFIG_PATH"
+
+    # `ogmara-node init` writes the SOURCE-BUILD defaults (data_dir
+    # relative to WORKDIR, API on host loopback). In Docker we want
+    # the analogous values for our container layout:
+    #   - data_dir = "/data"        (WORKDIR=/data, matches the volume
+    #                                 / bind-mount point the operator
+    #                                 set up via `-v .../data:/data`)
+    #   - listen_addr = "0.0.0.0"   (inside the container — the network
+    #                                 namespace isolates this; Docker's
+    #                                 `-p 41721:41721` port forward
+    #                                 silently fails when the API binds
+    #                                 only to the container's loopback)
+    # Without these rewrites the container crash-loops on first start
+    # (Permission denied creating /data/data) and the API is unreachable
+    # from the host even though the port forward is in place.
+    sed -i \
+        -e 's|^data_dir = "\./data"|data_dir = "/data"|' \
+        -e 's|^listen_addr = "127\.0\.0\.1"|listen_addr = "0.0.0.0"|' \
+        "$CONFIG_PATH"
+    echo "ogmara-node: applied Docker-specific defaults: data_dir=/data, listen_addr=0.0.0.0"
 elif [ ! -r "$CONFIG_PATH" ]; then
     # Common operator footgun: bind-mount a host file owned by `root:root`
     # without making it world-readable. The container runs as user
