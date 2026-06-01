@@ -84,6 +84,15 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
             "/api/v1/network/discovery/bootstrap-candidates",
             get(routes::network_bootstrap_candidates),
         )
+        // v0.48.0 — spec 13 §10.6 / spec 03 §4.1: presence-gossip
+        // surface (off-chain service-provider discovery). All three
+        // endpoints are public; the cache is in-memory only.
+        .route("/api/v1/network/identity", get(routes::network_identity))
+        .route("/api/v1/network/presence", get(routes::network_presence))
+        .route(
+            "/api/v1/network/presence/{peer_id}",
+            get(routes::network_presence_by_peer),
+        )
         // /users/search must be registered BEFORE /users/{address} so axum
         // matches the literal segment first instead of treating "search"
         // as an address parameter.

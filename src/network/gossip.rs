@@ -27,6 +27,14 @@ pub fn topic_network(network_id: &str) -> String {
     format!("/ogmara/{}/v1/network", network_id)
 }
 
+/// Presence-gossip topic for non-anchoring service-provider discovery
+/// (spec 13 §10, l2-node 0.48.0+). The per-network prefix mirrors the
+/// existing per-network isolation rule in spec 13 §4.2 so mainnet and
+/// testnet nodes do not see each other's presence records.
+pub fn topic_presence(network_id: &str) -> String {
+    format!("/ogmara/{}/presence/v1", network_id)
+}
+
 /// Build a channel topic string.
 pub fn channel_topic(network_id: &str, channel_id: u64) -> String {
     format!("/ogmara/{}/v1/channel/{}", network_id, channel_id)
@@ -83,6 +91,16 @@ impl TopicManager {
         self.subscribe_topic(swarm, &net);
         self.subscribe_topic(swarm, &prof);
         self.subscribe_topic(swarm, &news);
+    }
+
+    /// Subscribe to the presence-gossip topic (spec 13 §10, l2-node
+    /// 0.48.0+). Called separately from `subscribe_defaults` because
+    /// participation is opt-in: only nodes with `[network.presence]
+    /// enabled = true` join the topic. Nodes that don't subscribe see
+    /// no presence traffic, period.
+    pub fn subscribe_presence(&mut self, swarm: &mut Swarm<OgmaraBehaviour>) {
+        let topic = topic_presence(&self.network_id);
+        self.subscribe_topic(swarm, &topic);
     }
 
     /// Subscribe to a channel's GossipSub topic.

@@ -350,6 +350,16 @@ pub struct AppState {
     /// to append the onion multiaddr to the desired list when the
     /// operator has opted in. Operators restart to change.
     pub tor_config: crate::config::TorConfig,
+    /// Presence-gossip manager handle (spec 13 §10, l2-node 0.48.0+).
+    /// `Some` iff `[network.presence] enabled = true` at startup;
+    /// drives the `/api/v1/network/presence*` REST surface. The
+    /// manager owns the cache + rate limiter; `AppState` holds an
+    /// `Arc` clone for read-only handler access.
+    pub presence_manager: Option<Arc<crate::network::presence::PresenceManager>>,
+    /// `[network] network_id` snapshot — used by the `/network/identity`
+    /// endpoint (spec 03 §4.1). Single string ("mainnet" / "testnet"),
+    /// cloned once at startup.
+    pub network_id: String,
 }
 
 /// Cached bootstrap-candidates response (spec 13 §4.5).
@@ -438,6 +448,8 @@ impl AppState {
             crate::network::mesh_stats::PublishFailureCounters::default(), // publish_failure_counters
             None,                                           // media_fallback — disabled in tests
             crate::config::TorConfig::default(),            // tor_config — disabled in tests
+            None,                                           // presence_manager — disabled in tests
+            "testnet".to_string(),                          // network_id — fine for tests
         )
     }
 
@@ -486,6 +498,8 @@ impl AppState {
         publish_failure_counters: crate::network::mesh_stats::PublishFailureCounters,
         media_fallback: Option<crate::api::media_fallback::MediaFallbackState>,
         tor_config: crate::config::TorConfig,
+        presence_manager: Option<Arc<crate::network::presence::PresenceManager>>,
+        network_id: String,
     ) -> Self {
         // moka LRU with size-weighted eviction. `weigher` returns the
         // byte count of each value's body (content-type string is
@@ -560,6 +574,8 @@ impl AppState {
             publish_failure_counters,
             media_fallback,
             tor_config,
+            presence_manager,
+            network_id,
         }
     }
 

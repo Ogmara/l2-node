@@ -11,6 +11,7 @@ pub mod behaviour;
 pub mod discovery;
 pub mod gossip;
 pub mod mesh_stats;
+pub mod presence;
 pub mod reconcile;
 pub mod sc_discovery;
 pub mod snapshot;
@@ -172,6 +173,44 @@ pub struct NetworkService {
     /// (e.g., the channel is genuinely silent). Cleared on process
     /// restart.
     reconcile_triggered: HashSet<u64>,
+    /// Presence-gossip manager (spec 13 §10, l2-node 0.48.0+). `Some`
+    /// iff `[network.presence] enabled = true` at startup; held in an
+    /// `Arc` so the cache + rate limiter can be shared with the REST
+    /// handlers and the background sweep task without re-spawning.
+    presence_manager: Option<Arc<presence::PresenceManager>>,
+    /// Hash of the presence topic, cached so the gossipsub Message
+    /// handler can dispatch on it without re-hashing each time. `None`
+    /// iff `presence_manager` is `None`.
+    presence_topic_hash: Option<libp2p::gossipsub::TopicHash>,
+    /// True once the self-broadcast has fired on mesh stabilization
+    /// (≥ 3 connected peers — spec 13 §10.5). One-shot per process so
+    /// the steady-state interval handles all subsequent broadcasts.
+    presence_initial_broadcast_done: bool,
+    /// Channel that carries presence-record validation outcomes from
+    /// the spawned verifier task back into the swarm event loop, where
+    /// `gossipsub.report_message_validation_result(...)` is called.
+    /// Required because `.validate_messages()` is enabled on the
+    /// gossipsub config (spec 13 §10.3) — libp2p will hold relay until
+    /// we report Accept/Reject/Ignore for each received message.
+    /// `None` iff the presence subsystem is disabled.
+    presence_validation_tx:
+        Option<tokio::sync::mpsc::UnboundedSender<PresenceValidationOutcome>>,
+    /// Drain side of the above. Held by the swarm event loop in `run`.
+    /// Wrapped in `Option` because `run` takes the receiver out at
+    /// startup; field is `None` after that.
+    presence_validation_rx:
+        Option<tokio::sync::mpsc::UnboundedReceiver<PresenceValidationOutcome>>,
+}
+
+/// Spec 13 §10.3 validation outcome carried from the spawned verifier
+/// task back to the swarm event loop. The loop translates this into a
+/// libp2p `MessageAcceptance` and reports it to gossipsub so relay is
+/// either allowed or suppressed.
+#[derive(Debug)]
+struct PresenceValidationOutcome {
+    message_id: libp2p::gossipsub::MessageId,
+    propagation_source: PeerId,
+    acceptance: libp2p::gossipsub::MessageAcceptance,
 }
 
 /// Per-pending-outbound-reconciliation state.
@@ -290,6 +329,10 @@ impl NetworkService {
         alert_event_tx: Option<crate::notifications::alerts::AlertEventSender>,
         backfill_config: crate::config::BackfillConfig,
     ) -> Result<Self> {
+        // Clone before move — the presence subsystem needs its own
+        // handle to sign outbound records. libp2p `Keypair` is cheap
+        // to clone (internally `Arc`-backed for Ed25519).
+        let keypair_for_presence = keypair.clone();
         let mut swarm = behaviour::build_swarm(config, keypair)
             .context("building libp2p swarm")?;
 
@@ -437,6 +480,37 @@ impl NetworkService {
         let mut topics = TopicManager::new(config.network_id());
         topics.subscribe_defaults(&mut swarm);
 
+        // Presence-gossip subsystem (spec 13 §10, l2-node 0.48.0+).
+        // Build the manager (parses denylist, computes self-PeerId,
+        // decides broadcast vs subscribe-only based on public_url) ONLY
+        // when the operator opted in. Disabled-by-default → zero cost
+        // for nodes that haven't opted in.
+        let (presence_manager, presence_topic_hash, presence_validation_tx, presence_validation_rx) =
+            if config.network.presence.enabled {
+                topics.subscribe_presence(&mut swarm);
+                let topic_str = gossip::topic_presence(config.network_id());
+                let topic_hash = gossip::topic_hash(&topic_str);
+                let mgr = presence::PresenceManager::new(
+                    config.network_id().to_string(),
+                    &config.network.presence,
+                    keypair_for_presence,
+                    config.api.public_url.clone(),
+                )
+                .context("constructing PresenceManager")?;
+                info!(
+                    topic = %topic_str,
+                    broadcasting = mgr.broadcasting(),
+                    "presence-gossip enabled (spec 13 §10)"
+                );
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                (Some(Arc::new(mgr)), Some(topic_hash), Some(tx), Some(rx))
+            } else {
+                // Keypair_for_presence is dropped here, freeing its Arc
+                // reference. The default-off path is zero-cost.
+                drop(keypair_for_presence);
+                (None, None, None, None)
+            };
+
         // Create message router for P2P message processing (no PoW for gossip)
         let router = MessageRouter::new(storage.clone(), identity, None);
 
@@ -483,6 +557,11 @@ impl NetworkService {
             reconcile_limits: Arc::new(reconcile::ResponderLimits::default()),
             pending_reconcile_requests: HashMap::new(),
             reconcile_triggered: HashSet::new(),
+            presence_manager,
+            presence_topic_hash,
+            presence_initial_broadcast_done: false,
+            presence_validation_tx,
+            presence_validation_rx,
         })
     }
 
@@ -520,6 +599,14 @@ impl NetworkService {
     /// Get the local peer ID.
     pub fn local_peer_id(&self) -> &PeerId {
         self.swarm.local_peer_id()
+    }
+
+    /// Return a shared handle to the presence manager — used by
+    /// `node.rs` to wire the manager into `AppState` for the
+    /// `/api/v1/network/presence*` REST handlers. `None` when
+    /// `[network.presence] enabled = false`.
+    pub fn presence_manager(&self) -> Option<Arc<presence::PresenceManager>> {
+        self.presence_manager.clone()
     }
 
     /// Subscribe to a channel's GossipSub topic.
@@ -589,6 +676,12 @@ impl NetworkService {
             "Network event loop started"
         );
 
+        // Take the presence validation-outcome receiver into the loop;
+        // `presence_validation_tx` (the Send half) stays on `self` so
+        // `handle_presence_message` can hand it to the spawned task.
+        // `None` when presence is disabled.
+        let mut presence_validation_rx = self.presence_validation_rx.take();
+
         // Dial persisted peers from previous sessions (survives restart)
         self.dial_persisted_peers();
 
@@ -612,6 +705,21 @@ impl NetworkService {
         let mut mesh_stats_interval =
             tokio::time::interval(MESH_STATS_REFRESH_INTERVAL);
         mesh_stats_interval.tick().await;
+
+        // Presence-gossip self-broadcast cadence (spec 13 §10.5).
+        // When the manager is absent (presence disabled) or non-
+        // broadcasting (no public URL), the interval still ticks but
+        // `publish_presence_self_record` exits early. Default 6h.
+        let presence_interval_secs = self
+            .presence_manager
+            .as_ref()
+            .map(|m| m.rebroadcast_interval_secs())
+            .unwrap_or(21_600);
+        let mut presence_interval =
+            tokio::time::interval(Duration::from_secs(presence_interval_secs.max(1)));
+        // Skip the immediate first tick — the initial broadcast fires
+        // on mesh stabilization, not at boot.
+        presence_interval.tick().await;
 
         loop {
             tokio::select! {
@@ -644,6 +752,9 @@ impl NetworkService {
                 _ = mesh_stats_interval.tick() => {
                     self.refresh_mesh_stats();
                 }
+                _ = presence_interval.tick() => {
+                    self.publish_presence_self_record();
+                }
                 _ = announce_interval.tick() => {
                     self.publish_node_announcement();
                 }
@@ -663,6 +774,28 @@ impl NetworkService {
                 }
                 Some(cmd) = self.snapshot_client_rx.recv() => {
                     self.handle_snapshot_client_command(cmd);
+                }
+                Some(outcome) = async {
+                    match presence_validation_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        // Disabled-presence path: park forever so this
+                        // branch is never selected. `None` from
+                        // `rx.recv()` would terminate the loop unfairly.
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    // Spec 13 §10.3: report the validation result back
+                    // to gossipsub so it forwards (Accept) or suppresses
+                    // (Reject/Ignore) the message across the mesh.
+                    let _ = self
+                        .swarm
+                        .behaviour_mut()
+                        .gossipsub
+                        .report_message_validation_result(
+                            &outcome.message_id,
+                            &outcome.propagation_source,
+                            outcome.acceptance,
+                        );
                 }
                 _ = shutdown_rx.recv() => {
                     info!("Network shutting down");
@@ -689,10 +822,46 @@ impl NetworkService {
                     bytes = message.data.len(),
                     "Received GossipSub message"
                 );
-                // Store the raw envelope bytes — full routing pipeline
-                // will be wired in via the message router
-                if let Err(e) = self.handle_gossip_message(&message.data) {
-                    warn!(error = %e, "Failed to handle gossip message");
+                // Spec 13 §10.3: presence-topic messages take a
+                // separate validation path. Other topics fall through
+                // to the standard envelope router.
+                let on_presence_topic = self
+                    .presence_topic_hash
+                    .as_ref()
+                    .map(|h| *h == message.topic)
+                    .unwrap_or(false);
+                if on_presence_topic {
+                    // The presence handler reports validation outcome
+                    // back through `presence_validation_tx` once the
+                    // async verifier finishes — DO NOT report here.
+                    self.handle_presence_message(
+                        propagation_source,
+                        message_id,
+                        message.data,
+                    );
+                } else {
+                    // Spec 13 §10.3 + v0.48.0: gossipsub is now
+                    // configured with `.validate_messages()`, so EVERY
+                    // received message must produce a validation result
+                    // or relay stalls. Non-presence topics keep the
+                    // pre-v0.48.0 router semantics (auto-accept after
+                    // local dispatch); failures are logged but don't
+                    // suppress relay since the existing routers don't
+                    // distinguish "bad envelope" from "uninteresting
+                    // envelope" granularly enough to drive a Reject.
+                    let dispatch_err = self.handle_gossip_message(&message.data).err();
+                    let _ = self
+                        .swarm
+                        .behaviour_mut()
+                        .gossipsub
+                        .report_message_validation_result(
+                            &message_id,
+                            &propagation_source,
+                            libp2p::gossipsub::MessageAcceptance::Accept,
+                        );
+                    if let Some(e) = dispatch_err {
+                        warn!(error = %e, "Failed to handle gossip message");
+                    }
                 }
             }
 
@@ -895,6 +1064,9 @@ impl NetworkService {
                     // Announce ourselves immediately so other nodes know we exist
                     self.publish_node_announcement();
                 }
+                // Spec 13 §10.5: one-shot presence broadcast on mesh
+                // stabilization (≥ 3 peers, first time this process).
+                self.maybe_publish_initial_presence();
             }
 
             SwarmEvent::ConnectionClosed {
@@ -2159,6 +2331,129 @@ impl NetworkService {
                 debug!(error = %e, "Failed to publish NodeAnnouncement (no peers yet?)");
             }
         }
+    }
+
+    /// Validate an incoming presence-gossip record (spec 13 §10.3)
+    /// and either cache + accept it, or reject so libp2p suppresses
+    /// the mesh relay AND penalizes the relay peer's gossipsub score.
+    ///
+    /// Validation is async (Ed25519 verify + cache `RwLock::write`),
+    /// so it runs on a spawned task. The task sends the outcome over
+    /// `presence_validation_tx`; the swarm event loop in [`Self::run`]
+    /// drains that channel and calls
+    /// `gossipsub.report_message_validation_result` with the
+    /// translated `MessageAcceptance`. This honours spec 13 §10.3's
+    /// "Rejected records get dropped at the gossipsub layer and are
+    /// never relayed" — the `.validate_messages()` flag set in
+    /// [`super::behaviour::build_swarm`] holds relay until our report.
+    fn handle_presence_message(
+        &mut self,
+        propagation_source: PeerId,
+        message_id: libp2p::gossipsub::MessageId,
+        data: Vec<u8>,
+    ) {
+        let Some(mgr) = self.presence_manager.clone() else {
+            // Topic-hash match but no manager — shouldn't happen
+            // because the dispatch is gated on `presence_topic_hash`
+            // which is `None` iff the manager is `None`. Drop silently.
+            return;
+        };
+        let Some(tx) = self.presence_validation_tx.clone() else {
+            // Same invariant: tx is `None` iff manager is `None`.
+            return;
+        };
+        // Track inbound bytes for parity with the standard gossip path.
+        self.counters.add_bytes_in(data.len() as u64);
+        self.counters.inc_messages_received();
+        let counters = self.counters.clone();
+        tokio::spawn(async move {
+            let acceptance = match mgr
+                .handle_gossip_message(propagation_source, &data)
+                .await
+            {
+                presence::ValidationOutcome::Accepted => {
+                    counters.inc_messages_stored();
+                    debug!(
+                        msg_id = %message_id,
+                        source = %propagation_source,
+                        "presence record accepted"
+                    );
+                    libp2p::gossipsub::MessageAcceptance::Accept
+                }
+                presence::ValidationOutcome::Rejected(err) => {
+                    counters.inc_failed_validations();
+                    debug!(
+                        msg_id = %message_id,
+                        source = %propagation_source,
+                        error = %err,
+                        "presence record rejected"
+                    );
+                    libp2p::gossipsub::MessageAcceptance::Reject
+                }
+            };
+            // Send outcome back to the swarm loop. If the receiver is
+            // gone we're shutting down — silently drop. (Unbounded
+            // channel: bound is the cap of in-flight Ed25519 verifies,
+            // which is bounded by the gossipsub mesh fanout × peer
+            // rate caps, not by us.)
+            let _ = tx.send(PresenceValidationOutcome {
+                message_id,
+                propagation_source,
+                acceptance,
+            });
+        });
+    }
+
+    /// Build and publish the local node's presence record (spec 13
+    /// §10.5). Called from the rebroadcast timer in `run` and once
+    /// when the mesh reaches ≥ 3 connected peers for the first time.
+    /// Returns silently when the manager is absent or non-broadcasting
+    /// (presence disabled or no public URL configured).
+    fn publish_presence_self_record(&mut self) {
+        let Some(mgr) = self.presence_manager.as_ref() else {
+            return;
+        };
+        if !mgr.broadcasting() {
+            return;
+        }
+        let bytes = match mgr.build_self_record() {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(error = %e, "presence: failed to build self-record");
+                return;
+            }
+        };
+        let topic = gossip::topic_presence(mgr.network_id());
+        let topic_obj = libp2p::gossipsub::IdentTopic::new(&topic);
+        match self.swarm.behaviour_mut().gossipsub.publish(topic_obj, bytes) {
+            Ok(_) => {
+                debug!(topic = %topic, "presence: published self-record");
+            }
+            Err(e) => self.report_publish_failure(&topic, &e),
+        }
+    }
+
+    /// Fire the one-shot mesh-stabilization broadcast (spec 13 §10.5)
+    /// the first time we have ≥ 3 connected peers after boot. The
+    /// steady-state publish loop in `run` handles all subsequent
+    /// broadcasts.
+    fn maybe_publish_initial_presence(&mut self) {
+        if self.presence_initial_broadcast_done {
+            return;
+        }
+        let Some(mgr) = self.presence_manager.as_ref() else {
+            return;
+        };
+        if !mgr.broadcasting() {
+            return;
+        }
+        let connected = self.swarm.connected_peers().count();
+        if connected < 3 {
+            return;
+        }
+        debug!(connected, "presence: mesh stabilized — firing initial broadcast");
+        self.presence_initial_broadcast_done = true;
+        self.publish_presence_self_record();
     }
 
     /// Handle a received GossipSub message through the full validation pipeline.

@@ -96,6 +96,14 @@ pub struct NetworkConfig {
     /// operators with regulatory-resilience requirements opt in.
     #[serde(default)]
     pub tor: TorConfig,
+    /// Presence-gossip subsystem (spec 13 §10, l2-node 0.48.0+). Off-
+    /// chain, opt-in discovery channel for service-provider operators
+    /// who want to be discoverable without committing to on-chain
+    /// anchoring economics. Default-off — participation is explicit,
+    /// mirroring `[anchoring]`. Independent of `[anchoring]` and
+    /// `[anchoring.metadata]`.
+    #[serde(default)]
+    pub presence: PresenceConfig,
 }
 
 impl Default for NetworkConfig {
@@ -109,6 +117,7 @@ impl Default for NetworkConfig {
             discovery: DiscoveryConfig::default(),
             sc_discovery: ScDiscoveryConfig::default(),
             tor: TorConfig::default(),
+            presence: PresenceConfig::default(),
         }
     }
 }
@@ -290,6 +299,70 @@ impl Default for TorConfig {
 fn default_tor_socks_proxy() -> String {
     "127.0.0.1:9050".to_string()
 }
+
+/// Presence-gossip subsystem configuration (spec 13 §10, l2-node 0.48.0+).
+///
+/// Off-chain, opt-in discovery channel. When `enabled = true` AND
+/// `[api] public_url` is non-empty, the node periodically broadcasts a
+/// signed `PresenceRecord` on the
+/// `/ogmara/{network_id}/presence/v1` gossipsub topic so other nodes
+/// and the public Network page can list this node without on-chain
+/// registration.
+///
+/// Independent of `[anchoring]` and `[anchoring.metadata]`:
+///   - presence-only: lightweight, no KLV, no anchoring duties
+///   - anchoring + metadata: full participant, on-chain trust anchor
+///   - both: belt-and-suspenders, recommended for production anchoring
+///     operators because it provides discovery resilience even if
+///     Klever RPC is briefly unreachable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PresenceConfig {
+    /// Master switch. Default `false` — participation is explicit,
+    /// mirroring `[anchoring]`. Independent of `[anchoring]`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// How long our records stay valid in peers' caches (and the cap
+    /// on how stale our cached records of OTHER nodes can be before we
+    /// drop them). 24h default; max 7 days = 604_800 (spec 13 §10.3).
+    /// Validated at config-load when `enabled = true`.
+    #[serde(default = "default_presence_record_ttl_secs")]
+    pub record_ttl_secs: u64,
+    /// How often we re-sign and re-broadcast our own record. Must be
+    /// strictly less than `record_ttl_secs / 2` so peers always have a
+    /// valid record between re-broadcasts (spec 13 §10.5). Validated
+    /// at config-load when `enabled = true`. Default 6h = 21_600.
+    #[serde(default = "default_presence_rebroadcast_interval_secs")]
+    pub rebroadcast_interval_secs: u64,
+    /// Peers whose presence records we never accept (libp2p PeerIds,
+    /// base58-encoded `12D3KooW...` strings). Useful for surgical
+    /// exclusion of known-bad operators without touching the SC
+    /// denylist. Empty default. Validated at config-load — entries
+    /// that fail to parse as a `PeerId` abort startup with a
+    /// config-fix message.
+    #[serde(default)]
+    pub denylist: Vec<String>,
+}
+
+impl Default for PresenceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            record_ttl_secs: default_presence_record_ttl_secs(),
+            rebroadcast_interval_secs: default_presence_rebroadcast_interval_secs(),
+            denylist: Vec::new(),
+        }
+    }
+}
+
+fn default_presence_record_ttl_secs() -> u64 {
+    86_400
+}
+fn default_presence_rebroadcast_interval_secs() -> u64 {
+    21_600
+}
+
+/// Upper bound on `record_ttl_secs` (7 days, per spec 13 §10.3).
+pub const PRESENCE_MAX_RECORD_TTL_SECS: u64 = 7 * 24 * 3600;
 
 /// Cross-node media-fetch fallback policy (spec 3 §media-fetch,
 /// l2-node 0.46.7+).
@@ -1771,6 +1844,75 @@ impl Config {
                 );
             }
         }
+        // Spec 13 §10 (l2-node 0.48.0+) — presence-gossip subsystem
+        // tunables. Only checked when `enabled = true` so operators
+        // who leave the block untouched / disabled never hit these
+        // gates.
+        if self.network.presence.enabled {
+            // Hard ceiling on record TTL (spec 13 §10.3: max 7 days).
+            // A larger value would cause peers to keep stale records
+            // indefinitely; the topic-validation hook rejects incoming
+            // records that exceed the cap, so a self-configured TTL
+            // above the cap would also produce records that our own
+            // peers would refuse to relay.
+            if self.network.presence.record_ttl_secs == 0 {
+                anyhow::bail!(
+                    "network.presence.record_ttl_secs must be > 0 when \
+                     enabled (default 86400 = 24h)"
+                );
+            }
+            if self.network.presence.record_ttl_secs > PRESENCE_MAX_RECORD_TTL_SECS {
+                anyhow::bail!(
+                    "network.presence.record_ttl_secs = {} exceeds the \
+                     spec 13 §10.3 maximum of {} seconds (7 days). Reduce \
+                     record_ttl_secs to {} or less.",
+                    self.network.presence.record_ttl_secs,
+                    PRESENCE_MAX_RECORD_TTL_SECS,
+                    PRESENCE_MAX_RECORD_TTL_SECS,
+                );
+            }
+            // Re-broadcast cadence must be strictly less than
+            // `record_ttl_secs / 2` so peers always hold a valid record
+            // between re-broadcasts (spec 13 §10.5). Zero would hot-spin
+            // the publish loop.
+            if self.network.presence.rebroadcast_interval_secs == 0 {
+                anyhow::bail!(
+                    "network.presence.rebroadcast_interval_secs must be > 0 \
+                     when enabled (default 21600 = 6h)"
+                );
+            }
+            let half_ttl = self.network.presence.record_ttl_secs / 2;
+            if self.network.presence.rebroadcast_interval_secs >= half_ttl {
+                anyhow::bail!(
+                    "network.presence.rebroadcast_interval_secs = {} must be \
+                     strictly less than network.presence.record_ttl_secs / 2 \
+                     ({}). Either lower rebroadcast_interval_secs or raise \
+                     record_ttl_secs so peers always hold a valid record \
+                     between re-broadcasts (spec 13 §10.5).",
+                    self.network.presence.rebroadcast_interval_secs,
+                    half_ttl,
+                );
+            }
+            // Denylist entries must parse as libp2p PeerIds. Silent
+            // dropping would let an operator typo a PeerId and never
+            // notice that the bad operator's records still get cached.
+            for (idx, entry) in self.network.presence.denylist.iter().enumerate() {
+                if entry.trim().is_empty() {
+                    anyhow::bail!(
+                        "network.presence.denylist[{}] is empty — remove or \
+                         replace with a valid libp2p PeerId (base58)",
+                        idx,
+                    );
+                }
+                entry.parse::<libp2p::PeerId>().with_context(|| {
+                    format!(
+                        "network.presence.denylist[{}] = {:?} must be a \
+                         valid libp2p PeerId (base58, e.g. \"12D3KooW...\")",
+                        idx, entry,
+                    )
+                })?;
+            }
+        }
         if self.network.listen_port == 0 {
             anyhow::bail!("network.listen_port must be > 0");
         }
@@ -2001,6 +2143,36 @@ retry_interval_secs = 60
 # PERSISTS up to 256 peers (matches PEER_DIRECTORY cap); this knob
 # caps the immediate dial set so a fresh node doesn't burst-connect.
 max_candidates = 5
+
+[network.presence]
+# Off-chain presence-gossip subsystem (spec 13 §10, l2-node 0.48.0+).
+#
+# When `enabled = true` AND [api] public_url is non-empty, the node
+# broadcasts a signed PresenceRecord on the
+# /ogmara/{network_id}/presence/v1 gossipsub topic so other nodes and
+# the public Network page can list this node as a service provider
+# WITHOUT on-chain registration. Independent of [anchoring] —
+# operators may participate in presence gossip alone, in SC anchoring
+# alone, or in both (the recommended production configuration for
+# anchoring operators).
+#
+# Default off — participation is explicit, mirroring [anchoring].
+enabled = false
+# How long our records stay valid in peers' caches (and the cap on
+# how stale our cached records of OTHER nodes can be before we drop
+# them). Default 24h; max 7 days (604_800). Validated at startup.
+record_ttl_secs = 86400
+# How often we re-sign and re-broadcast our own record. Must be
+# strictly less than record_ttl_secs / 2 so peers always have a valid
+# record between re-broadcasts. Validated at startup — invalid values
+# abort with a config-fix message.
+rebroadcast_interval_secs = 21600
+# Peers whose presence records we never accept (libp2p PeerIds).
+# Useful for surgical exclusion of known-bad operators without
+# touching the SC denylist. Empty default. Each entry must parse as a
+# base58-encoded libp2p PeerId (e.g. "12D3KooW..."); malformed entries
+# abort startup.
+denylist = []
 
 [klever]
 node_url = ""

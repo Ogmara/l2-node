@@ -75,6 +75,36 @@ retry_interval_secs = 60
 # caps the immediate dial set so a fresh node doesn't burst-connect.
 max_candidates = 5
 
+[network.presence]
+# Off-chain presence-gossip subsystem (spec 13 §10, l2-node 0.48.0+).
+#
+# When `enabled = true` AND [api] public_url is non-empty, the node
+# broadcasts a signed PresenceRecord on the
+# /ogmara/{network_id}/presence/v1 gossipsub topic so other nodes and
+# the public Network page can list this node as a service provider
+# WITHOUT on-chain registration. Independent of [anchoring] —
+# operators may participate in presence gossip alone, in SC anchoring
+# alone, or in both (the recommended production configuration for
+# anchoring operators).
+#
+# Default off — participation is explicit, mirroring [anchoring].
+enabled = false
+# How long our records stay valid in peers' caches (and the cap on
+# how stale our cached records of OTHER nodes can be before we drop
+# them). Default 24h; max 7 days (604_800). Validated at startup.
+record_ttl_secs = 86400
+# How often we re-sign and re-broadcast our own record. Must be
+# strictly less than record_ttl_secs / 2 so peers always have a valid
+# record between re-broadcasts. Validated at startup — invalid values
+# abort with a config-fix message.
+rebroadcast_interval_secs = 21600
+# Peers whose presence records we never accept (libp2p PeerIds).
+# Useful for surgical exclusion of known-bad operators without
+# touching the SC denylist. Empty default. Each entry must parse as a
+# base58-encoded libp2p PeerId (e.g. "12D3KooW..."); malformed entries
+# abort startup.
+denylist = []
+
 [klever]
 node_url = ""
 api_url = ""
