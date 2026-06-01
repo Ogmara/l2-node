@@ -5,6 +5,36 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.47.2] - 2026-06-01
+
+Docker UX fix surfaced by a fresh-server walkthrough on 2026-06-01.
+The auto-generate entrypoint shipped in v0.46.1+ wrote the
+SOURCE-BUILD defaults straight into the container's config, which
+caused two crash-loops + one silent-failure for any operator
+following the Docker tutorial verbatim:
+
+### Fixed
+
+- **Entrypoint now rewrites `data_dir` and `listen_addr` for the
+  Docker container layout** after `ogmara-node init`. The init
+  writer emits the source-build defaults `data_dir = "./data"`
+  (relative to the WORKDIR; resolves to `/data/data` inside the
+  container with WORKDIR=/data) and `listen_addr = "127.0.0.1"`
+  (binds the API to the container's loopback only). For Docker
+  the analogous values are `data_dir = "/data"` (matches the
+  `-v .../data:/data` mount the operator set up; no nested
+  subdirectory) and `listen_addr = "0.0.0.0"` (inside the
+  container — the netns isolates it, but the API needs to bind on
+  the bridge interface for Docker's `-p 41721:41721` forward to
+  actually deliver packets). Without these rewrites the container
+  crash-loops on first start with `Permission denied (os error
+  13)` creating `/data/data`, and even after that's worked around
+  the host-side API endpoint silently returns nothing.
+
+  The rewrites only happen when the entrypoint is creating a
+  brand-new config; existing operator-edited configs are never
+  touched.
+
 ## [0.47.1] - 2026-05-31
 
 Bug-fix release for two issues exposed during the v0.46.5–v0.47.0
