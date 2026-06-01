@@ -5,6 +5,132 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.48.0] - 2026-06-01
+
+Off-chain presence-gossip subsystem (spec 13 §10, planning doc
+`docs/planning/presence-gossip-plan.md`). Lets service-provider
+operators advertise their public REST endpoint, libp2p PeerId, and
+node version on a new gossipsub topic **without** committing to the
+on-chain anchoring economics of spec 12. The subsystem is opt-in and
+default-off — operators flip `[network.presence] enabled = true` to
+participate. The Network-page consumer side (spec 9 §10.8) lands in
+the website repo separately.
+
+### Added
+
+- **`src/network/presence.rs`** — new module implementing the
+  `PresenceRecord` wire schema, Ed25519 sign/verify (libp2p key,
+  `rmp_serde::to_vec_named` canonical encoding), the topic-validation
+  pipeline (signature + timestamp window + TTL ceiling + URL format
+  + denylist + per-peer rate limit), the in-memory `PresenceCache`
+  (cap 4096, oldest-10 %-by-`last_heard` eviction on overflow,
+  background TTL sweep every 5 min), and the `PresenceManager` that
+  owns the cache + rate limiter + self-broadcast keypair.
+- **`src/network/gossip.rs` `topic_presence` + `subscribe_presence`**
+  helpers — build the per-network presence topic string
+  (`/ogmara/{network_id}/presence/v1`) and subscribe to it on the
+  gossipsub mesh.
+- **`src/network/behaviour.rs`** integration — the gossipsub config
+  now enables `.validate_messages()` so libp2p defers mesh relay
+  until each topic-handler reports an outcome. Validation for the
+  presence topic runs in `src/network/mod.rs::handle_presence_message`
+  on a spawned task; the outcome (Accept / Reject / Ignore) is
+  routed back to the swarm event loop via an unbounded mpsc and
+  delivered to gossipsub via `report_message_validation_result(...)`.
+  Non-presence topic handlers (existing channel-message, news,
+  profile, network) immediately report `Accept` after dispatch so
+  relay isn't held back; they keep the pre-v0.48.0 propagation
+  semantics. This satisfies spec 13 §10.3's "Rejected records get
+  dropped at the gossipsub layer and are never relayed" guarantee.
+- **`src/network/mod.rs`** self-broadcast wiring — a tokio interval
+  (`rebroadcast_interval_secs`, default 6h) re-signs and republishes
+  the local record; a one-shot mesh-stabilization broadcast fires
+  the first time ≥ 3 peers are connected after boot (spec 13 §10.5).
+- **`[network.presence]` config block** — `enabled`, `record_ttl_secs`,
+  `rebroadcast_interval_secs`, `denylist`. Validated at config-load:
+  `record_ttl_secs` must be ≤ 7 days, `rebroadcast_interval_secs`
+  must be < `record_ttl_secs / 2`, and each denylist entry must
+  parse as a libp2p PeerId. Invalid values abort startup with a
+  config-fix message.
+- **REST endpoints (public, no auth)**:
+  - `GET /api/v1/network/identity` — lightweight self-description
+    (`peer_id`, `network_id`, `version`, `public_url`,
+    `presence_broadcasting`). Designed as the consumer-side
+    Reachable-probe target (spec 13 §10.9).
+  - `GET /api/v1/network/presence` — all cached records ranked by
+    `last_heard` desc, with `verified_on_chain` set from the local
+    bootstrap-candidates SC view. Returns an empty `records` array
+    on nodes with presence disabled.
+  - `GET /api/v1/network/presence/:peer_id` — single record lookup,
+    404 on miss.
+- **`ogmara.example.toml`** — annotated `[network.presence]` block
+  matching the source-of-truth in `Config::default_toml()`.
+
+### Security
+
+- Topic-validation pipeline (spec 13 §10.3) rejects malformed
+  records at the gossipsub layer and **suppresses mesh relay** of
+  failed records via `MessageAcceptance::Reject`. Validations: bad
+  Ed25519 signature, timestamps outside `(now - 1h, now + 5min)`,
+  TTLs over 7 days, `http://` non-onion URLs (downgrade-poisoning
+  defence), non-semver version strings, denylisted PeerIds, and
+  records from a PeerId exceeding 1 record/minute. Rejected
+  records additionally cost the relay peer a gossipsub score
+  penalty (P₄), discouraging repeat fanout from compromised nodes.
+- **Cost-ordered validation** (Security Audit W1, v0.48.0). Cheap
+  checks (envelope size, msgpack decode, peer-id parse, denylist
+  lookup, non-mutating rate-limit `peek`) run BEFORE the ~50 µs
+  Ed25519 signature verify. An attacker who owns a single valid
+  signing key can no longer force the node to burn CPU at
+  sig-verify rate just by spamming — the `peek` short-circuits
+  every request beyond their per-peer budget.
+- **Envelope-size guard** (Security Audit W4, v0.48.0). Every
+  incoming presence message is rejected with `EnvelopeTooLarge`
+  before msgpack decode if it exceeds 8 KB. The gossipsub
+  topic-wide `max_transmit_size` is 256 KB; a 256 KB record padded
+  with valid-msgpack garbage would otherwise force a full decode +
+  signature verify before field-level rejection. Real records sit
+  well under 4 KB.
+- **Rate-limiter soft cap** (Security Audit W2, v0.48.0). The
+  per-peer `(PeerId → last_heard)` map is bounded to 16 384
+  entries between prunes; new PeerIds are refused once the cap is
+  hit. A Sybil flood with millions of unique PeerIds can no
+  longer grow the map without bound during the 5-minute prune
+  cadence. Existing peers can still refresh their slots.
+- Cache cap (4 096 records, oldest-by-`last_heard` evict-10 %-on-
+  overflow) bounds memory under a Sybil flood; legitimate records
+  re-broadcast every 6 h so they sort younger-than-attacker on the
+  next round of evictions.
+- Operator-configurable denylist surface (`[network.presence]
+  denylist`) for surgical PeerId exclusion without touching the
+  on-chain SC denylist.
+- Ed25519 signature is verified against the public key embedded in
+  `PresenceRecord.peer_id` via libp2p's content-addressed PeerId
+  (every Ogmara node uses an Ed25519 key, which fits libp2p's
+  42-byte inline-hash cap). Records claiming a `peer_id` whose
+  hash type is not the inline-protobuf identity code are rejected
+  with `UnsupportedPeerIdHash`.
+
+### Fixed (pre-release audit findings)
+
+- **`/api/v1/network/identity` `peer_id` taxonomy** — when presence
+  is disabled the fallback `peer_id` field is now the local libp2p
+  PeerId (`12D3KooW...`, sourced from `swarm.local_peer_id()` via
+  the existing `AppState::network_peer_id`), NOT the L2 anchorer
+  `node_id` (sha256-truncated Klever pubkey hash). Same fix
+  applied to the `self_peer_id` in `/api/v1/network/presence`'s
+  disabled-state response. Without this, reachability-probe
+  clients trying to verify gossip claims would always see a
+  PeerId-shaped mismatch on presence-disabled nodes. Spec 03
+  §4.1 / spec 13 §10.6.
+
+### References
+
+- Spec 13 §10: <https://github.com/Ogmara/ogmara/blob/main/docs/specs/13-node-discovery.md#10-presence-gossip-layer>
+- Spec 03 §3.8 + §4.1: <https://github.com/Ogmara/ogmara/blob/main/docs/specs/03-l2-node.md#38-presence-gossip-subsystem-l2-node-0480>
+- Planning doc: `docs/planning/presence-gossip-plan.md` (Ogmara
+  planning hub repo).
+
 ## [0.47.3] - 2026-06-01
 
 Admin-auth localhost-bypass fix for Docker reverse-proxy

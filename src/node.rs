@@ -325,10 +325,27 @@ impl Node {
         .context("starting network service")?;
 
         let network_peer_id = network.local_peer_id().to_string();
+        // Capture a shared handle to the presence manager before
+        // `network` is moved into the spawn (spec 13 §10, l2-node
+        // 0.48.0+). `None` when `[network.presence] enabled = false`.
+        // The handle is cloned into AppState so the REST handlers can
+        // serve the cache; the manager's background sweep runs as a
+        // separate task below.
+        let presence_manager_handle = network.presence_manager();
         info!(
             peer_id = %network_peer_id,
             "Network service started"
         );
+
+        // Spawn the presence-cache TTL sweep task (spec 13 §10.4).
+        // Only when the operator opted in.
+        if let Some(ref mgr) = presence_manager_handle {
+            let sweep_mgr = mgr.clone();
+            let sweep_shutdown_rx = self.shutdown_rx();
+            tokio::spawn(async move {
+                sweep_mgr.run_sweep(sweep_shutdown_rx).await;
+            });
+        }
 
         // Channel for chain scanner → network layer topic subscriptions
         let (channel_tx, channel_rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
@@ -1066,6 +1083,13 @@ impl Node {
             // append the onion multiaddr to the desired list when
             // `advertise_onion_in_metadata = true`.
             self.config.network.tor.clone(),
+            // Spec 13 §10 — presence-gossip manager handle. `Some`
+            // iff `[network.presence] enabled = true`. Drives the
+            // `/api/v1/network/presence*` REST surface.
+            presence_manager_handle.clone(),
+            // [network] network_id snapshot — exposed via
+            // /api/v1/network/identity (spec 03 §4.1).
+            self.config.network_id().to_string(),
         ));
         // Background sweep: drop zero-counter entries from the per-IP
         // media limiter (v0.41). Without this, the DashMap accumulates

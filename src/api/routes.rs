@@ -5306,6 +5306,208 @@ pub struct KeyParams {
     pub epoch: Option<u64>,
 }
 
+// --- Presence-gossip REST surface (spec 03 §4.1, spec 13 §10.6) -----
+//
+// All three endpoints are public + read-only. Handlers consult
+// `AppState.presence_manager`:
+//   - `None`         → presence disabled — `/network/presence` returns
+//                      an empty body (per spec 03 §4.1), the per-peer
+//                      lookup returns 404, `/network/identity` reports
+//                      `presence_broadcasting: false`.
+//   - `Some(mgr)`    → serve cache snapshots, enriched with the
+//                      SC-source `verified_on_chain` flag from the
+//                      bootstrap-candidates cache when populated.
+
+/// JSON row for `/network/presence` and `/network/presence/{peer_id}`.
+#[derive(Serialize)]
+struct PresenceRecordJson {
+    peer_id: String,
+    public_url: Option<String>,
+    version: String,
+    timestamp: u64,
+    ttl_secs: u32,
+    first_heard: u64,
+    last_heard: u64,
+    expires_at: u64,
+    verified_on_chain: bool,
+    anchored: bool,
+    last_anchor_at: Option<u64>,
+}
+
+/// Build a single response row from a cached record. The SC-enrichment
+/// fields (`verified_on_chain`, `anchored`, `last_anchor_at`) are
+/// computed at response time by consulting the SC-set produced by the
+/// bootstrap-candidates handler. The set is a snapshot of PeerIds that
+/// the local node has observed on-chain in the last bootstrap-
+/// candidates refresh; richer per-anchor data (`anchored`,
+/// `last_anchor_at`) is currently not surfaced and reports `false /
+/// None` — Phase 2 will wire a per-PeerId index once the
+/// `network/nodes` consolidation lands.
+fn presence_row_from_cached(
+    cached: &crate::network::presence::CachedPresenceRecord,
+    now_unix: u64,
+    sc_known_peer_ids: &std::collections::HashSet<String>,
+) -> PresenceRecordJson {
+    // Approximate `first_heard` / `last_heard` wall-clock unix by
+    // computing the deltas from `Instant::now` — the cache stores
+    // `Instant`s (monotonic, can't be wall-clock-converted directly),
+    // so we map `Instant -> SystemTime` by computing the elapsed
+    // duration and subtracting from `now_unix`. Worst-case skew is the
+    // function-call latency (microseconds); the response timestamp
+    // resolution is seconds, so the skew rounds out.
+    let now_inst = std::time::Instant::now();
+    let first_secs_ago = now_inst.duration_since(cached.first_heard).as_secs();
+    let last_secs_ago = now_inst.duration_since(cached.last_heard).as_secs();
+    let first_heard = now_unix.saturating_sub(first_secs_ago);
+    let last_heard = now_unix.saturating_sub(last_secs_ago);
+    let verified_on_chain = sc_known_peer_ids.contains(&cached.record.peer_id);
+    PresenceRecordJson {
+        peer_id: cached.record.peer_id.clone(),
+        public_url: cached.record.public_url.clone(),
+        version: cached.record.version.clone(),
+        timestamp: cached.record.timestamp,
+        ttl_secs: cached.record.ttl_secs,
+        first_heard,
+        last_heard,
+        expires_at: cached.record.expires_at(),
+        verified_on_chain,
+        anchored: false,        // Phase 2 — see fn doc above.
+        last_anchor_at: None,   // Phase 2 — see fn doc above.
+    }
+}
+
+/// Snapshot of PeerIds that appear in the local `bootstrap_candidates_cache`.
+/// Used to mark presence rows as `verified_on_chain: true` when the
+/// gossip-discovered PeerId also appears in the SC-derived discovery
+/// view (spec 03 §4.1). Returns an empty set if the cache is empty,
+/// disabled (isolated-subnet mode), or hasn't refreshed yet.
+async fn collect_sc_peer_ids(
+    state: &std::sync::Arc<AppState>,
+) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    let read = state.bootstrap_candidates_cache.read().await;
+    let Some(cached) = read.as_ref() else {
+        return out;
+    };
+    if let Some(arr) = cached.payload.get("candidates").and_then(|v| v.as_array()) {
+        for c in arr {
+            if let Some(pid) = c.get("peer_id").and_then(|v| v.as_str()) {
+                out.insert(pid.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// GET /api/v1/network/identity
+///
+/// Lightweight self-description for consumer-side reachability probes
+/// (spec 13 §10.9). The public Network page and SDK fetch this to
+/// verify that a `public_url` advertised via presence gossip resolves
+/// to the same `peer_id` that signed the gossip record.
+pub async fn network_identity(
+    Extension(state): Extension<std::sync::Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let broadcasting = state
+        .presence_manager
+        .as_ref()
+        .map(|m| m.broadcasting())
+        .unwrap_or(false);
+    // Spec 03 §4.1 / spec 13 §10.6: `peer_id` is the libp2p PeerId
+    // (12D3KooW...), NOT the L2 anchorer `node_id` (sha256-truncated
+    // Klever pubkey hash). Use the manager's view when broadcasting
+    // (cheaper — it's already cached as a string), otherwise fall back
+    // to `state.network_peer_id`, which the network layer wrote at
+    // startup from `swarm.local_peer_id()`. The two are equal by
+    // construction; the manager-first path keeps the hot path free of
+    // an extra `.clone()` when presence is enabled.
+    let peer_id = state
+        .presence_manager
+        .as_ref()
+        .map(|m| m.self_peer_id().to_string())
+        .unwrap_or_else(|| state.network_peer_id.clone());
+    Json(serde_json::json!({
+        "peer_id": peer_id,
+        "network_id": state.network_id,
+        "version": env!("CARGO_PKG_VERSION"),
+        "public_url": state.public_url,
+        "presence_broadcasting": broadcasting,
+    }))
+}
+
+/// GET /api/v1/network/presence
+///
+/// Returns all cached presence records ranked by `last_heard` desc,
+/// with SC-source enrichment. When presence is disabled returns an
+/// empty `records` array (spec 03 §4.1).
+pub async fn network_presence(
+    Extension(state): Extension<std::sync::Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let now_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let Some(mgr) = state.presence_manager.clone() else {
+        // Disabled-presence response shape per spec 03 §4.1. The
+        // `self_peer_id` is the local libp2p PeerId — NOT the L2
+        // anchorer `node_id`. See `network_identity` for the same
+        // taxonomy fix.
+        return Json(serde_json::json!({
+            "self_peer_id": state.network_peer_id,
+            "broadcasting": false,
+            "cache_size": 0,
+            "cache_cap": crate::network::presence::PRESENCE_CACHE_CAP,
+            "records": Vec::<serde_json::Value>::new(),
+        }));
+    };
+    let sc_peer_ids = collect_sc_peer_ids(&state).await;
+    let cache = mgr.cache();
+    let mut rows: Vec<crate::network::presence::CachedPresenceRecord> = cache.snapshot().await;
+    // Rank by `last_heard` descending.
+    rows.sort_by_key(|c| std::cmp::Reverse(c.last_heard));
+    let records: Vec<PresenceRecordJson> = rows
+        .iter()
+        .map(|c| presence_row_from_cached(c, now_unix, &sc_peer_ids))
+        .collect();
+    Json(serde_json::json!({
+        "self_peer_id": mgr.self_peer_id(),
+        "broadcasting": mgr.broadcasting(),
+        "cache_size": records.len(),
+        "cache_cap": crate::network::presence::PRESENCE_CACHE_CAP,
+        "records": records,
+    }))
+}
+
+/// GET /api/v1/network/presence/:peer_id
+///
+/// Single presence record by libp2p PeerId. 404 if not in cache or
+/// presence is disabled.
+pub async fn network_presence_by_peer(
+    Extension(state): Extension<std::sync::Arc<AppState>>,
+    Path(peer_id_str): Path<String>,
+) -> axum::response::Response {
+    let Some(mgr) = state.presence_manager.clone() else {
+        return (StatusCode::NOT_FOUND, "presence not enabled").into_response();
+    };
+    let peer_id: libp2p::PeerId = match peer_id_str.parse() {
+        Ok(p) => p,
+        Err(_) => {
+            return (StatusCode::BAD_REQUEST, "invalid peer_id").into_response();
+        }
+    };
+    let cache = mgr.cache();
+    let Some(row) = cache.get(&peer_id).await else {
+        return (StatusCode::NOT_FOUND, "peer_id not in presence cache").into_response();
+    };
+    let now_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let sc_peer_ids = collect_sc_peer_ids(&state).await;
+    let json = presence_row_from_cached(&row, now_unix, &sc_peer_ids);
+    Json(json).into_response()
+}
+
 #[cfg(test)]
 mod media_tests {
     use super::{detect_content_type, parse_byte_range};

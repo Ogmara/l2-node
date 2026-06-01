@@ -70,6 +70,17 @@ pub fn build_swarm(config: &Config, keypair: Keypair) -> Result<Swarm<OgmaraBeha
         .mesh_n_low(1)             // form mesh with as few as 1 peer (default: 5)
         .mesh_n_high(6)            // cap at 6 (default: 12)
         .mesh_outbound_min(1)      // at least 1 outbound mesh peer (default: 2)
+        // Spec 13 §10.3 + v0.48.0: defer relay until each topic's
+        // handler reports a validation outcome. Without this flag,
+        // gossipsub auto-relays every well-formed envelope before
+        // payload validation runs, allowing bad presence records to
+        // reach every mesh peer one hop before rejection. With the
+        // flag enabled, ALL topic handlers MUST call
+        // `gossipsub.report_message_validation_result(msg_id, source,
+        // MessageAcceptance::{Accept,Reject,Ignore})` for every
+        // received message — see `NetworkService::run` and
+        // `handle_swarm_event` in mod.rs.
+        .validate_messages()
         .build()
         .map_err(|e| anyhow::anyhow!("gossipsub config error: {}", e))?;
 
