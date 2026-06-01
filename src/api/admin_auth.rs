@@ -22,6 +22,7 @@ use tracing::{debug, warn};
 
 use crate::crypto;
 use crate::crypto::signing;
+use crate::trusted_proxies::TrustedProxies;
 
 use super::state::AppState;
 
@@ -62,11 +63,23 @@ pub struct AdminAuthState {
     session_ttl_hours: u64,
     /// Node ID (included in challenge message).
     node_id: String,
+    /// Trusted reverse-proxy peer set. A request whose TCP peer IP is
+    /// loopback OR is in this set is allowed to relay client identity
+    /// via `X-Forwarded-For`. Without this the Docker bridge gateway
+    /// (e.g. 172.17.0.1) would fail the loopback check, breaking
+    /// localhost-bypass for operators reverse-proxying through Docker
+    /// even when Apache/nginx is on the host.
+    trusted_proxies: Arc<TrustedProxies>,
 }
 
 impl AdminAuthState {
     /// Create a new auth state with a random HMAC secret.
-    pub fn new(admin_wallets: Vec<String>, session_ttl_hours: u64, node_id: String) -> Self {
+    pub fn new(
+        admin_wallets: Vec<String>,
+        session_ttl_hours: u64,
+        node_id: String,
+        trusted_proxies: Arc<TrustedProxies>,
+    ) -> Self {
         let mut hmac_secret = [0u8; 32];
         use rand::RngCore;
         rand::thread_rng().fill_bytes(&mut hmac_secret);
@@ -77,6 +90,7 @@ impl AdminAuthState {
             admin_wallets,
             session_ttl_hours,
             node_id,
+            trusted_proxies,
         }
     }
 
@@ -348,19 +362,28 @@ pub async fn auth_logout() -> impl IntoResponse {
 /// session token (for remote access via admin_wallets).
 ///
 /// Supports `X-Forwarded-For` header for reverse proxy deployments (Apache, nginx).
-/// When behind a proxy, the TCP peer is always 127.0.0.1 — this header reveals the
-/// real client IP so the localhost bypass only applies to actual local access.
+/// When the TCP peer is loopback OR is in `[api] trusted_proxies` CIDRs, the
+/// header is consulted to find the real client IP. Otherwise it's ignored.
+///
+/// The trusted_proxies branch matters for Docker deployments: a host-side
+/// Apache/nginx connects to `127.0.0.1:41721` (the Docker port forward),
+/// which inside the container arrives from the Docker bridge gateway
+/// (typically `172.17.0.1`) — NOT loopback. Adding the bridge to
+/// `[api] trusted_proxies = ["172.17.0.0/16"]` re-enables the
+/// localhost-bypass for this topology.
 pub async fn admin_auth_middleware(
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Extension(auth_state): Extension<Arc<AdminAuthState>>,
     req: Request,
     next: Next,
 ) -> Response {
-    // Determine real client IP: X-Forwarded-For (first entry) if present, else TCP peer.
-    // Only trust X-Forwarded-For when the TCP peer is loopback (i.e., request came from
-    // a local reverse proxy). If TCP peer is remote, ignore the header (could be spoofed).
-    let real_ip_is_loopback = if addr.ip().is_loopback() {
-        // Check if a reverse proxy forwarded this from a remote client
+    let peer_ip = addr.ip();
+    let peer_is_trusted = peer_ip.is_loopback() || auth_state.trusted_proxies.contains(peer_ip);
+
+    // Determine real client IP. If the peer is a trusted proxy (or loopback),
+    // consult X-Forwarded-For for the real client IP. Otherwise the peer IS
+    // the client — ignore the header (could be spoofed).
+    let real_ip_is_loopback = if peer_is_trusted {
         match req.headers().get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
             Some(forwarded) => {
                 // X-Forwarded-For: client, proxy1, proxy2 — first entry is the original client
@@ -370,7 +393,7 @@ pub async fn admin_auth_middleware(
                     Err(_) => false, // unparseable → treat as remote (require auth)
                 }
             }
-            None => true, // No proxy header, TCP peer is loopback → genuine localhost
+            None => peer_ip.is_loopback(), // No header → only true loopback bypasses
         }
     } else {
         false

@@ -5,6 +5,42 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.47.3] - 2026-06-01
+
+Admin-auth localhost-bypass fix for Docker reverse-proxy
+deployments. Surfaced by the same 2026-06-01 fresh-server
+walkthrough that produced v0.47.2.
+
+### Fixed
+
+- **`admin_auth_middleware` now consults `[api] trusted_proxies`.**
+  Previously the middleware only checked `addr.ip().is_loopback()`
+  before trusting `X-Forwarded-For`. That worked for source builds
+  (Apache talks to `127.0.0.1:41721` on the host, the node sees a
+  loopback peer) but failed for Docker deployments — Apache on the
+  host talks to `127.0.0.1:41721`, the Docker port forward delivers
+  to the container's `eth0`, and inside the container the peer IP
+  is the Docker bridge gateway (typically `172.17.0.1`), NOT
+  loopback. The bypass branch was skipped, so even with valid
+  `X-Forwarded-For: 127.0.0.1` from a same-host proxy, requests
+  from the host's reverse proxy required full wallet auth instead
+  of getting the localhost bypass.
+
+  The rest of the codebase (rate limiting, media handlers) already
+  consults `TrustedProxies` for the same reason. The admin auth
+  middleware now does the same: `peer_is_trusted = is_loopback() ||
+  trusted_proxies.contains(peer_ip)`. Adding `trusted_proxies =
+  ["172.17.0.0/16"]` to the config restores localhost-bypass for
+  Docker operators who want it (note: this remains *opt-in* —
+  the empty default preserves the v0.47.2 behaviour of "remote-only
+  for Docker reverse proxies").
+
+### Changed
+
+- `AdminAuthState::new()` signature now takes `Arc<TrustedProxies>`
+  as its fourth argument. Only one call site (`api/mod.rs:237`),
+  updated in lockstep.
+
 ## [0.47.2] - 2026-06-01
 
 Docker UX fix surfaced by a fresh-server walkthrough on 2026-06-01.

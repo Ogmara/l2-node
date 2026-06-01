@@ -233,11 +233,15 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
         .route("/api/v1/ws", get(websocket::ws_authenticated))
         .route("/api/v1/ws/public", get(websocket::ws_public));
 
-    // Admin auth state (shared between middleware and auth endpoints)
+    // Admin auth state (shared between middleware and auth endpoints).
+    // Passes app_state.trusted_proxies so the localhost-bypass works when
+    // operators reverse-proxy through Docker (peer IP = bridge gateway,
+    // not loopback). See admin_auth_middleware doc.
     let admin_auth_state = std::sync::Arc::new(admin_auth::AdminAuthState::new(
         config.api.admin.admin_wallets.clone(),
         config.api.admin.session_ttl_hours,
         app_state.node_id.clone(),
+        app_state.trusted_proxies.clone(),
     ));
 
     // Admin routes (localhost + wallet auth via middleware)
