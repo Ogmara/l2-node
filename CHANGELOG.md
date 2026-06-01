@@ -25,6 +25,19 @@ with another node it had a stale PEER_DIRECTORY row for.
   overwrite + mark for reconnect; missing = fresh insert subject
   to the cap. The cap is only enforced on fresh inserts (updates
   do not grow the set).
+- **Docker image now ships the auto-generate entrypoint.**
+  `.dockerignore` was excluding the entire `scripts/` directory,
+  silently preventing the Dockerfile's
+  `COPY scripts/docker-entrypoint.sh` from succeeding since
+  v0.46.1. Result: the published `l2-node-latest` image still had
+  `ENTRYPOINT ["ogmara-node"]` and crash-looped on first start with
+  "no config file" — operators following the docs to `docker cp`
+  the auto-generated config out hit "Could not find the file
+  /etc/ogmara/ogmara.toml in container". Fix: `.dockerignore` now
+  excludes only the operator-side helpers under `scripts/` and
+  keeps `scripts/docker-entrypoint.sh` in the build context. The
+  rebuilt `l2-node-0.47.1` and `l2-node-latest` images now
+  auto-generate the default config on first start as documented.
 
 ### Added
 
