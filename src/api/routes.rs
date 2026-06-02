@@ -444,6 +444,15 @@ pub struct StatsResponse {
 #[derive(Serialize)]
 struct NodeEntry {
     node_id: String,
+    /// libp2p PeerId (`12D3KooW...`) in base58. Populated for the
+    /// local node (always) and for currently-connected discovered
+    /// peers (from `ConnectedPeerInfo.peer_id`, set at Identify
+    /// time). `None` for peers known only via cached PEER_DIRECTORY
+    /// announcements where the libp2p binding isn't currently held.
+    /// Consumers (website, SDK) use this to dedup against gossip
+    /// records that key by libp2p PeerId rather than Ogmara node_id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    peer_id: Option<String>,
     api_endpoint: Option<String>,
     channels: Vec<u64>,
     user_count: u32,
@@ -542,8 +551,20 @@ pub async fn network_nodes(
         .unwrap_or_default()
         .as_millis() as u64;
 
+    // Build a node_id → libp2p peer_id lookup from the currently-
+    // connected peers map. This binding is known at Identify time
+    // (see network/mod.rs); we use it to attach a `peer_id` to each
+    // NodeEntry so consumers can dedup against presence-gossip rows
+    // (which key by libp2p PeerId). PEER_DIRECTORY entries whose
+    // peer is not currently connected get `peer_id: None`.
+    let peer_id_by_node_id: std::collections::HashMap<String, String> =
+        state.connected_peers.read()
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.peer_id.clone())).collect())
+            .unwrap_or_default();
+
     let self_entry = NodeEntry {
         node_id: state.node_id.clone(),
+        peer_id: Some(state.network_peer_id.clone()),
         api_endpoint: state.public_url.clone(),
         channels: self_channels,
         user_count: self_user_count,
@@ -587,8 +608,11 @@ pub async fn network_nodes(
                         }
                     });
 
+                    let peer_id = peer_id_by_node_id.get(&node_id).cloned();
+
                     Some(NodeEntry {
                         node_id,
+                        peer_id,
                         api_endpoint,
                         channels,
                         user_count,
@@ -607,12 +631,13 @@ pub async fn network_nodes(
             if let Ok(connected) = state.connected_peers.read() {
                 let known_ids: std::collections::HashSet<String> =
                     nodes.iter().map(|n| n.node_id.clone()).collect();
-                for (node_id, _info) in connected.iter() {
+                for (node_id, info) in connected.iter() {
                     if known_ids.contains(node_id) {
                         continue;
                     }
                     nodes.push(NodeEntry {
                         node_id: node_id.clone(),
+                        peer_id: Some(info.peer_id.clone()),
                         api_endpoint: None,
                         channels: vec![],
                         user_count: 0,

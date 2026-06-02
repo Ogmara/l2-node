@@ -1431,7 +1431,18 @@ fn default_api_port() -> u16 {
     41721
 }
 fn default_cors() -> Vec<String> {
-    vec!["http://localhost:*".to_string()]
+    // Includes `https://ogmara.org` so the public network page
+    // (`ogmara.org/network.html`) can run its browser-side
+    // reachability probe against a fresh node out of the box.
+    // Without it, an operator who runs the tutorial and lists their
+    // node via presence-gossip gets a red "unreachable" dot purely
+    // because the cross-origin probe is blocked by CORS — even though
+    // the API is otherwise serving correctly. Operators who want a
+    // narrower origin policy can remove this entry.
+    vec![
+        "https://ogmara.org".to_string(),
+        "http://localhost:*".to_string(),
+    ]
 }
 fn default_rate_limit() -> u32 {
     100
@@ -2265,7 +2276,10 @@ listen_port = 41721
 #     /dns4|/ip4|/ip6 multiaddr the SC publishes on chain
 # v0.46.0 Phase D supports bracketed IPv6 (`http://[2001:db8::1]:41721`).
 # public_url = "https://node.example.org"
-cors_origins = ["http://localhost:*"]
+# Includes `https://ogmara.org` so the public network page's
+# browser-side reachability probe can reach a fresh node without
+# extra config. Remove it if you want a narrower origin policy.
+cors_origins = ["https://ogmara.org", "http://localhost:*"]
 rate_limit_per_ip = 100
 # Trusted-proxy CIDRs for client-IP resolution behind a reverse proxy
 # (v0.42). Each entry is a CIDR (`"10.0.0.0/8"`, `"2001:db8::/32"`) or

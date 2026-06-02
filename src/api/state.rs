@@ -55,6 +55,14 @@ pub struct ConnectedPeerInfo {
     /// Which bootstrap tier produced this peer's dial chain this
     /// session (spec 13 §4.1). Set on Identify::Received.
     pub source: DiscoverySource,
+    /// libp2p PeerId in base58 (`12D3KooW...`). Stored alongside the
+    /// Ogmara `node_id` (which keys this map) so consumers like
+    /// `/api/v1/network/nodes` can return both encodings, letting the
+    /// website dedup presence-gossip rows (keyed by libp2p PeerId)
+    /// against peer-list rows (keyed by Ogmara `node_id`). Both forms
+    /// derive from the same libp2p public key — the binding is known
+    /// at Identify time, this just persists it.
+    pub peer_id: String,
 }
 
 // --- Media handler tunables (v0.39, config-driven in v0.40) ----------------

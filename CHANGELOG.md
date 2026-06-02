@@ -5,6 +5,64 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.48.1] - 2026-06-02
+
+Network-page dedup follow-up to v0.48.0 — surfaced by the same
+fresh-server walkthrough that produced v0.48.0. Without this fix,
+operators who enable presence gossip appear as **two** rows on
+`ogmara.org/network.html`: once via the existing peer-list path
+(keyed by Ogmara `node_id`, e.g. `3Y5BpfC4xHnQLCEAiBjure51yzFn`),
+and once via the new presence-gossip path (keyed by libp2p
+PeerId, e.g. `12D3KooWAQ5RiGr6oYapQfWtaxZS5ZX9gDVjqFwi1kWiNNt65W81`).
+The two encodings derive from the same libp2p public key but can't
+be string-matched in JS, so the website's dedup logic missed them.
+
+### Added
+
+- **`peer_id` field on `/api/v1/network/nodes` response.** Each node
+  entry now carries both `node_id` (Ogmara short form) and `peer_id`
+  (libp2p base58) when the libp2p binding is known. Populated for:
+    - The local node (always — from `AppState.network_peer_id`).
+    - Currently-connected discovered peers (from
+      `ConnectedPeerInfo.peer_id`, set at Identify time when both
+      forms are simultaneously known).
+  Omitted (`null` / not present in the JSON) when only the cached
+  `PEER_DIRECTORY` announcement is available and the peer is not
+  currently connected. The `#[serde(skip_serializing_if = ...)]`
+  attribute keeps the payload tidy when the field is absent.
+
+- **`ConnectedPeerInfo.peer_id`** — small struct extension to
+  persist the libp2p PeerId next to the Ogmara `node_id` at Identify
+  time. Both forms are already known at insert time
+  (`network/mod.rs:1003`); this just stops dropping one of them.
+
+### Changed
+
+- The library API surface `ConnectedPeerInfo` gained a required
+  field. Internal-only struct (not part of the public Rust API
+  for SDK consumers), but in-tree call sites updated in lockstep.
+- **`[api] cors_origins` default now includes `https://ogmara.org`.**
+  Without this, every operator following the tutorial got a red
+  "unreachable" dot on `ogmara.org/network.html` because the
+  browser-side reachability probe is a cross-origin `fetch()`
+  blocked by CORS — even though their API was otherwise serving
+  correctly. New default: `["https://ogmara.org",
+  "http://localhost:*"]`. Operators who want a narrower origin
+  policy can remove the `https://ogmara.org` entry. Affects only
+  freshly-generated configs (existing operator configs are never
+  modified by the Docker entrypoint).
+
+### How consumers use this
+
+- **Website** (`ogmara.org/network.html`): the presence-gossip merge
+  in `js/dashboard.js` now has the data it needs to dedup. The
+  `peer_id` exposed here matches the `peer_id` field of presence
+  records returned by `/api/v1/network/presence`, so a single
+  string comparison collapses the duplicate row.
+- **SDK / direct consumers**: prefer `peer_id` when correlating
+  against libp2p-derived data (gossip records, dialed multiaddrs).
+  Fall back to `node_id` only when the binding isn't published.
+
 ## [0.48.0] - 2026-06-01
 
 Off-chain presence-gossip subsystem (spec 13 §10, planning doc
