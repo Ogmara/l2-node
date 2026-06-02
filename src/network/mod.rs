@@ -753,7 +753,9 @@ impl NetworkService {
                     self.refresh_mesh_stats();
                 }
                 _ = presence_interval.tick() => {
-                    self.publish_presence_self_record();
+                    // Steady-state rebroadcast — don't care about
+                    // success here; the next tick fires regardless.
+                    let _ = self.publish_presence_self_record();
                 }
                 _ = announce_interval.tick() => {
                     self.publish_node_announcement();
@@ -869,6 +871,22 @@ impl NetworkService {
                 libp2p::gossipsub::Event::Subscribed { peer_id, topic },
             )) => {
                 debug!(peer = %peer_id, topic = %topic, "Peer subscribed to topic");
+                // v0.48.3: retry the presence initial-broadcast when a
+                // remote peer subscribes to our presence topic. The
+                // ConnectionEstablished trigger fires too early —
+                // gossipsub hasn't yet exchanged subscription RPCs, so
+                // the publish fails with `NoPeersSubscribedToTopic`
+                // even though the libp2p connection is up. The
+                // Subscribed event is the right moment: at that point
+                // we KNOW there's at least one peer in the topic mesh.
+                let is_presence_topic = self
+                    .presence_topic_hash
+                    .as_ref()
+                    .map(|h| h == &topic)
+                    .unwrap_or(false);
+                if is_presence_topic {
+                    self.maybe_publish_initial_presence();
+                }
             }
 
             SwarmEvent::Behaviour(OgmaraBehaviourEvent::Gossipsub(
@@ -2407,21 +2425,26 @@ impl NetworkService {
 
     /// Build and publish the local node's presence record (spec 13
     /// §10.5). Called from the rebroadcast timer in `run` and once
-    /// when the mesh reaches ≥ 3 connected peers for the first time.
-    /// Returns silently when the manager is absent or non-broadcasting
-    /// (presence disabled or no public URL configured).
-    fn publish_presence_self_record(&mut self) {
+    /// when the mesh reaches ≥ 1 connected peer for the first time.
+    /// Returns `true` iff the publish succeeded; the caller uses this
+    /// to decide whether to set `presence_initial_broadcast_done` —
+    /// keeping the door open for a retry on the next
+    /// gossipsub::Event::Subscribed if this attempt fired before the
+    /// remote peer's GRAFT exchange. Returns silently (with `true`)
+    /// when the manager is absent or non-broadcasting; nothing to
+    /// retry there.
+    fn publish_presence_self_record(&mut self) -> bool {
         let Some(mgr) = self.presence_manager.as_ref() else {
-            return;
+            return true;
         };
         if !mgr.broadcasting() {
-            return;
+            return true;
         }
         let bytes = match mgr.build_self_record() {
             Ok(b) => b,
             Err(e) => {
                 warn!(error = %e, "presence: failed to build self-record");
-                return;
+                return false;
             }
         };
         let topic = gossip::topic_presence(mgr.network_id());
@@ -2429,8 +2452,12 @@ impl NetworkService {
         match self.swarm.behaviour_mut().gossipsub.publish(topic_obj, bytes) {
             Ok(_) => {
                 debug!(topic = %topic, "presence: published self-record");
+                true
             }
-            Err(e) => self.report_publish_failure(&topic, &e),
+            Err(e) => {
+                self.report_publish_failure(&topic, &e);
+                false
+            }
         }
     }
 
@@ -2463,8 +2490,14 @@ impl NetworkService {
             return;
         }
         debug!(connected, "presence: peer connected — firing initial broadcast");
-        self.presence_initial_broadcast_done = true;
-        self.publish_presence_self_record();
+        // Only mark "done" if the publish succeeded. A
+        // `NoPeersSubscribedToTopic` error means we fired before the
+        // gossipsub subscription handshake completed; leaving the
+        // flag false lets us retry on the next
+        // gossipsub::Event::Subscribed for our topic.
+        if self.publish_presence_self_record() {
+            self.presence_initial_broadcast_done = true;
+        }
     }
 
     /// Handle a received GossipSub message through the full validation pipeline.
