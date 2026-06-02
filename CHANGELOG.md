@@ -5,6 +5,50 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.48.2] - 2026-06-02
+
+Presence-gossip bootstrap UX fix for small networks. Surfaced by
+the 2026-06-02 walkthrough — two presence-enabled nodes
+(freeweb=1 peer, darkw0rld=2 peers) both showed `broadcasting:
+true` with empty caches because:
+
+- `maybe_publish_initial_presence` gated on `connected >= 3`
+  (spec 13 §10.5 "wait for mesh stabilization"). On a 2-3 node
+  testnet the threshold is rarely met, so the initial broadcast
+  never fires.
+- The steady-state rebroadcast interval default was 21600s (6h),
+  so even after the initial-broadcast bug, fresh nodes wait up
+  to 6h before any peer sees their record.
+
+Combined, these meant a fresh small-testnet node was effectively
+invisible to the network page for hours after restart, even
+though both ends were nominally configured to participate.
+
+### Fixed
+
+- **Initial-broadcast threshold lowered from `>= 3` to `>= 1`
+  peer** (`src/network/mod.rs` `maybe_publish_initial_presence`).
+  The moment a node connects to ANY peer, it publishes its
+  self-record. Larger meshes don't lose anything — they still
+  re-broadcast on the steady-state cadence — they just no longer
+  bottleneck small-network startups. Calling `gossipsub.publish()`
+  with 0 mesh peers returns `InsufficientPeers` and gets nowhere
+  anyway, so the `>= 1` floor matches what gossipsub itself can
+  actually do.
+
+- **Default `rebroadcast_interval_secs` lowered from 21600s (6h)
+  to 3600s (1h)** (`src/config.rs`
+  `default_presence_rebroadcast_interval_secs`). Within an hour,
+  every presence-enabled node has had at least one publish
+  opportunity, so caches converge in a realistic operator-debug
+  window. Operators on large stable networks who prefer lower
+  gossip traffic can raise this in `ogmara.toml` (up to
+  `record_ttl_secs / 2`).
+
+Affects new operators following the tutorial out of the box.
+Existing operators who hand-edited a lower
+`rebroadcast_interval_secs` keep their override.
+
 ## [0.48.1] - 2026-06-02
 
 Network-page dedup follow-up to v0.48.0 — surfaced by the same
