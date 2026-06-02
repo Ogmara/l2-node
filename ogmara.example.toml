@@ -97,7 +97,7 @@ record_ttl_secs = 86400
 # strictly less than record_ttl_secs / 2 so peers always have a valid
 # record between re-broadcasts. Validated at startup — invalid values
 # abort with a config-fix message.
-rebroadcast_interval_secs = 21600
+rebroadcast_interval_secs = 3600
 # Peers whose presence records we never accept (libp2p PeerIds).
 # Useful for surgical exclusion of known-bad operators without
 # touching the SC denylist. Empty default. Each entry must parse as a

@@ -2435,9 +2435,19 @@ impl NetworkService {
     }
 
     /// Fire the one-shot mesh-stabilization broadcast (spec 13 §10.5)
-    /// the first time we have ≥ 3 connected peers after boot. The
+    /// the first time we have ≥ 1 connected peer after boot. The
     /// steady-state publish loop in `run` handles all subsequent
     /// broadcasts.
+    ///
+    /// Earlier drafts of this gated on ≥ 3 peers to "wait for the
+    /// mesh to stabilize" — but that's a death sentence on small
+    /// testnets / private deployments where the connected count
+    /// never reaches 3. With threshold = 1, the moment we form ANY
+    /// peer connection we publish, which is what gossipsub needs
+    /// anyway (publishing to an empty mesh returns InsufficientPeers
+    /// and gets nowhere). Larger meshes still re-broadcast on the
+    /// steady-state cadence; the initial broadcast just stops being
+    /// the bottleneck on small networks.
     fn maybe_publish_initial_presence(&mut self) {
         if self.presence_initial_broadcast_done {
             return;
@@ -2449,10 +2459,10 @@ impl NetworkService {
             return;
         }
         let connected = self.swarm.connected_peers().count();
-        if connected < 3 {
+        if connected < 1 {
             return;
         }
-        debug!(connected, "presence: mesh stabilized — firing initial broadcast");
+        debug!(connected, "presence: peer connected — firing initial broadcast");
         self.presence_initial_broadcast_done = true;
         self.publish_presence_self_record();
     }

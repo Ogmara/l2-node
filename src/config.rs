@@ -358,7 +358,16 @@ fn default_presence_record_ttl_secs() -> u64 {
     86_400
 }
 fn default_presence_rebroadcast_interval_secs() -> u64 {
-    21_600
+    // 1 hour. Earlier drafts of spec 13 §10.5 chose 6h (= 21_600s)
+    // to minimize gossip traffic, but real-operator testing on small
+    // testnets (2-3 active nodes) showed that combined with the
+    // <= 3 peers initial-broadcast threshold (lowered to >= 1 in
+    // v0.48.2, see network/mod.rs maybe_publish_initial_presence), a
+    // 6h cadence meant freshly-restarted nodes saw an empty presence
+    // cache for hours. 1h is the smallest interval that still keeps
+    // gossip traffic bounded but lets caches converge within a
+    // realistic operator-debug window.
+    3_600
 }
 
 /// Upper bound on `record_ttl_secs` (7 days, per spec 13 §10.3).
@@ -2176,8 +2185,10 @@ record_ttl_secs = 86400
 # How often we re-sign and re-broadcast our own record. Must be
 # strictly less than record_ttl_secs / 2 so peers always have a valid
 # record between re-broadcasts. Validated at startup — invalid values
-# abort with a config-fix message.
-rebroadcast_interval_secs = 21600
+# abort with a config-fix message. v0.48.2: default lowered from
+# 21600 (6h) to 3600 (1h) so caches converge in a realistic
+# operator-debug window on small testnets.
+rebroadcast_interval_secs = 3600
 # Peers whose presence records we never accept (libp2p PeerIds).
 # Useful for surgical exclusion of known-bad operators without
 # touching the SC denylist. Empty default. Each entry must parse as a
