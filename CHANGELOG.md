@@ -5,6 +5,59 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.48.3] - 2026-06-02
+
+Third presence-bootstrap fix in a single day — the v0.48.2 fix
+(threshold dropped from 3 peers to 1) was necessary but not
+sufficient. The user-visible symptom from the 2026-06-02
+walkthrough:
+
+```
+GossipSub publish failed
+  topic = /ogmara/testnet/presence/v1
+  error = NoPeersSubscribedToTopic
+  connected_peers = 1
+  topic_subscribers = 0
+  mesh_size = 0
+```
+
+`maybe_publish_initial_presence` fires correctly on the first
+`ConnectionEstablished` event (peers transitions 0 → 1), but
+that's BEFORE gossipsub has exchanged subscription RPCs
+(GRAFT/PRUNE). The TCP/Noise connection is up, but no peer is
+yet in the topic-specific mesh. `gossipsub.publish()` therefore
+returns `NoPeersSubscribedToTopic` and the publish goes
+nowhere. Worse: the old code set
+`presence_initial_broadcast_done = true` BEFORE checking the
+publish result, so the failed publish was treated as "done" and
+never retried.
+
+### Fixed
+
+- **`publish_presence_self_record` now returns `bool`** —
+  `true` iff the gossipsub.publish() succeeded (or the publish
+  is a no-op because presence is disabled). Caller uses this to
+  decide whether to mark the initial-broadcast complete.
+
+- **`maybe_publish_initial_presence` only sets the done flag on
+  successful publish.** If the publish fails (e.g.
+  `NoPeersSubscribedToTopic`), the flag stays `false` so we
+  retry on the next opportunity.
+
+- **`gossipsub::Event::Subscribed` for the presence topic now
+  triggers a retry.** This is the correct moment to publish —
+  at that point we KNOW a remote peer is in our topic mesh, so
+  `NoPeersSubscribedToTopic` can't occur. The retry is the
+  natural fix for the cold-start race: the ConnectionEstablished
+  trigger may fail, but the subsequent Subscribed event finishes
+  the job.
+
+The combined effect: a fresh node connecting to a single
+existing presence-enabled peer now reliably publishes its
+self-record within ~1 second of the gossipsub mesh forming,
+regardless of the order of `ConnectionEstablished` vs the
+subscription handshake.
+
 ## [0.48.2] - 2026-06-02
 
 Presence-gossip bootstrap UX fix for small networks. Surfaced by
