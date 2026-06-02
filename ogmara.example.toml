@@ -196,7 +196,7 @@ listen_port = 41721
 #     /dns4|/ip4|/ip6 multiaddr the SC publishes on chain
 # v0.46.0 Phase D supports bracketed IPv6 (`http://[2001:db8::1]:41721`).
 # public_url = "https://node.example.org"
-cors_origins = ["http://localhost:*"]
+cors_origins = ["https://ogmara.org", "http://localhost:*"]
 rate_limit_per_ip = 100
 # Trusted-proxy CIDRs for client-IP resolution behind a reverse proxy
 # (v0.42). Each entry is a CIDR (`"10.0.0.0/8"`, `"2001:db8::/32"`) or

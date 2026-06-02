@@ -1016,6 +1016,7 @@ impl NetworkService {
                                         agent_ver
                                     },
                                     source,
+                                    peer_id: peer_id.to_base58(),
                                 });
                             }
                         }
