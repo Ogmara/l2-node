@@ -38,7 +38,8 @@
 //!
 //! # Out of scope for v0.46.9
 //!
-//! - Outbound libp2p `Transport` integration (lands in v0.46.10).
+//! - Outbound libp2p `Transport` integration (deferred to a future
+//!   release; onion Phase 2, not a mainnet blocker).
 //!   The dialer is shipped now so the SOCKS5 security boundary can
 //!   be reviewed independently of the libp2p Transport-trait
 //!   composition work.

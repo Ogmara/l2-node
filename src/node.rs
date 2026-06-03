@@ -352,7 +352,7 @@ impl Node {
 
         // Channel for API layer → network layer GossipSub publishing
         let (gossip_tx, gossip_rx) =
-            tokio::sync::mpsc::unbounded_channel::<(String, Vec<u8>)>();
+            tokio::sync::mpsc::unbounded_channel::<crate::network::GossipPublish>();
 
         // Subscribe to all existing channels from storage so the node
         // participates in GossipSub for channels it already knows about.

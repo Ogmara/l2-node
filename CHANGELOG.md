@@ -5,6 +5,60 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.48.4] - 2026-06-03
+
+B4 fix proper — the asymmetric-GossipSub-propagation mainnet blocker
+(`docs/planning/mainnet-blockers-fix-plan.md` step 6). The 0.46.6
+instrumentation confirmed the root cause: a node holding **only inbound
+connections** could not satisfy `mesh_outbound_min = 1` (the minimum
+number of *outbound*, we-dialed peers GossipSub requires before
+grafting a topic mesh), so its publishes failed with
+`NoPeersSubscribedToTopic` even though inbound peers were subscribed.
+This is the common case on small / NATed meshes, not an edge case. The
+fix that was planned for the never-released v0.46.10 lands here instead
+(version numbering moved on while steps 7–8 and the presence subsystem
+shipped first).
+
+### Changed
+
+- **`mesh_outbound_min` lowered from `1` to `0`**
+  (`network/behaviour.rs`). Lets a node form a topic mesh and publish
+  over inbound-only links. Tradeoff: weaker eclipse-attack resistance
+  at large mesh sizes Ogmara does not yet reach — "messages actually
+  propagate" outranks that hardening at this scale.
+- **`POST /api/v1/messages` response gains an optional `delivery`
+  field** (`api/routes.rs`). `"propagated"` = handed to the mesh;
+  `"degraded"` = no mesh peer right now (message is persisted and will
+  arrive via backfill/reconciliation or once the mesh forms);
+  `"pending"` = outcome undetermined within the handler's 1.5s bounded
+  wait. Omitted for endpoints that don't gossip (DMs, reposts), so
+  existing clients are unaffected. Advisory only — the message is
+  always stored before the response is sent. Implemented by threading
+  an optional outcome responder (`GossipPublish` / `PublishOutcome`)
+  through the API → network publish channel.
+
+### Added
+
+- **`GET /admin/network/peer-telemetry`** (`api/admin.rs`, spec 10
+  §9.6). Per-peer inbound/outbound connection balance plus mesh
+  participation, projected from libp2p `ConnectionEstablished` /
+  `ConnectionClosed` direction tracking onto the existing 30s
+  mesh-stats snapshot tick. `inbound_only_peers > 0` while
+  `outbound_peers == 0` is the B4 danger zone the config change
+  tolerates. Reports `gossipsub_scoring: "disabled"` to document that
+  score-based mesh pruning is intentionally not enabled (it would evict
+  the only peer on a 1–3-peer mesh and make B4 worse).
+
+### Fixed
+
+- Regenerated `ogmara.example.toml` (was out of sync with
+  `Config::default_toml()`, failing the
+  `ogmara_example_toml_matches_default_toml` test).
+- Removed dangling references to the never-released `v0.46.10` across
+  the codebase and specs 10/13: the B4 references now point at this
+  release; the onion-outbound references (a genuinely pending Phase-2,
+  non-blocker feature) are de-pinned to "a future release".
+
 ## [0.48.3] - 2026-06-02
 
 Third presence-bootstrap fix in a single day — the v0.48.2 fix

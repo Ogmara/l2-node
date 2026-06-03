@@ -46,8 +46,9 @@ pub async fn list_peers(
 /// Returns a snapshot of per-topic mesh size + subscriber count plus
 /// the cumulative publish-failure counters partitioned by
 /// `PublishError` variant. Used to diagnose B4 (asymmetric GossipSub
-/// propagation, `docs/planning/mainnet-blockers-fix-plan.md` step 2)
-/// and gate the proper fix that ships in v0.46.10.
+/// propagation, `docs/planning/mainnet-blockers-fix-plan.md` step 2);
+/// the proper fix shipped in l2-node 0.48.4 (`mesh_outbound_min = 0`
+/// plus the `/admin/network/peer-telemetry` direction view below).
 ///
 /// The snapshot is refreshed by the network task every 30s
 /// ([`crate::network::MESH_STATS_REFRESH_INTERVAL`]); poll less
@@ -115,6 +116,71 @@ pub async fn mesh_stats(
         "other": other,
     });
     Json(body)
+}
+
+/// GET /admin/network/peer-telemetry — per-peer connection-direction
+/// view (B4 fix proper, l2-node 0.48.4).
+///
+/// B4 (asymmetric GossipSub propagation, `mainnet-blockers-fix-plan.md`
+/// step 6) is rooted in connection *direction*: a node holding only
+/// inbound connections cannot fill an outbound mesh slot. The 0.48.4
+/// release sets `mesh_outbound_min = 0` so such a node publishes
+/// anyway; this endpoint lets operators *see* the balance so a NATed
+/// or dial-failing node is still diagnosable.
+///
+/// `inbound_only_peers > 0` while `outbound_peers == 0` is the danger
+/// zone the config change tolerates — worth alerting on operationally.
+///
+/// **GossipSub peer-scoring is intentionally disabled.** libp2p's
+/// score-based mesh maintenance prunes low-scored peers; on Ogmara's
+/// small meshes (often 1–3 peers) that would evict the only peer a
+/// node has and make B4 worse, not better. Connection-direction
+/// telemetry is the actionable signal at this scale, so `gossipsub_
+/// scoring` is reported as `"disabled"` to make the decision explicit.
+///
+/// Reads the same `MeshStatsSnapshot` the network task refreshes every
+/// 30s ([`crate::network::MESH_STATS_REFRESH_INTERVAL`]); the per-peer
+/// rows reflect that snapshot, not live swarm state.
+///
+/// Response shape:
+/// ```json
+/// {
+///   "generated_at_unix": 1748707200,
+///   "total_peers": 4,
+///   "outbound_peers": 1,
+///   "inbound_only_peers": 3,
+///   "gossipsub_scoring": "disabled",
+///   "peers": [
+///     { "peer_id": "12D3KooW...", "outbound_conns": 1, "inbound_conns": 0, "mesh_topics": 2 }
+///   ]
+/// }
+/// ```
+pub async fn peer_telemetry(
+    Extension(state): Extension<Arc<AppState>>,
+) -> impl IntoResponse {
+    // Brief read lock; the writer never panics inside its critical
+    // section, but if poisoned we serve an empty view with
+    // `generated_at_unix = 0` ("no fresh data") rather than 500ing a
+    // diagnostic endpoint that's most-needed when something is wrong.
+    match state.mesh_stats.read() {
+        Ok(snap) => Json(serde_json::json!({
+            "generated_at_unix": snap.generated_at_unix,
+            "total_peers": snap.total_peers,
+            "outbound_peers": snap.outbound_peers,
+            "inbound_only_peers": snap.inbound_only_peers,
+            "gossipsub_scoring": "disabled",
+            "peers": snap.peers,
+        })),
+        Err(_) => Json(serde_json::json!({
+            "generated_at_unix": 0,
+            "total_peers": 0,
+            "outbound_peers": 0,
+            "inbound_only_peers": 0,
+            "gossipsub_scoring": "disabled",
+            "peers": [],
+            "note": "mesh_stats lock poisoned — no fresh peer telemetry",
+        })),
+    }
 }
 
 /// GET /admin/storage/stats — disk usage and message counts.

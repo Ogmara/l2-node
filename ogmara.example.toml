@@ -33,9 +33,9 @@ max_peer_staleness_days = 7
 #
 # When enabled = true, the operator MUST already run a Tor daemon
 # (apt install tor / brew install tor / etc.). The L2 node uses the
-# daemon's local SOCKS proxy for outbound onion dials (v0.46.10+)
-# and accepts inbound connections forwarded by the daemon's hidden-
-# service definition for the loopback port below.
+# daemon's local SOCKS proxy for outbound onion dials (deferred to a
+# future release) and accepts inbound connections forwarded by the
+# daemon's hidden-service definition for the loopback port below.
 enabled = false
 # Local Tor SOCKS5 proxy. Must be a loopback host (validator refuses
 # non-loopback to prevent operators from unwittingly routing onion
@@ -96,7 +96,9 @@ record_ttl_secs = 86400
 # How often we re-sign and re-broadcast our own record. Must be
 # strictly less than record_ttl_secs / 2 so peers always have a valid
 # record between re-broadcasts. Validated at startup — invalid values
-# abort with a config-fix message.
+# abort with a config-fix message. v0.48.2: default lowered from
+# 21600 (6h) to 3600 (1h) so caches converge in a realistic
+# operator-debug window on small testnets.
 rebroadcast_interval_secs = 3600
 # Peers whose presence records we never accept (libp2p PeerIds).
 # Useful for surgical exclusion of known-bad operators without
@@ -196,6 +198,9 @@ listen_port = 41721
 #     /dns4|/ip4|/ip6 multiaddr the SC publishes on chain
 # v0.46.0 Phase D supports bracketed IPv6 (`http://[2001:db8::1]:41721`).
 # public_url = "https://node.example.org"
+# Includes `https://ogmara.org` so the public network page's
+# browser-side reachability probe can reach a fresh node without
+# extra config. Remove it if you want a narrower origin policy.
 cors_origins = ["https://ogmara.org", "http://localhost:*"]
 rate_limit_per_ip = 100
 # Trusted-proxy CIDRs for client-IP resolution behind a reverse proxy
