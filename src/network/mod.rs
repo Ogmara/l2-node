@@ -2569,6 +2569,37 @@ impl NetworkService {
         };
         let topic = gossip::topic_presence(mgr.network_id());
         let topic_obj = libp2p::gossipsub::IdentTopic::new(&topic);
+        let topic_hash = topic_obj.hash();
+        // Pre-flight subscriber check (0.48.5). Presence is opt-in per
+        // node; a peer with presence disabled never subscribes to this
+        // topic. Publishing anyway returns NoPeersSubscribedToTopic,
+        // which — before this guard — went through `report_publish_failure`
+        // (error! log + the publish_failed_insufficient_peers alert + the
+        // shared no_peers_subscribed counter), producing a steady drip of
+        // false-positive errors on any node whose only peer has presence
+        // off. Skipping the publish when nobody is subscribed makes the
+        // common case a quiet no-op. We leave `presence_initial_broadcast_done`
+        // unset (return false) so the broadcast still fires the moment a
+        // presence-enabled peer actually subscribes (handled in the
+        // gossipsub `Subscribed` event for our topic). Distinct from the
+        // B4 case: there peers ARE subscribed but the mesh won't graft —
+        // here there is genuinely no audience, so there is nothing to fix
+        // and nothing worth alerting on.
+        let subscribers = self
+            .swarm
+            .behaviour()
+            .gossipsub
+            .all_peers()
+            .filter(|(_, topics)| topics.iter().any(|t| **t == topic_hash))
+            .count();
+        if subscribers == 0 {
+            debug!(
+                topic = %topic,
+                "presence: no peer subscribed to the presence topic — \
+                 skipping broadcast (will fire when one subscribes)"
+            );
+            return false;
+        }
         match self.swarm.behaviour_mut().gossipsub.publish(topic_obj, bytes) {
             Ok(_) => {
                 debug!(topic = %topic, "presence: published self-record");

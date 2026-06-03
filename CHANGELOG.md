@@ -5,6 +5,35 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.48.5] - 2026-06-03
+
+Quiet the presence-gossip self-broadcast on nodes whose only peer has
+presence disabled. Surfaced during the v0.48.4 bake: freeweb logged
+`GossipSub publish failed topic=/ogmara/<net>/presence/v1
+error=NoPeersSubscribedToTopic` every ~30–60s. Presence is opt-in per
+node, so a peer with presence off never subscribes to the topic;
+publishing anyway failed and — because the failure went through the
+shared `report_publish_failure` path — produced an `error!` log, bumped
+the `no_peers_subscribed` counter, and fired the
+`publish_failed_insufficient_peers` alert on every retry. None of that
+was actionable: there was simply no audience. (Not a B4 case — B4 is
+peers-subscribed-but-mesh-won't-graft; this is genuinely zero
+subscribers.)
+
+### Fixed
+
+- **Presence broadcast now pre-checks for subscribers**
+  (`network/mod.rs` `publish_presence_self_record`). If no connected peer
+  is subscribed to the presence topic, the publish is skipped with a
+  `debug!` no-op instead of attempting and failing. The one-shot initial
+  broadcast still fires the moment a presence-enabled peer subscribes
+  (the gossipsub `Subscribed`-event retry is unchanged), and the
+  steady-state rebroadcast still runs — they just no longer spam errors
+  / alerts / counters when there is nobody to broadcast to. This keeps
+  the `no_peers_subscribed` mesh-stats counter meaningful for real
+  message-path failures (§9.5/§9.6) rather than conflating it with
+  expected presence-cold-start.
+
 ## [0.48.4] - 2026-06-03
 
 B4 fix proper — the asymmetric-GossipSub-propagation mainnet blocker
