@@ -76,8 +76,10 @@ pub enum AlertType {
     /// [`libp2p::gossipsub::PublishError::NoPeersSubscribedToTopic`]
     /// case (spec 10 §9.2, l2-node 0.46.6+). Surfaced as B4
     /// instrumentation for the asymmetric-propagation diagnosis that
-    /// gates the proper fix in v0.46.10. Cooldown bounds re-fire so
-    /// a topic with no subscribers does not flood the alert log.
+    /// gated the proper fix shipped in l2-node 0.48.4
+    /// (`mesh_outbound_min = 0` + per-peer direction telemetry).
+    /// Cooldown bounds re-fire so a topic with no subscribers does not
+    /// flood the alert log.
     PublishFailedInsufficientPeers,
 }
 

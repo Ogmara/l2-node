@@ -289,7 +289,12 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
             // v0.46.6 — spec 10 §9.2 B4 instrumentation. Per-topic
             // mesh size + subscriber count + cumulative publish-
             // failure counters partitioned by PublishError variant.
-            .route("/admin/network/mesh-stats", get(admin::mesh_stats));
+            .route("/admin/network/mesh-stats", get(admin::mesh_stats))
+            // B4 peer-telemetry (0.48.4): per-peer inbound/outbound
+            // connection balance + mesh participation. Diagnoses the
+            // asymmetric-mesh case the `mesh_outbound_min = 0` fix
+            // tolerates.
+            .route("/admin/network/peer-telemetry", get(admin::peer_telemetry));
 
         if config.api.admin.dashboard {
             protected = protected

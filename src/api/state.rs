@@ -209,8 +209,9 @@ pub struct AppState {
     /// `None` if anchoring is not enabled.
     pub anchor_trigger: Option<mpsc::Sender<oneshot::Sender<Result<String, String>>>>,
     /// Channel to publish messages to GossipSub via the network layer.
-    /// Sends (topic_string, raw_envelope_bytes).
-    pub gossip_tx: tokio::sync::mpsc::UnboundedSender<(String, Vec<u8>)>,
+    /// Carries a [`crate::network::GossipPublish`] (topic + bytes +
+    /// optional outcome responder, l2-node 0.48.4).
+    pub gossip_tx: tokio::sync::mpsc::UnboundedSender<crate::network::GossipPublish>,
     /// Connected Ogmara peers (keyed by node_id), updated by the network layer.
     /// Used by `/api/v1/network/nodes` to include peers that haven't announced yet.
     pub connected_peers: Arc<RwLock<HashMap<String, ConnectedPeerInfo>>>,
@@ -480,7 +481,7 @@ impl AppState {
         ws_broadcast: broadcast::Sender<String>,
         anchor_trigger: Option<mpsc::Sender<oneshot::Sender<Result<String, String>>>>,
         peer_count: Arc<AtomicU32>,
-        gossip_tx: tokio::sync::mpsc::UnboundedSender<(String, Vec<u8>)>,
+        gossip_tx: tokio::sync::mpsc::UnboundedSender<crate::network::GossipPublish>,
         connected_peers: Arc<RwLock<HashMap<String, ConnectedPeerInfo>>>,
         counters: Arc<NetworkCounters>,
         metrics_latest: Arc<RwLock<MetricsSnapshot>>,

@@ -62,8 +62,33 @@ pub struct TopicMeshStats {
     pub subscribers: usize,
 }
 
+/// Per-peer connectivity at snapshot time — the B4 diagnostic view
+/// surfaced by `/admin/network/peer-telemetry` (l2-node 0.48.4).
+///
+/// The asymmetric-propagation root cause is connection *direction*: a
+/// node that holds only inbound connections cannot fill an outbound
+/// mesh slot. `mesh_outbound_min = 0` (set in `behaviour.rs`) lets it
+/// publish anyway, but operators still need to *see* a lopsided
+/// inbound/outbound balance to diagnose NAT / dial-failure problems.
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct PeerConnStats {
+    /// libp2p PeerId, base58 (`12D3KooW...`). A public network
+    /// identifier — safe to expose on the admin endpoint.
+    pub peer_id: String,
+    /// Live connections to this peer that *we* dialed (outbound).
+    pub outbound_conns: u32,
+    /// Live connections this peer dialed to *us* (inbound).
+    pub inbound_conns: u32,
+    /// Number of topic meshes this peer currently shares with us.
+    pub mesh_topics: usize,
+}
+
 /// Shared mesh-state snapshot — produced by `NetworkService` on a
-/// periodic tick, read by the `/admin/network/mesh-stats` endpoint.
+/// periodic tick, read by the `/admin/network/mesh-stats` and
+/// `/admin/network/peer-telemetry` endpoints. (It carries per-peer
+/// connectivity in addition to per-topic mesh state; the two endpoints
+/// project different views of the same snapshot so neither needs its
+/// own shared struct threaded through every `AppState` constructor.)
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct MeshStatsSnapshot {
     /// Unix-seconds at snapshot generation. `0` until the first tick
@@ -97,6 +122,19 @@ pub struct MeshStatsSnapshot {
     /// no_peers + all_queues_full + other` — every variant is counted
     /// exactly once.
     pub publish_failures_other: u64,
+    /// Total distinct peers with at least one live connection at
+    /// snapshot time (B4 peer-telemetry view).
+    pub total_peers: usize,
+    /// Peers we reach via at least one outbound (we-dialed) connection.
+    pub outbound_peers: usize,
+    /// Peers holding *only* inbound connections. When this is `> 0`
+    /// while `outbound_peers == 0`, the node is in the B4 danger zone
+    /// (no outbound mesh slots) and relies on `mesh_outbound_min = 0`
+    /// to publish at all.
+    pub inbound_only_peers: usize,
+    /// Per-peer connectivity rows, sorted by `peer_id` for stable
+    /// dashboards. Consumed by `/admin/network/peer-telemetry`.
+    pub peers: Vec<PeerConnStats>,
 }
 
 /// `Arc<RwLock>` wrapper for the snapshot — one writer (NetworkService

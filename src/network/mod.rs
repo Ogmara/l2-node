@@ -200,6 +200,47 @@ pub struct NetworkService {
     /// startup; field is `None` after that.
     presence_validation_rx:
         Option<tokio::sync::mpsc::UnboundedReceiver<PresenceValidationOutcome>>,
+    /// Per-peer live-connection direction counts, keyed by libp2p
+    /// `PeerId`. Maintained from `ConnectionEstablished` /
+    /// `ConnectionClosed` (`endpoint.is_dialer()` gives the direction).
+    /// Read by `refresh_mesh_stats` to populate the B4 peer-telemetry
+    /// view (`/admin/network/peer-telemetry`, l2-node 0.48.4). Tuple is
+    /// `(outbound, inbound)`. Entries are removed when both reach zero.
+    peer_directions: HashMap<PeerId, (u32, u32)>,
+}
+
+/// A request to publish an envelope to a GossipSub topic, sent from the
+/// API layer to the network task over `gossip_tx`.
+///
+/// `respond_to` lets a client-facing handler learn the publish outcome
+/// (B4 fix proper, l2-node 0.48.4). The message is *already persisted*
+/// by `MessageRouter::process_message` before it reaches this channel,
+/// so a degraded real-time publish is not data loss — channel-history
+/// reconciliation (B1) carries it to peers that join later. Surfacing
+/// the outcome just lets the UI distinguish "delivered to the mesh now"
+/// from "stored, will propagate via backfill".
+pub struct GossipPublish {
+    /// Topic string (e.g. `/ogmara/mainnet/v1/channel/42`).
+    pub topic: String,
+    /// Serialized envelope bytes to publish.
+    pub data: Vec<u8>,
+    /// When `Some`, the network task reports the publish outcome here.
+    /// `None` for best-effort internal re-publishes (e.g. the
+    /// `DeviceDelegation` relay) where no caller is awaiting a result.
+    pub respond_to: Option<tokio::sync::oneshot::Sender<PublishOutcome>>,
+}
+
+/// Outcome of a single GossipSub publish, reported back to the API
+/// caller via [`GossipPublish::respond_to`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishOutcome {
+    /// Handed to gossipsub for at least one mesh peer.
+    Propagated,
+    /// Publish failed (typically `NoPeersSubscribedToTopic`): no mesh
+    /// peer was available right now. The message is persisted locally
+    /// and will reach peers via backfill/reconciliation or once the
+    /// mesh forms — this is *degraded real-time delivery*, not loss.
+    Degraded,
 }
 
 /// Spec 13 §10.3 validation outcome carried from the spawned verifier
@@ -562,6 +603,7 @@ impl NetworkService {
             presence_initial_broadcast_done: false,
             presence_validation_tx,
             presence_validation_rx,
+            peer_directions: HashMap::new(),
         })
     }
 
@@ -663,7 +705,7 @@ impl NetworkService {
         &mut self,
         mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
         mut channel_rx: tokio::sync::mpsc::UnboundedReceiver<u64>,
-        mut gossip_rx: tokio::sync::mpsc::UnboundedReceiver<(String, Vec<u8>)>,
+        mut gossip_rx: tokio::sync::mpsc::UnboundedReceiver<GossipPublish>,
         // v0.44.0: sc_discovery sends `()` here when it persists new
         // multiaddrs from the on-chain registry. We respond by
         // running `dial_persisted_peers` out-of-cycle so SC-discovered
@@ -737,16 +779,28 @@ impl NetworkService {
                     self.subscribe_channel(channel_id);
                     info!(channel_id, "Auto-subscribed to channel topic (chain discovery)");
                 }
-                Some((topic, data)) = gossip_rx.recv() => {
+                Some(req) = gossip_rx.recv() => {
+                    let GossipPublish { topic, data, respond_to } = req;
                     let data_len = data.len() as u64;
                     let topic_obj = libp2p::gossipsub::IdentTopic::new(&topic);
-                    match self.swarm.behaviour_mut().gossipsub.publish(topic_obj, data) {
+                    let outcome = match self.swarm.behaviour_mut().gossipsub.publish(topic_obj, data) {
                         Ok(_) => {
                             self.counters.add_bytes_out(data_len);
                             self.counters.inc_messages_relayed();
                             debug!(topic = %topic, "Published message to GossipSub");
+                            PublishOutcome::Propagated
                         }
-                        Err(e) => self.report_publish_failure(&topic, &e),
+                        Err(e) => {
+                            self.report_publish_failure(&topic, &e);
+                            PublishOutcome::Degraded
+                        }
+                    };
+                    // Best-effort: the caller may have timed out and
+                    // dropped the receiver — a send error is expected
+                    // and ignorable. `None` respond_to means a
+                    // fire-and-forget internal re-publish.
+                    if let Some(tx) = respond_to {
+                        let _ = tx.send(outcome);
                     }
                 }
                 _ = mesh_stats_interval.tick() => {
@@ -1067,6 +1121,18 @@ impl NetworkService {
             } => {
                 let total_peers = self.swarm.connected_peers().count();
                 self.peer_count.store(total_peers as u32, Ordering::Relaxed);
+                // B4 peer-telemetry (0.48.4): track this connection's
+                // direction so `/admin/network/peer-telemetry` can show
+                // the inbound/outbound balance that diagnoses asymmetric
+                // meshes. `is_dialer()` ⇒ we dialed ⇒ outbound.
+                {
+                    let entry = self.peer_directions.entry(peer_id).or_insert((0, 0));
+                    if endpoint.is_dialer() {
+                        entry.0 = entry.0.saturating_add(1);
+                    } else {
+                        entry.1 = entry.1.saturating_add(1);
+                    }
+                }
                 info!(
                     peer = %peer_id,
                     connections = %num_established,
@@ -1092,10 +1158,25 @@ impl NetworkService {
                 peer_id,
                 num_established,
                 cause,
+                endpoint,
                 ..
             } => {
                 let total_peers = self.swarm.connected_peers().count();
                 self.peer_count.store(total_peers as u32, Ordering::Relaxed);
+                // B4 peer-telemetry (0.48.4): decrement the matching
+                // direction counter for the connection that closed.
+                // `num_established == 0` means this was the peer's last
+                // connection, so drop the entry entirely to bound the
+                // map; otherwise saturating-decrement the one direction.
+                if num_established == 0 {
+                    self.peer_directions.remove(&peer_id);
+                } else if let Some(entry) = self.peer_directions.get_mut(&peer_id) {
+                    if endpoint.is_dialer() {
+                        entry.0 = entry.0.saturating_sub(1);
+                    } else {
+                        entry.1 = entry.1.saturating_sub(1);
+                    }
+                }
                 if let Some(ref err) = cause {
                     warn!(
                         peer = %peer_id,
@@ -1405,9 +1486,16 @@ impl NetworkService {
         // network_id / topic prefix in the rendering).
         let mut topic_entries: HashMap<String, mesh_stats::TopicMeshStats> = HashMap::new();
         let mut total_mesh_slots = 0usize;
+        // Per-peer count of how many topic meshes each peer shares with
+        // us — joined with the direction map below for the peer-
+        // telemetry view.
+        let mut mesh_topic_count: HashMap<PeerId, usize> = HashMap::new();
         for topic_hash in gossipsub.topics() {
             let mesh_size = gossipsub.mesh_peers(topic_hash).count();
             total_mesh_slots += mesh_size;
+            for mesh_peer in gossipsub.mesh_peers(topic_hash) {
+                *mesh_topic_count.entry(*mesh_peer).or_insert(0) += 1;
+            }
             let subscribers = gossipsub
                 .all_peers()
                 .filter(|(_, topics)| topics.iter().any(|t| *t == topic_hash))
@@ -1433,6 +1521,34 @@ impl NetworkService {
         let (total, no_peers, all_queues_full, other) =
             self.publish_failure_counters.snapshot();
 
+        // B4 peer-telemetry: project the direction map into per-peer
+        // rows plus the inbound/outbound aggregates. `outbound_peers`
+        // counts peers reachable via ≥1 dialed connection;
+        // `inbound_only_peers` is the B4 risk signal.
+        let mut peers: Vec<mesh_stats::PeerConnStats> = self
+            .peer_directions
+            .iter()
+            .map(|(peer_id, (outbound, inbound))| mesh_stats::PeerConnStats {
+                peer_id: peer_id.to_string(),
+                outbound_conns: *outbound,
+                inbound_conns: *inbound,
+                mesh_topics: mesh_topic_count.get(peer_id).copied().unwrap_or(0),
+            })
+            .collect();
+        peers.sort_by(|a, b| a.peer_id.cmp(&b.peer_id));
+        // `total_peers` here is "peers with tracked direction state"
+        // (from `peer_directions`) — distinct from the live
+        // `self.peer_count` (swarm `connected_peers().count()`). Both
+        // are driven by the same connection events so they agree in
+        // steady state, but may differ momentarily between the 30s
+        // refresh tick and an interleaved connection event.
+        let total_peers = peers.len();
+        let outbound_peers = peers.iter().filter(|p| p.outbound_conns > 0).count();
+        let inbound_only_peers = peers
+            .iter()
+            .filter(|p| p.outbound_conns == 0 && p.inbound_conns > 0)
+            .count();
+
         let new_snapshot = mesh_stats::MeshStatsSnapshot {
             generated_at_unix: now_unix,
             topics,
@@ -1441,6 +1557,10 @@ impl NetworkService {
             publish_failures_no_peers: no_peers,
             publish_failures_all_queues_full: all_queues_full,
             publish_failures_other: other,
+            total_peers,
+            outbound_peers,
+            inbound_only_peers,
+            peers,
         };
 
         match self.mesh_stats.write() {

@@ -69,7 +69,25 @@ pub fn build_swarm(config: &Config, keypair: Keypair) -> Result<Swarm<OgmaraBeha
         .mesh_n(3)                 // target 3 peers in mesh (default: 6)
         .mesh_n_low(1)             // form mesh with as few as 1 peer (default: 5)
         .mesh_n_high(6)            // cap at 6 (default: 12)
-        .mesh_outbound_min(1)      // at least 1 outbound mesh peer (default: 2)
+        // B4 fix proper (mainnet-blockers-fix-plan.md step 6, l2-node
+        // 0.48.4). Was `1`. `mesh_outbound_min` is the minimum number
+        // of *outbound* (we-dialed-them) peers gossipsub requires in a
+        // topic mesh; if unmet, GRAFT is withheld and `publish` returns
+        // `NoPeersSubscribedToTopic` even though inbound peers are
+        // subscribed. On Ogmara's small / asymmetric testnet meshes a
+        // node behind NAT (or one that only ever received dials) holds
+        // *only* inbound connections, so `mesh_outbound_min = 1` made
+        // its publishes silently fail — exactly the asymmetric
+        // propagation the 0.46.6 instrumentation confirmed (one side
+        // receives but never delivers). Setting it to `0` lets such a
+        // node form a mesh and publish over its inbound links. The
+        // tradeoff is weaker eclipse-attack resistance (an attacker
+        // controlling all of a victim's inbound peers could sink its
+        // mesh), but that defense only bites at mesh sizes Ogmara does
+        // not yet reach, and "messages actually propagate" outranks a
+        // large-mesh hardening at this scale. The inbound/outbound
+        // balance is observable via `/admin/network/peer-telemetry`.
+        .mesh_outbound_min(0)      // tolerate inbound-only meshes (B4)
         // Spec 13 §10.3 + v0.48.0: defer relay until each topic's
         // handler reports a validation outcome. Without this flag,
         // gossipsub auto-relays every well-formed envelope before

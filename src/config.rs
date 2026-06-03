@@ -91,7 +91,7 @@ pub struct NetworkConfig {
     pub sc_discovery: ScDiscoveryConfig,
     /// Onion transport — external Tor daemon + SOCKS5 wrapper (spec
     /// 13 §6.4, l2-node 0.46.9+). Operator-facing knobs for hosting
-    /// a hidden service and (in v0.46.10) dialling onion peers
+    /// a hidden service and (in a future release) dialling onion peers
     /// through a local Tor SOCKS proxy. Disabled by default —
     /// operators with regulatory-resilience requirements opt in.
     #[serde(default)]
@@ -225,8 +225,9 @@ fn default_sc_max_candidates() -> u32 {
 ///   `/ip4/127.0.0.1/tcp/listen_onion_port` so the operator's Tor
 ///   hidden-service can forward traffic to it.
 /// - Outbound onion multiaddrs are still refused by the libp2p
-///   dialer in v0.46.9 — the SOCKS5-backed libp2p `Transport` lands
-///   in v0.46.10. Peers that publish onion-only addresses are not
+///   dialer — the SOCKS5-backed libp2p `Transport` integration is
+///   deferred to a future release (onion Phase 2; not a mainnet
+///   blocker). Peers that publish onion-only addresses are not
 ///   yet dialable, but ARE discoverable (their multiaddrs appear in
 ///   `bootstrap-candidates` with `transport: "onion"`).
 ///
@@ -236,7 +237,7 @@ pub struct TorConfig {
     /// Master switch. Default `false` — onion support is opt-in.
     /// Enabling this:
     /// 1. Validates `socks_proxy` parses cleanly.
-    /// 2. (v0.46.10+) Registers the SOCKS5-backed libp2p Transport
+    /// 2. (future release) Registers the SOCKS5-backed libp2p Transport
     ///    for outbound `/onion3/...` dials.
     /// 3. Configures inbound listen on the loopback TCP port that
     ///    the operator's external Tor service forwards the hidden
@@ -1813,7 +1814,7 @@ impl Config {
             }
             // Hidden-service hostname format check (v3 onion is
             // 56 base32 chars + ".onion" = 62 chars). Allow empty —
-            // operators may enable Tor for outbound only (v0.46.10).
+            // operators may enable Tor for outbound only (future release).
             let host = self.network.tor.listen_onion_hostname.trim();
             if !host.is_empty() {
                 if !host.is_ascii() {
@@ -2122,9 +2123,9 @@ max_peer_staleness_days = 7
 #
 # When enabled = true, the operator MUST already run a Tor daemon
 # (apt install tor / brew install tor / etc.). The L2 node uses the
-# daemon's local SOCKS proxy for outbound onion dials (v0.46.10+)
-# and accepts inbound connections forwarded by the daemon's hidden-
-# service definition for the loopback port below.
+# daemon's local SOCKS proxy for outbound onion dials (deferred to a
+# future release) and accepts inbound connections forwarded by the
+# daemon's hidden-service definition for the loopback port below.
 enabled = false
 # Local Tor SOCKS5 proxy. Must be a loopback host (validator refuses
 # non-loopback to prevent operators from unwittingly routing onion

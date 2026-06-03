@@ -463,6 +463,15 @@ struct NodeEntry {
 #[derive(Serialize)]
 pub struct MessageResponse {
     pub msg_id: String,
+    /// Real-time GossipSub delivery outcome for endpoints that publish
+    /// (B4 fix proper, l2-node 0.48.4). `"propagated"` = handed to the
+    /// mesh; `"degraded"` = no mesh peer right now (message is stored
+    /// and will reach peers via backfill/reconciliation); `"pending"` =
+    /// outcome unknown (network task slow or unavailable). Omitted
+    /// entirely for endpoints that don't gossip, so existing clients
+    /// see no change. Advisory only — the message is always persisted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -1973,12 +1982,50 @@ pub async fn post_message(
         } => {
             state.counters.inc_messages_stored();
 
+            // Real-time GossipSub delivery outcome (B4 fix proper,
+            // 0.48.4). `None` for messages with no gossip topic; set to
+            // the publish outcome otherwise. The message is already
+            // persisted above, so this is purely an advisory hint.
+            let mut delivery: Option<&'static str> = None;
+
             // Publish to GossipSub so other nodes receive the message
             if let Ok(envelope) =
                 rmp_serde::from_slice::<crate::messages::envelope::Envelope>(&raw_bytes)
             {
                 if let Some(topic) = gossip_topic_for_envelope(&envelope, &state.klever_network) {
-                    let _ = state.gossip_tx.send((topic, raw_bytes.clone()));
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    let sent = state
+                        .gossip_tx
+                        .send(crate::network::GossipPublish {
+                            topic,
+                            data: raw_bytes.clone(),
+                            respond_to: Some(tx),
+                        })
+                        .is_ok();
+                    delivery = if !sent {
+                        // Network task gone — message is stored, will
+                        // propagate via backfill once a node serves it.
+                        Some("pending")
+                    } else {
+                        // Bounded wait: the network task answers in
+                        // microseconds in steady state. A timeout means
+                        // it's busy, not that the publish failed — the
+                        // message is stored regardless.
+                        match tokio::time::timeout(
+                            std::time::Duration::from_millis(1500),
+                            rx,
+                        )
+                        .await
+                        {
+                            Ok(Ok(crate::network::PublishOutcome::Propagated)) => {
+                                Some("propagated")
+                            }
+                            Ok(Ok(crate::network::PublishOutcome::Degraded)) => {
+                                Some("degraded")
+                            }
+                            Ok(Err(_)) | Err(_) => Some("pending"),
+                        }
+                    };
                 }
 
                 // Feed to notification engine for mention detection
@@ -1992,6 +2039,7 @@ pub async fn post_message(
 
             Json(MessageResponse {
                 msg_id: hex::encode(msg_id),
+                delivery,
             })
             .into_response()
         }
@@ -2172,8 +2220,10 @@ pub async fn send_dm(
 
     match state.router.process_message(&body) {
         RouteResult::Accepted { msg_id, .. } => {
+            // DMs don't gossip via this path, so no delivery hint.
             Json(MessageResponse {
                 msg_id: hex::encode(msg_id),
+                delivery: None,
             })
             .into_response()
         }
@@ -2640,6 +2690,7 @@ pub async fn repost_news(
         RouteResult::Accepted { msg_id, .. } => {
             Json(MessageResponse {
                 msg_id: hex::encode(msg_id),
+                delivery: None,
             })
             .into_response()
         }
@@ -4253,7 +4304,13 @@ async fn propagate_device_delegation(
     match state.router.process_message(&envelope_bytes) {
         RouteResult::Accepted { raw_bytes, .. } => {
             let topic = crate::network::gossip::topic_network(&state.klever_network);
-            if let Err(e) = state.gossip_tx.send((topic, raw_bytes)) {
+            // Fire-and-forget: the delegation is persisted; backfill
+            // carries it if the live publish degrades. No responder.
+            if let Err(e) = state.gossip_tx.send(crate::network::GossipPublish {
+                topic,
+                data: raw_bytes,
+                respond_to: None,
+            }) {
                 tracing::warn!(error = %e, wallet = %expected_wallet_address,
                     "Failed to enqueue DeviceDelegation envelope for gossip publish");
                 return false;
