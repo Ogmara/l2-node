@@ -5,6 +5,37 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.48.6] - 2026-06-03
+
+Fix per-IP rate limiting behind a reverse proxy. On the Apache-fronted
+production node (~13 active users) every request — including login —
+got `429 Too Many Requests! Wait for 0s`. Root cause: the
+`tower_governor` layer used the default `PeerIpKeyExtractor`, which keys
+on the raw TCP peer IP. Behind a proxy the peer is always the proxy, so
+all clients shared one bucket (the proxy's IP) and the default 100/min
+limit saturated under aggregate load (a dashboard polling channel
+members at `limit=200` × 13 users). The retry-after rounded to 0s
+because the shared bucket refills at 100/min (~1 token per 0.6s). Nodes
+without a proxy or without load (Odroid, freeweb) were unaffected.
+
+Notably the rate limiter was the **only** request-IP consumer that did
+NOT honour `trusted_proxies` — `admin_auth` and the media limiter
+already resolve the real client IP via `X-Forwarded-For`/`Forwarded`.
+
+### Fixed
+
+- **Rate limiter now keys on the real client IP**
+  (`api/rate_limit_key.rs`, new `TrustedProxyIpKeyExtractor`). It reuses
+  the exact `trusted_proxies::resolve_client_ip` logic `admin_auth` uses:
+  `X-Forwarded-For` / RFC 7239 `Forwarded` are honoured **only** when the
+  peer is loopback or a configured trusted proxy, with a right-to-left
+  chain walk so an untrusted direct client cannot spoof its key. Behind a
+  proxy, `rate_limit_per_ip` now means *per real client* again; a direct
+  untrusted peer still keys on its own IP exactly like the old extractor.
+  No config change required for the common same-host Apache setup
+  (loopback is always trusted); operators whose proxy reaches the node on
+  a non-loopback address add that address to `api.trusted_proxies`.
+
 ## [0.48.5] - 2026-06-03
 
 Quiet the presence-gossip self-broadcast on nodes whose only peer has

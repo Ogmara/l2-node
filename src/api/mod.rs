@@ -12,6 +12,7 @@ pub mod auth;
 pub mod dashboard;
 pub mod media_fallback;
 pub mod media_limiter;
+pub mod rate_limit_key;
 pub mod routes;
 pub mod state;
 pub mod websocket;
@@ -320,11 +321,21 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
 
     // IP-based rate limiting: limit total HTTP requests per IP per minute.
     // Uses the `governor` crate via `tower_governor` middleware.
+    // v0.48.6: key on the REAL client IP (resolved via trusted_proxies +
+    // X-Forwarded-For/Forwarded), not the raw peer IP. Behind a reverse
+    // proxy the peer is always the proxy, so the default PeerIpKeyExtractor
+    // funnels every client into one shared bucket — on the Apache-fronted
+    // production node that saturated the 100/min bucket and 429'd every
+    // request (including login). Reuses the same resolution as admin_auth
+    // so an untrusted direct client still can't spoof its key.
     let rate_limit_per_ip = config.api.rate_limit_per_ip;
     let governor_conf = Arc::new(
         GovernorConfigBuilder::default()
             .per_millisecond(60_000 / rate_limit_per_ip.max(1) as u64)
             .burst_size(rate_limit_per_ip.max(1))
+            .key_extractor(rate_limit_key::TrustedProxyIpKeyExtractor::new(
+                app_state.trusted_proxies.clone(),
+            ))
             .finish()
             .expect("valid governor config"),
     );
