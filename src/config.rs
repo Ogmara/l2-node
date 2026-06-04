@@ -1441,18 +1441,28 @@ fn default_api_port() -> u16 {
     41721
 }
 fn default_cors() -> Vec<String> {
-    // Includes `https://ogmara.org` so the public network page
-    // (`ogmara.org/network.html`) can run its browser-side
-    // reachability probe against a fresh node out of the box.
-    // Without it, an operator who runs the tutorial and lists their
-    // node via presence-gossip gets a red "unreachable" dot purely
-    // because the cross-origin probe is blocked by CORS — even though
-    // the API is otherwise serving correctly. Operators who want a
-    // narrower origin policy can remove this entry.
-    vec![
-        "https://ogmara.org".to_string(),
-        "http://localhost:*".to_string(),
-    ]
+    // Allow ANY browser origin by default ("*").
+    //
+    // Ogmara is a decentralized, public-read network: a web client served
+    // from ANY origin — ogmara.org, a community fork on another domain, an
+    // IPFS gateway, a self-host, localhost — must be able to read whatever
+    // node the user points it at. Hardcoding a specific website (the old
+    // default listed `https://ogmara.org`) re-centralizes the whole web app
+    // onto one domain: if that domain dies or someone forks the app, every
+    // node would need reconfiguring before the new client could talk to it.
+    // That contradicts the point of running independent nodes.
+    //
+    // This is SAFE because CORS is not Ogmara's auth boundary. Every write /
+    // sensitive endpoint is gated by an Ed25519 request signature, not by
+    // origin (see `crate::api::auth`). A page at any origin can read public
+    // channels/news (already public), but cannot forge authenticated actions
+    // without the user's signing key — which the browser same-origin policy
+    // keeps isolated to the real app's origin. No cookies/credentials are
+    // used, so the `*`-with-credentials restriction doesn't apply.
+    //
+    // Operators who deliberately want a node restricted to specific origins
+    // can set an explicit `cors_origins` list (e.g. for a private node).
+    vec!["*".to_string()]
 }
 fn default_rate_limit() -> u32 {
     100
@@ -2288,10 +2298,12 @@ listen_port = 41721
 #     /dns4|/ip4|/ip6 multiaddr the SC publishes on chain
 # v0.46.0 Phase D supports bracketed IPv6 (`http://[2001:db8::1]:41721`).
 # public_url = "https://node.example.org"
-# Includes `https://ogmara.org` so the public network page's
-# browser-side reachability probe can reach a fresh node without
-# extra config. Remove it if you want a narrower origin policy.
-cors_origins = ["https://ogmara.org", "http://localhost:*"]
+# Allow ANY browser origin ("*") so a web client served from any domain
+# (ogmara.org, a fork, an IPFS gateway, a self-host, localhost) can read
+# this node — Ogmara is a decentralized public-read network and shouldn't
+# hardcode one website. Safe: writes are gated by request signatures, not
+# origin. Set an explicit list (e.g. ["https://my.app"]) for a private node.
+cors_origins = ["*"]
 rate_limit_per_ip = 100
 # Trusted-proxy CIDRs for client-IP resolution behind a reverse proxy
 # (v0.42). Each entry is a CIDR (`"10.0.0.0/8"`, `"2001:db8::/32"`) or
