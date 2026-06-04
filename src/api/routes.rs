@@ -423,6 +423,16 @@ pub struct HealthResponse {
     pub status: &'static str,
     pub version: &'static str,
     pub peers: u32,
+    /// Whether this node can currently accept media uploads and serve
+    /// media — i.e., an IPFS backend is configured AND reachable. A node
+    /// can be configured-but-offline (the Kubo daemon isn't running), so
+    /// this is a live capability signal, not a static config flag.
+    /// Clients use it to disable the attach/upload UI and tell the user
+    /// to switch to a media-capable node instead of failing on upload or
+    /// rendering broken image placeholders. Older nodes omit this field;
+    /// clients should treat its absence as "unknown" → assume available
+    /// (preserves prior behavior).
+    pub media_uploads: bool,
 }
 
 #[derive(Serialize)]
@@ -483,10 +493,17 @@ pub struct OkResponse {
 
 /// GET /api/v1/health
 pub async fn health(Extension(state): Extension<Arc<AppState>>) -> Json<HealthResponse> {
+    // Live media capability: configured AND the Kubo daemon answers.
+    // `is_available()` is cached (15s TTL) so polling /health stays cheap.
+    let media_uploads = match &state.ipfs {
+        Some(c) => c.is_available().await,
+        None => false,
+    };
     Json(HealthResponse {
         status: "ok",
         version: env!("CARGO_PKG_VERSION"),
         peers: state.peer_count(),
+        media_uploads,
     })
 }
 
@@ -3260,6 +3277,27 @@ pub async fn upload_media(
         }
         Err(e) => {
             tracing::error!(user = %auth_user.address, error = %e, "IPFS upload failed");
+            // Distinguish "storage backend offline" (Kubo not running /
+            // unreachable — the node is configured for media but the
+            // daemon is down, e.g. a text-only deployment) from a genuine
+            // upload error. The former gets a 503 + actionable message so
+            // the client tells the user to switch nodes rather than
+            // surfacing a confusing generic 500.
+            //
+            // Uses the CACHED `is_available()` (≤15s stale), not a fresh
+            // probe: `upload_media` has no per-IP limiter (only the global
+            // governor), so a fresh probe on every failed upload would let
+            // an authenticated client amplify uncapped 5s outbound probes
+            // against a slow/blackholed Kubo. A 15s-stale liveness signal
+            // is more than adequate to pick an error message. (Security
+            // audit, v0.48.7.)
+            if !ipfs.is_available().await {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "media uploads unavailable on this node (storage backend offline) — switch to a node with media support",
+                )
+                    .into_response();
+            }
             (StatusCode::INTERNAL_SERVER_ERROR, "upload failed").into_response()
         }
     }
