@@ -5,6 +5,34 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.48.7] - 2026-06-04
+
+Media-capability signal so clients can gracefully handle nodes that
+can't host files. A node keeps its IPFS client even when the Kubo daemon
+is unreachable ("may come online later"), and the default config always
+sets an IPFS `api_url` — so a text-only deployment (Kubo not running) is
+"configured but offline". Such a node returned a bare 500 on upload and
+404/placeholder on media fetch, with nothing telling the client to
+switch nodes.
+
+### Added
+
+- `media_uploads: bool` on `GET /api/v1/health` — live capability:
+  IPFS configured AND the Kubo daemon currently reachable. Backed by a
+  new `IpfsClient::is_available()` with a 15s cached liveness probe
+  (short 5s timeout) so polling `/health` stays cheap and a dead daemon
+  can't stall the endpoint. Clients (sdk-js 0.20.0+, desktop 1.24.0+)
+  use it to disable the upload UI and render friendly image placeholders.
+
+### Changed
+
+- `IpfsClient::health_check()` now uses a short 5s timeout (was the
+  shared 120s upload-client default) so liveness probes fail fast.
+- `POST /api/v1/media/upload` returns `503` with an actionable message
+  ("media uploads unavailable on this node (storage backend offline) —
+  switch to a node with media support") when the upload fails AND the
+  backend is unreachable, instead of a generic `500 upload failed`.
+
 ## [0.48.6] - 2026-06-03
 
 Fix per-IP rate limiting behind a reverse proxy. On the Apache-fronted

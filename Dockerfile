@@ -1,9 +1,9 @@
 # Ogmara L2 Node — Multi-stage Docker build
 #
-# Build:  docker build -t ogmara/ogmara:l2-node-0.46.1 .
+# Build:  docker build -t ogmara/ogmara:l2-node-0.48.7 .
 # Run:    docker run -v ogmara-data:/data \
 #           -p 41720:41720/udp -p 41720:41720/tcp -p 41721:41721 \
-#           ogmara/ogmara:l2-node-0.46.1
+#           ogmara/ogmara:l2-node-0.48.7
 #
 # On first run the entrypoint auto-generates /etc/ogmara/ogmara.toml
 # from the binary's `Config::default_toml()` if you haven't mounted

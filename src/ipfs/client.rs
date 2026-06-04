@@ -3,7 +3,9 @@
 //! Interfaces with a local Kubo node via the HTTP API (spec 04-ipfs.md).
 //! Supports upload (with pinning), retrieval by CID, and pin management.
 
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -11,6 +13,24 @@ use serde::Deserialize;
 use tracing::{debug, info, warn};
 
 use crate::config::IpfsConfig;
+
+/// How long a cached availability result is trusted before the next
+/// `is_available()` call re-probes Kubo. Keeps the hot `/api/v1/health`
+/// path cheap while still reflecting a daemon that just went up or down.
+const AVAILABILITY_TTL_MS: u64 = 15_000;
+
+/// Short timeout for liveness probes (`/api/v0/id`). The shared HTTP
+/// client defaults to 120s so slow uploads don't abort, but a liveness
+/// probe against a dead or blackholed daemon must fail fast — otherwise
+/// `/api/v1/health` (which clients poll) could stall for minutes.
+const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
 
 /// Allowed MIME types for media uploads (spec 04-ipfs.md section 3.1).
 const ALLOWED_MIME_PREFIXES: &[&str] = &[
@@ -86,6 +106,14 @@ pub struct IpfsClient {
     max_upload_bytes: u64,
     /// HTTP client.
     http: reqwest::Client,
+    /// Last known media-backend liveness, refreshed lazily by
+    /// [`IpfsClient::is_available`]. Seeded optimistically to `true`;
+    /// the first call (with `availability_checked_ms == 0`) forces a
+    /// real probe. Shared via `Arc` so clones (the client is `Clone`
+    /// and stored in `AppState`) observe the same cached state.
+    available: Arc<AtomicBool>,
+    /// Unix-ms timestamp of the last availability probe (0 = never).
+    availability_checked_ms: Arc<AtomicU64>,
 }
 
 /// Response from IPFS `add` endpoint.
@@ -125,16 +153,44 @@ impl IpfsClient {
             gateway_url: config.gateway_url.clone(),
             max_upload_bytes: config.max_upload_size_mb * 1024 * 1024,
             http,
+            available: Arc::new(AtomicBool::new(true)),
+            availability_checked_ms: Arc::new(AtomicU64::new(0)),
         })
     }
 
-    /// Check if the IPFS node is reachable.
+    /// Check if the IPFS node is reachable. Uses a short timeout
+    /// ([`HEALTH_PROBE_TIMEOUT`]) so a dead daemon fails fast instead of
+    /// inheriting the 120s upload timeout.
     pub async fn health_check(&self) -> Result<bool> {
         let url = format!("{}/api/v0/id", self.api_url);
-        match self.http.post(&url).send().await {
+        match self.http.post(&url).timeout(HEALTH_PROBE_TIMEOUT).send().await {
             Ok(resp) => Ok(resp.status().is_success()),
             Err(_) => Ok(false),
         }
+    }
+
+    /// Cheap, cached media-backend liveness signal.
+    ///
+    /// Re-probes Kubo via [`IpfsClient::health_check`] at most once per
+    /// [`AVAILABILITY_TTL_MS`]; otherwise returns the last known state.
+    /// Used by `/api/v1/health` to advertise the `media_uploads`
+    /// capability (so clients can disable the upload UI and explain
+    /// why) and by the upload handler to return a precise
+    /// "backend offline" error instead of a generic 500.
+    ///
+    /// Concurrent stale callers don't stampede: the timestamp is bumped
+    /// *before* the probe, so in-flight callers read the fresh stamp and
+    /// return the previous cached value rather than each firing a probe.
+    pub async fn is_available(&self) -> bool {
+        let now = now_ms();
+        let last = self.availability_checked_ms.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < AVAILABILITY_TTL_MS {
+            return self.available.load(Ordering::Relaxed);
+        }
+        self.availability_checked_ms.store(now, Ordering::Relaxed);
+        let ok = self.health_check().await.unwrap_or(false);
+        self.available.store(ok, Ordering::Relaxed);
+        ok
     }
 
     /// Upload a file to IPFS with automatic pinning.
