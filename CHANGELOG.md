@@ -5,6 +5,31 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.48.8] - 2026-06-04
+
+### Changed
+
+- **Default `cors_origins` is now `["*"]` (allow any browser origin)**,
+  replacing the hardcoded `["https://ogmara.org", "http://localhost:*"]`.
+  Ogmara is a decentralized public-read network: a web client served from
+  ANY origin (ogmara.org, a community fork, an IPFS gateway, a self-host,
+  localhost) must be able to read whatever node the user points it at.
+  Hardcoding one website re-centralized the web app onto a single domain —
+  if it went offline or someone forked it, every node needed reconfiguring
+  before the browser would talk to it (the browser blocks cross-origin
+  responses lacking `Access-Control-Allow-Origin`; Tauri/desktop is exempt,
+  which is why the web app showed empty channels/news against a node whose
+  CORS list omitted its origin while desktop worked).
+
+  Safe because CORS is NOT the auth boundary: every write/sensitive
+  endpoint is gated by an Ed25519 request signature, not by origin, and no
+  cookies/credentials are used. A page at any origin can read public data
+  but cannot forge authenticated actions without the user's key (kept
+  isolated by the browser same-origin policy). Operators who want a node
+  restricted to specific origins can still set an explicit `cors_origins`
+  list. NOTE: this only changes the DEFAULT — nodes with an existing
+  persisted/mounted `ogmara.toml` keep their configured list until updated.
+
 ## [0.48.7] - 2026-06-04
 
 Media-capability signal so clients can gracefully handle nodes that
