@@ -144,6 +144,41 @@ pub mod cf {
     /// Persists across restarts (unlike in-memory rate limit counters).
     pub const KNOWN_WALLETS: &str = "known_wallets";
 
+    // --- Identity-Sync (P-1, l2-node 0.50.0+) ---
+
+    /// (wallet_address, 0xFF, msg_type:1, timestamp:8 BE, msg_id:32) → ()
+    ///
+    /// Per-wallet index of a user's signed *identity* envelopes —
+    /// DeviceDelegation (0x31), DeviceRevocation (0x32), ProfileUpdate (0x30),
+    /// Follow (0x34), Unfollow (0x35). The lazy, per-wallet identity-sync
+    /// protocol (`network/identity_sync.rs`) scans this prefix to re-serve a
+    /// wallet's original signed envelopes to a node the user just connected to,
+    /// so their delegation/profile/follows follow them to any node. Written in
+    /// `router::update_indexes`; back-compat-backfilled from MESSAGES once via
+    /// the `IDENTITY_ENVELOPES_INDEXED` sentinel. NOT a snapshot DOMAIN_CF
+    /// (gossip-derived, no on-chain anchor).
+    pub const IDENTITY_ENVELOPES: &str = "identity_envelopes";
+
+    /// device_address → revoked_at (u64 BE) — device-revocation tombstone
+    /// (P-2, l2-node 0.51.0+). Written by `revoke_device` with the revocation's
+    /// timestamp (last-writer-wins: keeps the max). A `DeviceDelegation` whose
+    /// `timestamp <= revoked_at` is rejected, so a replayed/stale delegation
+    /// can never resurrect a revoked (possibly compromised) device — a genuine
+    /// re-delegation simply carries a newer timestamp. Closes the
+    /// resurrection/auth-bypass vector the identity-sync backfill (P-1) would
+    /// otherwise weaponize.
+    pub const DEVICE_REVOCATIONS: &str = "device_revocations";
+
+    /// follow-edge key (same encoding as FOLLOWS) → last-applied timestamp
+    /// (u64 BE) — Follow/Unfollow last-writer-wins watermark (P-2, l2-node
+    /// 0.51.0+). A Follow/Unfollow with `timestamp <= stored` is rejected, so a
+    /// stale/replayed follow or unfollow can't tamper a user's follow graph.
+    /// `FOLLOWS` itself remains the queryable state (both follow/unfollow are
+    /// idempotent), so no state byte is needed here — just the watermark. Edges
+    /// that predate P-2 carry no watermark (treated as 0) until their next
+    /// follow/unfollow establishes one.
+    pub const FOLLOW_EDGE_TS: &str = "follow_edge_ts";
+
     /// All column family names for database initialization.
     pub const ALL: &[&str] = &[
         MESSAGES,
@@ -193,6 +228,9 @@ pub mod cf {
         PRIVATE_CHANNEL_KEYS,
         PRIVATE_CHANNEL_ANCHORS,
         KNOWN_WALLETS,
+        IDENTITY_ENVELOPES,
+        DEVICE_REVOCATIONS,
+        FOLLOW_EDGE_TS,
     ];
 }
 
@@ -222,6 +260,9 @@ pub mod state_keys {
     pub const USERS_BY_NAME_BACKFILLED: &[u8] = b"migration_users_by_name_backfilled";
     /// Sentinel: set to 1 after DELEGATIONS are backfilled into DEVICE_WALLET_MAP.
     pub const DELEGATION_MAP_BACKFILLED: &[u8] = b"migration_delegation_map_backfilled";
+    /// Sentinel: set to 1 after IDENTITY_ENVELOPES is backfilled from existing
+    /// MESSAGES (P-1 identity-sync index, l2-node 0.50.0+).
+    pub const IDENTITY_ENVELOPES_INDEXED: &[u8] = b"migration_identity_envelopes_indexed";
     /// Sentinel: set to 1 after device addresses are re-derived from klv1 → ogd1.
     pub const DEVICE_HRP_MIGRATED: &[u8] = b"migration_device_hrp_migrated";
     /// Unix timestamp of last successful state anchor submission (u64 big-endian).
@@ -303,6 +344,38 @@ pub fn encode_channel_msg_key(channel_id: u64, lamport_ts: u64, msg_id: &[u8; 32
     key.extend_from_slice(&lamport_ts.to_be_bytes());
     key.extend_from_slice(msg_id);
     key
+}
+
+/// Encode an identity-envelope index key: `(wallet, 0xFF, msg_type, timestamp,
+/// msg_id)` (P-1 identity-sync, l2-node 0.50.0+). Big-endian timestamp for
+/// natural chronological sort. The `0xFF` separator delimits the variable-length
+/// wallet address from the fixed-width tail, so a prefix of `wallet ++ 0xFF`
+/// selects exactly one wallet's identity envelopes (and `wallet ++ 0xFF ++
+/// msg_type` selects one message type). `0xFF` cannot appear in a bech32
+/// `klv1…`/`ogd1…` address, so the boundary is unambiguous.
+pub fn encode_identity_envelope_key(
+    wallet_address: &str,
+    msg_type: u8,
+    timestamp: u64,
+    msg_id: &[u8; 32],
+) -> Vec<u8> {
+    let addr = wallet_address.as_bytes();
+    let mut key = Vec::with_capacity(addr.len() + 1 + 1 + 8 + 32);
+    key.extend_from_slice(addr);
+    key.push(0xFF);
+    key.push(msg_type);
+    key.extend_from_slice(&timestamp.to_be_bytes());
+    key.extend_from_slice(msg_id);
+    key
+}
+
+/// Prefix selecting all identity envelopes for one wallet: `wallet ++ 0xFF`.
+pub fn identity_envelope_prefix(wallet_address: &str) -> Vec<u8> {
+    let addr = wallet_address.as_bytes();
+    let mut p = Vec::with_capacity(addr.len() + 1);
+    p.extend_from_slice(addr);
+    p.push(0xFF);
+    p
 }
 
 /// Encode a DM message index key: (conversation_id, timestamp, msg_id).

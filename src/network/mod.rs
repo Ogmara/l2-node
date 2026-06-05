@@ -12,6 +12,8 @@ pub mod discovery;
 pub mod gossip;
 pub mod mesh_stats;
 pub mod presence;
+pub mod identity_sync;
+pub mod news_sync;
 pub mod reconcile;
 pub mod sc_discovery;
 pub mod snapshot;
@@ -173,6 +175,30 @@ pub struct NetworkService {
     /// (e.g., the channel is genuinely silent). Cleared on process
     /// restart.
     reconcile_triggered: HashSet<u64>,
+    /// Server-side rate-limit state for inbound `IdentitySyncRequest`s,
+    /// keyed by `(peer, wallet)` (P-1, l2-node 0.50.0+).
+    identity_sync_limits: Arc<identity_sync::IdentityResponderLimits>,
+    /// Outstanding outbound identity-sync requests, keyed by
+    /// `OutboundRequestId` → `(peer, wallet, scopes)` so the response
+    /// handler can apply + page the right wallet's bundle.
+    pending_identity_sync_requests: HashMap<
+        libp2p::request_response::OutboundRequestId,
+        IdentitySyncPending,
+    >,
+    /// Wallets this node has triggered an identity-sync pull for at least
+    /// once this process lifetime — dedups repeated first-seen triggers.
+    identity_sync_triggered: HashSet<String>,
+    /// Server-side rate-limit state for inbound news-sync requests (P-3).
+    news_sync_limits: Arc<news_sync::NewsResponderLimits>,
+    /// Outstanding outbound news-sync requests → the peer they went to (for
+    /// race-cancel + paging).
+    pending_news_sync_requests: HashMap<
+        libp2p::request_response::OutboundRequestId,
+        PeerId,
+    >,
+    /// Set once the one-time global-news backfill has been fired this process
+    /// lifetime (only fires when NEWS_FEED was empty and peers existed).
+    news_backfill_triggered: bool,
     /// Presence-gossip manager (spec 13 §10, l2-node 0.48.0+). `Some`
     /// iff `[network.presence] enabled = true` at startup; held in an
     /// `Arc` so the cache + rate limiter can be shared with the REST
@@ -261,6 +287,23 @@ struct ReconcilePending {
     channel_id: u64,
 }
 
+/// Per-pending-outbound-identity-sync state (P-1).
+#[derive(Debug, Clone)]
+struct IdentitySyncPending {
+    peer_id: PeerId,
+    wallet: String,
+    scopes: u8,
+}
+
+/// Command from the API/router task → network task asking it to lazily pull a
+/// wallet's identity bundle (P-1). Sent over `identity_sync_tx`; handled in the
+/// `run` select loop by `maybe_trigger_identity_sync`.
+#[derive(Debug, Clone)]
+pub struct IdentitySyncCommand {
+    pub wallet: String,
+    pub scopes: u8,
+}
+
 /// Cross-channel smuggling defense (Security Audit W1, 0.47.0).
 /// Returns `true` iff the envelope's payload claims the same
 /// `channel_id` we are reconciling. Envelopes that target a
@@ -306,6 +349,38 @@ fn envelope_targets_channel(env_bytes: &[u8], expected_channel: u64) -> bool {
         // the router decide.
         _ => true,
     }
+}
+
+/// Smuggling defense for identity-sync responses (P-1). Returns `true` iff the
+/// envelope is an identity message type the requester asked for (`scopes`).
+///
+/// This bounds an identity-sync response to identity types — a responder can't
+/// inject an unrelated type (e.g. a chat message or channel-create) through the
+/// identity-sync path. It does NOT bind to a specific wallet on purpose: a
+/// device-resolve-miss pull is keyed by the device address, but the resolved
+/// bundle's `DeviceDelegation` is authored by the WALLET, so a wallet-author
+/// check would wrongly drop it. That's safe — `process_synced_message`
+/// signature-validates every envelope, so an envelope for a different wallet is
+/// either genuine (harmlessly backfills that wallet's real data) or rejected.
+fn envelope_targets_scope(env_bytes: &[u8], scopes: u8) -> bool {
+    use crate::messages::envelope::Envelope;
+    let envelope: Envelope = match rmp_serde::from_slice(env_bytes) {
+        Ok(e) => e,
+        Err(_) => return false,
+    };
+    identity_sync::type_in_scopes(envelope.msg_type_u8(), scopes)
+}
+
+/// Smuggling defense for news-sync responses (P-3): accept only news-feed
+/// message types, so a responder can't inject a non-news type through this
+/// path. Every envelope is still signature-validated by `process_synced_message`.
+fn envelope_targets_news(env_bytes: &[u8]) -> bool {
+    use crate::messages::envelope::Envelope;
+    let envelope: Envelope = match rmp_serde::from_slice(env_bytes) {
+        Ok(e) => e,
+        Err(_) => return false,
+    };
+    news_sync::is_news_type(envelope.msg_type_u8())
 }
 
 /// How often `NetworkService` refreshes the shared `MeshStatsSnapshot`.
@@ -598,6 +673,12 @@ impl NetworkService {
             reconcile_limits: Arc::new(reconcile::ResponderLimits::default()),
             pending_reconcile_requests: HashMap::new(),
             reconcile_triggered: HashSet::new(),
+            identity_sync_limits: Arc::new(identity_sync::IdentityResponderLimits::default()),
+            pending_identity_sync_requests: HashMap::new(),
+            identity_sync_triggered: HashSet::new(),
+            news_sync_limits: Arc::new(news_sync::NewsResponderLimits::default()),
+            pending_news_sync_requests: HashMap::new(),
+            news_backfill_triggered: false,
             presence_manager,
             presence_topic_hash,
             presence_initial_broadcast_done: false,
@@ -712,6 +793,10 @@ impl NetworkService {
         // peers get dialed within seconds instead of waiting up to
         // 30s for the next periodic bootstrap tick. Spec 13 §4.3.
         mut sc_reconnect_rx: tokio::sync::mpsc::Receiver<()>,
+        // P-1: the API/router task sends here when a wallet is first seen on
+        // this node (login / node-switch) or a device can't be resolved, asking
+        // us to lazily pull that wallet's identity bundle from peers.
+        mut identity_sync_rx: tokio::sync::mpsc::UnboundedReceiver<IdentitySyncCommand>,
     ) {
         info!(
             peer_id = %self.swarm.local_peer_id(),
@@ -768,6 +853,9 @@ impl NetworkService {
                 event = self.swarm.select_next_some() => {
                     self.handle_swarm_event(event);
                 }
+                Some(cmd) = identity_sync_rx.recv() => {
+                    self.maybe_trigger_identity_sync(cmd.wallet, cmd.scopes);
+                }
                 Some(channel_id) = channel_rx.recv() => {
                     // Code Audit W2 (0.47.0): route chain-discovered
                     // channels through `Self::subscribe_channel` (not
@@ -816,6 +904,10 @@ impl NetworkService {
                 }
                 _ = bootstrap_interval.tick() => {
                     self.periodic_bootstrap();
+                    // P-3: one-time global-news backfill. No-op once it has
+                    // fired or the feed is non-empty; retries each tick until
+                    // peers are available.
+                    self.maybe_trigger_news_backfill();
                 }
                 _ = reconnect_interval.tick() => {
                     self.process_reconnect_queue();
@@ -1107,6 +1199,14 @@ impl NetworkService {
 
             SwarmEvent::Behaviour(OgmaraBehaviourEvent::Reconcile(event)) => {
                 self.handle_reconcile_event(event);
+            }
+
+            SwarmEvent::Behaviour(OgmaraBehaviourEvent::IdentitySync(event)) => {
+                self.handle_identity_sync_event(event);
+            }
+
+            SwarmEvent::Behaviour(OgmaraBehaviourEvent::NewsSync(event)) => {
+                self.handle_news_sync_event(event);
             }
 
             SwarmEvent::NewListenAddr { address, .. } => {
@@ -1571,6 +1671,376 @@ impl NetworkService {
 
     /// Channel-history backfill trigger (spec 1, l2-node 0.47.0+).
     /// See [`Self::subscribe_channel`] for the full trigger contract.
+    /// Lazily pull one wallet's identity bundle (delegation/profile/follows)
+    /// from peers the first time that wallet is seen on this node (P-1). This
+    /// is per-wallet and deduped — NOT a network-wide transfer — and races
+    /// `FANOUT` peers (first non-empty response wins; siblings cancelled).
+    fn maybe_trigger_identity_sync(&mut self, wallet: String, scopes: u8) {
+        if wallet.is_empty() || scopes == 0 {
+            return;
+        }
+        // Bound the dedup set (one entry per distinct subject ever seen). It's
+        // only a "don't re-pull this session" optimization, so clearing on
+        // overflow just costs an occasional redundant pull.
+        if self.identity_sync_triggered.len() >= 100_000 {
+            self.identity_sync_triggered.clear();
+        }
+        if !self.identity_sync_triggered.insert(wallet.clone()) {
+            return; // already pulled this session
+        }
+        // Any connected peer is a candidate — request-response negotiation
+        // refuses non-supporters cleanly.
+        let mut candidates: Vec<PeerId> = self.swarm.connected_peers().copied().collect();
+        if candidates.is_empty() {
+            // No peers yet — allow a future re-trigger when one connects.
+            self.identity_sync_triggered.remove(&wallet);
+            return;
+        }
+        use rand::seq::SliceRandom;
+        candidates.shuffle(&mut rand::thread_rng());
+        candidates.truncate(identity_sync::FANOUT);
+
+        let request = identity_sync::IdentitySyncRequest {
+            wallet: wallet.clone(),
+            scopes,
+            cursor: None,
+            overlap_digest: Vec::new(),
+            round: 0,
+        };
+        info!(wallet = %wallet, scopes, fanout = candidates.len(), "identity-sync: triggering pull");
+        for peer in candidates {
+            let id = self
+                .swarm
+                .behaviour_mut()
+                .identity_sync
+                .send_request(&peer, request.clone());
+            self.pending_identity_sync_requests.insert(
+                id,
+                IdentitySyncPending { peer_id: peer, wallet: wallet.clone(), scopes },
+            );
+        }
+    }
+
+    /// Handle inbound + outbound identity-sync request-response events (P-1).
+    fn handle_identity_sync_event(
+        &mut self,
+        event: libp2p::request_response::Event<
+            identity_sync::IdentitySyncRequest,
+            identity_sync::IdentitySyncResponse,
+        >,
+    ) {
+        use crate::messages::router::RouteResult;
+        use libp2p::request_response::{Event, Message};
+        match event {
+            // --- Inbound request: serve the wallet's identity envelopes ---
+            Event::Message {
+                peer,
+                message: Message::Request { request, channel, request_id: _ },
+                connection_id: _,
+            } => {
+                // Reject a malformed/oversized subject before it is used as a
+                // rate-limiter map key or DB prefix (DoS hardening). Don't echo
+                // the (possibly large) string back.
+                if !identity_sync::is_plausible_subject(&request.wallet) {
+                    let _ = self.swarm.behaviour_mut().identity_sync.send_response(
+                        channel,
+                        identity_sync::IdentitySyncResponse {
+                            wallet: String::new(),
+                            envelopes: Vec::new(),
+                            has_more: false,
+                            next_cursor: None,
+                            server_capped: true,
+                            completeness_root: None,
+                        },
+                    );
+                    return;
+                }
+                let guard = self.identity_sync_limits.try_acquire(
+                    peer,
+                    &request.wallet,
+                    identity_sync::SERVER_MAX_CONCURRENT_PER_PEER,
+                    identity_sync::TOTAL_ENVELOPES_CAP,
+                );
+                let response = if guard.is_none() {
+                    identity_sync::capped_response(&request)
+                } else {
+                    identity_sync::build_response(
+                        &self.storage,
+                        &request,
+                        identity_sync::MAX_ENVELOPES_PER_RESPONSE,
+                    )
+                };
+                let envelopes_sent = response.envelopes.len();
+                if envelopes_sent > 0 {
+                    self.identity_sync_limits
+                        .add_served(peer, &request.wallet, envelopes_sent as u64);
+                }
+                if let Err(e) = self
+                    .swarm
+                    .behaviour_mut()
+                    .identity_sync
+                    .send_response(channel, response)
+                {
+                    warn!(peer = %peer, wallet = %request.wallet, error = ?e, "identity-sync: send_response failed");
+                }
+                drop(guard);
+            }
+            // --- Inbound response: validate + apply, then page ---
+            Event::Message {
+                peer,
+                message: Message::Response { request_id, response },
+                connection_id: _,
+            } => {
+                let Some(pending) = self.pending_identity_sync_requests.remove(&request_id) else {
+                    return;
+                };
+                if response.server_capped {
+                    return;
+                }
+                if response.envelopes.is_empty() && !response.has_more {
+                    return;
+                }
+                // Race-winner: cancel sibling requests for the same wallet.
+                self.pending_identity_sync_requests
+                    .retain(|_, p| !(p.wallet == pending.wallet && p.peer_id != peer));
+
+                let env_count = response.envelopes.len();
+                let mut admitted = 0usize;
+                let mut dropped = 0usize;
+                for env_bytes in response.envelopes {
+                    // Smuggling defense: only apply identity envelopes of the
+                    // requested scopes (every envelope is still signature-
+                    // validated by the router below).
+                    if !envelope_targets_scope(&env_bytes, pending.scopes) {
+                        dropped += 1;
+                        continue;
+                    }
+                    match self.router.process_synced_message(&env_bytes) {
+                        RouteResult::Accepted { .. } | RouteResult::Duplicate => admitted += 1,
+                        RouteResult::Rejected(reason) => {
+                            warn!(peer = %peer, wallet = %pending.wallet, reason = %reason, "identity-sync: envelope rejected by router");
+                        }
+                        RouteResult::PowRequired { .. } => {}
+                    }
+                }
+                info!(peer = %peer, wallet = %pending.wallet, received = env_count, admitted, dropped, has_more = response.has_more, "identity-sync: applied bundle");
+
+                if response.has_more {
+                    if let Some(cursor) = response.next_cursor {
+                        let next_req = identity_sync::IdentitySyncRequest {
+                            wallet: pending.wallet.clone(),
+                            scopes: pending.scopes,
+                            cursor: Some(cursor),
+                            overlap_digest: Vec::new(),
+                            round: 0,
+                        };
+                        let next_id = self
+                            .swarm
+                            .behaviour_mut()
+                            .identity_sync
+                            .send_request(&pending.peer_id, next_req);
+                        self.pending_identity_sync_requests.insert(
+                            next_id,
+                            IdentitySyncPending {
+                                peer_id: pending.peer_id,
+                                wallet: pending.wallet,
+                                scopes: pending.scopes,
+                            },
+                        );
+                    }
+                }
+            }
+            Event::OutboundFailure { peer, request_id, error, .. } => {
+                if let Some(pending) = self.pending_identity_sync_requests.remove(&request_id) {
+                    debug!(peer = %peer, wallet = %pending.wallet, error = ?error, "identity-sync: outbound failed; siblings may succeed");
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// One-time bounded backfill of the GLOBAL news feed (P-3). Fires only when
+    /// NEWS_FEED is empty AND peers exist; pulls the last `news_max_age_days` of
+    /// news from up to FANOUT peers (first non-empty wins). Runs once per
+    /// process lifetime — new posts arrive live via gossip otherwise.
+    fn maybe_trigger_news_backfill(&mut self) {
+        if !self.backfill_config.enabled || self.news_backfill_triggered {
+            return;
+        }
+        // Only backfill a genuinely empty feed (fresh / wiped node). A transient
+        // storage error must NOT latch the flag — retry on the next tick.
+        let empty = match self
+            .storage
+            .prefix_iter_cf(crate::storage::schema::cf::NEWS_FEED, &[], 1)
+        {
+            Ok(rows) => rows.is_empty(),
+            Err(_) => return,
+        };
+        if !empty {
+            self.news_backfill_triggered = true; // already have news — never need it
+            return;
+        }
+        let mut candidates: Vec<PeerId> = self.swarm.connected_peers().copied().collect();
+        if candidates.is_empty() {
+            return; // no peers yet — retry on a later tick
+        }
+        use rand::seq::SliceRandom;
+        candidates.shuffle(&mut rand::thread_rng());
+        candidates.truncate(news_sync::FANOUT);
+
+        let max_age_secs = if self.backfill_config.news_max_age_days == 0 {
+            u64::MAX
+        } else {
+            self.backfill_config
+                .news_max_age_days
+                .saturating_mul(24 * 3600)
+        };
+        let request = news_sync::NewsSyncRequest {
+            max_age_secs,
+            cursor: None,
+            overlap_digest: Vec::new(),
+            round: 0,
+        };
+        info!(
+            fanout = candidates.len(),
+            news_max_age_days = self.backfill_config.news_max_age_days,
+            "news-sync: triggering bounded global-news backfill"
+        );
+        for peer in candidates {
+            let id = self
+                .swarm
+                .behaviour_mut()
+                .news_sync
+                .send_request(&peer, request.clone());
+            self.pending_news_sync_requests.insert(id, peer);
+        }
+        self.news_backfill_triggered = true;
+    }
+
+    /// Handle inbound + outbound news-sync request-response events (P-3).
+    fn handle_news_sync_event(
+        &mut self,
+        event: libp2p::request_response::Event<
+            news_sync::NewsSyncRequest,
+            news_sync::NewsSyncResponse,
+        >,
+    ) {
+        use crate::messages::router::RouteResult;
+        use libp2p::request_response::{Event, Message};
+
+        let window_secs = || {
+            if self.backfill_config.news_max_age_days == 0 {
+                u64::MAX
+            } else {
+                self.backfill_config
+                    .news_max_age_days
+                    .saturating_mul(24 * 3600)
+            }
+        };
+
+        match event {
+            // --- Inbound request: serve recent news (windowed + rate-limited) ---
+            Event::Message {
+                peer,
+                message: Message::Request { request, channel, request_id: _ },
+                connection_id: _,
+            } => {
+                let guard = self.news_sync_limits.try_acquire(
+                    peer,
+                    news_sync::SERVER_MAX_CONCURRENT_PER_PEER,
+                    news_sync::TOTAL_ENVELOPES_CAP,
+                );
+                let response = if guard.is_none() {
+                    news_sync::capped_response()
+                } else {
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    news_sync::build_response(
+                        &self.storage,
+                        &request,
+                        news_sync::MAX_ENVELOPES_PER_RESPONSE,
+                        now_ms,
+                        window_secs(),
+                    )
+                };
+                let sent = response.envelopes.len();
+                if sent > 0 {
+                    self.news_sync_limits.add_served(peer, sent as u64);
+                }
+                if let Err(e) = self
+                    .swarm
+                    .behaviour_mut()
+                    .news_sync
+                    .send_response(channel, response)
+                {
+                    warn!(peer = %peer, error = ?e, "news-sync: send_response failed");
+                }
+                drop(guard);
+            }
+            // --- Inbound response: validate + apply, then page ---
+            Event::Message {
+                peer,
+                message: Message::Response { request_id, response },
+                connection_id: _,
+            } => {
+                if self.pending_news_sync_requests.remove(&request_id).is_none() {
+                    return;
+                }
+                if response.server_capped {
+                    return;
+                }
+                if response.envelopes.is_empty() && !response.has_more {
+                    return;
+                }
+                // Race-winner: cancel sibling requests to other peers.
+                self.pending_news_sync_requests.retain(|_, p| *p == peer);
+
+                let count = response.envelopes.len();
+                let mut admitted = 0usize;
+                let mut dropped = 0usize;
+                for env_bytes in response.envelopes {
+                    if !envelope_targets_news(&env_bytes) {
+                        dropped += 1;
+                        continue;
+                    }
+                    match self.router.process_synced_message(&env_bytes) {
+                        RouteResult::Accepted { .. } | RouteResult::Duplicate => admitted += 1,
+                        RouteResult::Rejected(reason) => {
+                            warn!(peer = %peer, reason = %reason, "news-sync: envelope rejected by router");
+                        }
+                        RouteResult::PowRequired { .. } => {}
+                    }
+                }
+                info!(peer = %peer, received = count, admitted, dropped, has_more = response.has_more, "news-sync: applied batch");
+
+                if response.has_more {
+                    if let Some(cursor) = response.next_cursor {
+                        let next_req = news_sync::NewsSyncRequest {
+                            max_age_secs: window_secs(),
+                            cursor: Some(cursor),
+                            overlap_digest: Vec::new(),
+                            round: 0,
+                        };
+                        let next_id = self
+                            .swarm
+                            .behaviour_mut()
+                            .news_sync
+                            .send_request(&peer, next_req);
+                        self.pending_news_sync_requests.insert(next_id, peer);
+                    }
+                }
+            }
+            Event::OutboundFailure { peer, request_id, error, .. } => {
+                if self.pending_news_sync_requests.remove(&request_id).is_some() {
+                    debug!(peer = %peer, error = ?error, "news-sync: outbound failed; siblings may succeed");
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn maybe_trigger_backfill(&mut self, channel_id: u64) {
         if !self.backfill_config.enabled {
             return;

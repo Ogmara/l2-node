@@ -500,6 +500,37 @@ impl Storage {
         self.write_batch(batch)
     }
 
+    /// Apply a Follow (`follow=true`) or Unfollow (`follow=false`) with
+    /// last-writer-wins ordering by signed `ts` (P-2). Rejects a stale/replayed
+    /// edge change so a malicious backfill can't tamper a follow graph. Returns
+    /// `true` if applied, `false` if it was stale (no-op). `follow`/`unfollow`
+    /// are idempotent, so `FOLLOWS` stays the authoritative state and this only
+    /// adds the per-edge timestamp watermark.
+    pub fn apply_follow_edge(
+        &self,
+        follower: &str,
+        followed: &str,
+        follow: bool,
+        ts: u64,
+    ) -> Result<bool> {
+        let edge_key = super::schema::encode_follow_key(follower, followed);
+        let prev_ts = self
+            .get_cf(cf::FOLLOW_EDGE_TS, &edge_key)?
+            .and_then(|b| <[u8; 8]>::try_from(b.as_slice()).ok())
+            .map(u64::from_be_bytes)
+            .unwrap_or(0);
+        if ts <= prev_ts {
+            return Ok(false); // stale — no-op
+        }
+        if follow {
+            self.follow(follower, followed)?;
+        } else {
+            self.unfollow(follower, followed)?;
+        }
+        self.put_cf(cf::FOLLOW_EDGE_TS, &edge_key, &ts.to_be_bytes())?;
+        Ok(true)
+    }
+
     /// Check if follower is following followed.
     pub fn is_following(&self, follower: &str, followed: &str) -> Result<bool> {
         let key = super::schema::encode_follow_key(follower, followed);
@@ -1454,6 +1485,71 @@ impl Storage {
         Ok(())
     }
 
+    /// One-time backfill of `IDENTITY_ENVELOPES` from existing `MESSAGES`
+    /// (P-1 identity-sync, l2-node 0.50.0+). STREAMS every stored envelope
+    /// (raw iterator — no full materialization) and indexes the five identity
+    /// types under their resolved wallet, so a node upgraded with history can
+    /// serve pre-existing delegations/profiles/follows. Idempotent — guarded by
+    /// the `IDENTITY_ENVELOPES_INDEXED` sentinel. MUST run AFTER
+    /// `backfill_delegation_map` so device→wallet resolution is populated.
+    pub fn backfill_identity_envelopes(&self) -> Result<()> {
+        use crate::messages::envelope::Envelope;
+        use crate::messages::types::MessageType;
+        use tracing::info;
+
+        let cf = self
+            .db
+            .cf_handle(cf::MESSAGES)
+            .with_context(|| "column family 'messages' not found")?;
+        let mut iter = self.db.raw_iterator_cf(&cf);
+        iter.seek_to_first();
+
+        let mut indexed = 0u64;
+        while iter.valid() {
+            if let Some(raw) = iter.value() {
+                if let Ok(envelope) = rmp_serde::from_slice::<Envelope>(raw) {
+                    let is_identity = matches!(
+                        envelope.msg_type,
+                        MessageType::ProfileUpdate
+                            | MessageType::DeviceDelegation
+                            | MessageType::DeviceRevocation
+                            | MessageType::Follow
+                            | MessageType::Unfollow
+                    );
+                    if is_identity {
+                        // Index under the resolved wallet (device-authored
+                        // profile/follow envelopes resolve via DEVICE_WALLET_MAP;
+                        // DeviceDelegation is already wallet-authored). Falls
+                        // back to the raw author if unmapped.
+                        let wallet = match self.resolve_wallet(&envelope.author) {
+                            Ok(Some(w)) => w,
+                            _ => envelope.author.clone(),
+                        };
+                        let key = super::schema::encode_identity_envelope_key(
+                            &wallet,
+                            envelope.msg_type_u8(),
+                            envelope.timestamp,
+                            &envelope.msg_id,
+                        );
+                        self.put_cf(cf::IDENTITY_ENVELOPES, &key, &[])?;
+                        indexed += 1;
+                    }
+                }
+            }
+            iter.next();
+        }
+
+        if indexed > 0 {
+            info!(indexed, "Backfilled IDENTITY_ENVELOPES from MESSAGES");
+        }
+        self.put_cf(
+            cf::NODE_STATE,
+            super::schema::state_keys::IDENTITY_ENVELOPES_INDEXED,
+            &1u64.to_be_bytes(),
+        )?;
+        Ok(())
+    }
+
     /// Migrate device addresses from klv1... to ogd1... prefix.
     ///
     /// Re-derives all device addresses in DEVICE_WALLET_MAP and WALLET_DEVICES
@@ -2170,9 +2266,17 @@ impl Storage {
     /// Note: the read-then-delete is not fully atomic (TOCTOU). The API layer
     /// (Phase 3) serializes revocations per wallet via auth, making concurrent
     /// register+revoke for the same device by different wallets impossible.
-    pub fn revoke_device(&self, device_address: &str, wallet_address: &str) -> Result<bool> {
+    pub fn revoke_device(
+        &self,
+        device_address: &str,
+        wallet_address: &str,
+        revoked_at: u64,
+    ) -> Result<bool> {
         let device_key = device_address.as_bytes();
-        // Verify this device is actually mapped to this wallet
+        // Verify this device is actually mapped to this wallet. Only the owning
+        // wallet (while mapped) may tombstone the device — otherwise a wallet
+        // could tombstone a device it doesn't own and DoS the real owner's
+        // delegation.
         match self.get_cf(cf::DEVICE_WALLET_MAP, device_key)? {
             Some(stored_wallet) => {
                 if stored_wallet != wallet_address.as_bytes() {
@@ -2186,12 +2290,33 @@ impl Storage {
 
         let map_cf = self.cf_handle(cf::DEVICE_WALLET_MAP)?;
         let devices_cf = self.cf_handle(cf::WALLET_DEVICES)?;
+        let revoc_cf = self.cf_handle(cf::DEVICE_REVOCATIONS)?;
+
+        // P-2: write a revocation tombstone (last-writer-wins by timestamp) so a
+        // later replayed/stale DeviceDelegation cannot resurrect this device.
+        let prev = self
+            .get_cf(cf::DEVICE_REVOCATIONS, device_key)?
+            .and_then(|b| <[u8; 8]>::try_from(b.as_slice()).ok())
+            .map(u64::from_be_bytes)
+            .unwrap_or(0);
+        let tombstone_ts = revoked_at.max(prev);
 
         let mut batch = WriteBatch::default();
         batch.delete_cf(&map_cf, device_key);
         batch.delete_cf(&devices_cf, &wallet_device_key);
+        batch.put_cf(&revoc_cf, device_key, tombstone_ts.to_be_bytes());
         self.write_batch(batch)?;
         Ok(true)
+    }
+
+    /// Revocation-tombstone timestamp for a device, if it was ever revoked
+    /// (P-2). A `DeviceDelegation` with `timestamp <= revoked_at` must be
+    /// rejected to prevent resurrecting a revoked device via stale replay.
+    pub fn get_device_revoked_at(&self, device_address: &str) -> Result<Option<u64>> {
+        Ok(self
+            .get_cf(cf::DEVICE_REVOCATIONS, device_address.as_bytes())?
+            .and_then(|b| <[u8; 8]>::try_from(b.as_slice()).ok())
+            .map(u64::from_be_bytes))
     }
 
     /// Resolve a device address to its owning wallet address.

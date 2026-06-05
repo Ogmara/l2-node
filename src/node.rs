@@ -111,6 +111,18 @@ impl Node {
             }
         }
 
+        // Backfill IDENTITY_ENVELOPES from MESSAGES (one-time, P-1 identity-sync).
+        // Runs after the delegation-map backfill above so device-authored
+        // profile/follow envelopes resolve to their wallet. Lets a node upgraded
+        // with history serve pre-existing delegations/profiles/follows.
+        let identity_envelopes_indexed =
+            storage.get_stat(state_keys::IDENTITY_ENVELOPES_INDEXED)? > 0;
+        if !identity_envelopes_indexed {
+            if let Err(e) = storage.backfill_identity_envelopes() {
+                warn!(error = %e, "Failed to backfill IDENTITY_ENVELOPES index");
+            }
+        }
+
         // Load Lamport counter from storage
         let lamport_value = storage.get_lamport_counter()?;
         let lamport_counter = Arc::new(AtomicU64::new(lamport_value));
@@ -354,6 +366,11 @@ impl Node {
         let (gossip_tx, gossip_rx) =
             tokio::sync::mpsc::unbounded_channel::<crate::network::GossipPublish>();
 
+        // Channel for API/router → network: lazy per-wallet identity-sync pulls
+        // (P-1, l2-node 0.50.0+).
+        let (identity_sync_tx, identity_sync_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::network::IdentitySyncCommand>();
+
         // Subscribe to all existing channels from storage so the node
         // participates in GossipSub for channels it already knows about.
         match self.storage.prefix_iter_cf(
@@ -417,7 +434,7 @@ impl Node {
         let network_shutdown_rx = self.shutdown_rx();
         let network_task = tokio::spawn(async move {
             network
-                .run(network_shutdown_rx, channel_rx, gossip_rx, sc_reconnect_rx)
+                .run(network_shutdown_rx, channel_rx, gossip_rx, sc_reconnect_rx, identity_sync_rx)
                 .await;
         });
 
@@ -990,6 +1007,7 @@ impl Node {
             anchor_trigger_tx,
             peer_count,
             gossip_tx,
+            identity_sync_tx,
             connected_peers,
             network_counters,
             metrics_latest,
