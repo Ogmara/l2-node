@@ -14,6 +14,8 @@ use libp2p::{kad, Swarm, SwarmBuilder};
 
 use crate::config::Config;
 
+use super::identity_sync::IdentitySyncCodec;
+use super::news_sync::NewsSyncCodec;
 use super::reconcile::ReconcileCodec;
 use super::snapshot::SnapshotCodec;
 use super::sync::SyncCodec;
@@ -45,6 +47,15 @@ pub struct OgmaraBehaviour {
     /// 0.47.0+). Used to backfill an empty `CHANNEL_MSGS` index on
     /// cold-join. Wire types in [`super::reconcile`].
     pub reconcile: ReconcileCodec,
+    /// Request-Response for the identity-sync protocol (P-1, l2-node
+    /// 0.50.0+). Lazily backfills a single wallet's delegation/profile/
+    /// follows when that wallet is first seen on this node. Wire types in
+    /// [`super::identity_sync`].
+    pub identity_sync: IdentitySyncCodec,
+    /// Request-Response for the news-sync protocol (P-3, l2-node 0.52.0+).
+    /// Bounded backfill of the global news feed (default last 7 days) on a
+    /// node with an empty NEWS_FEED. Wire types in [`super::news_sync`].
+    pub news_sync: NewsSyncCodec,
 }
 
 /// Build the libp2p swarm with all configured behaviours.
@@ -214,6 +225,40 @@ pub fn build_swarm(config: &Config, keypair: Keypair) -> Result<Swarm<OgmaraBeha
             .with_request_timeout(Duration::from_secs(45)),
     );
 
+    // Identity-sync (P-1): always Full — serving a wallet's public identity
+    // envelopes is lightweight and read-only, and the per-(peer,wallet) rate
+    // limiter bounds it. Independent protocol string so it versions separately.
+    let identity_sync_protocol =
+        super::identity_sync::protocol_string(config.network_id());
+    let identity_sync = libp2p::request_response::cbor::Behaviour::<
+        super::identity_sync::IdentitySyncRequest,
+        super::identity_sync::IdentitySyncResponse,
+    >::new(
+        [(
+            libp2p::StreamProtocol::try_from_owned(identity_sync_protocol)
+                .map_err(|e| anyhow::anyhow!("invalid identity-sync protocol string: {}", e))?,
+            libp2p::request_response::ProtocolSupport::Full,
+        )],
+        libp2p::request_response::Config::default()
+            .with_request_timeout(Duration::from_secs(45)),
+    );
+
+    // News-sync (P-3): always Full — serving recent public news is lightweight
+    // and the per-peer cap + window bound it.
+    let news_sync_protocol = super::news_sync::protocol_string(config.network_id());
+    let news_sync = libp2p::request_response::cbor::Behaviour::<
+        super::news_sync::NewsSyncRequest,
+        super::news_sync::NewsSyncResponse,
+    >::new(
+        [(
+            libp2p::StreamProtocol::try_from_owned(news_sync_protocol)
+                .map_err(|e| anyhow::anyhow!("invalid news-sync protocol string: {}", e))?,
+            libp2p::request_response::ProtocolSupport::Full,
+        )],
+        libp2p::request_response::Config::default()
+            .with_request_timeout(Duration::from_secs(45)),
+    );
+
     let behaviour = OgmaraBehaviour {
         connection_limits,
         gossipsub,
@@ -223,6 +268,8 @@ pub fn build_swarm(config: &Config, keypair: Keypair) -> Result<Swarm<OgmaraBeha
         request_response,
         snapshot,
         reconcile,
+        identity_sync,
+        news_sync,
     };
 
     let swarm = SwarmBuilder::with_existing_identity(keypair)

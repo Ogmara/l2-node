@@ -212,6 +212,11 @@ pub struct AppState {
     /// Carries a [`crate::network::GossipPublish`] (topic + bytes +
     /// optional outcome responder, l2-node 0.48.4).
     pub gossip_tx: tokio::sync::mpsc::UnboundedSender<crate::network::GossipPublish>,
+    /// Channel asking the network task to lazily pull a wallet's identity
+    /// bundle from peers (P-1 identity-sync, l2-node 0.50.0+). Fired when a
+    /// wallet is first seen on this node or a device can't be resolved.
+    pub identity_sync_tx:
+        tokio::sync::mpsc::UnboundedSender<crate::network::IdentitySyncCommand>,
     /// Connected Ogmara peers (keyed by node_id), updated by the network layer.
     /// Used by `/api/v1/network/nodes` to include peers that haven't announced yet.
     pub connected_peers: Arc<RwLock<HashMap<String, ConnectedPeerInfo>>>,
@@ -411,6 +416,7 @@ impl AppState {
     ) -> Self {
         let (ws_broadcast, _) = broadcast::channel(1024);
         let (gossip_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let (identity_sync_tx, _) = tokio::sync::mpsc::unbounded_channel();
         let counters = Arc::new(NetworkCounters::new());
         let metrics_latest = Arc::new(RwLock::new(MetricsSnapshot::default()));
         let metrics_history = Arc::new(RwLock::new(RingBuffer::new(1440)));
@@ -432,6 +438,7 @@ impl AppState {
             anchor_trigger,
             Arc::new(AtomicU32::new(0)),
             gossip_tx,
+            identity_sync_tx,
             Arc::new(RwLock::new(HashMap::new())),
             counters,
             metrics_latest,
@@ -482,6 +489,7 @@ impl AppState {
         anchor_trigger: Option<mpsc::Sender<oneshot::Sender<Result<String, String>>>>,
         peer_count: Arc<AtomicU32>,
         gossip_tx: tokio::sync::mpsc::UnboundedSender<crate::network::GossipPublish>,
+        identity_sync_tx: tokio::sync::mpsc::UnboundedSender<crate::network::IdentitySyncCommand>,
         connected_peers: Arc<RwLock<HashMap<String, ConnectedPeerInfo>>>,
         counters: Arc<NetworkCounters>,
         metrics_latest: Arc<RwLock<MetricsSnapshot>>,
@@ -555,6 +563,7 @@ impl AppState {
             notification_engine,
             anchor_trigger,
             gossip_tx,
+            identity_sync_tx,
             connected_peers,
             counters,
             metrics_latest,

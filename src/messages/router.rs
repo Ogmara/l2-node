@@ -365,6 +365,20 @@ impl MessageRouter {
         let signature = ed25519_dalek::Signature::from_slice(&envelope.signature)
             .map_err(|e| anyhow::anyhow!("invalid signature bytes: {}", e))?;
 
+        // DeviceDelegation is dual-signed over the CLAIM string, not the
+        // binary envelope preimage (P-0, l2-node 0.49.0+). Browser-extension
+        // wallets can only sign UTF-8 strings (`signMessage`), so the wallet
+        // authorizes via a Klever-format signature over the canonical claim;
+        // the DEVICE key co-signs the SAME claim as proof-of-possession. We
+        // verify BOTH here at the gate so a forged/tampered delegation is
+        // rejected before it is stored or relayed (process_message order:
+        // verify → store → apply → caller relays). This makes the binding
+        // unforgeable: impersonating a wallet needs the wallet key; hijacking
+        // a device needs the device key.
+        if envelope.msg_type == MessageType::DeviceDelegation {
+            return self.verify_device_delegation_claim(envelope, &verifying_key, &signature);
+        }
+
         // Try Ogmara protocol format first (most common for L2 messages)
         let ogmara_result = signing::verify_ogmara_message(
             &verifying_key,
@@ -395,6 +409,81 @@ impl MessageRouter {
         );
 
         klever_result.map_err(|_| anyhow::anyhow!("signature verification failed for both formats"))
+    }
+
+    /// Dual-signature verification for a `DeviceDelegation` envelope (P-0).
+    ///
+    /// Both the WALLET (authorizes the binding) and the DEVICE (proves it
+    /// holds the key) must have signed the canonical claim string
+    /// `ogmara-device-claim:{device_pub_key_lowercase}:{wallet}:{timestamp}`
+    /// in Klever message format:
+    ///   * `envelope.signature` — the wallet's signature, checked against
+    ///     `envelope.author` (the wallet `wallet_key`).
+    ///   * `payload.device_signature` — the device's signature, checked
+    ///     against the device public key in the payload.
+    ///
+    /// A relaying node is never trusted: a receiver re-derives the claim from
+    /// the envelope and re-verifies both signatures, so it cannot be tricked
+    /// into storing a binding the wallet didn't authorize or the device
+    /// doesn't control.
+    fn verify_device_delegation_claim(
+        &self,
+        envelope: &Envelope,
+        wallet_key: &ed25519_dalek::VerifyingKey,
+        wallet_sig: &ed25519_dalek::Signature,
+    ) -> Result<()> {
+        let payload: DeviceDelegationPayload =
+            rmp_serde::from_slice(&envelope.payload)
+                .context("DeviceDelegation payload decode for signature verification")?;
+
+        // Canonical claim string — lowercase device pubkey so the bytes the
+        // two signers signed are reproduced exactly on every node.
+        let device_pubkey_hex = payload.device_pub_key.to_ascii_lowercase();
+        let claim = format!(
+            "ogmara-device-claim:{}:{}:{}",
+            device_pubkey_hex, envelope.author, envelope.timestamp
+        );
+
+        // 1) Wallet authorizes the binding.
+        signing::verify_klever_message(wallet_key, claim.as_bytes(), wallet_sig)
+            .map_err(|_| anyhow::anyhow!("DeviceDelegation wallet claim signature invalid"))?;
+
+        // 2) Device proves possession of its key over the SAME claim.
+        let dev_pubkey_bytes: [u8; 32] = hex::decode(&device_pubkey_hex)
+            .context("device_pub_key hex")?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("device_pub_key must be 32 bytes"))?;
+        let dev_key = ed25519_dalek::VerifyingKey::from_bytes(&dev_pubkey_bytes)
+            .map_err(|e| anyhow::anyhow!("invalid device public key: {}", e))?;
+        let dev_sig_bytes = hex::decode(&payload.device_signature)
+            .map_err(|_| anyhow::anyhow!("device_signature is not valid hex"))?;
+        let dev_sig = ed25519_dalek::Signature::from_slice(&dev_sig_bytes)
+            .map_err(|_| anyhow::anyhow!("device_signature must be 64 bytes"))?;
+        signing::verify_klever_message(&dev_key, claim.as_bytes(), &dev_sig)
+            .map_err(|_| anyhow::anyhow!("DeviceDelegation device proof-of-possession invalid"))?;
+
+        // The signed claim covers only the device↔wallet↔timestamp binding —
+        // NOT `permissions`/`expires_at`. To stop a relaying node from forging
+        // those fields (recomputing msg_id and riding the genuine claim
+        // signatures), require the canonical values at the gate. Device→wallet
+        // resolution ignores permissions today, but enforcing the canonical
+        // form here removes the forgery surface entirely and keeps a future
+        // code path from ever trusting relay-supplied permissions. The node's
+        // own builder (`build_and_gossip_dual_delegation`) always emits exactly
+        // these values. Granular/expiring delegations, if ever needed, must
+        // bring permissions+expiry under the signature (P-2+).
+        if !(payload.permissions.can_send_messages
+            && payload.permissions.can_create_channels
+            && payload.permissions.can_update_profile)
+            || payload.expires_at.is_some()
+        {
+            anyhow::bail!(
+                "DeviceDelegation must carry canonical permissions and no expiry \
+                 (unsigned fields; rejected to prevent relay forgery)"
+            );
+        }
+
+        Ok(())
     }
 
     /// Verify that the msg_id matches Keccak-256(author + payload + timestamp).
@@ -1076,6 +1165,31 @@ impl MessageRouter {
 
     /// Update storage indexes based on message type.
     fn update_indexes(&self, envelope: &Envelope, resolved_author: &str) -> Result<()> {
+        // P-1 (identity-sync): index a user's signed identity envelopes
+        // (delegation/revocation/profile/follow/unfollow) under their wallet so
+        // the per-wallet identity-sync responder can re-serve them to a node the
+        // user just connected to. `resolved_author` is the wallet for all five
+        // types (DeviceDelegation is wallet-authored; the others are
+        // device-authored and resolve to the wallet). The original signed
+        // envelope is already kept in MESSAGES; this index just enumerates it.
+        if matches!(
+            envelope.msg_type,
+            MessageType::ProfileUpdate
+                | MessageType::DeviceDelegation
+                | MessageType::DeviceRevocation
+                | MessageType::Follow
+                | MessageType::Unfollow
+        ) {
+            let key = schema::encode_identity_envelope_key(
+                resolved_author,
+                envelope.msg_type_u8(),
+                envelope.timestamp,
+                &envelope.msg_id,
+            );
+            self.storage
+                .put_cf(schema::cf::IDENTITY_ENVELOPES, &key, &[])?;
+        }
+
         match envelope.msg_type {
             MessageType::ChatMessage => {
                 if let Ok(payload) =
@@ -1175,14 +1289,26 @@ impl MessageRouter {
                 if let Ok(payload) =
                     rmp_serde::from_slice::<FollowPayload>(&envelope.payload)
                 {
-                    self.storage.follow(resolved_author, &payload.target)?;
+                    // P-2: LWW by signed timestamp — a stale/replayed follow is
+                    // a no-op so a malicious backfill can't tamper the graph.
+                    self.storage.apply_follow_edge(
+                        resolved_author,
+                        &payload.target,
+                        true,
+                        envelope.timestamp,
+                    )?;
                 }
             }
             MessageType::Unfollow => {
                 if let Ok(payload) =
                     rmp_serde::from_slice::<UnfollowPayload>(&envelope.payload)
                 {
-                    self.storage.unfollow(resolved_author, &payload.target)?;
+                    self.storage.apply_follow_edge(
+                        resolved_author,
+                        &payload.target,
+                        false,
+                        envelope.timestamp,
+                    )?;
                 }
             }
             MessageType::ChannelCreate => {
@@ -1665,6 +1791,28 @@ impl MessageRouter {
                     let device_address = crypto::device_pubkey_to_address(&verifying_key)
                         .map_err(|e| anyhow::anyhow!("failed to encode device address: {}", e))?;
 
+                    // P-2: reject a delegation older-or-equal to a revocation
+                    // tombstone. A stale/replayed DeviceDelegation must never
+                    // resurrect a revoked (possibly compromised) device — a
+                    // genuine re-delegation carries a newer timestamp. Closes
+                    // the resurrection/auth-bypass vector on every path (gossip
+                    // and identity-sync backfill).
+                    if let Some(revoked_at) = self
+                        .identity
+                        .get_device_revoked_at(&device_address)
+                        .context("checking device revocation tombstone")?
+                    {
+                        if envelope.timestamp <= revoked_at {
+                            debug!(
+                                device = %device_address,
+                                revoked_at,
+                                incoming_ts = envelope.timestamp,
+                                "DeviceDelegation older-or-equal to revocation tombstone — rejected"
+                            );
+                            return Ok(());
+                        }
+                    }
+
                     // Code Audit W1 (0.46.8): bail on storage faults
                     // rather than falling through to the apply path.
                     // A storage error in `list_devices` previously
@@ -1781,7 +1929,9 @@ impl MessageRouter {
                     let device_address = crypto::device_pubkey_to_address(&verifying_key)
                         .map_err(|e| anyhow::anyhow!("failed to encode device address: {}", e))?;
 
-                    let revoked = self.identity.revoke_device(&device_address, resolved_author)
+                    let revoked = self
+                        .identity
+                        .revoke_device(&device_address, resolved_author, envelope.timestamp)
                         .context("revoking device")?;
                     if revoked {
                         debug!(
@@ -1924,6 +2074,24 @@ impl MessageRouter {
                         }),
                     };
 
+                    // P-2: last-writer-wins by signed timestamp. Ignore a
+                    // stale/replayed ProfileUpdate so a malicious backfill can't
+                    // downgrade a profile to an older version. (on-chain
+                    // `registered_at` verification is separate and unaffected.)
+                    let prev_profile_ts = record
+                        .get("profile_updated_at")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    if envelope.timestamp <= prev_profile_ts {
+                        debug!(
+                            author = %resolved_author,
+                            prev = prev_profile_ts,
+                            incoming = envelope.timestamp,
+                            "ProfileUpdate older-or-equal — no-op (LWW)"
+                        );
+                        return Ok(());
+                    }
+
                     // Capture old display_name BEFORE merge so we can clean up the
                     // USERS_BY_NAME prefix index if the name actually changed.
                     let old_name = record
@@ -1942,6 +2110,11 @@ impl MessageRouter {
                         if let Some(bio) = &payload.bio {
                             map.insert("bio".into(), serde_json::json!(bio));
                         }
+                        // Record the LWW watermark for the next apply.
+                        map.insert(
+                            "profile_updated_at".into(),
+                            serde_json::json!(envelope.timestamp),
+                        );
                     }
 
                     let bytes = serde_json::to_vec(&record)

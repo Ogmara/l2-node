@@ -536,6 +536,13 @@ pub struct BackfillConfig {
     /// malicious client from inducing an unbounded scan.
     #[serde(default = "default_backfill_total_envelopes_cap")]
     pub total_envelopes_cap: usize,
+    /// Global-news backfill window in days (P-3, l2-node 0.52.0+). A fresh
+    /// node with an empty NEWS_FEED pulls only the last `news_max_age_days` of
+    /// news (default 7) — never years of history. `0` = unlimited (archive
+    /// nodes that want to serve/keep the full feed). The per-page and total
+    /// caps in `network::news_sync` apply on top of the window.
+    #[serde(default = "default_backfill_news_max_age_days")]
+    pub news_max_age_days: u64,
 }
 
 impl Default for BackfillConfig {
@@ -552,12 +559,16 @@ impl Default for BackfillConfig {
             max_envelopes_per_response:
                 default_backfill_max_envelopes_per_response(),
             total_envelopes_cap: default_backfill_total_envelopes_cap(),
+            news_max_age_days: default_backfill_news_max_age_days(),
         }
     }
 }
 
 fn default_backfill_max_age_days() -> u64 {
     30
+}
+fn default_backfill_news_max_age_days() -> u64 {
+    7
 }
 fn default_backfill_fanout() -> usize {
     3

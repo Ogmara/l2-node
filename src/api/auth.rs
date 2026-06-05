@@ -174,6 +174,21 @@ fn extract_and_verify(req: &Request, app_state: &AppState) -> Result<AuthUser, S
             "identity resolution error".to_string()
         })?;
 
+    // P-1 (identity-sync): the first time this wallet/device is seen on this
+    // node, lazily pull its identity bundle (delegation/profile/follows) from
+    // peers so the user keeps their identity, follows, and feed wherever they
+    // connect. The network task dedups per subject per session, so firing per
+    // request is cheap; `let _ =` ignores a closed channel (network task gone).
+    // An unresolved device (`resolved_address` still `ogd1…`) is resolved to
+    // its wallet by the serving peer, whose returned delegation then lets us
+    // resolve the device locally.
+    let _ = app_state
+        .identity_sync_tx
+        .send(crate::network::IdentitySyncCommand {
+            wallet: resolved_address.clone(),
+            scopes: crate::network::identity_sync::SCOPE_ALL,
+        });
+
     Ok(AuthUser {
         address: resolved_address,
         signing_address,

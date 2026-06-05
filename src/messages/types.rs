@@ -558,6 +558,18 @@ pub struct DeviceDelegationPayload {
     pub permissions: DelegationPermissions,
     /// Optional expiry timestamp.
     pub expires_at: Option<u64>,
+    /// **Device proof-of-possession** (l2-node 0.49.0+, P-0 dual-signed
+    /// delegation). Hex-encoded Ed25519 signature by the DEVICE key over the
+    /// canonical claim string
+    /// `ogmara-device-claim:{device_pub_key_lowercase}:{author_wallet}:{timestamp}`
+    /// (Klever message format). The envelope's own `signature` is the WALLET's
+    /// signature over the SAME claim string. Verifying BOTH (wallet authorizes
+    /// + device proves it holds the key) makes a delegation unforgeable:
+    /// impersonating a wallet needs the wallet key; hijacking a device needs
+    /// the device key. Empty/absent on legacy envelopes → rejected at
+    /// `verify_signature`. See spec 1 §device-delegation.
+    #[serde(default)]
+    pub device_signature: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -130,16 +130,30 @@ impl IdentityResolver {
         Ok(())
     }
 
-    /// Revoke a device registration and invalidate the cache.
+    /// Revoke a device registration and invalidate the cache. `revoked_at` is
+    /// the revocation timestamp written to the P-2 tombstone so later stale
+    /// delegations are rejected.
     ///
     /// Returns `true` if the device was registered and is now revoked.
-    pub fn revoke_device(&self, device_address: &str, wallet_address: &str) -> Result<bool> {
-        let revoked = self.storage.revoke_device(device_address, wallet_address)?;
+    pub fn revoke_device(
+        &self,
+        device_address: &str,
+        wallet_address: &str,
+        revoked_at: u64,
+    ) -> Result<bool> {
+        let revoked = self
+            .storage
+            .revoke_device(device_address, wallet_address, revoked_at)?;
         if revoked {
             // Remove from cache so next resolve falls back to device address
             self.cache.remove(device_address);
         }
         Ok(revoked)
+    }
+
+    /// Revocation-tombstone timestamp for a device, if any (P-2).
+    pub fn get_device_revoked_at(&self, device_address: &str) -> Result<Option<u64>> {
+        self.storage.get_device_revoked_at(device_address)
     }
 
     /// List all devices registered to a wallet.
@@ -243,8 +257,13 @@ mod tests {
         let claim = test_claim("klv1device333", "klv1wallet333");
         resolver.register_device(&claim).unwrap();
 
-        let revoked = resolver.revoke_device("klv1device333", "klv1wallet333").unwrap();
+        let revoked = resolver
+            .revoke_device("klv1device333", "klv1wallet333", 1000)
+            .unwrap();
         assert!(revoked);
+        // P-2: tombstone now blocks a stale re-delegation (ts <= revoked_at)
+        // and allows a genuine newer one.
+        assert_eq!(resolver.get_device_revoked_at("klv1device333").unwrap(), Some(1000));
 
         let result = resolver.resolve("klv1device333").unwrap();
         assert_eq!(result, "klv1device333"); // falls back to device address
@@ -309,7 +328,7 @@ mod tests {
         let claim_a = test_claim("klv1deviceREVOKED", "klv1walletA");
         resolver.register_device(&claim_a).unwrap();
         let revoked = resolver
-            .revoke_device("klv1deviceREVOKED", "klv1walletA")
+            .revoke_device("klv1deviceREVOKED", "klv1walletA", 1000)
             .unwrap();
         assert!(revoked);
 
@@ -331,7 +350,9 @@ mod tests {
         let claim = test_claim("klv1device444", "klv1wallet444");
         resolver.register_device(&claim).unwrap();
 
-        let revoked = resolver.revoke_device("klv1device444", "klv1wrongwallet").unwrap();
+        let revoked = resolver
+            .revoke_device("klv1device444", "klv1wrongwallet", 1000)
+            .unwrap();
         assert!(!revoked);
 
         // Mapping still intact

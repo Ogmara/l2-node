@@ -5,6 +5,184 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.52.1] - 2026-06-05
+
+### Fixed
+
+- **Channel logos/metadata now propagate to all nodes.** `ChannelUpdate`
+  (which carries `logo_cid`/`banner_cid`/display_name/description — L2-only
+  fields the chain scanner does NOT set) was not gossiped, so a channel's logo
+  only ever existed on the node where it was set; other nodes discovered the
+  channel via the chain scanner but showed no logo. `ChannelUpdate` is now
+  gossiped to the channel topic, so subscribed nodes pick up metadata changes.
+  Safe: `authorize_channel_action` runs on every ingest path (including gossip)
+  and rejects a `ChannelUpdate` whose author isn't the channel creator or a mod
+  with `can_edit_info`, so a relayed update can't be forged (the creator is
+  known on every node via the chain scanner). NOTE: this propagates updates
+  going forward — existing logos appear on other nodes the next time the owner
+  saves channel settings (re-emitting a `ChannelUpdate`) or when a node
+  bootstraps via snapshot (CHANNELS is a snapshot domain CF).
+
+## [0.52.0] - 2026-06-05
+
+### Added
+
+- **Bounded global-news backfill (P-3).** A fresh or wiped node previously
+  showed an empty news feed (NewsPosts gossip once and were never backfilled).
+  A new `news-sync` request/response (`/ogmara/{network}/news-sync/1.0.0`,
+  mirroring channel-reconcile) now backfills it — but **bounded by design**, so
+  it can never pull years of history:
+  - **7-day default window** (`[backfill] news_max_age_days = 7`,
+    operator-overridable; `0` = unlimited for archive nodes). NEWS_FEED is
+    stored newest-first, so the window is a cheap monotonic early-stop. The
+    responder serves the tighter of its own window and the request's, so a peer
+    can't ask it to scan further back than configured.
+  - **Capped + paged:** ≤200 envelopes/page, ≤2000 cumulative per peer, racing
+    fan-out to ≤3 peers (first non-empty wins). Per-peer concurrency + served
+    maps are size-bounded.
+  - **Lazy + once:** fires only when the local NEWS_FEED is empty AND peers are
+    connected, once per process lifetime (retries each bootstrap tick until
+    peers exist; respects `[backfill] enabled`). New posts arrive live via
+    gossip as before.
+  - The responder re-serves the original signed envelopes; the requester
+    re-validates each through `process_synced_message` and accepts only
+    news-feed message types (`0x20`–`0x23`, `0x25`), so a relaying peer is never
+    trusted and can't inject non-news content. NEWS_FEED only references public
+    news, so no DM/private content is reachable.
+
+### Note
+
+- L2-only channel **metadata/membership** backfill (the other half of plan P-3)
+  is deferred (post-mainnet-acceptable): on-chain channels are re-discovered by
+  the chain scanner, so the gap is limited to purely-L2 channels.
+
+## [0.51.0] - 2026-06-05
+
+### Security
+
+- **Replay-ordering for identity state (P-2) — closes the identity-sync (P-1)
+  pre-deploy gate.** Backfill re-serves genuine signed envelopes, so a
+  malicious peer could previously serve a *stale subset* (withholding a newer
+  update) to poison a freshly-synced node. The apply arms are now ordered, on
+  every path (gossip AND identity-sync), so a stale replay is a no-op:
+  - **Device-revocation tombstone** (the serious one — was an on-demand auth
+    bypass): `revoke_device` writes `DEVICE_REVOCATIONS[device] = revoked_at`
+    (last-writer-wins max; only when the device is mapped to the revoking
+    wallet, so it can't be used to DoS another wallet's device). The
+    `DeviceDelegation` apply arm rejects any delegation with
+    `timestamp <= revoked_at`, so a replayed/stale delegation can never
+    resurrect a revoked (possibly compromised) device. A genuine re-delegation
+    carries a newer timestamp and is unaffected.
+  - **ProfileUpdate LWW:** records `profile_updated_at` and no-ops an update
+    with `timestamp <=` it (no profile downgrade).
+  - **Follow/Unfollow LWW:** a per-edge `FOLLOW_EDGE_TS` watermark no-ops a
+    follow/unfollow with `timestamp <=` the last applied (no follow-graph
+    tamper). `FOLLOWS` stays the authoritative state (both ops are idempotent).
+
+### Known limitations (accepted)
+
+- **Revoke-before-delegate ordering:** if a `DeviceRevocation` arrives before
+  the device was ever delegated locally (device unmapped), no tombstone is
+  written, so a later stale delegation is accepted. Requires the attacker to
+  already hold a compromised device key AND control delivery order. Closing it
+  fully needs device-proof-of-possession on revocations (a future change);
+  writing a tombstone for an unmapped device on a wallet's say-so would
+  reintroduce a cross-wallet DoS.
+- **Pre-0.51 follow edges** carry no watermark (treated as 0) until their next
+  follow/unfollow, so a stale unfollow can apply once to a pre-existing edge;
+  self-corrects on the next genuine event.
+- A tombstone-/LWW-rejected identity envelope is still stored + indexed, so it
+  may be re-served once (and re-rejected by the receiver); bounded by the
+  per-(peer, wallet) envelope cap. Not a security issue.
+
+## [0.50.0] - 2026-06-05
+
+### Added
+
+- **Identity-sync: lazy, per-wallet backfill of a user's identity (P-1 of the
+  user-state-sync plan).** A new libp2p request/response protocol
+  (`/ogmara/{network}/identity-sync/1.0.0`, mirroring channel-reconcile) lets a
+  node pull a single wallet's signed identity envelopes — DeviceDelegation,
+  DeviceRevocation, ProfileUpdate, Follow, Unfollow — the first time that
+  wallet is seen on it. This is how a user keeps their identity, profile, and
+  follows when they connect to a node that was offline when those were
+  originally gossiped. It is **lazy and per-wallet** (triggered by the auth
+  middleware on first-seen, deduped per session) — NOT a 1:1 transfer between
+  all nodes — so a node does work proportional to the wallets that use it.
+  - New `IDENTITY_ENVELOPES` column family indexes each wallet's identity
+    envelopes; written in `router::update_indexes` and one-time backfilled from
+    `MESSAGES` at startup (streamed; sentinel `IDENTITY_ENVELOPES_INDEXED`).
+  - The responder re-serves the **original signed envelopes**; the requester
+    re-validates each through `process_synced_message` (same signature checks
+    as gossip), so a relaying peer is never trusted. Only the five PUBLIC
+    identity types are ever indexed/served — DMs, private-channel content, and
+    encrypted settings are structurally unreachable.
+  - A device-resolve-miss pull is keyed by the `ogd1…` device address; the
+    responder resolves it to the owning wallet and serves that bundle (the
+    returned delegation then lets the requester resolve the device locally).
+  - Bounded + rate-limited: per-`(peer, wallet)` cumulative cap, per-peer
+    concurrency, capped page size, racing fan-out (first non-empty wins).
+    Subjects are validated as `klv1…`/`ogd1…` addresses before use as map keys
+    or DB prefixes, and the rate-limiter/dedup maps are size-bounded.
+
+### Security / known follow-up
+
+- **MUST land before deploying identity-sync (P-2):** the identity apply arms
+  still lack last-writer-wins ordering and a **device-revocation tombstone**.
+  A malicious responder could serve a genuine but *stale* subset (withholding a
+  newer ProfileUpdate, an Unfollow, or a DeviceRevocation) to downgrade a
+  profile, tamper a follow graph, or **resurrect a revoked device** on a
+  freshly-synced node. These are pre-existing gossip weaknesses that
+  identity-sync makes on-demand/targeted. P-2 (LWW timestamps on
+  ProfileUpdate/Follow/Unfollow + a `device → revoked_at` tombstone that
+  rejects older delegations) closes them on every path and is a hard pre-deploy
+  gate. **→ Shipped in 0.51.0 below; the gate is now satisfied.**
+
+## [0.49.0] - 2026-06-05
+
+### Added
+
+- **Free, dual-signed device→wallet delegation propagation (P-0 of the
+  user-state-sync plan).** A device's delegation now reaches every node via
+  gossip with **no on-chain transaction and no fee** — so a user who connects
+  to a node that was offline when they first registered no longer hits the
+  "device not mapped" wall there. Security model (verified by adversarial
+  audit): the delegation is a **dual-signed claim** — the WALLET signs the
+  canonical claim string `ogmara-device-claim:{device_pubkey}:{wallet}:{ts}`
+  (authorizes the binding) AND the DEVICE key co-signs the SAME claim
+  (proof-of-possession). A node re-verifies BOTH signatures at the gate
+  (`router::verify_device_delegation_claim`) before storing or relaying, so a
+  relaying node is never trusted. Impersonating a wallet requires the wallet
+  key; hijacking a device requires the device key — both cryptographically
+  infeasible. The existing cross-wallet-hijack defense and per-wallet device
+  cap remain as defense-in-depth.
+  - `POST /api/v1/devices/register` gained an optional `device_signature`
+    field (the device's co-signature). When the wallet signature is valid
+    **and** `device_signature` is present and valid, the node constructs the
+    dual-signed `DeviceDelegation` envelope itself and gossips it on the
+    network topic (`propagated: true`). Without it, registration stays
+    local-only (back-compat with pre-0.49 clients and the K5 device-signed-
+    claim flow).
+
+### Changed
+
+- `DeviceDelegationPayload` gained a `device_signature` field. The signed
+  claim covers only the device↔wallet↔timestamp binding; `permissions` and
+  `expires_at` are therefore **not** trusted from gossip — a gossiped
+  `DeviceDelegation` must carry canonical permissions (all true) and no
+  expiry, or it is rejected at the gate (prevents a relay forging unsigned
+  fields). Granular/expiring delegations would require bringing those fields
+  under the signature (deferred).
+
+### Removed
+
+- The `signed_envelope_hex` register field and the `propagate_device_delegation`
+  path. They required a wallet-signed *envelope* (binary preimage), which a
+  browser-extension wallet (`signMessage`, string-only) cannot produce — the
+  reason extension delegations never propagated. Replaced by the dual-signed
+  claim above, which extension wallets can produce (both signatures are over a
+  string).
+
 ## [0.48.8] - 2026-06-04
 
 ### Changed
