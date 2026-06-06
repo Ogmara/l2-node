@@ -5,6 +5,29 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.56.0] - 2026-06-06
+
+### Added
+
+- **Real-time chat delivery over WebSocket — now works across nodes.**
+  Previously the node only broadcast mention-notifications over WS; chat
+  messages reached clients only via a 15s poll, and a message posted on one
+  node appeared on another node's clients only after a full reload. The
+  notification engine's `process()` runs on BOTH the API-post path AND the
+  gossip-receive path (after the message is stored), so it now also broadcasts
+  each chat message as a `{type:"message"}` WS event. A message posted on any
+  node appears live on every node's connected clients (which already handle and
+  dedup the event).
+
+### Security
+
+- The chat broadcast **fails closed on channel privacy**: it fans out to all
+  connected clients (who filter client-side), so it broadcasts ONLY
+  public/read-public channels. A missing/unparseable channel record, a private
+  channel, or an unknown type is never broadcast — so a private channel's
+  plaintext can't leak to non-members, even on a node that received the message
+  before it had the channel record. (Accepts numeric + legacy-string types.)
+
 ## [0.55.0] - 2026-06-06
 
 ### Added

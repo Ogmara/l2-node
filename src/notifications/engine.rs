@@ -116,6 +116,12 @@ impl NotificationEngine {
                     let mentions = &payload.mentions[..payload.mentions.len().min(50)];
                     self.check_mentions(envelope, mentions, Some(payload.channel_id), &preview)
                         .await;
+                    // Real-time delivery: broadcast the chat message to WS
+                    // subscribers. `process()` runs on BOTH the API-post path
+                    // AND the gossip-receive path, so this is what makes a
+                    // message posted on one node appear live on every node's
+                    // connected clients (not just after a poll/reload).
+                    self.broadcast_channel_message(envelope, payload.channel_id);
                 }
             }
             MessageType::NewsComment => {
@@ -133,6 +139,72 @@ impl NotificationEngine {
                 // The recipient's node gets the message via GossipSub topic
             }
             _ => {}
+        }
+    }
+
+    /// Broadcast a chat message to WebSocket subscribers as a `{type:"message"}`
+    /// event so connected clients render it live. The JSON mirrors the REST
+    /// message shape (hex `msg_id`, device→wallet-resolved `author`) and adds a
+    /// top-level `channel_id` so clients can filter by the channel they're
+    /// viewing. Best-effort — a dropped broadcast just means the client picks
+    /// the message up on its next poll/reload.
+    fn broadcast_channel_message(&self, envelope: &Envelope, channel_id: u64) {
+        // PRIVACY (fail CLOSED): the broadcast fans out to ALL connected WS
+        // clients (they filter by channel_id client-side), so ONLY broadcast
+        // PUBLIC (0) / READ-PUBLIC (1) channels. EVERY other case must NOT
+        // broadcast, to avoid leaking a private channel's plaintext content:
+        //   - the CHANNELS record is MISSING (a fresh/lagging node can receive
+        //     a message before it has the channel record),
+        //   - the record fails to parse,
+        //   - the channel is PRIVATE (2), or its type is unknown.
+        // Accept both numeric and legacy-string channel_type encodings.
+        let is_public = self
+            .storage
+            .as_ref()
+            .and_then(|s| s.get_cf(cf::CHANNELS, &channel_id.to_be_bytes()).ok().flatten())
+            .and_then(|data| serde_json::from_slice::<serde_json::Value>(&data).ok())
+            .and_then(|meta| match meta.get("channel_type") {
+                Some(serde_json::Value::Number(n)) => n.as_u64(),
+                Some(serde_json::Value::String(s)) => match s.as_str() {
+                    "Public" => Some(0),
+                    "ReadPublic" => Some(1),
+                    "Private" => Some(2),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .map(|ct| ct == 0 || ct == 1)
+            .unwrap_or(false);
+        if !is_public {
+            return;
+        }
+        let mut val = match serde_json::to_value(envelope) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        if let serde_json::Value::Object(ref mut map) = val {
+            // msg_id: byte array → hex (matches REST `envelope_to_json`).
+            if let Some(serde_json::Value::Array(bytes)) = map.get("msg_id") {
+                let hex: String = bytes
+                    .iter()
+                    .filter_map(|b| b.as_u64().map(|n| format!("{:02x}", n as u8)))
+                    .collect();
+                map.insert("msg_id".into(), serde_json::Value::String(hex));
+            }
+            // Resolve device key → wallet so the live message's author matches
+            // the REST/optimistic one (lets the client dedup the echo).
+            if let Some(ref storage) = self.storage {
+                if let Ok(Some(wallet)) = storage.resolve_wallet(&envelope.author) {
+                    map.insert("author".into(), serde_json::Value::String(wallet));
+                }
+            }
+            // The bare envelope has no top-level channel_id (it's in the
+            // payload); clients filter on it, so surface it here.
+            map.insert("channel_id".into(), serde_json::json!(channel_id));
+        }
+        let ws_msg = serde_json::json!({ "type": "message", "envelope": val });
+        if let Ok(json) = serde_json::to_string(&ws_msg) {
+            let _ = self.ws_broadcast.send(json);
         }
     }
 
