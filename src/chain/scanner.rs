@@ -49,6 +49,12 @@ pub struct ChainScanner {
     /// Channel to notify the network layer about new channel discoveries.
     /// The network service subscribes to the corresponding GossipSub topic.
     channel_tx: tokio::sync::mpsc::UnboundedSender<u64>,
+    /// In-memory cache of resolved `slug → channel_id`. Avoids re-querying the
+    /// `getChannelBySlug` SC view (a Klever RPC call) for the same channel
+    /// every time a 429-stalled cursor re-scans a block range — the main
+    /// source of chain-scan rate-limit amplification. `Mutex` for interior
+    /// mutability (resolution runs on `&self`).
+    slug_cache: std::sync::Mutex<std::collections::HashMap<String, u64>>,
 }
 
 impl ChainScanner {
@@ -93,6 +99,7 @@ impl ChainScanner {
             backoff: Duration::ZERO,
             consecutive_429s: 0,
             channel_tx,
+            slug_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -720,6 +727,15 @@ impl ChainScanner {
 
     /// Query the SC for a channel's ID by its slug via the VM hex endpoint.
     async fn query_channel_id_by_slug(&self, slug: &str) -> Result<u64> {
+        // Cache hit → skip the SC view query entirely. A channel_id is
+        // immutable once assigned, so a cached resolution is always valid; this
+        // is what stops a re-scanned block range from re-hammering Klever's RPC.
+        if let Ok(cache) = self.slug_cache.lock() {
+            if let Some(&id) = cache.get(slug) {
+                return Ok(id);
+            }
+        }
+
         let slug_hex = hex::encode(slug);
         let url = format!("{}/vm/hex", self.config.node_url);
 
@@ -757,7 +773,13 @@ impl ChainScanner {
         }
         let mut padded = [0u8; 8];
         padded[8 - bytes.len()..].copy_from_slice(&bytes);
-        Ok(u64::from_be_bytes(padded))
+        let channel_id = u64::from_be_bytes(padded);
+
+        // Cache the resolution so future re-scans of this range don't re-query.
+        if let Ok(mut cache) = self.slug_cache.lock() {
+            cache.insert(slug.to_string(), channel_id);
+        }
+        Ok(channel_id)
     }
 }
 

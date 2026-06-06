@@ -5,6 +5,30 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.53.1] - 2026-06-06
+
+### Fixed
+
+- **Existing chain-discovered channels now backfill their name/logo** (0.53.0
+  only covered freshly-discovered, chat-empty channels). The channel-history
+  reconcile now also fires for a **skeleton** channel — one that exists from the
+  chain scanner (slug/creator) but has had **no L2 metadata envelope applied**
+  (no `CHANNEL_META_MSGS` row) — even if it already has chat. So a node that
+  chain-discovered a channel before the metadata was available pulls the
+  name/logo/members on next start. Keying on "no metadata envelope applied"
+  (not "display_name is null") means a channel legitimately created without a
+  name isn't re-reconciled every session.
+
+- **Chain scanner no longer re-hammers Klever's RPC (the 429 stall).** The
+  scanner resolves a channel's on-chain id with a `getChannelBySlug` SC view
+  call; when a `429 Too Many Requests` stalled the cursor, the re-scanned block
+  range re-issued that call for **every** channel in the range, compounding the
+  rate-limit. Channel ids are immutable per slug, so they're now **cached
+  in-memory** (`slug → channel_id`) and resolved once — cutting the redundant
+  SC reads that were the main amplifier. (Block fetching was already ranged;
+  operators still hitting 429 on a shared/public Klever endpoint should point
+  the node at a less-throttled RPC.)
+
 ## [0.53.0] - 2026-06-05
 
 ### Fixed

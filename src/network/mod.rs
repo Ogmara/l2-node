@@ -2046,6 +2046,36 @@ impl NetworkService {
         }
     }
 
+    /// True if the channel exists (chain-scanned) but we've applied NO L2
+    /// metadata envelope for it — i.e. there is no `CHANNEL_META_MSGS` row for
+    /// the channel. Such a channel is a pure on-chain skeleton (slug/creator
+    /// only) and needs a metadata pull even if it already has chat.
+    ///
+    /// We key on "no metadata envelope applied" rather than "display_name is
+    /// null" so a channel legitimately created WITHOUT a name (its
+    /// `ChannelCreate` was applied → it has a `CHANNEL_META_MSGS` row) is NOT
+    /// treated as a skeleton, and doesn't trigger a redundant reconcile every
+    /// session.
+    fn channel_is_skeleton(&self, channel_id: u64) -> bool {
+        let key = channel_id.to_be_bytes();
+        let exists = self
+            .storage
+            .exists_cf(crate::storage::schema::cf::CHANNELS, &key)
+            .unwrap_or(false);
+        if !exists {
+            return false;
+        }
+        // No CHANNEL_META_MSGS row for this channel → no ChannelCreate/Update
+        // has been applied here → skeleton. On a read error, default to
+        // "has metadata" (not skeleton) so we never spuriously re-trigger.
+        let has_meta = self
+            .storage
+            .prefix_iter_cf(crate::storage::schema::cf::CHANNEL_META_MSGS, &key, 1)
+            .map(|rows| !rows.is_empty())
+            .unwrap_or(true);
+        !has_meta
+    }
+
     fn maybe_trigger_backfill(&mut self, channel_id: u64) {
         if !self.backfill_config.enabled {
             return;
@@ -2069,7 +2099,16 @@ impl NetworkService {
             .unwrap_or(false);
 
         let resync_active = self.backfill_config.force_resync_if_stale_days > 0;
-        let need_backfill = if !has_local {
+        // P-3b: also backfill a channel that is a SKELETON — chain-scanned (has
+        // the on-chain slug/creator) but missing its L2 metadata (display_name
+        // null), even if it already has chat. The reconcile rides the
+        // ChannelCreate/Update envelopes on its first page, so this is how an
+        // existing chain-discovered channel finally gets its name/logo/members.
+        // `reconcile_triggered` is cleared on restart, so this fires once per
+        // skeleton channel per process — and stops firing once the metadata
+        // lands and the channel is no longer a skeleton.
+        let is_skeleton = self.channel_is_skeleton(channel_id);
+        let need_backfill = if !has_local || is_skeleton {
             true
         } else if resync_active {
             // Re-reconciliation knob: read the NEWEST local envelope
