@@ -5,6 +5,28 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.54.0] - 2026-06-06
+
+### Added
+
+- **Cross-node media now falls back to a direct IPFS network fetch.** When a
+  media CID (channel logo, avatar, attachment) isn't in the local Kubo and the
+  HTTP peer-fallback can't satisfy it (e.g. an isolated node whose SC
+  peer-registry is throttled), the node now asks its own Kubo to fetch + pin the
+  CID from the IPFS network (DHT + bitswap), bounded by an 8s timeout. This is
+  independent of the SC/peer-registry, so it works as long as *any* provider for
+  the CID is reachable on IPFS — fixing channel logos that 404'd on nodes which
+  had the logo's CID but not its bytes.
+
+### Security
+
+- The new online IPFS fetch is **size-capped**: it online-stats the CID's
+  (content-addressed) size and refuses anything over `max_upload_bytes` *before*
+  pinning, so an attacker can't make the node fetch + permanently pin a huge DAG
+  (disk-fill). Mirrors the peer-fallback's existing cap.
+- `IpfsClient::pin` now checks the HTTP status instead of returning `Ok(())` on
+  any response — a Kubo pin failure no longer reads as success.
+
 ## [0.53.1] - 2026-06-06
 
 ### Fixed

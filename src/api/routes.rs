@@ -3315,6 +3315,14 @@ pub async fn upload_media(
     }
 }
 
+/// Bound on the last-resort online IPFS fetch in [`get_media`]. When the blob
+/// isn't local and the HTTP peer-fallback can't satisfy it, we ask the local
+/// Kubo to fetch+pin the CID from the IPFS network (DHT + bitswap). For content
+/// whose provider is reachable (e.g. a peer node's Kubo) this resolves in well
+/// under a second via bitswap; the cap only bites for genuinely-unreachable
+/// CIDs, where we'd otherwise hang the request indefinitely.
+const MEDIA_IPFS_FETCH_TIMEOUT_SECS: u64 = 8;
+
 /// GET / HEAD `/api/v1/media/:cid` — retrieve media from IPFS (public).
 ///
 /// Same handler serves both methods; HEAD elides the body but emits
@@ -3516,11 +3524,56 @@ pub async fn get_media(
                     );
                 }
                 None => {
-                    tracing::warn!(
-                        cid = %cid,
-                        "media not found locally and peer fallback declined or failed"
-                    );
-                    return (StatusCode::NOT_FOUND, "media not found").into_response();
+                    // Last resort: ask our own Kubo to fetch the CID from the
+                    // IPFS network (DHT + bitswap) and pin it, bounded by a
+                    // timeout. This is the SAME IPFS mechanism that serves any
+                    // other CID once its bytes are local — and unlike the peer
+                    // fallback it does NOT depend on the SC peer registry, so it
+                    // works even when this node is isolated or its Klever RPC is
+                    // throttled, as long as a provider for the CID is reachable
+                    // on IPFS. On success the blob is now local, so we re-stat
+                    // and fall through to the normal (range-capable) path.
+                    //
+                    // SIZE CAP: `pin/add` would otherwise fetch+pin an
+                    // arbitrarily large DAG (disk-fill DoS — an attacker picks
+                    // the CID and hosts the bytes). So we online-stat the
+                    // declared size FIRST and refuse anything over the upload
+                    // cap before pinning. The UnixFS size is content-addressed,
+                    // so the CID can't understate it. Mirrors the peer-fallback's
+                    // `max_upload_bytes` guard.
+                    let max = ipfs.max_upload_bytes();
+                    let outcome = tokio::time::timeout(
+                        std::time::Duration::from_secs(MEDIA_IPFS_FETCH_TIMEOUT_SECS),
+                        async {
+                            let size = ipfs.size_online(&cid).await.map_err(|_| ())?;
+                            if size > max {
+                                return Err(());
+                            }
+                            ipfs.pin(&cid).await.map_err(|_| ())?;
+                            Ok::<(), ()>(())
+                        },
+                    )
+                    .await;
+                    match outcome {
+                        Ok(Ok(())) => match ipfs.get_size(&cid).await {
+                            Ok(s) => s,
+                            Err(_) => {
+                                tracing::warn!(
+                                    cid = %cid,
+                                    "media: IPFS pin reported success but blob still not local"
+                                );
+                                return (StatusCode::NOT_FOUND, "media not found")
+                                    .into_response();
+                            }
+                        },
+                        _ => {
+                            tracing::warn!(
+                                cid = %cid,
+                                "media not found locally; peer fallback + IPFS network fetch both failed"
+                            );
+                            return (StatusCode::NOT_FOUND, "media not found").into_response();
+                        }
+                    }
                 }
             }
         }

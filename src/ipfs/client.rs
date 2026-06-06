@@ -578,14 +578,54 @@ impl IpfsClient {
         validate_cid(cid)?;
         let url = format!("{}/api/v0/pin/add?arg={}", self.api_url, cid);
 
-        self.http
+        let resp = self
+            .http
             .post(&url)
             .send()
             .await
             .context("pinning on IPFS")?;
 
+        // Kubo signals pin failure (e.g. "context deadline exceeded", unreachable
+        // CID) via a non-2xx status. The previous code returned Ok(()) on ANY
+        // response, so callers treated failures as success — fixed here.
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("pin/add HTTP {}: {}", status, &body[..body.len().min(200)]);
+        }
+
         debug!(cid = %cid, "Pinned on IPFS");
         Ok(())
+    }
+
+    /// Online variant of [`get_size`] — resolves the CID over the IPFS network
+    /// (DHT + bitswap) to read its declared size. Used to enforce a size cap
+    /// BEFORE pinning unknown remote content: the UnixFS size is part of the
+    /// content-addressed DAG, so a CID can't understate it, and this fetches
+    /// only the DAG root/structure (not all leaf data), so it's far cheaper
+    /// than a full fetch. Reserve for callers that have already missed the
+    /// local blockstore and are about to fetch from the network anyway.
+    pub async fn size_online(&self, cid: &str) -> Result<u64> {
+        validate_cid(cid)?;
+        let url = format!("{}/api/v0/files/stat?arg=/ipfs/{}", self.api_url, cid);
+
+        let resp = self
+            .http
+            .post(&url)
+            .send()
+            .await
+            .context("fetching IPFS files/stat (online)")?;
+        if !resp.status().is_success() {
+            anyhow::bail!("files/stat (online) HTTP {}", resp.status());
+        }
+        let body = read_body_capped(resp, MAX_STAT_RESPONSE_BYTES)
+            .await
+            .context("reading IPFS stat body")?;
+        let val: serde_json::Value = serde_json::from_slice(&body)
+            .context("parsing IPFS files/stat response")?;
+        val["Size"]
+            .as_u64()
+            .context("files/stat returned no Size")
     }
 
     /// Unpin a CID from the local IPFS node.
