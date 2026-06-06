@@ -1583,7 +1583,11 @@ pub async fn get_channel_messages(
             let envelope = rmp_serde::from_slice::<crate::messages::envelope::Envelope>(
                 &envelope_bytes,
             ).ok()?;
-            let key = encode_channel_msg_key(channel_id, envelope.lamport_ts, &msg_id);
+            // CHANNEL_MSGS is keyed by wall-clock timestamp (0.58.0), matching
+            // the writer (router.rs) and the re-index migration. Must NOT use
+            // lamport_ts here (always 0) or the cursor key won't exist and
+            // pagination silently resets to the first page.
+            let key = encode_channel_msg_key(channel_id, envelope.timestamp, &msg_id);
             // Verify this msg_id is indexed under this channel (not a foreign channel)
             if !state.storage.exists_cf(cf::CHANNEL_MSGS, &key).unwrap_or(false) {
                 return None;
@@ -4616,11 +4620,17 @@ pub async fn get_unread_counts(
         if key.len() < 8 { continue; }
         let channel_id = u64::from_be_bytes(key[..8].try_into().unwrap_or([0u8; 8]));
 
-        // Skip private channels the user isn't a member of
-        if let Ok(meta) = serde_json::from_slice::<serde_json::Value>(value) {
-            if !check_channel_access(&state, &meta, channel_id, Some(&auth_user.address)) {
-                continue;
+        // Skip private channels the user isn't a member of. Fail CLOSED: if the
+        // channel record won't parse, skip it entirely rather than counting its
+        // unread (a corrupt private-channel record must not leak activity to a
+        // non-member). Matches the WS broadcast privacy guard.
+        match serde_json::from_slice::<serde_json::Value>(value) {
+            Ok(meta) => {
+                if !check_channel_access(&state, &meta, channel_id, Some(&auth_user.address)) {
+                    continue;
+                }
             }
+            Err(_) => continue,
         }
 
         // Get the user's read cursor for this channel
@@ -4635,13 +4645,30 @@ pub async fn get_unread_counts(
         // Count messages newer than last_read_ts, excluding the user's own messages.
         // Within those, count how many @-mention the viewer (after device→wallet resolution).
         //
-        // Hot-path optimization: the channel-message index key embeds the lamport
-        // timestamp at bytes 8..16. Decode that first and skip the RocksDB point
-        // lookup + envelope decode + payload decode entirely when the message is
-        // already-read. Also short-circuit once both counters hit 99 — that's the
+        // Hot-path optimization: the channel-message index key embeds the
+        // wall-clock timestamp at bytes 8..16 (0.58.0). Decode that first and
+        // skip the RocksDB point lookup + envelope decode + payload decode
+        // entirely when the message is already-read. Also short-circuit once
+        // both counters hit 99 — that's the
         // display cap, so any further decoding is wasted work.
         let prefix = channel_id.to_be_bytes();
-        if let Ok(msgs) = state.storage.prefix_iter_cf(cf::CHANNEL_MSGS, &prefix, 100) {
+        // Seek straight to the read cursor and scan FORWARD: unread messages are
+        // those keyed with timestamp > last_read_ts, and the index is ordered by
+        // timestamp (0.58.0). Scanning from the channel start would only see the
+        // 100 OLDEST rows and report 0 unread on channels with >100 messages.
+        // msg_id [0;32] sorts before any real (hashed) msg_id, so the seek lands
+        // at-or-just-before the first message at exactly last_read_ts; the
+        // `key_ts <= last_read_ts` skip below drops that boundary.
+        let seek_key = crate::storage::schema::encode_channel_msg_key(
+            channel_id,
+            last_read_ts,
+            &[0u8; 32],
+        );
+        if let Ok(msgs) =
+            state
+                .storage
+                .prefix_iter_cf_after(cf::CHANNEL_MSGS, &seek_key, &prefix, 100)
+        {
             let mut count = 0u64;
             let mut mention_count = 0u64;
             for (msg_key, _) in &msgs {
@@ -4664,8 +4691,9 @@ pub async fn get_unread_counts(
                     Ok(e) => e,
                     Err(_) => continue,
                 };
-                // Envelope timestamp is the authoritative wall-clock check.
-                // Index lamport_ts can lag wall-clock under heavy fan-in.
+                // Authoritative recheck against the envelope's own timestamp
+                // (the index key carries the same value, but this guards any
+                // legacy row the re-key migration hasn't touched yet).
                 if env.timestamp <= last_read_ts { continue; }
                 let resolved = state.identity.resolve(&env.author)
                     .unwrap_or_else(|_| env.author.clone());

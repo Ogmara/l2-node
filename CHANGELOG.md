@@ -5,6 +5,32 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.58.1] - 2026-06-06
+
+### Fixed
+
+- **Channel history pagination (`GET /channels/:id/messages?after=`) after the
+  0.58.0 re-key** (audit C1): the `after` cursor still rebuilt the CHANNEL_MSGS
+  key from `lamport_ts`, which no longer exists post-migration, so "load older"
+  silently reset to the first page. Now uses `timestamp`, matching the writer +
+  migration.
+- **Unread undercount on busy channels** (audit W1): `GET /channels/unread`
+  scanned the first 100 (now oldest) rows, so channels with >100 messages could
+  report 0 unread despite newer unread ones. Now seeks from the read cursor and
+  scans forward.
+
+### Security
+
+- **Mention notifications no longer leak private-channel message previews** over
+  the WebSocket broadcast (audit finding). The broadcast fans out to all clients
+  (they filter by recipient), so the preview is now redacted for private
+  channels; the full preview is still delivered privately to the recipient via
+  the authenticated persisted-notification fetch. Extracted a shared
+  `channel_is_public` fail-closed helper.
+- **Unread now fails CLOSED on an unparseable channel record** (audit N4): a
+  corrupt private-channel record is skipped instead of being counted, matching
+  the WS broadcast guard.
+
 ## [0.58.0] - 2026-06-06
 
 ### Changed

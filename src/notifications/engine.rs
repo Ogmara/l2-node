@@ -193,23 +193,16 @@ impl NotificationEngine {
     /// top-level `channel_id` so clients can filter by the channel they're
     /// viewing. Best-effort — a dropped broadcast just means the client picks
     /// the message up on its next poll/reload.
-    fn broadcast_channel_message(
-        &self,
-        envelope: &Envelope,
-        channel_id: u64,
-        extra: &[(&str, serde_json::Value)],
-    ) {
-        // PRIVACY (fail CLOSED): the broadcast fans out to ALL connected WS
-        // clients (they filter by channel_id client-side), so ONLY broadcast
-        // PUBLIC (0) / READ-PUBLIC (1) channels. EVERY other case must NOT
-        // broadcast, to avoid leaking a private channel's plaintext content:
-        //   - the CHANNELS record is MISSING (a fresh/lagging node can receive
-        //     a message before it has the channel record),
-        //   - the record fails to parse,
-        //   - the channel is PRIVATE (2), or its type is unknown.
-        // Accept both numeric and legacy-string channel_type encodings.
-        let is_public = self
-            .storage
+    /// Whether a channel is PUBLIC (0) or READ-PUBLIC (1) — i.e. its content is
+    /// world-readable. Fails CLOSED (returns false) for every other case: the
+    /// CHANNELS record is missing (a fresh/lagging node may receive a message
+    /// before the channel record), the record fails to parse, the channel is
+    /// PRIVATE (2), or the type is unknown. Accepts both numeric and legacy
+    /// string `channel_type` encodings. Used to gate anything that fans out to
+    /// all WS clients (message + reaction/edit/delete broadcasts, mention
+    /// previews).
+    fn channel_is_public(&self, channel_id: u64) -> bool {
+        self.storage
             .as_ref()
             .and_then(|s| s.get_cf(cf::CHANNELS, &channel_id.to_be_bytes()).ok().flatten())
             .and_then(|data| serde_json::from_slice::<serde_json::Value>(&data).ok())
@@ -224,8 +217,19 @@ impl NotificationEngine {
                 _ => None,
             })
             .map(|ct| ct == 0 || ct == 1)
-            .unwrap_or(false);
-        if !is_public {
+            .unwrap_or(false)
+    }
+
+    fn broadcast_channel_message(
+        &self,
+        envelope: &Envelope,
+        channel_id: u64,
+        extra: &[(&str, serde_json::Value)],
+    ) {
+        // PRIVACY (fail CLOSED): the broadcast fans out to ALL connected WS
+        // clients (they filter by channel_id client-side), so ONLY broadcast
+        // PUBLIC / READ-PUBLIC channels — never a private channel's content.
+        if !self.channel_is_public(channel_id) {
             return;
         }
         let mut val = match serde_json::to_value(envelope) {
@@ -350,10 +354,25 @@ impl NotificationEngine {
             }
         }
 
-        // WebSocket broadcast
+        // WebSocket broadcast. This fans out to ALL connected WS clients (they
+        // filter by recipient client-side), so for PRIVATE channels redact the
+        // preview — otherwise a private channel's plaintext would leak to every
+        // client. The full preview is still delivered privately to the recipient
+        // via the per-recipient persisted notification above (authenticated
+        // GET /api/v1/notifications). Public-channel previews are world-readable.
+        // (Follow-up: per-recipient WS delivery would also hide the mention
+        // metadata — author/channel — not just the preview.)
+        let broadcast_notification = match notification.channel_id {
+            Some(cid) if !self.channel_is_public(cid) => {
+                let mut redacted = notification.clone();
+                redacted.preview = String::new();
+                redacted
+            }
+            _ => notification.clone(),
+        };
         let ws_msg = serde_json::json!({
             "type": "notification",
-            "mention": notification,
+            "mention": broadcast_notification,
         });
         if let Ok(json) = serde_json::to_string(&ws_msg) {
             let _ = self.ws_broadcast.send(json);
