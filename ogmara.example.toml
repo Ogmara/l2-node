@@ -198,10 +198,12 @@ listen_port = 41721
 #     /dns4|/ip4|/ip6 multiaddr the SC publishes on chain
 # v0.46.0 Phase D supports bracketed IPv6 (`http://[2001:db8::1]:41721`).
 # public_url = "https://node.example.org"
-# Includes `https://ogmara.org` so the public network page's
-# browser-side reachability probe can reach a fresh node without
-# extra config. Remove it if you want a narrower origin policy.
-cors_origins = ["https://ogmara.org", "http://localhost:*"]
+# Allow ANY browser origin ("*") so a web client served from any domain
+# (ogmara.org, a fork, an IPFS gateway, a self-host, localhost) can read
+# this node — Ogmara is a decentralized public-read network and shouldn't
+# hardcode one website. Safe: writes are gated by request signatures, not
+# origin. Set an explicit list (e.g. ["https://my.app"]) for a private node.
+cors_origins = ["*"]
 rate_limit_per_ip = 100
 # Trusted-proxy CIDRs for client-IP resolution behind a reverse proxy
 # (v0.42). Each entry is a CIDR (`"10.0.0.0/8"`, `"2001:db8::/32"`) or
