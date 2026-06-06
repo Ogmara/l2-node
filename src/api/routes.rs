@@ -4648,10 +4648,15 @@ pub async fn get_unread_counts(
                 if count >= 99 && mention_count >= 99 { break; }
                 // Key: (channel_id:8, lamport_ts:8, msg_id:32)
                 if msg_key.len() < 48 { continue; }
-                let key_ts = u64::from_be_bytes(msg_key[8..16].try_into().unwrap_or([0u8; 8]));
-                // Fast skip: if the index timestamp is already <= read cursor,
-                // the message is read; no need to fetch the envelope at all.
-                if key_ts <= last_read_ts { continue; }
+                // NOTE: the key's lamport_ts field is NOT usable as a read
+                // cursor — clients send `lamport_ts: 0` (the node doesn't assign
+                // a wall-clock value), so a `key_ts <= last_read_ts` fast-skip
+                // matched EVERY message (0 <= any-ms) and returned 0 unread for
+                // every channel. The authoritative check is `env.timestamp`
+                // below. We pay one envelope read per candidate (bounded by the
+                // 100-row prefix scan + the count cap). A real fix is to have
+                // the node stamp a wall-clock lamport_ts on ingest so the index
+                // is chronological and skippable again.
                 let msg_id: [u8; 32] = msg_key[16..48].try_into().unwrap_or([0u8; 32]);
                 let env_bytes = match state.storage.get_message(&msg_id) {
                     Ok(Some(b)) => b,
