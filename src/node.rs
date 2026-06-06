@@ -123,6 +123,16 @@ impl Node {
             }
         }
 
+        // Backfill CHANNEL_META_MSGS from MESSAGES (one-time, P-3b channel
+        // metadata) so the channel-history reconcile can serve channel
+        // name/logo/membership to nodes that chain-discovered the channel.
+        let channel_meta_indexed = storage.get_stat(state_keys::CHANNEL_META_INDEXED)? > 0;
+        if !channel_meta_indexed {
+            if let Err(e) = storage.backfill_channel_meta() {
+                warn!(error = %e, "Failed to backfill CHANNEL_META_MSGS index");
+            }
+        }
+
         // Load Lamport counter from storage
         let lamport_value = storage.get_lamport_counter()?;
         let lamport_counter = Arc::new(AtomicU64::new(lamport_value));

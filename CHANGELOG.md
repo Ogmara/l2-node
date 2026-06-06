@@ -5,6 +5,42 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.53.0] - 2026-06-05
+
+### Fixed
+
+- **Channel name + logo now follow a public channel to every node** (not just
+  the one it was created on). The chain scanner only writes a channel
+  *skeleton* (slug + on-chain creator); the L2 fields — `display_name`,
+  `description`, `logo_cid`, `banner_cid`, membership — live in signed
+  `ChannelCreate`/`ChannelUpdate`/`Join`/`Leave` envelopes that a node which
+  only chain-discovered the channel never received. So a public channel showed
+  with no name/logo (or 404'd entirely) on other nodes. Now:
+  - `ChannelCreate` apply is **merge-safe**: into an existing (e.g.
+    chain-scanned) channel it merges only `display_name`/`description`, only if
+    the envelope author is the channel's creator, and never clobbers the
+    on-chain `creator`/`member_count` or re-counts the channel. (This is what
+    makes a relayed/backfilled `ChannelCreate` safe.)
+  - New `CHANNEL_META_MSGS` index of a channel's metadata/membership envelopes
+    (written in `update_indexes`; one-time backfilled from `MESSAGES`).
+  - The **channel-history reconcile** — which already fires when a node
+    subscribes to a chain-discovered channel — now rides the channel's metadata
+    envelopes (ChannelCreate/Update + a bounded slice of memberships, name/logo
+    first) on the first page. So a node that catches up on chain-scan also
+    backfills the channel's name/logo/members, no owner re-save needed. Private
+    channels are still refused over reconcile (unchanged).
+  - `envelope_targets_channel` now binds `ChannelCreate`/`ChannelUpdate` to the
+    reconciled channel so a relay can't smuggle metadata for another channel;
+    every served envelope is re-validated through `process_synced_message`.
+
+### Known limitation (accepted)
+
+- An on-chain-registered wallet can pre-create an L2 `CHANNELS` record for a
+  `channel_id` the scanner hasn't reached yet. The scanner self-heals the
+  creator when it later confirms the on-chain event, so this is **not** a
+  name/ownership hijack — but it can leave `TOTAL_CHANNELS` off by one and a
+  stale member row. Cosmetic; gated behind on-chain registration.
+
 ## [0.52.1] - 2026-06-05
 
 ### Fixed

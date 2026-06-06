@@ -1190,6 +1190,31 @@ impl MessageRouter {
                 .put_cf(schema::cf::IDENTITY_ENVELOPES, &key, &[])?;
         }
 
+        // P-3b (channel-metadata): index a channel's L2 metadata/membership
+        // envelopes per channel so the channel-history reconcile can serve them
+        // to a node that chain-discovered the channel (the scanner only writes
+        // the skeleton — no display_name/logo/members).
+        if matches!(
+            envelope.msg_type,
+            MessageType::ChannelCreate
+                | MessageType::ChannelUpdate
+                | MessageType::ChannelJoin
+                | MessageType::ChannelLeave
+        ) {
+            if let Ok(p) = rmp_serde::from_slice::<serde_json::Value>(&envelope.payload) {
+                if let Some(cid) = p.get("channel_id").and_then(|v| v.as_u64()) {
+                    let key = schema::encode_channel_meta_key(
+                        cid,
+                        envelope.msg_type_u8(),
+                        envelope.timestamp,
+                        &envelope.msg_id,
+                    );
+                    self.storage
+                        .put_cf(schema::cf::CHANNEL_META_MSGS, &key, &[])?;
+                }
+            }
+        }
+
         match envelope.msg_type {
             MessageType::ChatMessage => {
                 if let Ok(payload) =
@@ -1315,34 +1340,79 @@ impl MessageRouter {
                 if let Ok(payload) =
                     rmp_serde::from_slice::<ChannelCreatePayload>(&envelope.payload)
                 {
-                    // Store channel metadata (member_count starts at 0, add_channel_member increments)
-                    let meta = serde_json::json!({
-                        "channel_id": payload.channel_id,
-                        "slug": payload.slug,
-                        "channel_type": payload.channel_type as u8,
-                        "creator": resolved_author,
-                        "created_at": envelope.timestamp,
-                        "display_name": payload.display_name,
-                        "description": payload.description,
-                        "member_count": 0,
-                    });
-                    let meta_bytes = serde_json::to_vec(&meta)
-                        .context("serializing channel metadata")?;
-                    self.storage.put_cf(
-                        schema::cf::CHANNELS,
-                        &payload.channel_id.to_be_bytes(),
-                        &meta_bytes,
-                    )?;
-                    self.storage
-                        .increment_stat(schema::state_keys::TOTAL_CHANNELS)?;
+                    let key = payload.channel_id.to_be_bytes();
+                    if let Ok(Some(existing)) = self.storage.get_cf(schema::cf::CHANNELS, &key) {
+                        // Channel already exists — typically the chain scanner's
+                        // skeleton (slug/creator, no L2 fields) for a public
+                        // channel, or a prior apply. MERGE only the L2 fields
+                        // (display_name/description) and ONLY if the envelope
+                        // author is the channel's creator. Never clobber the
+                        // on-chain creator/member_count and never re-count
+                        // TOTAL_CHANNELS. This makes a gossiped/backfilled
+                        // ChannelCreate safe and lets a public channel's name
+                        // follow it to every node that chain-discovered it.
+                        if let Ok(mut meta) =
+                            serde_json::from_slice::<serde_json::Value>(&existing)
+                        {
+                            let is_creator = meta
+                                .get("creator")
+                                .and_then(|v| v.as_str())
+                                == Some(resolved_author);
+                            if is_creator {
+                                if let Some(obj) = meta.as_object_mut() {
+                                    if payload.display_name.is_some() {
+                                        obj.insert(
+                                            "display_name".into(),
+                                            serde_json::json!(payload.display_name),
+                                        );
+                                    }
+                                    if payload.description.is_some() {
+                                        obj.insert(
+                                            "description".into(),
+                                            serde_json::json!(payload.description),
+                                        );
+                                    }
+                                    let bytes = serde_json::to_vec(&meta)
+                                        .context("serializing merged channel metadata")?;
+                                    self.storage.put_cf(schema::cf::CHANNELS, &key, &bytes)?;
+                                }
+                            } else {
+                                debug!(
+                                    channel_id = payload.channel_id,
+                                    author = %resolved_author,
+                                    "ChannelCreate for existing channel from non-creator — ignoring L2 merge"
+                                );
+                            }
+                        }
+                    } else {
+                        // New channel (L2-only/private, or a public channel not
+                        // yet chain-scanned). Create the full record; the chain
+                        // scanner merges its on-chain fields later if/when it
+                        // sees the event (it preserves these L2 fields).
+                        let meta = serde_json::json!({
+                            "channel_id": payload.channel_id,
+                            "slug": payload.slug,
+                            "channel_type": payload.channel_type as u8,
+                            "creator": resolved_author,
+                            "created_at": envelope.timestamp,
+                            "display_name": payload.display_name,
+                            "description": payload.description,
+                            "member_count": 0,
+                        });
+                        let meta_bytes = serde_json::to_vec(&meta)
+                            .context("serializing channel metadata")?;
+                        self.storage.put_cf(schema::cf::CHANNELS, &key, &meta_bytes)?;
+                        self.storage
+                            .increment_stat(schema::state_keys::TOTAL_CHANNELS)?;
 
-                    // Add creator as first member (increments member_count to 1)
-                    let _ = self.add_channel_member(
-                        payload.channel_id,
-                        resolved_author,
-                        envelope.timestamp,
-                        "creator",
-                    );
+                        // Add creator as first member (increments member_count to 1)
+                        let _ = self.add_channel_member(
+                            payload.channel_id,
+                            resolved_author,
+                            envelope.timestamp,
+                            "creator",
+                        );
+                    }
                 }
             }
             MessageType::ChannelJoin => {
