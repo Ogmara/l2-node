@@ -1550,6 +1550,67 @@ impl Storage {
         Ok(())
     }
 
+    /// One-time backfill of `CHANNEL_META_MSGS` from existing `MESSAGES`
+    /// (P-3b channel-metadata). Streams every envelope and indexes channel
+    /// metadata/membership types (ChannelCreate/Update/Join/Leave) by
+    /// channel_id, so the channel-history reconcile can serve a channel's L2
+    /// metadata. Idempotent — guarded by `CHANNEL_META_INDEXED`.
+    pub fn backfill_channel_meta(&self) -> Result<()> {
+        use crate::messages::envelope::Envelope;
+        use crate::messages::types::MessageType;
+        use tracing::info;
+
+        let cf = self
+            .db
+            .cf_handle(cf::MESSAGES)
+            .with_context(|| "column family 'messages' not found")?;
+        let mut iter = self.db.raw_iterator_cf(&cf);
+        iter.seek_to_first();
+
+        let mut indexed = 0u64;
+        while iter.valid() {
+            if let Some(raw) = iter.value() {
+                if let Ok(envelope) = rmp_serde::from_slice::<Envelope>(raw) {
+                    if matches!(
+                        envelope.msg_type,
+                        MessageType::ChannelCreate
+                            | MessageType::ChannelUpdate
+                            | MessageType::ChannelJoin
+                            | MessageType::ChannelLeave
+                    ) {
+                        if let Ok(p) =
+                            rmp_serde::from_slice::<serde_json::Value>(&envelope.payload)
+                        {
+                            if let Some(cid) =
+                                p.get("channel_id").and_then(|v| v.as_u64())
+                            {
+                                let key = super::schema::encode_channel_meta_key(
+                                    cid,
+                                    envelope.msg_type_u8(),
+                                    envelope.timestamp,
+                                    &envelope.msg_id,
+                                );
+                                self.put_cf(cf::CHANNEL_META_MSGS, &key, &[])?;
+                                indexed += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            iter.next();
+        }
+
+        if indexed > 0 {
+            info!(indexed, "Backfilled CHANNEL_META_MSGS from MESSAGES");
+        }
+        self.put_cf(
+            cf::NODE_STATE,
+            super::schema::state_keys::CHANNEL_META_INDEXED,
+            &1u64.to_be_bytes(),
+        )?;
+        Ok(())
+    }
+
     /// Migrate device addresses from klv1... to ogd1... prefix.
     ///
     /// Re-derives all device addresses in DEVICE_WALLET_MAP and WALLET_DEVICES

@@ -179,6 +179,18 @@ pub mod cf {
     /// follow/unfollow establishes one.
     pub const FOLLOW_EDGE_TS: &str = "follow_edge_ts";
 
+    /// (channel_id:8 BE, msg_type:1, timestamp:8 BE, msg_id:32) → () —
+    /// per-channel index of L2 channel-metadata envelopes (ChannelCreate
+    /// 0x10, ChannelUpdate 0x11, ChannelJoin 0x12, ChannelLeave 0x13). The
+    /// chain scanner only writes a channel skeleton (slug/creator); the L2
+    /// fields (display_name, description, logo_cid, banner_cid, membership)
+    /// live in these signed envelopes. The channel-history reconcile serves
+    /// them so a node that chain-discovers a public channel also gets its
+    /// name/logo/members. Written in `router::update_indexes`; one-time
+    /// backfilled from MESSAGES via `CHANNEL_META_INDEXED`. (P-3b, l2-node
+    /// 0.53.0+.)
+    pub const CHANNEL_META_MSGS: &str = "channel_meta_msgs";
+
     /// All column family names for database initialization.
     pub const ALL: &[&str] = &[
         MESSAGES,
@@ -231,6 +243,7 @@ pub mod cf {
         IDENTITY_ENVELOPES,
         DEVICE_REVOCATIONS,
         FOLLOW_EDGE_TS,
+        CHANNEL_META_MSGS,
     ];
 }
 
@@ -263,6 +276,9 @@ pub mod state_keys {
     /// Sentinel: set to 1 after IDENTITY_ENVELOPES is backfilled from existing
     /// MESSAGES (P-1 identity-sync index, l2-node 0.50.0+).
     pub const IDENTITY_ENVELOPES_INDEXED: &[u8] = b"migration_identity_envelopes_indexed";
+    /// Sentinel: set to 1 after CHANNEL_META_MSGS is backfilled from existing
+    /// MESSAGES (P-3b channel-metadata index, l2-node 0.53.0+).
+    pub const CHANNEL_META_INDEXED: &[u8] = b"migration_channel_meta_indexed";
     /// Sentinel: set to 1 after device addresses are re-derived from klv1 → ogd1.
     pub const DEVICE_HRP_MIGRATED: &[u8] = b"migration_device_hrp_migrated";
     /// Unix timestamp of last successful state anchor submission (u64 big-endian).
@@ -363,6 +379,23 @@ pub fn encode_identity_envelope_key(
     let mut key = Vec::with_capacity(addr.len() + 1 + 1 + 8 + 32);
     key.extend_from_slice(addr);
     key.push(0xFF);
+    key.push(msg_type);
+    key.extend_from_slice(&timestamp.to_be_bytes());
+    key.extend_from_slice(msg_id);
+    key
+}
+
+/// Encode a channel-metadata index key: `(channel_id, msg_type, timestamp,
+/// msg_id)` (P-3b). Big-endian for natural sort. A prefix of the 8-byte
+/// `channel_id` selects exactly one channel's metadata envelopes.
+pub fn encode_channel_meta_key(
+    channel_id: u64,
+    msg_type: u8,
+    timestamp: u64,
+    msg_id: &[u8; 32],
+) -> Vec<u8> {
+    let mut key = Vec::with_capacity(8 + 1 + 8 + 32);
+    key.extend_from_slice(&channel_id.to_be_bytes());
     key.push(msg_type);
     key.extend_from_slice(&timestamp.to_be_bytes());
     key.extend_from_slice(msg_id);

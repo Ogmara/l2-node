@@ -366,8 +366,21 @@ pub fn build_response(
     };
 
     let mut envelopes: Vec<Vec<u8>> = Vec::with_capacity(cap);
+
+    // P-3b: on the FIRST page, ride the channel's L2 metadata + membership
+    // envelopes (ChannelCreate/Update/Join/Leave) along with the chat history.
+    // The chain scanner only writes a skeleton (slug/creator), so this is how a
+    // node that chain-discovered a public channel gets its name/logo/members.
+    // These are re-validated + applied by the requester like any synced
+    // envelope (ChannelCreate apply is now merge-safe). Counted separately so
+    // the chat `cap` below is unaffected.
+    if request.cursor.is_none() {
+        envelopes.extend(channel_meta_envelopes(storage, request.channel_id));
+    }
+
     let mut last_cursor: Option<ReconcileCursor> = None;
     let mut hit_cap = false;
+    let mut chat_count = 0usize;
 
     for (key, _val) in rows {
         // Key layout from `encode_channel_msg_key`:
@@ -409,12 +422,13 @@ pub fn build_response(
         }
 
         envelopes.push(raw);
+        chat_count += 1;
         last_cursor = Some(ReconcileCursor {
             after_lamport_ts: lamport_ts,
             after_msg_id: msg_id,
         });
 
-        if envelopes.len() >= cap {
+        if chat_count >= cap {
             hit_cap = true;
             break;
         }
@@ -428,6 +442,39 @@ pub fn build_response(
         server_capped: false,
         epoch_root: None,
     }
+}
+
+/// Gather a channel's L2 metadata + membership envelopes (P-3b) to ride along
+/// with the first reconcile page. ChannelCreate (0x10) / ChannelUpdate (0x11)
+/// — which carry display_name/logo_cid/description — sort before
+/// ChannelJoin/Leave in the `CHANNEL_META_MSGS` key (msg_type is the second
+/// key field), so the name/logo are always included even if a large membership
+/// list is truncated at the cap. Bounded; the requester re-validates each
+/// envelope through `process_synced_message`.
+fn channel_meta_envelopes(storage: &Storage, channel_id: u64) -> Vec<Vec<u8>> {
+    const CHANNEL_META_CAP: usize = 256;
+    let prefix = channel_id.to_be_bytes();
+    let rows = match storage.prefix_iter_cf(
+        schema::cf::CHANNEL_META_MSGS,
+        &prefix,
+        CHANNEL_META_CAP,
+    ) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for (key, _) in rows {
+        // key: channel_id:8 ++ msg_type:1 ++ ts:8 ++ msg_id:32 = 49 bytes.
+        if key.len() != 8 + 1 + 8 + 32 {
+            continue;
+        }
+        let mut msg_id = [0u8; 32];
+        msg_id.copy_from_slice(&key[17..49]);
+        if let Ok(Some(raw)) = storage.get_message(&msg_id) {
+            out.push(raw);
+        }
+    }
+    out
 }
 
 /// Inspect the `CHANNELS` metadata row for `channel_id` and return
