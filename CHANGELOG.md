@@ -5,6 +5,22 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.56.1] - 2026-06-06
+
+### Fixed
+
+- **Replies, reactions, edits, deletes, and DMs now propagate between nodes.**
+  `gossip_topic_for_envelope` extracted the routing key (channel_id / recipient)
+  by deserializing the payload into a `serde_json::Value` — which **cannot
+  represent a msgpack `bin`**. Several payloads carry a `[u8;32]` field that
+  encodes as a bin (`reply_to` on a reply, `target_id` on a
+  reaction/edit/delete) or a `Vec<u8>` (DM ciphertext), so that deserialize
+  failed and the function returned `None` → the message was stored and shown
+  **locally but silently never gossiped**. Plain standalone messages
+  (`reply_to: null`, no bin) were the only ones that propagated. Now the routing
+  key is read with a minimal typed struct that decodes the map and ignores all
+  other fields (bins included), so every channel/DM message type gossips.
+
 ## [0.56.0] - 2026-06-06
 
 ### Added

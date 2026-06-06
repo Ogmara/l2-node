@@ -1288,6 +1288,26 @@ pub async fn list_channels(
 /// Determine the GossipSub topic for a message envelope based on its type and payload.
 ///
 /// Returns None if the message type doesn't map to a GossipSub topic.
+/// Minimal extractors for gossip routing. We MUST NOT deserialize a payload
+/// into `serde_json::Value` to read a routing key: `serde_json::Value` cannot
+/// represent a msgpack `bin`, and several payloads carry a `[u8;32]` field
+/// (`reply_to` on a reply, `target_id` on a reaction/edit/delete, `msg_id` on a
+/// pin) or `Vec<u8>` (DM ciphertext) that encode as bins — so the deser failed
+/// and the message was silently NOT gossiped (replies, reactions, edits,
+/// deletes, DMs never reached other nodes). A typed struct that names only the
+/// routing key deserializes the map and ignores every other field, bins
+/// included.
+#[derive(serde::Deserialize)]
+struct ChannelIdExtract {
+    #[serde(default)]
+    channel_id: Option<u64>,
+}
+
+#[derive(serde::Deserialize)]
+struct RecipientExtract {
+    recipient: String,
+}
+
 fn gossip_topic_for_envelope(
     envelope: &crate::messages::envelope::Envelope,
     network_id: &str,
@@ -1312,10 +1332,12 @@ fn gossip_topic_for_envelope(
         // update can't be forged. The creator is known on every node (set by
         // the chain scanner).
         | MessageType::ChannelUpdate => {
-            // Extract channel_id from payload
-            let payload: serde_json::Value = rmp_serde::from_slice(&envelope.payload).ok()?;
-            let channel_id = payload.get("channel_id")?.as_u64()?;
-            Some(gossip::channel_topic(network_id, channel_id))
+            // Extract channel_id with a minimal typed struct (NOT
+            // serde_json::Value — it can't decode the bin fields these payloads
+            // carry, which previously dropped replies/reactions/edits/deletes
+            // from gossip entirely).
+            let p: ChannelIdExtract = rmp_serde::from_slice(&envelope.payload).ok()?;
+            Some(gossip::channel_topic(network_id, p.channel_id?))
         }
         MessageType::NewsPost => {
             Some(gossip::topic_news_global(network_id))
@@ -1324,10 +1346,11 @@ fn gossip_topic_for_envelope(
             Some(gossip::topic_profile(network_id))
         }
         MessageType::DirectMessage => {
-            // DMs go to the recipient's topic
-            let payload: serde_json::Value = rmp_serde::from_slice(&envelope.payload).ok()?;
-            let recipient = payload.get("recipient")?.as_str()?;
-            Some(gossip::dm_topic(network_id, recipient))
+            // DMs go to the recipient's topic. Minimal struct — the DM payload's
+            // `content: Vec<u8>` ciphertext is a bin that serde_json::Value
+            // can't decode, which previously dropped DMs from gossip too.
+            let p: RecipientExtract = rmp_serde::from_slice(&envelope.payload).ok()?;
+            Some(gossip::dm_topic(network_id, &p.recipient))
         }
         MessageType::NodeAnnouncement | MessageType::DeviceDelegation => {
             Some(gossip::topic_network(network_id))
