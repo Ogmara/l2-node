@@ -5,6 +5,19 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.57.1] - 2026-06-06
+
+### Fixed
+
+- **Unread channel counts work again** (the sidebar badge for new messages since
+  your last visit). `GET /channels/unread` had a fast-skip
+  `if key_ts <= last_read_ts { continue }` where `key_ts` is the CHANNEL_MSGS
+  key's `lamport_ts` field — but clients send `lamport_ts: 0` (the node never
+  stamps a wall-clock value), so `0 <= <any last-read ms>` was always true and
+  EVERY message was skipped → every channel reported 0 unread. Removed the
+  broken skip; the count now uses the authoritative `env.timestamp` (already
+  checked just below). Bounded by the 100-row prefix scan + the 99 display cap.
+
 ## [0.57.0] - 2026-06-06
 
 ### Added
