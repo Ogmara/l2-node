@@ -4646,17 +4646,15 @@ pub async fn get_unread_counts(
             let mut mention_count = 0u64;
             for (msg_key, _) in &msgs {
                 if count >= 99 && mention_count >= 99 { break; }
-                // Key: (channel_id:8, lamport_ts:8, msg_id:32)
+                // Key: (channel_id:8, timestamp_ms:8, msg_id:32). As of 0.58.0
+                // the middle field is the message's signed wall-clock timestamp
+                // (legacy lamport_ts=0 rows re-keyed by the
+                // CHANNEL_MSGS_TS_REINDEXED migration), so it's a valid read
+                // cursor: skip already-read messages without fetching the
+                // envelope. `env.timestamp` below is the authoritative recheck.
                 if msg_key.len() < 48 { continue; }
-                // NOTE: the key's lamport_ts field is NOT usable as a read
-                // cursor — clients send `lamport_ts: 0` (the node doesn't assign
-                // a wall-clock value), so a `key_ts <= last_read_ts` fast-skip
-                // matched EVERY message (0 <= any-ms) and returned 0 unread for
-                // every channel. The authoritative check is `env.timestamp`
-                // below. We pay one envelope read per candidate (bounded by the
-                // 100-row prefix scan + the count cap). A real fix is to have
-                // the node stamp a wall-clock lamport_ts on ingest so the index
-                // is chronological and skippable again.
+                let key_ts = u64::from_be_bytes(msg_key[8..16].try_into().unwrap_or([0u8; 8]));
+                if key_ts <= last_read_ts { continue; }
                 let msg_id: [u8; 32] = msg_key[16..48].try_into().unwrap_or([0u8; 32]);
                 let env_bytes = match state.storage.get_message(&msg_id) {
                     Ok(Some(b)) => b,
