@@ -130,6 +130,7 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
     // Routes that optionally benefit from auth (e.g. filtering private channels)
     let optional_auth_routes = Router::new()
         .route("/api/v1/channels", get(routes::list_channels))
+        .route("/api/v1/channels/by-slug/{slug}", get(routes::channel_by_slug))
         .route("/api/v1/channels/{channel_id}", get(routes::get_channel))
         .route(
             "/api/v1/channels/{channel_id}/messages",
