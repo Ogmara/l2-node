@@ -5,6 +5,19 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.55.0] - 2026-06-06
+
+### Added
+
+- **`GET /api/v1/channels/by-slug/:slug`** — resolve a channel by its slug,
+  returning the channel metadata (incl. `channel_id`). Lets a browser learn a
+  freshly-created channel's SC-assigned id by polling the node, instead of
+  calling Klever's RPC `getChannelBySlug` directly (CORS-blocked in browsers).
+  The chain scanner records the channel once it sees the on-chain creation, so
+  a successful lookup both confirms the TX landed and yields the id. Respects
+  private-channel access (non-members get 404, identical to an unknown slug, so
+  existence isn't leaked).
+
 ## [0.54.1] - 2026-06-06
 
 ### Fixed

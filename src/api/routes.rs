@@ -1381,6 +1381,48 @@ fn require_channel_access(
     }
 }
 
+/// GET /api/v1/channels/by-slug/:slug — resolve a channel by its slug (public).
+///
+/// Lets a browser learn a freshly-created channel's SC-assigned `channel_id`
+/// WITHOUT calling Klever's RPC directly (CORS-blocked). The chain scanner
+/// records the channel (slug + channel_id) once it sees the on-chain creation,
+/// so the client polls this until it resolves. Scans the bounded CHANNELS set
+/// for a matching slug and returns the channel metadata (incl. `channel_id`),
+/// or 404 if not yet known.
+pub async fn channel_by_slug(
+    Extension(state): Extension<Arc<AppState>>,
+    auth_user: Option<Extension<AuthUser>>,
+    Path(slug): Path<String>,
+) -> impl IntoResponse {
+    let rows = match state.storage.prefix_iter_cf(cf::CHANNELS, &[], 100_000) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error = %e, "channel_by_slug: CHANNELS iteration failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
+                .into_response();
+        }
+    };
+    let caller = auth_user.as_ref().map(|u| u.address.as_str());
+    for (_key, value) in rows {
+        if let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&value) {
+            if meta.get("slug").and_then(|s| s.as_str()) == Some(slug.as_str()) {
+                let channel_id = meta
+                    .get("channel_id")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                // Respect private-channel access (same rule as get_channel):
+                // don't leak a private channel's metadata to non-members. 404
+                // looks identical to "unknown slug", so existence isn't leaked.
+                if !check_channel_access(&state, &meta, channel_id, caller) {
+                    return (StatusCode::NOT_FOUND, "channel not found").into_response();
+                }
+                return Json(meta).into_response();
+            }
+        }
+    }
+    (StatusCode::NOT_FOUND, "channel not found").into_response()
+}
+
 /// GET /api/v1/channels/:channel_id — extended response with moderators, pins, member_count
 pub async fn get_channel(
     Extension(state): Extension<Arc<AppState>>,
