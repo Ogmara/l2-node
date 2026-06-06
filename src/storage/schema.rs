@@ -279,6 +279,10 @@ pub mod state_keys {
     /// Sentinel: set to 1 after CHANNEL_META_MSGS is backfilled from existing
     /// MESSAGES (P-3b channel-metadata index, l2-node 0.53.0+).
     pub const CHANNEL_META_INDEXED: &[u8] = b"migration_channel_meta_indexed";
+    /// Sentinel: set to 1 after CHANNEL_MSGS is re-keyed from `lamport_ts` (always
+    /// 0 from clients) to the wall-clock `timestamp` — chronological ordering +
+    /// working unread fast-skip (l2-node 0.58.0+).
+    pub const CHANNEL_MSGS_TS_REINDEXED: &[u8] = b"migration_channel_msgs_ts_reindexed";
     /// Sentinel: set to 1 after device addresses are re-derived from klv1 → ogd1.
     pub const DEVICE_HRP_MIGRATED: &[u8] = b"migration_device_hrp_migrated";
     /// Unix timestamp of last successful state anchor submission (u64 big-endian).

@@ -1611,6 +1611,69 @@ impl Storage {
         Ok(())
     }
 
+    /// One-time re-index: CHANNEL_MSGS keys used `lamport_ts`, but clients always
+    /// send `lamport_ts: 0`, so the index sorted by msg_id (random) — breaking
+    /// chronological pagination and the unread fast-skip (`0 <= read_cursor` was
+    /// always true). Re-key every chat message by its signed wall-clock
+    /// `timestamp` (identical on every node). The old (lamport, msg_id) key is
+    /// deleted and the new (timestamp, msg_id) key written. Idempotent — guarded
+    /// by `CHANNEL_MSGS_TS_REINDEXED`. Messages live in MESSAGES (source of
+    /// truth), so this only rewrites the index, never message content.
+    pub fn reindex_channel_msgs_by_timestamp(&self) -> Result<()> {
+        use crate::messages::envelope::Envelope;
+        use crate::messages::types::{ChatMessagePayload, MessageType};
+        use tracing::info;
+
+        let cf = self
+            .db
+            .cf_handle(cf::MESSAGES)
+            .with_context(|| "column family 'messages' not found")?;
+        let mut iter = self.db.raw_iterator_cf(&cf);
+        iter.seek_to_first();
+
+        let mut reindexed = 0u64;
+        while iter.valid() {
+            if let Some(raw) = iter.value() {
+                if let Ok(envelope) = rmp_serde::from_slice::<Envelope>(raw) {
+                    if matches!(envelope.msg_type, MessageType::ChatMessage) {
+                        // Typed decode — the payload may carry a `reply_to` bin
+                        // that serde_json::Value cannot represent.
+                        if let Ok(p) =
+                            rmp_serde::from_slice::<ChatMessagePayload>(&envelope.payload)
+                        {
+                            let old_key = super::schema::encode_channel_msg_key(
+                                p.channel_id,
+                                envelope.lamport_ts,
+                                &envelope.msg_id,
+                            );
+                            let new_key = super::schema::encode_channel_msg_key(
+                                p.channel_id,
+                                envelope.timestamp,
+                                &envelope.msg_id,
+                            );
+                            if old_key != new_key {
+                                self.delete_cf(cf::CHANNEL_MSGS, &old_key)?;
+                                self.put_cf(cf::CHANNEL_MSGS, &new_key, &[])?;
+                                reindexed += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            iter.next();
+        }
+
+        if reindexed > 0 {
+            info!(reindexed, "Re-indexed CHANNEL_MSGS by timestamp");
+        }
+        self.put_cf(
+            cf::NODE_STATE,
+            super::schema::state_keys::CHANNEL_MSGS_TS_REINDEXED,
+            &1u64.to_be_bytes(),
+        )?;
+        Ok(())
+    }
+
     /// Migrate device addresses from klv1... to ogd1... prefix.
     ///
     /// Re-derives all device addresses in DEVICE_WALLET_MAP and WALLET_DEVICES

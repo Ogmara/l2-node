@@ -5,6 +5,27 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.58.0] - 2026-06-06
+
+### Changed
+
+- **CHANNEL_MSGS is now keyed by the message's wall-clock `timestamp` instead of
+  `lamport_ts`.** Clients always send `lamport_ts: 0`, so the index sorted by
+  msg_id (random) — which broke chronological pagination and forced 0.57.1 to
+  drop the unread fast-skip (every message fetched). `timestamp` is part of the
+  signed envelope, so the key is identical on every node: globally consistent
+  chronological ordering, a meaningful reconcile cursor, and a valid
+  `key_ts <= last_read` skip. Restored the fast-skip in `GET /channels/unread`
+  (now correct), so unread counting no longer reads every candidate envelope.
+
+### Added
+
+- **One-time migration** (`CHANNEL_MSGS_TS_REINDEXED`) re-keys every existing
+  chat message in CHANNEL_MSGS from `lamport_ts` to `timestamp` on startup.
+  Idempotent and crash-safe (re-runs complete a partial pass); rewrites only the
+  index, never message content (messages live in MESSAGES). Runs after the
+  CHANNEL_META backfill.
+
 ## [0.57.1] - 2026-06-06
 
 ### Fixed

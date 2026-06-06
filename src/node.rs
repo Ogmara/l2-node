@@ -133,6 +133,16 @@ impl Node {
             }
         }
 
+        // Re-key CHANNEL_MSGS from lamport_ts (always 0) to wall-clock timestamp
+        // so the channel index is chronological + the unread fast-skip works.
+        let channel_msgs_ts_reindexed =
+            storage.get_stat(state_keys::CHANNEL_MSGS_TS_REINDEXED)? > 0;
+        if !channel_msgs_ts_reindexed {
+            if let Err(e) = storage.reindex_channel_msgs_by_timestamp() {
+                warn!(error = %e, "Failed to re-index CHANNEL_MSGS by timestamp");
+            }
+        }
+
         // Load Lamport counter from storage
         let lamport_value = storage.get_lamport_counter()?;
         let lamport_counter = Arc::new(AtomicU64::new(lamport_value));

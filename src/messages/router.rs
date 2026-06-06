@@ -1220,9 +1220,16 @@ impl MessageRouter {
                 if let Ok(payload) =
                     rmp_serde::from_slice::<ChatMessagePayload>(&envelope.payload)
                 {
+                    // Sort key is the message's wall-clock timestamp (ms), NOT
+                    // `lamport_ts` — clients send `lamport_ts: 0`, which made the
+                    // index sort by msg_id (random) and broke the unread fast-skip
+                    // (0 <= any read cursor). `timestamp` is part of the signed
+                    // envelope, so this key is identical on every node → globally
+                    // consistent chronological ordering + a valid reconcile cursor
+                    // + a working `key_ts <= last_read` skip in get_unread_counts.
                     let key = schema::encode_channel_msg_key(
                         payload.channel_id,
-                        envelope.lamport_ts,
+                        envelope.timestamp,
                         &envelope.msg_id,
                     );
                     self.storage
