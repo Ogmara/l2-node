@@ -5,6 +5,19 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.57.0] - 2026-06-06
+
+### Added
+
+- **Reactions, edits, and deletes now broadcast live over WebSocket** (like
+  chat messages did in 0.56.0), so they appear on every node's clients in real
+  time instead of only after a poll/reload. The notification engine broadcasts
+  a `{type:"message"}` event for `ChatReaction`/`ChatEdit`/`ChatDelete` on both
+  the API-post and gossip-receive paths, surfacing `target_msg_id` (+ `emoji`/
+  `remove` for reactions) top-level so the client can apply the update. Same
+  fail-closed private-channel guard as the message broadcast (private channels
+  are never broadcast).
+
 ## [0.56.1] - 2026-06-06
 
 ### Fixed

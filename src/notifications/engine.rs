@@ -12,7 +12,10 @@ use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, warn};
 
 use crate::messages::envelope::Envelope;
-use crate::messages::types::{ChatMessagePayload, MessageType, NewsCommentPayload};
+use crate::messages::types::{
+    ChatMessagePayload, DeletePayload, EditPayload, MessageType, NewsCommentPayload,
+    ReactionPayload,
+};
 use crate::storage::rocks::Storage;
 use crate::storage::schema::cf;
 
@@ -121,7 +124,49 @@ impl NotificationEngine {
                     // AND the gossip-receive path, so this is what makes a
                     // message posted on one node appear live on every node's
                     // connected clients (not just after a poll/reload).
-                    self.broadcast_channel_message(envelope, payload.channel_id);
+                    self.broadcast_channel_message(envelope, payload.channel_id, &[]);
+                }
+            }
+            // Real-time delivery for reactions/edits/deletes so they appear
+            // live cross-node (they already propagate via gossip, but without
+            // this only show on poll/reload). `target_msg_id` (hex of the
+            // payload's `target_id`) is surfaced top-level so the client can
+            // apply the update to the right message.
+            MessageType::ChatReaction => {
+                if let Ok(p) = rmp_serde::from_slice::<ReactionPayload>(&envelope.payload) {
+                    if let Some(cid) = p.channel_id {
+                        self.broadcast_channel_message(
+                            envelope,
+                            cid,
+                            &[
+                                ("target_msg_id", serde_json::json!(hex::encode(p.target_id))),
+                                ("emoji", serde_json::json!(p.emoji)),
+                                ("remove", serde_json::json!(p.remove)),
+                            ],
+                        );
+                    }
+                }
+            }
+            MessageType::ChatEdit => {
+                if let Ok(p) = rmp_serde::from_slice::<EditPayload>(&envelope.payload) {
+                    if let Some(cid) = p.channel_id {
+                        self.broadcast_channel_message(
+                            envelope,
+                            cid,
+                            &[("target_msg_id", serde_json::json!(hex::encode(p.target_id)))],
+                        );
+                    }
+                }
+            }
+            MessageType::ChatDelete => {
+                if let Ok(p) = rmp_serde::from_slice::<DeletePayload>(&envelope.payload) {
+                    if let Some(cid) = p.channel_id {
+                        self.broadcast_channel_message(
+                            envelope,
+                            cid,
+                            &[("target_msg_id", serde_json::json!(hex::encode(p.target_id)))],
+                        );
+                    }
                 }
             }
             MessageType::NewsComment => {
@@ -148,7 +193,12 @@ impl NotificationEngine {
     /// top-level `channel_id` so clients can filter by the channel they're
     /// viewing. Best-effort — a dropped broadcast just means the client picks
     /// the message up on its next poll/reload.
-    fn broadcast_channel_message(&self, envelope: &Envelope, channel_id: u64) {
+    fn broadcast_channel_message(
+        &self,
+        envelope: &Envelope,
+        channel_id: u64,
+        extra: &[(&str, serde_json::Value)],
+    ) {
         // PRIVACY (fail CLOSED): the broadcast fans out to ALL connected WS
         // clients (they filter by channel_id client-side), so ONLY broadcast
         // PUBLIC (0) / READ-PUBLIC (1) channels. EVERY other case must NOT
@@ -201,6 +251,11 @@ impl NotificationEngine {
             // The bare envelope has no top-level channel_id (it's in the
             // payload); clients filter on it, so surface it here.
             map.insert("channel_id".into(), serde_json::json!(channel_id));
+            // Per-type routing fields (e.g. target_msg_id/emoji/remove for
+            // reactions/edits/deletes) the client needs to apply the update.
+            for (k, v) in extra {
+                map.insert((*k).to_string(), v.clone());
+            }
         }
         let ws_msg = serde_json::json!({ "type": "message", "envelope": val });
         if let Ok(json) = serde_json::to_string(&ws_msg) {
