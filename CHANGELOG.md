@@ -5,6 +5,19 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.54.1] - 2026-06-06
+
+### Fixed
+
+- **`POST /devices/register` now returns 409 (not an opaque 500) when the device
+  key is already linked to a different wallet.** Re-registering a device key
+  that's mapped to another wallet trips the cross-wallet hijack defense; that
+  surfaced as a 500 "registration failed" and a stuck "device not linked"
+  banner. The handler now pre-checks the existing mapping and returns
+  `409 Conflict` with a clear message so the client can mint a fresh device key
+  for the new wallet. The hijack defense inside `register_device` remains the
+  authoritative backstop (the pre-check only sets the status code).
+
 ## [0.54.0] - 2026-06-06
 
 ### Added

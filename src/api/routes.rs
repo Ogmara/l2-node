@@ -4187,6 +4187,22 @@ pub async fn register_device(
         registered_at: body.timestamp,
     };
 
+    // If this device key is already linked to a DIFFERENT wallet, refuse with
+    // 409 Conflict (not an opaque 500) so the client knows to mint a FRESH
+    // device key for the new wallet. Device keys are ephemeral and per-wallet:
+    // reassigning one across wallets is intentionally refused (cross-wallet
+    // hijack defense + it would re-attribute the old wallet's history). The
+    // correct resolution is a new device key, not reusing this one.
+    if let Ok(Some(existing_wallet)) = state.storage.resolve_wallet(&device_address) {
+        if existing_wallet != body.wallet_address {
+            return (
+                StatusCode::CONFLICT,
+                "device already linked to another wallet; register a fresh device key",
+            )
+                .into_response();
+        }
+    }
+
     match state.identity.register_device(&claim) {
         Ok(()) => {
             // Migrate read state from device address to wallet address.
