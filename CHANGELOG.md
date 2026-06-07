@@ -5,6 +5,22 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.60.0] - 2026-06-07
+
+### Fixed
+
+- **Cross-node DMs now delivered.** A node never subscribed to its users' DM
+  gossip topics — the `subscribe_dm` topic call existed but had no caller, and the
+  WebSocket `SubscribeDm` handler was a stub. So a DM published on the sender's node
+  had no subscriber on the recipient's node and was dropped (same-node DMs worked
+  via local storage + polling; cross-node never did). Now, on each authenticated
+  WebSocket connect, the node subscribes to that user's DM gossip topic (via a new
+  API/WS → network `dm_subscribe` command channel, mirroring `identity_sync`), so
+  DMs sent from other nodes are received and indexed locally.
+  - Known limitation: gossip is not store-and-forward, so a DM sent while the
+    recipient has no active connection (their node not yet subscribed) is still
+    missed. Persistent subscription for local users + DM backfill is a follow-up.
+
 ## [0.59.0] - 2026-06-07
 
 ### Added

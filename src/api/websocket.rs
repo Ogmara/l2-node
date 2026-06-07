@@ -168,6 +168,11 @@ async fn handle_authenticated_ws(socket: WebSocket, state: Arc<AppState>) {
     // the wallet address (not the device/signing key) with the engine.
     let wallet_address = state.identity.resolve(&auth_address).unwrap_or_else(|_| auth_address.clone());
 
+    // Subscribe this node to the user's DM gossip topic so DMs sent to them from
+    // OTHER nodes are received and indexed here (the network task owns the swarm).
+    // Idempotent in the topic layer; safe to send on every connect.
+    let _ = state.dm_subscribe_tx.send(wallet_address.clone());
+
     // Register this user with the notification engine for mention detection
     if let Some(ref engine) = state.notification_engine {
         engine.add_local_user(&wallet_address).await;

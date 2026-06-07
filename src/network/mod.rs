@@ -802,6 +802,9 @@ impl NetworkService {
         // this node (login / node-switch) or a device can't be resolved, asking
         // us to lazily pull that wallet's identity bundle from peers.
         mut identity_sync_rx: tokio::sync::mpsc::UnboundedReceiver<IdentitySyncCommand>,
+        // API/WS → network: subscribe a wallet's DM gossip topic on WS connect so
+        // this node receives that user's cross-node DMs.
+        mut dm_subscribe_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
     ) {
         info!(
             peer_id = %self.swarm.local_peer_id(),
@@ -860,6 +863,12 @@ impl NetworkService {
                 }
                 Some(cmd) = identity_sync_rx.recv() => {
                     self.maybe_trigger_identity_sync(cmd.wallet, cmd.scopes);
+                }
+                Some(addr) = dm_subscribe_rx.recv() => {
+                    // Subscribe this node to the user's DM gossip topic so DMs sent
+                    // to them from other nodes are received and indexed locally.
+                    self.subscribe_dm(&addr);
+                    debug!(%addr, "Subscribed to DM gossip topic");
                 }
                 Some(channel_id) = channel_rx.recv() => {
                     // Code Audit W2 (0.47.0): route chain-discovered
