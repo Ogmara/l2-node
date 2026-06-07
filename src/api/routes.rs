@@ -2359,11 +2359,39 @@ pub async fn send_dm(
     use crate::messages::router::RouteResult;
 
     match state.router.process_message(&body) {
-        RouteResult::Accepted { msg_id, .. } => {
-            // DMs don't gossip via this path, so no delivery hint.
+        RouteResult::Accepted { msg_id, raw_bytes, .. } => {
+            // Publish the DM to the recipient's gossip topic so the recipient's
+            // node receives and indexes it (it subscribes to its users' DM topics
+            // on WS connect, 0.60.0). Without this, the DM was only stored locally
+            // on the sender's node — same-node DMs worked, cross-node never did.
+            let mut delivery: Option<&'static str> = None;
+            if let Ok(envelope) =
+                rmp_serde::from_slice::<crate::messages::envelope::Envelope>(&raw_bytes)
+            {
+                if let Some(topic) = gossip_topic_for_envelope(&envelope, &state.klever_network) {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    let sent = state
+                        .gossip_tx
+                        .send(crate::network::GossipPublish {
+                            topic,
+                            data: raw_bytes.clone(),
+                            respond_to: Some(tx),
+                        })
+                        .is_ok();
+                    delivery = if !sent {
+                        Some("pending")
+                    } else {
+                        match tokio::time::timeout(std::time::Duration::from_millis(1500), rx).await {
+                            Ok(Ok(crate::network::PublishOutcome::Propagated)) => Some("propagated"),
+                            Ok(Ok(crate::network::PublishOutcome::Degraded)) => Some("degraded"),
+                            Ok(Err(_)) | Err(_) => Some("pending"),
+                        }
+                    };
+                }
+            }
             Json(MessageResponse {
                 msg_id: hex::encode(msg_id),
-                delivery: None,
+                delivery,
             })
             .into_response()
         }

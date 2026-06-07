@@ -5,6 +5,18 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.60.1] - 2026-06-07
+
+### Fixed
+
+- **Cross-node DMs: the send side now actually gossips.** 0.60.0 made the recipient
+  node subscribe to DM topics, but `send_dm` (`POST /api/v1/dm/{address}`) only
+  *stored* the DM locally and never published it to gossip ("DMs don't gossip via
+  this path") — so cross-node DMs still never left the sender's node. `send_dm` now
+  publishes the DM envelope to the recipient's gossip topic (with a delivery hint),
+  exactly like `post_message`. Together with the 0.60.0 subscription, cross-node DMs
+  are delivered when the recipient is connected. **Both nodes must run ≥0.60.1.**
+
 ## [0.60.0] - 2026-06-07
 
 ### Fixed
