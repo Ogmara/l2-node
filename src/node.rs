@@ -391,6 +391,11 @@ impl Node {
         let (identity_sync_tx, identity_sync_rx) =
             tokio::sync::mpsc::unbounded_channel::<crate::network::IdentitySyncCommand>();
 
+        // Channel for API/WS → network: subscribe a wallet's DM gossip topic on WS
+        // connect so this node receives that user's cross-node DMs (0.60.0).
+        let (dm_subscribe_tx, dm_subscribe_rx) =
+            tokio::sync::mpsc::unbounded_channel::<String>();
+
         // Subscribe to all existing channels from storage so the node
         // participates in GossipSub for channels it already knows about.
         match self.storage.prefix_iter_cf(
@@ -454,7 +459,7 @@ impl Node {
         let network_shutdown_rx = self.shutdown_rx();
         let network_task = tokio::spawn(async move {
             network
-                .run(network_shutdown_rx, channel_rx, gossip_rx, sc_reconnect_rx, identity_sync_rx)
+                .run(network_shutdown_rx, channel_rx, gossip_rx, sc_reconnect_rx, identity_sync_rx, dm_subscribe_rx)
                 .await;
         });
 
@@ -1028,6 +1033,7 @@ impl Node {
             peer_count,
             gossip_tx,
             identity_sync_tx,
+            dm_subscribe_tx,
             connected_peers,
             network_counters,
             metrics_latest,
