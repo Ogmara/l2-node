@@ -90,6 +90,10 @@ impl RateCategory {
     }
 }
 
+/// Max active encryption keys retained per wallet (protocol §2.4). Bounds the
+/// `device_enc_keys` directory and the multi-device wrap fan-out.
+const MAX_ENC_KEYS_PER_WALLET: usize = 10;
+
 /// The message router processes incoming messages through the full pipeline.
 pub struct MessageRouter {
     storage: Storage,
@@ -191,6 +195,21 @@ impl MessageRouter {
             Ok(addr) => addr,
             Err(e) => return RouteResult::Rejected(format!("identity resolution failed: {}", e)),
         };
+
+        // Device enc-key bindings MUST be authored directly by the WALLET (protocol
+        // §2.4): the wallet's `signMessage` over the canonical claim is the sole
+        // authority. Reject a delegated device authoring one — otherwise a single
+        // delegated device could poison the wallet's enc-key directory (audit
+        // WARNING-2), causing senders to encrypt to an attacker-controlled key.
+        if matches!(
+            envelope.msg_type,
+            MessageType::DeviceEncBinding | MessageType::DeviceEncRevoke
+        ) && envelope.author != resolved_author
+        {
+            return RouteResult::Rejected(
+                "enc-key binding/revoke must be authored by the wallet itself".into(),
+            );
+        }
 
         // Step 4d: Tiered identity requirements.
         //
@@ -379,6 +398,16 @@ impl MessageRouter {
             return self.verify_device_delegation_claim(envelope, &verifying_key, &signature);
         }
 
+        // DeviceEncBinding / DeviceEncRevoke are wallet-authorized over a canonical
+        // claim string (browser/K5 wallets can only `signMessage`), same shape as
+        // DeviceDelegation minus the device co-sign (an X25519 enc key cannot sign).
+        if matches!(
+            envelope.msg_type,
+            MessageType::DeviceEncBinding | MessageType::DeviceEncRevoke
+        ) {
+            return self.verify_device_enc_claim(envelope, &verifying_key, &signature);
+        }
+
         // Try Ogmara protocol format first (most common for L2 messages)
         let ogmara_result = signing::verify_ogmara_message(
             &verifying_key,
@@ -484,6 +513,96 @@ impl MessageRouter {
         }
 
         Ok(())
+    }
+
+    /// Verify a `DeviceEncBinding` / `DeviceEncRevoke` envelope (P0 E2E).
+    ///
+    /// The envelope is authored by the WALLET; `envelope.signature` is the wallet's
+    /// Klever-message signature over a canonical claim re-derived from envelope
+    /// fields (protocol §2.4), so a relaying node cannot forge it:
+    ///   * bind:   `ogmara-enc-bind:{enc_pub_lc}:{device_id_lc}:{wallet}:{timestamp}`
+    ///   * revoke: `ogmara-enc-revoke:{enc_pub_lc}:{wallet}:{timestamp}`
+    /// No device co-signature: an X25519 encryption key cannot produce a signature,
+    /// and the wallet signature is the sole authority (binding a key the wallet does
+    /// not control only harms that wallet).
+    fn verify_device_enc_claim(
+        &self,
+        envelope: &Envelope,
+        wallet_key: &ed25519_dalek::VerifyingKey,
+        wallet_sig: &ed25519_dalek::Signature,
+    ) -> Result<()> {
+        let claim = match envelope.msg_type {
+            MessageType::DeviceEncBinding => {
+                let p: DeviceEncBindingPayload = rmp_serde::from_slice(&envelope.payload)
+                    .context("DeviceEncBinding payload decode for signature verification")?;
+                Self::validate_hex32(&p.enc_pub, "enc_pub")?;
+                Self::validate_hex32(&p.device_id, "device_id")?;
+                format!(
+                    "ogmara-enc-bind:{}:{}:{}:{}",
+                    p.enc_pub.to_ascii_lowercase(),
+                    p.device_id.to_ascii_lowercase(),
+                    envelope.author,
+                    envelope.timestamp
+                )
+            }
+            MessageType::DeviceEncRevoke => {
+                let p: DeviceEncRevokePayload = rmp_serde::from_slice(&envelope.payload)
+                    .context("DeviceEncRevoke payload decode for signature verification")?;
+                Self::validate_hex32(&p.enc_pub, "enc_pub")?;
+                format!(
+                    "ogmara-enc-revoke:{}:{}:{}",
+                    p.enc_pub.to_ascii_lowercase(),
+                    envelope.author,
+                    envelope.timestamp
+                )
+            }
+            _ => unreachable!("verify_device_enc_claim called for non-enc message type"),
+        };
+
+        signing::verify_klever_message(wallet_key, claim.as_bytes(), wallet_sig)
+            .map_err(|_| anyhow::anyhow!("DeviceEnc wallet claim signature invalid"))
+    }
+
+    /// Validate a hex string decodes to exactly 32 bytes (Ed25519/X25519 key).
+    fn validate_hex32(s: &str, field: &str) -> Result<()> {
+        let bytes = hex::decode(s).map_err(|_| anyhow::anyhow!("{} is not valid hex", field))?;
+        if bytes.len() != 32 {
+            anyhow::bail!("{} must be 32 bytes", field);
+        }
+        Ok(())
+    }
+
+    /// True if an incoming enc-key op at `ts` is strictly newer than the existing
+    /// record for `key` (last-write-wins; an absent record counts as newer). This
+    /// is what prevents a replayed/stale bind or revoke from overwriting newer
+    /// state or resurrecting a revocation tombstone.
+    fn enc_key_is_newer(&self, key: &[u8], ts: u64) -> Result<bool> {
+        let existing_ts = self
+            .storage
+            .get_cf(schema::cf::DEVICE_ENC_KEYS, key)?
+            .and_then(|v| serde_json::from_slice::<serde_json::Value>(&v).ok())
+            .and_then(|r| r.get("ts").and_then(|t| t.as_u64()));
+        Ok(existing_ts.map_or(true, |existing| ts > existing))
+    }
+
+    /// Count active (non-revoked, non-tombstoned) enc keys for a wallet, excluding
+    /// `skip_enc_pub` so re-binding an existing key is not counted against the cap.
+    fn count_active_enc_keys(&self, wallet: &str, skip_enc_pub: &str) -> Result<usize> {
+        let mut prefix = wallet.as_bytes().to_vec();
+        prefix.push(0xFF);
+        let entries = self
+            .storage
+            .prefix_iter_cf(schema::cf::DEVICE_ENC_KEYS, &prefix, 256)?;
+        let count = entries
+            .into_iter()
+            .filter_map(|(_, v)| serde_json::from_slice::<serde_json::Value>(&v).ok())
+            .filter(|r| {
+                let revoked = r.get("revoked").and_then(|b| b.as_bool()).unwrap_or(false);
+                let ep = r.get("enc_pub").and_then(|s| s.as_str()).unwrap_or("");
+                !revoked && ep != skip_enc_pub
+            })
+            .count();
+        Ok(count)
     }
 
     /// Verify that the msg_id matches Keccak-256(author + payload + timestamp).
@@ -1179,6 +1298,8 @@ impl MessageRouter {
                 | MessageType::DeviceRevocation
                 | MessageType::Follow
                 | MessageType::Unfollow
+                | MessageType::DeviceEncBinding
+                | MessageType::DeviceEncRevoke
         ) {
             let key = schema::encode_identity_envelope_key(
                 resolved_author,
@@ -1825,6 +1946,65 @@ impl MessageRouter {
                         json.to_string().as_bytes(),
                     )?;
                     debug!(author = %resolved_author, "Settings synced");
+                }
+            }
+            MessageType::DeviceEncBinding => {
+                // P0 E2E (protocol §2.4): record a per-device X25519 encryption public
+                // key so senders can wrap message keys to each of this wallet's devices.
+                // The wallet signature over the canonical claim was verified at
+                // `verify_signature`. Apply last-write-wins so a replayed/stale binding
+                // can neither overwrite newer state (CRITICAL-2) nor resurrect a key a
+                // strictly-newer revoke tombstoned (CRITICAL-1); cap directory growth.
+                if let Ok(payload) =
+                    rmp_serde::from_slice::<DeviceEncBindingPayload>(&envelope.payload)
+                {
+                    let enc_pub = payload.enc_pub.to_ascii_lowercase();
+                    let key = schema::encode_device_enc_key(resolved_author, &enc_pub);
+                    if self.enc_key_is_newer(&key, envelope.timestamp)? {
+                        let active = self.count_active_enc_keys(resolved_author, &enc_pub)?;
+                        if active >= MAX_ENC_KEYS_PER_WALLET {
+                            warn!(wallet = %resolved_author, active,
+                                "enc-key cap reached; binding ignored");
+                        } else {
+                            let record = serde_json::json!({
+                                "enc_pub": enc_pub,
+                                "device_id": payload.device_id.to_ascii_lowercase(),
+                                "created_at": envelope.timestamp,
+                                "ts": envelope.timestamp,
+                                "revoked": false,
+                            });
+                            self.storage.put_cf(
+                                schema::cf::DEVICE_ENC_KEYS,
+                                &key,
+                                record.to_string().as_bytes(),
+                            )?;
+                            debug!(wallet = %resolved_author, %enc_pub, "Device enc key bound");
+                        }
+                    }
+                }
+            }
+            MessageType::DeviceEncRevoke => {
+                // Write a revocation TOMBSTONE (not a bare delete) so a replayed older
+                // binding cannot resurrect a retired key (CRITICAL-1). LWW-guarded.
+                if let Ok(payload) =
+                    rmp_serde::from_slice::<DeviceEncRevokePayload>(&envelope.payload)
+                {
+                    let enc_pub = payload.enc_pub.to_ascii_lowercase();
+                    let key = schema::encode_device_enc_key(resolved_author, &enc_pub);
+                    if self.enc_key_is_newer(&key, envelope.timestamp)? {
+                        let record = serde_json::json!({
+                            "enc_pub": enc_pub,
+                            "ts": envelope.timestamp,
+                            "revoked": true,
+                            "revoked_at": envelope.timestamp,
+                        });
+                        self.storage.put_cf(
+                            schema::cf::DEVICE_ENC_KEYS,
+                            &key,
+                            record.to_string().as_bytes(),
+                        )?;
+                        debug!(wallet = %resolved_author, %enc_pub, "Device enc key revoked");
+                    }
                 }
             }
             MessageType::DeviceDelegation => {

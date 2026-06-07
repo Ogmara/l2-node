@@ -84,6 +84,10 @@ pub mod cf {
     pub const DEVICE_WALLET_MAP: &str = "device_wallet_map";
     /// (wallet_address, 0xFF, device_address) → DeviceClaim (serialized) — wallet's registered devices
     pub const WALLET_DEVICES: &str = "wallet_devices";
+    /// (wallet_address, 0xFF, enc_pub_hex) → DeviceEncKey (JSON) — active per-device
+    /// X25519 encryption public keys (protocol §2.4). Opaque public key material;
+    /// EXCLUDED from snapshot DOMAIN_CFS (churns with devices, re-fetched on demand).
+    pub const DEVICE_ENC_KEYS: &str = "device_enc_keys";
 
     /// (wallet_address, 0xFF, channel_id_be8) → last_read_ts (u64 BE) — per-user per-channel read cursor
     pub const CHANNEL_READ_STATE: &str = "channel_read_state";
@@ -225,6 +229,7 @@ pub mod cf {
         NEWS_COMMENTS,
         DEVICE_WALLET_MAP,
         WALLET_DEVICES,
+        DEVICE_ENC_KEYS,
         CHANNEL_READ_STATE,
         DM_READ_STATE,
         DELETED_CHANNELS,
@@ -634,6 +639,18 @@ pub fn encode_wallet_device_key(wallet_address: &str, device_address: &str) -> V
     key.extend_from_slice(wallet_address.as_bytes());
     key.push(0xFF); // separator
     key.extend_from_slice(device_address.as_bytes());
+    key
+}
+
+/// Encode a device encryption-key directory key: (wallet_address, 0xFF, enc_pub_hex).
+///
+/// Keyed by the X25519 enc public key (the thing bound/revoked, protocol §2.4).
+/// Prefix iteration on wallet_address bytes returns all enc keys for that wallet.
+pub fn encode_device_enc_key(wallet_address: &str, enc_pub_hex: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(wallet_address.len() + 1 + enc_pub_hex.len());
+    key.extend_from_slice(wallet_address.as_bytes());
+    key.push(0xFF); // separator
+    key.extend_from_slice(enc_pub_hex.as_bytes());
     key
 }
 
