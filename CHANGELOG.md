@@ -5,6 +5,38 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.59.0] - 2026-06-07
+
+### Added
+
+- **Device encryption-key directory (E2E P0, protocol §2.4).** New message types
+  `DeviceEncBinding` (0x36) and `DeviceEncRevoke` (0x37): a wallet binds/revokes a
+  per-device X25519 **encryption** public key (distinct from the device signing
+  key). The envelope is wallet-authored; its signature is the wallet's
+  Klever-message signature over a canonical claim re-derived at the gate
+  (`ogmara-enc-bind:{enc_pub}:{device_id}:{wallet}:{timestamp}` /
+  `ogmara-enc-revoke:{enc_pub}:{wallet}:{timestamp}`), so a relaying node cannot
+  forge a binding. No device co-signature (an X25519 key cannot sign; the wallet
+  signature is the sole authority).
+- New CF `device_enc_keys: (wallet, 0xFF, enc_pub_hex) → {enc_pub, device_id,
+  created_at}`. Opaque public key material; **excluded from snapshot `DOMAIN_CFS`**.
+  Indexed in `IDENTITY_ENVELOPES` and gossiped on `topic_network` so a sender's node
+  can resolve a recipient's encryption keys cross-node.
+- New endpoint `GET /api/v1/users/{address}/enc-keys` (authenticated) returns a
+  wallet's active enc keys; `POST` on the same path submits a signed binding/revoke
+  via the standard message pipeline.
+
+### Security
+
+- Enc-key directory carries the same stateful defenses as dual-signed
+  `DeviceDelegation`: **last-write-wins** ordering (a replayed/stale bind cannot
+  overwrite newer state), **revocation tombstones** (revoke writes `revoked: true`
+  rather than deleting, so a replayed older bind cannot resurrect a retired key on
+  the drift-exempt sync path), a **per-wallet cap** (`MAX_ENC_KEYS_PER_WALLET = 10`),
+  and a **wallet-authored gate** (a delegated device cannot bind/revoke keys under
+  the wallet — `envelope.author` must equal the resolved wallet). GET returns active
+  keys only (tombstones filtered).
+
 ## [0.58.1] - 2026-06-06
 
 ### Fixed

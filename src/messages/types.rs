@@ -54,6 +54,8 @@ pub enum MessageType {
     SettingsSync = 0x33,
     Follow = 0x34,
     Unfollow = 0x35,
+    DeviceEncBinding = 0x36,
+    DeviceEncRevoke = 0x37,
 
     // Moderation
     Report = 0x40,
@@ -111,6 +113,8 @@ impl MessageType {
             0x33 => Some(Self::SettingsSync),
             0x34 => Some(Self::Follow),
             0x35 => Some(Self::Unfollow),
+            0x36 => Some(Self::DeviceEncBinding),
+            0x37 => Some(Self::DeviceEncRevoke),
             0x40 => Some(Self::Report),
             0x41 => Some(Self::CounterVote),
             0x42 => Some(Self::ChannelMute),
@@ -585,6 +589,32 @@ pub struct DeviceRevocationPayload {
     pub device_pub_key: String,
 }
 
+/// Device encryption-key binding (P0 E2E, l2-node 0.59.0+). Binds a per-device
+/// X25519 encryption public key to the wallet so senders can wrap message keys
+/// to each of a wallet's devices (protocol §2.4, §8.1). The envelope is authored
+/// by the WALLET and its `signature` is the wallet's Klever-message signature over
+/// the canonical binding string
+/// `ogmara-enc-bind:{enc_pub_lowercase}:{device_id_lowercase}:{wallet}:{timestamp}`.
+/// There is no device co-signature: an X25519 key cannot produce a signature, and
+/// the wallet signature is the sole authority (binding a key the wallet does not
+/// control only harms that wallet). Verified at `verify_signature`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceEncBindingPayload {
+    /// Device signing-key ID — 32-byte Ed25519 public key (hex-encoded).
+    pub device_id: String,
+    /// Device X25519 encryption public key — 32 bytes (hex-encoded).
+    pub enc_pub: String,
+}
+
+/// Revoke a previously-bound device encryption key (protocol §2.4). Wallet-authored;
+/// `signature` is the wallet's Klever-message signature over the canonical string
+/// `ogmara-enc-revoke:{enc_pub_lowercase}:{wallet}:{timestamp}`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceEncRevokePayload {
+    /// Device X25519 encryption public key to revoke — 32 bytes (hex-encoded).
+    pub enc_pub: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SettingsSyncPayload {
     /// AES-256-GCM ciphertext.
@@ -833,6 +863,8 @@ pub fn deserialize_payload(
         MessageType::SettingsSync => Ok(DeserializedPayload::SettingsSync(rmp_serde::from_slice(payload_bytes)?)),
         MessageType::Follow => Ok(DeserializedPayload::Follow(rmp_serde::from_slice(payload_bytes)?)),
         MessageType::Unfollow => Ok(DeserializedPayload::Unfollow(rmp_serde::from_slice(payload_bytes)?)),
+        MessageType::DeviceEncBinding => Ok(DeserializedPayload::DeviceEncBinding(rmp_serde::from_slice(payload_bytes)?)),
+        MessageType::DeviceEncRevoke => Ok(DeserializedPayload::DeviceEncRevoke(rmp_serde::from_slice(payload_bytes)?)),
         MessageType::Report => Ok(DeserializedPayload::Report(rmp_serde::from_slice(payload_bytes)?)),
         MessageType::CounterVote => Ok(DeserializedPayload::CounterVote(rmp_serde::from_slice(payload_bytes)?)),
         MessageType::ChannelMute => Ok(DeserializedPayload::ChannelMute(rmp_serde::from_slice(payload_bytes)?)),
@@ -874,6 +906,8 @@ pub enum DeserializedPayload {
     SettingsSync(SettingsSyncPayload),
     Follow(FollowPayload),
     Unfollow(UnfollowPayload),
+    DeviceEncBinding(DeviceEncBindingPayload),
+    DeviceEncRevoke(DeviceEncRevokePayload),
     Report(ReportPayload),
     CounterVote(CounterVotePayload),
     ChannelMute(ChannelMutePayload),

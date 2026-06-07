@@ -163,6 +163,13 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
         .route("/api/v1/dm/{address}/messages", get(routes::get_dm_messages))
         .route("/api/v1/dm/{address}/read", post(routes::mark_dm_read))
         .route("/api/v1/users/{address}/follow", post(routes::follow_user).delete(routes::unfollow_user))
+        // Device encryption-key directory (protocol §2.4). GET = fetch a wallet's
+        // active enc keys; POST = submit a signed DeviceEncBinding/Revoke envelope
+        // (routed through the standard message pipeline so it gossips + indexes).
+        .route(
+            "/api/v1/users/{address}/enc-keys",
+            get(routes::get_enc_keys).post(routes::post_message),
+        )
         .route("/api/v1/feed", get(routes::personal_feed))
         // News engagement
         .route(

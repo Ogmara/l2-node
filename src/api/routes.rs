@@ -1352,7 +1352,12 @@ fn gossip_topic_for_envelope(
             let p: RecipientExtract = rmp_serde::from_slice(&envelope.payload).ok()?;
             Some(gossip::dm_topic(network_id, &p.recipient))
         }
-        MessageType::NodeAnnouncement | MessageType::DeviceDelegation => {
+        MessageType::NodeAnnouncement
+        | MessageType::DeviceDelegation
+        | MessageType::DeviceEncBinding
+        | MessageType::DeviceEncRevoke => {
+            // Device enc-key bindings propagate network-wide so a sender's node can
+            // resolve a recipient's encryption keys (protocol §2.4).
             Some(gossip::topic_network(network_id))
         }
         _ => None,
@@ -1827,6 +1832,43 @@ pub async fn get_user(
                 tracing::error!(error = %e, "Storage error in API handler");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
             }
+        }
+    }
+}
+
+/// GET /api/v1/users/:address/enc-keys — device encryption key directory (protocol §2.4).
+///
+/// Returns all active (non-revoked) X25519 device encryption public keys bound to
+/// the wallet. This is public key material (not secret): any authenticated user may
+/// fetch a recipient's keys to wrap message keys to each of the recipient's devices
+/// (multi-device E2E). Wrapped key material itself lives in the `channel_keys` CF,
+/// never here.
+pub async fn get_enc_keys(
+    Extension(state): Extension<Arc<AppState>>,
+    Path(address): Path<String>,
+) -> impl IntoResponse {
+    // Resolve device key → wallet so a lookup by device address still finds the owner.
+    let wallet = state.identity.resolve(&address).unwrap_or_else(|_| address.clone());
+    let mut prefix = wallet.as_bytes().to_vec();
+    prefix.push(0xFF);
+    match state
+        .storage
+        .prefix_iter_cf(cf::DEVICE_ENC_KEYS, &prefix, 256)
+    {
+        Ok(entries) => {
+            // Return only active keys — revocation tombstones (`revoked: true`) are
+            // kept in the CF to block replayed re-binds (protocol §2.4) but must not
+            // be served to senders.
+            let keys: Vec<serde_json::Value> = entries
+                .into_iter()
+                .filter_map(|(_, v)| serde_json::from_slice::<serde_json::Value>(&v).ok())
+                .filter(|r| !r.get("revoked").and_then(|b| b.as_bool()).unwrap_or(false))
+                .collect();
+            Json(serde_json::json!({ "address": wallet, "keys": keys })).into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "enc-keys lookup failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
         }
     }
 }
