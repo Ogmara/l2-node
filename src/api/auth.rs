@@ -1,12 +1,20 @@
 //! Authentication middleware for Klever wallet signature verification.
 //!
-//! Authenticated endpoints require three headers (spec 4.2):
+//! Authenticated endpoints require four headers (spec 4.2):
 //!   X-Ogmara-Auth:      base64(Ed25519 signature)
 //!   X-Ogmara-Address:   klv1... (wallet) or ogd1... (device) address
 //!   X-Ogmara-Timestamp: unix timestamp in milliseconds
+//!   X-Ogmara-Nonce:     client-chosen single-use nonce (hex)
 //!
-//! Auth string: "ogmara-auth:{timestamp}:{method}:{path}"
+//! Auth string (v2, audit 2026-06-07 host-binding):
+//!   "ogmara-auth:{network}:{node_id}:{nonce}:{timestamp}:{method}:{path}"
 //! Signed using Klever message signing format (protocol spec 4.1.1).
+//!
+//! `network` + `node_id` are the *verifying node's own* values — a
+//! signature captured for one node fails on any other node (different
+//! node_id) or network, defeating cross-node replay. The single-use
+//! `nonce`, tracked in `AppState::auth_nonce_seen` for the freshness
+//! window, defeats same-node replay.
 //!
 //! After signature verification, the middleware resolves the signing address
 //! (device key) to its owning wallet address via the IdentityResolver.
@@ -25,8 +33,21 @@ use crate::crypto::signing;
 
 use super::state::AppState;
 
-/// Maximum age for an auth header timestamp (60 seconds).
-const MAX_AUTH_AGE_MS: u64 = 60_000;
+/// Maximum age for an auth header timestamp in the past (60 seconds).
+pub const MAX_AUTH_AGE_MS: u64 = 60_000;
+
+/// Maximum tolerated clock skew into the future (5 seconds). Tighter than
+/// the past window (audit 2026-06-07 W1): a legitimate client's clock may
+/// lag behind ours by up to a minute, but a request stamped far in the
+/// *future* is either a badly-skewed client or a pre-minted replay token,
+/// neither of which we want to honour for a full minute.
+pub const MAX_AUTH_FUTURE_SKEW_MS: u64 = 5_000;
+
+/// Bounds on the client-supplied nonce length (hex chars). Long enough to
+/// be collision-free (16 bytes = 32 hex), capped so a hostile client can't
+/// bloat the replay cache key.
+const MIN_NONCE_LEN: usize = 16;
+const MAX_NONCE_LEN: usize = 128;
 
 /// Authenticated user info extracted from headers and identity resolution.
 #[derive(Debug, Clone)]
@@ -51,8 +72,15 @@ pub async fn auth_middleware(mut req: Request, next: Next) -> Response {
         }
     };
 
+    // `extract_and_verify` is SYNC (signature check) so nothing borrowing the
+    // request — whose `Body` is `!Sync` — is held across an `.await`, which would
+    // make this middleware future `!Send` and break `middleware::from_fn`. The
+    // single async step (the nonce-replay claim) runs here over OWNED values.
     match extract_and_verify(&req, &app_state) {
-        Ok(user) => {
+        Ok((user, nonce)) => {
+            if let Err(msg) = claim_nonce(&app_state, &user.signing_address, &nonce).await {
+                return (StatusCode::UNAUTHORIZED, msg).into_response();
+            }
             req.extensions_mut().insert(user);
             next.run(req).await
         }
@@ -69,14 +97,75 @@ pub async fn optional_auth_middleware(mut req: Request, next: Next) -> Response 
         None => return next.run(req).await,
     };
 
-    if let Ok(user) = extract_and_verify(&req, &app_state) {
-        req.extensions_mut().insert(user);
+    // Best-effort: verify (sync) then burn the nonce (async, owned values). A
+    // replayed nonce on an optional-auth route simply isn't treated as
+    // authenticated. Owned-values-only across the await keeps the future Send.
+    if let Ok((user, nonce)) = extract_and_verify(&req, &app_state) {
+        if claim_nonce(&app_state, &user.signing_address, &nonce).await.is_ok() {
+            req.extensions_mut().insert(user);
+        }
     }
     next.run(req).await
 }
 
+/// Validate the freshness of an auth timestamp against the local clock.
+///
+/// Allows up to `MAX_AUTH_AGE_MS` in the past and only `MAX_AUTH_FUTURE_SKEW_MS`
+/// in the future (audit 2026-06-07 W1 — asymmetric skew). Shared by the REST
+/// and WebSocket verifiers.
+pub fn check_timestamp_fresh(timestamp: u64) -> Result<(), String> {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    if timestamp > now_ms {
+        if timestamp - now_ms > MAX_AUTH_FUTURE_SKEW_MS {
+            return Err("auth timestamp too far in future".to_string());
+        }
+    } else if now_ms - timestamp > MAX_AUTH_AGE_MS {
+        return Err("auth timestamp expired".to_string());
+    }
+    Ok(())
+}
+
+/// Validate a client-supplied nonce: bounded length, hex characters only.
+pub fn validate_nonce(nonce: &str) -> Result<(), String> {
+    if nonce.len() < MIN_NONCE_LEN || nonce.len() > MAX_NONCE_LEN {
+        return Err("invalid nonce length".to_string());
+    }
+    if !nonce.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("nonce must be hex".to_string());
+    }
+    Ok(())
+}
+
+/// Record a `(signing_address, nonce)` as used; reject if already seen.
+/// Closes the same-node replay window (audit 2026-06-07). The check and
+/// insert are not a single atomic op, but the only race is two *simultaneous*
+/// first-uses of the same nonce — which gains an attacker nothing; the point
+/// is to block any *later* replay, and the later replay always sees the entry.
+pub async fn claim_nonce(
+    app_state: &AppState,
+    signing_address: &str,
+    nonce: &str,
+) -> Result<(), String> {
+    let key = format!("{signing_address}:{nonce}");
+    if app_state.auth_nonce_seen.get(&key).await.is_some() {
+        return Err("auth nonce already used (replay rejected)".to_string());
+    }
+    app_state.auth_nonce_seen.insert(key, ()).await;
+    Ok(())
+}
+
 /// Extract and verify auth headers, then resolve device → wallet.
-fn extract_and_verify(req: &Request, app_state: &AppState) -> Result<AuthUser, String> {
+///
+/// SYNC by design: it must not `.await` while borrowing `req` (whose `Body` is
+/// `!Sync`), or the calling middleware future becomes `!Send` and
+/// `middleware::from_fn` won't accept it. Returns the resolved `AuthUser` plus
+/// the request's `nonce` (owned) so the caller can do the async replay-claim
+/// (`claim_nonce`) over owned values.
+fn extract_and_verify(req: &Request, app_state: &AppState) -> Result<(AuthUser, String), String> {
     let headers = req.headers();
 
     // Extract required headers
@@ -95,26 +184,19 @@ fn extract_and_verify(req: &Request, app_state: &AppState) -> Result<AuthUser, S
         .and_then(|v| v.to_str().ok())
         .ok_or("missing X-Ogmara-Timestamp header")?;
 
+    let nonce = headers
+        .get("x-ogmara-nonce")
+        .and_then(|v| v.to_str().ok())
+        .ok_or("missing X-Ogmara-Nonce header")?;
+    validate_nonce(nonce)?;
+
     // Parse timestamp
     let timestamp: u64 = timestamp_str
         .parse()
         .map_err(|_| "invalid timestamp format")?;
 
-    // Check timestamp freshness
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-
-    let age = if now_ms > timestamp {
-        now_ms - timestamp
-    } else {
-        timestamp - now_ms
-    };
-
-    if age > MAX_AUTH_AGE_MS {
-        return Err("auth timestamp expired or too far in future".to_string());
-    }
+    // Check timestamp freshness (asymmetric past/future skew).
+    check_timestamp_fresh(timestamp)?;
 
     // Decode signature from base64
     let sig_bytes = base64::Engine::decode(
@@ -134,30 +216,34 @@ fn extract_and_verify(req: &Request, app_state: &AppState) -> Result<AuthUser, S
     let verifying_key = crypto::address_to_verifying_key(address)
         .map_err(|_| "invalid address".to_string())?;
 
-    // Build the auth string and verify signature against the device key
+    // Build the auth string and verify signature against the device key.
+    // `network` + `node_id` are THIS node's own values — that's what binds
+    // the signature to this node and defeats cross-node replay.
     let method = req.method().as_str();
     let path = req.uri().path();
+    let network = app_state.klever_network.as_str();
+    let node_id = app_state.node_id.as_str();
 
-    signing::verify_auth_header(&verifying_key, timestamp, method, path, &signature)
-        .map_err(|e| {
-            // Debug: log the exact auth string and hash for comparison with client
-            let auth_string = format!("ogmara-auth:{}:{}:{}", timestamp, method, path);
-            let klever_hash = signing::klever_message_hash(auth_string.as_bytes());
-            tracing::warn!(
-                address = %address,
-                method = %method,
-                path = %path,
-                timestamp = %timestamp,
-                auth_string = %auth_string,
-                auth_string_len = %auth_string.len(),
-                klever_hash = %hex::encode(klever_hash),
-                sig_hex = %hex::encode(signature.to_bytes()),
-                pubkey_hex = %hex::encode(verifying_key.as_bytes()),
-                error = %e,
-                "Auth signature verification failed"
-            );
-            "signature verification failed".to_string()
-        })?;
+    signing::verify_auth_header(
+        &verifying_key, network, node_id, nonce, timestamp, method, path, &signature,
+    )
+    .map_err(|e| {
+        tracing::warn!(
+            address = %address,
+            method = %method,
+            path = %path,
+            timestamp = %timestamp,
+            network = %network,
+            node_id = %node_id,
+            error = %e,
+            "Auth signature verification failed"
+        );
+        "signature verification failed".to_string()
+    })?;
+
+    // NOTE: the nonce replay-claim (`claim_nonce`) is done by the async caller
+    // over owned values — see `auth_middleware` — to keep this fn sync (and the
+    // middleware future `Send`).
 
     // Resolve device address → wallet address.
     // If no mapping exists, the signing address IS the wallet (built-in wallet mode).
@@ -189,8 +275,11 @@ fn extract_and_verify(req: &Request, app_state: &AppState) -> Result<AuthUser, S
             scopes: crate::network::identity_sync::SCOPE_ALL,
         });
 
-    Ok(AuthUser {
-        address: resolved_address,
-        signing_address,
-    })
+    Ok((
+        AuthUser {
+            address: resolved_address,
+            signing_address,
+        },
+        nonce.to_string(),
+    ))
 }

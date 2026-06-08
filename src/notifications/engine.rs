@@ -280,7 +280,15 @@ impl NotificationEngine {
         // Look up channel name once (if applicable)
         let channel_name = channel_id.and_then(|id| self.lookup_channel_name(id));
 
+        // audit 2026-06-07 (W20): dedup mentions so a message that names the
+        // same wallet multiple times only fires one notification / stores one
+        // mention row, instead of one per repeat.
+        let mut seen: HashSet<&str> = HashSet::new();
+
         for mentioned_address in mentions {
+            if !seen.insert(mentioned_address.as_str()) {
+                continue;
+            }
             if users.contains(mentioned_address) {
                 let notification = Notification {
                     notification_type: NotificationType::Mention,

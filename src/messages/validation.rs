@@ -370,15 +370,48 @@ pub fn validate_news_delete(p: &DeletePayload) -> Result<(), ValidationError> {
     Ok(())
 }
 
-/// Validate a reaction payload.
-pub fn validate_reaction(p: &ReactionPayload) -> Result<(), ValidationError> {
-    if p.emoji.is_empty() {
+/// Maximum number of code points in a reaction emoji. A single emoji grapheme —
+/// including ZWJ family sequences (👨‍👩‍👧‍👦 = 7), skin-tone modifiers, and flags —
+/// is well under this; the cap rejects a long run of combining marks
+/// masquerading as one "emoji". (The 32-byte cap already bounds this, but the
+/// explicit code-point cap documents intent.)
+pub const MAX_EMOJI_CHARS: usize = 12;
+
+/// Validate a reaction emoji (audit 2026-06-07 C3). Must be non-empty, within
+/// the byte + code-point caps, and free of control / bidi / separator / BOM
+/// format characters — these have no place in an emoji, can spoof how the
+/// (signed) reaction is rendered, and would otherwise be persisted verbatim in
+/// the reaction-count key suffix. ZWJ (U+200D) and variation selectors are
+/// allowed since they legitimately compose emoji sequences.
+pub fn validate_emoji(emoji: &str) -> Result<(), ValidationError> {
+    if emoji.is_empty() {
         return Err(ValidationError("emoji must not be empty".into()));
     }
-    if p.emoji.len() > MAX_EMOJI_BYTES {
+    if emoji.len() > MAX_EMOJI_BYTES {
         return Err(ValidationError("emoji too long".into()));
     }
+    if emoji.chars().count() > MAX_EMOJI_CHARS {
+        return Err(ValidationError("emoji has too many code points".into()));
+    }
+    for c in emoji.chars() {
+        let cp = c as u32;
+        let disallowed = c.is_control()                  // C0/C1 incl. \n \t \r
+            || matches!(cp, 0x2028 | 0x2029)             // line / paragraph separator
+            || matches!(cp, 0x202A..=0x202E)             // bidi embeddings/overrides
+            || matches!(cp, 0x2066..=0x2069)             // bidi isolates
+            || cp == 0xFEFF; // zero-width no-break space / BOM
+        if disallowed {
+            return Err(ValidationError(
+                "emoji contains a disallowed control/format character".into(),
+            ));
+        }
+    }
     Ok(())
+}
+
+/// Validate a reaction payload.
+pub fn validate_reaction(p: &ReactionPayload) -> Result<(), ValidationError> {
+    validate_emoji(&p.emoji)
 }
 
 /// Validate a report payload.
@@ -792,6 +825,32 @@ pub fn validate_news_repost(author: &str, p: &NewsRepostPayload) -> Result<(), V
 mod tests {
     use super::*;
     use serde::Serialize;
+
+    #[test]
+    fn validate_emoji_accepts_real_emoji_incl_zwj_sequences() {
+        assert!(validate_emoji("👍").is_ok());
+        assert!(validate_emoji("❤️").is_ok()); // emoji + variation selector
+        assert!(validate_emoji("👨‍👩‍👧‍👦").is_ok()); // ZWJ family sequence (7 code points)
+        assert!(validate_emoji("🇬🇧").is_ok()); // regional-indicator flag
+    }
+
+    #[test]
+    fn validate_emoji_rejects_empty_and_oversize() {
+        assert!(validate_emoji("").is_err());
+        assert!(validate_emoji(&"a".repeat(MAX_EMOJI_BYTES + 1)).is_err());
+    }
+
+    #[test]
+    fn validate_emoji_rejects_control_and_format_chars() {
+        // audit C3: control / bidi / separator / BOM must be rejected so they
+        // can't be persisted in the signed reaction-count key suffix.
+        assert!(validate_emoji("👍\n").is_err()); // newline (control)
+        assert!(validate_emoji("a\tb").is_err()); // tab (control)
+        assert!(validate_emoji("\u{202E}x").is_err()); // RLO bidi override
+        assert!(validate_emoji("\u{2066}x").is_err()); // LRI bidi isolate
+        assert!(validate_emoji("\u{2028}").is_err()); // line separator
+        assert!(validate_emoji("\u{FEFF}").is_err()); // BOM / ZWNBSP
+    }
 
     fn empty_update(channel_id: u64) -> ChannelUpdatePayload {
         ChannelUpdatePayload {

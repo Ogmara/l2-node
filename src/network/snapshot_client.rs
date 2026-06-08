@@ -40,7 +40,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::SnapshotConfig;
 use crate::storage::rocks::Storage;
-use crate::storage::schema::{self, snapshot::DOMAIN_CFS};
+use crate::storage::schema::snapshot::DOMAIN_CFS;
 use crate::storage::snapshot::{decode_chunk, ChunkHeader, ChunkPayload};
 
 use super::snapshot::{
@@ -278,20 +278,20 @@ async fn fetch_manifest(
 
     manifest.validate().context("manifest structural validation")?;
 
-    // Phase 3: verify the producer signature when the manifest carries a
-    // pubkey. Phase 1/2 producers (v0.34, v0.35) shipped no pubkey field;
-    // we tolerate that with a warning so a v0.36 client can still pull a
-    // snapshot from an upgrade-laggard peer, but log loudly so operators
-    // know they're relying on quorum + Merkle + anchor verification only.
+    // Producer signature is now MANDATORY (audit 2026-06-07 W7). Previously a
+    // manifest with no pubkey field was tolerated with a warning (to pull from
+    // pre-signature v0.34/v0.35 laggards) — but that let an attacker simply
+    // OMIT the signature to bypass verification. As of the coordinated cutover,
+    // every producer signs, so a missing/invalid signature is a hard reject;
+    // trust no longer silently degrades to quorum + Merkle + anchor checks.
     match manifest.verify_producer_signature() {
         Ok(crate::network::snapshot::SignatureCheck::Verified) => {
             tracing::debug!("Producer signature verified");
         }
         Ok(crate::network::snapshot::SignatureCheck::SkippedNoPubkey) => {
-            tracing::warn!(
-                producer_node_id = %manifest.producer_node_id,
-                "Producer manifest has no pubkey (v0.34/v0.35 producer) — \
-                 signature verification SKIPPED; trust falls back to quorum + Merkle + Klever anchor checks"
+            bail!(
+                "producer manifest carries no pubkey/signature — rejected \
+                 (signature is mandatory as of the 2026-06 cutover)"
             );
         }
         Err(e) => {
@@ -1353,6 +1353,7 @@ mod tests {
     // --- Apply path tests against a real RocksDB tempdir ---------------
 
     use crate::storage::rocks::Storage;
+    use crate::storage::schema;
     use crate::storage::schema::cf as cf_names;
     use crate::storage::snapshot::ChunkPayload;
     use tempfile::TempDir;

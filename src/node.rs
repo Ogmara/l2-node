@@ -100,6 +100,16 @@ impl Node {
             }
         }
 
+        // Rebuild reaction-count CFs with the v2 length-prefixed key format
+        // (audit 2026-06-07 C3). Recounts from the per-reaction CFs (source of
+        // truth), so old unframed count keys are cleared. One-time migration.
+        let reaction_counts_v2 = storage.get_stat(state_keys::REACTION_COUNT_KEYV2)? > 0;
+        if !reaction_counts_v2 {
+            if let Err(e) = storage.migrate_reaction_count_keys() {
+                warn!(error = %e, "Failed to rebuild reaction-count keys (v2)");
+            }
+        }
+
         // Backfill USERS_BY_NAME prefix index from USERS (one-time migration).
         // Required so the v0.32.0 mention-autocomplete endpoint returns
         // pre-existing users immediately, not just users who update their
@@ -180,28 +190,6 @@ impl Node {
             .map_err(|e| anyhow::anyhow!("computing node address: {}", e))
     }
 
-    /// Increment and return the next Lamport timestamp.
-    pub fn next_lamport_ts(&self) -> u64 {
-        self.lamport_counter.fetch_add(1, Ordering::SeqCst) + 1
-    }
-
-    /// Update the Lamport counter based on a received timestamp.
-    ///
-    /// Atomically sets counter = max(current, received) + 1 using CAS loop.
-    pub fn update_lamport_ts(&self, received: u64) {
-        loop {
-            let current = self.lamport_counter.load(Ordering::SeqCst);
-            let new_val = current.max(received) + 1;
-            if self
-                .lamport_counter
-                .compare_exchange(current, new_val, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-            {
-                break;
-            }
-        }
-    }
-
     /// Get a receiver for the shutdown signal.
     pub fn shutdown_rx(&self) -> tokio::sync::broadcast::Receiver<()> {
         self.shutdown_tx.subscribe()
@@ -214,12 +202,21 @@ impl Node {
 
     /// Convert the node's Ed25519 signing key to a libp2p identity keypair.
     pub fn libp2p_keypair(&self) -> Result<libp2p::identity::Keypair> {
-        let secret_bytes = self.signing_key.to_bytes();
-        let libp2p_key = libp2p::identity::ed25519::Keypair::try_from_bytes(
-            &mut [secret_bytes, *self.signing_key.verifying_key().as_bytes()].concat(),
-        )
-        .context("converting Ed25519 key to libp2p keypair")?;
-        Ok(libp2p::identity::Keypair::from(libp2p_key))
+        // audit 2026-06-07 (W23): the intermediate buffers hold raw secret-key
+        // material. Bind them so we can scrub them after the keypair is built
+        // (mirrors the anchorer-key zeroize pattern with `.fill(0)` below in
+        // this file). `try_from_bytes` takes `&mut` but does not guarantee it
+        // zeroes the slice, and our `secret_bytes` copy is separate, so we
+        // clear both explicitly even on the error path.
+        let mut secret_bytes = self.signing_key.to_bytes();
+        let mut keypair_bytes =
+            [secret_bytes, *self.signing_key.verifying_key().as_bytes()].concat();
+        let result = libp2p::identity::ed25519::Keypair::try_from_bytes(&mut keypair_bytes)
+            .context("converting Ed25519 key to libp2p keypair");
+        // Scrub the secret material regardless of success/failure.
+        secret_bytes.fill(0);
+        keypair_bytes.fill(0);
+        Ok(libp2p::identity::Keypair::from(result?))
     }
 
     /// Run the node until shutdown is signaled.
@@ -227,6 +224,19 @@ impl Node {
     /// Starts the network layer, message router, and all background tasks.
     pub async fn run(&self) -> Result<()> {
         info!(node_id = %self.node_id, "Starting Ogmara L2 node");
+
+        // audit 2026-06-07 (W22): the snapshot anchor re-verification is a
+        // security control. If an operator left the experimental bypass on,
+        // make it impossible to miss in the boot logs — not just buried in
+        // the snapshot-bootstrap path that only fires on a fresh node.
+        if self.config.snapshot.experimental_skip_anchor_verify {
+            warn!(
+                "SECURITY: snapshot.experimental_skip_anchor_verify = true — \
+                 Klever anchor re-verification of snapshots is DISABLED. \
+                 A dishonest snapshot producer cannot be detected. \
+                 Use only on fully-controlled networks; set to false for production."
+            );
+        }
 
         // Initialize identity resolver (device → wallet mapping cache)
         let identity = crate::storage::identity::IdentityResolver::new(self.storage.clone());

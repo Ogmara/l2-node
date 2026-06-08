@@ -2091,6 +2091,22 @@ impl Config {
             );
             self.ipfs.media_cache_item_mb = self.ipfs.media_cache_total_mb;
         }
+        // audit 2026-06-07 (W21): PoW difficulty is leading-zero bits and is
+        // fed unclamped into the solver. A typo or hostile config (e.g. 250)
+        // would make the puzzle effectively unsolvable (2^250 hashes) and hang
+        // every new client forever. Clamp to a sane ceiling — 32 bits (~4B
+        // hashes) is already at the edge of acceptable on a phone. SOFT clamp +
+        // warn, matching the media-cache fixes above.
+        const MAX_POW_DIFFICULTY: u8 = 32;
+        if self.api.pow.difficulty > MAX_POW_DIFFICULTY {
+            eprintln!(
+                "[config] api.pow.difficulty ({}) exceeds the safe maximum; \
+                 clamping to {} leading-zero bits (higher values make PoW \
+                 unsolvable and hang new clients).",
+                self.api.pow.difficulty, MAX_POW_DIFFICULTY,
+            );
+            self.api.pow.difficulty = MAX_POW_DIFFICULTY;
+        }
         // Trusted-proxy CIDRs (v0.42). Parse-validate each entry at
         // load time; HARD reject on first malformed entry. Silently
         // dropping a bad CIDR would flip the security model: an

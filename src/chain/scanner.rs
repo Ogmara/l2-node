@@ -282,7 +282,7 @@ impl ChainScanner {
             anyhow::bail!(
                 "block list HTTP {}: {}",
                 status,
-                &text[..text.len().min(200)]
+                crate::util::truncate_str(&text, 200) // audit 2026-06-07 (W16)
             );
         }
 
@@ -302,13 +302,41 @@ impl ChainScanner {
     /// Paginates through the transaction list to ensure all transactions are captured
     /// even in busy block ranges. Capped at 50 pages to prevent infinite loops.
     async fn process_block_range(&self, start: u64, end: u64) -> Result<()> {
+        // W17 (audit 2026-06-07): a range with more SC txs than the page cap
+        // used to `break` and let the caller advance the cursor PAST it →
+        // permanent silent event loss. Instead, subdivide an over-capped range
+        // (work stack) so every block is fully covered before the cursor moves.
+        let mut stack = vec![(start, end)];
+        while let Some((s, e)) = stack.pop() {
+            if !self.process_range_paged(s, e).await? {
+                if s >= e {
+                    // A single block exceeding the cap is pathological (one block
+                    // with >MAX_PAGES*100 SC txs to our contract) — can't split
+                    // further; warn rather than loop forever.
+                    warn!(block = s, "single block exceeds pagination cap — some SC txs may be missed");
+                } else {
+                    let mid = s + (e - s) / 2;
+                    // Push high half first so the low half is processed first.
+                    stack.push((mid + 1, e));
+                    stack.push((s, mid));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Page through type-63 SC transactions for `[start, end]`.
+    ///
+    /// Returns `Ok(true)` when the range was fully processed (a short page
+    /// terminated it), or `Ok(false)` when it hit the page cap and the caller
+    /// must subdivide (audit 2026-06-07 W17).
+    async fn process_range_paged(&self, start: u64, end: u64) -> Result<bool> {
         let mut page = 1u64;
         const MAX_PAGES: u64 = 50;
 
         loop {
             if page > MAX_PAGES {
-                warn!(start, end, "Hit pagination cap ({MAX_PAGES} pages) — some transactions may be missed");
-                break;
+                return Ok(false); // over the cap — caller subdivides
             }
             let url = format!(
                 "{}/v1.0/transaction/list?status=success&type=63&toAddress={}&page={}&limit=100&startBlock={}&endBlock={}",
@@ -329,7 +357,7 @@ impl ChainScanner {
                 anyhow::bail!(
                     "transaction list HTTP {}: {}",
                     status,
-                    &text[..text.len().min(200)]
+                    crate::util::truncate_str(&text, 200) // audit 2026-06-07 (W16)
                 );
             }
 
@@ -339,7 +367,7 @@ impl ChainScanner {
             // Extract transactions array
             let txs = match resp.pointer("/data/transactions") {
                 Some(serde_json::Value::Array(arr)) if !arr.is_empty() => arr,
-                _ => break, // No (more) transactions
+                _ => return Ok(true), // No (more) transactions — range complete
             };
 
             let tx_count = txs.len();
@@ -393,17 +421,15 @@ impl ChainScanner {
                 }
             }
 
-            // If we got fewer than the limit, no more pages
+            // Fewer than a full page → no more transactions in this range.
             if tx_count < 100 {
-                break;
+                return Ok(true);
             }
             page += 1;
 
             // Brief pause between pages
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-
-        Ok(())
     }
 
     /// Handle a parsed SC event — update local state in RocksDB.
@@ -776,7 +802,15 @@ impl ChainScanner {
         let channel_id = u64::from_be_bytes(padded);
 
         // Cache the resolution so future re-scans of this range don't re-query.
+        // Bounded (audit 2026-06-07 W18): slugs come from on-chain channel
+        // creates (permissionless), so an unbounded map is a slow memory-growth
+        // vector. channel_id is immutable, so clearing on overflow is safe — the
+        // worst case is a few re-queries after a flush.
         if let Ok(mut cache) = self.slug_cache.lock() {
+            const SLUG_CACHE_CAP: usize = 10_000;
+            if cache.len() >= SLUG_CACHE_CAP {
+                cache.clear();
+            }
             cache.insert(slug.to_string(), channel_id);
         }
         Ok(channel_id)

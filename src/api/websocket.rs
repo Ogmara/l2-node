@@ -12,7 +12,6 @@ use axum::response::IntoResponse;
 use futures::stream::SplitSink;
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use tokio::sync::broadcast;
 use tracing::{debug, warn};
 
 use crate::crypto;
@@ -26,31 +25,26 @@ struct WsAuthMessage {
     address: String,
     timestamp: u64,
     signature: String, // base64-encoded
+    /// Client-chosen single-use nonce (hex). Required as of the
+    /// 2026-06-07 host-binding fix — same scheme as the REST auth header.
+    #[serde(default)]
+    nonce: String,
 }
 
-/// Maximum auth timestamp age (60 seconds).
-const WS_AUTH_MAX_AGE_MS: u64 = 60_000;
+/// The fixed path the WS auth signature is bound to.
+const WS_AUTH_PATH: &str = "/api/v1/ws";
 
 /// Verify a WebSocket auth message (same scheme as REST auth headers).
-fn verify_ws_auth(text: &str) -> Result<String, String> {
+///
+/// Binds `network` + `node_id` (this node's own) and a single-use `nonce`
+/// exactly like the REST verifier (audit 2026-06-07 host-binding), so a
+/// captured WS-auth frame is neither fleet-portable nor same-node replayable.
+async fn verify_ws_auth(text: &str, state: &AppState) -> Result<String, String> {
     let auth: WsAuthMessage =
         serde_json::from_str(text).map_err(|e| format!("invalid auth JSON: {}", e))?;
 
-    // Check timestamp freshness
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-
-    let age = if now_ms > auth.timestamp {
-        now_ms - auth.timestamp
-    } else {
-        auth.timestamp - now_ms
-    };
-
-    if age > WS_AUTH_MAX_AGE_MS {
-        return Err("auth timestamp expired".into());
-    }
+    super::auth::validate_nonce(&auth.nonce)?;
+    super::auth::check_timestamp_fresh(auth.timestamp)?;
 
     // Decode signature
     let sig_bytes = base64::Engine::decode(
@@ -69,15 +63,20 @@ fn verify_ws_auth(text: &str) -> Result<String, String> {
     let verifying_key = crypto::address_to_verifying_key(&auth.address)
         .map_err(|e| format!("invalid address: {}", e))?;
 
-    // Auth string for WebSocket: "ogmara-auth:{timestamp}:GET:/api/v1/ws"
     signing::verify_auth_header(
         &verifying_key,
+        &state.klever_network,
+        &state.node_id,
+        &auth.nonce,
         auth.timestamp,
         "GET",
-        "/api/v1/ws",
+        WS_AUTH_PATH,
         &signature,
     )
     .map_err(|_| "signature verification failed")?;
+
+    // Burn the nonce (same-node replay protection).
+    super::auth::claim_nonce(state, &auth.address, &auth.nonce).await?;
 
     Ok(auth.address)
 }
@@ -142,7 +141,7 @@ async fn handle_authenticated_ws(socket: WebSocket, state: Arc<AppState>) {
     };
 
     // Parse and verify auth message
-    let auth_result = verify_ws_auth(&auth_text);
+    let auth_result = verify_ws_auth(&auth_text, &state).await;
     let auth_address = match auth_result {
         Ok(addr) => {
             debug!(address = %addr, "WebSocket client authenticated");
@@ -217,7 +216,7 @@ async fn handle_authenticated_ws(socket: WebSocket, state: Arc<AppState>) {
 async fn handle_ws_client_message(
     text: &str,
     state: &Arc<AppState>,
-    sender: &mut SplitSink<WebSocket, Message>,
+    _sender: &mut SplitSink<WebSocket, Message>,
 ) -> anyhow::Result<()> {
     let msg: WsClientMessage = serde_json::from_str(text)?;
 

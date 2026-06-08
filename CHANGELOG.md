@@ -5,6 +5,152 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.63.1] - 2026-06-08
+
+Cleanup (audit 2026-06-07 fix-plan Batch 5).
+
+### Changed
+
+- **Honest admin controls (audit N5).** `POST /admin/peers/ban` and
+  `/admin/channels/pin` were no-ops that returned `{ok:true}` — a false sense of
+  control. They now return `501 Not Implemented` until the enforcement paths
+  exist.
+
+### Removed
+
+- Dead `localhost_only` admin middleware (superseded by `admin_auth_middleware`),
+  the unused `network/discovery.rs` module, the dead gossip-unsubscribe path, and
+  the vestigial Lamport-clock helpers (audit N6). Cleared all unused-import /
+  unused-variable warnings.
+
+## [0.63.0] - 2026-06-08
+
+Correctness, DoS, and robustness hardening from the 2026-06-07 audit campaign
+(fix-plan Batch 4).
+
+### Security
+
+- **Gossip relay now rejects invalid envelopes (audit W6).** A structurally /
+  cryptographically invalid gossip message (bad signature, malformed envelope,
+  wrong msg_id) now reports `Reject` to gossipsub — penalizing the source peer
+  and stopping propagation — instead of the old blanket `Accept`. Valid-but-
+  unaccepted messages (policy/authz/duplicate/unproven-wallet) report `Ignore`
+  (no relay, no penalty). New `RouteResult::Invalid` distinguishes the two.
+- **Snapshot producer signature is now MANDATORY (audit W7).** A snapshot
+  manifest with no producer pubkey/signature is rejected (was tolerated with a
+  warning, which let an attacker bypass verification by omitting it). **All
+  snapshot producers must run ≥0.63.0** (coordinated cutover).
+- **Presence-verify DoS bound (audit W5).** Concurrent inbound presence-record
+  Ed25519 verifications are capped by a semaphore (≤64); over the cap the record
+  is `Ignore`d rather than spawning unbounded verify tasks.
+- **SC `GetManifest` is now concurrency-gated (audit W8)**, alongside the
+  already-gated `GetChunk`.
+
+### Fixed
+
+- **Chain scanner no longer silently drops events (audit W17).** A block range
+  with more SC txs than the page cap is now SUBDIVIDED and fully processed
+  before the cursor advances, instead of `break`-ing and skipping the remainder.
+- **Bounded `slug_cache` (audit W18)** — cleared at 10k entries (was unbounded).
+- **No UTF-8 truncation panics (audit W16)** — error/log bodies are truncated on
+  a char boundary via `util::truncate_str` (RPC/Kubo/IPFS error bodies could
+  panic the slicer mid-multibyte-char).
+- **Delete-all-content fully drains (audit W12)** — the account/content deletion
+  path loops until the prefix is empty instead of silently stopping at 10k.
+- **IPFS `get()`/`get_range()` bodies are size-capped (audit W19)** — a hostile
+  daemon can no longer OOM the node with an unbounded body.
+- **Mention notifications deduped (audit W20)** — a message naming the same
+  wallet multiple times fires one notification.
+- **PoW difficulty clamped ≤32 bits (audit W21)** — a typo/hostile config can no
+  longer make PoW unsolvable.
+
+### Changed
+
+- `experimental_skip_anchor_verify` now logs a prominent startup warning (W22).
+- The libp2p identity keypair's intermediate key bytes are zeroized after use
+  (W23), matching the anchorer-key handling.
+
+## [0.62.0] - 2026-06-08
+
+Data-integrity & authz hardening from the 2026-06-07 audit campaign (fix-plan
+Batch 3).
+
+### Security
+
+- **Reaction-count key collision / junk-emoji (audit C3).** The reaction-count
+  keys are now u16-length-prefixed (`msg_id ++ len ++ emoji`), matching the
+  per-reaction keys, and `validate_reaction` rejects empty / oversize /
+  control / bidi / separator / BOM emoji and caps code points. A one-time
+  startup migration rebuilds both reaction-count CFs (derived data) from the
+  per-reaction CFs, so old unframed counts are recomputed, not lost.
+- **Merkle / anchoring hardening (audit W13/W14/W15) — canonical root format
+  change.** `StateManager` leaves now go through `hash_leaf` (0x00 domain
+  separation) instead of bare `sha256`; `compute_state_root` is framed with a
+  domain constant and each subtree's leaf COUNT, defeating the
+  duplicate-last-node (CVE-2012-2459-shape) forgery of the anchored root. On-chain
+  `state_root` events are validated (exactly 64 hex chars) and the anchorer must
+  be a well-formed `klv1` address before being recorded (anchor *authorization*
+  remains SC-enforced by the KApp quorum logic). **This changes every node's
+  anchored state root — all anchoring nodes must run ≥0.62.0 together or they
+  will diverge.**
+- **Private-channel ban-list IDOR (audit W3).** `GET /channels/{id}/bans` now
+  enforces `require_channel_access`, so a private channel's ban list (member
+  addresses) no longer leaks to non-members (404, existence not revealed).
+- **Channel-action authz: reject on missing channel_id (audit W9).**
+  `authorize_channel_action` no longer defaults a missing/invalid `channel_id`
+  to `0` (which ran creator/mod checks against channel 0) — it rejects.
+- **Banned users can no longer rejoin (audit W10).** `ChannelJoin` is now
+  channel-scoped in `extract_channel_id`, so the ban check sees it and a banned
+  user's re-join is rejected.
+- **DeviceEnc PoW gate confirmed (audit W11).** Documented that
+  `DeviceEncBinding`/`DeviceEncRevoke` are intentionally PoW-gated (via
+  `requires_registration`, PoW default-on) and NOT on-chain-registration-gated —
+  so unverified wallets can still set up E2E device keys. No behavior change.
+
+## [0.61.0] - 2026-06-08
+
+Security hardening from the 2026-06-07 audit campaign (fix-plan Batch 1).
+
+### Security
+
+- **Admin auth: closed a remote unauthenticated admin bypass (audit C1).** The
+  localhost-bypass in `admin_auth_middleware` read the *leftmost*
+  `X-Forwarded-For` entry, which an attacker could spoof as `127.0.0.1` (an
+  appending reverse proxy yields `127.0.0.1, <attacker>`) to reach every
+  protected `/admin/*` route with no token. It now resolves the real client IP
+  via `trusted_proxies::resolve_client_ip` (right-to-left walk, only trusting
+  headers from loopback / configured proxies) and tests loopback on the
+  *resolved* IP. Added a regression test.
+- **Auth host-binding: stopped cross-node and same-node auth replay (audit W1
+  + W2, project_auth_header_not_host_bound).** REST and WebSocket auth
+  signatures now sign
+  `ogmara-auth:{network}:{node_id}:{nonce}:{timestamp}:{method}:{path}`, where
+  `network` + `node_id` are *this node's own* values — a captured header no
+  longer verifies on any other node or network. A client-chosen single-use
+  `nonce` (new `X-Ogmara-Nonce` header / WS auth field) is tracked in a bounded
+  TTL cache (`AppState::auth_nonce_seen`) for the freshness window, closing
+  same-node replay. The future-skew window was tightened to 5s (past stays 60s).
+  **Breaking:** all clients must send the new signed form + nonce — requires
+  sdk-js ≥0.25.0 / sdk-rust ≥0.8.0 (hard cutover).
+
+- **SSRF: SC-discovered multiaddrs are routability-checked before persistence
+  (audit C2).** Node registration is permissionless, so any operator could
+  `setNodeMetadata` a multiaddr pointing at a private / loopback / link-local
+  target (incl. the 169.254.169.254 cloud-metadata endpoint); since tier-3 SC
+  discovery is the primary cold-start boot path, every bootstrapping node would
+  dial it. `persist_multiaddr` now runs each multiaddr through
+  `classify_transport` and refuses to write anything classified `Unknown`
+  (non-routable) to `PEER_DIRECTORY` — routable clearnet / DNS / overlay
+  (onion/i2p) addresses are still allowed.
+- **rustls-webpki 0.103.10 → 0.103.13 (RUSTSEC-2026-0098/0099/0104,
+  cross-cutting B1.5)** — fixes weakened cert-chain validation + a reachable CRL
+  panic on every `wss://`/`https://` connection.
+
+### Added
+
+- `GET /api/v1/health` now returns `node_id` and `network` so SDK clients can
+  bind their auth signatures to a specific node from a single lightweight fetch.
+
 ## [0.60.1] - 2026-06-07
 
 ### Fixed

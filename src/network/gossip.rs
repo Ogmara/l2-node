@@ -115,18 +115,6 @@ impl TopicManager {
         }
     }
 
-    /// Unsubscribe from a channel's GossipSub topic.
-    pub fn unsubscribe_channel(
-        &mut self,
-        swarm: &mut Swarm<OgmaraBehaviour>,
-        channel_id: u64,
-    ) {
-        if self.subscribed_channels.remove(&channel_id) {
-            let topic = channel_topic(&self.network_id, channel_id);
-            self.unsubscribe_topic(swarm, &topic);
-        }
-    }
-
     /// Subscribe to a user's DM topic.
     pub fn subscribe_dm(
         &mut self,
@@ -136,18 +124,6 @@ impl TopicManager {
         if self.subscribed_dms.insert(address.to_string()) {
             let topic = dm_topic(&self.network_id, address);
             self.subscribe_topic(swarm, &topic);
-        }
-    }
-
-    /// Unsubscribe from a user's DM topic.
-    pub fn unsubscribe_dm(
-        &mut self,
-        swarm: &mut Swarm<OgmaraBehaviour>,
-        address: &str,
-    ) {
-        if self.subscribed_dms.remove(address) {
-            let topic = dm_topic(&self.network_id, address);
-            self.unsubscribe_topic(swarm, &topic);
         }
     }
 
@@ -165,12 +141,4 @@ impl TopicManager {
         }
     }
 
-    fn unsubscribe_topic(&self, swarm: &mut Swarm<OgmaraBehaviour>, topic_str: &str) {
-        let topic = IdentTopic::new(topic_str);
-        if swarm.behaviour_mut().gossipsub.unsubscribe(&topic) {
-            debug!(topic = %topic_str, "Unsubscribed from topic");
-        } else {
-            debug!(topic = %topic_str, "Was not subscribed");
-        }
-    }
 }

@@ -24,8 +24,6 @@ use crate::crypto;
 use crate::crypto::signing;
 use crate::trusted_proxies::TrustedProxies;
 
-use super::state::AppState;
-
 /// Nonce TTL (5 minutes).
 const NONCE_TTL: Duration = Duration::from_secs(300);
 
@@ -361,9 +359,14 @@ pub async fn auth_logout() -> impl IntoResponse {
 /// Middleware that allows access from localhost (no auth) or with a valid
 /// session token (for remote access via admin_wallets).
 ///
-/// Supports `X-Forwarded-For` header for reverse proxy deployments (Apache, nginx).
-/// When the TCP peer is loopback OR is in `[api] trusted_proxies` CIDRs, the
-/// header is consulted to find the real client IP. Otherwise it's ignored.
+/// Supports `Forwarded` / `X-Forwarded-For` headers for reverse proxy
+/// deployments (Apache, nginx). The real client IP is resolved via
+/// `trusted_proxies::resolve_client_ip`, which only consults the headers
+/// when the TCP peer is loopback OR in `[api] trusted_proxies` CIDRs, and
+/// then walks the forwarding chain RIGHT-to-LEFT, skipping trusted hops.
+/// This defeats leftmost-XFF spoofing — an attacker cannot forge a
+/// `127.0.0.1` first entry to bypass auth, because the resolver returns the
+/// first *untrusted* hop, not the spoofed leading value.
 ///
 /// The trusted_proxies branch matters for Docker deployments: a host-side
 /// Apache/nginx connects to `127.0.0.1:41721` (the Docker port forward),
@@ -377,30 +380,26 @@ pub async fn admin_auth_middleware(
     req: Request,
     next: Next,
 ) -> Response {
-    let peer_ip = addr.ip();
-    let peer_is_trusted = peer_ip.is_loopback() || auth_state.trusted_proxies.contains(peer_ip);
+    // Determine the real client IP. `resolve_client_ip` walks the
+    // forwarding chain RIGHT-to-LEFT, skipping trusted hops, and only
+    // consults the headers when the TCP peer is itself loopback or a
+    // configured trusted proxy. This defeats the leftmost-XFF spoof
+    // (e.g. attacker sends `X-Forwarded-For: 127.0.0.1` and an
+    // appending proxy yields `127.0.0.1, <attacker>`): the right-to-left
+    // walk returns the attacker IP, not the spoofed loopback entry.
+    let forwarded = req.headers().get("forwarded").and_then(|v| v.to_str().ok());
+    let xff = req.headers().get("x-forwarded-for").and_then(|v| v.to_str().ok());
+    let client_ip = crate::trusted_proxies::resolve_client_ip(
+        addr,
+        forwarded,
+        xff,
+        &auth_state.trusted_proxies,
+    );
 
-    // Determine real client IP. If the peer is a trusted proxy (or loopback),
-    // consult X-Forwarded-For for the real client IP. Otherwise the peer IS
-    // the client — ignore the header (could be spoofed).
-    let real_ip_is_loopback = if peer_is_trusted {
-        match req.headers().get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-            Some(forwarded) => {
-                // X-Forwarded-For: client, proxy1, proxy2 — first entry is the original client
-                let client_ip = forwarded.split(',').next().unwrap_or("").trim();
-                match client_ip.parse::<std::net::IpAddr>() {
-                    Ok(ip) => ip.is_loopback(),
-                    Err(_) => false, // unparseable → treat as remote (require auth)
-                }
-            }
-            None => peer_ip.is_loopback(), // No header → only true loopback bypasses
-        }
-    } else {
-        false
-    };
-
-    // Localhost always passes (spec 10-dashboard.md §5.6)
-    if real_ip_is_loopback {
+    // Localhost always passes (spec 10-dashboard.md §5.6). Tested on the
+    // *resolved* client IP, never on a spoofable header value.
+    // `is_loopback_canonical` also treats `::ffff:127.0.0.1` as loopback.
+    if crate::trusted_proxies::is_loopback_canonical(client_ip) {
         return next.run(req).await;
     }
 

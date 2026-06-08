@@ -662,8 +662,8 @@ impl Storage {
         Ok(entries
             .into_iter()
             .filter_map(|(key, value)| {
-                if key.len() > 32 && value.len() == 8 {
-                    let emoji = String::from_utf8(key[32..].to_vec()).ok()?;
+                if value.len() == 8 {
+                    let emoji = super::schema::decode_reaction_count_emoji(&key)?;
                     let count = u64::from_be_bytes(value.try_into().ok()?);
                     if count > 0 {
                         Some((emoji, count))
@@ -1762,6 +1762,74 @@ impl Storage {
         Ok(())
     }
 
+    /// One-time migration (audit 2026-06-07 C3): rebuild both reaction-count CFs
+    /// with the v2 length-prefixed key format. Reaction counts are DERIVED data,
+    /// so the per-reaction CFs (CHAT_REACTIONS / NEWS_REACTIONS) are the source
+    /// of truth — we recount from them rather than transcode the old keys.
+    /// Idempotent + crash-safe: a re-run clears and rebuilds to the same result.
+    pub fn migrate_reaction_count_keys(&self) -> Result<()> {
+        use tracing::info;
+        let chat = self.rebuild_reaction_counts(cf::CHAT_REACTIONS, cf::CHAT_REACTION_COUNTS)?;
+        let news = self.rebuild_reaction_counts(cf::NEWS_REACTIONS, cf::REACTION_COUNTS)?;
+        info!(
+            chat_counts = chat,
+            news_counts = news,
+            "Rebuilt reaction-count keys (v2 length-prefixed format)"
+        );
+        self.put_cf(
+            cf::NODE_STATE,
+            super::schema::state_keys::REACTION_COUNT_KEYV2,
+            &1u64.to_be_bytes(),
+        )?;
+        Ok(())
+    }
+
+    /// Recount per-reaction entries in `reaction_cf` by (msg_id, emoji) and
+    /// rewrite `count_cf` with v2 length-prefixed count keys. The per-reaction
+    /// key format is `msg_id(32) ++ u16 len ++ emoji ++ 0xFF ++ author` for both
+    /// chat and news. Returns the number of distinct (msg_id, emoji) counts.
+    fn rebuild_reaction_counts(&self, reaction_cf: &str, count_cf: &str) -> Result<usize> {
+        use std::collections::HashMap;
+        // Generous bound; WARN (never silently truncate) if a CF exceeds it, so
+        // an undercount in this one-shot migration is detectable (audit W-1).
+        const SCAN_CAP: usize = 10_000_000;
+        // Tally per-reaction entries, keyed by the canonical v2 count-key bytes.
+        let mut counts: HashMap<Vec<u8>, u64> = HashMap::new();
+        let reaction_entries = self.prefix_iter_cf(reaction_cf, &[], SCAN_CAP)?;
+        if reaction_entries.len() >= SCAN_CAP {
+            tracing::warn!(
+                cf = %reaction_cf,
+                cap = SCAN_CAP,
+                "reaction-count rebuild hit the scan cap — counts may be undercounted"
+            );
+        }
+        for (key, _val) in reaction_entries {
+            if key.len() < 34 {
+                continue;
+            }
+            let mut msg_id = [0u8; 32];
+            msg_id.copy_from_slice(&key[0..32]);
+            let len = u16::from_be_bytes([key[32], key[33]]) as usize;
+            let Some(emoji_bytes) = key.get(34..34 + len) else {
+                continue;
+            };
+            let Ok(emoji) = std::str::from_utf8(emoji_bytes) else {
+                continue;
+            };
+            let count_key = super::schema::encode_reaction_count_key(&msg_id, emoji);
+            *counts.entry(count_key).or_insert(0) += 1;
+        }
+        // Clear existing count keys (old unframed AND any prior v2) then write
+        // the freshly-derived set, so the CF holds exactly the recomputed counts.
+        for (key, _val) in self.prefix_iter_cf(count_cf, &[], SCAN_CAP)? {
+            self.delete_cf(count_cf, &key)?;
+        }
+        for (key, count) in &counts {
+            self.put_cf(count_cf, key, &count.to_be_bytes())?;
+        }
+        Ok(counts.len())
+    }
+
     /// Get the comment count for a news post by prefix-scanning NEWS_COMMENTS.
     pub fn get_comment_count(&self, post_id: &[u8; 32]) -> Result<u64> {
         let entries = self.prefix_iter_cf(cf::NEWS_COMMENTS, post_id, 10_000)?;
@@ -1909,8 +1977,8 @@ impl Storage {
         Ok(entries
             .into_iter()
             .filter_map(|(key, value)| {
-                if key.len() > 32 && value.len() == 8 {
-                    let emoji = String::from_utf8(key[32..].to_vec()).ok()?;
+                if value.len() == 8 {
+                    let emoji = super::schema::decode_reaction_count_emoji(&key)?;
                     let count = u64::from_be_bytes(value.try_into().ok()?);
                     if count > 0 {
                         Some((emoji, count))

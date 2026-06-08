@@ -3,30 +3,19 @@
 //! Only accessible from localhost. Provides node operator controls
 //! for peer management, storage stats, and state anchoring.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::extract::{ConnectInfo, Extension, Request};
+use axum::extract::Extension;
 use axum::http::StatusCode;
-use axum::middleware::Next;
-use axum::response::{IntoResponse, Response};
+use axum::response::IntoResponse;
 use axum::Json;
 use serde::Deserialize;
 
 use super::state::AppState;
 
-/// Middleware that restricts access to localhost only.
-pub async fn localhost_only(
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    req: Request,
-    next: Next,
-) -> Response {
-    if addr.ip().is_loopback() {
-        next.run(req).await
-    } else {
-        (StatusCode::FORBIDDEN, "admin endpoints are localhost-only").into_response()
-    }
-}
+// NOTE: the old `localhost_only` middleware was removed (audit 2026-06-07 N5) —
+// it was dead code (admin routes are gated by `admin_auth::admin_auth_middleware`,
+// which does the resolved-client-IP loopback check; see B1.1).
 
 // --- Admin handlers ---
 
@@ -209,8 +198,17 @@ pub async fn ban_peer(
     Extension(_state): Extension<Arc<AppState>>,
     Json(req): Json<BanPeerRequest>,
 ) -> impl IntoResponse {
-    tracing::info!(node_id = %req.node_id, "Peer banned (admin)");
-    Json(serde_json::json!({ "ok": true, "banned": req.node_id }))
+    // Honest 501 (audit 2026-06-07 N5): peer-banning is NOT wired. Returning
+    // `{ok:true}` gave operators/dashboards a false sense of control. Surface
+    // it as unimplemented until the peer-ban enforcement path exists.
+    tracing::warn!(node_id = %req.node_id, "ban_peer called but peer-banning is not implemented");
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({
+            "ok": false,
+            "error": "peer banning is not implemented",
+        })),
+    )
 }
 
 /// POST /admin/channels/pin — pin a channel for permanent storage.
@@ -223,8 +221,16 @@ pub async fn pin_channel(
     Extension(_state): Extension<Arc<AppState>>,
     Json(req): Json<PinChannelRequest>,
 ) -> impl IntoResponse {
-    tracing::info!(channel_id = req.channel_id, "Channel pinned (admin)");
-    Json(serde_json::json!({ "ok": true, "pinned": req.channel_id }))
+    // Honest 501 (audit 2026-06-07 N5): channel pinning is NOT wired — see
+    // ban_peer. Don't claim success for a no-op control.
+    tracing::warn!(channel_id = req.channel_id, "pin_channel called but channel pinning is not implemented");
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({
+            "ok": false,
+            "error": "channel pinning is not implemented",
+        })),
+    )
 }
 
 /// GET /admin/state/latest — current Merkle root and stats.
