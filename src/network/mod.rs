@@ -8,7 +8,6 @@
 //! - Identify: peer identification and capability exchange
 
 pub mod behaviour;
-pub mod discovery;
 pub mod gossip;
 pub mod mesh_stats;
 pub mod presence;
@@ -226,6 +225,12 @@ pub struct NetworkService {
     /// startup; field is `None` after that.
     presence_validation_rx:
         Option<tokio::sync::mpsc::UnboundedReceiver<PresenceValidationOutcome>>,
+    /// Bounds concurrent inbound presence-record verifications (audit
+    /// 2026-06-07 W5). Each presence gossip message spawns an Ed25519 verify;
+    /// without a cap, a peer flooding the presence topic could spawn unbounded
+    /// tasks → CPU/memory exhaustion. When no permit is free the message is
+    /// reported `Ignore` (dropped, not verified) instead of spawning.
+    presence_verify_sem: Arc<tokio::sync::Semaphore>,
     /// Per-peer live-connection direction counts, keyed by libp2p
     /// `PeerId`. Maintained from `ConnectionEstablished` /
     /// `ConnectionClosed` (`endpoint.is_dialer()` gives the direction).
@@ -689,6 +694,8 @@ impl NetworkService {
             presence_initial_broadcast_done: false,
             presence_validation_tx,
             presence_validation_rx,
+            // ≤64 concurrent presence-record Ed25519 verifies (audit W5).
+            presence_verify_sem: Arc::new(tokio::sync::Semaphore::new(64)),
             peer_directions: HashMap::new(),
         })
     }
@@ -753,12 +760,6 @@ impl NetworkService {
         self.topics
             .subscribe_channel(&mut self.swarm, channel_id);
         self.maybe_trigger_backfill(channel_id);
-    }
-
-    /// Unsubscribe from a channel's GossipSub topic.
-    pub fn unsubscribe_channel(&mut self, channel_id: u64) {
-        self.topics
-            .unsubscribe_channel(&mut self.swarm, channel_id);
     }
 
     /// Subscribe to a user's DM topic.
@@ -1002,16 +1003,13 @@ impl NetworkService {
                         message.data,
                     );
                 } else {
-                    // Spec 13 §10.3 + v0.48.0: gossipsub is now
-                    // configured with `.validate_messages()`, so EVERY
-                    // received message must produce a validation result
-                    // or relay stalls. Non-presence topics keep the
-                    // pre-v0.48.0 router semantics (auto-accept after
-                    // local dispatch); failures are logged but don't
-                    // suppress relay since the existing routers don't
-                    // distinguish "bad envelope" from "uninteresting
-                    // envelope" granularly enough to drive a Reject.
-                    let dispatch_err = self.handle_gossip_message(&message.data).err();
+                    // Spec 13 §10.3 + v0.48.0: gossipsub is configured with
+                    // `.validate_messages()`, so EVERY received message must
+                    // produce a validation result or relay stalls. The router
+                    // now distinguishes structurally-INVALID envelopes (→
+                    // Reject + peer penalty) from valid-but-unaccepted ones (→
+                    // Ignore) — audit 2026-06-07 W6.
+                    let acceptance = self.handle_gossip_message(&message.data);
                     let _ = self
                         .swarm
                         .behaviour_mut()
@@ -1019,11 +1017,8 @@ impl NetworkService {
                         .report_message_validation_result(
                             &message_id,
                             &propagation_source,
-                            libp2p::gossipsub::MessageAcceptance::Accept,
+                            acceptance,
                         );
-                    if let Some(e) = dispatch_err {
-                        warn!(error = %e, "Failed to handle gossip message");
-                    }
                 }
             }
 
@@ -1831,7 +1826,7 @@ impl NetworkService {
                     }
                     match self.router.process_synced_message(&env_bytes) {
                         RouteResult::Accepted { .. } | RouteResult::Duplicate => admitted += 1,
-                        RouteResult::Rejected(reason) => {
+                        RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
                             warn!(peer = %peer, wallet = %pending.wallet, reason = %reason, "identity-sync: envelope rejected by router");
                         }
                         RouteResult::PowRequired { .. } => {}
@@ -2021,7 +2016,7 @@ impl NetworkService {
                     }
                     match self.router.process_synced_message(&env_bytes) {
                         RouteResult::Accepted { .. } | RouteResult::Duplicate => admitted += 1,
-                        RouteResult::Rejected(reason) => {
+                        RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
                             warn!(peer = %peer, reason = %reason, "news-sync: envelope rejected by router");
                         }
                         RouteResult::PowRequired { .. } => {}
@@ -2378,7 +2373,8 @@ impl NetworkService {
                             // storage write needed.
                             admitted += 1;
                         }
-                        crate::messages::router::RouteResult::Rejected(reason) => {
+                        crate::messages::router::RouteResult::Rejected(reason)
+                        | crate::messages::router::RouteResult::Invalid(reason) => {
                             warn!(
                                 peer = %peer,
                                 channel_id = pending.channel_id,
@@ -2641,7 +2637,7 @@ impl NetworkService {
                             accepted += 1;
                         }
                         RouteResult::Duplicate => {}
-                        RouteResult::Rejected(reason) => {
+                        RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
                             self.counters.inc_failed_validations();
                             warn!(reason = %reason, "Rejected synced message");
                             rejected += 1;
@@ -2698,13 +2694,20 @@ impl NetworkService {
             } => {
                 debug!(peer = %peer, request = ?request, "Received snapshot request");
 
-                // Concurrency gate — only `GetChunk` is rate-limited (it's the
-                // expensive arm; `Advertise` and `GetManifest` are cheap).
+                // Concurrency gate (audit 2026-06-07 W8). `GetChunk` is the
+                // expensive arm; `GetManifest` is a cheap cached read but was
+                // previously UNGATED, so a peer could flood it. Both now take a
+                // permit (manifest holds it only briefly, so it can't
+                // meaningfully starve chunk serving); `Advertise` stays free.
                 // The permit is held until the response is sent to bound the
                 // working set across the libp2p task. `try_acquire_owned` is
                 // non-blocking — under load we return `RateLimited` immediately
                 // so the peer falls over to a different mirror in Phase 2+.
-                let _permit_guard = if matches!(request, self::snapshot::SnapshotRequest::GetChunk { .. }) {
+                let _permit_guard = if matches!(
+                    request,
+                    self::snapshot::SnapshotRequest::GetChunk { .. }
+                        | self::snapshot::SnapshotRequest::GetManifest { .. }
+                ) {
                     match self.snapshot_chunk_semaphore.clone().try_acquire_owned() {
                         Ok(p) => Some(p),
                         Err(_) => {
@@ -3027,8 +3030,23 @@ impl NetworkService {
         // Track inbound bytes for parity with the standard gossip path.
         self.counters.add_bytes_in(data.len() as u64);
         self.counters.inc_messages_received();
+        // Bound concurrent verifies (audit 2026-06-07 W5). If we're already at
+        // the cap, report `Ignore` (gossipsub stops holding relay for us) and
+        // drop this record unverified rather than spawning an unbounded task.
+        let permit = match self.presence_verify_sem.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                let _ = tx.send(PresenceValidationOutcome {
+                    message_id,
+                    propagation_source,
+                    acceptance: libp2p::gossipsub::MessageAcceptance::Ignore,
+                });
+                return;
+            }
+        };
         let counters = self.counters.clone();
         tokio::spawn(async move {
+            let _permit = permit; // released when the verify task finishes
             let acceptance = match mgr
                 .handle_gossip_message(propagation_source, &data)
                 .await
@@ -3175,7 +3193,14 @@ impl NetworkService {
     }
 
     /// Handle a received GossipSub message through the full validation pipeline.
-    fn handle_gossip_message(&self, data: &[u8]) -> Result<()> {
+    /// Process a gossip message and return the gossipsub validation verdict
+    /// (audit 2026-06-07 W6). Structurally/cryptographically invalid envelopes
+    /// → `Reject` (gossipsub penalizes the source peer + won't propagate);
+    /// valid-but-unaccepted-here (policy/authz/dup/unproven-wallet) → `Ignore`
+    /// (we don't propagate, but don't penalize an honest relay); accepted →
+    /// `Accept` (propagate across the mesh).
+    fn handle_gossip_message(&self, data: &[u8]) -> libp2p::gossipsub::MessageAcceptance {
+        use libp2p::gossipsub::MessageAcceptance;
         // Track incoming bytes and messages for dashboard metrics
         self.counters.add_bytes_in(data.len() as u64);
         self.counters.inc_messages_received();
@@ -3204,20 +3229,26 @@ impl NetworkService {
                     });
                 }
 
-                Ok(())
+                MessageAcceptance::Accept
             }
             RouteResult::Duplicate => {
                 debug!("Duplicate message from gossip, skipping");
-                Ok(())
+                // Already have it — valid, but no need to re-propagate from us.
+                MessageAcceptance::Ignore
+            }
+            RouteResult::Invalid(reason) => {
+                self.counters.inc_failed_validations();
+                warn!(reason = %reason, "Invalid message from gossip — rejecting (penalize peer)");
+                MessageAcceptance::Reject
             }
             RouteResult::Rejected(reason) => {
                 self.counters.inc_failed_validations();
-                warn!(reason = %reason, "Rejected message from gossip");
-                Ok(())
+                debug!(reason = %reason, "Message not accepted locally — ignoring (no penalty)");
+                MessageAcceptance::Ignore
             }
             RouteResult::PowRequired { address } => {
-                debug!(address = %address, "PoW required for gossip message (skipping)");
-                Ok(())
+                debug!(address = %address, "PoW required for gossip message (ignoring)");
+                MessageAcceptance::Ignore
             }
         }
     }

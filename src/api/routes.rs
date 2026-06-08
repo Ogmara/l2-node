@@ -433,6 +433,13 @@ pub struct HealthResponse {
     /// clients should treat its absence as "unknown" → assume available
     /// (preserves prior behavior).
     pub media_uploads: bool,
+    /// This node's Ogmara `node_id` (anchorer identity). Exposed here so
+    /// SDK clients can bind their auth signatures to this specific node
+    /// (audit 2026-06-07 host-binding) from a single lightweight fetch.
+    pub node_id: String,
+    /// Klever network name ("testnet" / "mainnet"). The other half of the
+    /// auth binding — a signature is valid only for this network + node_id.
+    pub network: String,
 }
 
 #[derive(Serialize)]
@@ -504,6 +511,8 @@ pub async fn health(Extension(state): Extension<Arc<AppState>>) -> Json<HealthRe
         version: env!("CARGO_PKG_VERSION"),
         peers: state.peer_count(),
         media_uploads,
+        node_id: state.node_id.clone(),
+        network: state.klever_network.clone(),
     })
 }
 
@@ -1397,12 +1406,16 @@ fn require_channel_access(
 ) -> Result<(), axum::response::Response> {
     match state.storage.get_cf(cf::CHANNELS, &channel_id.to_be_bytes()) {
         Ok(Some(data)) => {
-            if let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&data) {
-                if !check_channel_access(state, &meta, channel_id, caller) {
-                    return Err((StatusCode::NOT_FOUND, "channel not found").into_response());
+            // Fail CLOSED on a corrupt channel record (audit 2026-06-07 N-1): an
+            // access gate must not grant access when it can't evaluate the
+            // policy, or a corrupt private-channel record would leak.
+            match serde_json::from_slice::<serde_json::Value>(&data) {
+                Ok(meta) if check_channel_access(state, &meta, channel_id, caller) => Ok(()),
+                Ok(_) => Err((StatusCode::NOT_FOUND, "channel not found").into_response()),
+                Err(_) => {
+                    Err((StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response())
                 }
             }
-            Ok(())
         }
         Ok(None) => Err((StatusCode::NOT_FOUND, "channel not found").into_response()),
         Err(_) => Err((StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()),
@@ -2118,7 +2131,7 @@ pub async fn post_message(
         RouteResult::Accepted {
             msg_id,
             raw_bytes,
-            msg_type,
+            msg_type: _,
         } => {
             state.counters.inc_messages_stored();
 
@@ -2191,7 +2204,7 @@ pub async fn post_message(
             state.counters.record_rejection("PoW required", &address);
             pow_required_response(&state, &address)
         }
-        RouteResult::Rejected(reason) => {
+        RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
             state.counters.inc_failed_validations();
             state.counters.record_rejection(&reason, &_auth_user.address);
             (StatusCode::BAD_REQUEST, reason).into_response()
@@ -2235,7 +2248,7 @@ pub async fn create_channel(
             (StatusCode::CONFLICT, "message already exists").into_response()
         }
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
-        RouteResult::Rejected(reason) => {
+        RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
             (StatusCode::BAD_REQUEST, reason).into_response()
         }
     }
@@ -2343,7 +2356,7 @@ pub async fn update_profile(
             (StatusCode::CONFLICT, "already processed").into_response()
         }
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
-        RouteResult::Rejected(reason) => {
+        RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
             (StatusCode::BAD_REQUEST, reason).into_response()
         }
     }
@@ -2399,7 +2412,7 @@ pub async fn send_dm(
             (StatusCode::CONFLICT, "message already exists").into_response()
         }
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
-        RouteResult::Rejected(reason) => {
+        RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
             (StatusCode::BAD_REQUEST, reason).into_response()
         }
     }
@@ -2757,7 +2770,7 @@ pub async fn follow_user(
         RouteResult::Accepted { .. } => Json(OkResponse { ok: true }).into_response(),
         RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
-        RouteResult::Rejected(reason) => {
+        RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
             (StatusCode::BAD_REQUEST, reason).into_response()
         }
     }
@@ -2776,7 +2789,7 @@ pub async fn unfollow_user(
         RouteResult::Accepted { .. } => Json(OkResponse { ok: true }).into_response(),
         RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
-        RouteResult::Rejected(reason) => {
+        RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
             (StatusCode::BAD_REQUEST, reason).into_response()
         }
     }
@@ -2839,7 +2852,7 @@ pub async fn react_to_news(
         RouteResult::Accepted { .. } => Json(OkResponse { ok: true }).into_response(),
         RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
-        RouteResult::Rejected(reason) => {
+        RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
             (StatusCode::BAD_REQUEST, reason).into_response()
         }
     }
@@ -2866,7 +2879,7 @@ pub async fn repost_news(
             (StatusCode::CONFLICT, "already reposted").into_response()
         }
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
-        RouteResult::Rejected(reason) => {
+        RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
             (StatusCode::BAD_REQUEST, reason).into_response()
         }
     }
@@ -3114,8 +3127,17 @@ pub async fn get_channel_pins(
 /// GET /api/v1/channels/:channel_id/bans
 pub async fn get_channel_bans(
     Extension(state): Extension<Arc<AppState>>,
+    Extension(auth_user): Extension<AuthUser>,
     Path(channel_id): Path<u64>,
 ) -> impl IntoResponse {
+    // W3 (audit 2026-06-07): the ban list reveals member addresses, so a private
+    // channel's list must not leak to a non-member. Gate on channel access (the
+    // same rule as `get_channel`); a private channel returns 404 to outsiders,
+    // not leaking its existence.
+    if let Err(resp) = require_channel_access(&state, channel_id, Some(&auth_user.address)) {
+        return resp;
+    }
+
     let prefix = channel_id.to_be_bytes();
 
     match state
@@ -3164,7 +3186,7 @@ pub async fn add_moderator(
         RouteResult::Accepted { .. } => Json(OkResponse { ok: true }).into_response(),
         RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
-        RouteResult::Rejected(reason) => {
+        RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
             (StatusCode::BAD_REQUEST, reason).into_response()
         }
     }
@@ -3183,7 +3205,7 @@ pub async fn remove_moderator(
         RouteResult::Accepted { .. } => Json(OkResponse { ok: true }).into_response(),
         RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
-        RouteResult::Rejected(reason) => {
+        RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
             (StatusCode::BAD_REQUEST, reason).into_response()
         }
     }
@@ -3201,7 +3223,7 @@ pub async fn kick_user(
     match state.router.process_message(&body) {
         RouteResult::Accepted { .. } => Json(OkResponse { ok: true }).into_response(),
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
-        RouteResult::Rejected(reason) => {
+        RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
             (StatusCode::BAD_REQUEST, reason).into_response()
         }
         RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
@@ -3220,7 +3242,7 @@ pub async fn ban_user(
     match state.router.process_message(&body) {
         RouteResult::Accepted { .. } => Json(OkResponse { ok: true }).into_response(),
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
-        RouteResult::Rejected(reason) => {
+        RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
             (StatusCode::BAD_REQUEST, reason).into_response()
         }
         RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
@@ -3239,7 +3261,7 @@ pub async fn unban_user(
     match state.router.process_message(&body) {
         RouteResult::Accepted { .. } => Json(OkResponse { ok: true }).into_response(),
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
-        RouteResult::Rejected(reason) => {
+        RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
             (StatusCode::BAD_REQUEST, reason).into_response()
         }
         RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
@@ -3258,7 +3280,7 @@ pub async fn pin_message(
     match state.router.process_message(&body) {
         RouteResult::Accepted { .. } => Json(OkResponse { ok: true }).into_response(),
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
-        RouteResult::Rejected(reason) => {
+        RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
             (StatusCode::BAD_REQUEST, reason).into_response()
         }
         RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
@@ -3277,7 +3299,7 @@ pub async fn unpin_message(
     match state.router.process_message(&body) {
         RouteResult::Accepted { .. } => Json(OkResponse { ok: true }).into_response(),
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
-        RouteResult::Rejected(reason) => {
+        RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
             (StatusCode::BAD_REQUEST, reason).into_response()
         }
         RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
@@ -3296,7 +3318,7 @@ pub async fn invite_user(
     match state.router.process_message(&body) {
         RouteResult::Accepted { .. } => Json(OkResponse { ok: true }).into_response(),
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
-        RouteResult::Rejected(reason) => {
+        RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
             (StatusCode::BAD_REQUEST, reason).into_response()
         }
         RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
@@ -4550,7 +4572,7 @@ async fn build_and_gossip_dual_delegation(
                 "DeviceDelegation already known; treating as propagated");
             true
         }
-        RouteResult::Rejected(reason) => {
+        RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
             tracing::warn!(reason = %reason, wallet = %wallet_address,
                 "Router rejected constructed DeviceDelegation; not propagating");
             false
@@ -5631,7 +5653,7 @@ pub async fn distribute_channel_keys(
             })).into_response()
         }
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
-        RouteResult::Rejected(reason) => {
+        RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
             (StatusCode::BAD_REQUEST, reason).into_response()
         }
         RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),

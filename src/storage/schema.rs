@@ -290,6 +290,9 @@ pub mod state_keys {
     pub const CHANNEL_MSGS_TS_REINDEXED: &[u8] = b"migration_channel_msgs_ts_reindexed";
     /// Sentinel: set to 1 after device addresses are re-derived from klv1 → ogd1.
     pub const DEVICE_HRP_MIGRATED: &[u8] = b"migration_device_hrp_migrated";
+    /// Sentinel: set to 1 after the reaction-count CFs are rebuilt with the v2
+    /// length-prefixed key format (audit 2026-06-07 C3, l2-node 0.62.0+).
+    pub const REACTION_COUNT_KEYV2: &[u8] = b"migration_reaction_count_keyv2";
     /// Unix timestamp of last successful state anchor submission (u64 big-endian).
     pub const LAST_ANCHOR_TS: &[u8] = b"last_anchor_ts";
     /// Latest known Klever chain tip block height (u64 big-endian).
@@ -539,13 +542,32 @@ pub fn encode_news_reaction_key(msg_id: &[u8; 32], emoji: &str, author: &str) ->
     key
 }
 
-/// Encode a reaction count key: (msg_id, emoji).
+/// Encode a reaction count key: (msg_id, len(emoji), emoji).
+///
+/// The emoji is u16-length-prefixed (audit 2026-06-07 C3) — matching
+/// `encode_news_reaction_key` — so the format is unambiguous and robust if a
+/// suffix is ever appended. v2 format; counts are rebuilt from
+/// `NEWS_REACTIONS` by the `reaction_count_keyv2` migration.
 pub fn encode_reaction_count_key(msg_id: &[u8; 32], emoji: &str) -> Vec<u8> {
     let emoji_bytes = emoji.as_bytes();
-    let mut key = Vec::with_capacity(32 + emoji_bytes.len());
+    let mut key = Vec::with_capacity(32 + 2 + emoji_bytes.len());
     key.extend_from_slice(msg_id);
+    key.extend_from_slice(&(emoji_bytes.len() as u16).to_be_bytes());
     key.extend_from_slice(emoji_bytes);
     key
+}
+
+/// Decode the emoji from a v2 reaction-count key produced by
+/// [`encode_reaction_count_key`] / [`encode_chat_reaction_count_key`]:
+/// `msg_id(32) ++ u16 len ++ emoji`. Returns `None` on a malformed/old-format
+/// key (the migration rebuilds the CF, so old-format keys are cleared).
+pub fn decode_reaction_count_emoji(key: &[u8]) -> Option<String> {
+    if key.len() < 34 {
+        return None;
+    }
+    let len = u16::from_be_bytes([key[32], key[33]]) as usize;
+    let emoji_bytes = key.get(34..34 + len)?;
+    String::from_utf8(emoji_bytes.to_vec()).ok()
 }
 
 /// Encode a repost key: (original_id, reposter_address).
@@ -701,11 +723,15 @@ pub fn encode_chat_reaction_key(msg_id: &[u8; 32], emoji: &str, author: &str) ->
     key
 }
 
-/// Encode a chat reaction count key: (msg_id, emoji).
+/// Encode a chat reaction count key: (msg_id, len(emoji), emoji).
+///
+/// u16-length-prefixed emoji (audit 2026-06-07 C3) — see
+/// [`encode_reaction_count_key`]. Decode with [`decode_reaction_count_emoji`].
 pub fn encode_chat_reaction_count_key(msg_id: &[u8; 32], emoji: &str) -> Vec<u8> {
     let emoji_bytes = emoji.as_bytes();
-    let mut key = Vec::with_capacity(32 + emoji_bytes.len());
+    let mut key = Vec::with_capacity(32 + 2 + emoji_bytes.len());
     key.extend_from_slice(msg_id);
+    key.extend_from_slice(&(emoji_bytes.len() as u16).to_be_bytes());
     key.extend_from_slice(emoji_bytes);
     key
 }
@@ -777,6 +803,29 @@ mod tests {
         let (name, addr) = decode_users_by_name_key(&key).unwrap();
         assert_eq!(name, "alice");
         assert_eq!(addr, "klv1abc");
+    }
+
+    #[test]
+    fn reaction_count_key_round_trips_v2() {
+        // audit C3: v2 count key is msg_id(32) ++ u16 len ++ emoji.
+        let msg_id = [7u8; 32];
+        for emoji in ["👍", "❤️", "👨‍👩‍👧‍👦", "🇬🇧"] {
+            let k = encode_reaction_count_key(&msg_id, emoji);
+            assert_eq!(&k[0..32], &msg_id);
+            assert_eq!(decode_reaction_count_emoji(&k).as_deref(), Some(emoji));
+            // chat encoder produces byte-identical keys
+            assert_eq!(encode_chat_reaction_count_key(&msg_id, emoji), k);
+        }
+    }
+
+    #[test]
+    fn decode_reaction_count_emoji_rejects_malformed() {
+        assert_eq!(decode_reaction_count_emoji(&[0u8; 10]), None); // too short
+        // declared len overruns the buffer → None (no panic)
+        let mut k = [0u8; 34].to_vec();
+        k[32] = 0xFF;
+        k[33] = 0xFF; // len = 65535, but no emoji bytes follow
+        assert_eq!(decode_reaction_count_emoji(&k), None);
     }
 
     #[test]

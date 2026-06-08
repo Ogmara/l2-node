@@ -74,6 +74,10 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
 const INTERNAL_PREFIX: u8 = 0x01;
 /// Domain separator for leaf nodes.
 const LEAF_PREFIX: u8 = 0x00;
+/// Domain constant framing the three-subtree state-root hash (audit W14).
+/// The `-v2` marks the post-2026-06-07 canonical-root format (leaf-count
+/// framed); bump the suffix on any future change to the root construction.
+const STATE_ROOT_DOMAIN: &[u8] = b"ogmara-state-root-v2";
 
 /// Hash two child nodes together: SHA-256(0x01 || left || right).
 /// The 0x01 prefix distinguishes internal nodes from leaf hashes,
@@ -231,31 +235,49 @@ impl StateManager {
     }
 
     /// Add a user state hash.
+    ///
+    /// Leaves go through `hash_leaf` (0x00 domain prefix) so they can never be
+    /// confused with an internal node (0x01) — second-preimage resistance
+    /// (audit 2026-06-07 W13). Previously these used bare `sha256`, bypassing
+    /// the domain separation that `hash_pair` relies on.
     pub fn add_user(&mut self, user_data: &[u8]) {
-        self.user_hashes.push(sha256(user_data));
+        self.user_hashes.push(hash_leaf(user_data));
     }
 
     /// Add a channel state hash (metadata + message subtree root).
     pub fn add_channel(&mut self, channel_data: &[u8]) {
-        self.channel_hashes.push(sha256(channel_data));
+        self.channel_hashes.push(hash_leaf(channel_data));
     }
 
     /// Add a delegation record hash.
     pub fn add_delegation(&mut self, delegation_data: &[u8]) {
-        self.delegation_hashes.push(sha256(delegation_data));
+        self.delegation_hashes.push(hash_leaf(delegation_data));
     }
 
     /// Compute the state root from all three subtrees.
     ///
-    /// State Root = SHA-256(users_root || channels_root || delegations_root)
+    /// v2 (audit 2026-06-07 W14): the concatenation is framed with a domain
+    /// constant and each subtree's leaf COUNT is mixed in, so the
+    /// duplicate-last-node padding in `compute_root` (CVE-2012-2459 shape — a
+    /// `[a,b,c]` tree and a `[a,b,c,c]` tree share a subtree root) can no longer
+    /// forge the same *anchored* state root: the two differ by leaf count. The
+    /// `u64` counts also unambiguously frame the three fixed-width roots.
+    ///
+    /// **Canonical cross-node value — changing this changes every node's
+    /// anchored root.** All anchoring nodes must run a build with the same
+    /// `STATE_ROOT_DOMAIN` (l2-node ≥0.62.0); a mixed fleet would diverge.
     pub fn compute_state_root(&self) -> [u8; 32] {
         let users_root = compute_root(&self.user_hashes);
         let channels_root = compute_root(&self.channel_hashes);
         let delegations_root = compute_root(&self.delegation_hashes);
 
         let mut hasher = Sha256::new();
+        hasher.update(STATE_ROOT_DOMAIN);
+        hasher.update((self.user_hashes.len() as u64).to_be_bytes());
         hasher.update(users_root);
+        hasher.update((self.channel_hashes.len() as u64).to_be_bytes());
         hasher.update(channels_root);
+        hasher.update((self.delegation_hashes.len() as u64).to_be_bytes());
         hasher.update(delegations_root);
         hasher.finalize().into()
     }
@@ -342,5 +364,43 @@ mod tests {
         // Same data should produce the same root
         let root2 = sm.compute_state_root();
         assert_eq!(root, root2);
+    }
+
+    #[test]
+    fn state_manager_uses_leaf_domain_separation() {
+        // W13: StateManager leaves must be hash_leaf (0x00), not bare sha256.
+        let mut sm = StateManager::new();
+        sm.add_user(b"u");
+        // Single-leaf subtree root == the leaf == hash_leaf(data), NOT sha256.
+        assert_eq!(compute_root(&sm.user_hashes), hash_leaf(b"u"));
+        assert_ne!(compute_root(&sm.user_hashes), sha256(b"u"));
+    }
+
+    #[test]
+    fn state_root_leaf_count_framing_defeats_duplicate_last() {
+        // W14 / CVE-2012-2459: a subtree of [a,b,c] and [a,b,c,c] share the same
+        // `compute_root`, but the leaf-count framing must make the *state roots*
+        // differ so a padded duplicate can't forge the anchored root.
+        let mut a = StateManager::new();
+        a.add_user(b"a");
+        a.add_user(b"b");
+        a.add_user(b"c");
+
+        let mut b = StateManager::new();
+        b.add_user(b"a");
+        b.add_user(b"b");
+        b.add_user(b"c");
+        b.add_user(b"c"); // duplicated last → same compute_root, different count
+
+        assert_eq!(
+            compute_root(&a.user_hashes),
+            compute_root(&b.user_hashes),
+            "precondition: duplicate-last shares the bare subtree root",
+        );
+        assert_ne!(
+            a.compute_state_root(),
+            b.compute_state_root(),
+            "leaf-count framing must distinguish the two anchored roots",
+        );
     }
 }

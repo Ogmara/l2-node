@@ -147,6 +147,15 @@ impl MessageType {
     /// identity. Advanced features like channel creation, message editing,
     /// moderation, and private channels require on-chain registration.
     /// Unverified wallets can only use basic features (chat, news, reactions).
+    ///
+    /// NOTE (audit 2026-06-07 W11): `DeviceEncBinding`/`DeviceEncRevoke` are
+    /// deliberately NOT here. E2E device-key publishing must work for UNVERIFIED
+    /// wallets (registration is optional — see the registration-economics model
+    /// + E2E plan D2), so gating it on on-chain registration would break E2E for
+    /// them. It is instead PoW-gated for unknown wallets via
+    /// `requires_registration()` (true for all non-network types) at the
+    /// proof-of-work step — PoW is enabled by default in prod. Do NOT add the
+    /// DeviceEnc types here.
     pub fn requires_verified_identity(&self) -> bool {
         matches!(
             self,

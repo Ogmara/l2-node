@@ -18,6 +18,7 @@ mod metrics;
 mod network;
 mod notifications;
 mod trusted_proxies;
+mod util;
 
 use std::path::PathBuf;
 

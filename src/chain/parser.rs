@@ -143,9 +143,26 @@ fn parse_anchor_state(args: &[&str], sender: &str, timestamp: u64) -> Option<ScE
     if args.len() < 6 {
         return None;
     }
+    // W15 (audit 2026-06-07): reject a malformed state_root before it can be
+    // recorded into STATE_ANCHORS / drive verification badges. A valid root is
+    // exactly 64 lowercase-hex chars (a SHA-256 digest). The `anchorer` is the
+    // TX sender; require it to be a well-formed klv1 address. (Authorization to
+    // anchor is enforced on-chain by the KApp quorum logic — this is the
+    // node-side format gate against garbage/forged event data.)
+    let state_root = decode_hex_string(args[1])?;
+    // Exactly 64 LOWERCASE hex chars — `compute_state_root` only ever emits
+    // lowercase, so reject any other form rather than record a non-canonical root.
+    if state_root.len() != 64
+        || !state_root.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return None;
+    }
+    if !sender.starts_with("klv1") {
+        return None;
+    }
     Some(ScEvent::StateAnchored {
         block_height: decode_hex_u64(args[0])?,
-        state_root: decode_hex_string(args[1])?,
+        state_root,
         message_count: decode_hex_u64(args[2])?,
         channel_count: u32::try_from(decode_hex_u64(args[3])?).ok()?,
         user_count: u32::try_from(decode_hex_u64(args[4])?).ok()?,

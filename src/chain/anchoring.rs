@@ -644,7 +644,8 @@ impl StateAnchorer {
         let send_status = send_resp.status();
         let send_text = send_resp.text().await.context("reading /transaction/send body")?;
         let send_body: Value = serde_json::from_str(&send_text)
-            .with_context(|| format!("/transaction/send returned non-JSON (HTTP {}): {}", send_status, &send_text[..send_text.len().min(500)]))?;
+            // audit 2026-06-07 (W16): char-boundary-safe truncation.
+            .with_context(|| format!("/transaction/send returned non-JSON (HTTP {}): {}", send_status, crate::util::truncate_str(&send_text, 500)))?;
         if send_status.is_server_error() {
             let err_msg = send_body.get("error").and_then(|e| e.as_str()).unwrap_or("server error");
             return Err(anyhow::anyhow!("TX send HTTP {}: {}", send_status, err_msg));
@@ -677,7 +678,8 @@ impl StateAnchorer {
         debug!(status = %decode_status, body = %decode_text, "TX decode response");
 
         let decode_json: Value = serde_json::from_str(&decode_text)
-            .with_context(|| format!("/transaction/decode returned non-JSON (HTTP {}): {}", decode_status, &decode_text[..decode_text.len().min(500)]))?;
+            // audit 2026-06-07 (W16): char-boundary-safe truncation.
+            .with_context(|| format!("/transaction/decode returned non-JSON (HTTP {}): {}", decode_status, crate::util::truncate_str(&decode_text, 500)))?;
         let tx_hash_hex = decode_json
             .pointer("/data/tx/hash")
             .and_then(|h| h.as_str())

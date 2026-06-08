@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use serde::Deserialize;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::config::IpfsConfig;
 
@@ -264,29 +264,14 @@ impl IpfsClient {
             .await
             .context("fetching from IPFS")?;
 
-        // Check Content-Length if available to reject oversized responses early
-        if let Some(len) = resp.content_length() {
-            if len > self.max_upload_bytes {
-                anyhow::bail!(
-                    "IPFS content too large: {} bytes (max: {})",
-                    len,
-                    self.max_upload_bytes
-                );
-            }
-        }
-
-        let bytes = resp
-            .bytes()
-            .await
-            .context("reading IPFS response bytes")?;
-
-        if bytes.len() as u64 > self.max_upload_bytes {
-            anyhow::bail!(
-                "IPFS content too large: {} bytes (max: {})",
-                bytes.len(),
-                self.max_upload_bytes
-            );
-        }
+        // audit 2026-06-07 (W19): bound the body during the streamed read.
+        // `resp.bytes()` buffers the WHOLE response before any post-check
+        // fires, so a chunked (Content-Length-less) response from a hostile
+        // or buggy Kubo could OOM the node. `read_body_capped` rejects an
+        // oversize declared Content-Length early and aborts mid-stream the
+        // moment the accumulated body exceeds `max_upload_bytes`.
+        let max = self.max_upload_bytes as usize;
+        let bytes = Bytes::from(read_body_capped(resp, max).await?);
 
         debug!(cid = %cid, bytes = bytes.len(), "Retrieved from IPFS");
 
@@ -331,28 +316,11 @@ impl IpfsClient {
             .await
             .context("fetching IPFS range")?;
 
-        if let Some(len) = resp.content_length() {
-            if len > self.max_upload_bytes {
-                anyhow::bail!(
-                    "IPFS range response too large: {} bytes (max: {})",
-                    len,
-                    self.max_upload_bytes
-                );
-            }
-        }
-
-        let bytes = resp
-            .bytes()
-            .await
-            .context("reading IPFS range response")?;
-
-        if bytes.len() as u64 > self.max_upload_bytes {
-            anyhow::bail!(
-                "IPFS range response too large: {} bytes (max: {})",
-                bytes.len(),
-                self.max_upload_bytes
-            );
-        }
+        // audit 2026-06-07 (W19): stream-bounded read — see `get()`. A daemon
+        // that ignores `offset/length` and returns the whole (possibly
+        // chunked) blob can't OOM us: the read aborts past `max_upload_bytes`.
+        let max = self.max_upload_bytes as usize;
+        let bytes = Bytes::from(read_body_capped(resp, max).await?);
 
         debug!(
             cid = %cid,
@@ -591,7 +559,12 @@ impl IpfsClient {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("pin/add HTTP {}: {}", status, &body[..body.len().min(200)]);
+            // audit 2026-06-07 (W16): char-boundary-safe truncation.
+            anyhow::bail!(
+                "pin/add HTTP {}: {}",
+                status,
+                crate::util::truncate_str(&body, 200)
+            );
         }
 
         debug!(cid = %cid, "Pinned on IPFS");

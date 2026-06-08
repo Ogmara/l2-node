@@ -18,7 +18,6 @@ use super::identity_sync::IdentitySyncCodec;
 use super::news_sync::NewsSyncCodec;
 use super::reconcile::ReconcileCodec;
 use super::snapshot::SnapshotCodec;
-use super::sync::SyncCodec;
 
 /// The composed network behaviour for the Ogmara node.
 #[derive(NetworkBehaviour)]

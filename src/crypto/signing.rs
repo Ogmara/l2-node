@@ -120,33 +120,55 @@ pub fn verify_tx_hash(
 
 // --- Auth Header Signing (L2 node spec 4.2) ---
 
-/// Build the auth string for REST API authentication.
+/// Build the auth string for REST/WS API authentication.
 ///
-/// Format: "ogmara-auth:" + timestamp + ":" + method + ":" + path
-pub fn build_auth_string(timestamp: u64, method: &str, path: &str) -> String {
-    format!("ogmara-auth:{timestamp}:{method}:{path}")
+/// Format (v2, audit 2026-06-07 host-binding):
+///   "ogmara-auth:" + network + ":" + node_id + ":" + nonce + ":"
+///                  + timestamp + ":" + method + ":" + path
+///
+/// Binding `network` + `node_id` defeats cross-node replay: a signature
+/// captured for one node fails verification on any other node (different
+/// node_id) or network. The client-chosen single-use `nonce` (tracked by
+/// the verifier for the freshness window) defeats same-node replay.
+pub fn build_auth_string(
+    network: &str,
+    node_id: &str,
+    nonce: &str,
+    timestamp: u64,
+    method: &str,
+    path: &str,
+) -> String {
+    format!("ogmara-auth:{network}:{node_id}:{nonce}:{timestamp}:{method}:{path}")
 }
 
 /// Sign an auth header using Klever message format.
+#[allow(clippy::too_many_arguments)]
 pub fn sign_auth_header(
     signing_key: &SigningKey,
+    network: &str,
+    node_id: &str,
+    nonce: &str,
     timestamp: u64,
     method: &str,
     path: &str,
 ) -> Signature {
-    let auth_string = build_auth_string(timestamp, method, path);
+    let auth_string = build_auth_string(network, node_id, nonce, timestamp, method, path);
     sign_klever_message(signing_key, auth_string.as_bytes())
 }
 
 /// Verify an auth header signature.
+#[allow(clippy::too_many_arguments)]
 pub fn verify_auth_header(
     verifying_key: &VerifyingKey,
+    network: &str,
+    node_id: &str,
+    nonce: &str,
     timestamp: u64,
     method: &str,
     path: &str,
     signature: &Signature,
 ) -> Result<(), CryptoError> {
-    let auth_string = build_auth_string(timestamp, method, path);
+    let auth_string = build_auth_string(network, node_id, nonce, timestamp, method, path);
     verify_klever_message(verifying_key, auth_string.as_bytes(), signature)
 }
 
@@ -215,11 +237,43 @@ mod tests {
     fn test_auth_header_sign_verify() {
         let key = test_keypair();
         let timestamp = 1234567890u64;
-        let sig = sign_auth_header(&key, timestamp, "GET", "/api/v1/health");
-        assert!(
-            verify_auth_header(&key.verifying_key(), timestamp, "GET", "/api/v1/health", &sig)
-                .is_ok()
+        let sig = sign_auth_header(
+            &key, "testnet", "node-abc", "nonce123", timestamp, "GET", "/api/v1/health",
         );
+        assert!(verify_auth_header(
+            &key.verifying_key(),
+            "testnet",
+            "node-abc",
+            "nonce123",
+            timestamp,
+            "GET",
+            "/api/v1/health",
+            &sig,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn test_auth_header_wrong_node_id_fails() {
+        // REGRESSION (audit 2026-06-07 host-binding): a signature made for
+        // one node_id must NOT verify against another node_id — this is
+        // what stops cross-node replay.
+        let key = test_keypair();
+        let timestamp = 1234567890u64;
+        let sig = sign_auth_header(
+            &key, "testnet", "node-A", "n1", timestamp, "GET", "/api/v1/health",
+        );
+        assert!(verify_auth_header(
+            &key.verifying_key(),
+            "testnet",
+            "node-B", // different node
+            "n1",
+            timestamp,
+            "GET",
+            "/api/v1/health",
+            &sig,
+        )
+        .is_err());
     }
 
     #[test]

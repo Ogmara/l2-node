@@ -621,6 +621,29 @@ impl ScDiscovery {
             return false;
         };
 
+        // SSRF guard (audit 2026-06-07 C2). Node registration is
+        // permissionless, so any operator can `setNodeMetadata` a multiaddr
+        // pointing at a private / loopback / link-local target (incl. the
+        // 169.254.169.254 cloud-metadata endpoint). Tier-3 SC discovery is the
+        // primary cold-start boot path, so an unguarded write here forces every
+        // bootstrapping node to dial that target. Refuse to persist anything
+        // that classifies as `Unknown` — `classify_transport` returns Unknown
+        // for every non-routable IP literal; routable clearnet, DNS, and
+        // overlay (onion/i2p — proxy-dialed, no internal-IP reach) addresses
+        // are allowed.
+        let multiaddr_str = multiaddr.to_string();
+        if matches!(
+            crate::chain::sc_views::classify_transport(&multiaddr_str),
+            crate::chain::sc_views::TransportKind::Unknown
+        ) {
+            debug!(
+                owner = %owner_addr,
+                multiaddr = %multiaddr_str,
+                "sc_discovery: refusing non-routable/private multiaddr (SSRF guard)"
+            );
+            return false;
+        }
+
         let cf = crate::storage::schema::cf::PEER_DIRECTORY;
 
         // Enforce the same 256-entry cap that `NetworkService::persist_peer_addr`

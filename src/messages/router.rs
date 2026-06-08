@@ -27,7 +27,7 @@ use crate::storage::rocks::Storage;
 use crate::storage::schema;
 use ed25519_dalek;
 
-use super::envelope::{Envelope, MAX_TIMESTAMP_DRIFT_MS};
+use super::envelope::Envelope;
 use super::types::*;
 use super::validation;
 
@@ -117,8 +117,16 @@ pub enum RouteResult {
     },
     /// Message is a duplicate (already stored).
     Duplicate,
-    /// Message rejected with reason.
+    /// Message rejected on a POLICY/authz/local basis (e.g. banned user,
+    /// unknown channel, storage error). The envelope is structurally sound and
+    /// an honest peer may legitimately relay it, so over gossip this maps to
+    /// `Ignore` (don't propagate from us, but don't penalize the relaying peer).
     Rejected(String),
+    /// Message is cryptographically/structurally INVALID (bad signature,
+    /// malformed envelope, wrong msg_id) — no honest peer should be relaying it.
+    /// Over gossip this maps to `Reject` so gossipsub penalizes the source
+    /// (audit 2026-06-07 W6). The API layer treats it like `Rejected` (400).
+    Invalid(String),
     /// Message rejected because the wallet needs to solve a PoW challenge first.
     /// The API layer converts this to a 429 response with the challenge payload.
     PowRequired {
@@ -162,12 +170,12 @@ impl MessageRouter {
         // Step 1: Deserialize
         let envelope: Envelope = match rmp_serde::from_slice(raw_bytes) {
             Ok(env) => env,
-            Err(e) => return RouteResult::Rejected(format!("deserialization failed: {}", e)),
+            Err(e) => return RouteResult::Invalid(format!("deserialization failed: {}", e)),
         };
 
         // Step 2: Validate envelope structure
         if let Err(e) = envelope.validate_structure() {
-            return RouteResult::Rejected(format!("invalid envelope: {}", e));
+            return RouteResult::Invalid(format!("invalid envelope: {}", e));
         }
 
         // Step 3: Check duplicate
@@ -179,12 +187,12 @@ impl MessageRouter {
 
         // Step 4a: Verify msg_id computation
         if let Err(e) = self.verify_msg_id(&envelope) {
-            return RouteResult::Rejected(format!("invalid msg_id: {}", e));
+            return RouteResult::Invalid(format!("invalid msg_id: {}", e));
         }
 
         // Step 4b: Verify Ed25519 signature (against device/signing key)
         if let Err(e) = self.verify_signature(&envelope) {
-            return RouteResult::Rejected(format!("signature verification failed: {}", e));
+            return RouteResult::Invalid(format!("signature verification failed: {}", e));
         }
 
         // Step 4c: Resolve device key → wallet address for all subsequent operations.
@@ -896,7 +904,9 @@ impl MessageRouter {
         match envelope.msg_type {
             // Creator-only actions
             MessageType::ChannelAddModerator | MessageType::ChannelRemoveModerator => {
-                let channel_id = self.extract_channel_id(envelope).unwrap_or(0);
+                let channel_id = self
+                    .extract_channel_id(envelope)
+                    .ok_or("missing or invalid channel_id")?;
                 if !self.is_channel_creator(channel_id, resolved_author)? {
                     return Err("only the channel creator can manage moderators".into());
                 }
@@ -912,7 +922,9 @@ impl MessageRouter {
             }
             // Creator + mods with can_kick
             MessageType::ChannelKick => {
-                let channel_id = self.extract_channel_id(envelope).unwrap_or(0);
+                let channel_id = self
+                    .extract_channel_id(envelope)
+                    .ok_or("missing or invalid channel_id")?;
                 if let Ok(p) = rmp_serde::from_slice::<ChannelKickPayload>(&envelope.payload) {
                     // Cannot kick the creator
                     if self.is_channel_creator(channel_id, &p.target_user)? {
@@ -923,7 +935,9 @@ impl MessageRouter {
             }
             // Creator + mods with can_ban
             MessageType::ChannelBan => {
-                let channel_id = self.extract_channel_id(envelope).unwrap_or(0);
+                let channel_id = self
+                    .extract_channel_id(envelope)
+                    .ok_or("missing or invalid channel_id")?;
                 if let Ok(p) = rmp_serde::from_slice::<ChannelBanPayload>(&envelope.payload) {
                     if self.is_channel_creator(channel_id, &p.target_user)? {
                         return Err("cannot ban the channel creator".into());
@@ -932,17 +946,23 @@ impl MessageRouter {
                 self.require_mod_permission(channel_id, resolved_author, "can_ban")
             }
             MessageType::ChannelUnban => {
-                let channel_id = self.extract_channel_id(envelope).unwrap_or(0);
+                let channel_id = self
+                    .extract_channel_id(envelope)
+                    .ok_or("missing or invalid channel_id")?;
                 self.require_mod_permission(channel_id, resolved_author, "can_ban")
             }
             // Creator + mods with can_pin
             MessageType::ChannelPinMessage | MessageType::ChannelUnpinMessage => {
-                let channel_id = self.extract_channel_id(envelope).unwrap_or(0);
+                let channel_id = self
+                    .extract_channel_id(envelope)
+                    .ok_or("missing or invalid channel_id")?;
                 self.require_mod_permission(channel_id, resolved_author, "can_pin")
             }
             // Creator + mods with can_mute
             MessageType::ChannelMute => {
-                let channel_id = self.extract_channel_id(envelope).unwrap_or(0);
+                let channel_id = self
+                    .extract_channel_id(envelope)
+                    .ok_or("missing or invalid channel_id")?;
                 if let Ok(p) = rmp_serde::from_slice::<ChannelMutePayload>(&envelope.payload) {
                     if self.is_channel_creator(channel_id, &p.target_user)? {
                         return Err("cannot mute the channel creator".into());
@@ -952,7 +972,9 @@ impl MessageRouter {
             }
             // Creator + mods with can_edit_info
             MessageType::ChannelUpdate => {
-                let channel_id = self.extract_channel_id(envelope).unwrap_or(0);
+                let channel_id = self
+                    .extract_channel_id(envelope)
+                    .ok_or("missing or invalid channel_id")?;
                 self.require_mod_permission(channel_id, resolved_author, "can_edit_info")
             }
             // Private channel join: allow with explicit invite or via invite link.
@@ -992,7 +1014,9 @@ impl MessageRouter {
             }
             // Creator + any moderator
             MessageType::ChannelInvite => {
-                let channel_id = self.extract_channel_id(envelope).unwrap_or(0);
+                let channel_id = self
+                    .extract_channel_id(envelope)
+                    .ok_or("missing or invalid channel_id")?;
                 if self.is_channel_creator(channel_id, resolved_author)? {
                     return Ok(());
                 }
@@ -1006,7 +1030,9 @@ impl MessageRouter {
             // Private channel key distribution — creator or moderator of the channel.
             // Only valid on the anchor node (where the channel was created).
             MessageType::PrivateChannelKeyDistribution => {
-                let channel_id = self.extract_channel_id(envelope).unwrap_or(0);
+                let channel_id = self
+                    .extract_channel_id(envelope)
+                    .ok_or("missing or invalid channel_id")?;
                 // Verify this is a private channel and we are the anchor node
                 let key = channel_id.to_be_bytes();
                 let meta_bytes = self.storage.get_cf(schema::cf::CHANNELS, &key)
@@ -1114,6 +1140,13 @@ impl MessageRouter {
         match envelope.msg_type {
             MessageType::ChatMessage => {
                 rmp_serde::from_slice::<ChatMessagePayload>(&envelope.payload)
+                    .ok().map(|p| p.channel_id)
+            }
+            // W10 (audit 2026-06-07): ChannelJoin MUST be channel-scoped here so
+            // the ban check (step 7b) sees it — otherwise a banned user can
+            // simply re-`ChannelJoin` to rejoin a channel they were banned from.
+            MessageType::ChannelJoin => {
+                rmp_serde::from_slice::<ChannelJoinPayload>(&envelope.payload)
                     .ok().map(|p| p.channel_id)
             }
             MessageType::ChatEdit => {
@@ -2232,26 +2265,54 @@ impl MessageRouter {
                                 p.push(0xFF);
                                 p
                             };
-                            let entries = self.storage.prefix_iter_cf(
-                                schema::cf::NEWS_BY_AUTHOR,
-                                &prefix,
-                                10_000, // single scan, capped
-                            )?;
+                            // audit 2026-06-07 (W12): page through ALL of the
+                            // user's news posts instead of a single 10k-capped
+                            // scan that silently leaves data behind. Deletion
+                            // markers live in a separate CF, so the NEWS_BY_AUTHOR
+                            // rows are not consumed — we advance the cursor with
+                            // `prefix_iter_cf_after` until the prefix is drained.
+                            const PAGE: usize = 10_000;
                             let mut deleted_count: u64 = 0;
-                            for (key, _) in &entries {
-                                // Key: (author, 0xFF, !timestamp:8, msg_id:32)
-                                if key.len() >= 32 {
-                                    let msg_id: [u8; 32] = key[key.len() - 32..]
-                                        .try_into()
-                                        .unwrap_or([0u8; 32]);
-                                    if msg_id != [0u8; 32] {
-                                        self.storage.store_deletion_marker(
-                                            &msg_id,
-                                            resolved_author,
-                                            envelope.timestamp,
-                                        )?;
-                                        deleted_count += 1;
+                            let mut cursor: Option<Vec<u8>> = None;
+                            loop {
+                                let entries = match &cursor {
+                                    None => self.storage.prefix_iter_cf(
+                                        schema::cf::NEWS_BY_AUTHOR,
+                                        &prefix,
+                                        PAGE,
+                                    )?,
+                                    Some(start) => self.storage.prefix_iter_cf_after(
+                                        schema::cf::NEWS_BY_AUTHOR,
+                                        start,
+                                        &prefix,
+                                        PAGE,
+                                    )?,
+                                };
+                                if entries.is_empty() {
+                                    break;
+                                }
+                                // Remember the last key to resume after this page.
+                                cursor = entries.last().map(|(k, _)| k.clone());
+                                let page_len = entries.len();
+                                for (key, _) in &entries {
+                                    // Key: (author, 0xFF, !timestamp:8, msg_id:32)
+                                    if key.len() >= 32 {
+                                        let msg_id: [u8; 32] = key[key.len() - 32..]
+                                            .try_into()
+                                            .unwrap_or([0u8; 32]);
+                                        if msg_id != [0u8; 32] {
+                                            self.storage.store_deletion_marker(
+                                                &msg_id,
+                                                resolved_author,
+                                                envelope.timestamp,
+                                            )?;
+                                            deleted_count += 1;
+                                        }
                                     }
+                                }
+                                // Short page = prefix exhausted.
+                                if page_len < PAGE {
+                                    break;
                                 }
                             }
                             warn!(

@@ -699,6 +699,26 @@ mod tests {
     }
 
     #[test]
+    fn spoofed_leftmost_loopback_does_not_bypass_admin_auth() {
+        // REGRESSION for admin_auth C1 (audit 2026-06-07): the old admin
+        // middleware read the LEFTMOST XFF entry. In the Docker/Apache
+        // topology the node's TCP peer is the trusted bridge gateway, so
+        // an attacker sends `X-Forwarded-For: 127.0.0.1`; an appending
+        // proxy (Apache mod_proxy default) yields `127.0.0.1, <attacker>`.
+        // Reading leftmost gave `127.0.0.1` → loopback → auth bypass.
+        // The right-to-left walk MUST return the attacker, not loopback.
+        let trusted = proxies(&["172.17.0.0/16"]);
+        let peer = sock("172.17.0.1:5555"); // Docker bridge gateway (trusted)
+        let xff = "127.0.0.1, 8.8.8.8"; // attacker-spoofed loopback, then attacker
+        let resolved = resolve_client_ip(peer, None, Some(xff), &trusted);
+        assert_eq!(resolved, "8.8.8.8".parse::<IpAddr>().unwrap());
+        assert!(
+            !is_loopback_canonical(resolved),
+            "spoofed leftmost loopback must NOT resolve to a loopback client IP",
+        );
+    }
+
+    #[test]
     fn forwarded_bracketed_ipv6_with_trusted_chain() {
         // RFC 7239: IPv6 must be bracketed. Verify the bracketed
         // form works alongside the rightmost-walk semantics.

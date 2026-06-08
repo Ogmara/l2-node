@@ -377,6 +377,14 @@ pub struct AppState {
     /// endpoint (spec 03 §4.1). Single string ("mainnet" / "testnet"),
     /// cloned once at startup.
     pub network_id: String,
+    /// Replay-protection cache for REST/WS auth nonces (audit 2026-06-07
+    /// host-binding). Key = `"{signing_address}:{nonce}"`; an entry's mere
+    /// presence means "already used" (value is unit). TTL is the auth
+    /// freshness window plus a margin so a nonce cannot be replayed even
+    /// just after its signing timestamp ages out. Bounded capacity caps
+    /// memory under a flood of distinct nonces — evicted entries are safe
+    /// to forget because their signing timestamps have already expired.
+    pub auth_nonce_seen: Cache<String, ()>,
 }
 
 /// Cached bootstrap-candidates response (spec 13 §4.5).
@@ -551,6 +559,22 @@ impl AppState {
             .timeout(std::time::Duration::from_secs(15))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
+        // Auth-nonce replay cache (audit 2026-06-07 host-binding). A
+        // timestamp T is accepted by `check_timestamp_fresh` across a real-
+        // time span of (MAX_AUTH_AGE_MS + MAX_AUTH_FUTURE_SKEW_MS): from
+        // T - future_skew (claimed early) to T + past_age. The cache TTL is
+        // measured from CLAIM time, so to guarantee the entry outlives the
+        // *entire* acceptance window even when the original was stamped at
+        // max future skew, the TTL must be the full span PLUS another
+        // future-skew margin (audit follow-up W1). Capped at 100k entries;
+        // at this TTL that absorbs >1k distinct authed requests/sec before
+        // early eviction — far above any node's authenticated write load.
+        let auth_nonce_seen: Cache<String, ()> = Cache::builder()
+            .time_to_live(std::time::Duration::from_millis(
+                crate::api::auth::MAX_AUTH_AGE_MS + 2 * crate::api::auth::MAX_AUTH_FUTURE_SKEW_MS,
+            ))
+            .max_capacity(100_000)
+            .build();
         Self {
             storage,
             router,
@@ -601,6 +625,7 @@ impl AppState {
             tor_config,
             presence_manager,
             network_id,
+            auth_nonce_seen,
         }
     }
 
