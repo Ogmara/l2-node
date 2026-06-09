@@ -607,6 +607,29 @@ pub async fn network_nodes(
         anchor_status: self_anchor_status,
     };
 
+    // Presence-gossip fallback for `api_endpoint` (audit follow-up 2026-06-09).
+    // The modern presence layer carries each peer's `public_url` and propagates
+    // reliably, whereas the legacy `NodeAnnouncement` → PEER_DIRECTORY path may
+    // lag (or a peer may be known only as a bare libp2p connection). Build a
+    // `peer_id -> public_url` map so peers always surface a usable endpoint for
+    // clients, instead of `null`. Keyed by base58 libp2p PeerId.
+    let presence_endpoints: std::collections::HashMap<String, String> =
+        if let Some(mgr) = state.presence_manager.clone() {
+            mgr.cache()
+                .snapshot()
+                .await
+                .into_iter()
+                .filter_map(|c| {
+                    c.record
+                        .public_url
+                        .filter(|u| !u.is_empty())
+                        .map(|u| (c.record.peer_id, u))
+                })
+                .collect()
+        } else {
+            std::collections::HashMap::new()
+        };
+
     match state.storage.prefix_iter_cf(cf::PEER_DIRECTORY, &[], limit) {
         Ok(entries) => {
             let mut nodes: Vec<NodeEntry> = Vec::with_capacity(entries.len() + 1);
@@ -644,6 +667,11 @@ pub async fn network_nodes(
                     });
 
                     let peer_id = peer_id_by_node_id.get(&node_id).cloned();
+                    // Fall back to the presence-gossip public_url when the
+                    // NodeAnnouncement carried no api_endpoint (audit 2026-06-09).
+                    let api_endpoint = api_endpoint.or_else(|| {
+                        peer_id.as_ref().and_then(|p| presence_endpoints.get(p).cloned())
+                    });
 
                     Some(NodeEntry {
                         node_id,
@@ -673,7 +701,11 @@ pub async fn network_nodes(
                     nodes.push(NodeEntry {
                         node_id: node_id.clone(),
                         peer_id: Some(info.peer_id.clone()),
-                        api_endpoint: None,
+                        // Presence-gossip endpoint (audit 2026-06-09): a peer
+                        // known only as a bare libp2p connection still has a
+                        // usable public_url from presence — surface it instead
+                        // of null so clients can use this node.
+                        api_endpoint: presence_endpoints.get(&info.peer_id).cloned(),
                         channels: vec![],
                         user_count: 0,
                         last_seen: now_ms,

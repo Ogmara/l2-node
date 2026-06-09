@@ -5,6 +5,21 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.63.3] - 2026-06-09
+
+### Fixed
+
+- **`/api/v1/network/nodes` now fills `api_endpoint` from the presence-gossip
+  cache** when the legacy `NodeAnnouncement` → `PEER_DIRECTORY` path hasn't
+  populated it (or a peer is known only as a bare libp2p connection). After
+  0.63.2 fixed the mesh, presence records propagate reliably and carry each
+  peer's `public_url` (the real API endpoint, including port) — but the clients'
+  discovery endpoint still returned `api_endpoint: null` for those peers because
+  it only read the announcement path. It now falls back to the presence
+  `public_url` keyed by libp2p PeerId, so clients discover every reachable peer
+  via the connected node (no `nodes.json` dependency). The website network page
+  was unaffected (it queries the SC + presence directly).
+
 ## [0.63.2] - 2026-06-09
 
 Peer-discovery / gossip-mesh fix. On a small fleet, nodes connected over
