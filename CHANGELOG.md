@@ -5,6 +5,44 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.63.2] - 2026-06-09
+
+Peer-discovery / gossip-mesh fix. On a small fleet, nodes connected over
+libp2p but the gossipsub mesh stayed empty (`HEARTBEAT: Mesh low. Topic
+contains: 0 needs: 3`), so `NodeAnnouncement`s never propagated and each node's
+`/api/v1/network/nodes` listed peers with `api_endpoint: null` — clients could
+only use the node they were directly connected to. Root cause: the node
+advertised no public address and ingested peers' private/loopback addresses
+unfiltered.
+
+### Fixed
+
+- **Filter Identify-reported peer addresses through `classify_transport`.** A
+  node listening on `0.0.0.0` reports every local interface via Identify
+  (127.0.0.1, docker bridge, RFC1918 LAN, CGNAT/tailscale). Those were added to
+  Kademlia + the reconnect set + `PEER_DIRECTORY` unfiltered, so peers dialed
+  private addresses (`WrongPeerId`, or dialed themselves → `LocalPeerId`) and a
+  private addr could clobber the routable on-chain `/dns4` entry. Now only
+  routable (Clearnet/Onion/I2p) addresses are kept — reusing the SSRF guard the
+  SC-discovery path already had. `persist_peer_addr` guards the same way.
+- **Advertise the public external address to libp2p** (`add_external_address`),
+  derived from `[api] public_url` + `[network] listen_port` (same source as the
+  on-chain metadata). Without it the swarm only knew its `0.0.0.0`-expanded
+  local addrs; peers had no routable address to dial back, so connections were
+  unstable and never meshed.
+- **Force Kademlia Server mode** (`set_mode(Server)`). It defaulted to client
+  mode and only auto-promotes after an external address is confirmed (which
+  never happened), so peers saw `/ogmara/<net>/kad/1.0.0` as "protocol not
+  supported".
+
+### Changed
+
+- **Verified Ogmara peers are added as gossipsub explicit peers**, bounded by
+  `EXPLICIT_PEER_CAP = 16`. On a small fleet this guarantees `NodeAnnouncement`
+  + channel/DM propagation even before the random mesh forms; beyond the cap the
+  node relies on the (now correctly forming) mesh, avoiding O(n) per-message
+  fan-out on a large network.
+
 ## [0.63.1] - 2026-06-08
 
 Cleanup (audit 2026-06-07 fix-plan Batch 5).

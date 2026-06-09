@@ -484,6 +484,38 @@ impl NetworkService {
             .listen_on(tcp_addr.clone())
             .context("listening on TCP")?;
 
+        // Advertise our PUBLIC external address(es) to libp2p (audit follow-up
+        // 2026-06-08). Without this the swarm only knows its `0.0.0.0`-expanded
+        // LOCAL addresses (127.0.0.1, docker bridge, LAN) and leaks those via
+        // Identify — peers then dial private addresses (WrongPeerId / dialing
+        // themselves) and never form a stable, mutually-reachable connection,
+        // so gossipsub never meshes and `NodeAnnouncement`s don't propagate
+        // (peers show `api_endpoint: null`). We derive the routable address
+        // from the SAME source as the on-chain metadata (`[api] public_url` +
+        // `[network] listen_port`) and strip the `/p2p/<id>` suffix that
+        // `add_external_address` doesn't want.
+        {
+            let local_peer_id = swarm.local_peer_id().to_base58();
+            let (ext_multiaddrs, _) = crate::api::admin::compute_effective_multiaddrs(
+                &config.anchoring.metadata,
+                config.network.listen_port,
+                config.api.public_url.as_deref(),
+                &local_peer_id,
+            );
+            for ma in &ext_multiaddrs {
+                let base = ma.split("/p2p/").next().unwrap_or(ma);
+                match base.parse::<Multiaddr>() {
+                    Ok(addr) => {
+                        info!(addr = %addr, "Advertising external address to libp2p");
+                        swarm.add_external_address(addr);
+                    }
+                    Err(e) => {
+                        warn!(multiaddr = %base, error = %e, "Skipping unparseable external multiaddr");
+                    }
+                }
+            }
+        }
+
         // Inbound onion listen (spec 13 §6.4, l2-node 0.46.9+). When
         // the operator runs an external Tor daemon with a
         // HiddenServicePort directive forwarding to
@@ -1142,10 +1174,24 @@ impl NetworkService {
                 // (tier 1 + 2 produced nothing) ⇒ fire SC fan-out.
                 self.identify_success_count.fetch_add(1, Ordering::Relaxed);
 
-                // Add identified peer's addresses to Kademlia and store the
-                // first address for reconnection after disconnect.
+                // Add identified peer's ROUTABLE addresses to Kademlia and
+                // store the first for reconnection. A node listening on
+                // `0.0.0.0` reports every local interface via Identify
+                // (127.0.0.1, docker bridge, RFC1918 LAN, CGNAT/tailscale).
+                // Ingesting those unfiltered (audit follow-up 2026-06-08) made
+                // peers dial private addresses → `WrongPeerId` / dialing
+                // themselves (`LocalPeerId`), and clobbered the on-chain
+                // `/dns4` addr in PEER_DIRECTORY — which broke the gossip mesh
+                // + `NodeAnnouncement` propagation. Filter through the same
+                // `classify_transport` guard the SC-discovery path already uses
+                // (audit C2): keep only Clearnet/Onion/I2p, drop `Unknown`
+                // (loopback / private / CGNAT / link-local).
+                use crate::chain::sc_views::{classify_transport, TransportKind};
                 let mut first_addr = None;
                 for addr in info.listen_addrs.into_iter().take(16) {
+                    if classify_transport(&addr.to_string()) == TransportKind::Unknown {
+                        continue; // non-routable — never dial or persist it
+                    }
                     if first_addr.is_none() {
                         first_addr = Some(addr.clone());
                     }
@@ -1173,7 +1219,21 @@ impl NetworkService {
                     use sha2::{Digest, Sha256};
                     let hash = Sha256::digest(ed25519_pk.to_bytes());
                     let node_id = bs58::encode(&hash[..20]).into_string();
+                    let known_peer_count = self.peer_node_ids.len();
                     self.peer_node_ids.insert(peer_id, node_id.clone());
+                    // On a SMALL fleet, mark verified Ogmara peers as gossipsub
+                    // EXPLICIT peers (audit follow-up 2026-06-08): the random
+                    // mesh may stay empty ("Mesh low: 0 peers"), and explicit
+                    // peers receive forwarded messages directly regardless of
+                    // mesh size — so `NodeAnnouncement` + channel/DM traffic
+                    // propagate reliably. Bounded by EXPLICIT_PEER_CAP so a
+                    // large network doesn't degrade into O(n) per-message
+                    // fan-out — beyond the cap we rely on the (now correctly
+                    // forming) gossipsub mesh. Idempotent (gossipsub dedups).
+                    const EXPLICIT_PEER_CAP: usize = 16;
+                    if known_peer_count < EXPLICIT_PEER_CAP {
+                        self.swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                    }
                     // Spec 13 §4.1 — classify which bootstrap tier
                     // produced this peer's dial chain this session.
                     let source = self.classify_discovery_source(&peer_id);
@@ -1355,6 +1415,16 @@ impl NetworkService {
 
     /// Persist a peer's multiaddr to storage for reconnection after restart.
     fn persist_peer_addr(&self, peer_id: &PeerId, addr: &Multiaddr) {
+        // Defense-in-depth (audit follow-up 2026-06-08): never persist a
+        // non-routable addr. PEER_DIRECTORY's `pa:` keyspace is shared with the
+        // SC-discovery path, so a private/loopback Identify addr here would
+        // both be dialed on restart AND clobber the routable on-chain `/dns4`
+        // entry. The Identify call site already filters, but guard here too.
+        if crate::chain::sc_views::classify_transport(&addr.to_string())
+            == crate::chain::sc_views::TransportKind::Unknown
+        {
+            return;
+        }
         // Cap stored peers at 256 to prevent unbounded growth
         let existing = self.storage.prefix_iter_cf(
             crate::storage::schema::cf::PEER_DIRECTORY,

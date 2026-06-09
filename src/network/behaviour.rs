@@ -127,7 +127,16 @@ pub fn build_swarm(config: &Config, keypair: Keypair) -> Result<Swarm<OgmaraBeha
                 .map_err(|e| anyhow::anyhow!("invalid Kademlia protocol string: {}", e))?,
         );
         kconfig.set_query_timeout(Duration::from_secs(30));
-        kad::Behaviour::with_config(peer_id, store, kconfig)
+        let mut kad = kad::Behaviour::with_config(peer_id, store, kconfig);
+        // Serve Kademlia queries (audit follow-up 2026-06-08). `with_config`
+        // defaults to CLIENT mode and only auto-promotes to Server after libp2p
+        // confirms an external address — which historically never happened
+        // (we never advertised one), so peers saw `/ogmara/<net>/kad/1.0.0`
+        // as "protocol not supported". We now advertise an external address
+        // (see NetworkService::new) AND force Server mode so the small fleet's
+        // DHT actually answers.
+        kad.set_mode(Some(kad::Mode::Server));
+        kad
     };
 
     // mDNS (local network discovery)
