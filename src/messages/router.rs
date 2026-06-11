@@ -94,6 +94,12 @@ impl RateCategory {
 /// `device_enc_keys` directory and the multi-device wrap fan-out.
 const MAX_ENC_KEYS_PER_WALLET: usize = 10;
 
+/// Max per-device key envelopes retained per `key_scope` (all targets/devices/
+/// epochs). Bounds the `channel_keys` CF against a flood of envelopes addressed to
+/// fabricated device ids (spec 8.1.1). Generous: covers many devices × retained
+/// history epochs for a DM or channel.
+const MAX_CHANNEL_KEY_ENVELOPES_PER_SCOPE: usize = 4096;
+
 /// The message router processes incoming messages through the full pipeline.
 pub struct MessageRouter {
     storage: Storage,
@@ -751,6 +757,9 @@ impl MessageRouter {
                 DeserializedPayload::PrivateChannelKeyDistribution(ref p) => {
                     validation::validate_private_channel_key_distribution(p)
                 }
+                DeserializedPayload::ChannelKeyEnvelope(ref p) => {
+                    validation::validate_channel_key_envelope(p)
+                }
                 // Types with no specific validation rules (NewsReaction uses existing validate_reaction)
                 _ => Ok(()),
             },
@@ -1053,6 +1062,40 @@ impl MessageRouter {
                     return Ok(());
                 }
                 Err("only creator or moderators can distribute channel keys".into())
+            }
+            // Per-device key envelope (0x61). Scope-aware authorization:
+            //  - DM: `conversation_id` is one-way, so the publisher proves
+            //    participation by supplying `peer` such that
+            //    `key_scope == compute_conversation_id(author, peer)`, and the
+            //    envelope must target one of the two participants. This blocks an
+            //    outsider from planting key envelopes into someone else's DM scope.
+            //  - Channel: membership-gated — lands in P2.
+            MessageType::ChannelKeyEnvelope => {
+                let p = rmp_serde::from_slice::<ChannelKeyEnvelopePayload>(&envelope.payload)
+                    .map_err(|e| format!("invalid channel key envelope: {}", e))?;
+                match p.scope_kind {
+                    crate::messages::types::key_scope_kind::DM => {
+                        let peer = p
+                            .peer
+                            .as_deref()
+                            .ok_or("DM key envelope missing peer")?;
+                        let expected =
+                            crate::crypto::compute_conversation_id(resolved_author, peer);
+                        if p.key_scope != expected {
+                            return Err(
+                                "key_scope does not match the (author, peer) conversation".into(),
+                            );
+                        }
+                        if p.target.as_str() != resolved_author && p.target.as_str() != peer {
+                            return Err("target must be a conversation participant".into());
+                        }
+                        Ok(())
+                    }
+                    crate::messages::types::key_scope_kind::CHANNEL => {
+                        Err("channel-scope key envelopes are not yet supported (P2)".into())
+                    }
+                    other => Err(format!("invalid scope_kind: {}", other)),
+                }
             }
             _ => Ok(()),
         }
@@ -2364,6 +2407,43 @@ impl MessageRouter {
                         author = %resolved_author,
                         "Private channel key distribution stored"
                     );
+                }
+            }
+            MessageType::ChannelKeyEnvelope => {
+                if let Ok(p) =
+                    rmp_serde::from_slice::<ChannelKeyEnvelopePayload>(&envelope.payload)
+                {
+                    // Store the opaque per-device wrapped key (first-write-wins). The
+                    // node never decrypts it; the recipient device unwraps with its own
+                    // X25519 enc privkey on retrieval.
+                    let record = serde_json::to_vec(&serde_json::json!({
+                        "eph_pub": hex::encode(p.eph_pub),
+                        "nonce": hex::encode(p.nonce),
+                        "wrapped": hex::encode(&p.wrapped),
+                        "epoch": p.epoch,
+                        "scope_kind": p.scope_kind,
+                        "author": resolved_author,
+                        "timestamp": envelope.timestamp,
+                    }))
+                    .context("serializing channel key envelope")?;
+                    match self.storage.put_channel_key_envelope_fww(
+                        &p.key_scope,
+                        &p.target,
+                        &p.device_id,
+                        p.epoch,
+                        &record,
+                        MAX_CHANNEL_KEY_ENVELOPES_PER_SCOPE,
+                    )? {
+                        crate::storage::rocks::KeyEnvelopeStore::Stored => {
+                            debug!(epoch = p.epoch, target = %p.target, "Channel key envelope stored");
+                        }
+                        crate::storage::rocks::KeyEnvelopeStore::AlreadyPresent => {
+                            debug!(epoch = p.epoch, target = %p.target, "Channel key envelope already present (first-write-wins)");
+                        }
+                        crate::storage::rocks::KeyEnvelopeStore::ScopeFull => {
+                            warn!(target = %p.target, key_scope = %hex::encode(p.key_scope), "Channel key envelope rejected: scope full");
+                        }
+                    }
                 }
             }
             MessageType::ProfileUpdate => {

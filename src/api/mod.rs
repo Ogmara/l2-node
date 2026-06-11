@@ -227,6 +227,9 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
             "/api/v1/channels/{channel_id}/keys",
             get(routes::get_channel_keys).post(routes::distribute_channel_keys),
         )
+        // Per-device E2E key envelopes (DMs + channels), generalized by key_scope.
+        // Publishing flows through the generic message-ingestion path (0x61).
+        .route("/api/v1/keys/{key_scope}", get(routes::get_key_envelope))
         .route("/api/v1/media/upload", post(routes::upload_media))
         // Device identity management
         .route("/api/v1/devices/register", post(routes::register_device))

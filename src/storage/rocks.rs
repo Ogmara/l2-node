@@ -15,6 +15,17 @@ use super::schema::{cf, encode_wallet_device_key};
 /// Type alias for the multi-threaded RocksDB instance.
 pub type RocksDb = DBWithThreadMode<MultiThreaded>;
 
+/// Outcome of a first-write-wins channel-key-envelope store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyEnvelopeStore {
+    /// The envelope was stored.
+    Stored,
+    /// A key already existed for `(key_scope, epoch, target, device)` — kept (FWW).
+    AlreadyPresent,
+    /// The scope already holds its maximum number of envelopes — rejected.
+    ScopeFull,
+}
+
 /// A device registration claim proving a wallet authorized a device key.
 ///
 /// The wallet signs a claim string binding the device to the wallet address.
@@ -2563,6 +2574,78 @@ impl Storage {
         self.get_cf(cf::PRIVATE_CHANNEL_KEYS, &key)
     }
 
+    // --- Channel key envelopes (per-device E2E key delivery, spec 8.1.1 / 8.2) ---
+
+    /// Store a per-device wrapped key envelope (`channel_keys` CF) under
+    /// **first-write-wins** semantics with a per-scope cap. `value` is the opaque
+    /// serialized record (the node never decrypts it).
+    ///
+    /// Returns [`KeyEnvelopeStore`] so the caller can log the reason a write was a
+    /// no-op. First-write-wins prevents a later (possibly hostile) publisher from
+    /// clobbering a good key already cached for `(key_scope, epoch, target, device)`;
+    /// the cap bounds storage per scope against a flood of bogus envelopes.
+    pub fn put_channel_key_envelope_fww(
+        &self,
+        key_scope: &[u8; 32],
+        target: &str,
+        device_id_hex: &str,
+        epoch: u64,
+        value: &[u8],
+        scope_cap: usize,
+    ) -> Result<KeyEnvelopeStore> {
+        use super::schema;
+        let key = schema::encode_channel_key(key_scope, target, device_id_hex, epoch);
+        if self.exists_cf(cf::CHANNEL_KEYS, &key)? {
+            return Ok(KeyEnvelopeStore::AlreadyPresent);
+        }
+        // Cap is checked on the new key's absence: scan up to scope_cap+1 entries.
+        let prefix = schema::encode_channel_key_scope_prefix(key_scope);
+        let existing = self.prefix_iter_cf(cf::CHANNEL_KEYS, &prefix, scope_cap + 1)?;
+        if existing.len() >= scope_cap {
+            return Ok(KeyEnvelopeStore::ScopeFull);
+        }
+        self.put_cf(cf::CHANNEL_KEYS, &key, value)?;
+        Ok(KeyEnvelopeStore::Stored)
+    }
+
+    /// Get the latest-epoch wrapped key envelope for one `(scope, target, device)`.
+    /// Returns `(epoch, value)`.
+    pub fn get_channel_key_envelope_latest(
+        &self,
+        key_scope: &[u8; 32],
+        target: &str,
+        device_id_hex: &str,
+    ) -> Result<Option<(u64, Vec<u8>)>> {
+        use super::schema;
+        let prefix = schema::encode_channel_key_device_prefix(key_scope, target, device_id_hex);
+        // start just past the highest possible epoch for this device prefix.
+        let mut start = prefix.clone();
+        start.extend_from_slice(&u64::MAX.to_be_bytes());
+        let entries = self.reverse_iter_cf(cf::CHANNEL_KEYS, &start, &prefix, 1)?;
+        if let Some((key, value)) = entries.into_iter().next() {
+            if key.len() >= 8 {
+                let epoch = u64::from_be_bytes(
+                    key[key.len() - 8..].try_into().unwrap_or([0; 8]),
+                );
+                return Ok(Some((epoch, value)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Get the wrapped key envelope for an exact `(scope, target, device, epoch)`.
+    pub fn get_channel_key_envelope(
+        &self,
+        key_scope: &[u8; 32],
+        target: &str,
+        device_id_hex: &str,
+        epoch: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        use super::schema;
+        let key = schema::encode_channel_key(key_scope, target, device_id_hex, epoch);
+        self.get_cf(cf::CHANNEL_KEYS, &key)
+    }
+
     /// Store anchor node info for a remote private channel.
     pub fn store_private_channel_anchor(
         &self,
@@ -2629,4 +2712,85 @@ fn num_cpus() -> i32 {
     std::thread::available_parallelism()
         .map(|n| n.get() as i32)
         .unwrap_or(2)
+}
+
+#[cfg(test)]
+mod channel_key_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn db() -> (Storage, TempDir) {
+        let dir = TempDir::new().unwrap();
+        (Storage::open(dir.path()).unwrap(), dir)
+    }
+
+    #[test]
+    fn channel_key_envelope_fww_and_latest() {
+        let (s, _d) = db();
+        let scope = [7u8; 32];
+        let target = "klv1aaaa";
+        let device = "ab".repeat(32); // 64 hex chars
+        let cap = 16;
+
+        // First write stores.
+        assert_eq!(
+            s.put_channel_key_envelope_fww(&scope, target, &device, 1, b"v1", cap)
+                .unwrap(),
+            KeyEnvelopeStore::Stored
+        );
+        // A second write to the same (scope, epoch, device) is rejected (first-write-wins).
+        assert_eq!(
+            s.put_channel_key_envelope_fww(&scope, target, &device, 1, b"attacker", cap)
+                .unwrap(),
+            KeyEnvelopeStore::AlreadyPresent
+        );
+        // The original value is preserved.
+        assert_eq!(
+            s.get_channel_key_envelope(&scope, target, &device, 1)
+                .unwrap()
+                .as_deref(),
+            Some(&b"v1"[..])
+        );
+        // A newer epoch is a distinct entry; latest returns the highest epoch.
+        assert_eq!(
+            s.put_channel_key_envelope_fww(&scope, target, &device, 2, b"v2", cap)
+                .unwrap(),
+            KeyEnvelopeStore::Stored
+        );
+        let (ep, val) = s
+            .get_channel_key_envelope_latest(&scope, target, &device)
+            .unwrap()
+            .unwrap();
+        assert_eq!(ep, 2);
+        assert_eq!(val, b"v2");
+
+        // A different device under the same scope does not collide.
+        let other = "cd".repeat(32);
+        assert!(s
+            .get_channel_key_envelope_latest(&scope, target, &other)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn channel_key_envelope_scope_cap() {
+        let (s, _d) = db();
+        let scope = [9u8; 32];
+        let cap = 3;
+        for i in 0..cap {
+            let device = format!("{:064x}", i);
+            assert_eq!(
+                s.put_channel_key_envelope_fww(&scope, "klv1t", &device, 1, b"x", cap)
+                    .unwrap(),
+                KeyEnvelopeStore::Stored
+            );
+        }
+        // One past the cap is rejected.
+        let device = format!("{:064x}", 99);
+        assert_eq!(
+            s.put_channel_key_envelope_fww(&scope, "klv1t", &device, 1, b"x", cap)
+                .unwrap(),
+            KeyEnvelopeStore::ScopeFull
+        );
+    }
 }

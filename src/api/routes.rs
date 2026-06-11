@@ -5639,6 +5639,70 @@ pub async fn get_channel_keys(
     }
 }
 
+/// Query params for the per-device key-envelope retrieval endpoint.
+#[derive(Debug, serde::Deserialize)]
+pub struct KeyEnvelopeParams {
+    /// Specific epoch; if omitted, returns the latest.
+    pub epoch: Option<u64>,
+    /// Requesting device id — hex of the device Ed25519 signing pubkey (§2.4).
+    pub device_id: String,
+}
+
+/// GET /api/v1/keys/:key_scope — fetch THIS wallet's per-device wrapped key
+/// envelope for a scope (a DM `conversation_id` or a channel scope, spec 8.1.1 /
+/// 8.2). Authenticated; the lookup is always scoped to the caller's own wallet
+/// (`auth_user.address`), so a caller can only ever retrieve envelopes wrapped for
+/// itself — and even then the blob is ECIES-sealed to a device enc key it must
+/// hold to unwrap. `key_scope` is 32-byte hex.
+pub async fn get_key_envelope(
+    Extension(state): Extension<Arc<AppState>>,
+    Extension(auth_user): Extension<AuthUser>,
+    Path(key_scope_hex): Path<String>,
+    Query(params): Query<KeyEnvelopeParams>,
+) -> impl IntoResponse {
+    let scope_bytes = match hex::decode(&key_scope_hex) {
+        Ok(b) if b.len() == 32 => b,
+        _ => return (StatusCode::BAD_REQUEST, "key_scope must be 32-byte hex").into_response(),
+    };
+    let mut key_scope = [0u8; 32];
+    key_scope.copy_from_slice(&scope_bytes);
+    if params.device_id.len() != 64 || !params.device_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return (StatusCode::BAD_REQUEST, "device_id must be 64 hex chars").into_response();
+    }
+    let target = &auth_user.address;
+    let result = if let Some(epoch) = params.epoch {
+        state
+            .storage
+            .get_channel_key_envelope(&key_scope, target, &params.device_id, epoch)
+            .map(|opt| opt.map(|data| (epoch, data)))
+    } else {
+        state
+            .storage
+            .get_channel_key_envelope_latest(&key_scope, target, &params.device_id)
+    };
+    match result {
+        Ok(Some((epoch, record))) => match serde_json::from_slice::<serde_json::Value>(&record) {
+            Ok(data) => Json(serde_json::json!({
+                "key_scope": key_scope_hex,
+                "epoch": epoch,
+                "envelope": data,
+            }))
+            .into_response(),
+            Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "corrupt key data").into_response(),
+        },
+        Ok(None) => Json(serde_json::json!({
+            "key_scope": key_scope_hex,
+            "epoch": null,
+            "envelope": null,
+        }))
+        .into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to fetch key envelope");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
+        }
+    }
+}
+
 /// POST /api/v1/channels/:channel_id/keys — distribute group keys (authenticated)
 ///
 /// Only the channel creator or admins can publish key distributions.
