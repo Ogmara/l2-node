@@ -5,6 +5,24 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.64.1] - 2026-06-11
+
+E2E P1 DM fixes found during cross-node testing.
+
+### Fixed
+
+- **Cross-node DM key delivery: `ChannelKeyEnvelope` (0x61) was never gossiped.**
+  `gossip_topic_for_envelope` had no arm for 0x61, so a wrapped epoch key stayed on
+  the sender's node — a recipient on a *different* node never received it and the DM
+  showed "waiting for key" forever (same-node worked). Now routed to the target's DM
+  topic (DM scope) or the channel topic (channel scope, P2), the same way DM content
+  is delivered.
+- **Garbled DM conversation preview.** `GET /api/v1/dm/conversations` built
+  `last_message_preview` via `String::from_utf8_lossy(content)` — on encrypted DMs
+  the content is ciphertext, so the preview rendered as mojibake (web AND desktop).
+  Now the server only previews legacy plaintext DMs (`key_epoch == 0`); encrypted
+  conversations get an empty preview (the client builds it after decrypting).
+
 ## [0.64.0] - 2026-06-11
 
 E2E encryption P1 (node side) — per-device key delivery for encrypted DMs (spec

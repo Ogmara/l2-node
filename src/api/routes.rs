@@ -1349,6 +1349,17 @@ struct RecipientExtract {
     recipient: String,
 }
 
+/// Minimal extractor to route a `ChannelKeyEnvelope` (0x61) for cross-node gossip:
+/// a DM-scope envelope (no `channel_id`) goes to the target's DM topic so the
+/// recipient's node receives the wrapped key; a channel-scope envelope (P2) goes
+/// to the channel topic.
+#[derive(serde::Deserialize)]
+struct KeyEnvelopeRouteExtract {
+    target: String,
+    #[serde(default)]
+    channel_id: Option<u64>,
+}
+
 fn gossip_topic_for_envelope(
     envelope: &crate::messages::envelope::Envelope,
     network_id: &str,
@@ -1392,6 +1403,17 @@ fn gossip_topic_for_envelope(
             // can't decode, which previously dropped DMs from gossip too.
             let p: RecipientExtract = rmp_serde::from_slice(&envelope.payload).ok()?;
             Some(gossip::dm_topic(network_id, &p.recipient))
+        }
+        MessageType::ChannelKeyEnvelope => {
+            // Per-device wrapped epoch key (spec 8.1.1 / 8.2) — MUST reach the
+            // recipient's node so a cross-node DM/channel member can fetch + unwrap
+            // it. DM scope → the target's DM topic (same place the DM content goes);
+            // channel scope (P2) → the channel topic.
+            let p: KeyEnvelopeRouteExtract = rmp_serde::from_slice(&envelope.payload).ok()?;
+            match p.channel_id {
+                Some(cid) => Some(gossip::channel_topic(network_id, cid)),
+                None => Some(gossip::dm_topic(network_id, &p.target)),
+            }
         }
         MessageType::NodeAnnouncement
         | MessageType::DeviceDelegation
@@ -2527,15 +2549,22 @@ pub async fn get_dm_conversations(
                                         crate::messages::types::DirectMessagePayload,
                                     >(&env.payload)
                                     {
-                                        let text =
-                                            String::from_utf8_lossy(&payload.content);
-                                        // Truncate to 100 chars for preview (char-safe boundary)
-                                        last_message_preview = if text.chars().count() > 100 {
-                                            let truncated: String = text.chars().take(97).collect();
-                                            format!("{truncated}...")
-                                        } else {
-                                            text.to_string()
-                                        };
+                                        // Only legacy plaintext DMs (key_epoch 0) have a
+                                        // server-readable preview. Encrypted content
+                                        // (key_epoch >= 1) is opaque ciphertext — never
+                                        // `from_utf8_lossy` it (renders as mojibake); the
+                                        // client builds the preview after decrypting.
+                                        if payload.key_epoch == 0 {
+                                            let text =
+                                                String::from_utf8_lossy(&payload.content);
+                                            // Truncate to 100 chars (char-safe boundary)
+                                            last_message_preview = if text.chars().count() > 100 {
+                                                let truncated: String = text.chars().take(97).collect();
+                                                format!("{truncated}...")
+                                            } else {
+                                                text.to_string()
+                                            };
+                                        }
                                     }
                                 }
                             }
