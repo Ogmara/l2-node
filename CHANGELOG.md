@@ -5,6 +5,47 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.64.0] - 2026-06-11
+
+E2E encryption P1 (node side) — per-device key delivery for encrypted DMs (spec
+8.1.1 / 8.2). The node stays content-blind; it relays/stores opaque ciphertext and
+wrapped keys it cannot decrypt.
+
+### Added
+
+- **`ChannelKeyEnvelope` message type (0x61)** — a per-device ECIES-wrapped epoch
+  key, generalized over a 32-byte `key_scope` (a DM `conversation_id` now; channel
+  scope in P2). Carries `scope_kind`, `epoch`, `target`, `device_id`, `peer` (DM),
+  `eph_pub`, `nonce`, `wrapped`.
+- **`channel_keys` column family** — per-device wrapped key store, keyed
+  `key_scope(32) ++ target ++ 0xFF ++ device_id ++ epoch_be8`. **First-write-wins**
+  per `(key_scope, epoch, device)` so a later/hostile publisher can't clobber a good
+  key; capped at 4096 envelopes/scope. EXCLUDED from snapshot `DOMAIN_CFS`.
+- **`GET /api/v1/keys/{key_scope}`** — authenticated per-device key-envelope
+  retrieval (`?device_id=&epoch=`). The lookup is always scoped to the caller's own
+  wallet, so no cross-user leakage. Publishing flows through the generic
+  message-ingestion path.
+- **Scope-aware authorization for 0x61**: DM envelopes require
+  `key_scope == compute_conversation_id(author, peer)` and `target ∈ {author, peer}`
+  — `conversation_id` is one-way, so the explicit `peer` is what makes
+  participant-binding verifiable. Channel scope is reserved for P2.
+- Structural validation `validate_channel_key_envelope` (scope_kind, 48-byte wrapped
+  length, non-zero `eph_pub`, 64-hex `device_id`, DM-requires-peer). Tests for
+  first-write-wins, per-scope cap, latest-epoch lookup, and validation.
+
+### Changed
+
+- **`DirectMessagePayload.nonce` / `EncryptedAttachment.nonce` widened `[u8;12]` →
+  `[u8;24]`** for XChaCha20-Poly1305 (was AES-GCM-era 12-byte). DM `content` is now
+  documented as XChaCha20-Poly1305 ciphertext under the per-conversation `conv_key`.
+  Wire-format change; acceptable pre-mainnet (MVP DMs were plaintext, nonce unused).
+
+### Security
+
+- Audit 2026-06-11 Code-W1: bound `ChannelKeyEnvelope` `target`/`peer` to
+  `MAX_KLEVER_ADDRESS_LEN` (70) — they flow into `channel_keys` RocksDB keys, so an
+  unbounded length was a storage-amplification path within one's own DM scopes.
+
 ## [0.63.4] - 2026-06-11
 
 ### Fixed

@@ -805,6 +805,65 @@ pub fn validate_private_channel_key_distribution(
     Ok(())
 }
 
+/// Exact wrapped-key length: 32-byte key + 16-byte Poly1305 tag (spec §8.1).
+pub const WRAPPED_KEY_LEN: usize = 48;
+
+/// Upper bound on a Klever bech32 address length (`klv1…` is 62 chars). Caps the
+/// `target`/`peer` fields that flow into `channel_keys` RocksDB keys, closing a
+/// storage-amplification path (audit 2026-06-11 Code-W1).
+pub const MAX_KLEVER_ADDRESS_LEN: usize = 70;
+
+/// Whether `s` is a syntactically plausible, length-bounded Klever address.
+fn is_bounded_klever_address(s: &str) -> bool {
+    s.starts_with("klv1") && s.len() <= MAX_KLEVER_ADDRESS_LEN
+}
+
+/// Validate a per-device channel key envelope (spec 8.1.1 / 8.2). Structural only —
+/// participant-binding (DM) / membership (channel) authorization is enforced in the
+/// router's `authorize_channel_action`.
+pub fn validate_channel_key_envelope(
+    p: &super::types::ChannelKeyEnvelopePayload,
+) -> Result<(), ValidationError> {
+    use super::types::key_scope_kind;
+    if p.scope_kind != key_scope_kind::DM && p.scope_kind != key_scope_kind::CHANNEL {
+        return Err(ValidationError(format!("invalid scope_kind: {}", p.scope_kind)));
+    }
+    if !is_bounded_klever_address(&p.target) {
+        return Err(ValidationError("target must be a valid Klever address".into()));
+    }
+    // device_id is the hex of an Ed25519 signing pubkey: 64 lowercase hex chars.
+    if p.device_id.len() != 64 || !p.device_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(ValidationError("device_id must be 64 hex chars".into()));
+    }
+    if p.eph_pub.iter().all(|&b| b == 0) {
+        return Err(ValidationError("eph_pub must not be all-zero".into()));
+    }
+    if p.wrapped.len() != WRAPPED_KEY_LEN {
+        return Err(ValidationError(format!(
+            "wrapped key must be {} bytes, got {}",
+            WRAPPED_KEY_LEN,
+            p.wrapped.len()
+        )));
+    }
+    match p.scope_kind {
+        key_scope_kind::DM => {
+            // DM scope: a peer (the other participant) is required for the router's
+            // `key_scope == conversation_id(author, peer)` authorization check.
+            match &p.peer {
+                Some(peer) if is_bounded_klever_address(peer) => {}
+                _ => return Err(ValidationError("DM key envelope requires a valid peer".into())),
+            }
+        }
+        key_scope_kind::CHANNEL => {
+            if p.channel_id.unwrap_or(0) == 0 {
+                return Err(ValidationError("channel key envelope requires channel_id > 0".into()));
+            }
+        }
+        _ => unreachable!(),
+    }
+    Ok(())
+}
+
 /// Validate a news repost payload.
 pub fn validate_news_repost(author: &str, p: &NewsRepostPayload) -> Result<(), ValidationError> {
     if p.original_author.is_empty() || !p.original_author.starts_with("klv1") {
@@ -825,6 +884,58 @@ pub fn validate_news_repost(author: &str, p: &NewsRepostPayload) -> Result<(), V
 mod tests {
     use super::*;
     use serde::Serialize;
+
+    fn dm_key_envelope() -> super::super::types::ChannelKeyEnvelopePayload {
+        super::super::types::ChannelKeyEnvelopePayload {
+            key_scope: [1u8; 32],
+            scope_kind: super::super::types::key_scope_kind::DM,
+            epoch: 1,
+            target: "klv1target".into(),
+            device_id: "ab".repeat(32),
+            peer: Some("klv1peer".into()),
+            channel_id: None,
+            eph_pub: [2u8; 32],
+            nonce: [3u8; 24],
+            wrapped: vec![0u8; WRAPPED_KEY_LEN],
+        }
+    }
+
+    #[test]
+    fn validate_channel_key_envelope_accepts_good_dm() {
+        assert!(validate_channel_key_envelope(&dm_key_envelope()).is_ok());
+    }
+
+    #[test]
+    fn validate_channel_key_envelope_rejects_bad() {
+        // wrong wrapped length
+        let mut p = dm_key_envelope();
+        p.wrapped = vec![0u8; 32];
+        assert!(validate_channel_key_envelope(&p).is_err());
+        // all-zero eph_pub
+        let mut p = dm_key_envelope();
+        p.eph_pub = [0u8; 32];
+        assert!(validate_channel_key_envelope(&p).is_err());
+        // bad device_id (not 64 hex)
+        let mut p = dm_key_envelope();
+        p.device_id = "zz".into();
+        assert!(validate_channel_key_envelope(&p).is_err());
+        // DM scope without a peer
+        let mut p = dm_key_envelope();
+        p.peer = None;
+        assert!(validate_channel_key_envelope(&p).is_err());
+        // unknown scope_kind
+        let mut p = dm_key_envelope();
+        p.scope_kind = 9;
+        assert!(validate_channel_key_envelope(&p).is_err());
+        // over-long target (storage-key amplification guard, Code-W1)
+        let mut p = dm_key_envelope();
+        p.target = format!("klv1{}", "a".repeat(MAX_KLEVER_ADDRESS_LEN));
+        assert!(validate_channel_key_envelope(&p).is_err());
+        // over-long peer
+        let mut p = dm_key_envelope();
+        p.peer = Some(format!("klv1{}", "a".repeat(MAX_KLEVER_ADDRESS_LEN)));
+        assert!(validate_channel_key_envelope(&p).is_err());
+    }
 
     #[test]
     fn validate_emoji_accepts_real_emoji_incl_zwj_sequences() {

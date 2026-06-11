@@ -133,6 +133,17 @@ pub mod cf {
     /// Maps private channels to their anchor node URL (for remote private channels).
     pub const PRIVATE_CHANNEL_ANCHORS: &str = "private_channel_anchors";
 
+    /// (key_scope:32, target_wallet, 0xFF, device_id_hex, epoch_be8)
+    /// → ChannelKeyEnvelope (JSON) — per-device wrapped epoch key for E2E content
+    /// (epoch is the TRAILING component so a reverse prefix-scan yields the latest
+    /// epoch for one device — see `encode_channel_key` / `get_channel_key_envelope_latest`).
+    /// (spec 8.1.1 / 8.2). Generalized over `key_scope`: a DM `conversation_id` or a
+    /// channel scope. Opaque wrapped blobs; the node cannot decrypt them. First-write-
+    /// wins per `(key_scope, epoch, device_id)`. EXCLUDED from snapshot DOMAIN_CFS
+    /// (per-member secret material, re-fetched on demand — same rationale as
+    /// `device_enc_keys` / `private_channel_keys`).
+    pub const CHANNEL_KEYS: &str = "channel_keys";
+
     // --- Cross-Device Sync ---
 
     /// wallet_address bytes → encrypted settings blob (SettingsSyncPayload serialized)
@@ -244,6 +255,7 @@ pub mod cf {
         NOTIFICATIONS,
         PRIVATE_CHANNEL_KEYS,
         PRIVATE_CHANNEL_ANCHORS,
+        CHANNEL_KEYS,
         KNOWN_WALLETS,
         IDENTITY_ENVELOPES,
         DEVICE_REVOCATIONS,
@@ -791,6 +803,44 @@ pub fn encode_private_channel_key(channel_id: u64, epoch: u64) -> Vec<u8> {
 /// Encode a private channel anchor key: channel_id (8 bytes BE).
 pub fn encode_private_channel_anchor_key(channel_id: u64) -> Vec<u8> {
     channel_id.to_be_bytes().to_vec()
+}
+
+/// Encode a `channel_keys` CF key:
+/// `key_scope(32) ++ target_wallet ++ 0xFF ++ device_id_hex ++ epoch_be8`.
+///
+/// The `0xFF` separator is unambiguous: Klever addresses are bech32 (lowercase
+/// alphanumeric) and device ids are hex — neither contains `0xFF`. Epoch is the
+/// trailing component so a reverse prefix-scan over
+/// [`encode_channel_key_device_prefix`] yields the latest epoch for one device.
+pub fn encode_channel_key(key_scope: &[u8; 32], target: &str, device_id_hex: &str, epoch: u64) -> Vec<u8> {
+    let t = target.as_bytes();
+    let d = device_id_hex.as_bytes();
+    let mut key = Vec::with_capacity(32 + t.len() + 1 + d.len() + 8);
+    key.extend_from_slice(key_scope);
+    key.extend_from_slice(t);
+    key.push(0xFF);
+    key.extend_from_slice(d);
+    key.extend_from_slice(&epoch.to_be_bytes());
+    key
+}
+
+/// Prefix selecting every epoch of a `channel_keys` entry for one `(scope, target,
+/// device)` — reverse-iterate for the latest epoch.
+pub fn encode_channel_key_device_prefix(key_scope: &[u8; 32], target: &str, device_id_hex: &str) -> Vec<u8> {
+    let t = target.as_bytes();
+    let d = device_id_hex.as_bytes();
+    let mut key = Vec::with_capacity(32 + t.len() + 1 + d.len());
+    key.extend_from_slice(key_scope);
+    key.extend_from_slice(t);
+    key.push(0xFF);
+    key.extend_from_slice(d);
+    key
+}
+
+/// Prefix selecting every `channel_keys` entry for a scope (all targets/devices/
+/// epochs) — used to enforce the per-scope envelope cap.
+pub fn encode_channel_key_scope_prefix(key_scope: &[u8; 32]) -> Vec<u8> {
+    key_scope.to_vec()
 }
 
 #[cfg(test)]

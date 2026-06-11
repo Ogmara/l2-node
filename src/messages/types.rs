@@ -68,6 +68,9 @@ pub enum MessageType {
     // Private Channel Management
     PrivateChannelKeyDistribution = 0x60,
 
+    // E2E key delivery (per-device, all channel types + DMs) — spec 8.1.1 / 8.2
+    ChannelKeyEnvelope = 0x61,
+
     // Network
     NodeAnnouncement = 0xE0,
     Ping = 0xF0,
@@ -120,6 +123,7 @@ impl MessageType {
             0x42 => Some(Self::ChannelMute),
             0x50 => Some(Self::DeletionRequest),
             0x60 => Some(Self::PrivateChannelKeyDistribution),
+            0x61 => Some(Self::ChannelKeyEnvelope),
             0xE0 => Some(Self::NodeAnnouncement),
             0xF0 => Some(Self::Ping),
             0xF1 => Some(Self::Pong),
@@ -228,10 +232,10 @@ pub struct Attachment {
 pub struct EncryptedAttachment {
     /// CID of encrypted content on IPFS.
     pub cid: String,
-    /// AES-GCM encrypted metadata (mime_type, size, filename, thumbnail_cid).
+    /// XChaCha20-Poly1305 encrypted metadata (mime_type, size, filename, thumbnail_cid).
     pub encrypted_meta: Vec<u8>,
-    /// AES-GCM nonce for metadata.
-    pub nonce: [u8; 12],
+    /// XChaCha20-Poly1305 nonce for metadata (24 bytes; spec 3.4).
+    pub nonce: [u8; 24],
 }
 
 // --- Chat Message Payload (spec 3.3) ---
@@ -263,11 +267,13 @@ pub struct DirectMessagePayload {
     pub recipient: String,
     /// Deterministic: Keccak-256(sorted(sender, recipient)).
     pub conversation_id: [u8; 32],
-    /// Encrypted ciphertext (AES-256-GCM).
+    /// XChaCha20-Poly1305 ciphertext under the conversation key (`conv_key`).
+    /// Opaque to the node — it relays bytes it cannot decrypt.
     pub content: Vec<u8>,
-    /// AES-GCM nonce (unique per message).
-    pub nonce: [u8; 12],
-    /// Which DH-derived key epoch was used.
+    /// XChaCha20-Poly1305 nonce, 24 bytes, unique per message (spec 3.4 / 8.2).
+    pub nonce: [u8; 24],
+    /// Which `conv_key` epoch was used (§8.2). New encrypted conversations start
+    /// at epoch 1; the legacy plaintext MVP used 0.
     pub key_epoch: u64,
     /// msg_id of parent message.
     pub reply_to: Option<[u8; 32]>,
@@ -766,6 +772,54 @@ pub struct PrivateChannelKeyDistributionPayload {
     pub member_keys: std::collections::HashMap<String, Vec<u8>>,
 }
 
+// --- Channel Key Envelope (spec 8.1.1 / 8.2) ---
+
+/// Scope kind for a [`ChannelKeyEnvelopePayload`].
+pub mod key_scope_kind {
+    /// `key_scope` is a DM `conversation_id`.
+    pub const DM: u8 = 0;
+    /// `key_scope` is a channel scope (P2).
+    pub const CHANNEL: u8 = 1;
+}
+
+/// Per-device wrapped epoch key (spec 8.1.1 / 8.2). One envelope delivers a single
+/// `conv_key`/`channel_key` to ONE recipient device, ECIES-wrapped to that device's
+/// X25519 enc pubkey. The node stores opaque blobs in the `channel_keys` CF and
+/// cannot decrypt them. Generalized over a 32-byte `key_scope`:
+///
+/// - **DM** (`scope_kind = 0`): `key_scope = conversation_id`, `peer` = the other
+///   participant. The node authorizes by checking `key_scope ==
+///   compute_conversation_id(author, peer)` (proves the author is a participant)
+///   and `target ∈ {author, peer}` — `conversation_id` is one-way, so the explicit
+///   `peer` is what makes participant-binding verifiable.
+/// - **Channel** (`scope_kind = 1`): `key_scope` is a derived channel scope and
+///   `channel_id` is set; authorized by membership (P2).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelKeyEnvelopePayload {
+    /// 32-byte key scope: `conversation_id` (DM) or derived channel scope (channel).
+    pub key_scope: [u8; 32],
+    /// Scope discriminant — see [`key_scope_kind`].
+    pub scope_kind: u8,
+    /// Key rotation epoch this envelope carries.
+    pub epoch: u64,
+    /// Recipient wallet (`klv1…`) this key is wrapped for.
+    pub target: String,
+    /// Recipient device id — hex of the device Ed25519 signing pubkey (§2.4).
+    pub device_id: String,
+    /// DM only: the other participant, for participant-binding authorization.
+    #[serde(default)]
+    pub peer: Option<String>,
+    /// Channel only: the channel id, for membership authorization + scope binding (P2).
+    #[serde(default)]
+    pub channel_id: Option<u64>,
+    /// ECIES ephemeral X25519 public key.
+    pub eph_pub: [u8; 32],
+    /// AEAD nonce (24 bytes).
+    pub nonce: [u8; 24],
+    /// ECIES-wrapped key bytes (`KEY_LEN + tag` = 48 bytes), opaque to the node.
+    pub wrapped: Vec<u8>,
+}
+
 // --- Content Request/Response (spec 5.5.2) ---
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -879,6 +933,7 @@ pub fn deserialize_payload(
         MessageType::ChannelMute => Ok(DeserializedPayload::ChannelMute(rmp_serde::from_slice(payload_bytes)?)),
         MessageType::DeletionRequest => Ok(DeserializedPayload::DeletionRequest(rmp_serde::from_slice(payload_bytes)?)),
         MessageType::PrivateChannelKeyDistribution => Ok(DeserializedPayload::PrivateChannelKeyDistribution(rmp_serde::from_slice(payload_bytes)?)),
+        MessageType::ChannelKeyEnvelope => Ok(DeserializedPayload::ChannelKeyEnvelope(rmp_serde::from_slice(payload_bytes)?)),
         MessageType::NodeAnnouncement => Ok(DeserializedPayload::NodeAnnouncement(rmp_serde::from_slice(payload_bytes)?)),
         MessageType::SyncRequest => Ok(DeserializedPayload::ContentRequest(rmp_serde::from_slice(payload_bytes)?)),
         // Ping, Pong, StateRoot, SyncResponse carry opaque bytes
@@ -922,6 +977,7 @@ pub enum DeserializedPayload {
     ChannelMute(ChannelMutePayload),
     DeletionRequest(DeletionRequestPayload),
     PrivateChannelKeyDistribution(PrivateChannelKeyDistributionPayload),
+    ChannelKeyEnvelope(ChannelKeyEnvelopePayload),
     NodeAnnouncement(NodeAnnouncementPayload),
     ContentRequest(ContentRequest),
     Raw(Vec<u8>),
