@@ -3979,7 +3979,12 @@ fn serve_from_cached(
             let headers = [
                 (header::CONTENT_TYPE, content_type),
                 (header::ACCEPT_RANGES, "bytes".to_string()),
-                (header::VARY, "Range".to_string()),
+                // NB: do NOT add `Vary: Range`. Range is not a cache-key
+                // dimension — HTTP caches handle ranges natively via
+                // Accept-Ranges/206. Sending `Vary: Range` makes browsers treat
+                // the entry as unmatchable and re-fetch/revalidate on every
+                // load, defeating the `immutable` directive below — that was
+                // reloading channel logos on every page refresh (2026-06-11).
                 (header::ETAG, etag),
                 (header::LAST_MODIFIED, last_modified_str),
                 (header::CACHE_CONTROL, cache_control.to_string()),
@@ -4015,7 +4020,7 @@ fn serve_from_cached(
     let headers = [
         (header::CONTENT_TYPE, content_type),
         (header::ACCEPT_RANGES, "bytes".to_string()),
-        (header::VARY, "Range".to_string()),
+        // No `Vary: Range` — it defeats immutable caching (see the 200 path).
         (header::ETAG, etag),
         (header::LAST_MODIFIED, last_modified_str),
         (header::CACHE_CONTROL, cache_control.to_string()),
@@ -4163,7 +4168,7 @@ async fn serve_range_streamed(
     let headers = [
         (header::CONTENT_TYPE, content_type),
         (header::ACCEPT_RANGES, "bytes".to_string()),
-        (header::VARY, "Range".to_string()),
+        // No `Vary: Range` — it defeats immutable caching (see the 200 path).
         (header::ETAG, etag),
         (header::CACHE_CONTROL, cache_control.to_string()),
         (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),

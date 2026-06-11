@@ -5,6 +5,19 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.63.4] - 2026-06-11
+
+### Fixed
+
+- **Channel logos (and all media) re-fetched on every page reload.** Media
+  responses sent `Vary: Range`, which is not a valid cache-key dimension —
+  browsers treated the cached entry as unmatchable and re-fetched/revalidated
+  on every load, defeating the `Cache-Control: public, max-age=31536000,
+  immutable` directive. Removed `Vary: Range` from all three media response
+  paths (200 full, 206 partial, streaming fallback). Range requests are
+  unaffected (handled natively via `Accept-Ranges`/206). Media now caches as
+  intended — logos paint instantly from disk cache on reload.
+
 ## [0.63.3] - 2026-06-09
 
 ### Fixed
