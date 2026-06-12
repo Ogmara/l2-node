@@ -2588,13 +2588,14 @@ impl Storage {
         &self,
         key_scope: &[u8; 32],
         target: &str,
+        author: &str,
         device_id_hex: &str,
         epoch: u64,
         value: &[u8],
         scope_cap: usize,
     ) -> Result<KeyEnvelopeStore> {
         use super::schema;
-        let key = schema::encode_channel_key(key_scope, target, device_id_hex, epoch);
+        let key = schema::encode_channel_key(key_scope, target, author, device_id_hex, epoch);
         if self.exists_cf(cf::CHANNEL_KEYS, &key)? {
             return Ok(KeyEnvelopeStore::AlreadyPresent);
         }
@@ -2608,16 +2609,17 @@ impl Storage {
         Ok(KeyEnvelopeStore::Stored)
     }
 
-    /// Get the latest-epoch wrapped key envelope for one `(scope, target, device)`.
-    /// Returns `(epoch, value)`.
+    /// Get the latest-epoch wrapped key envelope for one `(scope, target, author,
+    /// device)` — i.e. author X's key for this recipient device. Returns `(epoch, value)`.
     pub fn get_channel_key_envelope_latest(
         &self,
         key_scope: &[u8; 32],
         target: &str,
+        author: &str,
         device_id_hex: &str,
     ) -> Result<Option<(u64, Vec<u8>)>> {
         use super::schema;
-        let prefix = schema::encode_channel_key_device_prefix(key_scope, target, device_id_hex);
+        let prefix = schema::encode_channel_key_device_prefix(key_scope, target, author, device_id_hex);
         // start just past the highest possible epoch for this device prefix.
         let mut start = prefix.clone();
         start.extend_from_slice(&u64::MAX.to_be_bytes());
@@ -2633,16 +2635,17 @@ impl Storage {
         Ok(None)
     }
 
-    /// Get the wrapped key envelope for an exact `(scope, target, device, epoch)`.
+    /// Get the wrapped key envelope for an exact `(scope, target, author, device, epoch)`.
     pub fn get_channel_key_envelope(
         &self,
         key_scope: &[u8; 32],
         target: &str,
+        author: &str,
         device_id_hex: &str,
         epoch: u64,
     ) -> Result<Option<Vec<u8>>> {
         use super::schema;
-        let key = schema::encode_channel_key(key_scope, target, device_id_hex, epoch);
+        let key = schema::encode_channel_key(key_scope, target, author, device_id_hex, epoch);
         self.get_cf(cf::CHANNEL_KEYS, &key)
     }
 
@@ -2729,45 +2732,68 @@ mod channel_key_tests {
         let (s, _d) = db();
         let scope = [7u8; 32];
         let target = "klv1aaaa";
+        let author = "klv1author";
         let device = "ab".repeat(32); // 64 hex chars
         let cap = 16;
 
         // First write stores.
         assert_eq!(
-            s.put_channel_key_envelope_fww(&scope, target, &device, 1, b"v1", cap)
+            s.put_channel_key_envelope_fww(&scope, target, author, &device, 1, b"v1", cap)
                 .unwrap(),
             KeyEnvelopeStore::Stored
         );
-        // A second write to the same (scope, epoch, device) is rejected (first-write-wins).
+        // A second write to the same (scope, author, epoch, device) is rejected (FWW).
         assert_eq!(
-            s.put_channel_key_envelope_fww(&scope, target, &device, 1, b"attacker", cap)
+            s.put_channel_key_envelope_fww(&scope, target, author, &device, 1, b"attacker", cap)
                 .unwrap(),
             KeyEnvelopeStore::AlreadyPresent
         );
         // The original value is preserved.
         assert_eq!(
-            s.get_channel_key_envelope(&scope, target, &device, 1)
+            s.get_channel_key_envelope(&scope, target, author, &device, 1)
                 .unwrap()
                 .as_deref(),
             Some(&b"v1"[..])
         );
         // A newer epoch is a distinct entry; latest returns the highest epoch.
         assert_eq!(
-            s.put_channel_key_envelope_fww(&scope, target, &device, 2, b"v2", cap)
+            s.put_channel_key_envelope_fww(&scope, target, author, &device, 2, b"v2", cap)
                 .unwrap(),
             KeyEnvelopeStore::Stored
         );
         let (ep, val) = s
-            .get_channel_key_envelope_latest(&scope, target, &device)
+            .get_channel_key_envelope_latest(&scope, target, author, &device)
             .unwrap()
             .unwrap();
         assert_eq!(ep, 2);
         assert_eq!(val, b"v2");
 
-        // A different device under the same scope does not collide.
+        // PER-SENDER: a different author's key for the SAME device coexists (no
+        // collision — this is the split-brain fix).
+        let author2 = "klv1other";
+        assert_eq!(
+            s.put_channel_key_envelope_fww(&scope, target, author2, &device, 1, b"k2", cap)
+                .unwrap(),
+            KeyEnvelopeStore::Stored
+        );
+        assert_eq!(
+            s.get_channel_key_envelope(&scope, target, author2, &device, 1)
+                .unwrap()
+                .as_deref(),
+            Some(&b"k2"[..])
+        );
+        // author1's key is still its own value, not clobbered.
+        assert_eq!(
+            s.get_channel_key_envelope(&scope, target, author, &device, 1)
+                .unwrap()
+                .as_deref(),
+            Some(&b"v1"[..])
+        );
+
+        // A different device under the same scope/author does not collide.
         let other = "cd".repeat(32);
         assert!(s
-            .get_channel_key_envelope_latest(&scope, target, &other)
+            .get_channel_key_envelope_latest(&scope, target, author, &other)
             .unwrap()
             .is_none());
     }
@@ -2780,7 +2806,7 @@ mod channel_key_tests {
         for i in 0..cap {
             let device = format!("{:064x}", i);
             assert_eq!(
-                s.put_channel_key_envelope_fww(&scope, "klv1t", &device, 1, b"x", cap)
+                s.put_channel_key_envelope_fww(&scope, "klv1t", "klv1a", &device, 1, b"x", cap)
                     .unwrap(),
                 KeyEnvelopeStore::Stored
             );
@@ -2788,7 +2814,7 @@ mod channel_key_tests {
         // One past the cap is rejected.
         let device = format!("{:064x}", 99);
         assert_eq!(
-            s.put_channel_key_envelope_fww(&scope, "klv1t", &device, 1, b"x", cap)
+            s.put_channel_key_envelope_fww(&scope, "klv1t", "klv1a", &device, 1, b"x", cap)
                 .unwrap(),
             KeyEnvelopeStore::ScopeFull
         );

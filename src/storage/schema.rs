@@ -806,18 +806,32 @@ pub fn encode_private_channel_anchor_key(channel_id: u64) -> Vec<u8> {
 }
 
 /// Encode a `channel_keys` CF key:
-/// `key_scope(32) ++ target_wallet ++ 0xFF ++ device_id_hex ++ epoch_be8`.
+/// `key_scope(32) ++ target ++ 0xFF ++ author ++ 0xFF ++ device_id_hex ++ epoch_be8`.
 ///
-/// The `0xFF` separator is unambiguous: Klever addresses are bech32 (lowercase
-/// alphanumeric) and device ids are hex — neither contains `0xFF`. Epoch is the
-/// trailing component so a reverse prefix-scan over
-/// [`encode_channel_key_device_prefix`] yields the latest epoch for one device.
-pub fn encode_channel_key(key_scope: &[u8; 32], target: &str, device_id_hex: &str, epoch: u64) -> Vec<u8> {
+/// **Per-sender keys** (spec §8.2): the `author` (the wallet whose `conv_key`/
+/// `channel_key` this envelope carries) is part of the key, so each participant's
+/// own sending key for a given recipient device coexists — a recipient decrypts a
+/// message from author X by fetching X's key. Without `author` in the key, two
+/// participants' first-write-wins envelopes for the same `(scope, epoch, device)`
+/// collide and one party can never obtain the other's key (the cross-node
+/// "split-brain"). The `0xFF` separators are unambiguous (addresses are bech32,
+/// device ids hex — neither contains `0xFF`); epoch trails so a reverse prefix-scan
+/// over [`encode_channel_key_device_prefix`] yields the latest epoch.
+pub fn encode_channel_key(
+    key_scope: &[u8; 32],
+    target: &str,
+    author: &str,
+    device_id_hex: &str,
+    epoch: u64,
+) -> Vec<u8> {
     let t = target.as_bytes();
+    let a = author.as_bytes();
     let d = device_id_hex.as_bytes();
-    let mut key = Vec::with_capacity(32 + t.len() + 1 + d.len() + 8);
+    let mut key = Vec::with_capacity(32 + t.len() + 1 + a.len() + 1 + d.len() + 8);
     key.extend_from_slice(key_scope);
     key.extend_from_slice(t);
+    key.push(0xFF);
+    key.extend_from_slice(a);
     key.push(0xFF);
     key.extend_from_slice(d);
     key.extend_from_slice(&epoch.to_be_bytes());
@@ -825,13 +839,21 @@ pub fn encode_channel_key(key_scope: &[u8; 32], target: &str, device_id_hex: &st
 }
 
 /// Prefix selecting every epoch of a `channel_keys` entry for one `(scope, target,
-/// device)` — reverse-iterate for the latest epoch.
-pub fn encode_channel_key_device_prefix(key_scope: &[u8; 32], target: &str, device_id_hex: &str) -> Vec<u8> {
+/// author, device)` — reverse-iterate for the latest epoch of that author's key.
+pub fn encode_channel_key_device_prefix(
+    key_scope: &[u8; 32],
+    target: &str,
+    author: &str,
+    device_id_hex: &str,
+) -> Vec<u8> {
     let t = target.as_bytes();
+    let a = author.as_bytes();
     let d = device_id_hex.as_bytes();
-    let mut key = Vec::with_capacity(32 + t.len() + 1 + d.len());
+    let mut key = Vec::with_capacity(32 + t.len() + 1 + a.len() + 1 + d.len());
     key.extend_from_slice(key_scope);
     key.extend_from_slice(t);
+    key.push(0xFF);
+    key.extend_from_slice(a);
     key.push(0xFF);
     key.extend_from_slice(d);
     key

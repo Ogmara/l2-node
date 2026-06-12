@@ -5,6 +5,27 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.65.0] - 2026-06-12
+
+E2E P1 DM — per-sender keys (fixes cross-node "can't decrypt").
+
+### Changed
+
+- **`channel_keys` CF is now keyed by author**: `(key_scope, target, author,
+  device_id, epoch)`. Cross-node, two DM participants each generate their own
+  epoch-1 `conv_key`; under the old `(key_scope, target, device, epoch)` keying their
+  first-write-wins envelopes collided and one party could never obtain the other's
+  key (the "split-brain" — `UNWRAP OK` but `DECRYPT FAILED: invalid tag`). Keying by
+  the signature-verified `author` lets each participant's sending key coexist; a
+  recipient fetches a message's key by its author. Storage-format change (additive;
+  old `channel_keys` entries orphaned — pre-mainnet test data).
+- **`GET /api/v1/keys/{key_scope}`** gains an optional `author` query param (defaults
+  to the caller's own wallet) — to decrypt author X's messages, fetch X's key.
+
+512 tests pass (incl. a per-author coexistence test); clippy-clean. Audit:
+code/security clean (the storage author is the signature-verified `resolved_author`,
+so no author spoofing).
+
 ## [0.64.1] - 2026-06-11
 
 E2E P1 DM fixes found during cross-node testing.
