@@ -183,9 +183,16 @@ async fn handle_authenticated_ws(socket: WebSocket, state: Arc<AppState>) {
     // Process messages in both directions
     loop {
         tokio::select! {
-            // Forward broadcast messages to client
-            Ok(msg) = broadcast_rx.recv() => {
-                if sender.send(Message::Text(msg.into())).await.is_err() {
+            // Forward broadcast messages to client — but only those whose
+            // audience includes this connection's authenticated wallet, so a
+            // DM is delivered only to its participants, never to every client.
+            Ok(out) = broadcast_rx.recv() => {
+                if out.audience.allows(&wallet_address)
+                    && sender
+                        .send(Message::Text(out.json.clone().into()))
+                        .await
+                        .is_err()
+                {
                     break;
                 }
             }
@@ -276,8 +283,15 @@ async fn handle_public_ws(socket: WebSocket, state: Arc<AppState>) {
 
     loop {
         tokio::select! {
-            Ok(msg) = broadcast_rx.recv() => {
-                if sender.send(Message::Text(msg.into())).await.is_err() {
+            // Public (unauthenticated) WS: forward only `Everyone`-audience
+            // frames (public-channel messages) — never a participant-private DM.
+            Ok(out) = broadcast_rx.recv() => {
+                if out.audience.allows("")
+                    && sender
+                        .send(Message::Text(out.json.clone().into()))
+                        .await
+                        .is_err()
+                {
                     break;
                 }
             }
