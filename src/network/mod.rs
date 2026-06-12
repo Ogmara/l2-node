@@ -1219,21 +1219,28 @@ impl NetworkService {
                     use sha2::{Digest, Sha256};
                     let hash = Sha256::digest(ed25519_pk.to_bytes());
                     let node_id = bs58::encode(&hash[..20]).into_string();
-                    let known_peer_count = self.peer_node_ids.len();
                     self.peer_node_ids.insert(peer_id, node_id.clone());
-                    // On a SMALL fleet, mark verified Ogmara peers as gossipsub
-                    // EXPLICIT peers (audit follow-up 2026-06-08): the random
-                    // mesh may stay empty ("Mesh low: 0 peers"), and explicit
-                    // peers receive forwarded messages directly regardless of
-                    // mesh size — so `NodeAnnouncement` + channel/DM traffic
-                    // propagate reliably. Bounded by EXPLICIT_PEER_CAP so a
-                    // large network doesn't degrade into O(n) per-message
-                    // fan-out — beyond the cap we rely on the (now correctly
-                    // forming) gossipsub mesh. Idempotent (gossipsub dedups).
-                    const EXPLICIT_PEER_CAP: usize = 16;
-                    if known_peer_count < EXPLICIT_PEER_CAP {
-                        self.swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
-                    }
+                    // NOTE (l2-node 0.66.0): verified Ogmara peers are
+                    // deliberately NOT marked as gossipsub EXPLICIT peers.
+                    // An earlier build (2026-06-08) did so to work around an
+                    // empty mesh — but gossipsub *excludes* explicit peers from
+                    // mesh grafting (`get_random_peers`'s filter requires
+                    // `!explicit_peers.contains(peer)`). On the small fleet,
+                    // where every peer was marked explicit, the mesh could
+                    // therefore NEVER form: peers grafted on subscribe, then
+                    // `add_explicit_peer` evicted them, leaving `mesh_size = 0`
+                    // permanently ("RANDOM PEERS: Got 0 peers"). That forced all
+                    // cross-node traffic onto the explicit-peer DIRECT-FORWARD
+                    // path, which carries no IHAVE/IWANT recovery — so any drop
+                    // (reconnect window, inbound-only link) was permanent,
+                    // producing the intermittent cross-node DM loss and
+                    // "waiting for key" symptoms. The original empty-mesh cause
+                    // (`mesh_outbound_min = 1` blocking inbound-only nodes) was
+                    // since fixed properly via `mesh_outbound_min = 0` (see
+                    // behaviour.rs), so peers now graft into a real, stable mesh
+                    // (mesh_n=3, never exceeds mesh_n_high) and regain
+                    // gossip-based recovery. Peer identity is still tracked
+                    // below for `/api/v1/network/nodes` + telemetry.
                     // Spec 13 §4.1 — classify which bootstrap tier
                     // produced this peer's dial chain this session.
                     let source = self.classify_discovery_source(&peer_id);

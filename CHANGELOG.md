@@ -5,6 +5,36 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.66.0] - 2026-06-12
+
+GossipSub mesh fix — stop sabotaging the mesh with explicit peers (fixes
+intermittent cross-node DM loss and "waiting for key").
+
+### Fixed
+
+- **Verified Ogmara peers are no longer marked as gossipsub `explicit_peers`**
+  (removed `add_explicit_peer` on identify, `src/network/mod.rs`). gossipsub
+  *excludes* explicit peers from mesh grafting (`get_random_peers` requires
+  `!explicit_peers.contains(peer)`), so on the small fleet — where every peer
+  was marked explicit — the mesh could **never** form: a peer grafted on
+  subscribe, then `add_explicit_peer` evicted it, leaving `mesh_size = 0`
+  permanently (`RANDOM PEERS: Got 0 peers` every heartbeat). All cross-node
+  traffic was thus forced onto the explicit-peer **direct-forward** path, which
+  has no IHAVE/IWANT recovery — so any dropped message (reconnect window, an
+  inbound-only link) was lost for good, producing intermittent cross-node DM
+  loss and stuck "waiting for key" key envelopes. The original empty-mesh cause
+  (`mesh_outbound_min = 1` blocking inbound-only nodes) was already fixed
+  properly via `mesh_outbound_min = 0` (0.48.4), making the explicit-peer
+  workaround both redundant and actively harmful. Peers now graft into a real,
+  stable mesh (`mesh_n = 3`, never exceeds `mesh_n_high`) and regain
+  gossip-based message recovery.
+
+### Note
+
+- No storage/protocol/API change — pure network-behaviour fix. Requires a fleet
+  redeploy to take effect; verify with `mesh_size > 0` on
+  `/admin/network/mesh-stats` once all nodes run ≥ 0.66.0.
+
 ## [0.65.0] - 2026-06-12
 
 E2E P1 DM — per-sender keys (fixes cross-node "can't decrypt").
