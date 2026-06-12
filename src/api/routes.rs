@@ -5675,6 +5675,10 @@ pub struct KeyEnvelopeParams {
     pub epoch: Option<u64>,
     /// Requesting device id — hex of the device Ed25519 signing pubkey (§2.4).
     pub device_id: String,
+    /// The key's author (the wallet whose sending key to fetch). Per-sender keys
+    /// (§8.2): to decrypt a message from author X, fetch X's key. Defaults to the
+    /// caller's own wallet (fetch your own sending key).
+    pub author: Option<String>,
 }
 
 /// GET /api/v1/keys/:key_scope — fetch THIS wallet's per-device wrapped key
@@ -5699,15 +5703,18 @@ pub async fn get_key_envelope(
         return (StatusCode::BAD_REQUEST, "device_id must be 64 hex chars").into_response();
     }
     let target = &auth_user.address;
+    // Per-sender keys: fetch author X's key (to decrypt X's messages). Defaults to
+    // the caller's own wallet (your own sending key).
+    let author = params.author.as_deref().unwrap_or(target.as_str());
     let result = if let Some(epoch) = params.epoch {
         state
             .storage
-            .get_channel_key_envelope(&key_scope, target, &params.device_id, epoch)
+            .get_channel_key_envelope(&key_scope, target, author, &params.device_id, epoch)
             .map(|opt| opt.map(|data| (epoch, data)))
     } else {
         state
             .storage
-            .get_channel_key_envelope_latest(&key_scope, target, &params.device_id)
+            .get_channel_key_envelope_latest(&key_scope, target, author, &params.device_id)
     };
     match result {
         Ok(Some((epoch, record))) => match serde_json::from_slice::<serde_json::Value>(&record) {

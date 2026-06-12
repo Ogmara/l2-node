@@ -2429,6 +2429,7 @@ impl MessageRouter {
                     match self.storage.put_channel_key_envelope_fww(
                         &p.key_scope,
                         &p.target,
+                        resolved_author, // per-sender key: this envelope carries the author's own conv_key
                         &p.device_id,
                         p.epoch,
                         &record,
