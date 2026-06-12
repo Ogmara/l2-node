@@ -306,7 +306,11 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
             // connection balance + mesh participation. Diagnoses the
             // asymmetric-mesh case the `mesh_outbound_min = 0` fix
             // tolerates.
-            .route("/admin/network/peer-telemetry", get(admin::peer_telemetry));
+            .route("/admin/network/peer-telemetry", get(admin::peer_telemetry))
+            // Loopback-only E2E diagnostics (0.68.0): dump a wallet's device
+            // enc-key directory + a conversation's wrapped-key envelopes and
+            // stored DM messages, to diagnose "can't decrypt" / vanishing DMs.
+            .route("/admin/debug/e2e", get(admin::debug_e2e));
 
         if config.api.admin.dashboard {
             protected = protected
