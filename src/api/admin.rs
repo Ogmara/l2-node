@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::Extension;
+use axum::extract::{Extension, Query};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
@@ -1394,4 +1394,160 @@ pub async fn trigger_anchor(
         )
             .into_response(),
     }
+}
+
+/// Query for [`debug_e2e`].
+#[derive(Deserialize)]
+pub struct E2eDebugParams {
+    /// Wallet (or device) address whose enc-key directory to dump.
+    pub wallet: String,
+    /// Optional conversation_id (64-hex) for its key envelopes + DM messages.
+    #[serde(default)]
+    pub scope: Option<String>,
+    /// Optional DM peer — if given (and `scope` is not), the scope is computed as
+    /// `compute_conversation_id(wallet, peer)` so callers needn't hash.
+    #[serde(default)]
+    pub peer: Option<String>,
+}
+
+/// GET /admin/debug/e2e?wallet=<addr>&peer=<addr> — loopback-only E2E key +
+/// DM-storage dump, for diagnosing "can't decrypt" / vanishing DMs.
+///
+/// Returns, for `wallet`: `enc_keys` (its device enc-key directory — **two
+/// entries sharing a `device_id` is the wrap-collision signature**: a sender
+/// wraps to both, the `channel_keys` envelopes collide on
+/// `(scope,target,author,device_id,epoch)` first-write-wins, and the stale one
+/// can win so the recipient's current device can't unwrap → "can't decrypt").
+/// With a scope: `channel_keys` (decoded `target/author/device_id/epoch`) and
+/// `dm_messages` (the conversation's stored messages; `has_envelope=false` means
+/// indexed-but-body-missing, i.e. it vanishes from history on reload).
+///
+/// Loopback-only (same guard as the other `/admin` routes). Public key material
+/// + ciphertext metadata only — no private keys, no plaintext.
+pub async fn debug_e2e(
+    Extension(state): Extension<Arc<AppState>>,
+    Query(params): Query<E2eDebugParams>,
+) -> impl IntoResponse {
+    use crate::storage::schema::cf;
+
+    let wallet = state
+        .identity
+        .resolve(&params.wallet)
+        .unwrap_or_else(|_| params.wallet.clone());
+
+    // Device enc-key directory for the wallet.
+    let mut enc_prefix = wallet.as_bytes().to_vec();
+    enc_prefix.push(0xFF);
+    let enc_keys: Vec<serde_json::Value> = state
+        .storage
+        .prefix_iter_cf(cf::DEVICE_ENC_KEYS, &enc_prefix, 256)
+        .map(|entries| {
+            entries
+                .into_iter()
+                .filter_map(|(_, v)| serde_json::from_slice::<serde_json::Value>(&v).ok())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Resolve the conversation scope: explicit `scope` hex wins; else derive from `peer`.
+    let scope_bytes: Option<Vec<u8>> = match (&params.scope, &params.peer) {
+        (Some(hex_s), _) => hex::decode(hex_s).ok().filter(|b| b.len() == 32),
+        (None, Some(peer)) => {
+            let peer_wallet = state.identity.resolve(peer).unwrap_or_else(|_| peer.clone());
+            Some(crate::crypto::compute_conversation_id(&wallet, &peer_wallet).to_vec())
+        }
+        _ => None,
+    };
+    let scope_hex_resolved = scope_bytes.as_ref().map(hex::encode);
+
+    let mut channel_keys: Vec<serde_json::Value> = Vec::new();
+    let mut dm_messages: Vec<serde_json::Value> = Vec::new();
+
+    if let Some(scope_bytes) = scope_bytes.as_ref() {
+        // Wrapped-key envelopes stored for this scope.
+        if let Ok(entries) = state.storage.prefix_iter_cf(cf::CHANNEL_KEYS, scope_bytes, 512) {
+            // key = scope(32) ++ target ++ 0xFF ++ author ++ 0xFF ++ device_id ++ epoch_be8
+            let split_ff = |b: &[u8]| -> (String, usize) {
+                match b.iter().position(|x| *x == 0xFF) {
+                    Some(i) => (String::from_utf8_lossy(&b[..i]).into_owned(), i + 1),
+                    None => (String::from_utf8_lossy(b).into_owned(), b.len()),
+                }
+            };
+            for (k, v) in entries {
+                if k.len() <= 32 {
+                    continue;
+                }
+                let rest = &k[32..];
+                let (target, o1) = split_ff(rest);
+                let (author, o2) = split_ff(&rest[o1..]);
+                let tail = &rest[o1 + o2..];
+                let (device_id, epoch) = if tail.len() >= 8 {
+                    let mut e = [0u8; 8];
+                    e.copy_from_slice(&tail[tail.len() - 8..]);
+                    (
+                        String::from_utf8_lossy(&tail[..tail.len() - 8]).into_owned(),
+                        u64::from_be_bytes(e),
+                    )
+                } else {
+                    (String::from_utf8_lossy(tail).into_owned(), 0)
+                };
+                channel_keys.push(serde_json::json!({
+                    "target": target,
+                    "author": author,
+                    "device_id": device_id,
+                    "epoch": epoch,
+                    "value_len": v.len(),
+                }));
+            }
+        }
+
+        // Stored DM messages for this conversation.
+        if let Ok(entries) = state.storage.prefix_iter_cf(cf::DM_MESSAGES, scope_bytes, 256) {
+            for (k, _) in entries {
+                // key = conversation_id(32) ++ timestamp_be8 ++ msg_id(32)
+                if k.len() < 72 {
+                    continue;
+                }
+                let mut ts = [0u8; 8];
+                ts.copy_from_slice(&k[32..40]);
+                let mut mid = [0u8; 32];
+                mid.copy_from_slice(&k[40..72]);
+                // Is the body retrievable? false ⇒ indexed but missing ⇒ vanishes on reload.
+                let (has_envelope, author, key_epoch) = match state.storage.get_message(&mid) {
+                    Ok(Some(bytes)) => {
+                        rmp_serde::from_slice::<crate::messages::envelope::Envelope>(&bytes)
+                            .ok()
+                            .map(|env| {
+                                let ep = rmp_serde::from_slice::<
+                                    crate::messages::types::DirectMessagePayload,
+                                >(&env.payload)
+                                .ok()
+                                .map(|p| p.key_epoch);
+                                (true, Some(env.author), ep)
+                            })
+                            .unwrap_or((true, None, None))
+                    }
+                    _ => (false, None, None),
+                };
+                dm_messages.push(serde_json::json!({
+                    "timestamp": u64::from_be_bytes(ts),
+                    "msg_id": hex::encode(mid),
+                    "has_envelope": has_envelope,
+                    "author": author,
+                    "key_epoch": key_epoch,
+                }));
+            }
+        }
+    }
+
+    Json(serde_json::json!({
+        "wallet": wallet,
+        "enc_key_count": enc_keys.len(),
+        "enc_keys": enc_keys,
+        "scope": scope_hex_resolved,
+        "channel_key_count": channel_keys.len(),
+        "channel_keys": channel_keys,
+        "dm_message_count": dm_messages.len(),
+        "dm_messages": dm_messages,
+    }))
 }
