@@ -5,6 +5,43 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.67.0] - 2026-06-12
+
+Real-time cross-node DM delivery — push gossip-received DMs to the recipient's
+WebSocket (fixes "web→desktop never arrives").
+
+### Fixed
+
+- **Cross-node DMs are now pushed to the recipient's live WebSocket.** The
+  notification engine's `process()` (the real-time WS hook, run on BOTH the
+  API-post and gossip-receive paths) had an **empty `DirectMessage` arm** — so a
+  DM received from another node via gossip was stored and indexed but **never
+  pushed to the connected client**. Channel messages broadcast fine, so the
+  symptom was DM-specific and asymmetric: a same-node DM appeared instantly
+  (local broadcast), but a cross-node DM only showed on a manual poll/reload —
+  and a recipient whose client doesn't poll (desktop) saw nothing at all
+  ("web→desktop never arrives"). The arm now pushes a `{"type":"dm","envelope":…}`
+  frame (the shape the SDK/web/desktop already handle) with the sender's device
+  key resolved to its wallet, on both paths.
+
+### Security
+
+- **DM WS frames are delivered ONLY to the two participants**, never broadcast to
+  all clients. The WS broadcast channel now carries a `WsAudience`
+  (`Everyone` for public-channel messages, `Wallets([sender, recipient])` for
+  DMs); each connection's forward loop drops frames whose audience excludes its
+  authenticated wallet, and the public/unauthenticated WS receives only
+  `Everyone` frames. This prevents leaking DM ciphertext + sender/recipient
+  metadata to every connected client. (`broadcast::Sender<String>` →
+  `Sender<Arc<WsOutbound>>`; `Arc` also makes N-receiver fan-out a refcount bump
+  instead of N string clones.)
+
+### Note
+
+- Node-only; clients already handle the `dm` WS event (sdk-js `WsEvent`,
+  web/desktop `DmConversationView`). 515 tests pass (incl. 3 new audience-filter
+  tests); clippy-clean.
+
 ## [0.66.0] - 2026-06-12
 
 GossipSub mesh fix — stop sabotaging the mesh with explicit peers (fixes

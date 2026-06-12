@@ -13,9 +13,10 @@ use tracing::{debug, warn};
 
 use crate::messages::envelope::Envelope;
 use crate::messages::types::{
-    ChatMessagePayload, DeletePayload, EditPayload, MessageType, NewsCommentPayload,
-    ReactionPayload,
+    ChatMessagePayload, DeletePayload, DirectMessagePayload, EditPayload, MessageType,
+    NewsCommentPayload, ReactionPayload,
 };
+use crate::api::state::{WsAudience, WsOutbound};
 use crate::storage::rocks::Storage;
 use crate::storage::schema::cf;
 
@@ -55,7 +56,7 @@ pub struct NotificationEngine {
     /// and the message processing pipeline.
     local_users: Arc<RwLock<HashSet<String>>>,
     /// Broadcast channel for WebSocket delivery.
-    ws_broadcast: broadcast::Sender<String>,
+    ws_broadcast: broadcast::Sender<Arc<WsOutbound>>,
     /// Push gateway base URL (if configured).
     push_gateway_url: Option<String>,
     /// Push gateway auth token.
@@ -68,7 +69,7 @@ pub struct NotificationEngine {
 
 impl NotificationEngine {
     pub fn new(
-        ws_broadcast: broadcast::Sender<String>,
+        ws_broadcast: broadcast::Sender<Arc<WsOutbound>>,
         push_gateway_url: Option<String>,
         push_gateway_token: Option<String>,
     ) -> Self {
@@ -180,8 +181,14 @@ impl NotificationEngine {
                 }
             }
             MessageType::DirectMessage => {
-                // DM notifications are handled by the DM subscription system
-                // The recipient's node gets the message via GossipSub topic
+                // Real-time delivery: push the DM to the sender's + recipient's
+                // connected clients. The recipient's node receives the DM via the
+                // GossipSub DM topic and lands here on the gossip-receive path; the
+                // sender's node lands here on the API-post path. Without this,
+                // cross-node DMs were stored but never pushed to the live WS (only
+                // surfaced on a poll/reload) — the "web→desktop never arrives"
+                // bug. Targeted to the two participants only (no all-client leak).
+                self.broadcast_direct_message(envelope);
             }
             _ => {}
         }
@@ -263,7 +270,65 @@ impl NotificationEngine {
         }
         let ws_msg = serde_json::json!({ "type": "message", "envelope": val });
         if let Ok(json) = serde_json::to_string(&ws_msg) {
-            let _ = self.ws_broadcast.send(json);
+            // Public-channel content → every connected client (the guard above
+            // already returned for private channels).
+            let _ = self.ws_broadcast.send(Arc::new(WsOutbound {
+                audience: WsAudience::Everyone,
+                json,
+            }));
+        }
+    }
+
+    /// Real-time WS delivery of a `DirectMessage` to its two participants only.
+    ///
+    /// Runs on BOTH the API-post and gossip-receive paths (see [`Self::process`]),
+    /// so a DM sent on one node appears live on the recipient's connected client
+    /// on ANY node — previously the `DirectMessage` arm was empty, so cross-node
+    /// DMs were stored but never pushed (they only showed on a poll/reload), and
+    /// a recipient whose client doesn't poll saw nothing at all.
+    ///
+    /// PRIVACY: a DM envelope (ciphertext + sender/recipient metadata) is
+    /// delivered ONLY to the sender's and recipient's wallets via a `Wallets`
+    /// audience — never broadcast to all clients like public-channel messages.
+    fn broadcast_direct_message(&self, envelope: &Envelope) {
+        let payload: DirectMessagePayload = match rmp_serde::from_slice(&envelope.payload) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        // Resolve the sender's device key → wallet so the client's
+        // `author === peerAddress` match (and its own-echo filter) works, exactly
+        // like the channel-message path.
+        let sender_wallet = self
+            .storage
+            .as_ref()
+            .and_then(|s| s.resolve_wallet(&envelope.author).ok().flatten())
+            .unwrap_or_else(|| envelope.author.clone());
+
+        let mut val = match serde_json::to_value(envelope) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        if let serde_json::Value::Object(ref mut map) = val {
+            // msg_id: byte array → hex (matches REST `envelope_to_json` + the
+            // channel path, so the client dedups against the polled copy).
+            if let Some(serde_json::Value::Array(bytes)) = map.get("msg_id") {
+                let hex: String = bytes
+                    .iter()
+                    .filter_map(|b| b.as_u64().map(|n| format!("{:02x}", n as u8)))
+                    .collect();
+                map.insert("msg_id".into(), serde_json::Value::String(hex));
+            }
+            map.insert(
+                "author".into(),
+                serde_json::Value::String(sender_wallet.clone()),
+            );
+        }
+        let ws_msg = serde_json::json!({ "type": "dm", "envelope": val });
+        if let Ok(json) = serde_json::to_string(&ws_msg) {
+            let _ = self.ws_broadcast.send(Arc::new(WsOutbound {
+                audience: WsAudience::Wallets(vec![sender_wallet, payload.recipient]),
+                json,
+            }));
         }
     }
 
@@ -383,7 +448,13 @@ impl NotificationEngine {
             "mention": broadcast_notification,
         });
         if let Ok(json) = serde_json::to_string(&ws_msg) {
-            let _ = self.ws_broadcast.send(json);
+            // Mention notifications keep the legacy all-clients fan-out (clients
+            // filter to the mentioned wallet; private-channel previews are
+            // redacted above). See the follow-up note re: per-recipient delivery.
+            let _ = self.ws_broadcast.send(Arc::new(WsOutbound {
+                audience: WsAudience::Everyone,
+                json,
+            }));
         }
 
         // Push gateway (if configured)

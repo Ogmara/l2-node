@@ -166,6 +166,39 @@ pub struct CachedMedia {
     pub last_modified: std::time::SystemTime,
 }
 
+/// Who may receive a `WsOutbound` broadcast frame. The WS broadcast channel
+/// fans out to ALL connected clients, so any participant-private payload (a DM)
+/// MUST carry a `Wallets` audience; the per-connection forward loop drops a
+/// frame whose audience doesn't include that connection's authenticated wallet.
+#[derive(Clone, Debug)]
+pub enum WsAudience {
+    /// Deliver to every connected client (e.g. public-channel messages).
+    Everyone,
+    /// Deliver only to connections authenticated as one of these wallets.
+    Wallets(Vec<String>),
+}
+
+impl WsAudience {
+    /// Whether a connection authenticated as `wallet` should receive this frame.
+    /// An unauthenticated (public) WS passes the empty string, so it only ever
+    /// receives `Everyone` frames — never a DM.
+    pub fn allows(&self, wallet: &str) -> bool {
+        match self {
+            WsAudience::Everyone => true,
+            WsAudience::Wallets(wallets) => wallets.iter().any(|w| w == wallet),
+        }
+    }
+}
+
+/// A single WS broadcast frame: the JSON payload plus its delivery audience.
+/// Wrapped in `Arc` on the channel so fan-out to N receivers is a cheap
+/// refcount bump rather than N string clones.
+#[derive(Clone, Debug)]
+pub struct WsOutbound {
+    pub audience: WsAudience,
+    pub json: String,
+}
+
 /// Shared state accessible to all API handlers.
 pub struct AppState {
     /// Persistent storage.
@@ -178,8 +211,10 @@ pub struct AppState {
     pub started_at: Instant,
     /// Connected peer count (shared with the network layer).
     peers: Arc<AtomicU32>,
-    /// Broadcast channel for forwarding messages to WebSocket clients.
-    pub ws_broadcast: broadcast::Sender<String>,
+    /// Broadcast channel for forwarding messages to WebSocket clients. Each
+    /// frame carries a [`WsAudience`] so participant-private payloads (DMs) are
+    /// delivered only to the relevant wallets' connections.
+    pub ws_broadcast: broadcast::Sender<Arc<WsOutbound>>,
     /// Klever network name ("testnet" or "mainnet"), derived from config.
     pub klever_network: String,
     /// Klever node RPC URL (e.g. https://node.testnet.klever.org). Used
@@ -498,7 +533,7 @@ impl AppState {
         identity: IdentityResolver,
         public_url: Option<String>,
         notification_engine: Option<Arc<NotificationEngine>>,
-        ws_broadcast: broadcast::Sender<String>,
+        ws_broadcast: broadcast::Sender<Arc<WsOutbound>>,
         anchor_trigger: Option<mpsc::Sender<oneshot::Sender<Result<String, String>>>>,
         peer_count: Arc<AtomicU32>,
         gossip_tx: tokio::sync::mpsc::UnboundedSender<crate::network::GossipPublish>,
@@ -635,5 +670,41 @@ impl AppState {
 
     pub fn set_peer_count(&self, count: u32) {
         self.peers.store(count, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod ws_audience_tests {
+    use super::{WsAudience, WsOutbound};
+
+    #[test]
+    fn everyone_reaches_all_including_unauthenticated() {
+        let a = WsAudience::Everyone;
+        assert!(a.allows("klv1alice"));
+        assert!(a.allows("klv1bob"));
+        // Public (unauthenticated) WS passes the empty string.
+        assert!(a.allows(""));
+    }
+
+    #[test]
+    fn wallets_reach_only_listed_participants() {
+        let a = WsAudience::Wallets(vec!["klv1alice".into(), "klv1bob".into()]);
+        assert!(a.allows("klv1alice"));
+        assert!(a.allows("klv1bob"));
+        // A third party MUST NOT receive a participant-private DM.
+        assert!(!a.allows("klv1carol"));
+        // The public WS (empty string) MUST NOT receive a DM.
+        assert!(!a.allows(""));
+    }
+
+    #[test]
+    fn outbound_carries_audience_and_json() {
+        let out = WsOutbound {
+            audience: WsAudience::Wallets(vec!["klv1alice".into()]),
+            json: r#"{"type":"dm"}"#.into(),
+        };
+        assert!(out.audience.allows("klv1alice"));
+        assert!(!out.audience.allows("klv1eve"));
+        assert_eq!(out.json, r#"{"type":"dm"}"#);
     }
 }

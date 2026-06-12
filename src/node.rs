@@ -247,7 +247,8 @@ impl Node {
         }
 
         // Create shared broadcast channel (used by WS layer, notification engine, etc.)
-        let (ws_broadcast, _) = tokio::sync::broadcast::channel::<String>(1024);
+        let (ws_broadcast, _) =
+            tokio::sync::broadcast::channel::<Arc<crate::api::state::WsOutbound>>(1024);
 
         // Initialize notification engine before the network service so gossip
         // messages can be fed to it immediately.
