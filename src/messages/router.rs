@@ -451,7 +451,16 @@ impl MessageRouter {
             &signature,
         );
 
-        klever_result.map_err(|_| anyhow::anyhow!("signature verification failed for both formats"))
+        klever_result.map_err(|_| {
+            anyhow::anyhow!(
+                "signature verification failed for both formats (author={}, msg_type={:?}, ts={}, payload_len={}, sig_len={})",
+                envelope.author,
+                envelope.msg_type,
+                envelope.timestamp,
+                envelope.payload.len(),
+                envelope.signature.len(),
+            )
+        })
     }
 
     /// Dual-signature verification for a `DeviceDelegation` envelope (P-0).
