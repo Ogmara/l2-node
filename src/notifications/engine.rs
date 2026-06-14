@@ -196,7 +196,83 @@ impl NotificationEngine {
                 // without this only show on the recipient's next poll/reload).
                 self.broadcast_dm_update(envelope);
             }
+            MessageType::ChannelJoin | MessageType::ChannelLeave => {
+                #[derive(serde::Deserialize)]
+                struct E {
+                    channel_id: u64,
+                }
+                if let Ok(p) = rmp_serde::from_slice::<E>(&envelope.payload) {
+                    let member = self.resolve_member_wallet(&envelope.author);
+                    let action = if envelope.msg_type == MessageType::ChannelJoin {
+                        "join"
+                    } else {
+                        "leave"
+                    };
+                    self.broadcast_channel_membership_change(p.channel_id, action, &member);
+                }
+            }
+            MessageType::ChannelKick | MessageType::ChannelBan => {
+                #[derive(serde::Deserialize)]
+                struct E {
+                    channel_id: u64,
+                    target_user: String,
+                }
+                if let Ok(p) = rmp_serde::from_slice::<E>(&envelope.payload) {
+                    let action = if envelope.msg_type == MessageType::ChannelKick {
+                        "kick"
+                    } else {
+                        "ban"
+                    };
+                    self.broadcast_channel_membership_change(p.channel_id, action, &p.target_user);
+                }
+            }
             _ => {}
+        }
+    }
+
+    /// Resolve a device key → wallet (fallback to the address itself).
+    fn resolve_member_wallet(&self, author: &str) -> String {
+        self.storage
+            .as_ref()
+            .and_then(|s| s.resolve_wallet(author).ok().flatten())
+            .unwrap_or_else(|| author.to_string())
+    }
+
+    /// Notify a PRIVATE channel's members that membership changed, so their clients
+    /// react live: on `join` an existing member's client wraps the channel epoch key
+    /// to the new member (reliable key delivery — no longer depends on a member
+    /// actively viewing the channel); on `kick`/`ban`/`leave` clients drop the member
+    /// (and the removed member learns it lost access). Members-only `Wallets` audience.
+    /// Runs on BOTH the API-post and gossip-receive paths, so it reaches members on
+    /// every node. Skipped for public channels (no encryption → no cover needed).
+    fn broadcast_channel_membership_change(&self, channel_id: u64, action: &str, member: &str) {
+        // Only private channels need this (key cover + removal). Gate on
+        // KNOWN-private (not "not known public") so a public channel learned via
+        // gossip before its CHANNELS metadata arrives doesn't get a spurious
+        // member-targeted push.
+        if !self.channel_is_known_private(channel_id) {
+            return;
+        }
+        let mut audience = self.channel_member_addresses(channel_id);
+        // On removal the member is already out of CHANNEL_MEMBERS — include them so
+        // their own client learns it was removed.
+        if matches!(action, "kick" | "ban" | "leave") && !audience.iter().any(|a| a == member) {
+            audience.push(member.to_string());
+        }
+        if audience.is_empty() {
+            return;
+        }
+        let ws_msg = serde_json::json!({
+            "type": "channel_members_changed",
+            "channel_id": channel_id,
+            "action": action,
+            "member": member,
+        });
+        if let Ok(json) = serde_json::to_string(&ws_msg) {
+            let _ = self.ws_broadcast.send(Arc::new(WsOutbound {
+                audience: WsAudience::Wallets(audience),
+                json,
+            }));
         }
     }
 
@@ -230,6 +306,29 @@ impl NotificationEngine {
                 _ => None,
             })
             .map(|ct| ct == 0 || ct == 1)
+            .unwrap_or(false)
+    }
+
+    /// True only when the channel's stored metadata is present, parseable, and
+    /// explicitly PRIVATE (2). Unlike `!channel_is_public`, a missing/unparseable
+    /// record returns `false` here — so membership-change pushes fire only for
+    /// channels we KNOW are private, never for not-yet-synced metadata.
+    fn channel_is_known_private(&self, channel_id: u64) -> bool {
+        self.storage
+            .as_ref()
+            .and_then(|s| s.get_cf(cf::CHANNELS, &channel_id.to_be_bytes()).ok().flatten())
+            .and_then(|data| serde_json::from_slice::<serde_json::Value>(&data).ok())
+            .and_then(|meta| match meta.get("channel_type") {
+                Some(serde_json::Value::Number(n)) => n.as_u64(),
+                Some(serde_json::Value::String(s)) => match s.as_str() {
+                    "Private" => Some(2),
+                    "Public" => Some(0),
+                    "ReadPublic" => Some(1),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .map(|ct| ct == 2)
             .unwrap_or(false)
     }
 
