@@ -5,6 +5,33 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.74.0] - 2026-06-14
+
+Private-channel **federation** — F1 node foundation (mirrors the DM federation
+stack). Lets a member's HOME node replicate a private channel hosted elsewhere so
+they get its encrypted messages + keys live without switching nodes.
+
+### Added
+
+- **`POST /api/v1/channels/{id}/federate`** (authenticated). The member's home node
+  fetches the channel record from the host (`host_url` from the invite link), stores
+  a local `CHANNELS` record + the caller's `CHANNEL_MEMBERS` entry, and subscribes to
+  the channel's gossip topic — reusing the chain-scanner subscribe path. The channel's
+  encrypted messages + `ChannelKeyEnvelope`s already gossip to `channel_topic(id)`, so
+  once subscribed they flow here live (stored in `CHANNEL_MSGS` / `CHANNEL_KEYS`, served
+  to the local member, and pushed via the member-targeted WS, 0.73.0). The node learns
+  only ciphertext + membership/timing, never content. Idempotent.
+- **`channel_subscribe_tx`** threaded through `AppState` (a clone of the chain
+  scanner's channel-subscribe channel) so the endpoint can subscribe at runtime.
+  Startup re-subscription is already covered by the existing all-`CHANNELS` subscribe.
+
+### Security / residuals (tracked for F3)
+
+- SSRF guard on `host_url` is https-only + blocks obvious internal IPs; full
+  DNS-resolution / allowlist hardening is deferred. A caller can only add THEMSELVES
+  as a member (from the authenticated wallet), and federation yields ciphertext only.
+- No per-wallet federation cap yet (global rate limit applies); add in F3.
+
 ## [0.73.0] - 2026-06-14
 
 ### Fixed
