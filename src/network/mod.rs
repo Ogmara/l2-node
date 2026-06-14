@@ -373,7 +373,10 @@ fn envelope_targets_channel(env_bytes: &[u8], expected_channel: u64) -> bool {
         // bind them to the reconciled channel too (a relay can't smuggle a
         // ChannelCreate/Update for a different channel).
         | MessageType::ChannelCreate
-        | MessageType::ChannelUpdate => {
+        | MessageType::ChannelUpdate
+        // ChannelDelete also rides the metadata-reconcile page; bind it to the
+        // reconciled channel so a relay can't smuggle a delete for another channel.
+        | MessageType::ChannelDelete => {
             let payload: serde_json::Value =
                 match rmp_serde::from_slice(&envelope.payload) {
                     Ok(v) => v,

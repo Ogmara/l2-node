@@ -5,6 +5,52 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.76.0] - 2026-06-14
+
+### Added
+
+- **`ChannelDelete` (0x1C) — signed, gossiped channel deletion.** Channels are
+  on-chain (each node's chain scanner discovers them from the `ChannelCreated` SC
+  event), but deletion was previously a LOCAL-only REST endpoint: it wrote a
+  `DELETED_CHANNELS` tombstone on one node, so a channel deleted on node A
+  **resurrected on node B** when B's scanner re-processed the event (B had no
+  tombstone). The new creator-signed `ChannelDelete` message is gossiped to the
+  channel topic AND indexed for metadata-reconcile, so the tombstone propagates to
+  every node that discovered the channel. Creator-only authorization is enforced on
+  every ingest path (API submit, gossip, reconcile) before the tombstone is applied.
+  A shared `Storage::tombstone_channel` helper backs both the new message handler
+  and the (retained, local-only) `DELETE /api/v1/channels/:id` endpoint.
+
+### Fixed
+
+- **Tombstone-bypass resurrection (security, found in audit).** A verified wallet
+  could re-gossip a `ChannelCreate` for a deleted `channel_id` (fully
+  attacker-controlled) and resurrect the channel network-wide with themselves as
+  creator — the L2 `ChannelCreate` apply path didn't consult the deletion tombstone
+  (only the chain scanner did). The apply path now refuses to (re)create a
+  tombstoned channel.
+- **`TOTAL_CHANNELS` over-decrement.** `tombstone_channel` decremented the channel
+  counter on every call; re-deleting an already-tombstoned channel (e.g. legacy REST
+  delete + signed delete) double-counted. It now decrements only on the first
+  deletion.
+- **Reconcile per-channel binding** now covers `ChannelDelete`, so a relay answering
+  a metadata reconcile for one channel can't ride along a delete for another.
+
+### Security
+
+- `cargo audit`: 2 NEW advisories appeared against `hickory-proto 0.25.2` — a
+  TRANSITIVE dep pulled in by `libp2p 0.56.0` (libp2p-dns + libp2p-mdns), NOT
+  introduced by this change and unrelated to it: RUSTSEC-2026-0118 (NSEC3
+  cross-zone unbounded loop — **no upstream fix available**) and RUSTSEC-2026-0119
+  (O(n²) name-compression CPU exhaustion — fixed in hickory-proto ≥0.26.1).
+  **DEFERRED:** the fix is blocked by libp2p 0.56.0 pinning `hickory-proto ^0.25.2`
+  (verified: `cargo update --precise 0.26.1` is rejected by libp2p-mdns 0.48.0), so
+  it requires a future libp2p release that adopts hickory 0.26 — flagged for a
+  dedicated dependency-remediation pass once that ships. These affect the libp2p DNS
+  resolver / mDNS peer-discovery path (a malicious DNS response could drive the DoS).
+  Pre-existing advisories carried forward (`paste` unmaintained, `rand` 0.8.5
+  unsound-only-as-logger, `core2` yanked) are unchanged. JS clients (`npm audit`): 0.
+
 ## [0.75.0] - 2026-06-14
 
 ### Added

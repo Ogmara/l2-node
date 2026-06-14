@@ -36,6 +36,7 @@ pub enum MessageType {
     ChannelPinMessage = 0x19,
     ChannelUnpinMessage = 0x1A,
     ChannelInvite = 0x1B,
+    ChannelDelete = 0x1C,
 
     // News / Posts
     NewsPost = 0x20,
@@ -104,6 +105,7 @@ impl MessageType {
             0x19 => Some(Self::ChannelPinMessage),
             0x1A => Some(Self::ChannelUnpinMessage),
             0x1B => Some(Self::ChannelInvite),
+            0x1C => Some(Self::ChannelDelete),
             0x20 => Some(Self::NewsPost),
             0x21 => Some(Self::NewsEdit),
             0x22 => Some(Self::NewsDelete),
@@ -181,6 +183,7 @@ impl MessageType {
             | Self::ChannelPinMessage
             | Self::ChannelUnpinMessage
             | Self::ChannelInvite
+            | Self::ChannelDelete
             // Moderation — spec 07 §2.2 requires registration for reports
             | Self::Report
             | Self::CounterVote
@@ -486,6 +489,14 @@ pub struct ChannelInvitePayload {
     /// Tells the invited user's home node where this private channel is hosted.
     #[serde(default)]
     pub anchor_node: Option<String>,
+}
+
+/// Delete a channel (creator only). Signed + gossiped so every node that
+/// discovered the channel (via chain scan or snapshot) tombstones it, rather
+/// than the deletion staying local to the node that served the request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelDeletePayload {
+    pub channel_id: u64,
 }
 
 // --- News Engagement Payloads ---
@@ -946,6 +957,7 @@ pub fn deserialize_payload(
         MessageType::ChannelPinMessage => Ok(DeserializedPayload::ChannelPinMessage(rmp_serde::from_slice(payload_bytes)?)),
         MessageType::ChannelUnpinMessage => Ok(DeserializedPayload::ChannelUnpinMessage(rmp_serde::from_slice(payload_bytes)?)),
         MessageType::ChannelInvite => Ok(DeserializedPayload::ChannelInvite(rmp_serde::from_slice(payload_bytes)?)),
+        MessageType::ChannelDelete => Ok(DeserializedPayload::ChannelDelete(rmp_serde::from_slice(payload_bytes)?)),
         MessageType::NewsRepost => Ok(DeserializedPayload::NewsRepost(rmp_serde::from_slice(payload_bytes)?)),
         MessageType::NewsPost => Ok(DeserializedPayload::NewsPost(rmp_serde::from_slice(payload_bytes)?)),
         MessageType::NewsComment => Ok(DeserializedPayload::NewsComment(rmp_serde::from_slice(payload_bytes)?)),
@@ -990,6 +1002,7 @@ pub enum DeserializedPayload {
     ChannelPinMessage(ChannelPinMessagePayload),
     ChannelUnpinMessage(ChannelUnpinMessagePayload),
     ChannelInvite(ChannelInvitePayload),
+    ChannelDelete(ChannelDeletePayload),
     Edit(EditPayload),
     Delete(DeletePayload),
     Reaction(ReactionPayload),

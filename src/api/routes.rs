@@ -13,7 +13,6 @@ use axum::Json;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
-use rocksdb::WriteBatch;
 
 use crate::storage::schema::{cf, decode_users_by_name_key, encode_channel_msg_key, encode_dm_msg_key, state_keys};
 
@@ -1403,6 +1402,11 @@ fn gossip_topic_for_envelope(
         // node (federation) — not just the host. authorize_channel_action gates
         // them to mods on every ingest path, so a relayed kick/ban can't be forged.
         | MessageType::ChannelKick | MessageType::ChannelBan
+        // ChannelDelete MUST gossip so the deletion (tombstone) reaches every node
+        // that discovered the channel via chain scan/snapshot — otherwise the
+        // channel resurrects on nodes that never saw the delete. Creator-only,
+        // re-checked by authorize_channel_action on every ingest path.
+        | MessageType::ChannelDelete
         // ChannelUpdate carries channel metadata (display_name, description,
         // logo_cid, banner_cid, …). It was previously NOT gossiped, so a
         // channel's logo/metadata only ever existed on the node where it was
@@ -2379,62 +2383,22 @@ pub async fn delete_channel(
         }
     }
 
-    // Atomically write tombstone + delete channel metadata
+    // Atomically tombstone + delete channel metadata + clean up membership/admin
+    // state. NOTE: this REST path is LOCAL-ONLY — it does not propagate the deletion
+    // to other nodes. Clients should send a signed `ChannelDelete` message
+    // (gossiped + reconcile-indexed) so the deletion reaches every node that
+    // discovered the channel; this endpoint is kept for backward compatibility.
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
 
-    let mut batch = WriteBatch::default();
-    match (
-        state.storage.cf_handle(cf::DELETED_CHANNELS),
-        state.storage.cf_handle(cf::CHANNELS),
-    ) {
-        (Ok(tombstone_cf), Ok(channels_cf)) => {
-            batch.put_cf(&tombstone_cf, &channel_key, &now.to_be_bytes());
-            batch.delete_cf(&channels_cf, &channel_key);
-            if let Err(e) = state.storage.write_batch(batch) {
-                tracing::error!(channel_id, error = %e, "Failed to write channel deletion batch");
-                return (StatusCode::INTERNAL_SERVER_ERROR, "deletion failed").into_response();
-            }
-        }
-        _ => {
-            tracing::error!(channel_id, "Missing column families for channel deletion");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
-        }
+    if let Err(e) = state.storage.tombstone_channel(channel_id, now) {
+        tracing::error!(channel_id, error = %e, "Failed to tombstone channel");
+        return (StatusCode::INTERNAL_SERVER_ERROR, "deletion failed").into_response();
     }
 
-    // Bulk cleanup — tombstone already prevents resurrection, so partial failure is safe
-    let cleanup_cfs: &[(&str, usize)] = &[
-        (cf::CHANNEL_MEMBERS, 10_000),
-        (cf::CHANNEL_MODERATORS, 10_000),
-        (cf::CHANNEL_BANS, 10_000),
-        (cf::CHANNEL_PINS, 100),
-        (cf::CHANNEL_INVITES, 10_000),
-    ];
-    for &(cf_name, limit) in cleanup_cfs {
-        match state.storage.prefix_iter_cf(cf_name, &channel_key, limit) {
-            Ok(entries) => {
-                for (key, _) in &entries {
-                    if let Err(e) = state.storage.delete_cf(cf_name, key) {
-                        tracing::warn!(channel_id, cf = cf_name, error = %e, "Failed to delete entry during channel cleanup");
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!(channel_id, cf = cf_name, error = %e, "Failed to iterate during channel cleanup");
-            }
-        }
-    }
-
-    // Decrement total channels counter
-    if let Err(e) = state.storage.decrement_stat(
-        crate::storage::schema::state_keys::TOTAL_CHANNELS,
-    ) {
-        tracing::warn!(channel_id, error = %e, "Failed to decrement TOTAL_CHANNELS");
-    }
-
-    tracing::info!(channel_id, creator = %auth_user.address, "Channel deleted");
+    tracing::info!(channel_id, creator = %auth_user.address, "Channel deleted (local REST path)");
     Json(OkResponse { ok: true }).into_response()
 }
 

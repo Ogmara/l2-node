@@ -198,6 +198,68 @@ impl Storage {
             .context("executing write batch")
     }
 
+    /// Tombstone + remove a channel and its membership/admin state.
+    ///
+    /// Atomically writes a `DELETED_CHANNELS` tombstone (`deleted_at` big-endian
+    /// seconds) and drops the `CHANNELS` record, then best-effort clears the
+    /// channel's members/moderators/bans/pins/invites. The tombstone is what the
+    /// chain scanner consults to avoid resurrecting an intentionally-deleted
+    /// channel on re-scan, so it MUST land even if the bulk cleanup partially
+    /// fails. Idempotent: re-deleting an already-tombstoned channel is a no-op
+    /// write. Shared by the REST `delete_channel` endpoint and the signed,
+    /// gossiped `ChannelDelete` message handler so both paths behave identically.
+    pub fn tombstone_channel(&self, channel_id: u64, deleted_at: u64) -> Result<()> {
+        let channel_key = channel_id.to_be_bytes();
+
+        // Idempotency: a channel already tombstoned must not decrement
+        // TOTAL_CHANNELS again (e.g. the legacy REST delete + the signed gossip
+        // delete, or a re-delivered ChannelDelete with a fresh msg_id). Only the
+        // first deletion adjusts the counter.
+        let already_deleted = self.exists_cf(cf::DELETED_CHANNELS, &channel_key)?;
+
+        let mut batch = WriteBatch::default();
+        let tombstone_cf = self.cf_handle(cf::DELETED_CHANNELS)?;
+        let channels_cf = self.cf_handle(cf::CHANNELS)?;
+        batch.put_cf(&tombstone_cf, channel_key, deleted_at.to_be_bytes());
+        batch.delete_cf(&channels_cf, channel_key);
+        self.write_batch(batch)
+            .context("writing channel deletion batch")?;
+
+        if already_deleted {
+            // Tombstone refreshed, nothing else to clean up or count.
+            return Ok(());
+        }
+
+        // Bulk cleanup — the tombstone already prevents resurrection, so a partial
+        // failure here is safe (the leftover rows are unreachable once CHANNELS is gone).
+        let cleanup_cfs: &[(&str, usize)] = &[
+            (cf::CHANNEL_MEMBERS, 10_000),
+            (cf::CHANNEL_MODERATORS, 10_000),
+            (cf::CHANNEL_BANS, 10_000),
+            (cf::CHANNEL_PINS, 100),
+            (cf::CHANNEL_INVITES, 10_000),
+        ];
+        for &(cf_name, limit) in cleanup_cfs {
+            match self.prefix_iter_cf(cf_name, &channel_key, limit) {
+                Ok(entries) => {
+                    for (key, _) in &entries {
+                        if let Err(e) = self.delete_cf(cf_name, key) {
+                            tracing::warn!(channel_id, cf = cf_name, error = %e, "channel cleanup: delete failed");
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(channel_id, cf = cf_name, error = %e, "channel cleanup: iterate failed");
+                }
+            }
+        }
+
+        if let Err(e) = self.decrement_stat(crate::storage::schema::state_keys::TOTAL_CHANNELS) {
+            tracing::warn!(channel_id, error = %e, "Failed to decrement TOTAL_CHANNELS");
+        }
+        Ok(())
+    }
+
     /// Get a column family handle for use in WriteBatch operations.
     pub fn cf_handle(&self, cf_name: &str) -> Result<Arc<BoundColumnFamily<'_>>> {
         self.db

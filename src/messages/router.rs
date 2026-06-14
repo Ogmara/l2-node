@@ -80,7 +80,8 @@ impl RateCategory {
             | MessageType::NewsReaction => Self::Reaction,
             MessageType::NewsRepost => Self::Repost,
             MessageType::ChannelKick | MessageType::ChannelBan
-            | MessageType::ChannelUnban | MessageType::ChannelMute => Self::ChannelAdmin,
+            | MessageType::ChannelUnban | MessageType::ChannelMute
+            | MessageType::ChannelDelete => Self::ChannelAdmin,
             MessageType::ChannelAddModerator | MessageType::ChannelRemoveModerator
             | MessageType::PrivateChannelKeyDistribution => Self::ModeratorChange,
             MessageType::ChannelInvite => Self::ChannelInvite,
@@ -993,6 +994,16 @@ impl MessageRouter {
                 }
                 Ok(())
             }
+            // Creator-only: deleting the channel
+            MessageType::ChannelDelete => {
+                let channel_id = self
+                    .extract_channel_id(envelope)
+                    .ok_or("missing or invalid channel_id")?;
+                if !self.is_channel_creator(channel_id, resolved_author)? {
+                    return Err("only the channel creator can delete the channel".into());
+                }
+                Ok(())
+            }
             // Creator + mods with can_kick
             MessageType::ChannelKick => {
                 let channel_id = self
@@ -1320,6 +1331,10 @@ impl MessageRouter {
                 rmp_serde::from_slice::<ChannelInvitePayload>(&envelope.payload)
                     .ok().map(|p| p.channel_id)
             }
+            MessageType::ChannelDelete => {
+                rmp_serde::from_slice::<ChannelDeletePayload>(&envelope.payload)
+                    .ok().map(|p| p.channel_id)
+            }
             MessageType::ChannelUpdate => {
                 rmp_serde::from_slice::<ChannelUpdatePayload>(&envelope.payload)
                     .ok().map(|p| p.channel_id)
@@ -1490,6 +1505,10 @@ impl MessageRouter {
                 | MessageType::ChannelUpdate
                 | MessageType::ChannelJoin
                 | MessageType::ChannelLeave
+                // Index the deletion too: a node that chain-discovers this channel
+                // later reconciles its metadata envelopes and will pull the
+                // ChannelDelete → apply the tombstone → not resurrect it.
+                | MessageType::ChannelDelete
         ) {
             if let Ok(p) = rmp_serde::from_slice::<serde_json::Value>(&envelope.payload) {
                 if let Some(cid) = p.get("channel_id").and_then(|v| v.as_u64()) {
@@ -1638,6 +1657,20 @@ impl MessageRouter {
                     rmp_serde::from_slice::<ChannelCreatePayload>(&envelope.payload)
                 {
                     let key = payload.channel_id.to_be_bytes();
+                    // Tombstone guard: never (re)create a channel that was deleted.
+                    // `ChannelDelete` removes the CHANNELS row, so a resurrection
+                    // attempt would otherwise hit the new-record branch below and
+                    // re-create the channel network-wide with the attacker as
+                    // creator. The chain scanner makes the same check (scanner.rs);
+                    // this closes the L2-envelope path. channel_id is fully
+                    // attacker-controlled here, so this MUST gate creation.
+                    if self.storage.exists_cf(schema::cf::DELETED_CHANNELS, &key).unwrap_or(false) {
+                        debug!(
+                            channel_id = payload.channel_id,
+                            "ChannelCreate for tombstoned channel — ignoring (deleted)"
+                        );
+                        return Ok(());
+                    }
                     if let Ok(Some(existing)) = self.storage.get_cf(schema::cf::CHANNELS, &key) {
                         // Channel already exists — typically the chain scanner's
                         // skeleton (slug/creator, no L2 fields) for a public
@@ -1730,6 +1763,16 @@ impl MessageRouter {
                     rmp_serde::from_slice::<ChannelLeavePayload>(&envelope.payload)
                 {
                     self.remove_channel_member(payload.channel_id, resolved_author)?;
+                }
+            }
+            MessageType::ChannelDelete => {
+                if let Ok(payload) =
+                    rmp_serde::from_slice::<ChannelDeletePayload>(&envelope.payload)
+                {
+                    // Authorization (creator-only) already enforced in
+                    // authorize_channel_action on every ingest path (API + gossip +
+                    // sync), so applying the tombstone here is safe. Idempotent.
+                    self.storage.tombstone_channel(payload.channel_id, envelope.timestamp)?;
                 }
             }
             MessageType::NewsComment => {
