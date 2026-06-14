@@ -5,6 +5,28 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.71.0] - 2026-06-14
+
+Cross-node delivery for DM **edits and deletes** — they were stored locally but
+never reached the recipient. (Follow-up to 0.70.0's encrypted DM edits.)
+
+### Fixed
+
+- **DM edits/deletes are now gossiped to the recipient's DM topic.** The gossip
+  topic router had no `DirectMessageEdit`/`DirectMessageDelete` arm, so they fell
+  through to "no topic" and were never propagated cross-node — an edit/delete only
+  ever showed on the sender's own node. They now route to `dm_topic(recipient)`,
+  exactly like DM content. (The client sends `recipient` in the edit payload.)
+
+### Added
+
+- **Live WS delivery of DM edits/deletes.** New `broadcast_dm_update` pushes a
+  `{type:"dm", …, target_msg_id}` event to the two participants' wallets (never a
+  global broadcast) on both the API-post and gossip-receive paths, so an edit
+  applied on one node updates the recipient's open conversation live instead of on
+  the next poll. Mirrors `broadcast_direct_message`; the client refetches the
+  authoritative projected conversation on `target_msg_id`.
+
 ## [0.70.0] - 2026-06-14
 
 Node-side enforcement of **one active `enc_pub` per `(wallet, device_id)`** at

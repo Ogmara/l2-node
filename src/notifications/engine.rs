@@ -190,6 +190,12 @@ impl NotificationEngine {
                 // bug. Targeted to the two participants only (no all-client leak).
                 self.broadcast_direct_message(envelope);
             }
+            MessageType::DirectMessageEdit | MessageType::DirectMessageDelete => {
+                // Real-time delivery of DM edits/deletes to both participants so
+                // they appear live (they also propagate via gossip + storage, but
+                // without this only show on the recipient's next poll/reload).
+                self.broadcast_dm_update(envelope);
+            }
             _ => {}
         }
     }
@@ -327,6 +333,57 @@ impl NotificationEngine {
         if let Ok(json) = serde_json::to_string(&ws_msg) {
             let _ = self.ws_broadcast.send(Arc::new(WsOutbound {
                 audience: WsAudience::Wallets(vec![sender_wallet, payload.recipient]),
+                json,
+            }));
+        }
+    }
+
+    /// Real-time WS delivery of a DM **edit/delete** to its two participants.
+    ///
+    /// Mirrors [`Self::broadcast_direct_message`] but surfaces `target_msg_id`
+    /// (hex of the edited/deleted message) top-level so the client can refetch the
+    /// authoritative, projected conversation instead of appending a phantom
+    /// message. Runs on BOTH the API-post and gossip-receive paths, so an edit
+    /// applied on one node reaches the recipient's connected client on any node.
+    /// Targeted to the two wallets only — never a global broadcast.
+    fn broadcast_dm_update(&self, envelope: &Envelope) {
+        #[derive(serde::Deserialize)]
+        struct DmUpdateExtract {
+            recipient: String,
+            target_id: [u8; 32],
+        }
+        let p: DmUpdateExtract = match rmp_serde::from_slice(&envelope.payload) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let sender_wallet = self
+            .storage
+            .as_ref()
+            .and_then(|s| s.resolve_wallet(&envelope.author).ok().flatten())
+            .unwrap_or_else(|| envelope.author.clone());
+        let mut val = match serde_json::to_value(envelope) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        if let serde_json::Value::Object(ref mut map) = val {
+            if let Some(serde_json::Value::Array(bytes)) = map.get("msg_id") {
+                let hex: String = bytes
+                    .iter()
+                    .filter_map(|b| b.as_u64().map(|n| format!("{:02x}", n as u8)))
+                    .collect();
+                map.insert("msg_id".into(), serde_json::Value::String(hex));
+            }
+            map.insert("author".into(), serde_json::Value::String(sender_wallet.clone()));
+            // Which message changed — the client keys its refetch/update on this.
+            map.insert(
+                "target_msg_id".into(),
+                serde_json::json!(hex::encode(p.target_id)),
+            );
+        }
+        let ws_msg = serde_json::json!({ "type": "dm", "envelope": val });
+        if let Ok(json) = serde_json::to_string(&ws_msg) {
+            let _ = self.ws_broadcast.send(Arc::new(WsOutbound {
+                audience: WsAudience::Wallets(vec![sender_wallet, p.recipient]),
                 json,
             }));
         }
