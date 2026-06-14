@@ -5,6 +5,41 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.77.0] - 2026-06-14
+
+### Added
+
+- **P2d private-channel key rotation — `key_epoch_floor`.** When a member is removed
+  from a private channel (`ChannelLeave`/`ChannelKick`/`ChannelBan`), the node now raises
+  an authoritative `key_epoch_floor` on the channel to `max(floor, current_max_epoch + 1)`
+  — above every epoch the removed member held. The node has no key custody (E2E), so
+  rotation itself is client-driven; the floor tells clients to re-key (wrapping a fresh
+  key to remaining members only) and to refuse sending under a below-floor (compromised)
+  epoch. The floor is exposed in `GET /channels/:id` (member view) and in the
+  `channel_members_changed` WS event. Bumped on every ingest path (API/gossip/reconcile),
+  monotonic, so it converges across nodes. Public/ReadPublic channels are unaffected.
+- `Storage::max_channel_key_epoch(scope)` — highest stored channel-key epoch for a scope.
+
+### Security
+
+- **Brick-resistance for the rotation mechanism (found in P2d audit, both fixed before
+  ship):** (1) a `ChannelKeyEnvelope` may now be published at most `CHANNEL_KEY_EPOCH_MAX_JUMP`
+  (256) epochs ahead of the scope's current max — previously a member could publish at a
+  near-`u64::MAX` epoch, saturating the floor (and exceeding JS safe-integer range) so the
+  channel became permanently unsendable. (2) When a key scope hits its 4096-envelope cap,
+  the store now **evicts the lowest-epoch** envelope to admit a higher one instead of
+  rejecting — so a flood of fabricated-device envelopes can no longer starve a legitimate
+  rotation (which always carries the highest epoch). Both close a single-member permanent
+  denial-of-service on a private channel.
+- Accepted residuals (documented, bounded, do NOT breach the hard boundary — the node
+  refuses to distribute a new-epoch key to a removed member on any path): intra-node floor
+  read-modify-write race on concurrent removals (self-corrects on next removal/key arrival);
+  a federated node whose `channel_keys` lag may briefly publish a lower floor (sender uses a
+  slightly-old epoch until propagation); the floor is advisory to senders (node does not
+  reject below-floor message ingest, to avoid cross-node-lag message loss).
+- `cargo audit`: unchanged — the 2 deferred transitive `hickory-proto 0.25.2` advisories
+  (via libp2p 0.56.0) remain; no dependency was added/changed. JS clients (`npm audit`): 0.
+
 ## [0.76.0] - 2026-06-14
 
 ### Added

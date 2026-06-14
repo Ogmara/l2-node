@@ -262,11 +262,16 @@ impl NotificationEngine {
         if audience.is_empty() {
             return;
         }
+        // Current key-epoch floor (P2d): bumped in update_indexes BEFORE this runs, so
+        // it reflects the removal. Clients use it to re-key (mods) / refuse sending
+        // under a below-floor epoch (all members) without an extra channel fetch.
+        let key_epoch_floor = self.channel_key_epoch_floor(channel_id);
         let ws_msg = serde_json::json!({
             "type": "channel_members_changed",
             "channel_id": channel_id,
             "action": action,
             "member": member,
+            "key_epoch_floor": key_epoch_floor,
         });
         if let Ok(json) = serde_json::to_string(&ws_msg) {
             let _ = self.ws_broadcast.send(Arc::new(WsOutbound {
@@ -330,6 +335,16 @@ impl NotificationEngine {
             })
             .map(|ct| ct == 2)
             .unwrap_or(false)
+    }
+
+    /// Current key-epoch floor for a channel (0 if unset / metadata absent).
+    fn channel_key_epoch_floor(&self, channel_id: u64) -> u64 {
+        self.storage
+            .as_ref()
+            .and_then(|s| s.get_cf(cf::CHANNELS, &channel_id.to_be_bytes()).ok().flatten())
+            .and_then(|data| serde_json::from_slice::<serde_json::Value>(&data).ok())
+            .and_then(|meta| meta.get("key_epoch_floor").and_then(|v| v.as_u64()))
+            .unwrap_or(0)
     }
 
     /// Member wallet addresses of a channel (from `CHANNEL_MEMBERS`). Bounded scan.

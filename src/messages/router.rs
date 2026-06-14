@@ -101,6 +101,15 @@ const MAX_ENC_KEYS_PER_WALLET: usize = 10;
 /// history epochs for a DM or channel.
 const MAX_CHANNEL_KEY_ENVELOPES_PER_SCOPE: usize = 4096;
 
+/// Max epochs a `ChannelKeyEnvelope` may sit AHEAD of a scope's current highest
+/// epoch (P2d hardening). Rotation only ever needs `current_max + 1`; this headroom
+/// covers concurrent rotators and cross-node lag. Without a ceiling, a member could
+/// publish a key at a near-`u64::MAX` epoch, saturating the rotation floor (and
+/// blowing past JS's safe-integer range) so the channel becomes permanently
+/// unsendable. Generous enough that legitimate lag never trips it (an epoch jump
+/// this large would require hundreds of un-propagated removals).
+const CHANNEL_KEY_EPOCH_MAX_JUMP: u64 = 256;
+
 /// The message router processes incoming messages through the full pipeline.
 pub struct MessageRouter {
     storage: Storage,
@@ -1187,6 +1196,17 @@ impl MessageRouter {
                         if !self.is_channel_member(channel_id, &p.target)? {
                             return Err("channel key target must be a channel member".into());
                         }
+                        // P2d hardening (C1): cap how far ahead of the current max epoch
+                        // a key may be published, so a member can't wedge the channel by
+                        // publishing at a near-u64::MAX epoch (which would saturate the
+                        // rotation floor → permanently unsendable).
+                        let max_epoch = self
+                            .storage
+                            .max_channel_key_epoch(&expected)
+                            .map_err(|e| format!("storage error checking epoch: {}", e))?;
+                        if p.epoch > max_epoch.saturating_add(CHANNEL_KEY_EPOCH_MAX_JUMP) {
+                            return Err("channel key epoch too far ahead of the current epoch".into());
+                        }
                         Ok(())
                     }
                     other => Err(format!("invalid scope_kind: {}", other)),
@@ -1444,6 +1464,42 @@ impl MessageRouter {
         }
 
         Ok(true)
+    }
+
+    /// Raise a PRIVATE channel's key-epoch FLOOR after a member is removed (P2d
+    /// rotation). The floor is the lowest epoch a client may encrypt under; it is set
+    /// to `max(existing_floor, current_max_epoch + 1)` so every key the removed
+    /// member held (epochs ≤ current_max) falls below it. Clients then re-key to ≥
+    /// floor and refuse to send under a below-floor (compromised) epoch — the node
+    /// can't generate keys itself (E2E), so it only publishes the floor; rotation is
+    /// client-driven. Monotonic + idempotent: runs on every ingest path (API/gossip/
+    /// reconcile) and converges. No-op for public/read-public channels (not encrypted).
+    fn raise_channel_key_epoch_floor(&self, channel_id: u64) -> Result<()> {
+        let channel_key = channel_id.to_be_bytes();
+        let Some(data) = self.storage.get_cf(schema::cf::CHANNELS, &channel_key)? else {
+            return Ok(());
+        };
+        let Ok(mut meta) = serde_json::from_slice::<serde_json::Value>(&data) else {
+            return Ok(());
+        };
+        // Only private channels (channel_type == 2) rotate.
+        let ctype = meta.get("channel_type").and_then(|v| v.as_u64()).unwrap_or(0);
+        if ctype != 2 {
+            return Ok(());
+        }
+        let scope = crate::crypto::compute_channel_scope(channel_id);
+        let max_epoch = self.storage.max_channel_key_epoch(&scope)?;
+        let cur_floor = meta.get("key_epoch_floor").and_then(|v| v.as_u64()).unwrap_or(0);
+        let new_floor = cur_floor.max(max_epoch.saturating_add(1));
+        if new_floor != cur_floor {
+            if let Some(obj) = meta.as_object_mut() {
+                obj.insert("key_epoch_floor".into(), serde_json::json!(new_floor));
+                if let Ok(bytes) = serde_json::to_vec(&meta) {
+                    self.storage.put_cf(schema::cf::CHANNELS, &channel_key, &bytes)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Remove a member from a channel. Updates member_count.
@@ -1763,6 +1819,8 @@ impl MessageRouter {
                     rmp_serde::from_slice::<ChannelLeavePayload>(&envelope.payload)
                 {
                     self.remove_channel_member(payload.channel_id, resolved_author)?;
+                    // P2d: rotate — a leaver must not read messages sent after they go.
+                    self.raise_channel_key_epoch_floor(payload.channel_id)?;
                 }
             }
             MessageType::ChannelDelete => {
@@ -1856,6 +1914,8 @@ impl MessageRouter {
                     rmp_serde::from_slice::<ChannelKickPayload>(&envelope.payload)
                 {
                     self.remove_channel_member(payload.channel_id, &payload.target_user)?;
+                    // P2d: rotate so the kicked member can't read future messages.
+                    self.raise_channel_key_epoch_floor(payload.channel_id)?;
                 }
             }
             MessageType::ChannelBan => {
@@ -1864,6 +1924,8 @@ impl MessageRouter {
                 {
                     // Remove from members (updates member_count)
                     self.remove_channel_member(payload.channel_id, &payload.target_user)?;
+                    // P2d: rotate so the banned member can't read future messages.
+                    self.raise_channel_key_epoch_floor(payload.channel_id)?;
 
                     // Add to bans
                     let ban_key = schema::encode_channel_ban_key(

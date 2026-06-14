@@ -260,6 +260,27 @@ impl Storage {
         Ok(())
     }
 
+    /// Highest channel-key epoch currently stored for a `key_scope` (0 if none).
+    ///
+    /// `channel_keys` rows end in an 8-byte big-endian epoch
+    /// (`…device_id_hex ++ epoch_be8`, see `encode_channel_key`), so the max over a
+    /// scope's prefix is the channel's current epoch. Used to set the rotation floor
+    /// on member removal (`floor = max_epoch + 1`) so a removed member's keys all
+    /// fall below it. Bounded scan (per-scope envelopes are capped at 4096).
+    pub fn max_channel_key_epoch(&self, key_scope: &[u8; 32]) -> Result<u64> {
+        let entries = self.prefix_iter_cf(cf::CHANNEL_KEYS, &key_scope[..], 8192)?;
+        let mut max = 0u64;
+        for (k, _) in &entries {
+            if k.len() >= 8 {
+                let epoch = u64::from_be_bytes(k[k.len() - 8..].try_into().unwrap());
+                if epoch > max {
+                    max = epoch;
+                }
+            }
+        }
+        Ok(max)
+    }
+
     /// Get a column family handle for use in WriteBatch operations.
     pub fn cf_handle(&self, cf_name: &str) -> Result<Arc<BoundColumnFamily<'_>>> {
         self.db
@@ -2665,7 +2686,28 @@ impl Storage {
         let prefix = schema::encode_channel_key_scope_prefix(key_scope);
         let existing = self.prefix_iter_cf(cf::CHANNEL_KEYS, &prefix, scope_cap + 1)?;
         if existing.len() >= scope_cap {
-            return Ok(KeyEnvelopeStore::ScopeFull);
+            // P2d hardening (C2): the scope is full. Rather than reject (which would
+            // let a member brick the channel by flooding the scope so legitimate key
+            // ROTATION envelopes can't be stored), evict the LOWEST-epoch entry — but
+            // only if the incoming envelope's epoch is strictly higher, so we always
+            // make room for newer epochs (rotation uses the highest epoch) and never
+            // evict newer keys to admit an older one. The trade-off is that very old
+            // epochs' keys may be dropped under pressure (old-history decryption
+            // degrades), which is acceptable versus a permanently unsendable channel.
+            let epoch_of = |k: &[u8]| -> u64 {
+                if k.len() >= 8 {
+                    u64::from_be_bytes(k[k.len() - 8..].try_into().unwrap_or([0; 8]))
+                } else {
+                    0
+                }
+            };
+            let lowest = existing.iter().min_by_key(|(k, _)| epoch_of(k));
+            match lowest {
+                Some((lk, _)) if epoch_of(lk) < epoch => {
+                    self.delete_cf(cf::CHANNEL_KEYS, lk)?;
+                }
+                _ => return Ok(KeyEnvelopeStore::ScopeFull),
+            }
         }
         self.put_cf(cf::CHANNEL_KEYS, &key, value)?;
         Ok(KeyEnvelopeStore::Stored)
