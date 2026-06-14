@@ -6,6 +6,11 @@ use super::types::*;
 
 /// Maximum content length for chat messages (4096 chars).
 pub const MAX_CHAT_CONTENT: usize = 4096;
+/// Maximum ciphertext length for an ENCRYPTED chat message (8 KiB, spec §3.3).
+/// The encrypted blob holds the message `text` (≤ `MAX_CHAT_CONTENT`) plus an
+/// optional reply preview and AEAD overhead — metadata (mentions/reply_to/…) stays
+/// plaintext, so this only needs to bound the text, not the whole payload.
+pub const MAX_CHAT_CIPHERTEXT: usize = 8192;
 /// Maximum title length for news posts (256 chars).
 pub const MAX_NEWS_TITLE: usize = 256;
 /// Maximum content length for news posts (65536 chars).
@@ -59,6 +64,58 @@ impl std::error::Error for ValidationError {}
 
 /// Validate a chat message payload.
 pub fn validate_chat_message(p: &ChatMessagePayload) -> Result<(), ValidationError> {
+    if p.channel_id == 0 {
+        return Err(ValidationError("channel_id must be > 0".into()));
+    }
+
+    // P2 OECK: an ENCRYPTED chat message carries only its TEXT as ciphertext in
+    // `enc_content` (the plaintext `content` String is then empty and the node skips
+    // UTF-8). Per spec §3.3 the routing/index/notification metadata — `mentions`,
+    // `reply_to`, `thread_root`, `content_rating` — deliberately STAYS PLAINTEXT so
+    // the node keeps serving mention notifications, thread pagination, ordering, and
+    // rating filters unchanged; only the message text is hidden. So those fields are
+    // validated by the SAME bounds as a plaintext message, not forced empty.
+    if let Some(ct) = p.enc_content.as_ref() {
+        if ct.is_empty() {
+            return Err(ValidationError("enc_content must not be empty".into()));
+        }
+        if ct.len() > MAX_CHAT_CIPHERTEXT {
+            return Err(ValidationError(format!(
+                "enc_content too long: {} > {}",
+                ct.len(),
+                MAX_CHAT_CIPHERTEXT
+            )));
+        }
+        if p.enc_nonce.is_none() {
+            return Err(ValidationError(
+                "encrypted chat message requires enc_nonce".into(),
+            ));
+        }
+        match p.key_epoch {
+            Some(e) if e >= 1 => {}
+            _ => {
+                return Err(ValidationError(
+                    "encrypted chat message requires key_epoch >= 1".into(),
+                ))
+            }
+        }
+        // The encrypted text lives in `enc_content`; the plaintext text field is unused.
+        if !p.content.is_empty() {
+            return Err(ValidationError(
+                "encrypted chat message must not carry plaintext content".into(),
+            ));
+        }
+        // Plaintext metadata stays node-visible (spec §3.3) — same caps as plaintext.
+        if p.mentions.len() > MAX_MENTIONS {
+            return Err(ValidationError("too many mentions".into()));
+        }
+        if p.attachments.len() > MAX_ATTACHMENTS {
+            return Err(ValidationError("too many attachments".into()));
+        }
+        return Ok(());
+    }
+
+    // Plaintext (public / read-public) path — unchanged.
     if p.content.is_empty() && p.attachments.is_empty() {
         return Err(ValidationError("content or attachments required".into()));
     }
@@ -74,9 +131,6 @@ pub fn validate_chat_message(p: &ChatMessagePayload) -> Result<(), ValidationErr
     }
     if p.attachments.len() > MAX_ATTACHMENTS {
         return Err(ValidationError("too many attachments".into()));
-    }
-    if p.channel_id == 0 {
-        return Err(ValidationError("channel_id must be > 0".into()));
     }
     Ok(())
 }
@@ -1240,5 +1294,85 @@ mod tests {
         channel_id: Option<u64>,
         content: String,
         edited_at: u64,
+    }
+
+    // --- P2 encrypted (private-channel) chat message validation ---
+
+    fn plaintext_chat() -> ChatMessagePayload {
+        ChatMessagePayload {
+            channel_id: 1,
+            content: "hello".into(),
+            content_rating: ContentRating::General,
+            reply_to: None,
+            mentions: vec![],
+            attachments: vec![],
+            enc_content: None,
+            enc_nonce: None,
+            key_epoch: None,
+        }
+    }
+
+    fn encrypted_chat() -> ChatMessagePayload {
+        let mut p = plaintext_chat();
+        p.content = String::new(); // empty placeholder for encrypted messages
+        p.enc_content = Some(vec![0xAB; 64]);
+        p.enc_nonce = Some([0u8; 24]);
+        p.key_epoch = Some(1);
+        p
+    }
+
+    #[test]
+    fn chat_plaintext_still_validates() {
+        assert!(validate_chat_message(&plaintext_chat()).is_ok());
+    }
+
+    #[test]
+    fn chat_encrypted_accepts_well_formed() {
+        assert!(validate_chat_message(&encrypted_chat()).is_ok());
+    }
+
+    #[test]
+    fn chat_encrypted_rejects_oversize_ciphertext() {
+        let mut p = encrypted_chat();
+        p.enc_content = Some(vec![0u8; MAX_CHAT_CIPHERTEXT + 1]);
+        assert!(validate_chat_message(&p).is_err());
+    }
+
+    #[test]
+    fn chat_encrypted_rejects_missing_nonce() {
+        let mut p = encrypted_chat();
+        p.enc_nonce = None;
+        assert!(validate_chat_message(&p).is_err());
+    }
+
+    #[test]
+    fn chat_encrypted_rejects_epoch_zero() {
+        let mut p = encrypted_chat();
+        p.key_epoch = Some(0);
+        assert!(validate_chat_message(&p).is_err());
+    }
+
+    #[test]
+    fn chat_encrypted_rejects_plaintext_content_leak() {
+        let mut p = encrypted_chat();
+        p.content = "leak".into();
+        assert!(validate_chat_message(&p).is_err());
+    }
+
+    #[test]
+    fn chat_encrypted_allows_plaintext_metadata() {
+        // Per spec §3.3 mentions/reply_to stay PLAINTEXT for encrypted channels so
+        // the node keeps doing notifications + threading — only the text is hidden.
+        let mut p = encrypted_chat();
+        p.mentions = vec!["klv1someone".into()];
+        p.reply_to = Some([1u8; 32]);
+        assert!(validate_chat_message(&p).is_ok());
+    }
+
+    #[test]
+    fn chat_encrypted_rejects_too_many_mentions() {
+        let mut p = encrypted_chat();
+        p.mentions = vec!["klv1x".into(); MAX_MENTIONS + 1];
+        assert!(validate_chat_message(&p).is_err());
     }
 }

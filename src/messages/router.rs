@@ -1156,7 +1156,27 @@ impl MessageRouter {
                         Ok(())
                     }
                     crate::messages::types::key_scope_kind::CHANNEL => {
-                        Err("channel-scope key envelopes are not yet supported (P2)".into())
+                        // P2 OECK: a per-device wrapped channel epoch key. The scope
+                        // must be the deterministic channel scope, and BOTH the
+                        // publisher (author) and the recipient (target) must be
+                        // members — non-members can neither distribute nor receive a
+                        // channel key. (WHICH member may start a NEW epoch — creator/
+                        // mods — is a client-enforced policy; the node bounds key flow
+                        // to the membership set, which is the security boundary.)
+                        let channel_id = p
+                            .channel_id
+                            .ok_or("channel key envelope missing channel_id")?;
+                        let expected = crate::crypto::compute_channel_scope(channel_id);
+                        if p.key_scope != expected {
+                            return Err("key_scope does not match the channel".into());
+                        }
+                        if !self.is_channel_member(channel_id, resolved_author)? {
+                            return Err("only a channel member may publish a channel key".into());
+                        }
+                        if !self.is_channel_member(channel_id, &p.target)? {
+                            return Err("channel key target must be a channel member".into());
+                        }
+                        Ok(())
                     }
                     other => Err(format!("invalid scope_kind: {}", other)),
                 }
@@ -1329,6 +1349,15 @@ impl MessageRouter {
             Ok(None) => Err(format!("channel {} not found", channel_id)),
             Err(e) => Err(format!("storage error: {}", e)),
         }
+    }
+
+    /// Check if `address` is a member of `channel_id`. The creator is added as a
+    /// member (role "creator") at ChannelCreate, so this covers them too.
+    fn is_channel_member(&self, channel_id: u64, address: &str) -> Result<bool, String> {
+        let key = schema::encode_channel_member_key(channel_id, address);
+        self.storage
+            .exists_cf(schema::cf::CHANNEL_MEMBERS, &key)
+            .map_err(|e| format!("storage error: {}", e))
     }
 
     /// Check if the user is the creator or a moderator with the required permission.
@@ -2551,10 +2580,25 @@ impl MessageRouter {
                         "timestamp": envelope.timestamp,
                     }))
                     .context("serializing channel key envelope")?;
+                    // DM keys are PER-SENDER (keyed by the publishing author so each
+                    // participant's conv_key coexists). A channel epoch key is a SINGLE
+                    // GROUP key shared by all members, so it's stored author-agnostically
+                    // (canonical empty author) — any member fetches their wrapped copy by
+                    // (channel_scope, target=self, device, epoch) without knowing which
+                    // member published it. First-write-wins per device still yields one
+                    // key per (target, device, epoch); the actual publisher is preserved
+                    // in the record's `author` field for traceability.
+                    let store_author = if p.scope_kind
+                        == crate::messages::types::key_scope_kind::CHANNEL
+                    {
+                        ""
+                    } else {
+                        resolved_author
+                    };
                     match self.storage.put_channel_key_envelope_fww(
                         &p.key_scope,
                         &p.target,
-                        resolved_author, // per-sender key: this envelope carries the author's own conv_key
+                        store_author,
                         &p.device_id,
                         p.epoch,
                         &record,
@@ -2920,5 +2964,89 @@ mod enc_supersede_tests {
         let (newer, to_revoke) = r.plan_enc_key_supersede(w, "", "bb", 200).unwrap();
         assert!(!newer);
         assert!(to_revoke.is_empty());
+    }
+
+    // --- P2 channel-scope ChannelKeyEnvelope authorization ---
+
+    fn make_channel(r: &MessageRouter, channel_id: u64, creator: &str) {
+        let meta = serde_json::json!({ "channel_id": channel_id, "channel_type": 2u8, "creator": creator });
+        r.storage
+            .put_cf(schema::cf::CHANNELS, &channel_id.to_be_bytes(), meta.to_string().as_bytes())
+            .unwrap();
+        add_member(r, channel_id, creator);
+    }
+
+    fn add_member(r: &MessageRouter, channel_id: u64, addr: &str) {
+        let key = schema::encode_channel_member_key(channel_id, addr);
+        r.storage.put_cf(schema::cf::CHANNEL_MEMBERS, &key, b"{}").unwrap();
+    }
+
+    fn channel_key_env(channel_id: u64, scope: [u8; 32], author: &str, target: &str) -> Envelope {
+        let payload = crate::messages::types::ChannelKeyEnvelopePayload {
+            key_scope: scope,
+            scope_kind: crate::messages::types::key_scope_kind::CHANNEL,
+            epoch: 1,
+            target: target.to_string(),
+            device_id: "ab".repeat(32),
+            peer: None,
+            channel_id: Some(channel_id),
+            eph_pub: [0u8; 32],
+            nonce: [0u8; 24],
+            wrapped: vec![0u8; 48],
+        };
+        Envelope {
+            version: 1,
+            msg_type: MessageType::ChannelKeyEnvelope,
+            msg_id: [0u8; 32],
+            author: author.to_string(),
+            timestamp: 1,
+            lamport_ts: 0,
+            payload: rmp_serde::to_vec_named(&payload).unwrap(),
+            signature: vec![0u8; 64],
+            relay_path: vec![],
+        }
+    }
+
+    #[test]
+    fn channel_key_authz_member_to_member_ok() {
+        let (r, _d) = router();
+        let (cid, creator, member) = (7u64, "klv1creator", "klv1member");
+        make_channel(&r, cid, creator);
+        add_member(&r, cid, member);
+        let scope = crate::crypto::compute_channel_scope(cid);
+        let env = channel_key_env(cid, scope, creator, member);
+        assert!(r.authorize_channel_action(&env, creator).is_ok());
+    }
+
+    #[test]
+    fn channel_key_authz_rejects_non_member_author() {
+        let (r, _d) = router();
+        let (cid, creator, member, outsider) = (7u64, "klv1creator", "klv1member", "klv1outsider");
+        make_channel(&r, cid, creator);
+        add_member(&r, cid, member);
+        let scope = crate::crypto::compute_channel_scope(cid);
+        let env = channel_key_env(cid, scope, outsider, member);
+        assert!(r.authorize_channel_action(&env, outsider).is_err());
+    }
+
+    #[test]
+    fn channel_key_authz_rejects_non_member_target() {
+        let (r, _d) = router();
+        let (cid, creator, outsider) = (7u64, "klv1creator", "klv1outsider");
+        make_channel(&r, cid, creator);
+        let scope = crate::crypto::compute_channel_scope(cid);
+        let env = channel_key_env(cid, scope, creator, outsider);
+        assert!(r.authorize_channel_action(&env, creator).is_err());
+    }
+
+    #[test]
+    fn channel_key_authz_rejects_scope_mismatch() {
+        let (r, _d) = router();
+        let (cid, creator) = (7u64, "klv1creator");
+        make_channel(&r, cid, creator);
+        // key_scope for a DIFFERENT channel → reject even though author is a member.
+        let wrong_scope = crate::crypto::compute_channel_scope(999);
+        let env = channel_key_env(cid, wrong_scope, creator, creator);
+        assert!(r.authorize_channel_action(&env, creator).is_err());
     }
 }

@@ -5,6 +5,54 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.72.0] - 2026-06-14
+
+P2a — **node foundation for end-to-end-encrypted PRIVATE channels** (OECK). Not yet
+usable end-to-end (no client publishes channel keys yet); this lands the node-side
+storage, authorization, and message carrier so P2b (SDK + web) can build on it.
+Plaintext public/read-public channels are unaffected.
+
+### Added
+
+- **`compute_channel_scope(channel_id)`** = `keccak256("ogmara-channel-scope-v1" ||
+  channel_id_be8)` — the deterministic 32-byte `key_scope` for a channel's epoch
+  keys, domain-separated from DM `conversation_id` scopes so the two key spaces can
+  never collide. (Clients mirror this byte-for-byte.)
+- **Channel-scope `ChannelKeyEnvelope` (0x61) support.** The P2 stub in
+  `authorize_channel_action` is replaced with a membership-gated branch: a channel
+  key envelope is accepted only when `key_scope == compute_channel_scope(channel_id)`
+  and BOTH the publisher and the recipient (`target`) are channel members. Non-members
+  can neither distribute nor receive a channel key. (Which member may START a new
+  epoch — creator/mods — is a client-enforced policy; the node bounds key flow to the
+  membership set, the security boundary.)
+- **Encrypted chat message carrier.** `ChatMessagePayload` gained trailing
+  `serde(default)` `enc_content` / `enc_nonce` / `key_epoch` fields (wire-compatible
+  with plaintext messages). `validate_chat_message` gained an encrypted branch:
+  `enc_content` non-empty and ≤ `MAX_CHAT_CIPHERTEXT` (8 KiB), `enc_nonce` present,
+  `key_epoch ≥ 1`, and the plaintext `content` (text) empty. Per spec §3.3 only the
+  message TEXT is encrypted — `mentions` / `reply_to` / `content_rating` stay
+  PLAINTEXT (same caps as a plaintext message) so the node keeps serving mention
+  notifications, threading, ordering, and rating filters. 17 new unit tests.
+
+### Changed
+
+- Channel epoch keys are stored **author-agnostically** (canonical empty author) in
+  the `channel_keys` CF — a single group key per epoch, fetchable by any member via
+  `(channel_scope, target=self, device, epoch)` without knowing which member
+  published it. DM keys remain per-sender. First-write-wins still yields one key per
+  `(target, device, epoch)`.
+
+### Known residuals (tracked for P2b/P2d)
+
+- Clients MUST fetch channel keys with an explicit empty `author=` query param
+  (the read endpoint defaults `author` to the caller's own wallet). Wire this in the
+  SDK (P2b).
+- Group-key FWW: the node gates membership, not which member mints an epoch — a
+  member could race a bogus epoch key. Mitigated by the client policy
+  (creator/mods-only-establish); revisit with a key-commitment check (P2d).
+- The node does not enforce "private channel ⇒ encrypted" (no channel-type lookup in
+  the validation hot path) — client responsibility for now (P2d candidate).
+
 ## [0.71.0] - 2026-06-14
 
 Cross-node delivery for DM **edits and deletes** — they were stored locally but
