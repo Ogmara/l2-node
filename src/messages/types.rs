@@ -505,7 +505,9 @@ pub struct EditPayload {
     // projection in `enrich_message_json`. Per-type semantics:
     //   - NewsEdit:        title, tags, attachments all applicable
     //   - ChatEdit:        attachments applicable; title/tags ignored
-    //   - DirectMessageEdit: all ignored (encrypted ciphertext only)
+    //   - DirectMessageEdit: title/tags/attachments ignored; the new content
+    //     rides as ciphertext in `enc_content`/`enc_nonce`/`key_epoch` below
+    //     (the plaintext `content` String is an unused placeholder for DM edits).
     // Trailing position + `#[serde(default)]` keeps msgpack wire-compat: old
     // 4-element edit envelopes still decode into the new struct.
     /// Optional new title (news posts only).
@@ -517,6 +519,18 @@ pub struct EditPayload {
     /// Optional new attachments (news posts + chat messages).
     #[serde(default)]
     pub attachments: Option<Vec<Attachment>>,
+    /// DM-only: XChaCha20-Poly1305 ciphertext of the new content under the
+    /// conversation key (`conv_key`). Opaque to the node — it relays bytes it
+    /// cannot read, identically to `DirectMessagePayload::content`. Present iff
+    /// this is an encrypted `DirectMessageEdit`.
+    #[serde(default)]
+    pub enc_content: Option<Vec<u8>>,
+    /// DM-only: 24-byte AEAD nonce for `enc_content` (matches `DirectMessagePayload::nonce`).
+    #[serde(default)]
+    pub enc_nonce: Option<[u8; 24]>,
+    /// DM-only: which `conv_key` epoch `enc_content` was sealed under (§8.2).
+    #[serde(default)]
+    pub key_epoch: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

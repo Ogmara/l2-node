@@ -5,6 +5,57 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.70.0] - 2026-06-14
+
+Node-side enforcement of **one active `enc_pub` per `(wallet, device_id)`** at
+bind time (protocol §2.4) — closes the long-standing E2E residual that left a
+device able to hold several active encryption keys after a rotation without an
+explicit revoke. That ambiguity was the root of colliding `channel_keys`
+envelopes (the "can't decrypt" class of DM failures): a sender wrapping to two
+active `enc_pub`s for the same device could let the wrong wrapping win.
+
+### Security
+
+- **`DeviceEncBinding` now supersedes the device's prior key.** When a wallet
+  binds a new `enc_pub` for a `device_id` it already has an active key for, the
+  node tombstones the older `enc_pub` (revoked, `superseded_by`) so the directory
+  serves exactly one active key per device. The rule is highest-`ts`-wins and so
+  converges identically across gossip replays regardless of arrival order: an
+  out-of-order (older) replay for the same device is stored as a revoked
+  tombstone rather than resurrected as a second active key. This removes the
+  clients' reliance on a client-controlled `created_at` for wrap-target dedup —
+  correctness is now enforced node-side. Bindings with an empty `device_id` are
+  never superseded (identity can't be established); the per-wallet cap (10) still
+  bounds them. New `plan_enc_key_supersede` helper + 5 unit tests.
+
+- **Known deferred advisories (no in-range fix).** `cargo audit` flags two
+  DoS advisories in `hickory-proto 0.25.2` (RUSTSEC-2026-0118 NSEC3 unbounded
+  loop, RUSTSEC-2026-0119 O(n²) name-compression CPU exhaustion), a transitive
+  runtime dep via `libp2p 0.56` (libp2p-dns / libp2p-mdns). The fix lands only in
+  hickory 0.26.x, which libp2p 0.56's `^0.25` pin rejects — so closing it needs a
+  major libp2p bump, deferred to a dedicated session where the P2P stack can be
+  re-tested. Pre-existing (present since before 0.69.0); not introduced here. The
+  npm clients (sdk-js/web/desktop) report 0 vulnerabilities.
+
+### Added
+
+- **End-to-end-encrypted DM edits (§3.7 / §8.2.2).** A `DirectMessageEdit` now
+  carries the new body as ciphertext, not plaintext. `EditPayload` gained three
+  trailing `serde(default)` DM-only fields — `enc_content` (XChaCha20-Poly1305
+  ciphertext under the conv_key), `enc_nonce` (24-byte), and `key_epoch` — kept
+  wire-compatible with Chat/News edits. `project_edited_payload` gained a
+  `DirectMessage` arm that swaps `enc_content`/`enc_nonce`/`key_epoch` onto the
+  original DM payload, so an edited DM decrypts exactly like a never-edited one;
+  an edit missing the ciphertext is unrecoverable and the payload is blanked (a
+  redacting edit never reveals the pre-edit content). 4 new validation tests.
+
+### Changed
+
+- **`validate_dm_edit` now requires the encrypted carrier.** A DM edit must carry
+  a non-empty `enc_content` (≤ `MAX_DM_CONTENT`), an `enc_nonce`, and `key_epoch ≥ 1`
+  (epoch 0 is legacy plaintext), and its plaintext `content` String MUST be empty.
+  Legacy plaintext DM edits are rejected. Field overrides remain rejected.
+
 ## [0.69.0] - 2026-06-14
 
 DM offline store-and-forward (spec 3 §dm-offline-store-and-forward). Until now a

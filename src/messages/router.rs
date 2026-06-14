@@ -628,6 +628,61 @@ impl MessageRouter {
         Ok(count)
     }
 
+    /// Enforce one active `enc_pub` per `(wallet, device_id)` at bind time
+    /// (protocol §2.4). Scans the wallet's enc-key directory for OTHER active keys
+    /// bound to the same `device_id` and returns a supersede plan:
+    ///   - `newer_exists`: an active key for this device already has `ts >= ts`, so
+    ///     the incoming binding lost the last-write-wins race and must itself be
+    ///     stored as a revoked tombstone (a later replay can't resurrect it active).
+    ///   - `to_revoke`: directory keys of strictly-older active device keys to
+    ///     tombstone so the directory serves exactly one active `enc_pub` per device.
+    ///
+    /// An empty `device_id` yields an empty plan — without a device identity we
+    /// cannot tell which prior keys belong to the same device, so we never supersede
+    /// (the per-wallet cap remains the only bound). The `>= ts` tie-break keeps the
+    /// already-stored key on an exact timestamp collision; this converges across
+    /// gossip replays because every node applies the same highest-ts-wins rule.
+    fn plan_enc_key_supersede(
+        &self,
+        wallet: &str,
+        device_id: &str,
+        keep_enc_pub: &str,
+        ts: u64,
+    ) -> Result<(bool, Vec<(Vec<u8>, String)>)> {
+        if device_id.is_empty() {
+            return Ok((false, Vec::new()));
+        }
+        let mut prefix = wallet.as_bytes().to_vec();
+        prefix.push(0xFF);
+        let entries = self
+            .storage
+            .prefix_iter_cf(schema::cf::DEVICE_ENC_KEYS, &prefix, 256)?;
+        let mut newer_exists = false;
+        let mut to_revoke = Vec::new();
+        for (k, v) in entries {
+            let r = match serde_json::from_slice::<serde_json::Value>(&v) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            if r.get("revoked").and_then(|b| b.as_bool()).unwrap_or(false) {
+                continue;
+            }
+            let r_dev = r.get("device_id").and_then(|s| s.as_str()).unwrap_or("");
+            let r_enc = r.get("enc_pub").and_then(|s| s.as_str()).unwrap_or("");
+            // Only collide with the SAME device's OTHER enc keys.
+            if r_dev.is_empty() || r_dev != device_id || r_enc == keep_enc_pub {
+                continue;
+            }
+            let r_ts = r.get("ts").and_then(|t| t.as_u64()).unwrap_or(0);
+            if r_ts >= ts {
+                newer_exists = true;
+            } else {
+                to_revoke.push((k, r_enc.to_string()));
+            }
+        }
+        Ok((newer_exists, to_revoke))
+    }
+
     /// Verify that the msg_id matches Keccak-256(author + payload + timestamp).
     fn verify_msg_id(&self, envelope: &Envelope) -> Result<()> {
         let author_bytes = crypto::address_to_pubkey_bytes(&envelope.author)
@@ -2044,26 +2099,87 @@ impl MessageRouter {
                     rmp_serde::from_slice::<DeviceEncBindingPayload>(&envelope.payload)
                 {
                     let enc_pub = payload.enc_pub.to_ascii_lowercase();
+                    let device_id = payload.device_id.to_ascii_lowercase();
                     let key = schema::encode_device_enc_key(resolved_author, &enc_pub);
                     if self.enc_key_is_newer(&key, envelope.timestamp)? {
-                        let active = self.count_active_enc_keys(resolved_author, &enc_pub)?;
-                        if active >= MAX_ENC_KEYS_PER_WALLET {
-                            warn!(wallet = %resolved_author, active,
-                                "enc-key cap reached; binding ignored");
-                        } else {
+                        // §2.4 one-active-enc_pub-per-device: plan which prior keys
+                        // for THIS device this binding supersedes (and whether it
+                        // itself lost the LWW race against a newer key for the device).
+                        let (newer_exists, to_revoke) = self.plan_enc_key_supersede(
+                            resolved_author,
+                            &device_id,
+                            &enc_pub,
+                            envelope.timestamp,
+                        )?;
+                        if newer_exists {
+                            // A strictly-newer (or equal-ts) key for this device is
+                            // already active: store this binding as a tombstone so a
+                            // later replay cannot resurrect it as a second active key.
                             let record = serde_json::json!({
                                 "enc_pub": enc_pub,
-                                "device_id": payload.device_id.to_ascii_lowercase(),
-                                "created_at": envelope.timestamp,
+                                "device_id": device_id,
                                 "ts": envelope.timestamp,
-                                "revoked": false,
+                                "revoked": true,
+                                "revoked_at": envelope.timestamp,
+                                "superseded": true,
                             });
                             self.storage.put_cf(
                                 schema::cf::DEVICE_ENC_KEYS,
                                 &key,
                                 record.to_string().as_bytes(),
                             )?;
-                            debug!(wallet = %resolved_author, %enc_pub, "Device enc key bound");
+                            debug!(wallet = %resolved_author, %enc_pub, %device_id,
+                                "stale per-device enc binding superseded on arrival");
+                        } else {
+                            // Cap check counts current active keys; superseding this
+                            // device's older key frees a slot, so subtract those so a
+                            // legitimate rotation never trips the per-wallet cap.
+                            let active = self
+                                .count_active_enc_keys(resolved_author, &enc_pub)?
+                                .saturating_sub(to_revoke.len());
+                            if active >= MAX_ENC_KEYS_PER_WALLET {
+                                warn!(wallet = %resolved_author, active,
+                                    "enc-key cap reached; binding ignored");
+                            } else {
+                                // Tombstone the older enc_pub(s) for this device first,
+                                // then activate the new one — both writes happen only
+                                // once the cap check has passed.
+                                for (rk, old_enc) in &to_revoke {
+                                    let tomb = serde_json::json!({
+                                        "enc_pub": old_enc,
+                                        "device_id": device_id,
+                                        "ts": envelope.timestamp,
+                                        "revoked": true,
+                                        "revoked_at": envelope.timestamp,
+                                        "superseded_by": enc_pub,
+                                    });
+                                    self.storage.put_cf(
+                                        schema::cf::DEVICE_ENC_KEYS,
+                                        rk,
+                                        tomb.to_string().as_bytes(),
+                                    )?;
+                                }
+                                let record = serde_json::json!({
+                                    "enc_pub": enc_pub,
+                                    "device_id": device_id,
+                                    "created_at": envelope.timestamp,
+                                    "ts": envelope.timestamp,
+                                    "revoked": false,
+                                });
+                                self.storage.put_cf(
+                                    schema::cf::DEVICE_ENC_KEYS,
+                                    &key,
+                                    record.to_string().as_bytes(),
+                                )?;
+                                if to_revoke.is_empty() {
+                                    debug!(wallet = %resolved_author, %enc_pub,
+                                        "Device enc key bound");
+                                } else {
+                                    debug!(wallet = %resolved_author, %enc_pub, %device_id,
+                                        superseded = to_revoke.len(),
+                                        "Device enc key bound; superseded prior key(s)");
+                                }
+                            }
                         }
                     }
                 }
@@ -2718,5 +2834,91 @@ impl MessageRouter {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod enc_supersede_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn router() -> (MessageRouter, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let identity = IdentityResolver::new(storage.clone());
+        (MessageRouter::new(storage, identity, None), dir)
+    }
+
+    fn put_enc(r: &MessageRouter, wallet: &str, enc_pub: &str, device_id: &str, ts: u64, revoked: bool) {
+        let key = schema::encode_device_enc_key(wallet, enc_pub);
+        let rec = serde_json::json!({
+            "enc_pub": enc_pub,
+            "device_id": device_id,
+            "created_at": ts,
+            "ts": ts,
+            "revoked": revoked,
+        });
+        r.storage
+            .put_cf(schema::cf::DEVICE_ENC_KEYS, &key, rec.to_string().as_bytes())
+            .unwrap();
+    }
+
+    #[test]
+    fn supersedes_older_key_for_same_device() {
+        let (r, _d) = router();
+        let w = "klv1wallet";
+        put_enc(&r, w, "aa", "dev1", 100, false);
+        // A newer binding (ts=200) for the same device with a different enc_pub
+        // supersedes the older one and does not lose the LWW race.
+        let (newer, to_revoke) = r.plan_enc_key_supersede(w, "dev1", "bb", 200).unwrap();
+        assert!(!newer, "incoming is newer, should not be marked superseded");
+        assert_eq!(to_revoke.len(), 1);
+        assert_eq!(to_revoke[0].1, "aa");
+    }
+
+    #[test]
+    fn stale_binding_loses_to_newer_device_key() {
+        let (r, _d) = router();
+        let w = "klv1wallet";
+        put_enc(&r, w, "bb", "dev1", 200, false);
+        // An out-of-order replay (ts=100) for the same device must NOT revoke the
+        // newer active key; it loses the race and is flagged for tombstoning.
+        let (newer, to_revoke) = r.plan_enc_key_supersede(w, "dev1", "aa", 100).unwrap();
+        assert!(newer, "incoming is older, should be superseded on arrival");
+        assert!(to_revoke.is_empty());
+    }
+
+    #[test]
+    fn leaves_other_devices_untouched() {
+        let (r, _d) = router();
+        let w = "klv1wallet";
+        put_enc(&r, w, "aa", "dev1", 100, false);
+        put_enc(&r, w, "cc", "dev2", 100, false);
+        // Binding a new key for dev1 must not touch dev2's key.
+        let (newer, to_revoke) = r.plan_enc_key_supersede(w, "dev1", "bb", 200).unwrap();
+        assert!(!newer);
+        assert_eq!(to_revoke.len(), 1);
+        assert_eq!(to_revoke[0].1, "aa");
+    }
+
+    #[test]
+    fn ignores_revoked_and_rebind_of_same_key() {
+        let (r, _d) = router();
+        let w = "klv1wallet";
+        put_enc(&r, w, "aa", "dev1", 100, true); // already revoked
+        // Re-binding the SAME enc_pub (keep == record) is a no-op for supersede.
+        let (newer, to_revoke) = r.plan_enc_key_supersede(w, "dev1", "aa", 200).unwrap();
+        assert!(!newer);
+        assert!(to_revoke.is_empty());
+    }
+
+    #[test]
+    fn empty_device_id_never_supersedes() {
+        let (r, _d) = router();
+        let w = "klv1wallet";
+        put_enc(&r, w, "aa", "dev1", 100, false);
+        let (newer, to_revoke) = r.plan_enc_key_supersede(w, "", "bb", 200).unwrap();
+        assert!(!newer);
+        assert!(to_revoke.is_empty());
     }
 }
