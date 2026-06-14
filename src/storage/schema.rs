@@ -21,6 +21,11 @@ pub mod cf {
     /// snapshot `DOMAIN_CFS`. Bounded by `[dm] max_local_subscriptions` with LRU
     /// eviction on `last_active_ms`.
     pub const LOCAL_DM_USERS: &str = "local_dm_users";
+    /// (wallet_address, 0xFF, channel_id_be8) → () — channels a LOCAL member has
+    /// FEDERATED to this node (private-channel federation, F1). NODE-LOCAL; excluded
+    /// from snapshot `DOMAIN_CFS`. Used to cap how many channels one wallet may
+    /// federate (bounds the gossip-topic subscriptions a single user can drive).
+    pub const LOCAL_CHANNEL_FED: &str = "local_channel_fed";
     /// (timestamp, msg_id) → () — global news feed index
     pub const NEWS_FEED: &str = "news_feed";
     /// (tag, timestamp, msg_id) → () — tag-based news index
@@ -222,6 +227,7 @@ pub mod cf {
         DM_MESSAGES,
         DM_CONVERSATIONS,
         LOCAL_DM_USERS,
+        LOCAL_CHANNEL_FED,
         NEWS_FEED,
         NEWS_BY_TAG,
         NEWS_BY_AUTHOR,
@@ -663,6 +669,21 @@ pub fn encode_channel_member_key(channel_id: u64, address: &str) -> Vec<u8> {
     let mut key = Vec::with_capacity(8 + address.len());
     key.extend_from_slice(&channel_id.to_be_bytes());
     key.extend_from_slice(address.as_bytes());
+    key
+}
+
+/// Prefix for a wallet's `LOCAL_CHANNEL_FED` entries: (wallet, 0xFF). Prefix
+/// iteration counts/lists the channels that wallet has federated to this node.
+pub fn encode_local_channel_fed_prefix(wallet: &str) -> Vec<u8> {
+    let mut p = wallet.as_bytes().to_vec();
+    p.push(0xFF);
+    p
+}
+
+/// Encode a `LOCAL_CHANNEL_FED` key: (wallet, 0xFF, channel_id_be8).
+pub fn encode_local_channel_fed_key(wallet: &str, channel_id: u64) -> Vec<u8> {
+    let mut key = encode_local_channel_fed_prefix(wallet);
+    key.extend_from_slice(&channel_id.to_be_bytes());
     key
 }
 

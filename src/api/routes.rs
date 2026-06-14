@@ -2474,21 +2474,74 @@ pub async fn federate_channel(
     Path(channel_id): Path<u64>,
     Json(req): Json<FederateRequest>,
 ) -> impl IntoResponse {
+    use crate::storage::schema as sch;
+    /// Cap on how many channels ONE wallet may federate to this node — bounds the
+    /// gossip-topic subscriptions a single user can drive (DoS guard).
+    const MAX_FEDERATED_PER_WALLET: usize = 256;
     let caller = auth_user.address;
-    let host = req.host_url.trim_end_matches('/').to_string();
-    // Basic SSRF guard: https only, and not an obvious internal host. Full
-    // allowlist/private-IP hardening is tracked for F3.
-    let host_ok = host.starts_with("https://")
-        && !host.contains("localhost")
-        && !host.contains("127.0.0.1")
-        && !host.contains("://10.")
-        && !host.contains("://192.168.")
-        && !host.contains("://169.254.");
-    if !host_ok {
-        return (StatusCode::BAD_REQUEST, "host_url must be a public https URL").into_response();
+
+    // --- SSRF-safe host validation ---
+    // `classify_api_endpoint` rejects bad schemes / onion / IP-LITERAL non-routable
+    // ranges. Then resolve the host and verify EVERY resolved IP is publicly
+    // routable (defeats DNS→internal names + odd IP encodings the string check
+    // misses), and fetch with a NO-REDIRECT client (a public host can't 3xx us to
+    // an internal target). DNS-rebinding TOCTOU between this check and the fetch
+    // remains a documented residual (F3: connect-to-validated-IP).
+    let parsed = match crate::api::media_fallback::classify_api_endpoint(
+        req.host_url.trim_end_matches('/'),
+    ) {
+        Ok(u) => u,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("host_url rejected: {}", e)).into_response(),
+    };
+    if parsed.scheme() != "https" {
+        return (StatusCode::BAD_REQUEST, "host_url must be https").into_response();
+    }
+    let host_str = parsed.host_str().unwrap_or("").to_string();
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    match tokio::net::lookup_host((host_str.as_str(), port)).await {
+        Ok(addrs) => {
+            let mut saw = false;
+            for a in addrs {
+                saw = true;
+                if !crate::api::media_fallback::ip_is_routable(a.ip()) {
+                    return (StatusCode::BAD_REQUEST, "host resolves to a non-routable address")
+                        .into_response();
+                }
+            }
+            if !saw {
+                return (StatusCode::BAD_GATEWAY, "host did not resolve").into_response();
+            }
+        }
+        Err(_) => return (StatusCode::BAD_GATEWAY, "host did not resolve").into_response(),
+    }
+    let base = match parsed.port() {
+        Some(p) => format!("https://{}:{}", host_str, p),
+        None => format!("https://{}", host_str),
+    };
+
+    // --- Per-wallet federation cap ---
+    let already_fed = state
+        .storage
+        .get_cf(cf::LOCAL_CHANNEL_FED, &sch::encode_local_channel_fed_key(&caller, channel_id))
+        .ok()
+        .flatten()
+        .is_some();
+    if !already_fed {
+        let count = state
+            .storage
+            .prefix_iter_cf(
+                cf::LOCAL_CHANNEL_FED,
+                &sch::encode_local_channel_fed_prefix(&caller),
+                MAX_FEDERATED_PER_WALLET + 1,
+            )
+            .map(|e| e.len())
+            .unwrap_or(0);
+        if count >= MAX_FEDERATED_PER_WALLET {
+            return (StatusCode::TOO_MANY_REQUESTS, "federated-channel limit reached").into_response();
+        }
     }
 
-    // Fetch + store the channel record if we don't already have it.
+    // --- Fetch + store the channel record if absent (never clobber a hosted one) ---
     let have_channel = state
         .storage
         .get_cf(cf::CHANNELS, &channel_id.to_be_bytes())
@@ -2496,8 +2549,16 @@ pub async fn federate_channel(
         .flatten()
         .is_some();
     if !have_channel {
-        let url = format!("{}/api/v1/channels/{}", host, channel_id);
-        let resp = match state.klever_view_http.get(&url).send().await {
+        let http = match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+        {
+            Ok(c) => c,
+            Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "http client init").into_response(),
+        };
+        let url = format!("{}/api/v1/channels/{}", base, channel_id);
+        let resp = match http.get(&url).send().await {
             Ok(r) if r.status().is_success() => r,
             _ => return (StatusCode::BAD_GATEWAY, "could not reach host channel").into_response(),
         };
@@ -2518,28 +2579,39 @@ pub async fn federate_channel(
             "description": ch.get("description").cloned().unwrap_or(serde_json::Value::Null),
             "creator": ch.get("creator").cloned().unwrap_or(serde_json::Value::Null),
             "member_count": ch.get("member_count").cloned().unwrap_or(serde_json::json!(0)),
-            "federated_from": host,
+            "federated_from": base,
         });
-        if let Ok(bytes) = serde_json::to_vec(&meta) {
-            if let Err(e) = state.storage.put_cf(cf::CHANNELS, &channel_id.to_be_bytes(), &bytes) {
-                return (StatusCode::INTERNAL_SERVER_ERROR, format!("storage error: {}", e)).into_response();
-            }
+        let bytes = serde_json::to_vec(&meta).unwrap_or_default();
+        if let Err(e) = state.storage.put_cf(cf::CHANNELS, &channel_id.to_be_bytes(), &bytes) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("storage error: {}", e)).into_response();
         }
     }
 
-    // Record the caller as a local member so this node can serve them the channel
-    // (private-channel reads are membership-gated). Their ChannelJoin envelope
-    // (sent separately by the client) gossips the membership to the host + members.
-    let member_key = crate::storage::schema::encode_channel_member_key(channel_id, &caller);
+    // --- Record local membership + federation marker (surface storage errors) ---
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let member_key = sch::encode_channel_member_key(channel_id, &caller);
     if state.storage.get_cf(cf::CHANNEL_MEMBERS, &member_key).ok().flatten().is_none() {
-        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
         let rec = serde_json::json!({ "joined_at": now_ms, "role": "member" });
-        let _ = state.storage.put_cf(cf::CHANNEL_MEMBERS, &member_key, rec.to_string().as_bytes());
+        if let Err(e) = state.storage.put_cf(cf::CHANNEL_MEMBERS, &member_key, rec.to_string().as_bytes()) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("storage error: {}", e)).into_response();
+        }
+    }
+    if let Err(e) = state.storage.put_cf(
+        cf::LOCAL_CHANNEL_FED,
+        &sch::encode_local_channel_fed_key(&caller, channel_id),
+        &now_ms.to_be_bytes(),
+    ) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("storage error: {}", e)).into_response();
     }
 
     // Subscribe to the channel's gossip topic (reuses the chain-scanner subscribe
     // path) so its messages + key envelopes flow here live.
-    let _ = state.channel_subscribe_tx.send(channel_id);
+    if state.channel_subscribe_tx.send(channel_id).is_err() {
+        tracing::warn!(channel_id, "federate: channel subscribe channel closed");
+    }
 
     Json(serde_json::json!({ "federated": true, "channel_id": channel_id })).into_response()
 }
