@@ -144,6 +144,20 @@ pub fn compute_conversation_id(addr_a: &str, addr_b: &str) -> [u8; 32] {
     keccak256(&data)
 }
 
+/// Compute a deterministic 32-byte key scope for an encrypted channel (P2 OECK).
+///
+/// `keccak256("ogmara-channel-scope-v1" || channel_id_be8)`. The domain prefix
+/// keeps it disjoint from DM `conversation_id` scopes (which hash bech32 address
+/// strings) so the two key spaces can never collide. Both the Rust and TypeScript
+/// implementations must produce identical output.
+pub fn compute_channel_scope(channel_id: u64) -> [u8; 32] {
+    const DOMAIN: &[u8] = b"ogmara-channel-scope-v1";
+    let mut data = Vec::with_capacity(DOMAIN.len() + 8);
+    data.extend_from_slice(DOMAIN);
+    data.extend_from_slice(&channel_id.to_be_bytes());
+    keccak256(&data)
+}
+
 /// Compute the message ID: Keccak-256(author_address_bytes + payload_bytes + timestamp_bytes).
 pub fn compute_msg_id(author_pubkey: &[u8; 32], payload_bytes: &[u8], timestamp: u64) -> [u8; 32] {
     let mut data = Vec::with_capacity(32 + payload_bytes.len() + 8);
@@ -151,4 +165,39 @@ pub fn compute_msg_id(author_pubkey: &[u8; 32], payload_bytes: &[u8], timestamp:
     data.extend_from_slice(payload_bytes);
     data.extend_from_slice(&timestamp.to_be_bytes());
     keccak256(&data)
+}
+
+#[cfg(test)]
+mod channel_scope_tests {
+    use super::*;
+
+    #[test]
+    fn channel_scope_is_deterministic() {
+        assert_eq!(compute_channel_scope(42), compute_channel_scope(42));
+    }
+
+    #[test]
+    fn channel_scope_differs_per_channel() {
+        assert_ne!(compute_channel_scope(1), compute_channel_scope(2));
+    }
+
+    #[test]
+    fn channel_scope_domain_separated_from_dm() {
+        // A DM conversation_id hashes bech32 address strings; a channel scope hashes
+        // a domain tag + u64. They must never collide for any plausible input.
+        let dm = compute_conversation_id("klv1aaaa", "klv1bbbb");
+        assert_ne!(dm, compute_channel_scope(0));
+        assert_ne!(dm, compute_channel_scope(1));
+    }
+
+    #[test]
+    fn channel_scope_known_answer() {
+        // Lock the wire format: keccak256("ogmara-channel-scope-v1" || 1u64_be).
+        use sha3::{Digest, Keccak256};
+        let mut h = Keccak256::new();
+        h.update(b"ogmara-channel-scope-v1");
+        h.update(1u64.to_be_bytes());
+        let expected: [u8; 32] = h.finalize().into();
+        assert_eq!(compute_channel_scope(1), expected);
+    }
 }

@@ -6832,6 +6832,9 @@ mod edit_projection_tests {
             reply_to: None,
             mentions: vec![],
             attachments: vec![],
+            enc_content: None,
+            enc_nonce: None,
+            key_epoch: None,
         }
     }
 

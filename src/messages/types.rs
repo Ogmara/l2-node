@@ -257,6 +257,21 @@ pub struct ChatMessagePayload {
     /// Media references.
     #[serde(default)]
     pub attachments: Vec<Attachment>,
+    // --- P2 OECK encrypted-channel carrier (trailing, serde-default → wire-compat
+    // with plaintext public-channel messages). ---
+    /// XChaCha20-Poly1305 ciphertext of the message body under the channel epoch
+    /// key. Present iff this is an encrypted (private-channel) message — `content`
+    /// is then empty and `mentions`/`reply_to`/`content_rating` ride INSIDE the
+    /// ciphertext (spec §3.3), so the node learns nothing but channel + timing.
+    /// Opaque to the node.
+    #[serde(default)]
+    pub enc_content: Option<Vec<u8>>,
+    /// P2: 24-byte AEAD nonce for `enc_content`.
+    #[serde(default)]
+    pub enc_nonce: Option<[u8; 24]>,
+    /// P2: which `channel_key` epoch `enc_content` was sealed under (≥1).
+    #[serde(default)]
+    pub key_epoch: Option<u64>,
 }
 
 // --- Direct Message Payload (spec 3.4) ---
