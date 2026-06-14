@@ -1431,6 +1431,15 @@ fn gossip_topic_for_envelope(
             let p: RecipientExtract = rmp_serde::from_slice(&envelope.payload).ok()?;
             Some(gossip::dm_topic(network_id, &p.recipient))
         }
+        MessageType::DirectMessageEdit | MessageType::DirectMessageDelete => {
+            // DM edits/deletes go to the recipient's DM topic, exactly like the
+            // DM content (above). Without this they fell through to `_ => None`
+            // and were NEVER gossiped — so an edit/delete only ever showed on the
+            // sender's node and never reached the recipient. The payload carries
+            // `recipient` (sent by the client alongside `target_id`).
+            let p: RecipientExtract = rmp_serde::from_slice(&envelope.payload).ok()?;
+            Some(gossip::dm_topic(network_id, &p.recipient))
+        }
         MessageType::ChannelKeyEnvelope => {
             // Per-device wrapped epoch key (spec 8.1.1 / 8.2) — MUST reach the
             // recipient's node so a cross-node DM/channel member can fetch + unwrap
