@@ -220,6 +220,17 @@ pub fn classify_api_endpoint(api_endpoint: &str) -> Result<url::Url, &'static st
     Ok(parsed)
 }
 
+/// True if a RESOLVED IP is publicly routable (not loopback/private/link-local/
+/// ULA/CGNAT/multicast/doc/unspecified). Use after DNS resolution to defeat
+/// hostname-based SSRF (a DNS name that resolves to an internal IP) — the
+/// string-level [`classify_api_endpoint`] only inspects IP *literals*.
+pub fn ip_is_routable(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => ipv4_routable(&v4),
+        std::net::IpAddr::V6(v6) => ipv6_routable(&v6),
+    }
+}
+
 fn ipv4_routable(ip: &std::net::Ipv4Addr) -> bool {
     if ip.is_loopback()
         || ip.is_private()
@@ -258,6 +269,10 @@ fn ipv6_routable(ip: &std::net::Ipv6Addr) -> bool {
     }
     if s[0] == 0x2001 && s[1] == 0x0db8 {
         return false; // documentation
+    }
+    if s[0] == 0x0064 && s[1] == 0xff9b {
+        return false; // NAT64 well-known prefix 64:ff9b::/96 (RFC 6052) — could
+                      // translate an embedded private IPv4 on a NAT64 deployment
     }
     true
 }

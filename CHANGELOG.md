@@ -5,6 +5,24 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.74.1] - 2026-06-14
+
+### Security
+
+- **Harden the `/channels/{id}/federate` SSRF surface** (audit follow-up to 0.74.0,
+  which shipped with a bypassable string guard). `host_url` is now validated with
+  `classify_api_endpoint` (rejects bad schemes / .onion / IP-literal private ranges),
+  then the host is RESOLVED and every resolved IP must pass `ip_is_routable`
+  (loopback/private/link-local/ULA/CGNAT/multicast/IPv4-mapped/NAT64/doc/unspecified,
+  v4+v6), and the channel fetch uses a dedicated **no-redirect** client — closing the
+  `[::1]` / `0.0.0.0` / `172.16/12` / decimal-IP / DNS→private / 3xx-redirect-to-
+  internal bypasses. Residual: DNS-rebinding TOCTOU (documented; F3 connect-to-pinned-IP).
+- **Per-wallet federation cap** (`MAX_FEDERATED_PER_WALLET = 256`) via a new
+  node-local `LOCAL_CHANNEL_FED` CF — bounds how many gossip-topic subscriptions one
+  wallet can drive (the endpoint previously had no cap; channel subscriptions have no
+  eviction yet — full unsubscribe/eviction tracked for F3). Storage errors on the
+  membership / federation-marker writes now surface instead of being swallowed.
+
 ## [0.74.0] - 2026-06-14
 
 Private-channel **federation** — F1 node foundation (mirrors the DM federation
