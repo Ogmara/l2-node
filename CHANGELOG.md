@@ -5,6 +5,17 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.74.2] - 2026-06-14
+
+### Fixed
+
+- **Federated private channels now carry the channel logo/banner.** A non-member
+  `get_channel` (used by `/federate` to fetch the channel record) only returned
+  display_name/slug/description, so a federated channel showed no icon. `logo_cid`
+  and `banner_cid` (public branding, not sensitive) are now included in the limited
+  response and stored in the federated `CHANNELS` record. New federations pick up the
+  logo; an already-federated channel needs to be re-federated to refresh it.
+
 ## [0.74.1] - 2026-06-14
 
 ### Security

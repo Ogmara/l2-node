@@ -1579,8 +1579,10 @@ pub async fn get_channel(
                         "channel_type": channel.get("channel_type").cloned().unwrap_or(serde_json::json!(2)),
                         "channel_id": channel_id,
                     });
-                    // Include safe display fields
-                    for key in ["display_name", "slug", "description"] {
+                    // Include safe display fields (logo/banner are public branding,
+                    // not sensitive — needed so a federating member's node can show
+                    // the channel's icon).
+                    for key in ["display_name", "slug", "description", "logo_cid", "banner_cid"] {
                         if let Some(v) = channel.get(key) {
                             limited[key] = v.clone();
                         }
@@ -2577,6 +2579,8 @@ pub async fn federate_channel(
             "slug": ch.get("slug").cloned().unwrap_or(serde_json::Value::Null),
             "display_name": ch.get("display_name").cloned().unwrap_or(serde_json::Value::Null),
             "description": ch.get("description").cloned().unwrap_or(serde_json::Value::Null),
+            "logo_cid": ch.get("logo_cid").cloned().unwrap_or(serde_json::Value::Null),
+            "banner_cid": ch.get("banner_cid").cloned().unwrap_or(serde_json::Value::Null),
             "creator": ch.get("creator").cloned().unwrap_or(serde_json::Value::Null),
             "member_count": ch.get("member_count").cloned().unwrap_or(serde_json::json!(0)),
             "federated_from": base,
