@@ -5,6 +5,22 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.73.0] - 2026-06-14
+
+### Fixed
+
+- **Private-channel messages now deliver live to members.** A private channel's
+  content must never hit the all-clients WS broadcast (privacy), so
+  `broadcast_channel_message` simply *returned* for private channels — meaning
+  members only saw new messages after a manual refetch (leave + re-enter the
+  channel). Now a private channel is delivered to its **members only** via a
+  targeted `Wallets` audience (the same model as DMs): privacy-safe (members are
+  authorized, content is encrypted, a member who left is no longer in
+  `CHANNEL_MEMBERS` so won't receive), and members get real-time updates. Covers
+  messages plus reactions/edits/deletes on private channels. New
+  `channel_member_addresses` helper. No client change required (the client already
+  appends `message` events for the open channel).
+
 ## [0.72.0] - 2026-06-14
 
 P2a — **node foundation for end-to-end-encrypted PRIVATE channels** (OECK). Not yet
