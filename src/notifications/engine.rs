@@ -233,18 +233,42 @@ impl NotificationEngine {
             .unwrap_or(false)
     }
 
+    /// Member wallet addresses of a channel (from `CHANNEL_MEMBERS`). Bounded scan.
+    fn channel_member_addresses(&self, channel_id: u64) -> Vec<String> {
+        let Some(storage) = self.storage.as_ref() else {
+            return Vec::new();
+        };
+        storage
+            .prefix_iter_cf(cf::CHANNEL_MEMBERS, &channel_id.to_be_bytes(), 4096)
+            .map(|entries| {
+                entries
+                    .into_iter()
+                    .filter_map(|(k, _)| {
+                        // key = channel_id_be8 ++ address
+                        if k.len() > 8 {
+                            String::from_utf8(k[8..].to_vec()).ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn broadcast_channel_message(
         &self,
         envelope: &Envelope,
         channel_id: u64,
         extra: &[(&str, serde_json::Value)],
     ) {
-        // PRIVACY (fail CLOSED): the broadcast fans out to ALL connected WS
-        // clients (they filter by channel_id client-side), so ONLY broadcast
-        // PUBLIC / READ-PUBLIC channels — never a private channel's content.
-        if !self.channel_is_public(channel_id) {
-            return;
-        }
+        // PRIVACY: a PUBLIC / READ-PUBLIC channel's content fans out to ALL
+        // connected clients (they filter by channel_id). A PRIVATE channel must
+        // NEVER hit that all-client broadcast — instead it's delivered ONLY to its
+        // members (targeted `Wallets` audience), which is privacy-safe (members are
+        // authorized, content is encrypted) and gives them LIVE updates. Without
+        // this, private-channel messages only appeared on a manual refetch.
+        let public = self.channel_is_public(channel_id);
         let mut val = match serde_json::to_value(envelope) {
             Ok(v) => v,
             Err(_) => return,
@@ -276,12 +300,18 @@ impl NotificationEngine {
         }
         let ws_msg = serde_json::json!({ "type": "message", "envelope": val });
         if let Ok(json) = serde_json::to_string(&ws_msg) {
-            // Public-channel content → every connected client (the guard above
-            // already returned for private channels).
-            let _ = self.ws_broadcast.send(Arc::new(WsOutbound {
-                audience: WsAudience::Everyone,
-                json,
-            }));
+            let audience = if public {
+                WsAudience::Everyone
+            } else {
+                // Private channel → members only. No members reachable (e.g. record
+                // missing) → nothing to deliver.
+                let members = self.channel_member_addresses(channel_id);
+                if members.is_empty() {
+                    return;
+                }
+                WsAudience::Wallets(members)
+            };
+            let _ = self.ws_broadcast.send(Arc::new(WsOutbound { audience, json }));
         }
     }
 
