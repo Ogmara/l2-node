@@ -299,18 +299,40 @@ pub fn validate_chat_delete(p: &DeletePayload) -> Result<(), ValidationError> {
 
 /// Validate a DM edit payload — content not empty, within chat length limits.
 pub fn validate_dm_edit(p: &EditPayload) -> Result<(), ValidationError> {
-    if p.content.is_empty() {
-        return Err(ValidationError("content must not be empty".into()));
+    // DMs are end-to-end encrypted: the new content rides as ciphertext in
+    // `enc_content` (sealed under the conv_key), never as the plaintext
+    // `content` String — which is an unused placeholder for DM edits.
+    let ct = p.enc_content.as_ref().ok_or_else(|| {
+        ValidationError("DM edit requires encrypted content (enc_content)".into())
+    })?;
+    if ct.is_empty() {
+        return Err(ValidationError("enc_content must not be empty".into()));
     }
-    if p.content.len() > MAX_CHAT_CONTENT {
+    if ct.len() > MAX_DM_CONTENT {
         return Err(ValidationError(format!(
-            "content too long: {} > {}",
-            p.content.len(),
-            MAX_CHAT_CONTENT
+            "enc_content too long: {} > {}",
+            ct.len(),
+            MAX_DM_CONTENT
         )));
     }
-    // DMs are end-to-end encrypted ciphertext; field-level overrides have no
-    // meaning. Reject explicit attempts.
+    if p.enc_nonce.is_none() {
+        return Err(ValidationError("DM edit requires enc_nonce".into()));
+    }
+    // Encrypted conversations start at epoch 1; epoch 0 is the legacy plaintext
+    // MVP and must never be used for an encrypted edit.
+    match p.key_epoch {
+        Some(e) if e >= 1 => {}
+        _ => return Err(ValidationError("DM edit requires key_epoch >= 1".into())),
+    }
+    // The plaintext `content` String is an unused placeholder for DM edits — it
+    // must be empty so a future code path that ever surfaces the raw edit envelope
+    // can never leak plaintext the user intended to encrypt.
+    if !p.content.is_empty() {
+        return Err(ValidationError(
+            "DM edit must not carry plaintext content".into(),
+        ));
+    }
+    // Field-level overrides have no meaning for an encrypted DM. Reject attempts.
     if p.title.is_some() || p.tags.is_some() || p.attachments.is_some() {
         return Err(ValidationError(
             "field overrides not allowed on DM edit".into(),
@@ -1046,6 +1068,9 @@ mod tests {
             title: None,
             tags: None,
             attachments: None,
+            enc_content: None,
+            enc_nonce: None,
+            key_epoch: None,
         }
     }
 
@@ -1140,10 +1165,45 @@ mod tests {
         assert!(validate_chat_edit(&p).is_err());
     }
 
+    /// A well-formed encrypted DM edit: ciphertext + 24-byte nonce + epoch ≥ 1.
+    fn encrypted_dm_edit() -> EditPayload {
+        let mut p = base_edit();
+        p.content = String::new(); // unused placeholder for DM edits
+        p.enc_content = Some(vec![0xAB; 48]);
+        p.enc_nonce = Some([0u8; 24]);
+        p.key_epoch = Some(1);
+        p
+    }
+
+    #[test]
+    fn dm_edit_accepts_encrypted_content() {
+        assert!(validate_dm_edit(&encrypted_dm_edit()).is_ok());
+    }
+
+    #[test]
+    fn dm_edit_rejects_missing_enc_content() {
+        // The legacy plaintext shape (no enc_content) must be rejected outright.
+        let p = base_edit();
+        assert!(validate_dm_edit(&p).is_err());
+    }
+
+    #[test]
+    fn dm_edit_rejects_epoch_zero() {
+        let mut p = encrypted_dm_edit();
+        p.key_epoch = Some(0);
+        assert!(validate_dm_edit(&p).is_err());
+    }
+
+    #[test]
+    fn dm_edit_rejects_missing_nonce() {
+        let mut p = encrypted_dm_edit();
+        p.enc_nonce = None;
+        assert!(validate_dm_edit(&p).is_err());
+    }
+
     #[test]
     fn dm_edit_rejects_any_override() {
-        let mut p = base_edit();
-        p.content = "c".into();
+        let mut p = encrypted_dm_edit();
         p.attachments = Some(vec![]);
         assert!(validate_dm_edit(&p).is_err());
     }

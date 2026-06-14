@@ -195,7 +195,9 @@ fn project_edited_payload(
     storage: &crate::storage::rocks::Storage,
 ) -> Option<Vec<u8>> {
     use crate::messages::envelope::Envelope;
-    use crate::messages::types::{ChatMessagePayload, EditPayload, MessageType, NewsPostPayload};
+    use crate::messages::types::{
+        ChatMessagePayload, DirectMessagePayload, EditPayload, MessageType, NewsPostPayload,
+    };
 
     // Helper: turn each decode/IO failure into a tracing warn so storage
     // corruption is observable instead of presenting as "the edit just
@@ -240,10 +242,11 @@ fn project_edited_payload(
 
     // Only message types whose Rust struct EditPayload can target are
     // handled. There is no `NewsCommentEdit` message type today (router
-    // dispatches only ChatEdit / DirectMessageEdit / NewsEdit), and DMs
-    // are encrypted ciphertext blobs whose validator forbids field
-    // overrides — so comments and DMs return None and the caller blanks
-    // the payload (consistent privacy fail-safe).
+    // dispatches only ChatEdit / DirectMessageEdit / NewsEdit), so comments
+    // return None and the caller blanks the payload (consistent privacy
+    // fail-safe). DM edits ARE handled: the edit carries fresh ciphertext
+    // (`enc_content`/`enc_nonce`/`key_epoch`) which replaces the original DM
+    // body so the projected payload decrypts exactly like a never-edited DM.
     // Re-encode with `to_vec_named` (struct → msgpack MAP), not `to_vec`
     // (struct → msgpack ARRAY). JS clients (`@msgpack/msgpack`) decode the
     // payload by field name — an array-encoded merge result deserializes as
@@ -276,6 +279,30 @@ fn project_edited_payload(
             if let Some(a) = edit.attachments { p.attachments = a; }
             rmp_serde::to_vec_named(&p)
                 .map_err(|e| warn_decode("chat_reencode", &e))
+                .ok()
+        }
+        MessageType::DirectMessage => {
+            let mut p: DirectMessagePayload = match rmp_serde::from_slice(&orig_env.payload) {
+                Ok(v) => v,
+                Err(e) => { warn_decode("dm_decode", &e); return None; }
+            };
+            // The encrypted edit replaces the DM body wholesale: new ciphertext,
+            // new nonce, and (if the conversation re-keyed) new epoch. Absent
+            // ciphertext means an unrecoverable edit → None → caller blanks the
+            // payload (a redacting edit must never reveal the pre-edit content).
+            let ct = match edit.enc_content {
+                Some(c) => c,
+                None => { warn_decode("dm_edit_no_ct", &"missing enc_content"); return None; }
+            };
+            let nonce = match edit.enc_nonce {
+                Some(n) => n,
+                None => { warn_decode("dm_edit_no_nonce", &"missing enc_nonce"); return None; }
+            };
+            p.content = ct;
+            p.nonce = nonce;
+            if let Some(e) = edit.key_epoch { p.key_epoch = e; }
+            rmp_serde::to_vec_named(&p)
+                .map_err(|e| warn_decode("dm_reencode", &e))
                 .ok()
         }
         _ => None,
