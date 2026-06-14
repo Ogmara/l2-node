@@ -2543,14 +2543,19 @@ pub async fn federate_channel(
         }
     }
 
-    // --- Fetch + store the channel record if absent (never clobber a hosted one) ---
-    let have_channel = state
+    // --- Fetch + store/REFRESH the channel record, unless this node HOSTS it ---
+    // Refresh (not just create-if-absent) so a federated channel picks up updated
+    // metadata (e.g. a logo set after the first federation). Never touch a channel
+    // this node hosts: a record WITHOUT `federated_from` is authoritative here.
+    let hosted_here = state
         .storage
         .get_cf(cf::CHANNELS, &channel_id.to_be_bytes())
         .ok()
         .flatten()
-        .is_some();
-    if !have_channel {
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .map(|v| v.get("federated_from").is_none())
+        .unwrap_or(false);
+    if !hosted_here {
         let http = match reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::none())
