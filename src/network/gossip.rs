@@ -127,6 +127,26 @@ impl TopicManager {
         }
     }
 
+    /// Unsubscribe from a user's DM topic (LRU eviction of a local DM user,
+    /// l2-node 0.69.0+). No-op if not currently subscribed. Returns `true` iff
+    /// a subscription was actually removed.
+    pub fn unsubscribe_dm(
+        &mut self,
+        swarm: &mut Swarm<OgmaraBehaviour>,
+        address: &str,
+    ) -> bool {
+        if self.subscribed_dms.remove(address) {
+            let topic = IdentTopic::new(dm_topic(&self.network_id, address));
+            match swarm.behaviour_mut().gossipsub.unsubscribe(&topic) {
+                true => debug!(topic = %topic, "Unsubscribed from DM topic"),
+                false => debug!(topic = %topic, "Was not subscribed to DM topic"),
+            }
+            true
+        } else {
+            false
+        }
+    }
+
     /// Get the set of subscribed channel IDs.
     pub fn subscribed_channels(&self) -> &HashSet<u64> {
         &self.subscribed_channels

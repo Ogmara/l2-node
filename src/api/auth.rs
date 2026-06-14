@@ -275,6 +275,13 @@ fn extract_and_verify(req: &Request, app_state: &AppState) -> Result<(AuthUser, 
             scopes: crate::network::identity_sync::SCOPE_ALL,
         });
 
+    // DM offline store-and-forward Phase 1: register this wallet as a local DM
+    // user so the node persistently subscribes to its DM gossip topic and
+    // receives its cross-node DMs even while offline (REST-only clients get the
+    // same coverage as WS clients this way). The network task dedups per session,
+    // so firing per request is cheap; `let _ =` ignores a closed channel.
+    let _ = app_state.dm_subscribe_tx.send(resolved_address.clone());
+
     Ok((
         AuthUser {
             address: resolved_address,

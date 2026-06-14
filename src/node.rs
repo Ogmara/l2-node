@@ -363,6 +363,9 @@ impl Node {
             // cloned snapshot used both for the cold-join trigger
             // (subscribe_channel) and the responder-side rate limits.
             self.config.backfill.clone(),
+            // Spec 3 §dm-offline-store-and-forward (l2-node 0.69.0+) —
+            // persistent DM-subscription cap/LRU + dm-sync backfill window.
+            self.config.dm.clone(),
         )
         .await
         .context("starting network service")?;
