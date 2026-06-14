@@ -1399,6 +1399,10 @@ fn gossip_topic_for_envelope(
         | MessageType::ChatReaction | MessageType::ChannelPinMessage
         | MessageType::ChannelUnpinMessage | MessageType::ChannelJoin
         | MessageType::ChannelLeave
+        // Kick/Ban MUST gossip so a removed member is dropped on every member's
+        // node (federation) — not just the host. authorize_channel_action gates
+        // them to mods on every ingest path, so a relayed kick/ban can't be forged.
+        | MessageType::ChannelKick | MessageType::ChannelBan
         // ChannelUpdate carries channel metadata (display_name, description,
         // logo_cid, banner_cid, …). It was previously NOT gossiped, so a
         // channel's logo/metadata only ever existed on the node where it was

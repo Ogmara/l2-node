@@ -5,6 +5,39 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.75.0] - 2026-06-14
+
+### Added
+
+- **Live private-channel membership push (`channel_members_changed`).** On
+  `ChannelJoin`/`ChannelLeave`/`ChannelKick`/`ChannelBan` for a KNOWN-private channel,
+  the node now emits a member-targeted WebSocket event
+  `{type:"channel_members_changed", channel_id, action, member}` to the channel's
+  members (`WsAudience::Wallets`), plus the removed member on kick/ban/leave. This is the
+  reliable E2E key-delivery path: an existing member's client wraps the channel epoch key
+  to a new joiner on receipt, so key delivery no longer depends on a member actively
+  viewing the channel. Fires on BOTH the API-post and gossip-receive paths, so it reaches
+  members on every federated node. Gated on `channel_is_known_private` (channel_type==2,
+  fail-closed when metadata is absent) so public channels never get a spurious push.
+
+### Changed
+
+- **`ChannelKick` + `ChannelBan` now gossip to the channel topic** (previously only
+  `ChannelJoin`/`ChannelLeave` did). Removals therefore propagate to every member's home
+  node in a federated private channel — not just the host. `authorize_channel_action`
+  re-gates kick/ban to mods on every ingest path (including relayed gossip), so a
+  propagated removal cannot be forged.
+
+### Security
+
+- `cargo audit`: 2 pre-existing transitive advisories remain, NOT introduced by this
+  change (no dependency was added/changed): `paste` (RUSTSEC-2024-0436, unmaintained,
+  build-time proc-macro, no patch published), `rand` 0.8.5 (RUSTSEC-2026-0097, unsound
+  only when used as a custom logger via `rand::rng()` — we log via `tracing`, so not
+  applicable), and yanked `core2` 0.4.0. The `rand` major bump is deferred to a dedicated
+  dependency change to avoid a cross-cutting migration mid-feature. JS clients
+  (`npm audit`): 0 vulnerabilities.
+
 ## [0.74.3] - 2026-06-14
 
 ### Fixed
