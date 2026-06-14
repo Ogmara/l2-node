@@ -5,6 +5,15 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.74.3] - 2026-06-14
+
+### Fixed
+
+- **Federate now REFRESHES a federated channel's metadata** (not just create-if-absent),
+  so a federated private channel picks up a logo/display-name set after the first
+  federation. A channel this node HOSTS (record without `federated_from`) is still never
+  touched. Pairs with the client re-federating on an invite-link join.
+
 ## [0.74.2] - 2026-06-14
 
 ### Fixed
