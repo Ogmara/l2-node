@@ -2452,6 +2452,98 @@ pub async fn update_profile(
     }
 }
 
+#[derive(serde::Deserialize)]
+pub struct FederateRequest {
+    /// The host node URL the private channel lives on (from the invite link).
+    pub host_url: String,
+}
+
+/// POST /api/v1/channels/:channel_id/federate — federate a PRIVATE channel hosted
+/// on another node to THIS (the caller's home) node (F1 federation).
+///
+/// Private channels are host-node-scoped; rather than make the member switch their
+/// whole app to the host node, the member's home node fetches the channel record
+/// from the host, records local membership, and subscribes to the channel's gossip
+/// topic — so the channel's encrypted messages + key envelopes flow here live (they
+/// already gossip to `channel_topic(channel_id)`) and the member never leaves their
+/// node. The node learns only ciphertext + membership/timing, never content.
+/// Idempotent.
+pub async fn federate_channel(
+    Extension(state): Extension<Arc<AppState>>,
+    Extension(auth_user): Extension<AuthUser>,
+    Path(channel_id): Path<u64>,
+    Json(req): Json<FederateRequest>,
+) -> impl IntoResponse {
+    let caller = auth_user.address;
+    let host = req.host_url.trim_end_matches('/').to_string();
+    // Basic SSRF guard: https only, and not an obvious internal host. Full
+    // allowlist/private-IP hardening is tracked for F3.
+    let host_ok = host.starts_with("https://")
+        && !host.contains("localhost")
+        && !host.contains("127.0.0.1")
+        && !host.contains("://10.")
+        && !host.contains("://192.168.")
+        && !host.contains("://169.254.");
+    if !host_ok {
+        return (StatusCode::BAD_REQUEST, "host_url must be a public https URL").into_response();
+    }
+
+    // Fetch + store the channel record if we don't already have it.
+    let have_channel = state
+        .storage
+        .get_cf(cf::CHANNELS, &channel_id.to_be_bytes())
+        .ok()
+        .flatten()
+        .is_some();
+    if !have_channel {
+        let url = format!("{}/api/v1/channels/{}", host, channel_id);
+        let resp = match state.klever_view_http.get(&url).send().await {
+            Ok(r) if r.status().is_success() => r,
+            _ => return (StatusCode::BAD_GATEWAY, "could not reach host channel").into_response(),
+        };
+        let detail: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(_) => return (StatusCode::BAD_GATEWAY, "invalid host channel response").into_response(),
+        };
+        let ch = detail.get("channel").cloned().unwrap_or(serde_json::Value::Null);
+        let ctype = ch.get("channel_type").and_then(|v| v.as_u64()).unwrap_or(0);
+        if ctype != 2 {
+            return (StatusCode::BAD_REQUEST, "only private channels need federation").into_response();
+        }
+        let meta = serde_json::json!({
+            "channel_id": channel_id,
+            "channel_type": 2u8,
+            "slug": ch.get("slug").cloned().unwrap_or(serde_json::Value::Null),
+            "display_name": ch.get("display_name").cloned().unwrap_or(serde_json::Value::Null),
+            "description": ch.get("description").cloned().unwrap_or(serde_json::Value::Null),
+            "creator": ch.get("creator").cloned().unwrap_or(serde_json::Value::Null),
+            "member_count": ch.get("member_count").cloned().unwrap_or(serde_json::json!(0)),
+            "federated_from": host,
+        });
+        if let Ok(bytes) = serde_json::to_vec(&meta) {
+            if let Err(e) = state.storage.put_cf(cf::CHANNELS, &channel_id.to_be_bytes(), &bytes) {
+                return (StatusCode::INTERNAL_SERVER_ERROR, format!("storage error: {}", e)).into_response();
+            }
+        }
+    }
+
+    // Record the caller as a local member so this node can serve them the channel
+    // (private-channel reads are membership-gated). Their ChannelJoin envelope
+    // (sent separately by the client) gossips the membership to the host + members.
+    let member_key = crate::storage::schema::encode_channel_member_key(channel_id, &caller);
+    if state.storage.get_cf(cf::CHANNEL_MEMBERS, &member_key).ok().flatten().is_none() {
+        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+        let rec = serde_json::json!({ "joined_at": now_ms, "role": "member" });
+        let _ = state.storage.put_cf(cf::CHANNEL_MEMBERS, &member_key, rec.to_string().as_bytes());
+    }
+
+    // Subscribe to the channel's gossip topic (reuses the chain-scanner subscribe
+    // path) so its messages + key envelopes flow here live.
+    let _ = state.channel_subscribe_tx.send(channel_id);
+
+    Json(serde_json::json!({ "federated": true, "channel_id": channel_id })).into_response()
+}
+
 /// POST /api/v1/dm/:address — send an encrypted DM
 pub async fn send_dm(
     Extension(state): Extension<Arc<AppState>>,

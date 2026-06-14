@@ -255,6 +255,11 @@ pub struct AppState {
     /// Tells the network task to subscribe to a wallet's DM gossip topic so this
     /// node receives that user's cross-node DMs. Sent on each WS connect.
     pub dm_subscribe_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    /// Tells the network task to subscribe to a channel's gossip topic so this
+    /// node receives that channel's cross-node messages/keys (private-channel
+    /// federation, F1). Fired by the `/channels/{id}/federate` endpoint. Reuses the
+    /// same subscribe path the chain scanner uses for public channels.
+    pub channel_subscribe_tx: tokio::sync::mpsc::UnboundedSender<u64>,
     /// Connected Ogmara peers (keyed by node_id), updated by the network layer.
     /// Used by `/api/v1/network/nodes` to include peers that haven't announced yet.
     pub connected_peers: Arc<RwLock<HashMap<String, ConnectedPeerInfo>>>,
@@ -464,6 +469,7 @@ impl AppState {
         let (gossip_tx, _) = tokio::sync::mpsc::unbounded_channel();
         let (identity_sync_tx, _) = tokio::sync::mpsc::unbounded_channel();
         let (dm_subscribe_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let (channel_subscribe_tx, _) = tokio::sync::mpsc::unbounded_channel();
         let counters = Arc::new(NetworkCounters::new());
         let metrics_latest = Arc::new(RwLock::new(MetricsSnapshot::default()));
         let metrics_history = Arc::new(RwLock::new(RingBuffer::new(1440)));
@@ -487,6 +493,7 @@ impl AppState {
             gossip_tx,
             identity_sync_tx,
             dm_subscribe_tx,
+            channel_subscribe_tx,
             Arc::new(RwLock::new(HashMap::new())),
             counters,
             metrics_latest,
@@ -539,6 +546,7 @@ impl AppState {
         gossip_tx: tokio::sync::mpsc::UnboundedSender<crate::network::GossipPublish>,
         identity_sync_tx: tokio::sync::mpsc::UnboundedSender<crate::network::IdentitySyncCommand>,
         dm_subscribe_tx: tokio::sync::mpsc::UnboundedSender<String>,
+        channel_subscribe_tx: tokio::sync::mpsc::UnboundedSender<u64>,
         connected_peers: Arc<RwLock<HashMap<String, ConnectedPeerInfo>>>,
         counters: Arc<NetworkCounters>,
         metrics_latest: Arc<RwLock<MetricsSnapshot>>,
@@ -630,6 +638,7 @@ impl AppState {
             gossip_tx,
             identity_sync_tx,
             dm_subscribe_tx,
+            channel_subscribe_tx,
             connected_peers,
             counters,
             metrics_latest,

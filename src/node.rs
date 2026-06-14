@@ -393,8 +393,11 @@ impl Node {
             });
         }
 
-        // Channel for chain scanner → network layer topic subscriptions
+        // Channel for chain scanner → network layer topic subscriptions. Cloned for
+        // AppState so the `/channels/{id}/federate` endpoint can subscribe to a
+        // private channel's topic on demand (F1 federation) via the same path.
         let (channel_tx, channel_rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+        let channel_subscribe_tx = channel_tx.clone();
 
         // Channel for API layer → network layer GossipSub publishing
         let (gossip_tx, gossip_rx) =
@@ -1048,6 +1051,7 @@ impl Node {
             gossip_tx,
             identity_sync_tx,
             dm_subscribe_tx,
+            channel_subscribe_tx,
             connected_peers,
             network_counters,
             metrics_latest,
