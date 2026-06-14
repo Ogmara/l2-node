@@ -765,6 +765,35 @@ pub fn validate_settings_sync(p: &SettingsSyncPayload) -> Result<(), ValidationE
     Ok(())
 }
 
+/// Maximum encrypted key-vault size: 2 MB. The vault holds one symmetric key per
+/// (channel, epoch) and per DM conversation; 2 MB accommodates tens of thousands of
+/// keys (~48 bytes each pre-encryption) while bounding storage/DoS amplification.
+pub const MAX_KEY_VAULT_SIZE: usize = 2 * 1_048_576;
+
+/// Validate a key-vault sync payload (E2E P3). The node never decrypts the blob;
+/// it only enforces size + nonce + format bounds and stores the latest copy.
+pub fn validate_key_vault_sync(p: &KeyVaultSyncPayload) -> Result<(), ValidationError> {
+    if p.encrypted_vault.is_empty() {
+        return Err(ValidationError("encrypted_vault must not be empty".into()));
+    }
+    if p.encrypted_vault.len() > MAX_KEY_VAULT_SIZE {
+        return Err(ValidationError(format!(
+            "encrypted_vault too large: {} > {} bytes",
+            p.encrypted_vault.len(),
+            MAX_KEY_VAULT_SIZE
+        )));
+    }
+    // XChaCha20-Poly1305 ciphertext must at least carry the 16-byte Poly1305 tag;
+    // `nonce` is fixed-width ([u8; 24]) by the type, so it needs no length check.
+    if p.encrypted_vault.len() < 16 {
+        return Err(ValidationError("encrypted_vault too small to be valid AEAD".into()));
+    }
+    if p.format_version == 0 {
+        return Err(ValidationError("key-vault format_version must be >= 1".into()));
+    }
+    Ok(())
+}
+
 /// Validate a device revocation payload.
 pub fn validate_device_revocation(p: &DeviceRevocationPayload) -> Result<(), ValidationError> {
     // 32-byte Ed25519 public key, hex-encoded = 64 chars

@@ -57,6 +57,7 @@ pub enum MessageType {
     Unfollow = 0x35,
     DeviceEncBinding = 0x36,
     DeviceEncRevoke = 0x37,
+    KeyVaultSync = 0x38,
 
     // Moderation
     Report = 0x40,
@@ -120,6 +121,7 @@ impl MessageType {
             0x35 => Some(Self::Unfollow),
             0x36 => Some(Self::DeviceEncBinding),
             0x37 => Some(Self::DeviceEncRevoke),
+            0x38 => Some(Self::KeyVaultSync),
             0x40 => Some(Self::Report),
             0x41 => Some(Self::CounterVote),
             0x42 => Some(Self::ChannelMute),
@@ -373,6 +375,19 @@ pub struct ChannelCreatePayload {
     pub content_rating: ContentRating,
     /// Moderation policy.
     pub moderation: ModerationPolicy,
+    /// P4 OECK: whether message content is E2E-encrypted in this channel (§8.1).
+    /// `None` = client omitted it (legacy client) → the node defaults it: Private
+    /// channels are always encrypted; new Public/ReadPublic channels from updated
+    /// clients send `Some(true)` (encryption is forced on, no user toggle). Legacy
+    /// public channels (field absent) stay plaintext (v1) — dual-read on clients.
+    /// Immutable once set (you cannot retroactively un-encrypt a channel).
+    #[serde(default)]
+    pub encryption_enabled: Option<bool>,
+    /// P4 D3 history visibility: `0` = ForwardOnly (joiner gets only the current
+    /// epoch key), `1` = FullHistory (joiner gets all retained epoch keys). `None`
+    /// defaults by type: Private → ForwardOnly, Public/ReadPublic → FullHistory.
+    #[serde(default)]
+    pub history_visibility: Option<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -680,6 +695,26 @@ pub struct SettingsSyncPayload {
     pub key_epoch: u64,
 }
 
+/// Wallet-encrypted E2E key-recovery vault (protocol §2.5 / E2E plan D4 / P3).
+///
+/// Holds the user's symmetric content keys — DM `conv_key`s and channel epoch
+/// `channel_key`s — sealed under a backup key derived deterministically from the
+/// wallet's `signMessage("ogmara-keyvault-v1")`, so a fresh device can restore full
+/// message history without ever exposing the wallet private key. The blob is
+/// **opaque to the node** (XChaCha20-Poly1305; the node never holds the backup key).
+/// Stored per-wallet in the `key_vault` CF, parallel to `settings_sync`; never
+/// gossiped, never in snapshots. Last-write-wins on the owner's own record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyVaultSyncPayload {
+    /// XChaCha20-Poly1305 ciphertext of `msgpack(keyring)`.
+    pub encrypted_vault: Vec<u8>,
+    /// XChaCha20-Poly1305 nonce (24 bytes).
+    pub nonce: [u8; 24],
+    /// Vault payload format version (currently 1) — lets clients evolve the
+    /// inner keyring schema without a new message type.
+    pub format_version: u8,
+}
+
 // --- Social Payloads (Follow/Unfollow) ---
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -969,6 +1004,7 @@ pub fn deserialize_payload(
         MessageType::Unfollow => Ok(DeserializedPayload::Unfollow(rmp_serde::from_slice(payload_bytes)?)),
         MessageType::DeviceEncBinding => Ok(DeserializedPayload::DeviceEncBinding(rmp_serde::from_slice(payload_bytes)?)),
         MessageType::DeviceEncRevoke => Ok(DeserializedPayload::DeviceEncRevoke(rmp_serde::from_slice(payload_bytes)?)),
+        MessageType::KeyVaultSync => Ok(DeserializedPayload::KeyVaultSync(rmp_serde::from_slice(payload_bytes)?)),
         MessageType::Report => Ok(DeserializedPayload::Report(rmp_serde::from_slice(payload_bytes)?)),
         MessageType::CounterVote => Ok(DeserializedPayload::CounterVote(rmp_serde::from_slice(payload_bytes)?)),
         MessageType::ChannelMute => Ok(DeserializedPayload::ChannelMute(rmp_serde::from_slice(payload_bytes)?)),
@@ -1010,6 +1046,7 @@ pub enum DeserializedPayload {
     DeviceDelegation(DeviceDelegationPayload),
     DeviceRevocation(DeviceRevocationPayload),
     SettingsSync(SettingsSyncPayload),
+    KeyVaultSync(KeyVaultSyncPayload),
     Follow(FollowPayload),
     Unfollow(UnfollowPayload),
     DeviceEncBinding(DeviceEncBindingPayload),

@@ -162,6 +162,11 @@ pub mod cf {
 
     /// wallet_address bytes → encrypted settings blob (SettingsSyncPayload serialized)
     pub const SETTINGS_SYNC: &str = "settings_sync";
+    /// wallet_address bytes → encrypted E2E key-recovery vault (KeyVaultSyncPayload
+    /// serialized to JSON). Opaque to the node (sealed under a wallet-signMessage-derived
+    /// backup key). Per-wallet, last-write-wins; never gossiped, EXCLUDED from snapshot
+    /// DOMAIN_CFS (user-private secret material — same rationale as `settings_sync`).
+    pub const KEY_VAULT: &str = "key_vault";
     /// (target_address, !timestamp:8, notification_id:32) → Notification JSON
     /// Reverse-chronological order. 30-day retention.
     pub const NOTIFICATIONS: &str = "notifications";
@@ -268,6 +273,7 @@ pub mod cf {
         COUNTER_VOTES,
         CHANNEL_MUTES,
         SETTINGS_SYNC,
+        KEY_VAULT,
         NOTIFICATIONS,
         PRIVATE_CHANNEL_KEYS,
         PRIVATE_CHANNEL_ANCHORS,

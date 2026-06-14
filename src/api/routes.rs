@@ -1590,7 +1590,10 @@ pub async fn get_channel(
                     // Include safe display fields (logo/banner are public branding,
                     // not sensitive — needed so a federating member's node can show
                     // the channel's icon).
-                    for key in ["display_name", "slug", "description", "logo_cid", "banner_cid"] {
+                    for key in [
+                        "display_name", "slug", "description", "logo_cid", "banner_cid",
+                        "encryption_enabled", "history_visibility",
+                    ] {
                         if let Some(v) = channel.get(key) {
                             limited[key] = v.clone();
                         }
@@ -5083,6 +5086,29 @@ pub async fn get_settings(
         Ok(None) => (StatusCode::NOT_FOUND, "no settings found").into_response(),
         Err(e) => {
             tracing::error!(error = %e, "Failed to get settings");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+        }
+    }
+}
+
+/// GET /api/v1/key-vault — retrieve the caller's encrypted E2E key-recovery vault
+/// (authenticated, host-bound). The blob is opaque to the node; only the owner can
+/// decrypt it with their wallet-derived backup key. (E2E P3 / protocol §2.5)
+pub async fn get_key_vault(
+    Extension(state): Extension<Arc<AppState>>,
+    Extension(auth_user): Extension<AuthUser>,
+) -> impl IntoResponse {
+    match state.storage.get_key_vault(&auth_user.address) {
+        Ok(Some(data)) => match serde_json::from_slice::<serde_json::Value>(&data) {
+            Ok(json) => Json(json).into_response(),
+            Err(e) => {
+                tracing::error!(error = %e, "Stored key vault is not valid JSON");
+                (StatusCode::INTERNAL_SERVER_ERROR, "corrupt vault").into_response()
+            }
+        },
+        Ok(None) => (StatusCode::NOT_FOUND, "no key vault found").into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to get key vault");
             (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
         }
     }

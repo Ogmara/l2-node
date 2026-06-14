@@ -245,6 +245,8 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
         .route("/api/v1/devices", get(routes::list_devices))
         // Settings sync
         .route("/api/v1/settings", get(routes::get_settings))
+        // E2E key-recovery vault (publish flows through 0x38 message ingestion)
+        .route("/api/v1/key-vault", get(routes::get_key_vault))
         // Account data export
         .route("/api/v1/account/export", get(routes::export_account))
         .layer(middleware::from_fn(auth::auth_middleware));

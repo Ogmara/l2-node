@@ -50,6 +50,7 @@ enum RateCategory {
     ModeratorChange,   // 10 per day
     ChannelInvite,     // 20 per hour
     PinUnpin,          // 20 per hour
+    KeyVault,          // 10 per minute (E2E vault — debounced LWW republish)
     Other,             // fallback: 100 per minute
 }
 
@@ -65,6 +66,9 @@ impl RateCategory {
             Self::ModeratorChange => (10, 86_400_000),
             Self::ChannelInvite => (20, 3_600_000),
             Self::PinUnpin => (20, 3_600_000),
+            // Legit clients publish a 4 s-debounced last-write-wins vault; 10/min is
+            // generous for that while bounding the 2 MB-per-write storage churn.
+            Self::KeyVault => (10, 60_000),
             Self::Other => (100, 60_000),
         }
     }
@@ -86,9 +90,37 @@ impl RateCategory {
             | MessageType::PrivateChannelKeyDistribution => Self::ModeratorChange,
             MessageType::ChannelInvite => Self::ChannelInvite,
             MessageType::ChannelPinMessage | MessageType::ChannelUnpinMessage => Self::PinUnpin,
+            MessageType::KeyVaultSync => Self::KeyVault,
             _ => Self::Other,
         }
     }
+}
+
+/// P4: resolve a new channel's `(encryption_enabled, history_visibility)` from the
+/// `ChannelCreate` payload, applying type-based defaults when the (legacy) client
+/// omitted them. Private channels are always encrypted + ForwardOnly; Public/
+/// ReadPublic default to NOT-encrypted when the field is absent (legacy plaintext
+/// channels) but updated clients send `Some(true)` (encryption forced on for new
+/// public channels) — and they default to FullHistory.
+fn channel_encryption_defaults(payload: &ChannelCreatePayload) -> (bool, u8) {
+    let is_private = matches!(payload.channel_type, ChannelType::Private);
+    // Private channels are ALWAYS encrypted — never trust a client `Some(false)`
+    // to create a plaintext private channel (that would silently break the
+    // confidentiality guarantee + accept plaintext via `check_channel_encryption_required`).
+    let enc = is_private || payload.encryption_enabled.unwrap_or(false);
+    // 0 = ForwardOnly, 1 = FullHistory. Clamp an out-of-range client value to the
+    // type default rather than storing an undefined visibility.
+    let hist = match payload.history_visibility {
+        Some(v) if v <= 1 => v,
+        _ => {
+            if is_private {
+                0
+            } else {
+                1
+            }
+        }
+    };
+    (enc, hist)
 }
 
 /// Max active encryption keys retained per wallet (protocol §2.4). Bounds the
@@ -356,6 +388,12 @@ impl MessageRouter {
         // channels. Reactions remain open to all members. See protocol spec §3.6.
         if let Err(e) = self.check_readonly_channel(&envelope, &resolved_author) {
             return RouteResult::Rejected(format!("broadcast_channel_post_denied: {}", e));
+        }
+
+        // Step 7f (P4): an `encryption_enabled` channel rejects plaintext-text chat
+        // (no-downgrade guarantee). Encrypted + attachment-only messages pass.
+        if let Err(e) = self.check_channel_encryption_required(&envelope) {
+            return RouteResult::Rejected(format!("channel_encryption_required: {}", e));
         }
 
         // Step 8: Store message (atomically increments total_messages counter)
@@ -822,6 +860,9 @@ impl MessageRouter {
                 DeserializedPayload::SettingsSync(ref p) => {
                     validation::validate_settings_sync(p)
                 }
+                DeserializedPayload::KeyVaultSync(ref p) => {
+                    validation::validate_key_vault_sync(p)
+                }
                 DeserializedPayload::DeviceRevocation(ref p) => {
                     validation::validate_device_revocation(p)
                 }
@@ -913,6 +954,51 @@ impl MessageRouter {
     /// channel_type) so creators can flip broadcast mode at runtime via
     /// `ChannelUpdate`. If the channel record is missing, the check is a
     /// no-op — other pipeline steps already reject orphan messages.
+    /// P4: enforce that a channel marked `encryption_enabled` does not accept a
+    /// PLAINTEXT-text `ChatMessage` (a downgrade that would leak content in a
+    /// channel whose whole point is anti-bulk-readout). Attachment-only messages
+    /// (empty `content`, no `enc_content`) and properly-encrypted messages
+    /// (`enc_content` present) are allowed; attachments aren't encrypted until P5.
+    /// Legacy channels (no `encryption_enabled` flag) are unaffected (dual-read).
+    /// Only gates `ChatMessage` (edits carry their own enc fields, validated in
+    /// `validate_dm_edit`/chat-edit; deletes carry no content).
+    fn check_channel_encryption_required(&self, envelope: &Envelope) -> Result<(), String> {
+        if envelope.msg_type != MessageType::ChatMessage {
+            return Ok(());
+        }
+        let payload = match rmp_serde::from_slice::<ChatMessagePayload>(&envelope.payload) {
+            Ok(p) => p,
+            Err(_) => return Ok(()), // malformed → let validation reject it
+        };
+        // Fast path: an encrypted message (`enc_content` present) or one with no
+        // plaintext text (attachment-only / empty) is ALWAYS allowed — skip the
+        // channel-record read entirely. Only a plaintext-text message needs the
+        // per-channel `encryption_enabled` check below.
+        if payload.enc_content.is_some() || payload.content.is_empty() {
+            return Ok(());
+        }
+        let key = payload.channel_id.to_be_bytes();
+        let data = match self.storage.get_cf(schema::cf::CHANNELS, &key) {
+            Ok(Some(d)) => d,
+            _ => return Ok(()), // unknown/corrupt channel → not our gate
+        };
+        let meta: serde_json::Value = match serde_json::from_slice(&data) {
+            Ok(m) => m,
+            Err(_) => return Ok(()),
+        };
+        let encrypted = meta
+            .get("encryption_enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if encrypted && payload.enc_content.is_none() && !payload.content.is_empty() {
+            return Err(format!(
+                "channel {} is encrypted; plaintext content is not accepted",
+                payload.channel_id
+            ));
+        }
+        Ok(())
+    }
+
     fn check_readonly_channel(&self, envelope: &Envelope, resolved_author: &str) -> Result<(), String> {
         // Only gates write actions on chat content. Reactions and admin/control
         // messages have their own authorization paths.
@@ -1758,6 +1844,16 @@ impl MessageRouter {
                                             serde_json::json!(payload.description),
                                         );
                                     }
+                                    // P4: seed encryption flags on a chain-scanned
+                                    // skeleton from the creator's L2 ChannelCreate.
+                                    // `or_insert` keeps them IMMUTABLE — a later
+                                    // ChannelCreate replay can't flip encryption off.
+                                    let (enc_enabled, hist_vis) =
+                                        channel_encryption_defaults(&payload);
+                                    obj.entry("encryption_enabled")
+                                        .or_insert(serde_json::json!(enc_enabled));
+                                    obj.entry("history_visibility")
+                                        .or_insert(serde_json::json!(hist_vis));
                                     let bytes = serde_json::to_vec(&meta)
                                         .context("serializing merged channel metadata")?;
                                     self.storage.put_cf(schema::cf::CHANNELS, &key, &bytes)?;
@@ -1775,6 +1871,7 @@ impl MessageRouter {
                         // yet chain-scanned). Create the full record; the chain
                         // scanner merges its on-chain fields later if/when it
                         // sees the event (it preserves these L2 fields).
+                        let (enc_enabled, hist_vis) = channel_encryption_defaults(&payload);
                         let meta = serde_json::json!({
                             "channel_id": payload.channel_id,
                             "slug": payload.slug,
@@ -1784,6 +1881,8 @@ impl MessageRouter {
                             "display_name": payload.display_name,
                             "description": payload.description,
                             "member_count": 0,
+                            "encryption_enabled": enc_enabled,
+                            "history_visibility": hist_vis,
                         });
                         let meta_bytes = serde_json::to_vec(&meta)
                             .context("serializing channel metadata")?;
@@ -2222,6 +2321,27 @@ impl MessageRouter {
                     debug!(author = %resolved_author, "Settings synced");
                 }
             }
+            MessageType::KeyVaultSync => {
+                // E2E P3 (protocol §2.5): store the wallet-encrypted key-recovery
+                // vault. Opaque to the node; persisted as JSON so the owner can
+                // retrieve {encrypted_vault, nonce, format_version} for restore.
+                // Last-write-wins per wallet — only the verified signer can write
+                // their own record (auth is the envelope signature).
+                if let Ok(payload) =
+                    rmp_serde::from_slice::<KeyVaultSyncPayload>(&envelope.payload)
+                {
+                    let json = serde_json::json!({
+                        "encrypted_vault": payload.encrypted_vault,
+                        "nonce": payload.nonce,
+                        "format_version": payload.format_version,
+                    });
+                    self.storage.store_key_vault(
+                        resolved_author,
+                        json.to_string().as_bytes(),
+                    )?;
+                    debug!(author = %resolved_author, "Key vault synced");
+                }
+            }
             MessageType::DeviceEncBinding => {
                 // P0 E2E (protocol §2.4): record a per-device X25519 encryption public
                 // key so senders can wrap message keys to each of this wallet's devices.
@@ -2617,11 +2737,19 @@ impl MessageRouter {
                                     break;
                                 }
                             }
+                            // Purge the user's most sensitive per-account artifacts:
+                            // the E2E key-recovery vault (all DM/channel content keys)
+                            // and the encrypted settings blob. Local to this node;
+                            // other nodes purge as the DeletionRequest reaches them.
+                            // (Security audit 2026-06-14, Sec-W1.)
+                            self.storage.delete_key_vault(resolved_author)?;
+                            self.storage.delete_settings(resolved_author)?;
                             warn!(
                                 author = %resolved_author,
                                 news_posts_marked = deleted_count,
-                                "AllUserContent deletion: marked news posts. \
-                                 Channel message deletion is not yet implemented."
+                                "AllUserContent deletion: marked news posts, purged key \
+                                 vault + settings. Channel message deletion is not yet \
+                                 implemented."
                             );
                         }
                     }

@@ -5,6 +5,72 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.79.0] - 2026-06-14
+
+### Added
+
+- **Encrypted public/ReadPublic channels (P4 / protocol §8.1) — node carrier.** The
+  encrypted-channel content carrier (`enc_content`/`enc_nonce`/`key_epoch`, P2) already
+  worked for any channel type; P4 adds the per-channel policy so clients know to encrypt.
+  - `ChannelCreatePayload` gains `encryption_enabled: Option<bool>` and
+    `history_visibility: Option<u8>` (0=ForwardOnly, 1=FullHistory). Stored in the channel
+    record (new-record + chain-scanned-skeleton merge, the latter `or_insert` so the flag is
+    **immutable** — a channel can't be retroactively un-encrypted). Exposed automatically via
+    `GET /channels/:id` (whole record) and added to the restricted (non-member) view.
+  - Type-based defaults when a (legacy) client omits the fields: Private → encrypted +
+    ForwardOnly; Public/ReadPublic → NOT-encrypted + FullHistory (so legacy plaintext public
+    channels stay v1 / dual-read). Updated clients send `encryption_enabled=true` for new
+    public channels (encryption is forced on, no user toggle).
+  - **No-downgrade enforcement:** an `encryption_enabled` channel rejects a plaintext-text
+    `ChatMessage` (`check_channel_encryption_required` at ingest step 7f) — encrypted and
+    attachment-only messages pass; legacy channels (no flag) are unaffected.
+  - Permissionless key establishment needs no node change: the `ChannelKeyEnvelope` (0x61)
+    channel-scope authz is already membership-gated (no mod-only check), so any member of a
+    public channel may seed/cover the epoch key. Removal-rotation (`key_epoch_floor`) stays
+    private-only — public channels have no forward-secrecy by design (anti-bulk-readout only).
+
+### Security
+
+- **Private channels are forced-encrypted at the node** (audit P4-W1): `channel_encryption_defaults`
+  now sets `encryption_enabled = true` for any `Private` channel regardless of the client-sent
+  flag, so a malicious/buggy `ChannelCreate { encryption_enabled: false }` cannot create a
+  plaintext private channel. `history_visibility` is clamped to {0,1} (out-of-range → type default).
+- `check_channel_encryption_required` gains a fast-path early-out (encrypted or empty-content
+  messages skip the channel-record read), so only a plaintext-text message pays the lookup.
+
+### Known residuals (accepted, documented)
+
+- **Chain-scan ordering window:** a public channel created on-chain has no `encryption_enabled`
+  on its scanner skeleton until the creator's L2 `ChannelCreate` merges (seconds); during that
+  window the no-downgrade gate reads `false`. Pre-mainnet, small window; the creator's client
+  sends the L2 envelope immediately after the on-chain tx.
+- **Public-channel epoch fragmentation:** establishment is permissionless, so a malicious member
+  could wrap a higher epoch to only some devices. Largely self-limiting — key fetch is per-device
+  (returns each member's own latest wrapped epoch) and honest clients never advance the epoch for a
+  public channel (floor 0 → reuse the existing key). Confidentiality is out of scope for public
+  channels by design; impact is bounded to that member's own messages.
+
+## [0.78.0] - 2026-06-14
+
+### Added
+
+- **E2E key-recovery vault (P3 / protocol §2.5) — node carrier.** New `KeyVaultSync`
+  message (`0x38`) + `key_vault` column family let a user persist their wallet-encrypted
+  bundle of symmetric content keys (DM `conv_key`s and channel epoch `channel_key`s) to
+  their home node, so a fresh install / new device can restore full message history.
+  - The vault blob is **opaque to the node**: sealed client-side with XChaCha20-Poly1305
+    under a backup key derived deterministically from the wallet's
+    `signMessage("ogmara-keyvault-v1")` — the node never holds the key and cannot decrypt.
+  - `KeyVaultSyncPayload { encrypted_vault, nonce: [u8;24], format_version }`; stored
+    per-wallet, last-write-wins (only the verified envelope signer writes their own record).
+  - `GET /api/v1/key-vault` (authenticated, host-bound) returns the caller's stored vault
+    (`{encrypted_vault, nonce, format_version}`) or `404` when none exists. Publish flows
+    through the standard signed message-ingestion path (`POST /api/v1/messages`).
+  - `validate_key_vault_sync`: non-empty, ≤ 2 MB (`MAX_KEY_VAULT_SIZE`), ciphertext ≥ 16 B
+    (Poly1305 tag floor), `format_version >= 1`.
+  - `key_vault` is **excluded from snapshot `DOMAIN_CFS`** and **never gossiped**
+    (user-private secret material — same boundary as `settings_sync`).
+
 ## [0.77.0] - 2026-06-14
 
 ### Added

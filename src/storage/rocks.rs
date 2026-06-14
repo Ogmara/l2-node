@@ -2217,6 +2217,33 @@ impl Storage {
         self.get_cf(cf::SETTINGS_SYNC, wallet_address.as_bytes())
     }
 
+    // --- Key-Recovery Vault (E2E P3) ---
+
+    /// Store the encrypted E2E key-recovery vault for a user.
+    ///
+    /// The blob is opaque to the node — sealed under a wallet-derived backup key the
+    /// node never holds. Last-write-wins; one record per wallet.
+    pub fn store_key_vault(&self, wallet_address: &str, data: &[u8]) -> Result<()> {
+        self.put_cf(cf::KEY_VAULT, wallet_address.as_bytes(), data)
+    }
+
+    /// Get the encrypted E2E key-recovery vault for a user.
+    pub fn get_key_vault(&self, wallet_address: &str) -> Result<Option<Vec<u8>>> {
+        self.get_cf(cf::KEY_VAULT, wallet_address.as_bytes())
+    }
+
+    /// Delete a user's encrypted key-recovery vault + settings blob (account
+    /// deletion). These are the most sensitive per-account artifacts, so a
+    /// "delete all my content" request must purge them, not just news rows.
+    pub fn delete_key_vault(&self, wallet_address: &str) -> Result<()> {
+        self.delete_cf(cf::KEY_VAULT, wallet_address.as_bytes())
+    }
+
+    /// Delete a user's encrypted settings blob (account deletion).
+    pub fn delete_settings(&self, wallet_address: &str) -> Result<()> {
+        self.delete_cf(cf::SETTINGS_SYNC, wallet_address.as_bytes())
+    }
+
     // --- Notifications ---
 
     /// Store a notification for a user.
