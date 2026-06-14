@@ -14,6 +14,7 @@ use libp2p::{kad, Swarm, SwarmBuilder};
 
 use crate::config::Config;
 
+use super::dm_sync::DmSyncCodec;
 use super::identity_sync::IdentitySyncCodec;
 use super::news_sync::NewsSyncCodec;
 use super::reconcile::ReconcileCodec;
@@ -55,6 +56,11 @@ pub struct OgmaraBehaviour {
     /// Bounded backfill of the global news feed (default last 7 days) on a
     /// node with an empty NEWS_FEED. Wire types in [`super::news_sync`].
     pub news_sync: NewsSyncCodec,
+    /// Request-Response for the dm-sync protocol (offline store-and-forward
+    /// Phase 2, l2-node 0.69.0+). Authenticated, bounded backfill of a single
+    /// wallet's missed DMs on a fresh node / after a home-node was down. Wire
+    /// types in [`super::dm_sync`].
+    pub dm_sync: DmSyncCodec,
 }
 
 /// Build the libp2p swarm with all configured behaviours.
@@ -267,6 +273,22 @@ pub fn build_swarm(config: &Config, keypair: Keypair) -> Result<Swarm<OgmaraBeha
             .with_request_timeout(Duration::from_secs(45)),
     );
 
+    // DM-sync (offline store-and-forward Phase 2): Full. Requests are
+    // authenticated (node-signed, host-bound) + per-peer capped at the handler.
+    let dm_sync_protocol = super::dm_sync::protocol_string(config.network_id());
+    let dm_sync = libp2p::request_response::cbor::Behaviour::<
+        super::dm_sync::DmSyncRequest,
+        super::dm_sync::DmSyncResponse,
+    >::new(
+        [(
+            libp2p::StreamProtocol::try_from_owned(dm_sync_protocol)
+                .map_err(|e| anyhow::anyhow!("invalid dm-sync protocol string: {}", e))?,
+            libp2p::request_response::ProtocolSupport::Full,
+        )],
+        libp2p::request_response::Config::default()
+            .with_request_timeout(Duration::from_secs(45)),
+    );
+
     let behaviour = OgmaraBehaviour {
         connection_limits,
         gossipsub,
@@ -278,6 +300,7 @@ pub fn build_swarm(config: &Config, keypair: Keypair) -> Result<Swarm<OgmaraBeha
         reconcile,
         identity_sync,
         news_sync,
+        dm_sync,
     };
 
     let swarm = SwarmBuilder::with_existing_identity(keypair)

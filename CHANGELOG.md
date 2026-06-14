@@ -5,6 +5,70 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.69.0] - 2026-06-14
+
+DM offline store-and-forward (spec 3 §dm-offline-store-and-forward). Until now a
+DM was dropped on the wire if its recipient was offline at send time — the
+recipient's node only subscribed to their DM gossip topic while they held a live
+WebSocket. This release makes DMs survive an offline recipient, in two phases
+shipped together.
+
+### Added
+
+- **Phase 1 — persistent DM subscription for local users.** New node-local
+  `LOCAL_DM_USERS` column family (`wallet → {first_seen_ms, last_active_ms}`).
+  When a wallet authenticates here (WebSocket OR REST), the node records it and
+  persistently subscribes to its DM gossip topic, re-subscribing on every restart
+  — so an offline user's cross-node DMs are received and stored by the existing
+  `DirectMessage` apply path, then served on reconnect. Gossip-received DMs run
+  the full `process_message` pipeline (signature + validation); the node still
+  cannot read the E2E-encrypted body.
+- **Phase 2 — authenticated `dm-sync` backfill.** New libp2p request/response
+  protocol `/ogmara/<net>/dm-sync/1.0.0` (`network/dm_sync.rs`). On a wallet's
+  first auth this process, the node pulls that wallet's recent missed DMs from up
+  to 3 peers (first non-empty wins) — covering the fresh-node and
+  home-node-was-down cases Phase 1 cannot. Re-served envelopes are re-validated
+  through `process_synced_message`, so a relaying peer is never trusted. Paging
+  walks the wallet's conversations in stable `conversation_id` order with a
+  `(conversation_id, after_timestamp, after_msg_id)` cursor.
+- **`[dm]` config section** — `max_local_subscriptions` (default 5000, LRU-evicted
+  on `last_active_ms`), `retention_days` (default 30), `backfill_max_age_days`
+  (default 30).
+- `TopicManager::unsubscribe_dm` — gossipsub DM-topic unsubscribe, used by LRU
+  eviction (previously absent).
+
+### Security
+
+- **`dm-sync` requests are authenticated, node-signed and host-bound** to the
+  responder's PeerId (`ogmara-dm-sync:<net>:<responder_peer_id>:<wallet>:<ts>`,
+  signed with the requesting node's key). The responder additionally binds the
+  request's claimed pubkey to the transport-authenticated PeerId
+  (`pubkey.to_peer_id() == connected_peer`) and enforces a ±120s freshness
+  window, so a captured request is neither replayable to another responder nor
+  forgeable by a node that is not the connected peer. DM confidentiality rests on
+  E2E encryption — the responder only ever serves ciphertext — while the auth and
+  per-peer caps defend against DoS and bulk metadata scraping. The `/dm/<wallet>`
+  gossip topic is itself openly subscribable, so `dm-sync` exposes nothing the
+  live gossip path does not. (This is runtime/shipped behaviour.)
+- Responder is bounded: ≤200 envelopes/page, ≤5000 envelopes/peer/process, ≤2
+  concurrent requests/peer, ≤2000 conversations scanned per wallet (over-cap is
+  logged, never silent), and the auth check runs BEFORE any storage scan.
+
+### Notes
+
+- Dependency scan (`cargo audit`): bumped `rand` 0.9.2 → 0.9.4 (latest). Two
+  advisories remain, both `hickory-proto 0.25.2` (RUSTSEC-2026-0118/0119, DoS in
+  DNS response parsing) — transitive via `libp2p 0.56`'s DNS/mDNS stack, already
+  at the latest version compatible with libp2p's constraints, so unfixable here
+  without an upstream libp2p release. Pre-existing and unrelated to this change;
+  flagged for an upstream-bump follow-up.
+- `LOCAL_DM_USERS` is intentionally excluded from the snapshot `DOMAIN_CFS` —
+  it is node-local membership, not network state.
+- The 30-day retention reaper and per-conversation DM caps (Phase 3) are
+  scheduled for a later release; `retention_days` already bounds how far back
+  `dm-sync` serves. Multi-node N-replica DM durability remains a mainnet
+  decision; on testnet the sender + home-node replicas are adequate.
+
 ## [0.68.1] - 2026-06-13
 
 ### Changed

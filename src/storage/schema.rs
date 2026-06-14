@@ -12,6 +12,15 @@ pub mod cf {
     pub const DM_MESSAGES: &str = "dm_messages";
     /// (user_address, last_activity_ts, conversation_id) → () — user's DM list
     pub const DM_CONVERSATIONS: &str = "dm_conversations";
+    /// wallet_address → (first_seen_ms:8 BE, last_active_ms:8 BE) — wallets this
+    /// node is "home" for. The node persistently subscribes to each one's DM
+    /// gossip topic (`/ogmara/<net>/v1/dm/<wallet>`) at startup + first-seen so
+    /// it receives that user's cross-node DMs even when they are OFFLINE, then
+    /// serves them on reconnect (offline store-and-forward, l2-node 0.69.0+).
+    /// NODE-LOCAL membership, NOT network state → intentionally excluded from the
+    /// snapshot `DOMAIN_CFS`. Bounded by `[dm] max_local_subscriptions` with LRU
+    /// eviction on `last_active_ms`.
+    pub const LOCAL_DM_USERS: &str = "local_dm_users";
     /// (timestamp, msg_id) → () — global news feed index
     pub const NEWS_FEED: &str = "news_feed";
     /// (tag, timestamp, msg_id) → () — tag-based news index
@@ -212,6 +221,7 @@ pub mod cf {
         CHANNEL_MSGS,
         DM_MESSAGES,
         DM_CONVERSATIONS,
+        LOCAL_DM_USERS,
         NEWS_FEED,
         NEWS_BY_TAG,
         NEWS_BY_AUTHOR,
@@ -456,6 +466,26 @@ pub fn encode_dm_conversation_key(
     key.extend_from_slice(&(!last_activity_ts).to_be_bytes());
     key.extend_from_slice(conversation_id);
     key
+}
+
+/// Encode a `LOCAL_DM_USERS` value: (first_seen_ms, last_active_ms) as two
+/// big-endian u64s. Fixed 16 bytes — no serde overhead for this hot-path row.
+pub fn encode_local_dm_user(first_seen_ms: u64, last_active_ms: u64) -> [u8; 16] {
+    let mut v = [0u8; 16];
+    v[0..8].copy_from_slice(&first_seen_ms.to_be_bytes());
+    v[8..16].copy_from_slice(&last_active_ms.to_be_bytes());
+    v
+}
+
+/// Decode a `LOCAL_DM_USERS` value into (first_seen_ms, last_active_ms).
+/// Returns `None` if the row is malformed (wrong length).
+pub fn decode_local_dm_user(value: &[u8]) -> Option<(u64, u64)> {
+    if value.len() != 16 {
+        return None;
+    }
+    let first = u64::from_be_bytes(value[0..8].try_into().ok()?);
+    let last = u64::from_be_bytes(value[8..16].try_into().ok()?);
+    Some((first, last))
 }
 
 /// Encode a news feed index key: (timestamp, msg_id).

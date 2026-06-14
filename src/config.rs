@@ -48,6 +48,10 @@ pub struct Config {
     /// §channel-history-reconciliation, l2-node 0.47.0+).
     #[serde(default)]
     pub backfill: BackfillConfig,
+    /// Direct-message offline store-and-forward policy (spec 3
+    /// §dm-offline-store-and-forward, l2-node 0.69.0+).
+    #[serde(default)]
+    pub dm: DmConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -584,6 +588,57 @@ fn default_backfill_max_envelopes_per_response() -> usize {
 }
 fn default_backfill_total_envelopes_cap() -> usize {
     200_000
+}
+
+/// Direct-message offline store-and-forward policy (spec 3
+/// §dm-offline-store-and-forward, l2-node 0.69.0+).
+///
+/// A node persistently subscribes to the DM gossip topics of the wallets it is
+/// "home" for (those tracked in `LOCAL_DM_USERS`) so it receives their DMs even
+/// while they are offline, and can serve those DMs back on reconnect. These
+/// knobs bound how many such subscriptions the node maintains and how far back
+/// the lazy `dm-sync` backfill (Phase 2) reaches.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DmConfig {
+    /// Max persistent DM-topic subscriptions this node maintains for its local
+    /// users. When the cap is hit, the least-recently-active wallet is evicted
+    /// (LRU on `last_active_ms`) and its topic unsubscribed. Default 5000.
+    /// Bounds gossipsub subscription state + the startup re-subscribe cost.
+    #[serde(default = "default_dm_max_local_subscriptions")]
+    pub max_local_subscriptions: usize,
+    /// Days a DM row is retained before the (Phase 3) reaper deletes it. Also
+    /// the natural ceiling on how far back `dm-sync` backfill can reach — you
+    /// cannot serve what was reaped. `0` = unlimited. Default 30 (matches the
+    /// spec's NOTIFICATIONS retention). The reaper itself lands in a later phase;
+    /// this value is the agreed policy.
+    #[serde(default = "default_dm_retention_days")]
+    pub retention_days: u64,
+    /// Lazy `dm-sync` backfill window in days: on a user's first auth this
+    /// process, the node pulls only DMs newer than `now - backfill_max_age_days`
+    /// from peers. `0` = unlimited. Default 30. Clamped to `retention_days` in
+    /// practice. The per-page + total caps in `network::dm_sync` apply on top.
+    #[serde(default = "default_dm_backfill_max_age_days")]
+    pub backfill_max_age_days: u64,
+}
+
+impl Default for DmConfig {
+    fn default() -> Self {
+        Self {
+            max_local_subscriptions: default_dm_max_local_subscriptions(),
+            retention_days: default_dm_retention_days(),
+            backfill_max_age_days: default_dm_backfill_max_age_days(),
+        }
+    }
+}
+
+fn default_dm_max_local_subscriptions() -> usize {
+    5000
+}
+fn default_dm_retention_days() -> u64 {
+    30
+}
+fn default_dm_backfill_max_age_days() -> u64 {
+    30
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

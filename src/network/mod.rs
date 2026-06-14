@@ -8,6 +8,7 @@
 //! - Identify: peer identification and capability exchange
 
 pub mod behaviour;
+pub mod dm_sync;
 pub mod gossip;
 pub mod mesh_stats;
 pub mod presence;
@@ -39,6 +40,7 @@ use crate::metrics::counters::NetworkCounters;
 use crate::notifications::engine::NotificationEngine;
 use crate::storage::identity::IdentityResolver;
 use crate::storage::rocks::Storage;
+use crate::storage::schema;
 
 use self::behaviour::{OgmaraBehaviour, OgmaraBehaviourEvent};
 use self::gossip::TopicManager;
@@ -198,6 +200,28 @@ pub struct NetworkService {
     /// Set once the one-time global-news backfill has been fired this process
     /// lifetime (only fires when NEWS_FEED was empty and peers existed).
     news_backfill_triggered: bool,
+    /// DM offline store-and-forward policy (spec 3, l2-node 0.69.0+): persistent
+    /// DM-subscription cap + LRU, and the dm-sync backfill window.
+    dm_config: crate::config::DmConfig,
+    /// Server-side rate-limit state for inbound dm-sync requests (Phase 2).
+    dm_sync_limits: Arc<dm_sync::DmResponderLimits>,
+    /// Outstanding outbound dm-sync requests → `(peer, wallet)` for race-cancel
+    /// + cursor paging of that wallet's backfill.
+    pending_dm_sync_requests: HashMap<
+        libp2p::request_response::OutboundRequestId,
+        DmSyncPending,
+    >,
+    /// Wallets this node has triggered a dm-sync backfill for at least once this
+    /// process lifetime — dedups repeated first-seen triggers (per auth).
+    dm_backfill_triggered: HashSet<String>,
+    /// Wallet → last time (ms) we persisted its `LOCAL_DM_USERS` row this
+    /// session. Lets the per-REST-request registration path skip redundant
+    /// RocksDB work, while still refreshing `last_active_ms` on a throttle so
+    /// LRU eviction sees genuine recency (not just first-seen). An entry is
+    /// REMOVED when the wallet is evicted, so a re-auth re-creates its row +
+    /// subscription. Cleared on overflow. (The backfill trigger is gated
+    /// separately so it still fires once peers exist.)
+    local_dm_users_seen: HashMap<String, u64>,
     /// Presence-gossip manager (spec 13 §10, l2-node 0.48.0+). `Some`
     /// iff `[network.presence] enabled = true` at startup; held in an
     /// `Arc` so the cache + rate limiter can be shared with the REST
@@ -300,6 +324,13 @@ struct IdentitySyncPending {
     scopes: u8,
 }
 
+/// Per-pending-outbound-dm-sync state (offline store-and-forward Phase 2).
+#[derive(Debug, Clone)]
+struct DmSyncPending {
+    peer_id: PeerId,
+    wallet: String,
+}
+
 /// Command from the API/router task → network task asking it to lazily pull a
 /// wallet's identity bundle (P-1). Sent over `identity_sync_tx`; handled in the
 /// `run` select loop by `maybe_trigger_identity_sync`.
@@ -393,6 +424,27 @@ fn envelope_targets_news(env_bytes: &[u8]) -> bool {
     news_sync::is_news_type(envelope.msg_type_u8())
 }
 
+/// Current wall-clock time in Unix milliseconds (0 if the clock is before the
+/// epoch, which never happens in practice).
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Smuggling defense for dm-sync responses (Phase 2): accept ONLY the
+/// DirectMessage type, so a responder can't inject another type through this
+/// path. Every envelope is still signature-validated by `process_synced_message`.
+fn envelope_targets_dm(env_bytes: &[u8]) -> bool {
+    use crate::messages::envelope::Envelope;
+    let envelope: Envelope = match rmp_serde::from_slice(env_bytes) {
+        Ok(e) => e,
+        Err(_) => return false,
+    };
+    dm_sync::is_dm_type(envelope.msg_type_u8())
+}
+
 /// How often `NetworkService` refreshes the shared `MeshStatsSnapshot`.
 /// Short enough that an operator running `watch -n5
 /// 'curl /admin/network/mesh-stats'` sees fresh data every other
@@ -454,6 +506,7 @@ impl NetworkService {
         mesh_stats: mesh_stats::SharedMeshStats,
         alert_event_tx: Option<crate::notifications::alerts::AlertEventSender>,
         backfill_config: crate::config::BackfillConfig,
+        dm_config: crate::config::DmConfig,
     ) -> Result<Self> {
         // Clone before move — the presence subsystem needs its own
         // handle to sign outbound records. libp2p `Keypair` is cheap
@@ -721,6 +774,11 @@ impl NetworkService {
             news_sync_limits: Arc::new(news_sync::NewsResponderLimits::default()),
             pending_news_sync_requests: HashMap::new(),
             news_backfill_triggered: false,
+            dm_config,
+            dm_sync_limits: Arc::new(dm_sync::DmResponderLimits::default()),
+            pending_dm_sync_requests: HashMap::new(),
+            dm_backfill_triggered: HashSet::new(),
+            local_dm_users_seen: HashMap::new(),
             presence_manager,
             presence_topic_hash,
             presence_initial_broadcast_done: false,
@@ -800,6 +858,145 @@ impl NetworkService {
             .subscribe_dm(&mut self.swarm, address);
     }
 
+    /// Unsubscribe from a user's DM topic (LRU eviction of a local DM user).
+    pub fn unsubscribe_dm(&mut self, address: &str) {
+        self.topics
+            .unsubscribe_dm(&mut self.swarm, address);
+    }
+
+    /// Register `wallet` as a local DM user (offline store-and-forward Phase 1).
+    ///
+    /// Called when a wallet authenticates to this node (WS/REST). Persists it to
+    /// `LOCAL_DM_USERS` so the node re-subscribes to its DM gossip topic on every
+    /// restart — receiving that user's cross-node DMs even while they are OFFLINE
+    /// — then subscribes immediately, evicts the least-recently-active user if
+    /// over the cap, and lazily fires a one-time dm-sync backfill for missed DMs.
+    fn register_local_dm_user(&mut self, wallet: &str) {
+        // How often we re-persist `last_active_ms` for an already-known wallet.
+        // The per-REST-request path calls this on every request; the throttle
+        // keeps it O(1) most of the time while still letting LRU eviction see
+        // genuine recency rather than only first-seen.
+        const REFRESH_THROTTLE_MS: u64 = 5 * 60 * 1000;
+        const MAX_SEEN: usize = 100_000;
+
+        let now = now_ms();
+        let due = match self.local_dm_users_seen.get(wallet) {
+            Some(&last_persist) => now.saturating_sub(last_persist) >= REFRESH_THROTTLE_MS,
+            None => true,
+        };
+
+        if due {
+            // Bound the throttle map; on overflow clear it (next call re-does the
+            // idempotent storage upsert — harmless).
+            if self.local_dm_users_seen.len() >= MAX_SEEN {
+                self.local_dm_users_seen.clear();
+            }
+            let key = wallet.as_bytes();
+
+            // Upsert: preserve first_seen, refresh last_active. A storage error
+            // here is non-fatal — we still subscribe so live delivery works.
+            let is_new = match self.storage.get_cf(schema::cf::LOCAL_DM_USERS, key) {
+                Ok(Some(existing)) => {
+                    let first_seen = schema::decode_local_dm_user(&existing)
+                        .map(|(f, _)| f)
+                        .unwrap_or(now);
+                    let _ = self.storage.put_cf(
+                        schema::cf::LOCAL_DM_USERS,
+                        key,
+                        &schema::encode_local_dm_user(first_seen, now),
+                    );
+                    false
+                }
+                Ok(None) => {
+                    let _ = self.storage.put_cf(
+                        schema::cf::LOCAL_DM_USERS,
+                        key,
+                        &schema::encode_local_dm_user(now, now),
+                    );
+                    true
+                }
+                Err(e) => {
+                    warn!(%wallet, error = %e, "register_local_dm_user: LOCAL_DM_USERS read failed; subscribing anyway");
+                    false
+                }
+            };
+
+            // Subscribe (idempotent in the topic layer).
+            self.subscribe_dm(wallet);
+
+            // Record BEFORE eviction so the just-registered wallet is protected
+            // from being chosen as the LRU victim of its own insertion.
+            self.local_dm_users_seen.insert(wallet.to_string(), now);
+
+            // Enforce the subscription cap with LRU eviction — only when we just
+            // ADDED a user (steady-state refreshes don't grow the set).
+            if is_new {
+                self.evict_local_dm_users_over_cap(wallet);
+            }
+        }
+
+        // Lazily backfill missed DMs for this wallet, once per process (self-
+        // dedups; retries on a later call if no peers were connected yet).
+        self.maybe_trigger_dm_backfill(wallet);
+    }
+
+    /// Evict least-recently-active local DM users until the count is within
+    /// `[dm] max_local_subscriptions` (LRU on `last_active_ms`). Unsubscribes the
+    /// evicted wallet's DM topic, deletes its `LOCAL_DM_USERS` row, AND drops it
+    /// from the in-memory throttle map so a later re-auth re-establishes it (else
+    /// the throttle would short-circuit and the user would silently stop
+    /// receiving cross-node DMs until restart). `protect` is the wallet we just
+    /// registered — never evict it as the victim of its own insertion. A cap of 0
+    /// disables the bound (unbounded — not recommended outside tiny test fleets).
+    fn evict_local_dm_users_over_cap(&mut self, protect: &str) {
+        let cap = self.dm_config.max_local_subscriptions;
+        if cap == 0 {
+            return;
+        }
+        // Cap the scan so a pathological CF can't stall the network loop.
+        const SCAN_CAP: usize = 200_000;
+        let rows = match self
+            .storage
+            .prefix_iter_cf(schema::cf::LOCAL_DM_USERS, &[], SCAN_CAP)
+        {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(error = %e, "evict_local_dm_users_over_cap: scan failed");
+                return;
+            }
+        };
+        if rows.len() <= cap {
+            return;
+        }
+        // Sort ascending by last_active_ms; evict the oldest until within cap.
+        let mut by_active: Vec<(u64, Vec<u8>)> = rows
+            .into_iter()
+            .map(|(k, v)| {
+                let last = schema::decode_local_dm_user(&v).map(|(_, l)| l).unwrap_or(0);
+                (last, k)
+            })
+            .collect();
+        by_active.sort_unstable_by_key(|(last, _)| *last);
+        let mut evict_n = by_active.len().saturating_sub(cap);
+        for (_, key) in by_active.into_iter() {
+            if evict_n == 0 {
+                break;
+            }
+            let wallet = match std::str::from_utf8(&key) {
+                Ok(w) => w.to_string(),
+                Err(_) => continue,
+            };
+            if wallet == protect {
+                continue; // never evict the wallet we just registered
+            }
+            self.unsubscribe_dm(&wallet);
+            let _ = self.storage.delete_cf(schema::cf::LOCAL_DM_USERS, &key);
+            self.local_dm_users_seen.remove(&wallet);
+            debug!(%wallet, "evicted least-recently-active local DM user (over cap)");
+            evict_n -= 1;
+        }
+    }
+
     /// Publish a raw message to a GossipSub topic.
     pub fn publish(
         &mut self,
@@ -853,6 +1050,14 @@ impl NetworkService {
         // Dial persisted peers from previous sessions (survives restart)
         self.dial_persisted_peers();
 
+        // Re-subscribe to the DM gossip topics of the wallets this node is home
+        // for (offline store-and-forward Phase 1, l2-node 0.69.0+). This runs on
+        // EVERY startup so an offline user's DMs are received and stored even
+        // before that user re-connects this session. Bounded by the same
+        // `[dm] max_local_subscriptions` cap (we re-subscribe at most that many,
+        // most-recently-active first).
+        self.resubscribe_local_dm_users();
+
         // Periodic Kademlia bootstrap + reconnection (every 30s).
         let mut bootstrap_interval = tokio::time::interval(Duration::from_secs(30));
         bootstrap_interval.tick().await; // skip the immediate first tick
@@ -898,10 +1103,12 @@ impl NetworkService {
                     self.maybe_trigger_identity_sync(cmd.wallet, cmd.scopes);
                 }
                 Some(addr) = dm_subscribe_rx.recv() => {
-                    // Subscribe this node to the user's DM gossip topic so DMs sent
-                    // to them from other nodes are received and indexed locally.
-                    self.subscribe_dm(&addr);
-                    debug!(%addr, "Subscribed to DM gossip topic");
+                    // A wallet authenticated here. Persist it as a local DM user
+                    // (so we re-subscribe on restart and receive its DMs while
+                    // offline), subscribe now, enforce the LRU cap, and lazily
+                    // backfill any DMs missed while this node was down.
+                    self.register_local_dm_user(&addr);
+                    debug!(%addr, "Registered local DM user + subscribed to DM gossip topic");
                 }
                 Some(channel_id) = channel_rx.recv() => {
                     // Code Audit W2 (0.47.0): route chain-discovered
@@ -1283,6 +1490,10 @@ impl NetworkService {
 
             SwarmEvent::Behaviour(OgmaraBehaviourEvent::NewsSync(event)) => {
                 self.handle_news_sync_event(event);
+            }
+
+            SwarmEvent::Behaviour(OgmaraBehaviourEvent::DmSync(event)) => {
+                self.handle_dm_sync_event(event);
             }
 
             SwarmEvent::NewListenAddr { address, .. } => {
@@ -2121,6 +2332,276 @@ impl NetworkService {
             Event::OutboundFailure { peer, request_id, error, .. } => {
                 if self.pending_news_sync_requests.remove(&request_id).is_some() {
                     debug!(peer = %peer, error = ?error, "news-sync: outbound failed; siblings may succeed");
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // ===== DM offline store-and-forward (spec 3, l2-node 0.69.0+) =====
+
+    /// Re-subscribe to the DM gossip topics of this node's local users at
+    /// startup (offline store-and-forward Phase 1). Subscribes the
+    /// most-recently-active `max_local_subscriptions` first, so that — if the CF
+    /// somehow exceeds the cap — the freshest users win the bounded slots.
+    fn resubscribe_local_dm_users(&mut self) {
+        const SCAN_CAP: usize = 200_000;
+        let rows = match self
+            .storage
+            .prefix_iter_cf(schema::cf::LOCAL_DM_USERS, &[], SCAN_CAP)
+        {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(error = %e, "resubscribe_local_dm_users: scan failed");
+                return;
+            }
+        };
+        if rows.is_empty() {
+            return;
+        }
+        // Sort most-recently-active first, then bound to the configured cap.
+        let mut users: Vec<(u64, String)> = rows
+            .into_iter()
+            .filter_map(|(k, v)| {
+                let last = schema::decode_local_dm_user(&v).map(|(_, l)| l).unwrap_or(0);
+                String::from_utf8(k).ok().map(|w| (last, w))
+            })
+            .collect();
+        users.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        let cap = self.dm_config.max_local_subscriptions;
+        if cap > 0 && users.len() > cap {
+            users.truncate(cap);
+        }
+        let count = users.len();
+        for (_, wallet) in users {
+            self.subscribe_dm(&wallet);
+        }
+        info!(count, "re-subscribed to local users' DM gossip topics (offline store-and-forward)");
+    }
+
+    /// One-time bounded backfill of a single wallet's missed DMs (Phase 2). Fires
+    /// once per wallet per process — when that wallet first authenticates here —
+    /// pulling its recent DMs from up to `FANOUT` peers (first non-empty wins).
+    /// Covers the fresh-node / home-node-was-down case Phase 1 can't. Each
+    /// request is node-signed + host-bound to its responder (`dm_sync::sign_request`).
+    fn maybe_trigger_dm_backfill(&mut self, wallet: &str) {
+        if self.dm_backfill_triggered.contains(wallet) {
+            return;
+        }
+        let mut candidates: Vec<PeerId> = self.swarm.connected_peers().copied().collect();
+        if candidates.is_empty() {
+            return; // no peers yet — retry on the wallet's next auth/registration
+        }
+        use rand::seq::SliceRandom;
+        candidates.shuffle(&mut rand::thread_rng());
+        candidates.truncate(dm_sync::FANOUT);
+
+        let max_age_secs = if self.dm_config.backfill_max_age_days == 0 {
+            u64::MAX
+        } else {
+            self.dm_config
+                .backfill_max_age_days
+                .saturating_mul(24 * 3600)
+        };
+        let network = self.topics.network_id().to_string();
+        let now = now_ms();
+        info!(
+            %wallet,
+            fanout = candidates.len(),
+            backfill_max_age_days = self.dm_config.backfill_max_age_days,
+            "dm-sync: triggering bounded DM backfill"
+        );
+        for peer in candidates {
+            let request = dm_sync::sign_request(
+                &self.signing_key,
+                &network,
+                &peer.to_string(),
+                wallet,
+                now,
+                max_age_secs,
+                None,
+            );
+            let id = self
+                .swarm
+                .behaviour_mut()
+                .dm_sync
+                .send_request(&peer, request);
+            self.pending_dm_sync_requests.insert(
+                id,
+                DmSyncPending { peer_id: peer, wallet: wallet.to_string() },
+            );
+        }
+        // Mark triggered even if all requests ultimately fail — re-auth retries
+        // are unnecessary noise; live gossip fills the gap once subscribed.
+        // Bound the set (mirrors `identity_sync_triggered`); clearing only causes
+        // a one-time redundant backfill later, which self-dedups via gossip.
+        if self.dm_backfill_triggered.len() >= 100_000 {
+            self.dm_backfill_triggered.clear();
+        }
+        self.dm_backfill_triggered.insert(wallet.to_string());
+    }
+
+    /// Handle inbound + outbound dm-sync request-response events (Phase 2).
+    fn handle_dm_sync_event(
+        &mut self,
+        event: libp2p::request_response::Event<
+            dm_sync::DmSyncRequest,
+            dm_sync::DmSyncResponse,
+        >,
+    ) {
+        use crate::messages::router::RouteResult;
+        use libp2p::request_response::{Event, Message};
+
+        // Responder retention window: serve DMs no older than this. 0 = unlimited.
+        let window_secs = || {
+            if self.dm_config.retention_days == 0 {
+                u64::MAX
+            } else {
+                self.dm_config.retention_days.saturating_mul(24 * 3600)
+            }
+        };
+
+        match event {
+            // --- Inbound request: authenticate, then serve the wallet's DMs ---
+            Event::Message {
+                peer,
+                message: Message::Request { request, channel, request_id: _ },
+                connection_id: _,
+            } => {
+                let network = self.topics.network_id().to_string();
+                let responder_peer_id = self.swarm.local_peer_id().to_string();
+                let now = now_ms();
+
+                // AUTH FIRST — reject before any storage scan (DoS gate).
+                if !dm_sync::verify_request_auth(&request, &responder_peer_id, &network, now, &peer) {
+                    warn!(peer = %peer, wallet = %request.wallet, "dm-sync: request auth failed");
+                    if let Err(e) = self
+                        .swarm
+                        .behaviour_mut()
+                        .dm_sync
+                        .send_response(channel, dm_sync::auth_failed_response())
+                    {
+                        warn!(peer = %peer, error = ?e, "dm-sync: send auth_failed response failed");
+                    }
+                    return;
+                }
+
+                let guard = self.dm_sync_limits.try_acquire(
+                    peer,
+                    dm_sync::SERVER_MAX_CONCURRENT_PER_PEER,
+                    dm_sync::TOTAL_ENVELOPES_CAP,
+                );
+                let response = if guard.is_none() {
+                    dm_sync::capped_response()
+                } else {
+                    let (resp, scanned_all) = dm_sync::build_response(
+                        &self.storage,
+                        &request.wallet,
+                        &request,
+                        dm_sync::MAX_ENVELOPES_PER_RESPONSE,
+                        now,
+                        window_secs(),
+                    );
+                    if !scanned_all {
+                        warn!(
+                            peer = %peer,
+                            wallet = %request.wallet,
+                            cap = dm_sync::MAX_CONVERSATIONS,
+                            "dm-sync: wallet has more conversations than the scan cap; backfilled the first {} only (rest arrive via live gossip)",
+                            dm_sync::MAX_CONVERSATIONS,
+                        );
+                    }
+                    resp
+                };
+                let sent = response.envelopes.len();
+                if sent > 0 {
+                    self.dm_sync_limits.add_served(peer, sent as u64);
+                }
+                if let Err(e) = self
+                    .swarm
+                    .behaviour_mut()
+                    .dm_sync
+                    .send_response(channel, response)
+                {
+                    warn!(peer = %peer, error = ?e, "dm-sync: send_response failed");
+                }
+                drop(guard);
+            }
+            // --- Inbound response: validate + apply, then page ---
+            Event::Message {
+                peer,
+                message: Message::Response { request_id, response },
+                connection_id: _,
+            } => {
+                let pending = match self.pending_dm_sync_requests.remove(&request_id) {
+                    Some(p) => p,
+                    None => return,
+                };
+                if response.auth_failed {
+                    // Our own request was rejected — a bug or clock skew. Don't
+                    // hammer; live gossip still covers newly-arriving DMs.
+                    warn!(peer = %peer, wallet = %pending.wallet, "dm-sync: responder rejected our auth");
+                    return;
+                }
+                if response.server_capped {
+                    return;
+                }
+                if response.envelopes.is_empty() && !response.has_more {
+                    return;
+                }
+                // Race-winner: cancel sibling requests for this wallet to others.
+                let wallet = pending.wallet.clone();
+                self.pending_dm_sync_requests
+                    .retain(|_, p| p.peer_id == peer || p.wallet != wallet);
+
+                let count = response.envelopes.len();
+                let mut admitted = 0usize;
+                let mut dropped = 0usize;
+                for env_bytes in response.envelopes {
+                    if !envelope_targets_dm(&env_bytes) {
+                        dropped += 1;
+                        continue;
+                    }
+                    match self.router.process_synced_message(&env_bytes) {
+                        RouteResult::Accepted { .. } | RouteResult::Duplicate => admitted += 1,
+                        RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
+                            warn!(peer = %peer, reason = %reason, "dm-sync: envelope rejected by router");
+                        }
+                        RouteResult::PowRequired { .. } => {}
+                    }
+                }
+                info!(peer = %peer, wallet = %wallet, received = count, admitted, dropped, has_more = response.has_more, "dm-sync: applied batch");
+
+                if response.has_more {
+                    if let Some(cursor) = response.next_cursor {
+                        let network = self.topics.network_id().to_string();
+                        let max_age_secs = if self.dm_config.backfill_max_age_days == 0 {
+                            u64::MAX
+                        } else {
+                            self.dm_config.backfill_max_age_days.saturating_mul(24 * 3600)
+                        };
+                        let next_req = dm_sync::sign_request(
+                            &self.signing_key,
+                            &network,
+                            &peer.to_string(),
+                            &wallet,
+                            now_ms(),
+                            max_age_secs,
+                            Some(cursor),
+                        );
+                        let next_id = self
+                            .swarm
+                            .behaviour_mut()
+                            .dm_sync
+                            .send_request(&peer, next_req);
+                        self.pending_dm_sync_requests
+                            .insert(next_id, DmSyncPending { peer_id: peer, wallet });
+                    }
+                }
+            }
+            Event::OutboundFailure { peer, request_id, error, .. } => {
+                if let Some(p) = self.pending_dm_sync_requests.remove(&request_id) {
+                    debug!(peer = %peer, wallet = %p.wallet, error = ?error, "dm-sync: outbound failed; siblings may succeed");
                 }
             }
             _ => {}
