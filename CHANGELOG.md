@@ -5,6 +5,29 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.80.0] - 2026-06-15
+
+### Added
+
+- **Encrypted media upload (P5 / D6 — spec 04 §9.4).** `POST /api/v1/media/upload`
+  now accepts an optional `encrypted` multipart field (`"1"`/`"true"`). When set, the
+  node treats the payload as an opaque E2E-encrypted blob: it **bypasses the MIME
+  allowlist** (which rejects `application/octet-stream`), forces the stored content
+  type to `application/octet-stream`, drops the (potentially identifying) filename, and
+  pins it normally — the `max_upload_bytes` cap still applies. `IpfsClient::upload_encrypted`
+  wraps the shared `upload_inner`. This is the **only** node change for P5: the per-file
+  key rides inside the message's already-encrypted content blob (§8.1/§8.2), so the wire
+  `Attachment` struct is unchanged and `GET /api/v1/media/:cid` already serves ciphertext
+  content-agnostically. The node holds no `file_key` and cannot decrypt media.
+- Unit test asserting `application/octet-stream` stays out of the normal allowlist, so a
+  future allowlist edit can't silently admit opaque blobs on the non-encrypted path.
+
+### Notes
+
+- No-downgrade gate is satisfied automatically: an encrypted-media message carries
+  `enc_content`, so `check_channel_encryption_required` passes. Encrypted media now
+  unblocks attachments in DMs and private channels (previously rejected client-side).
+
 ## [0.79.0] - 2026-06-14
 
 ### Added

@@ -202,6 +202,35 @@ impl IpfsClient {
         filename: Option<String>,
         mime_type: &str,
     ) -> Result<UploadResult> {
+        self.upload_inner(data, filename, mime_type, false).await
+    }
+
+    /// Upload an **opaque encrypted blob** (P5 / spec 04 §9.4).
+    ///
+    /// Identical to [`upload`](Self::upload) but bypasses the MIME allowlist —
+    /// E2E-encrypted media is `application/octet-stream` ciphertext and would
+    /// otherwise be rejected. The size cap and pinning are unchanged; the stored
+    /// content type is forced to `application/octet-stream` so the node never
+    /// pretends to know what the ciphertext is. The node holds no `file_key` and
+    /// cannot decrypt the blob.
+    pub async fn upload_encrypted(
+        &self,
+        data: Vec<u8>,
+        filename: Option<String>,
+    ) -> Result<UploadResult> {
+        // Filename is dropped for encrypted uploads — it could leak the real name.
+        let _ = filename;
+        self.upload_inner(data, None, "application/octet-stream", true)
+            .await
+    }
+
+    async fn upload_inner(
+        &self,
+        data: Vec<u8>,
+        filename: Option<String>,
+        mime_type: &str,
+        encrypted: bool,
+    ) -> Result<UploadResult> {
         // Validate file size
         if data.len() as u64 > self.max_upload_bytes {
             anyhow::bail!(
@@ -211,8 +240,9 @@ impl IpfsClient {
             );
         }
 
-        // Validate MIME type
-        if !is_allowed_mime(mime_type) {
+        // Validate MIME type. Encrypted blobs are opaque octet-streams (spec 04
+        // §9.4) and are exempt from the allowlist — the size cap still applies.
+        if !encrypted && !is_allowed_mime(mime_type) {
             anyhow::bail!("MIME type not allowed: {}", mime_type);
         }
 
@@ -686,5 +716,15 @@ mod tests {
         assert!(!is_allowed_mime("application/x-executable"));
         assert!(!is_allowed_mime("application/zip"));
         assert!(!is_allowed_mime("text/html"));
+    }
+
+    /// E2E-encrypted media (P5 / spec 04 §9.4) is opaque `application/octet-stream`
+    /// ciphertext, which the allowlist deliberately rejects — hence the dedicated
+    /// `upload_encrypted` path that bypasses the MIME check. This guards against a
+    /// future allowlist edit silently letting arbitrary octet-streams through the
+    /// normal (non-encrypted) upload path.
+    #[test]
+    fn test_octet_stream_rejected_by_allowlist() {
+        assert!(!is_allowed_mime("application/octet-stream"));
     }
 }

@@ -3658,28 +3658,63 @@ pub async fn upload_media(
         None => return (StatusCode::SERVICE_UNAVAILABLE, "IPFS not configured").into_response(),
     };
 
-    // Extract the first file field from the multipart form
-    let field = match multipart.next_field().await {
-        Ok(Some(f)) => f,
-        Ok(None) => return (StatusCode::BAD_REQUEST, "no file in request").into_response(),
-        Err(e) => {
-            tracing::warn!(error = %e, "multipart parse error");
-            return (StatusCode::BAD_REQUEST, "invalid multipart data").into_response();
+    // Walk the multipart form. The `file` field carries the bytes; an optional
+    // `encrypted` field (`"1"`/`"true"`) marks an opaque E2E-encrypted blob
+    // (P5 / spec 04 §9.4) that bypasses the MIME allowlist. Field order is not
+    // guaranteed, so collect both before deciding.
+    let mut filename: Option<String> = None;
+    let mut content_type = "application/octet-stream".to_string();
+    let mut data: Option<Vec<u8>> = None;
+    let mut encrypted = false;
+
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(f)) => f,
+            Ok(None) => break,
+            Err(e) => {
+                tracing::warn!(error = %e, "multipart parse error");
+                return (StatusCode::BAD_REQUEST, "invalid multipart data").into_response();
+            }
+        };
+
+        match field.name() {
+            Some("encrypted") => {
+                let v = field.text().await.unwrap_or_default();
+                encrypted = matches!(v.trim(), "1" | "true" | "yes");
+            }
+            // Treat the first file-bearing field (or `file`) as the payload.
+            _ if data.is_none() => {
+                filename = field.file_name().map(|s| s.to_string());
+                content_type = field
+                    .content_type()
+                    .unwrap_or("application/octet-stream")
+                    .to_string();
+                match field.bytes().await {
+                    Ok(b) => data = Some(b.to_vec()),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to read upload body");
+                        return (StatusCode::BAD_REQUEST, "failed to read file data")
+                            .into_response();
+                    }
+                }
+            }
+            // Ignore any further fields once we have the file bytes.
+            _ => {}
         }
+    }
+
+    let data = match data {
+        Some(d) => d,
+        None => return (StatusCode::BAD_REQUEST, "no file in request").into_response(),
     };
 
-    let filename = field.file_name().map(|s| s.to_string());
-    let content_type = field.content_type().unwrap_or("application/octet-stream").to_string();
-
-    let data = match field.bytes().await {
-        Ok(b) => b.to_vec(),
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to read upload body");
-            return (StatusCode::BAD_REQUEST, "failed to read file data").into_response();
-        }
+    let upload = if encrypted {
+        ipfs.upload_encrypted(data, filename).await
+    } else {
+        ipfs.upload(data, filename, &content_type).await
     };
 
-    match ipfs.upload(data, filename, &content_type).await {
+    match upload {
         Ok(result) => {
             tracing::info!(cid = %result.cid, user = %auth_user.address, size = result.size, "Media uploaded");
             Json(serde_json::json!({
