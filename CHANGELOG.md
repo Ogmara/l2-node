@@ -5,6 +5,34 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.80.1] - 2026-07-26
+
+### Fixed
+
+- **Cross-node private-channel federation drops `encryption_enabled`/`history_visibility`.**
+  `POST /api/v1/channels/:id/federate` fetches the channel record from the host and stores a
+  local copy, but the copied JSON omitted `encryption_enabled` and `history_visibility` even
+  though the host's non-member `GET /api/v1/channels/:id` response already includes both
+  (routes.rs `get_channel` limited/restricted branch). Result: a federated member's home node
+  never learns the channel is encryption-required, so `check_channel_encryption_required`
+  (the plaintext-to-encrypted no-downgrade guard) silently didn't enforce on that node.
+  `federate_channel` now copies both fields into the stored record. Found during a 2026-07-26
+  cross-node private-channel key-delivery diagnosis (see docs/planning/cross-node-private-channel-keys.md);
+  the primary "waiting for the channel key" symptom traced to client-side retry timeout, not
+  this node bug, but this is a real secondary gap worth closing regardless.
+
+### Security
+
+- **Dependency scan (`cargo audit`).** Bumped two transitive deps to patched versions via
+  `Cargo.lock` (both build-tooling-transparent, no direct Cargo.toml change needed):
+  `crossbeam-epoch` 0.9.18 → 0.9.20 (RUSTSEC-2026-0204, invalid pointer dereference in a
+  `Debug`/`Pointer` impl) and `quinn-proto` 0.11.14 → 0.11.15 (RUSTSEC-2026-0185, severity
+  7.5, remote memory exhaustion via unbounded out-of-order QUIC stream reassembly — runtime
+  path, reachable over libp2p's QUIC transport). Full release build + all 441 tests re-run
+  green after the bump. The remaining 2 advisories (`hickory-proto` 0.25.2, RUSTSEC-2026-0118
+  no fix available / RUSTSEC-2026-0119 fix needs hickory 0.26.1, blocked on the `libp2p ^0.25.2`
+  pin) are the pre-existing deferred pair tracked separately — unchanged by this bump.
+
 ## [0.80.0] - 2026-06-15
 
 ### Added

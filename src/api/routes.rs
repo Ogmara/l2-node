@@ -2559,6 +2559,8 @@ pub async fn federate_channel(
             "banner_cid": ch.get("banner_cid").cloned().unwrap_or(serde_json::Value::Null),
             "creator": ch.get("creator").cloned().unwrap_or(serde_json::Value::Null),
             "member_count": ch.get("member_count").cloned().unwrap_or(serde_json::json!(0)),
+            "encryption_enabled": ch.get("encryption_enabled").cloned().unwrap_or(serde_json::Value::Null),
+            "history_visibility": ch.get("history_visibility").cloned().unwrap_or(serde_json::Value::Null),
             "federated_from": base,
         });
         let bytes = serde_json::to_vec(&meta).unwrap_or_default();
