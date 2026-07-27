@@ -585,11 +585,21 @@ impl ChainScanner {
                     if let Ok(member_bytes) = serde_json::to_vec(&member_record) {
                         let _ = self.storage.put_cf(cf::CHANNEL_MEMBERS, &member_key, &member_bytes);
                     }
-                }
-                // Notify network layer to subscribe to this channel's GossipSub topic
-                let _ = self.channel_tx.send(channel_id);
 
-                info!(channel_id, slug = %slug, "Channel created (on-chain)");
+                    // Notify network layer to subscribe to this channel's GossipSub
+                    // topic — only for a genuinely NEW channel. A `ChannelCreated`
+                    // event for an already-known channel can keep re-parsing on
+                    // repeated scans (e.g. a slow/rate-limited catch-up re-fetching
+                    // an overlapping block range); resending on every re-parse fired
+                    // a redundant subscribe + backfill-reconciliation-fanout + log
+                    // line for the SAME channel over and over, observed as a tight,
+                    // continuously-repeating cycle in production (freeweb) — pure
+                    // system load for a topic the node is already subscribed to
+                    // (`subscribe_channel` is idempotent, but idempotent isn't free:
+                    // it still triggers `maybe_trigger_backfill`'s peer fanout).
+                    let _ = self.channel_tx.send(channel_id);
+                    info!(channel_id, slug = %slug, "Channel created (on-chain)");
+                }
             }
 
             ScEvent::ChannelTransferred {

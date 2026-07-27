@@ -5,6 +5,25 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.82.1] - 2026-07-27
+
+### Fixed
+
+- **Chain scanner re-triggered a GossipSub resubscribe + backfill-reconciliation-fanout + log
+  line for already-known channels on every re-parse of their `ChannelCreated` event**, observed
+  in production (freeweb) as a continuously-repeating cycle roughly every 80-90s, unconditionally
+  regardless of whether the channel was new. Root cause of the repeats themselves wasn't fully
+  pinned down (the chain cursor is not stuck — freeweb's sync lag was only ~20 blocks at the time
+  — so a `ChannelCreated`-classified event keeps re-parsing for these channel_ids by some other
+  mechanism not yet isolated), but the downstream waste is fully eliminated regardless: the
+  `channel_tx` resubscribe notification and the `"Channel created (on-chain)"` log now only fire
+  for a genuinely new channel (`is_new`), matching the scope of the `TOTAL_CHANNELS` counter
+  increment and creator-membership write right above it. Already-known channels are subscribed
+  once via the startup loop (`node.rs`) and don't need re-triggering on every re-parse. Full
+  suite green (448/448, no new tests — this handler is part of an async, network-dependent SC
+  event-processing function with no existing test scaffolding, consistent with its sibling
+  event-handling arms).
+
 ## [0.82.0] - 2026-07-27
 
 ### Added
