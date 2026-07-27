@@ -5,6 +5,28 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.82.0] - 2026-07-27
+
+### Added
+
+- **`channel_deleted` WS event.** Deleting a channel (via the signed, gossiped `ChannelDelete`
+  path — `deleteChannel()` in the SDK, not the legacy REST-only endpoint) correctly tombstones
+  the channel and propagates to every node that knows about it, but until now no connected
+  client ever found out live: unlike kick/ban (`channel_members_changed`), there was no
+  equivalent event for deletion, and "joined channels" is a client-local list that never
+  resynced from the server on its own. Result: a deleted channel just sat in every member's
+  (including federated members') sidebar/channel list forever, silently 404ing if opened.
+  `tombstone_channel` now captures the member list into the `DELETED_CHANNELS` tombstone value
+  just before wiping `CHANNEL_MEMBERS` (nothing downstream can derive the audience once that CF
+  is empty), and the notification engine reads it back to broadcast `{type:"channel_deleted",
+  channel_id}` to every former member, on both the API-post and gossip-receive paths — reaching
+  members on the host and every federated node identically. New `deleted_channel_members`
+  storage accessor; not exposed via any HTTP endpoint (internal to the notification path only).
+  3 new unit tests (member capture + wipe, idempotent re-delete preserves the original list,
+  non-deleted channel has none) — the last one caught a real bug in this same change (a
+  re-delivered `ChannelDelete` was overwriting the captured list with an empty one) before it
+  shipped. Full suite green (448/448).
+
 ## [0.81.1] - 2026-07-27
 
 ### Fixed

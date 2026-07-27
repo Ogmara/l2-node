@@ -226,6 +226,15 @@ impl NotificationEngine {
                     self.broadcast_channel_membership_change(p.channel_id, action, &p.target_user);
                 }
             }
+            MessageType::ChannelDelete => {
+                #[derive(serde::Deserialize)]
+                struct E {
+                    channel_id: u64,
+                }
+                if let Ok(p) = rmp_serde::from_slice::<E>(&envelope.payload) {
+                    self.broadcast_channel_deleted(p.channel_id);
+                }
+            }
             _ => {}
         }
     }
@@ -276,6 +285,35 @@ impl NotificationEngine {
         if let Ok(json) = serde_json::to_string(&ws_msg) {
             let _ = self.ws_broadcast.send(Arc::new(WsOutbound {
                 audience: WsAudience::Wallets(audience),
+                json,
+            }));
+        }
+    }
+
+    /// Notify a channel's members that it was deleted, so their clients drop it
+    /// from their local "joined channels" list and bounce out of its view if
+    /// currently open — the deletion counterpart to kick/ban
+    /// (`broadcast_channel_membership_change`). Reads the member list
+    /// `tombstone_channel` captured just before wiping `CHANNEL_MEMBERS`: by the
+    /// time this runs, that CF (and the `CHANNELS` record itself) are already
+    /// gone, so there is nothing left here to derive the audience from directly.
+    /// Runs on BOTH the API-post and gossip-receive paths, so it reaches members
+    /// on every node — including federated nodes, whose only signal that the
+    /// channel is gone is this broadcast plus their own local tombstone (applied
+    /// moments earlier by the same `ChannelDelete` envelope).
+    fn broadcast_channel_deleted(&self, channel_id: u64) {
+        let Some(storage) = self.storage.as_ref() else { return };
+        let members = storage.deleted_channel_members(channel_id).unwrap_or_default();
+        if members.is_empty() {
+            return;
+        }
+        let ws_msg = serde_json::json!({
+            "type": "channel_deleted",
+            "channel_id": channel_id,
+        });
+        if let Ok(json) = serde_json::to_string(&ws_msg) {
+            let _ = self.ws_broadcast.send(Arc::new(WsOutbound {
+                audience: WsAudience::Wallets(members),
                 json,
             }));
         }

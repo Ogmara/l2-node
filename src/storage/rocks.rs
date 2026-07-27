@@ -200,35 +200,67 @@ impl Storage {
 
     /// Tombstone + remove a channel and its membership/admin state.
     ///
-    /// Atomically writes a `DELETED_CHANNELS` tombstone (`deleted_at` big-endian
-    /// seconds) and drops the `CHANNELS` record, then best-effort clears the
-    /// channel's members/moderators/bans/pins/invites. The tombstone is what the
-    /// chain scanner consults to avoid resurrecting an intentionally-deleted
-    /// channel on re-scan, so it MUST land even if the bulk cleanup partially
-    /// fails. Idempotent: re-deleting an already-tombstoned channel is a no-op
-    /// write. Shared by the REST `delete_channel` endpoint and the signed,
-    /// gossiped `ChannelDelete` message handler so both paths behave identically.
+    /// Atomically writes a `DELETED_CHANNELS` tombstone (JSON: `deleted_at` +
+    /// the member list captured just before it's wiped below) and drops the
+    /// `CHANNELS` record, then best-effort clears the channel's
+    /// members/moderators/bans/pins/invites. The tombstone is what the chain
+    /// scanner consults to avoid resurrecting an intentionally-deleted channel
+    /// on re-scan, so it MUST land even if the bulk cleanup partially fails.
+    /// Idempotent: re-deleting an already-tombstoned channel is a no-op write.
+    /// Shared by the REST `delete_channel` endpoint and the signed, gossiped
+    /// `ChannelDelete` message handler so both paths behave identically.
+    ///
+    /// The captured member list lets the notification engine broadcast a live
+    /// `channel_deleted` WS event to everyone who was a member — it can't
+    /// derive that itself after the fact, since by the time it processes the
+    /// envelope, `CHANNEL_MEMBERS` has already been emptied by this function.
     pub fn tombstone_channel(&self, channel_id: u64, deleted_at: u64) -> Result<()> {
         let channel_key = channel_id.to_be_bytes();
 
-        // Idempotency: a channel already tombstoned must not decrement
-        // TOTAL_CHANNELS again (e.g. the legacy REST delete + the signed gossip
-        // delete, or a re-delivered ChannelDelete with a fresh msg_id). Only the
-        // first deletion adjusts the counter.
-        let already_deleted = self.exists_cf(cf::DELETED_CHANNELS, &channel_key)?;
+        // Idempotency: a channel already tombstoned is a pure no-op — must NOT
+        // rewrite the tombstone value. It carries the member list captured at
+        // the ORIGINAL delete (CHANNEL_MEMBERS is long gone by a re-delivery, so
+        // a second capture would be empty), and overwriting it here would wipe
+        // that list out from under the delete-notification path. Also avoids
+        // double-decrementing TOTAL_CHANNELS (e.g. the legacy REST delete + the
+        // signed gossip delete, or a re-delivered ChannelDelete with a fresh
+        // msg_id).
+        if self.exists_cf(cf::DELETED_CHANNELS, &channel_key)? {
+            return Ok(());
+        }
+
+        // Capture BEFORE the cleanup loop below wipes CHANNEL_MEMBERS. Best-effort:
+        // an empty/failed capture just means the delete notification has no
+        // audience, not a failed delete (the tombstone write below is what matters
+        // for correctness).
+        let members: Vec<String> = self
+            .prefix_iter_cf(cf::CHANNEL_MEMBERS, &channel_key, 10_000)
+            .map(|entries| {
+                entries
+                    .into_iter()
+                    .filter_map(|(k, _)| {
+                        if k.len() > 8 {
+                            String::from_utf8(k[8..].to_vec()).ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let tombstone_value = serde_json::to_vec(&serde_json::json!({
+            "deleted_at": deleted_at,
+            "members": members,
+        }))
+        .unwrap_or_else(|_| deleted_at.to_be_bytes().to_vec());
 
         let mut batch = WriteBatch::default();
         let tombstone_cf = self.cf_handle(cf::DELETED_CHANNELS)?;
         let channels_cf = self.cf_handle(cf::CHANNELS)?;
-        batch.put_cf(&tombstone_cf, channel_key, deleted_at.to_be_bytes());
+        batch.put_cf(&tombstone_cf, channel_key, tombstone_value);
         batch.delete_cf(&channels_cf, channel_key);
         self.write_batch(batch)
             .context("writing channel deletion batch")?;
-
-        if already_deleted {
-            // Tombstone refreshed, nothing else to clean up or count.
-            return Ok(());
-        }
 
         // Bulk cleanup — the tombstone already prevents resurrection, so a partial
         // failure here is safe (the leftover rows are unreachable once CHANNELS is gone).
@@ -258,6 +290,22 @@ impl Storage {
             tracing::warn!(channel_id, error = %e, "Failed to decrement TOTAL_CHANNELS");
         }
         Ok(())
+    }
+
+    /// The member list `tombstone_channel` captured at delete time, for the
+    /// notification engine's `channel_deleted` broadcast (CHANNEL_MEMBERS itself
+    /// is already gone by the time that runs). Empty if the channel was never
+    /// deleted, or predates this field (falls back to the legacy raw-`deleted_at`
+    /// encoding, which has no member list).
+    pub fn deleted_channel_members(&self, channel_id: u64) -> Result<Vec<String>> {
+        match self.get_cf(cf::DELETED_CHANNELS, &channel_id.to_be_bytes())? {
+            Some(bytes) => Ok(serde_json::from_slice::<serde_json::Value>(&bytes)
+                .ok()
+                .and_then(|v| v.get("members").cloned())
+                .and_then(|m| serde_json::from_value::<Vec<String>>(m).ok())
+                .unwrap_or_default()),
+            None => Ok(Vec::new()),
+        }
     }
 
     /// Highest channel-key epoch currently stored for a `key_scope` (0 if none).
@@ -2949,5 +2997,59 @@ mod channel_key_tests {
                 .unwrap(),
             KeyEnvelopeStore::ScopeFull
         );
+    }
+}
+
+#[cfg(test)]
+mod tombstone_channel_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn db() -> (Storage, TempDir) {
+        let dir = TempDir::new().unwrap();
+        (Storage::open(dir.path()).unwrap(), dir)
+    }
+
+    fn put_member(s: &Storage, channel_id: u64, address: &str) {
+        let key = crate::storage::schema::encode_channel_member_key(channel_id, address);
+        s.put_cf(cf::CHANNEL_MEMBERS, &key, b"{}").unwrap();
+    }
+
+    #[test]
+    fn captures_members_for_the_delete_broadcast_and_wipes_channel_members() {
+        let (s, _d) = db();
+        let channel_id = 42;
+        put_member(&s, channel_id, "klv1creator");
+        put_member(&s, channel_id, "klv1joiner");
+
+        s.tombstone_channel(channel_id, 1_700_000_000).unwrap();
+
+        let mut members = s.deleted_channel_members(channel_id).unwrap();
+        members.sort();
+        assert_eq!(members, vec!["klv1creator".to_string(), "klv1joiner".to_string()]);
+
+        // CHANNEL_MEMBERS itself is gone — the whole reason deleted_channel_members
+        // exists is that nothing can derive the audience from there anymore.
+        let key = crate::storage::schema::encode_channel_member_key(channel_id, "klv1creator");
+        assert!(s.get_cf(cf::CHANNEL_MEMBERS, &key).unwrap().is_none());
+    }
+
+    #[test]
+    fn re_deleting_an_already_tombstoned_channel_keeps_the_original_member_list() {
+        let (s, _d) = db();
+        let channel_id = 43;
+        put_member(&s, channel_id, "klv1a");
+        s.tombstone_channel(channel_id, 100).unwrap();
+
+        // A second delete (e.g. a re-delivered ChannelDelete) must not overwrite the
+        // captured list with an empty one — CHANNEL_MEMBERS is already gone by then.
+        s.tombstone_channel(channel_id, 200).unwrap();
+        assert_eq!(s.deleted_channel_members(channel_id).unwrap(), vec!["klv1a".to_string()]);
+    }
+
+    #[test]
+    fn non_deleted_channel_has_no_captured_members() {
+        let (s, _d) = db();
+        assert_eq!(s.deleted_channel_members(999).unwrap(), Vec::<String>::new());
     }
 }
