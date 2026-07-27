@@ -5,6 +5,28 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.81.0] - 2026-07-27
+
+### Fixed
+
+- **Host never subscribes to its own private channel's gossip topic on creation.**
+  `subscribe_channel` was only called at startup (looping the `CHANNELS` CF) and by a joining
+  member's `federate_channel` — never by the channel's own creator. A host that created a
+  channel stayed deaf to that channel's GossipSub topic until its next restart, so a federated
+  member's gossiped `ChannelJoin` never reached it: the host's `CHANNEL_MEMBERS` never grew past
+  the creator, `coverChannelMembers` had no target to wrap the epoch key to, and the joiner sat
+  at "waiting for the channel key" forever — same-node worked because no gossip round trip was
+  needed. This is what the earlier 0.80.1 fix's "gossip stall" theory had misattributed; a fleet
+  restart "fixing" it was actually just startup re-subscribing to the now-existing channel.
+  Live-confirmed on the darkw0rld/freeweb testnet fleet: joiner-side `member_count: 2` vs
+  host-side `member_count: 1`, and the host's `mesh-stats` had no entry for the channel's topic
+  at all. Fixed by firing `channel_subscribe_tx` (the same idempotent plumbing `federate_channel`
+  already uses) from `POST /api/v1/channels` (`create_channel`) and, belt-and-suspenders, from
+  `POST /api/v1/messages` (`post_message`) for both `ChannelCreate` and a local `ChannelJoin` —
+  the latter also covers channels created before this fix was deployed, where the host still
+  never subscribed. New `channel_id_for_resubscribe` unit tests cover the extraction logic; the
+  cross-node delivery path itself needs a live 2-node fleet retest to confirm.
+
 ## [0.80.1] - 2026-07-26
 
 ### Fixed

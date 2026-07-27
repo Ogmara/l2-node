@@ -1471,6 +1471,34 @@ fn gossip_topic_for_envelope(
     }
 }
 
+/// If `envelope` should cause this node to (re)subscribe to a channel's
+/// GossipSub topic, return that channel_id.
+///
+/// `ChannelCreate` covers the primary case: a host that just created a
+/// private channel must join its own topic or it's deaf to a federated
+/// member's gossiped `ChannelJoin` (host `CHANNEL_MEMBERS` never grows past
+/// the creator, `coverChannelMembers` never runs, the joiner waits on the key
+/// forever). `ChannelJoin` is belt-and-suspenders for a same-node member
+/// joining a channel created before this fix was deployed, where the host
+/// still never subscribed. `subscribe_channel` de-dupes, so firing this for
+/// every join is harmless.
+fn channel_id_for_resubscribe(envelope: &crate::messages::envelope::Envelope) -> Option<u64> {
+    use crate::messages::types::{ChannelCreatePayload, ChannelJoinPayload, MessageType};
+    match envelope.msg_type {
+        MessageType::ChannelCreate => {
+            rmp_serde::from_slice::<ChannelCreatePayload>(&envelope.payload)
+                .ok()
+                .map(|p| p.channel_id)
+        }
+        MessageType::ChannelJoin => {
+            rmp_serde::from_slice::<ChannelJoinPayload>(&envelope.payload)
+                .ok()
+                .map(|p| p.channel_id)
+        }
+        _ => None,
+    }
+}
+
 fn is_private_channel(channel_meta: &serde_json::Value) -> bool {
     match channel_meta.get("channel_type") {
         Some(serde_json::Value::Number(n)) => n.as_u64() == Some(2),
@@ -2284,6 +2312,20 @@ pub async fn post_message(
                     };
                 }
 
+                // Belt-and-suspenders channel-topic subscribe (mirrors create_channel
+                // above): a ChannelCreate submitted through this generic path (rather
+                // than the dedicated /channels endpoint) must also subscribe the host
+                // to its own channel's gossip topic. A local member's ChannelJoin also
+                // re-fires it, covering channels created before this fix was deployed
+                // (host never subscribed at creation, so it's still deaf until this
+                // no-op-if-already-subscribed catches it here). subscribe_channel is
+                // idempotent, so redundant sends across both paths are harmless.
+                if let Some(cid) = channel_id_for_resubscribe(&envelope) {
+                    if state.channel_subscribe_tx.send(cid).is_err() {
+                        tracing::warn!(channel_id = cid, "post_message: channel subscribe channel closed");
+                    }
+                }
+
                 // Feed to notification engine for mention detection
                 if let Some(ref engine) = state.notification_engine {
                     let engine = engine.clone();
@@ -2327,18 +2369,27 @@ pub async fn create_channel(
 ) -> impl IntoResponse {
     use crate::messages::envelope::Envelope;
     use crate::messages::router::RouteResult;
-    use crate::messages::types::ChannelCreatePayload;
 
     match state.router.process_message(&body) {
         RouteResult::Accepted { msg_id, .. } => {
             // Try to extract channel_id from the envelope payload
             let channel_id = rmp_serde::from_slice::<Envelope>(&body)
                 .ok()
-                .and_then(|env| {
-                    rmp_serde::from_slice::<ChannelCreatePayload>(&env.payload)
-                        .ok()
-                        .map(|p| p.channel_id)
-                });
+                .and_then(|env| channel_id_for_resubscribe(&env));
+
+            // Subscribe the host to its own new channel's gossip topic (mirrors
+            // the subscribe federate already does for the joiner, routes.rs
+            // federate_channel). Without this, a creator's node never joins the
+            // topic until its next restart (only startup + federate subscribe),
+            // so it's deaf to a federated member's gossiped ChannelJoin — the
+            // member never reaches CHANNEL_MEMBERS, coverChannelMembers has no
+            // target, and the joiner waits on the key forever. Idempotent
+            // (subscribe_channel de-dupes).
+            if let Some(cid) = channel_id {
+                if state.channel_subscribe_tx.send(cid).is_err() {
+                    tracing::warn!(channel_id = cid, "create_channel: channel subscribe channel closed");
+                }
+            }
 
             Json(serde_json::json!({
                 "ok": true,
@@ -7304,5 +7355,65 @@ mod bootstrap_candidates_tests {
     fn source_rank_orders_sc_over_book_over_config() {
         assert!(source_rank("sc") > source_rank("book"));
         assert!(source_rank("book") > source_rank("config"));
+    }
+}
+
+#[cfg(test)]
+mod channel_resubscribe_tests {
+    use super::channel_id_for_resubscribe;
+    use crate::messages::envelope::Envelope;
+    use crate::messages::types::{
+        ChannelCreatePayload, ChannelJoinPayload, ChannelType, ContentRating, MessageType,
+        ModerationPolicy,
+    };
+
+    fn envelope(msg_type: MessageType, payload: Vec<u8>) -> Envelope {
+        Envelope {
+            version: 1,
+            msg_type,
+            msg_id: [0u8; 32],
+            author: "klv1test".to_string(),
+            timestamp: 0,
+            lamport_ts: 0,
+            payload,
+            signature: Vec::new(),
+            relay_path: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn channel_create_yields_its_channel_id() {
+        let payload = ChannelCreatePayload {
+            channel_id: 4242,
+            slug: "test".to_string(),
+            channel_type: ChannelType::Private,
+            display_name: None,
+            description: None,
+            content_rating: ContentRating::General,
+            moderation: ModerationPolicy { admins: Vec::new(), rules: None },
+            encryption_enabled: Some(true),
+            history_visibility: None,
+        };
+        let env = envelope(MessageType::ChannelCreate, rmp_serde::to_vec(&payload).unwrap());
+        assert_eq!(channel_id_for_resubscribe(&env), Some(4242));
+    }
+
+    #[test]
+    fn channel_join_yields_its_channel_id() {
+        let payload = ChannelJoinPayload { channel_id: 777 };
+        let env = envelope(MessageType::ChannelJoin, rmp_serde::to_vec(&payload).unwrap());
+        assert_eq!(channel_id_for_resubscribe(&env), Some(777));
+    }
+
+    #[test]
+    fn unrelated_message_type_yields_none() {
+        let env = envelope(MessageType::ChatMessage, Vec::new());
+        assert_eq!(channel_id_for_resubscribe(&env), None);
+    }
+
+    #[test]
+    fn channel_create_with_corrupt_payload_yields_none() {
+        let env = envelope(MessageType::ChannelCreate, vec![0xff, 0x00, 0x01]);
+        assert_eq!(channel_id_for_resubscribe(&env), None);
     }
 }
