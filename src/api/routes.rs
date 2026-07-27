@@ -1617,10 +1617,17 @@ pub async fn get_channel(
                     });
                     // Include safe display fields (logo/banner are public branding,
                     // not sensitive — needed so a federating member's node can show
-                    // the channel's icon).
+                    // the channel's icon). `creator` is needed so a federating node
+                    // can recognize the creator as a channel member locally (see
+                    // federate_channel) — without it, every ChannelKeyEnvelope
+                    // authored by the creator/mod covering a new joiner fails the
+                    // author-is-member authorization check on every federated node,
+                    // since ChannelCreate is L2-only and never gossips the creator's
+                    // CHANNEL_MEMBERS entry there. A single wallet address is a much
+                    // narrower exposure than the full member list (never sent here).
                     for key in [
                         "display_name", "slug", "description", "logo_cid", "banner_cid",
-                        "encryption_enabled", "history_visibility",
+                        "encryption_enabled", "history_visibility", "creator",
                     ] {
                         if let Some(v) = channel.get(key) {
                             limited[key] = v.clone();
@@ -2630,6 +2637,35 @@ pub async fn federate_channel(
         let rec = serde_json::json!({ "joined_at": now_ms, "role": "member" });
         if let Err(e) = state.storage.put_cf(cf::CHANNEL_MEMBERS, &member_key, rec.to_string().as_bytes()) {
             return (StatusCode::INTERNAL_SERVER_ERROR, format!("storage error: {}", e)).into_response();
+        }
+    }
+    // The creator is added to CHANNEL_MEMBERS at ChannelCreate on the host (see
+    // `is_channel_member`'s doc comment: "creator is added as a member... at
+    // ChannelCreate, so this covers them too") — but ChannelCreate is L2-only and
+    // never gossips, so a federating node never replays that step and the creator
+    // is otherwise recognized ONLY via `CHANNELS.creator` (is_channel_creator), not
+    // CHANNEL_MEMBERS. `ChannelKeyEnvelope` authorization requires the AUTHOR (and
+    // target) to pass `is_channel_member` specifically — the creator/mod covering a
+    // new joiner is always author'd by the creator, so every cover envelope was
+    // silently rejected on every federated node until a ChatMessage from the
+    // creator happened to auto-add them first (router.rs `add_channel_member` on
+    // ChatMessage receipt). Explicitly mirror the host's invariant here so the
+    // creator is a recognized member from the moment of federation, not by luck of
+    // message ordering.
+    if let Some(creator) = state
+        .storage
+        .get_cf(cf::CHANNELS, &channel_id.to_be_bytes())
+        .ok()
+        .flatten()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| v.get("creator").and_then(|c| c.as_str()).map(|s| s.to_string()))
+    {
+        let creator_key = sch::encode_channel_member_key(channel_id, &creator);
+        if state.storage.get_cf(cf::CHANNEL_MEMBERS, &creator_key).ok().flatten().is_none() {
+            let rec = serde_json::json!({ "joined_at": now_ms, "role": "creator" });
+            if let Err(e) = state.storage.put_cf(cf::CHANNEL_MEMBERS, &creator_key, rec.to_string().as_bytes()) {
+                return (StatusCode::INTERNAL_SERVER_ERROR, format!("storage error: {}", e)).into_response();
+            }
         }
     }
     if let Err(e) = state.storage.put_cf(

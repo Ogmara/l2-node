@@ -5,6 +5,39 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.81.1] - 2026-07-27
+
+### Fixed
+
+- **A federated channel's creator is never a recognized `CHANNEL_MEMBERS` entry on the
+  federating node, so every `ChannelKeyEnvelope` they author is silently rejected.** With
+  0.81.0's subscribe-on-create fix deployed and verified working (member_count converges
+  correctly cross-node), key delivery still failed 100% of the time on a live 2-node retest.
+  Root cause: `ChannelKeyEnvelope` authorization (`router.rs`) requires the envelope's AUTHOR
+  to pass `is_channel_member` — but the creator is only ever added to `CHANNEL_MEMBERS` by the
+  `ChannelCreate` handler, which is L2-only and never gossips (private channels aren't
+  chain-discovered). `federate_channel` only recorded the *caller* (joiner) as a member, never
+  the creator, so on a federated node the creator was recognized only via `CHANNELS.creator`
+  (`is_channel_creator`) — a different check that `ChannelKeyEnvelope`'s authorization doesn't
+  consult. Since the creator/mod always authors the cover envelope that wraps the epoch key to
+  a new joiner, that envelope was rejected with "only a channel member may publish a channel
+  key" on every node that federated the channel, every time — confirmed identically reproduced
+  on 3 separate test channels, with the host holding the full set of key envelopes and every
+  federated node holding zero. (`ChatMessage`, by contrast, auto-adds its author as a member on
+  receipt, which is why chat content crossed fine while only the key envelope silently vanished
+  — a false lead toward a "gossip mesh" theory before this was traced to authorization.)
+
+  Two-part fix: (1) the host's unauthenticated (non-member) `GET /api/v1/channels/:id`
+  response — the only response `federate_channel` ever receives, since it calls the host
+  without auth — now includes `creator` alongside the existing display fields (a single
+  wallet address, much narrower than the member list, which is never exposed to non-members).
+  (2) `federate_channel` now also adds that creator to the local `CHANNEL_MEMBERS`, mirroring
+  the same invariant `ChannelCreate` establishes on the host. Full suite green (445/445),
+  `cargo audit` unchanged (2 pre-existing deferred hickory-proto advisories).
+
+  Still needs a live 2-node fleet retest to confirm this finally closes cross-node key
+  delivery end-to-end.
+
 ## [0.81.0] - 2026-07-27
 
 ### Fixed
