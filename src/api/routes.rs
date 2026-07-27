@@ -14,7 +14,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 
-use crate::storage::schema::{cf, decode_users_by_name_key, encode_channel_msg_key, encode_dm_msg_key, state_keys};
+use crate::storage::schema::{cf, decode_users_by_name_key, encode_channel_msg_key, encode_dm_msg_key, message_key_upper_bound, state_keys};
 
 use super::auth::AuthUser;
 use super::state::{AppState, CachedMedia};
@@ -1728,8 +1728,14 @@ pub async fn get_channel_messages(
         }
     });
 
-    // Resolve `after` cursor to a seek key for incremental fetching
-    let entries_result = if let Some(after_hex) = &params.after {
+    // Resolve `after`/`before` cursors to a seek key for incremental fetching.
+    // No cursor at all (a fresh conversation open) must return the NEWEST
+    // `limit` messages, not the oldest — `prefix_iter_cf` seeks from the start
+    // of the key range, which previously made every fresh open land on the
+    // earliest history ever exchanged once a channel exceeded one page.
+    // `reverse_order` tracks whether `entries` came back newest-first and
+    // needs flipping to the ascending order the response format always uses.
+    let (entries_result, reverse_order) = if let Some(after_hex) = &params.after {
         // Parse the hex msg_id, look up the message to get its lamport_ts,
         // then verify the message belongs to this channel (prevents cross-channel oracle)
         let after_key = (|| -> Option<Vec<u8>> {
@@ -1751,18 +1757,66 @@ pub async fn get_channel_messages(
             Some(key)
         })();
         match after_key {
-            Some(seek_key) => state.storage.prefix_iter_cf_after(
-                cf::CHANNEL_MSGS, &seek_key, &prefix, limit,
+            Some(seek_key) => (
+                state.storage.prefix_iter_cf_after(cf::CHANNEL_MSGS, &seek_key, &prefix, limit),
+                false,
             ),
-            // Cursor not found or not in this channel — fall back to full fetch
-            None => state.storage.prefix_iter_cf(cf::CHANNEL_MSGS, &prefix, limit),
+            // Cursor not found or not in this channel — fall back to the newest page.
+            None => (
+                state.storage.reverse_iter_cf(
+                    cf::CHANNEL_MSGS, &message_key_upper_bound(&prefix), &prefix, limit,
+                ),
+                true,
+            ),
+        }
+    } else if let Some(before_hex) = &params.before {
+        // Same resolve/verify pattern as `after`, for "load older" pagination.
+        let before_key = (|| -> Option<Vec<u8>> {
+            let msg_id_bytes = hex::decode(before_hex).ok()?;
+            let msg_id: [u8; 32] = msg_id_bytes.try_into().ok()?;
+            let envelope_bytes = state.storage.get_message(&msg_id).ok()??;
+            let envelope = rmp_serde::from_slice::<crate::messages::envelope::Envelope>(
+                &envelope_bytes,
+            ).ok()?;
+            let key = encode_channel_msg_key(channel_id, envelope.timestamp, &msg_id);
+            if !state.storage.exists_cf(cf::CHANNEL_MSGS, &key).unwrap_or(false) {
+                return None;
+            }
+            Some(key)
+        })();
+        match before_key {
+            Some(seek_key) => (
+                state.storage.reverse_iter_cf_before(cf::CHANNEL_MSGS, &seek_key, &prefix, limit),
+                true,
+            ),
+            // Cursor not found or not in this channel — fall back to the newest page.
+            // Currently unreachable in normal "load older" scroll-up use: message
+            // deletion is a soft tombstone (content hidden, key/entry untouched —
+            // see docs/specs/03-l2-node.md), so a `before` cursor that was valid
+            // when handed to a client stays resolvable indefinitely. If that ever
+            // changes (hard delete), reconsider returning an explicit error here
+            // instead of silently teleporting a mid-scroll client to the bottom.
+            None => (
+                state.storage.reverse_iter_cf(
+                    cf::CHANNEL_MSGS, &message_key_upper_bound(&prefix), &prefix, limit,
+                ),
+                true,
+            ),
         }
     } else {
-        state.storage.prefix_iter_cf(cf::CHANNEL_MSGS, &prefix, limit)
+        (
+            state.storage.reverse_iter_cf(
+                cf::CHANNEL_MSGS, &message_key_upper_bound(&prefix), &prefix, limit,
+            ),
+            true,
+        )
     };
 
     match entries_result {
-        Ok(entries) => {
+        Ok(mut entries) => {
+            if reverse_order {
+                entries.reverse();
+            }
             let mut messages = Vec::with_capacity(entries.len());
             for (key, _) in &entries {
                 if key.len() >= 48 {
@@ -2910,9 +2964,11 @@ pub async fn get_dm_messages(
     let conversation_id =
         crate::crypto::compute_conversation_id(&auth_user.address, &address);
 
-    // Resolve `after` cursor for incremental DM fetching
-    // Verify the cursor message belongs to this conversation (prevents cross-conversation oracle)
-    let entries_result = if let Some(after_hex) = &params.after {
+    // Resolve `after`/`before` cursors for DM fetching. No cursor at all (a
+    // fresh conversation open) must return the NEWEST `limit` messages, not
+    // the oldest — see the identical comment in `get_channel_messages` above.
+    let (entries_result, reverse_order) = if let Some(after_hex) = &params.after {
+        // Verify the cursor message belongs to this conversation (prevents cross-conversation oracle)
         let after_key = (|| -> Option<Vec<u8>> {
             let msg_id_bytes = hex::decode(after_hex).ok()?;
             let msg_id: [u8; 32] = msg_id_bytes.try_into().ok()?;
@@ -2928,18 +2984,66 @@ pub async fn get_dm_messages(
             Some(key)
         })();
         match after_key {
-            Some(seek_key) => state.storage.prefix_iter_cf_after(
-                cf::DM_MESSAGES, &seek_key, &conversation_id, limit,
+            Some(seek_key) => (
+                state.storage.prefix_iter_cf_after(cf::DM_MESSAGES, &seek_key, &conversation_id, limit),
+                false,
             ),
-            // Cursor not found or not in this conversation — fall back to full fetch
-            None => state.storage.prefix_iter_cf(cf::DM_MESSAGES, &conversation_id, limit),
+            // Cursor not found or not in this conversation — fall back to the newest page.
+            None => (
+                state.storage.reverse_iter_cf(
+                    cf::DM_MESSAGES, &message_key_upper_bound(&conversation_id), &conversation_id, limit,
+                ),
+                true,
+            ),
+        }
+    } else if let Some(before_hex) = &params.before {
+        // Same resolve/verify pattern as `after`, for "load older" pagination.
+        let before_key = (|| -> Option<Vec<u8>> {
+            let msg_id_bytes = hex::decode(before_hex).ok()?;
+            let msg_id: [u8; 32] = msg_id_bytes.try_into().ok()?;
+            let envelope_bytes = state.storage.get_message(&msg_id).ok()??;
+            let envelope = rmp_serde::from_slice::<crate::messages::envelope::Envelope>(
+                &envelope_bytes,
+            ).ok()?;
+            let key = encode_dm_msg_key(&conversation_id, envelope.timestamp, &msg_id);
+            if !state.storage.exists_cf(cf::DM_MESSAGES, &key).unwrap_or(false) {
+                return None;
+            }
+            Some(key)
+        })();
+        match before_key {
+            Some(seek_key) => (
+                state.storage.reverse_iter_cf_before(cf::DM_MESSAGES, &seek_key, &conversation_id, limit),
+                true,
+            ),
+            // Cursor not found or not in this conversation — fall back to the newest page.
+            // Currently unreachable in normal "load older" scroll-up use: message
+            // deletion is a soft tombstone (content hidden, key/entry untouched —
+            // see docs/specs/03-l2-node.md), so a `before` cursor that was valid
+            // when handed to a client stays resolvable indefinitely. If that ever
+            // changes (hard delete), reconsider returning an explicit error here
+            // instead of silently teleporting a mid-scroll client to the bottom.
+            None => (
+                state.storage.reverse_iter_cf(
+                    cf::DM_MESSAGES, &message_key_upper_bound(&conversation_id), &conversation_id, limit,
+                ),
+                true,
+            ),
         }
     } else {
-        state.storage.prefix_iter_cf(cf::DM_MESSAGES, &conversation_id, limit)
+        (
+            state.storage.reverse_iter_cf(
+                cf::DM_MESSAGES, &message_key_upper_bound(&conversation_id), &conversation_id, limit,
+            ),
+            true,
+        )
     };
 
     match entries_result {
-        Ok(entries) => {
+        Ok(mut entries) => {
+            if reverse_order {
+                entries.reverse();
+            }
             let mut messages = Vec::with_capacity(entries.len());
             for (key, _) in &entries {
                 // Key: (conversation_id:32, timestamp:8, msg_id:32)

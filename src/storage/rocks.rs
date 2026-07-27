@@ -441,6 +441,50 @@ impl Storage {
         Ok(results)
     }
 
+    /// Iterate backwards over a column family starting strictly before a given key.
+    ///
+    /// Seeks to `start_key` (or the nearest key ≤ it), skips it if it's an exact
+    /// match, then iterates backward within the prefix. Used for "load older"
+    /// pagination (e.g. "give me messages before this one"), mirroring
+    /// `prefix_iter_cf_after`'s forward/skip-boundary behavior in reverse.
+    pub fn reverse_iter_cf_before(
+        &self,
+        cf_name: &str,
+        start_key: &[u8],
+        prefix: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let cf = self
+            .db
+            .cf_handle(cf_name)
+            .with_context(|| format!("column family '{}' not found", cf_name))?;
+
+        let mut iter = self.db.raw_iterator_cf(&cf);
+        iter.seek_for_prev(start_key);
+
+        // Skip the start_key itself (we want entries strictly before it)
+        if iter.valid() {
+            if let Some(key) = iter.key() {
+                if key == start_key {
+                    iter.prev();
+                }
+            }
+        }
+
+        let mut results = Vec::with_capacity(limit.min(500));
+        while iter.valid() && results.len() < limit {
+            if let (Some(key), Some(value)) = (iter.key(), iter.value()) {
+                if !key.starts_with(prefix) {
+                    break;
+                }
+                results.push((key.to_vec(), value.to_vec()));
+            }
+            iter.prev();
+        }
+
+        Ok(results)
+    }
+
     /// Store a message envelope and atomically increment the message counter.
     ///
     /// Uses a WriteBatch to ensure the message and its counter update are
@@ -3051,5 +3095,94 @@ mod tombstone_channel_tests {
     fn non_deleted_channel_has_no_captured_members() {
         let (s, _d) = db();
         assert_eq!(s.deleted_channel_members(999).unwrap(), Vec::<String>::new());
+    }
+}
+
+#[cfg(test)]
+mod message_pagination_tests {
+    use super::*;
+    use crate::storage::schema::{encode_channel_msg_key, message_key_upper_bound};
+    use tempfile::TempDir;
+
+    fn db() -> (Storage, TempDir) {
+        let dir = TempDir::new().unwrap();
+        (Storage::open(dir.path()).unwrap(), dir)
+    }
+
+    /// Seed `count` channel messages with strictly increasing timestamps
+    /// `base_ts..base_ts+count`, msg_id derived from the index so each is
+    /// distinguishable, and returns their keys in seeded (ascending) order.
+    fn seed_channel_messages(s: &Storage, channel_id: u64, base_ts: u64, count: u64) -> Vec<Vec<u8>> {
+        let mut keys = Vec::with_capacity(count as usize);
+        for i in 0..count {
+            let mut msg_id = [0u8; 32];
+            msg_id[24..].copy_from_slice(&i.to_be_bytes());
+            let key = encode_channel_msg_key(channel_id, base_ts + i, &msg_id);
+            s.put_cf(cf::CHANNEL_MSGS, &key, b"{}").unwrap();
+            keys.push(key);
+        }
+        keys
+    }
+
+    #[test]
+    fn no_cursor_returns_newest_page_not_oldest() {
+        // Regression test for the bug this session fixed: a fresh conversation
+        // open (no cursor) must land on the newest messages, not the oldest —
+        // it previously always returned the oldest `limit` via `prefix_iter_cf`.
+        let (s, _d) = db();
+        let channel_id = 100;
+        let all_keys = seed_channel_messages(&s, channel_id, 1_000, 10);
+        let prefix = channel_id.to_be_bytes();
+
+        let limit = 4;
+        let mut newest = s
+            .reverse_iter_cf(cf::CHANNEL_MSGS, &message_key_upper_bound(&prefix), &prefix, limit)
+            .unwrap();
+        newest.reverse(); // route handlers reverse back to ascending order
+
+        let newest_keys: Vec<Vec<u8>> = newest.into_iter().map(|(k, _)| k).collect();
+        // The 4 newest of 10 seeded messages are the last 4 in seed order.
+        assert_eq!(newest_keys, all_keys[6..10].to_vec());
+
+        // Sanity: the OLD (buggy) behavior would have returned the first 4 —
+        // explicitly confirm the fix actually changed the selected window.
+        let oldest = s.prefix_iter_cf(cf::CHANNEL_MSGS, &prefix, limit).unwrap();
+        let oldest_keys: Vec<Vec<u8>> = oldest.into_iter().map(|(k, _)| k).collect();
+        assert_eq!(oldest_keys, all_keys[0..4].to_vec());
+        assert_ne!(newest_keys, oldest_keys);
+    }
+
+    #[test]
+    fn before_cursor_returns_the_page_immediately_preceding_it() {
+        let (s, _d) = db();
+        let channel_id = 101;
+        let all_keys = seed_channel_messages(&s, channel_id, 2_000, 10);
+        let prefix = channel_id.to_be_bytes();
+
+        // "Load older" from the 7th message (index 6) should return the 4
+        // immediately before it (indices 2..6), newest-first before reversal.
+        let cursor_key = &all_keys[6];
+        let mut older = s
+            .reverse_iter_cf_before(cf::CHANNEL_MSGS, cursor_key, &prefix, 4)
+            .unwrap();
+        older.reverse();
+        let older_keys: Vec<Vec<u8>> = older.into_iter().map(|(k, _)| k).collect();
+        assert_eq!(older_keys, all_keys[2..6].to_vec());
+    }
+
+    #[test]
+    fn message_key_upper_bound_does_not_leak_into_another_channel() {
+        let (s, _d) = db();
+        seed_channel_messages(&s, 200, 5_000, 3);
+        seed_channel_messages(&s, 201, 5_000, 3);
+        let prefix_200 = 200u64.to_be_bytes();
+
+        let entries = s
+            .reverse_iter_cf(cf::CHANNEL_MSGS, &message_key_upper_bound(&prefix_200), &prefix_200, 100)
+            .unwrap();
+        assert_eq!(entries.len(), 3);
+        for (key, _) in &entries {
+            assert!(key.starts_with(&prefix_200));
+        }
     }
 }

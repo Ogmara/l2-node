@@ -5,6 +5,39 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.82.2] - 2026-07-27
+
+### Fixed
+
+- **Every fresh conversation open landed on the OLDEST messages ever
+  exchanged, not the newest.** `GET /api/v1/channels/:id/messages` and
+  `GET /api/v1/dm/:address/messages`, when called with no cursor (i.e. every
+  time a client opens a channel or DM), seeked from the *start* of the
+  message-key range and returned the chronologically oldest page — because
+  message keys sort in plain ascending timestamp order and the no-cursor
+  path used a forward-only iterator. Any conversation whose history
+  exceeded one page (50 for DMs, 50–200 for channels) was permanently stuck
+  showing ancient history on every open. Fixed by seeking from the end of
+  the conversation's key range and reading backward
+  (`storage::reverse_iter_cf`, previously written but never wired to any
+  caller) when no cursor is given, then re-ascending the result before
+  responding — the wire format/order is unchanged, only the *selected
+  window* is now correct.
+- **`before` pagination cursor was dead code.** `MessageParams.before` was
+  parsed but never read by either handler, so "load older" (scroll-up)
+  pagination silently re-fetched the same page instead of retrieving older
+  history. Implemented via a new `storage::reverse_iter_cf_before` (mirrors
+  the existing `prefix_iter_cf_after`'s skip-boundary logic, in reverse).
+  This makes the channel client views' existing "load older" UI (which
+  already called the endpoint with `before` — it just did nothing) start
+  working with no client changes required.
+- New `storage::schema::message_key_upper_bound()` — the shared helper both
+  fixes above use to seek to the end of a channel/DM message key range.
+- Added regression tests (`storage::rocks::message_pagination_tests`,
+  `storage::schema::tests::message_key_upper_bound_sorts_after_any_real_key`)
+  covering the no-cursor newest-page selection, the `before`-cursor older
+  page, and prefix isolation between channels.
+
 ## [0.82.1] - 2026-07-27
 
 ### Fixed

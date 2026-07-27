@@ -408,6 +408,23 @@ pub fn encode_channel_msg_key(channel_id: u64, lamport_ts: u64, msg_id: &[u8; 32
     key
 }
 
+/// Length of the `(timestamp:8, msg_id:32)` suffix shared by both
+/// `encode_channel_msg_key` and `encode_dm_msg_key` — the only variable part
+/// is the prefix (channel_id or conversation_id).
+const MESSAGE_KEY_SUFFIX_LEN: usize = 8 + 32;
+
+/// Build an upper-bound key for a channel/DM message prefix: guaranteed to
+/// sort at or after any real message key with that prefix, since no real
+/// `(timestamp, msg_id)` suffix can exceed all-`0xFF` bytes. Used with
+/// `reverse_iter_cf`/`seek_for_prev` to seek to the newest message in a
+/// channel or conversation without needing a known cursor.
+pub fn message_key_upper_bound(prefix: &[u8]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(prefix.len() + MESSAGE_KEY_SUFFIX_LEN);
+    key.extend_from_slice(prefix);
+    key.extend(std::iter::repeat(0xFFu8).take(MESSAGE_KEY_SUFFIX_LEN));
+    key
+}
+
 /// Encode an identity-envelope index key: `(wallet, 0xFF, msg_type, timestamp,
 /// msg_id)` (P-1 identity-sync, l2-node 0.50.0+). Big-endian timestamp for
 /// natural chronological sort. The `0xFF` separator delimits the variable-length
@@ -925,6 +942,23 @@ pub fn encode_channel_key_scope_prefix(key_scope: &[u8; 32]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_key_upper_bound_sorts_after_any_real_key() {
+        // Channel message keys: prefix = channel_id (8 bytes).
+        let channel_id: u64 = 42;
+        let prefix = channel_id.to_be_bytes();
+        let upper = message_key_upper_bound(&prefix);
+        // The theoretical maximum real key for this channel: max timestamp,
+        // max msg_id — must sort at or before the upper bound.
+        let max_real = encode_channel_msg_key(channel_id, u64::MAX, &[0xFFu8; 32]);
+        assert!(max_real <= upper);
+        // A very ordinary real key must also sort before it.
+        let ordinary = encode_channel_msg_key(channel_id, 1_700_000_000, &[3u8; 32]);
+        assert!(ordinary < upper);
+        // And the upper bound must not accidentally match another channel's prefix.
+        assert!(!upper.starts_with(&(channel_id + 1).to_be_bytes()));
+    }
 
     #[test]
     fn users_by_name_key_round_trips() {
