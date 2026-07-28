@@ -247,19 +247,20 @@ impl NotificationEngine {
             .unwrap_or_else(|| author.to_string())
     }
 
-    /// Notify a PRIVATE channel's members that membership changed, so their clients
-    /// react live: on `join` an existing member's client wraps the channel epoch key
-    /// to the new member (reliable key delivery — no longer depends on a member
+    /// Notify a channel's members that membership changed, so their clients react
+    /// live: on `join` an existing member's client wraps the channel epoch key to
+    /// the new member (reliable key delivery — no longer depends on a member
     /// actively viewing the channel); on `kick`/`ban`/`leave` clients drop the member
     /// (and the removed member learns it lost access). Members-only `Wallets` audience.
     /// Runs on BOTH the API-post and gossip-receive paths, so it reaches members on
-    /// every node. Skipped for public channels (no encryption → no cover needed).
+    /// every node. Skipped for channels that need no key cover — i.e. PRIVATE (2)
+    /// or `encryption_enabled` PUBLIC/READ-PUBLIC (P4) channels both need it;
+    /// plain unencrypted public channels don't.
     fn broadcast_channel_membership_change(&self, channel_id: u64, action: &str, member: &str) {
-        // Only private channels need this (key cover + removal). Gate on
-        // KNOWN-private (not "not known public") so a public channel learned via
-        // gossip before its CHANNELS metadata arrives doesn't get a spurious
+        // Gate on KNOWN-needs-cover (not "not known public") so a channel learned
+        // via gossip before its CHANNELS metadata arrives doesn't get a spurious
         // member-targeted push.
-        if !self.channel_is_known_private(channel_id) {
+        if !self.channel_needs_key_cover(channel_id) {
             return;
         }
         let mut audience = self.channel_member_addresses(channel_id);
@@ -352,26 +353,30 @@ impl NotificationEngine {
             .unwrap_or(false)
     }
 
-    /// True only when the channel's stored metadata is present, parseable, and
-    /// explicitly PRIVATE (2). Unlike `!channel_is_public`, a missing/unparseable
-    /// record returns `false` here — so membership-change pushes fire only for
-    /// channels we KNOW are private, never for not-yet-synced metadata.
-    fn channel_is_known_private(&self, channel_id: u64) -> bool {
+    /// True only when the channel's stored metadata is present, parseable, and the
+    /// channel needs join/leave key cover — either explicitly PRIVATE (2), or
+    /// explicitly `encryption_enabled: true` (P4 encrypted PUBLIC/READ-PUBLIC
+    /// channels use the same epoch-key-wrap-on-join mechanism as private ones).
+    /// Unlike `!channel_is_public`, a missing/unparseable record returns `false`
+    /// here — so membership-change pushes fire only for channels we KNOW need
+    /// cover, never for not-yet-synced metadata.
+    fn channel_needs_key_cover(&self, channel_id: u64) -> bool {
         self.storage
             .as_ref()
             .and_then(|s| s.get_cf(cf::CHANNELS, &channel_id.to_be_bytes()).ok().flatten())
             .and_then(|data| serde_json::from_slice::<serde_json::Value>(&data).ok())
-            .and_then(|meta| match meta.get("channel_type") {
-                Some(serde_json::Value::Number(n)) => n.as_u64(),
-                Some(serde_json::Value::String(s)) => match s.as_str() {
-                    "Private" => Some(2),
-                    "Public" => Some(0),
-                    "ReadPublic" => Some(1),
-                    _ => None,
-                },
-                _ => None,
+            .map(|meta| {
+                let is_private = match meta.get("channel_type") {
+                    Some(serde_json::Value::Number(n)) => n.as_u64() == Some(2),
+                    Some(serde_json::Value::String(s)) => s == "Private",
+                    _ => false,
+                };
+                let encrypted = meta
+                    .get("encryption_enabled")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                is_private || encrypted
             })
-            .map(|ct| ct == 2)
             .unwrap_or(false)
     }
 

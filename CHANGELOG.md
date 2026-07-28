@@ -5,6 +5,41 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.82.3] - 2026-07-28
+
+### Fixed
+
+- **Joining an encrypted PUBLIC channel left the new member stuck "waiting
+  for the channel key" forever.** `broadcast_channel_membership_change`
+  (the `channel_members_changed` WS event that triggers an existing
+  member's client to wrap the channel's epoch key for a joiner) only fired
+  for channels it knew were PRIVATE (`channel_type == 2`). P4 (encrypted
+  public channels) added `encryption_enabled: true` PUBLIC/READ-PUBLIC
+  channels that need the exact same join-time key cover, but the gate
+  predates P4 and was never widened — so joins to an encrypted public
+  channel never emitted the event, no member's client ever ran
+  `coverChannelMembers`, and the joiner's device was never wrapped a key.
+  Same-node private channels were unaffected (the gate matched them
+  correctly); only encrypted public/read-public channels were stuck.
+  Renamed `channel_is_known_private` → `channel_needs_key_cover` and
+  broadened it to `channel_type == 2 OR encryption_enabled == true`,
+  fail-closed on missing/unparseable channel metadata as before (no
+  spurious push for not-yet-synced channels). Kick/ban/leave and the P2d
+  `key_epoch_floor` push share the same call path, so they now also cover
+  encrypted public channels. Client-side (`coverChannelMembers`) required
+  no change — it already runs for any joined channel regardless of
+  public/private.
+
+### Known follow-up
+
+- For a large encrypted public channel, every join now fans out
+  `channel_members_changed` to every member, each of whom runs
+  `coverChannelMembers` — the node de-dupes wraps (FWW), so it's correct
+  but wasteful at scale (redundant client work + WS/publish volume). Fine
+  for testnet; before mainnet-scale public channels, bound the cover
+  audience (e.g. creator + N recent-active members, or a rotating
+  coverer) instead of all members.
+
 ## [0.82.2] - 2026-07-27
 
 ### Fixed
