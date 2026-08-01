@@ -231,18 +231,6 @@ pub struct Attachment {
     pub thumbnail_cid: Option<String>,
 }
 
-// --- Encrypted Attachment (spec 3.4) ---
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EncryptedAttachment {
-    /// CID of encrypted content on IPFS.
-    pub cid: String,
-    /// XChaCha20-Poly1305 encrypted metadata (mime_type, size, filename, thumbnail_cid).
-    pub encrypted_meta: Vec<u8>,
-    /// XChaCha20-Poly1305 nonce for metadata (24 bytes; spec 3.4).
-    pub nonce: [u8; 24],
-}
-
 // --- Chat Message Payload (spec 3.3) ---
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -297,9 +285,15 @@ pub struct DirectMessagePayload {
     pub key_epoch: u64,
     /// msg_id of parent message.
     pub reply_to: Option<[u8; 32]>,
-    /// Encrypted media references.
+    /// Media references (P5, spec 04 §9): the node only ever sees the stripped,
+    /// non-sensitive shape — same as `ChatMessagePayload::attachments`. The
+    /// per-file encryption key, real mime type, and real filename all ride
+    /// inside `content` (the sealed message body) instead; a P5 `encrypted`
+    /// upload already replaces the filename with `None` and the mime type
+    /// with `application/octet-stream` at the IPFS layer, so nothing
+    /// attachment-identifying reaches the node even in plaintext form here.
     #[serde(default)]
-    pub attachments: Vec<EncryptedAttachment>,
+    pub attachments: Vec<Attachment>,
 }
 
 // --- News Post Payload (spec 3.5) ---

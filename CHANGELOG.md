@@ -5,6 +5,33 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.82.4] - 2026-08-01
+
+### Fixed
+
+- **DM media always rejected: `400 payload deserialization failed: missing
+  field encrypted_meta`.** `DirectMessagePayload::attachments` was still typed
+  `Vec<EncryptedAttachment>` — a pre-P5 shape (`cid` + `encrypted_meta` +
+  `nonce`) that P5 (spec 04-ipfs §9) never actually used for DMs. Every
+  client sends the stripped `Attachment` shape (`cid`, `mime_type`,
+  `size_bytes`, `filename`, `thumbnail_cid`) instead — the per-file key/real
+  mime/real filename ride inside the sealed message `content` — same as
+  `ChatMessagePayload::attachments`, which was correctly migrated to this
+  shape already (that's why channel media worked and DM media never did).
+  Changed `DirectMessagePayload::attachments` to `Vec<Attachment>`, matching
+  `ChatMessagePayload` and the actual P5 design. No migration needed — DM
+  media has never once successfully landed, so there's no old-format data on
+  disk anywhere. Removed the now-fully-unused `EncryptedAttachment` struct.
+  Also added a `MAX_ATTACHMENTS` cap to `validate_direct_message`, which
+  (unlike every sibling validator) had none.
+
+### Added
+
+- Regression tests: a DM with a stripped `Attachment` (opaque
+  `application/octet-stream`, `filename: None`) round-trips through
+  `rmp_serde` and passes validation; a DM with more than `MAX_ATTACHMENTS`
+  is rejected.
+
 ## [0.82.3] - 2026-07-28
 
 ### Fixed

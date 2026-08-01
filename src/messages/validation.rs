@@ -866,6 +866,11 @@ pub fn validate_direct_message(
             "conversation_id does not match sender/recipient".into(),
         ));
     }
+    // Same cap as channel messages/comments/news posts (attachments is now the
+    // stripped Attachment shape, not the pre-P5 EncryptedAttachment).
+    if p.attachments.len() > MAX_ATTACHMENTS {
+        return Err(ValidationError("too many attachments".into()));
+    }
     Ok(())
 }
 
@@ -1246,6 +1251,68 @@ mod tests {
         assert!(validate_chat_edit(&p).is_err());
         p.attachments = Some(vec![]);
         assert!(validate_chat_edit(&p).is_err());
+    }
+
+    /// `DirectMessagePayload::attachments` was `Vec<EncryptedAttachment>`
+    /// (pre-P5 shape: cid + encrypted_meta + nonce), but every client sends
+    /// the stripped P5 `Attachment` shape for DM media too — same as
+    /// `ChatMessagePayload` — so every DM containing media was rejected with
+    /// "missing field encrypted_meta". Regression test: a stripped Attachment
+    /// (opaque octet-stream, filename hidden) must deserialize onto
+    /// `DirectMessagePayload` and pass validation.
+    #[test]
+    fn direct_message_accepts_p5_stripped_attachment() {
+        let author = "klv1sender0000000000000000000000000000000000000000000000000000";
+        let recipient = "klv1recipient00000000000000000000000000000000000000000000000000";
+        let p = DirectMessagePayload {
+            recipient: recipient.into(),
+            conversation_id: crate::crypto::compute_conversation_id(author, recipient),
+            content: vec![1, 2, 3], // opaque ciphertext — node never decrypts
+            nonce: [4u8; 24],
+            key_epoch: 1,
+            reply_to: None,
+            attachments: vec![Attachment {
+                cid: "bafkreitest".into(),
+                mime_type: "application/octet-stream".into(),
+                size_bytes: 1024,
+                filename: None,
+                thumbnail_cid: None,
+            }],
+        };
+        // Round-trip through msgpack, exactly like a real envelope payload,
+        // so this also proves the wire format actually deserializes (the
+        // reported bug was a deserialization failure, not a validation one).
+        let bytes = rmp_serde::to_vec_named(&p).expect("encode");
+        let decoded: DirectMessagePayload = rmp_serde::from_slice(&bytes).expect("decode");
+        assert_eq!(decoded.attachments.len(), 1);
+        assert_eq!(decoded.attachments[0].filename, None);
+        assert_eq!(decoded.attachments[0].mime_type, "application/octet-stream");
+        assert!(validate_direct_message(author, &decoded).is_ok());
+    }
+
+    #[test]
+    fn direct_message_rejects_too_many_attachments() {
+        let author = "klv1sender0000000000000000000000000000000000000000000000000000";
+        let recipient = "klv1recipient00000000000000000000000000000000000000000000000000";
+        let p = DirectMessagePayload {
+            recipient: recipient.into(),
+            conversation_id: crate::crypto::compute_conversation_id(author, recipient),
+            content: vec![1, 2, 3],
+            nonce: [4u8; 24],
+            key_epoch: 1,
+            reply_to: None,
+            attachments: vec![
+                Attachment {
+                    cid: "bafkreitest".into(),
+                    mime_type: "application/octet-stream".into(),
+                    size_bytes: 1024,
+                    filename: None,
+                    thumbnail_cid: None,
+                };
+                MAX_ATTACHMENTS + 1
+            ],
+        };
+        assert!(validate_direct_message(author, &p).is_err());
     }
 
     /// A well-formed encrypted DM edit: ciphertext + 24-byte nonce + epoch ≥ 1.
