@@ -153,6 +153,14 @@ pub struct MessageRouter {
     pow: Option<Arc<crate::pow::PowManager>>,
 }
 
+/// Rejection reason for step 4d (tiered identity). Shared with
+/// `network::handle_gossip_message`, which pattern-matches on this exact
+/// text to decide whether a `Rejected` result is a routine policy denial
+/// (debug!) or a chain-scan-lag signal worth surfacing at warn! — keep both
+/// sites on this constant so the two never drift apart.
+pub const REGISTRATION_REQUIRED_REASON: &str =
+    "on-chain registration required: verify your wallet to use this feature";
+
 /// Result of processing a message through the router.
 #[derive(Debug)]
 pub enum RouteResult {
@@ -295,15 +303,11 @@ impl MessageRouter {
                         .and_then(|v| v.get("registered_at")?.as_u64())
                         .map_or(false, |ts| ts > 0);
                     if !is_verified {
-                        return RouteResult::Rejected(
-                            "on-chain registration required: verify your wallet to use this feature".into(),
-                        );
+                        return RouteResult::Rejected(REGISTRATION_REQUIRED_REASON.into());
                     }
                 }
                 _ => {
-                    return RouteResult::Rejected(
-                        "on-chain registration required: verify your wallet to use this feature".into(),
-                    );
+                    return RouteResult::Rejected(REGISTRATION_REQUIRED_REASON.into());
                 }
             }
         }
@@ -1651,6 +1655,13 @@ impl MessageRouter {
                 // later reconciles its metadata envelopes and will pull the
                 // ChannelDelete → apply the tombstone → not resurrect it.
                 | MessageType::ChannelDelete
+                // Index kick/ban too: a node that chain-discovers this channel (or
+                // reconciles after a scan gap) must also learn about removals that
+                // already happened, or it resurrects a member the rest of the
+                // network has already removed.
+                | MessageType::ChannelKick
+                | MessageType::ChannelBan
+                | MessageType::ChannelUnban
         ) {
             if let Ok(p) = rmp_serde::from_slice::<serde_json::Value>(&envelope.payload) {
                 if let Some(cid) = p.get("channel_id").and_then(|v| v.as_u64()) {
@@ -3281,5 +3292,180 @@ mod enc_supersede_tests {
         let wrong_scope = crate::crypto::compute_channel_scope(999);
         let env = channel_key_env(cid, wrong_scope, creator, creator);
         assert!(r.authorize_channel_action(&env, creator).is_err());
+    }
+}
+
+// --- Cross-node ChannelKick/ChannelBan enforcement (federation parity) ---
+//
+// Reproduces a live bug: a host node applies a ChannelBan cleanly, but a
+// federated member node that received the SAME gossip envelope never applies
+// it (member stays, CHANNEL_BANS never written, key_epoch_floor never
+// raised). These tests simulate two independent node instances receiving the
+// identical signed envelope via the real `process_message` pipeline, to
+// determine whether the router logic itself diverges given identical state
+// (it doesn't — see `ban_applies_when_both_nodes_fully_synced`), or whether
+// divergent local state (specifically: the creator's on-chain registration
+// record, checked by `requires_verified_identity()` in step 4d, *before*
+// `authorize_channel_action`'s step-7c creator/mod check) causes a silent
+// per-node rejection (it does — see the second test).
+#[cfg(test)]
+mod cross_node_ban_kick_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn router() -> (MessageRouter, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let identity = IdentityResolver::new(storage.clone());
+        (MessageRouter::new(storage, identity, None), dir)
+    }
+
+    fn make_channel(r: &MessageRouter, channel_id: u64, creator: &str) {
+        let meta = serde_json::json!({
+            "channel_id": channel_id,
+            "channel_type": 2u8,
+            "creator": creator,
+            "member_count": 2u64,
+        });
+        r.storage
+            .put_cf(schema::cf::CHANNELS, &channel_id.to_be_bytes(), meta.to_string().as_bytes())
+            .unwrap();
+        add_member(r, channel_id, creator);
+    }
+
+    fn add_member(r: &MessageRouter, channel_id: u64, addr: &str) {
+        let key = schema::encode_channel_member_key(channel_id, addr);
+        r.storage.put_cf(schema::cf::CHANNEL_MEMBERS, &key, b"{}").unwrap();
+    }
+
+    fn register_user(r: &MessageRouter, address: &str, registered_at: u64) {
+        let rec = serde_json::json!({ "address": address, "registered_at": registered_at });
+        r.storage
+            .put_cf(schema::cf::USERS, address.as_bytes(), rec.to_string().as_bytes())
+            .unwrap();
+    }
+
+    /// Build a fully signed ChannelBan envelope (real msg_id + real Ed25519
+    /// signature), ready to feed into `process_message` on any node.
+    fn signed_ban_envelope(
+        sk: &ed25519_dalek::SigningKey,
+        author: &str,
+        channel_id: u64,
+        target_user: &str,
+        timestamp: u64,
+    ) -> Vec<u8> {
+        let payload = ChannelBanPayload {
+            channel_id,
+            target_user: target_user.to_string(),
+            reason: Some("test".into()),
+            duration_secs: 0,
+        };
+        let payload_bytes = rmp_serde::to_vec_named(&payload).unwrap();
+        let author_pubkey: [u8; 32] = sk.verifying_key().to_bytes();
+        let msg_id = crypto::compute_msg_id(&author_pubkey, &payload_bytes, timestamp);
+        let signature = signing::sign_ogmara_message(
+            sk,
+            1,
+            MessageType::ChannelBan as u8,
+            &msg_id,
+            timestamp,
+            &payload_bytes,
+        );
+        let envelope = Envelope {
+            version: 1,
+            msg_type: MessageType::ChannelBan,
+            msg_id,
+            author: author.to_string(),
+            timestamp,
+            lamport_ts: 0,
+            payload: payload_bytes,
+            signature: signature.to_bytes().to_vec(),
+            relay_path: vec![],
+        };
+        rmp_serde::to_vec_named(&envelope).unwrap()
+    }
+
+    fn now_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    }
+
+    #[test]
+    fn ban_applies_identically_when_both_nodes_fully_synced() {
+        let (host, _d1) = router();
+        let (target_node, _d2) = router();
+
+        let sk = crypto::generate_keypair();
+        let creator = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        let banned = "klv1banneduser";
+        let cid = 42u64;
+
+        for r in [&host, &target_node] {
+            make_channel(r, cid, &creator);
+            add_member(r, cid, banned);
+            register_user(r, &creator, 1_000);
+        }
+
+        let raw = signed_ban_envelope(&sk, &creator, cid, banned, now_ms());
+
+        for r in [&host, &target_node] {
+            match r.process_message(&raw) {
+                RouteResult::Accepted { .. } => {}
+                other => panic!("expected Accepted on fully-synced node, got {:?}", other),
+            }
+            let member_key = schema::encode_channel_member_key(cid, banned);
+            assert!(
+                r.storage.get_cf(schema::cf::CHANNEL_MEMBERS, &member_key).unwrap().is_none(),
+                "banned member must be removed"
+            );
+            let ban_key = schema::encode_channel_ban_key(cid, banned);
+            assert!(
+                r.storage.get_cf(schema::cf::CHANNEL_BANS, &ban_key).unwrap().is_some(),
+                "CHANNEL_BANS record must be written"
+            );
+        }
+    }
+
+    #[test]
+    fn ban_silently_rejected_when_target_node_lacks_creator_registration() {
+        let (host, _d1) = router();
+        let (target_node, _d2) = router();
+
+        let sk = crypto::generate_keypair();
+        let creator = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        let banned = "klv1banneduser";
+        let cid = 42u64;
+
+        for r in [&host, &target_node] {
+            make_channel(r, cid, &creator);
+            add_member(r, cid, banned);
+        }
+        // Host's chain scanner has recorded the creator's on-chain registration;
+        // the federated target node's local scanner has NOT (lagging/never
+        // synced) — the exact divergence hypothesized as the live bug's cause.
+        register_user(&host, &creator, 1_000);
+
+        let raw = signed_ban_envelope(&sk, &creator, cid, banned, now_ms());
+
+        assert!(matches!(host.process_message(&raw), RouteResult::Accepted { .. }));
+
+        match target_node.process_message(&raw) {
+            RouteResult::Rejected(reason) => {
+                assert!(
+                    reason.contains(REGISTRATION_REQUIRED_REASON),
+                    "unexpected rejection reason: {reason}"
+                );
+            }
+            other => panic!("expected Rejected(on-chain registration), got {:?}", other),
+        }
+        // Reproduces the live bug: the ban never applies on the target node —
+        // member stays, CHANNEL_BANS is never written — even though the SAME
+        // envelope that the host accepted was delivered via gossip.
+        let member_key = schema::encode_channel_member_key(cid, banned);
+        assert!(target_node.storage.get_cf(schema::cf::CHANNEL_MEMBERS, &member_key).unwrap().is_some());
+        let ban_key = schema::encode_channel_ban_key(cid, banned);
+        assert!(target_node.storage.get_cf(schema::cf::CHANNEL_BANS, &ban_key).unwrap().is_none());
     }
 }

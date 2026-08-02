@@ -3804,7 +3804,22 @@ impl NetworkService {
             }
             RouteResult::Rejected(reason) => {
                 self.counters.inc_failed_validations();
-                debug!(reason = %reason, "Message not accepted locally — ignoring (no penalty)");
+                // "on-chain registration required" means THIS node's local chain-scan
+                // cache doesn't have the author's USERS record yet, even though the
+                // envelope passed signature verification and (for channel actions)
+                // channel-ACL authorization. That combination almost always means the
+                // author IS legitimately registered and this node's scanner is lagging
+                // or gapped — a real moderation-enforcement risk (e.g. a ChannelBan
+                // silently never applying on this node) that debug!-level logging made
+                // invisible outside an explicit RUST_LOG=debug session. Surface it.
+                if reason.contains(crate::messages::router::REGISTRATION_REQUIRED_REASON) {
+                    warn!(
+                        reason = %reason,
+                        "Message rejected: local chain-scan state may be lagging the network"
+                    );
+                } else {
+                    debug!(reason = %reason, "Message not accepted locally — ignoring (no penalty)");
+                }
                 MessageAcceptance::Ignore
             }
             RouteResult::PowRequired { address } => {

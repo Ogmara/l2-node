@@ -5,6 +5,63 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.82.5] - 2026-08-02
+
+### Fixed
+
+- **`ChannelBan`/`ChannelKick` don't reliably enforce on federated member
+  nodes** — a channel creator's ban/kick could apply cleanly on the host node
+  while a federated member node kept letting the banned/kicked user post,
+  `CHANNEL_BANS` never got written there, and the P2d key-epoch floor never
+  rose. Root cause investigation (two new integration tests, see Added)
+  proved the ban/kick apply logic in `router.rs` is correct and identical on
+  every node when local state matches — this is **not** a router bug.
+  The real cause: `process_message_inner`'s tiered-identity gate (step 4d,
+  `MessageType::requires_verified_identity()`) rejects a `ChannelBan`/
+  `ChannelKick` envelope on ANY node whose own local chain-scanner hasn't yet
+  recorded the author's on-chain `UserRegistered` event — a per-node,
+  independently-scanned cache that can lag or gap (tracked separately as the
+  L2 node history-backfill completeness gap). The creator/moderator
+  authorization check (`is_channel_creator`/`require_mod_permission`, based
+  on federated `CHANNELS`/`CHANNEL_MODERATORS` state) passes fine on both
+  nodes — it's the earlier, independent registration check that silently
+  diverges. This is not ban/kick-specific: every channel-management action
+  gated the same way (mute, pin, add/remove moderator, invite, update,
+  delete) has the identical latent exposure to per-node chain-scan lag.
+  The on-chain registration requirement itself is spec-mandated (protocol
+  spec §6.4 / 07-moderation.md §2.4) and intentionally NOT weakened here —
+  removing it would let an unregistered wallet moderate without ever paying
+  the on-chain registration fee. The actual state-divergence gap needs the
+  node history-backfill work to close; this release ships the diagnosability
+  and completeness pieces that are safe to land immediately:
+  - `network::handle_gossip_message` now logs this specific rejection at
+    `warn!` instead of `debug!`, so "local chain-scan state is lagging the
+    network" is visible in normal operation instead of requiring
+    `RUST_LOG=debug` to notice (which is how this bug went unseen).
+  - `update_indexes`'s P-3b channel-metadata reconcile index now also
+    indexes `ChannelKick`/`ChannelBan`/`ChannelUnban`, so a node that
+    chain-discovers a channel later (or reconciles after a scan gap) also
+    learns about removals that already happened, instead of only ever
+    seeing create/update/join/leave/delete history.
+
+### Added
+
+- Two `router.rs` integration tests (`cross_node_ban_kick_tests`) simulating
+  two independent node instances receiving the identical signed
+  `ChannelBan` envelope: a full-parity baseline proving the apply logic
+  itself is correct, and a registration-divergence reproduction proving the
+  exact live failure mode (`Rejected("on-chain registration required...")`)
+  when a receiving node's local `USERS` cache lacks the author's
+  registration record.
+
+### Security
+
+- The `on-chain registration required` rejection reason is now a shared
+  `router::REGISTRATION_REQUIRED_REASON` constant instead of a
+  string literal duplicated between `router.rs` and `network/mod.rs`,
+  so the gossip-handler's log-level match can't silently drift out of sync
+  with the router's actual rejection text.
+
 ## [0.82.4] - 2026-08-01
 
 ### Fixed
