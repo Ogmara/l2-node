@@ -5,6 +5,26 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.82.6] - 2026-08-16
+
+### Fixed
+
+- **Username/display-name changes never reached other nodes.** `PUT
+  /api/v1/profile` (`update_profile`) stored the signed `ProfileUpdate`
+  locally via `router.process_message()` but never published it to
+  GossipSub — unlike `POST /api/v1/messages` and `POST /api/v1/dm/:address`,
+  which both call `gossip_topic_for_envelope()` + `gossip_tx.send(...)`
+  after a successful accept. `ProfileUpdate` already had a dedicated gossip
+  topic (`/ogmara/{network}/v1/profile`, subscribed by every node by
+  default) and correct LWW handling on the receiving end — the topic was
+  simply never published to from this endpoint. Registered and unregistered
+  wallets were equally affected (the chain scanner never sets
+  `display_name` from on-chain data either way, so there's no
+  registered-vs-unregistered distinction for usernames); it just happened
+  to be reported against an unregistered wallet first. Fixed by wiring
+  `update_profile` to the same gossip-publish pattern used by
+  `post_message`/`send_dm`.
+
 ## [0.82.5] - 2026-08-02
 
 ### Fixed

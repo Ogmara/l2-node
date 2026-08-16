@@ -2526,7 +2526,32 @@ pub async fn update_profile(
     use crate::messages::router::RouteResult;
 
     match state.router.process_message(&body) {
-        RouteResult::Accepted { .. } => Json(OkResponse { ok: true }).into_response(),
+        RouteResult::Accepted { raw_bytes, .. } => {
+            // Publish to GossipSub so other nodes learn the new display_name.
+            // Without this the ProfileUpdate was only ever stored locally on
+            // the node it was submitted to — other nodes (which discover the
+            // wallet via the chain scanner or an authored message, neither of
+            // which carries display_name) never saw the name at all.
+            if let Ok(envelope) =
+                rmp_serde::from_slice::<crate::messages::envelope::Envelope>(&raw_bytes)
+            {
+                if let Some(topic) = gossip_topic_for_envelope(&envelope, &state.klever_network) {
+                    // raw_bytes isn't needed again after this, so move rather than clone.
+                    let sent = state
+                        .gossip_tx
+                        .send(crate::network::GossipPublish {
+                            topic,
+                            data: raw_bytes,
+                            respond_to: None,
+                        })
+                        .is_ok();
+                    if !sent {
+                        tracing::warn!("update_profile: gossip network task gone, ProfileUpdate stored locally only");
+                    }
+                }
+            }
+            Json(OkResponse { ok: true }).into_response()
+        }
         RouteResult::Duplicate => {
             (StatusCode::CONFLICT, "already processed").into_response()
         }
