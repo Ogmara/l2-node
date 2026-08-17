@@ -52,6 +52,11 @@ pub fn is_news_type(msg_type: u8) -> bool {
                 | MessageType::NewsDelete
                 | MessageType::NewsComment
                 | MessageType::NewsRepost
+                // Audit final pre-mainnet W28: NewsReaction was excluded here
+                // (and had no gossip bridge arm), so reaction counts on other
+                // nodes stayed permanently 0 — a node catching up via backfill
+                // never got a chance to see them either.
+                | MessageType::NewsReaction
         )
     )
 }
@@ -275,5 +280,39 @@ impl Drop for NewsResponderGuard {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_news_type;
+    use crate::messages::types::MessageType;
+
+    #[test]
+    fn is_news_type_covers_news_reaction() {
+        // Regression (audit final pre-mainnet W28): NewsReaction was
+        // excluded here, so a node catching up via backfill never got a
+        // chance to see reaction counts either (on top of the missing
+        // gossip bridge arm).
+        assert!(is_news_type(MessageType::NewsReaction as u8));
+    }
+
+    #[test]
+    fn is_news_type_covers_the_other_news_variants() {
+        for t in [
+            MessageType::NewsPost,
+            MessageType::NewsEdit,
+            MessageType::NewsDelete,
+            MessageType::NewsComment,
+            MessageType::NewsRepost,
+        ] {
+            assert!(is_news_type(t as u8), "{:?} should be a news type", t);
+        }
+    }
+
+    #[test]
+    fn is_news_type_excludes_unrelated_types() {
+        assert!(!is_news_type(MessageType::ChatMessage as u8));
+        assert!(!is_news_type(MessageType::Follow as u8));
     }
 }

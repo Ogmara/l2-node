@@ -1429,6 +1429,18 @@ fn gossip_topic_for_envelope(
         MessageType::NewsPost => {
             Some(gossip::topic_news_global(network_id))
         }
+        // NewsReaction MUST gossip network-wide (audit final pre-mainnet
+        // W28): it propagated by NO mechanism (no bridge arm, and excluded
+        // from news_sync's `is_news_type` backfill filter), so reaction
+        // counts on every OTHER node stayed permanently 0. The local apply
+        // arm (`toggle_news_reaction`) already worked correctly — this was
+        // a pure propagation gap. Safe to relay: idempotent (checks
+        // existence before add/remove, so a duplicate relay can't
+        // double-count) and keyed by `resolved_author` (the envelope's
+        // verified signer, never the payload).
+        MessageType::NewsReaction => {
+            Some(gossip::topic_news_global(network_id))
+        }
         // Follow/Unfollow MUST gossip network-wide (audit final pre-mainnet
         // W24, spec CCS#1): 0x30 (ProfileUpdate) got a bridge arm in
         // 0.82.6 but 0x34/0x35 didn't, so cross-node follower graphs went
@@ -7646,7 +7658,8 @@ mod gossip_bridge_tests {
     use crate::messages::envelope::Envelope;
     use crate::messages::types::{
         CounterVotePayload, DeletionRequestPayload, DeletionType, DeviceRevocationPayload,
-        FollowPayload, MessageType, ReportPayload, ReportReason, ReportTarget, UnfollowPayload,
+        FollowPayload, MessageType, ReactionPayload, ReportPayload, ReportReason, ReportTarget,
+        UnfollowPayload,
     };
 
     fn envelope(msg_type: MessageType, payload: Vec<u8>) -> Envelope {
@@ -7661,6 +7674,25 @@ mod gossip_bridge_tests {
             signature: Vec::new(),
             relay_path: Vec::new(),
         }
+    }
+
+    #[test]
+    fn news_reaction_gossips_on_news_global_topic() {
+        // Regression (audit final pre-mainnet W28): NewsReaction propagated
+        // by NO mechanism (no bridge arm, excluded from news_sync's
+        // is_news_type), so reaction counts on every other node stayed
+        // permanently 0.
+        let payload = ReactionPayload {
+            target_id: [3u8; 32],
+            channel_id: None,
+            emoji: "🔥".to_string(),
+            remove: false,
+        };
+        let env = envelope(MessageType::NewsReaction, rmp_serde::to_vec(&payload).unwrap());
+        assert_eq!(
+            gossip_topic_for_envelope(&env, "testnet"),
+            Some(crate::network::gossip::topic_news_global("testnet")),
+        );
     }
 
     #[test]

@@ -5,6 +5,22 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.88.0] - 2026-08-17
+
+### Security
+
+- **NewsReaction never propagated (final pre-mainnet audit W28).**
+  `NewsReaction` (0x24) propagated by NO mechanism — no gossip bridge arm,
+  and excluded from `news_sync`'s `is_news_type` backfill filter — so
+  reaction counts on every other node stayed permanently 0. The local
+  apply arm (`toggle_news_reaction`) already worked correctly; this was a
+  pure propagation gap. Now gossips on the news-global topic alongside
+  `NewsPost`, and is included in backfill sync. Safe to relay: idempotent
+  (checks existence before add/remove, so a duplicate relay can't
+  double-count) and keyed by the envelope's verified signer. No SDK/client
+  change needed — `buildReaction`/`OgmaraClient.react()` already built
+  correct envelopes.
+
 ## [0.87.0] - 2026-08-17
 
 ### Security
