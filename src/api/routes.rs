@@ -3733,7 +3733,11 @@ pub async fn get_channel_bans(
 /// endpoints' response contract doesn't report delivery status, and the
 /// message is already durably stored before this runs regardless of
 /// whether the publish itself succeeds.
-async fn gossip_if_applicable(state: &AppState, raw_bytes: &[u8]) {
+///
+/// `pub(crate)` so `websocket.rs` can reuse it too (audit W26): WS
+/// `Message`/`Dm` frames go through the identical `process_message` +
+/// `Accepted { raw_bytes }` shape but previously never called this.
+pub(crate) async fn gossip_if_applicable(state: &AppState, raw_bytes: &[u8]) {
     let Ok(envelope) = rmp_serde::from_slice::<crate::messages::envelope::Envelope>(raw_bytes)
     else {
         return;

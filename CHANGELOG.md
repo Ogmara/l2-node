@@ -5,6 +5,33 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.91.0] - 2026-08-17
+
+### Security
+
+- **WebSocket `message`/`dm` client frames never gossiped (final pre-mainnet
+  audit W26, same class as W25).** The authenticated WS endpoint
+  (`/api/v1/ws`)'s `handle_ws_client_message` ran `WsClientMessage::Message`/
+  `Dm` frames through the full `process_message()` validation pipeline
+  (signature, dedup, rate-limit, authorization — identical to the REST
+  path) and applied accepted envelopes locally, but never published them to
+  GossipSub. A chat message or DM sent over WS therefore stayed on the
+  receiving node only, unlike the same content sent via
+  `POST /api/v1/messages` / `POST /api/v1/dm/:address`, which already
+  gossip.
+  - Widened the existing `gossip_if_applicable` helper (added for W25) from
+    private to `pub(crate)` and called it from both WS arms, gated on
+    `RouteResult::Accepted { raw_bytes, .. }` — the exact pattern already
+    used by the 11 REST call sites.
+  - No new authorization surface: `Accepted` already implies the envelope's
+    own signature was independently re-verified against its claimed
+    author, regardless of which wallet authenticated the WS connection —
+    identical to how REST endpoints have always worked. Rate limiting is
+    keyed on the resolved wallet in the router's shared state, so mixing
+    WS and REST doesn't grant extra throughput.
+  - No SDK/client change needed — this is a node-side propagation fix
+    only; WS clients already send correctly-formed frames.
+
 ## [0.90.0] - 2026-08-17
 
 ### Security

@@ -245,6 +245,11 @@ async fn handle_ws_client_message(
                 debug!(result = ?result, "WS message processed");
                 // Feed accepted messages to notification engine for mention detection
                 if let crate::messages::router::RouteResult::Accepted { raw_bytes, .. } = result {
+                    // Audit W26: chat/news/etc sent over WS were stored +
+                    // locally notified but never gossip-published, unlike
+                    // the identical envelope sent via POST /api/v1/messages
+                    // — so WS-submitted content silently never federated.
+                    super::routes::gossip_if_applicable(state, &raw_bytes).await;
                     if let Some(ref engine) = state.notification_engine {
                         let engine = engine.clone();
                         tokio::spawn(async move {
@@ -260,6 +265,11 @@ async fn handle_ws_client_message(
             if let Ok(bytes) = rmp_serde::to_vec(&envelope) {
                 let result = state.router.process_message(&bytes);
                 debug!(result = ?result, "WS DM processed");
+                // Audit W26: same gap as Message above — a DM sent over WS
+                // reached only the sender's own node.
+                if let crate::messages::router::RouteResult::Accepted { raw_bytes, .. } = result {
+                    super::routes::gossip_if_applicable(state, &raw_bytes).await;
+                }
             }
         }
     }
