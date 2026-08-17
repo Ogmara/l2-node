@@ -629,7 +629,7 @@ pub struct DeviceDelegationPayload {
     /// **Device proof-of-possession** (l2-node 0.49.0+, P-0 dual-signed
     /// delegation). Hex-encoded Ed25519 signature by the DEVICE key over the
     /// canonical claim string
-    /// `ogmara-device-claim:{device_pub_key_lowercase}:{author_wallet}:{timestamp}`
+    /// `ogmara-device-claim:{network}:{device_pub_key_lowercase}:{author_wallet}:{timestamp}`
     /// (Klever message format). The envelope's own `signature` is the WALLET's
     /// signature over the SAME claim string. Verifying BOTH (wallet authorizes
     /// + device proves it holds the key) makes a delegation unforgeable:
@@ -658,7 +658,7 @@ pub struct DeviceRevocationPayload {
 /// to each of a wallet's devices (protocol §2.4, §8.1). The envelope is authored
 /// by the WALLET and its `signature` is the wallet's Klever-message signature over
 /// the canonical binding string
-/// `ogmara-enc-bind:{enc_pub_lowercase}:{device_id_lowercase}:{wallet}:{timestamp}`.
+/// `ogmara-enc-bind:{network}:{enc_pub_lowercase}:{device_id_lowercase}:{wallet}:{timestamp}`.
 /// There is no device co-signature: an X25519 key cannot produce a signature, and
 /// the wallet signature is the sole authority (binding a key the wallet does not
 /// control only harms that wallet). Verified at `verify_signature`.
@@ -672,7 +672,7 @@ pub struct DeviceEncBindingPayload {
 
 /// Revoke a previously-bound device encryption key (protocol §2.4). Wallet-authored;
 /// `signature` is the wallet's Klever-message signature over the canonical string
-/// `ogmara-enc-revoke:{enc_pub_lowercase}:{wallet}:{timestamp}`.
+/// `ogmara-enc-revoke:{network}:{enc_pub_lowercase}:{wallet}:{timestamp}`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceEncRevokePayload {
     /// Device X25519 encryption public key to revoke — 32 bytes (hex-encoded).

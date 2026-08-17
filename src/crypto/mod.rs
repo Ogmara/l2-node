@@ -158,9 +158,25 @@ pub fn compute_channel_scope(channel_id: u64) -> [u8; 32] {
     keccak256(&data)
 }
 
-/// Compute the message ID: Keccak-256(author_address_bytes + payload_bytes + timestamp_bytes).
-pub fn compute_msg_id(author_pubkey: &[u8; 32], payload_bytes: &[u8], timestamp: u64) -> [u8; 32] {
-    let mut data = Vec::with_capacity(32 + payload_bytes.len() + 8);
+/// Compute the message ID (protocol v2, audit 2026-08-16 C1):
+/// `Keccak-256(network_id_len(1) + network_id + author_pubkey + payload_bytes + timestamp_bytes)`.
+///
+/// Folding `network_id` ("testnet"/"mainnet") in here means a msg_id computed
+/// on one network can never equal the msg_id the same bytes would produce on
+/// another — a replayed envelope fails `verify_msg_id` before signature
+/// verification is even attempted, independent of the domain-separated
+/// signing preimage (`signing::ogmara_signed_bytes`) also binding the network.
+pub fn compute_msg_id(
+    network_id: &str,
+    author_pubkey: &[u8; 32],
+    payload_bytes: &[u8],
+    timestamp: u64,
+) -> [u8; 32] {
+    let network_bytes = network_id.as_bytes();
+    let mut data =
+        Vec::with_capacity(1 + network_bytes.len() + 32 + payload_bytes.len() + 8);
+    data.push(network_bytes.len() as u8);
+    data.extend_from_slice(network_bytes);
     data.extend_from_slice(author_pubkey);
     data.extend_from_slice(payload_bytes);
     data.extend_from_slice(&timestamp.to_be_bytes());

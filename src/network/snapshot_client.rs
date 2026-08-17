@@ -595,6 +595,14 @@ pub struct AnchorVerifyResult {
     pub checked: usize,
     /// Total anchors in the snapshot.
     pub total: usize,
+    /// The verified `state_root` (hex) at `cutoff_height` — confirmed to
+    /// match Klever on-chain. Used by `verify_content_matches_anchor` to
+    /// bind the snapshot's actual USERS/CHANNELS/DELEGATIONS(/CHANNEL_MEMBERS)
+    /// content to this anchor (audit final pre-mainnet C2): a genuine
+    /// `STATE_ANCHORS` record proves an anchor value like this ONE existed
+    /// on-chain, but is public and copyable into a fabricated snapshot on
+    /// its own — it says nothing about the OTHER content bundled beside it.
+    pub state_root: String,
 }
 
 /// Iterate the snapshot's `STATE_ANCHORS` rows from highest height down,
@@ -669,7 +677,9 @@ pub async fn verify_anchors_against_klever(
     let mut checked: usize = 0;
     let mut rpc_failures: usize = 0;
     let mut newer_not_anchored: usize = 0;
-    let mut first_verified: Option<u64> = None;
+    // (block_height, state_root) of the first (highest) verified match —
+    // a single Option so the two values can never desync.
+    let mut first_verified: Option<(u64, String)> = None;
     // After we find the first match, we can stop — that's the highest
     // verified anchor and therefore the cutoff.
     for record in &anchors {
@@ -692,7 +702,7 @@ pub async fn verify_anchors_against_klever(
 
         match outcome {
             AnchorVerifyOutcome::Match => {
-                first_verified = Some(record.block_height);
+                first_verified = Some((record.block_height, record.state_root.clone()));
                 break;
             }
             AnchorVerifyOutcome::Mismatch { on_chain, in_snapshot } => {
@@ -744,7 +754,7 @@ pub async fn verify_anchors_against_klever(
         }
     }
 
-    let cutoff_height = first_verified.ok_or_else(|| {
+    let (cutoff_height, state_root) = first_verified.ok_or_else(|| {
         anyhow!(
             "No snapshot anchors verified against Klever (checked {}/{}); refusing apply",
             checked,
@@ -764,7 +774,113 @@ pub async fn verify_anchors_against_klever(
         cutoff_height,
         checked,
         total,
+        state_root,
     })
+}
+
+/// Recompute the anchored state root directly from the snapshot's OWN
+/// decoded `USERS`/`CHANNELS`/`DELEGATIONS`/`CHANNEL_MEMBERS` content
+/// (audit final pre-mainnet C2).
+///
+/// `verify_anchors_against_klever` only proves that a `STATE_ANCHORS`
+/// record bundled in the snapshot corresponds to a REAL historical
+/// on-chain anchor — but that record is a public, copyable JSON blob. It
+/// says nothing about whether the OTHER content sitting beside it in the
+/// same snapshot (device delegations, user registrations, channel
+/// metadata) is genuine. This closes that gap by rebuilding the exact
+/// same Merkle root `Storage::compute_current_state_root` would compute
+/// after writing this data to a fresh DB — entirely in memory, before any
+/// write happens.
+///
+/// Entries within each `ChunkPayload` are key-sorted (see
+/// `storage::snapshot::ChunkPayload` doc comment) and chunks are iterated
+/// in ascending `seq` order, exactly matching the `raw_iterator_cf` +
+/// `seek_to_first`/`next` traversal `Storage::build_snapshot_cf` used to
+/// produce them — so the reconstructed leaf order is byte-identical to
+/// live DB iteration order, which is required for the roots to match.
+pub fn recompute_content_state_root(chunks: &HashMap<String, DecodedChunks>) -> Result<[u8; 32]> {
+    use crate::crypto::merkle::StateManager;
+    use crate::storage::schema::cf;
+
+    let mut mgr = StateManager::new();
+
+    let mut cf_chunks: Vec<&ChunkPayload> = chunks
+        .get(cf::USERS)
+        .ok_or_else(|| anyhow!("missing decoded chunks for cf '{}'", cf::USERS))?
+        .iter()
+        .collect();
+    cf_chunks.sort_by_key(|c| c.seq);
+    for chunk in cf_chunks {
+        for (_, v) in &chunk.entries {
+            mgr.add_user(v);
+        }
+    }
+
+    let mut cf_chunks: Vec<&ChunkPayload> = chunks
+        .get(cf::CHANNELS)
+        .ok_or_else(|| anyhow!("missing decoded chunks for cf '{}'", cf::CHANNELS))?
+        .iter()
+        .collect();
+    cf_chunks.sort_by_key(|c| c.seq);
+    for chunk in cf_chunks {
+        for (_, v) in &chunk.entries {
+            mgr.add_channel(v);
+        }
+    }
+
+    let mut cf_chunks: Vec<&ChunkPayload> = chunks
+        .get(cf::DELEGATIONS)
+        .ok_or_else(|| anyhow!("missing decoded chunks for cf '{}'", cf::DELEGATIONS))?
+        .iter()
+        .collect();
+    cf_chunks.sort_by_key(|c| c.seq);
+    for chunk in cf_chunks {
+        for (_, v) in &chunk.entries {
+            mgr.add_delegation(v);
+        }
+    }
+
+    // CHANNEL_MEMBERS values don't redundantly encode their key (channel_id
+    // + address) the way USERS/DELEGATIONS values do — pass both (see
+    // `StateManager::add_channel_member` doc for why).
+    let mut cf_chunks: Vec<&ChunkPayload> = chunks
+        .get(cf::CHANNEL_MEMBERS)
+        .ok_or_else(|| anyhow!("missing decoded chunks for cf '{}'", cf::CHANNEL_MEMBERS))?
+        .iter()
+        .collect();
+    cf_chunks.sort_by_key(|c| c.seq);
+    for chunk in cf_chunks {
+        for (k, v) in &chunk.entries {
+            mgr.add_channel_member(k, v);
+        }
+    }
+
+    Ok(mgr.compute_state_root())
+}
+
+/// Verify the snapshot's decoded content hashes to the Klever-verified
+/// anchor's `state_root` (audit final pre-mainnet C2). Factored out of
+/// `run_bootstrap` so it's unit-testable without mocking Klever RPC or the
+/// full bootstrap pipeline.
+pub fn verify_content_matches_anchor(
+    chunks: &HashMap<String, DecodedChunks>,
+    anchor_result: &AnchorVerifyResult,
+) -> Result<()> {
+    let content_root = recompute_content_state_root(chunks)
+        .context("recomputing content state root from decoded snapshot chunks")?;
+    let content_root_hex = hex::encode(content_root);
+    if content_root_hex != anchor_result.state_root {
+        bail!(
+            "POISONED SNAPSHOT — recomputed USERS/CHANNELS/DELEGATIONS content root {} does \
+             not match the Klever-verified anchor's state_root {} (height {}). The snapshot's \
+             STATE_ANCHORS record is genuine, but the content bundled beside it is not — \
+             refusing to apply.",
+            content_root_hex,
+            anchor_result.state_root,
+            anchor_result.cutoff_height,
+        );
+    }
+    Ok(())
 }
 
 // --- Apply path ---------------------------------------------------------
@@ -1106,6 +1222,20 @@ pub async fn run_bootstrap(
                 return Ok(None);
             }
         };
+
+        // Audit final pre-mainnet C2: the STATE_ANCHORS record just proved
+        // above is genuine and on-chain — but it's public and copyable on
+        // its own. Prove the OTHER content in this snapshot (delegations,
+        // users, channels) is genuine too, by recomputing the same root
+        // from what was actually received and requiring equality.
+        if let Err(e) = verify_content_matches_anchor(&chunks, &anchor_result) {
+            warn!(
+                error = %e,
+                "Snapshot content does not match its verified anchor — falling back to chain scan."
+            );
+            return Ok(None);
+        }
+
         anchor_result.cutoff_height
     };
 
@@ -1484,6 +1614,13 @@ mod tests {
         source_storage
             .put_cf(cf_names::NODE_STATE, schema::state_keys::TOTAL_CHANNELS, &1u64.to_be_bytes())
             .unwrap();
+        source_storage
+            .put_cf(
+                cf_names::CHANNEL_MEMBERS,
+                &crate::storage::schema::encode_channel_member_key(7, "klv1a"),
+                br#"{"joined_at":1700000000000,"role":"member"}"#,
+            )
+            .unwrap();
         source_storage.set_chain_cursor(12345).unwrap();
 
         // Build a snapshot from the source.
@@ -1568,9 +1705,172 @@ mod tests {
             .unwrap();
         assert!(restored_users.is_empty(), "rollback captured pre-apply (empty) state");
 
+        // C2: the anchored content root (now covering CHANNEL_MEMBERS too)
+        // must survive the snapshot round-trip byte-for-byte.
+        let (source_root, ..) = source_storage.compute_current_state_root().unwrap();
+        let (target_root, ..) = target_storage.compute_current_state_root().unwrap();
+        assert_eq!(
+            source_root, target_root,
+            "content state root must survive a full snapshot apply round-trip"
+        );
+
         // Drop source so tempdir cleanup runs.
         drop(source_storage);
         drop(source_dir);
+    }
+
+    // --- C2 fix: content-vs-anchor binding tests ---
+
+    /// Build decoded chunks from `storage` via the real `build_cache` +
+    /// `decode_chunk` pipeline — mirrors `full_apply_roundtrip_against_real_rocksdb`.
+    fn build_decoded_chunks(storage: &Storage) -> HashMap<String, DecodedChunks> {
+        use crate::network::snapshot::build_cache;
+        use crate::storage::schema::snapshot::codec;
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let cache = build_cache(storage, "testnet", "test_node", &signing_key, 64 * 1024, codec::NONE)
+            .expect("build_cache");
+
+        let mut decoded: HashMap<String, DecodedChunks> = HashMap::new();
+        for cf in &cache.manifest.cfs {
+            let mut by_cf: Vec<ChunkPayload> = Vec::with_capacity(cf.chunks.len());
+            for header in &cf.chunks {
+                let payload_arc = cache
+                    .chunks
+                    .get(&(cf.cf_name.clone(), header.seq))
+                    .expect("chunk in cache");
+                let payload = crate::storage::snapshot::decode_chunk(
+                    payload_arc.as_slice(),
+                    header.codec,
+                    &header.chunk_hash,
+                )
+                .expect("decode chunk");
+                by_cf.push(payload);
+            }
+            decoded.insert(cf.cf_name.clone(), by_cf);
+        }
+        decoded
+    }
+
+    fn seed_users_channels_delegations(storage: &Storage) {
+        storage.put_cf(cf_names::USERS, b"klv1a", br#"{"display_name":"alice"}"#).unwrap();
+        storage.put_cf(cf_names::USERS, b"klv1b", br#"{"display_name":"bob"}"#).unwrap();
+        storage
+            .put_cf(cf_names::CHANNELS, &7u64.to_be_bytes(), br#"{"name":"general"}"#)
+            .unwrap();
+        storage
+            .put_cf(
+                cf_names::DELEGATIONS,
+                b"ogd1device1",
+                br#"{"user_address":"klv1a","device_pub_key":"aa","active":true}"#,
+            )
+            .unwrap();
+        storage
+            .put_cf(
+                cf_names::CHANNEL_MEMBERS,
+                &crate::storage::schema::encode_channel_member_key(7, "klv1a"),
+                br#"{"joined_at":1700000000000,"role":"member"}"#,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn recompute_content_state_root_matches_live_compute_current_state_root() {
+        // Load-bearing correctness proof: the order snapshot chunks are
+        // decoded in must exactly match live-DB iteration order, or the
+        // whole C2 fix silently always rejects genuine snapshots.
+        let (storage, _dir) = fresh_storage();
+        seed_users_channels_delegations(&storage);
+
+        let (live_root, _, _, _) = storage.compute_current_state_root().unwrap();
+        let decoded = build_decoded_chunks(&storage);
+        let recomputed_root = recompute_content_state_root(&decoded).unwrap();
+
+        assert_eq!(
+            live_root, recomputed_root,
+            "recompute_content_state_root must reproduce compute_current_state_root exactly"
+        );
+    }
+
+    #[test]
+    fn recompute_content_state_root_detects_channel_member_key_reassignment() {
+        // C2 attack shape specific to CHANNEL_MEMBERS: its value
+        // ({"joined_at","role"}) doesn't redundantly encode channel_id/
+        // address the way USERS/DELEGATIONS values do. An attacker who
+        // could reassign a genuine value to a different key (grant
+        // themselves membership in someone else's private channel) must
+        // NOT get away with an unchanged root.
+        let (genuine, _d1) = fresh_storage();
+        seed_users_channels_delegations(&genuine);
+        let (genuine_root, _, _, _) = genuine.compute_current_state_root().unwrap();
+
+        let (reassigned, _d2) = fresh_storage();
+        seed_users_channels_delegations(&reassigned);
+        // Overwrite with the SAME value bytes as seed_users_channels_delegations'
+        // membership row, but under a DIFFERENT (channel_id, address) key —
+        // remove the genuine row, add the attacker's.
+        reassigned
+            .delete_cf(
+                cf_names::CHANNEL_MEMBERS,
+                &crate::storage::schema::encode_channel_member_key(7, "klv1a"),
+            )
+            .unwrap();
+        reassigned
+            .put_cf(
+                cf_names::CHANNEL_MEMBERS,
+                &crate::storage::schema::encode_channel_member_key(99, "klv1mallory"),
+                br#"{"joined_at":1700000000000,"role":"member"}"#,
+            )
+            .unwrap();
+        let (reassigned_root, _, _, _) = reassigned.compute_current_state_root().unwrap();
+
+        assert_ne!(
+            genuine_root, reassigned_root,
+            "reassigning a genuine membership value to a different (channel_id, address) \
+             key must change the anchored root"
+        );
+    }
+
+    #[test]
+    fn verify_content_matches_anchor_accepts_genuine_snapshot() {
+        let (storage, _dir) = fresh_storage();
+        seed_users_channels_delegations(&storage);
+
+        let (live_root, _, _, _) = storage.compute_current_state_root().unwrap();
+        let decoded = build_decoded_chunks(&storage);
+        let anchor_result = AnchorVerifyResult {
+            cutoff_height: 100,
+            checked: 1,
+            total: 1,
+            state_root: hex::encode(live_root),
+        };
+
+        assert!(verify_content_matches_anchor(&decoded, &anchor_result).is_ok());
+    }
+
+    #[test]
+    fn verify_content_matches_anchor_rejects_fabricated_content() {
+        // The exact C2 attack shape: a genuine (copied) STATE_ANCHORS
+        // record's state_root, bundled beside fabricated DELEGATIONS/USERS
+        // content the attacker actually controls.
+        let (storage, _dir) = fresh_storage();
+        seed_users_channels_delegations(&storage);
+        let decoded = build_decoded_chunks(&storage);
+
+        let anchor_result = AnchorVerifyResult {
+            cutoff_height: 100,
+            checked: 1,
+            total: 1,
+            // A real-looking but WRONG root — simulates a genuine anchor
+            // record copied from a different, unrelated snapshot.
+            state_root: hex::encode([0xAAu8; 32]),
+        };
+
+        let err = verify_content_matches_anchor(&decoded, &anchor_result)
+            .expect_err("mismatched content must be rejected");
+        assert!(err.to_string().contains("POISONED SNAPSHOT"));
     }
 
     // --- Phase 3 anchor verification tests ---

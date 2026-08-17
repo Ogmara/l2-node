@@ -5,6 +5,162 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.86.0] - 2026-08-17
+
+### Security
+
+- **Snapshot bootstrap content not bound to the Klever-verified anchor
+  (final pre-mainnet audit C2 — the last CRITICAL from that audit).** A
+  fresh node bootstrapping via snapshot only ever proved (a) the received
+  chunks matched what the manifest/quorum claimed (packaging integrity)
+  and (b) `STATE_ANCHORS` records bundled in the snapshot corresponded to
+  real historical on-chain anchors. It never proved the snapshot's actual
+  `USERS`/`CHANNELS`/`DELEGATIONS`/`CHANNEL_MEMBERS` content matched what
+  was anchored — those anchor records are public JSON blobs, copyable
+  verbatim from a genuine snapshot into a fabricated one. A small Sybil
+  quorum (`quorum_min_peers` defaults to 3, permissionless registration)
+  could bundle genuine copied anchor records alongside completely
+  fabricated content: fake device→wallet delegations (impersonation via
+  `identity.resolve`), a forged `registered_at` to unlock the verified
+  tier, or arbitrary private-channel membership grants.
+  - **Fix, part 1:** after re-verifying a `STATE_ANCHORS` record against
+    Klever, the node now recomputes the anchored Merkle root directly from
+    the snapshot's own decoded `USERS`/`CHANNELS`/`DELEGATIONS` content
+    (`recompute_content_state_root`, new) and requires it to equal the
+    verified anchor's `state_root` — entirely in memory, before any DB
+    write. Closes the impersonation/verified-tier vectors. No coordinated
+    deploy needed.
+  - **Fix, part 2:** added `CHANNEL_MEMBERS` as a 4th subtree to the
+    anchored commitment (`STATE_ROOT_DOMAIN` bumped `v2` → `v3` —
+    canonical cross-node value, same shape as the precedented v1→v2 bump,
+    W14, 2026-06). This CF was already transferred by snapshot bootstrap
+    but never covered by the Merkle commitment. Closes the private-channel
+    membership vector. **Every anchoring node must upgrade together** — a
+    mixed fleet computes divergent v2 vs v3 roots for new anchor heights
+    (old v2-anchored history stays valid and verifiable regardless, since
+    verification always uses the anchor's own recorded height).
+  - **Found and fixed while implementing part 2:** `CHANNEL_MEMBERS` row
+    values (`{"joined_at": ..., "role": ...}`) do NOT redundantly encode
+    their key (`channel_id` + address) the way `USERS`/`DELEGATIONS`
+    values do. Hashing the value alone (mirroring the other three
+    subtrees) would have let an attacker reassign a genuine
+    `(joined_at, role)` blob to a completely different
+    `(channel_id, address)` — same leaf multiset, same root, arbitrary
+    forged membership. `StateManager::add_channel_member` hashes key+value
+    together (`hash_kv`, already used for per-CF snapshot integrity)
+    instead of value-only `hash_leaf`.
+  - Deferred out of scope (noted in the audit register): binding
+    `producer_node_id` to the actual serving libp2p PeerId or to SC
+    registration, and per-row `DELEGATIONS` signature re-verification in
+    `backfill_delegation_map` — both become largely redundant once content
+    is bound to a Klever-verified root (tampering any row now requires a
+    SHA-256 second-preimage).
+
+## [0.85.0] - 2026-08-17
+
+### Security
+
+- **Report/CounterVote never propagated (final pre-mainnet audit W22, spec
+  07-moderation §3.1/§3.2 violated).** Neither had a `gossip_topic_for_envelope`
+  bridge arm, so distributed moderation scoring was structurally impossible
+  — each node only ever tallied reports/counter-votes it received directly.
+  Both now gossip on the network-wide topic. Both are already
+  `requires_verified_identity()`-gated at ingest on every node, so a relayed
+  report/vote can't be forged by an unregistered relayer.
+- **DeletionRequest never propagated (final pre-mainnet audit W23, spec
+  08-compliance §3.5 violated — GDPR/right-to-erasure blocker).** Local
+  purge (including key-vault) was fully implemented but had no gossip arm,
+  so a deletion only ever affected the home node — every other node kept
+  serving the "deleted" content indefinitely. Now gossips on the
+  network-wide topic (author-scoped, not channel/DM-scoped — the apply arm
+  keys purely off `resolved_author`, so this is correct regardless of where
+  the deleted content lives). The apply arm only ever deletes the resolved
+  author's OWN content, so a relayed request can't be used to delete
+  someone else's data.
+- **Note:** no client currently builds/sends a `DeletionRequest` envelope —
+  this fix closes the node-side propagation gap; sdk-js 0.44.0 adds the
+  first SDK-level builder (`buildDeletionRequest` + `OgmaraClient.deleteMessageRequest`/
+  `deleteAllContentRequest`). No web/desktop/mobile UI wired to it yet — that's
+  a separate feature-build, out of scope for this fix.
+
+## [0.84.0] - 2026-08-17
+
+### Security
+
+- **DeviceRevocation never propagated (final pre-mainnet audit C3).**
+  `register_device` gossips a delegation for free the moment both signatures
+  land, but revoking a device only ever wrote locally — `DeviceRevocation`
+  (0x32) had no arm in `gossip_topic_for_envelope`. A revoked/stolen device
+  stayed valid on every OTHER node until a slow independent catch-up
+  (on-chain `revokeDevice` chain-scan, or a once-per-process identity_sync
+  pull that already ran). Fixed: `DeviceRevocation` now routes to the same
+  network-wide topic as `DeviceDelegation`/`DeviceEncBinding`/
+  `DeviceEncRevoke`. `revoked` is a permanent tombstone
+  (`identity::revoke_device` is idempotent), so relaying it can never
+  regress a wallet's state.
+- **Note:** `DELETE /api/v1/devices/{device_address}` (the older REST
+  endpoint) is still local-only by design — it authorizes via REST auth
+  headers only, never builds a wallet-signed envelope, so the node has
+  nothing verifiable to gossip on that path. Doc-commented clearly; callers
+  should submit a signed `DeviceRevocation` envelope via
+  `POST /api/v1/messages` instead (sdk-js 0.43.0's `OgmaraClient.revokeDevice`
+  now does this). No l2-node client currently called the REST endpoint in
+  practice — device revocation today goes exclusively through the on-chain
+  `revokeDevice` SC call, whose chain-scan already reaches every node
+  independently (just slower); this fix adds the fast off-chain path that
+  mirrors free device *delegation*.
+
+## [0.83.0] - 2026-08-17
+
+### Security
+
+- **Cross-network envelope replay (final pre-mainnet audit C1).** Signed
+  envelope msg_ids and signing preimages carried no binding to the Klever
+  network they were created on. Because the same wallet keys exist on both
+  testnet and mainnet, a peer could capture a signed envelope from one
+  network and rebroadcast it as valid on the other — live gossip has a
+  ±5-minute timestamp window, but **synced/backfilled messages skip that
+  check entirely**, so this was an arbitrary-age cross-network injection
+  vector, not just a narrow live-gossip replay. Fixed by folding
+  `network_id` ("testnet"/"mainnet") into both `compute_msg_id` and the
+  `ogmara-msg:` signing domain (`crypto/mod.rs`, `crypto/signing.rs`) —
+  two independent binding layers, so neither a mismatched msg_id nor a
+  mismatched signature can cross networks. `PROTOCOL_VERSION` is bumped
+  1 → 2 as a **hard cutover**: `Envelope::validate_structure()` now rejects
+  any version other than the current one, rather than silently accepting
+  the old, network-unbound preimage format. This is a wire-format break —
+  requires the coordinated `sdk-js`/`sdk-rust`/web/desktop/mobile bump
+  shipping alongside this release; all nodes and clients must upgrade
+  together. Runtime impact: none for honest same-network traffic; a
+  same-network envelope's msg_id/signature are unchanged in shape, just
+  additionally domain-separated.
+- **Same finding, second signing scheme (post-fix internal audit).** The
+  generic envelope fix above does not cover `DeviceDelegation` (0x31),
+  `DeviceEncBinding` (0x36), or `DeviceEncRevoke` (0x37) — these are
+  wallet/device-signed over a fixed **claim string**
+  (`ogmara-device-claim:...` / `ogmara-enc-bind:...` / `ogmara-enc-revoke:...`),
+  never through `verify_ogmara_message`, and their signature never covers
+  `msg_id`. Since `msg_id` is a public hash (not a MAC), an attacker could
+  still recompute it for a different network, substitute it into an
+  otherwise-untouched captured envelope, and the claim-string signature
+  would verify unchanged — `verify_msg_id` passing gave no real protection
+  for these three types. Confirmed independently exploitable via ordinary
+  `POST /api/v1/messages` (auth headers only gate *who may call the
+  endpoint*, not that the caller owns `envelope.author` — by design, so
+  relaying works). Fixed by folding `network` into all three claim formats
+  too (`router.rs::verify_device_delegation_claim`/`verify_device_enc_claim`,
+  `routes.rs::register_device`) — see regression tests
+  `device_enc_binding_claim_forged_for_wrong_network_is_rejected` /
+  `_same_network_claim_accepted` in `router.rs`.
+- **Unrelated bug fixed in the same pass:** `network/mod.rs::publish_node_announcement`
+  hand-rolled its own msg_id/signing (no domain separator, no Klever
+  prefix over a bare msg_id sign) that never matched
+  `verify_ogmara_message`/`verify_klever_message` — `NodeAnnouncement`
+  gossip envelopes were unconditionally rejected by every receiver
+  regardless of this release. Now uses the shared `crypto::compute_msg_id`/
+  `signing::sign_ogmara_message` helpers, fixing the rejection and getting
+  network binding for free.
+
 ## [0.82.6] - 2026-08-16
 
 ### Fixed

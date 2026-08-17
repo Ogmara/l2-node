@@ -1,14 +1,15 @@
 //! Sparse Merkle tree for L2 state anchoring.
 //!
 //! Constructs a Merkle tree from L2 state (users, channels, messages,
-//! delegations) and generates state roots for on-chain anchoring.
-//! Uses SHA-256 hashing (spec 02-onchain.md section 7).
+//! delegations, channel members) and generates state roots for on-chain
+//! anchoring. Uses SHA-256 hashing (spec 02-onchain.md section 7).
 //!
 //! Tree structure:
 //!   State Root
 //!   ├── Users Subtree
 //!   ├── Channels Subtree (each channel has metadata + messages subtree)
-//!   └── Delegations Subtree
+//!   ├── Delegations Subtree
+//!   └── Channel Members Subtree (added v3, audit final pre-mainnet C2)
 
 use sha2::{Digest, Sha256};
 
@@ -74,10 +75,16 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
 const INTERNAL_PREFIX: u8 = 0x01;
 /// Domain separator for leaf nodes.
 const LEAF_PREFIX: u8 = 0x00;
-/// Domain constant framing the three-subtree state-root hash (audit W14).
-/// The `-v2` marks the post-2026-06-07 canonical-root format (leaf-count
-/// framed); bump the suffix on any future change to the root construction.
-const STATE_ROOT_DOMAIN: &[u8] = b"ogmara-state-root-v2";
+/// Domain constant framing the state-root hash (audit W14 / C2). The
+/// suffix marks the canonical-root format generation; bump it on any
+/// future change to the root construction:
+///   - v1 → v2 (2026-06-07, W14): leaf-count framing added (defeats the
+///     duplicate-last-node CVE-2012-2459 shape).
+///   - v2 → v3 (2026-08-17, C2): added the channel-members subtree —
+///     CHANNEL_MEMBERS was transferred by snapshot bootstrap but not
+///     covered by the anchored commitment, letting a Sybil quorum inject
+///     arbitrary private-channel membership grants into a fresh node.
+const STATE_ROOT_DOMAIN: &[u8] = b"ogmara-state-root-v3";
 
 /// Hash two child nodes together: SHA-256(0x01 || left || right).
 /// The 0x01 prefix distinguishes internal nodes from leaf hashes,
@@ -215,7 +222,8 @@ pub fn build_proof(leaves: &[[u8; 32]], index: usize) -> Option<MerkleProof> {
 
 /// The state manager that builds and maintains the L2 state Merkle tree.
 ///
-/// Composed of three subtrees: users, channels (with messages), delegations.
+/// Composed of four subtrees: users, channels (with messages), delegations,
+/// channel members.
 pub struct StateManager {
     /// Hashes of user states.
     user_hashes: Vec<[u8; 32]>,
@@ -223,6 +231,8 @@ pub struct StateManager {
     channel_hashes: Vec<[u8; 32]>,
     /// Hashes of delegation records.
     delegation_hashes: Vec<[u8; 32]>,
+    /// Hashes of channel-membership records (added v3, audit C2).
+    channel_member_hashes: Vec<[u8; 32]>,
 }
 
 impl StateManager {
@@ -231,6 +241,7 @@ impl StateManager {
             user_hashes: Vec::new(),
             channel_hashes: Vec::new(),
             delegation_hashes: Vec::new(),
+            channel_member_hashes: Vec::new(),
         }
     }
 
@@ -254,22 +265,49 @@ impl StateManager {
         self.delegation_hashes.push(hash_leaf(delegation_data));
     }
 
-    /// Compute the state root from all three subtrees.
+    /// Add a channel-membership record hash (v3, audit final pre-mainnet
+    /// C2). `CHANNEL_MEMBERS` is transferred by snapshot bootstrap like the
+    /// other three CFs, but was not covered by the anchored commitment
+    /// until this subtree was added — a Sybil quorum could inject arbitrary
+    /// private-channel membership grants into a fresh bootstrapping node.
+    ///
+    /// **Unlike `add_user`/`add_channel`/`add_delegation`, this hashes the
+    /// KEY together with the value (`hash_kv`, not bare `hash_leaf`).** The
+    /// other three CFs' values happen to redundantly re-encode their own
+    /// identifying key fields (e.g. a USERS value includes `"address"`), so
+    /// hashing the value alone still binds identity. `CHANNEL_MEMBERS`
+    /// values do NOT — the production write path
+    /// (`MessageRouter::add_channel_member`, router.rs) stores only
+    /// `{"joined_at": ..., "role": ...}`; `channel_id` and the member's
+    /// address live ONLY in the key (`encode_channel_member_key`). Hashing
+    /// the value alone would let an attacker reassign genuine
+    /// `(joined_at, role)` values to a completely different
+    /// `(channel_id, address)` key — same leaf multiset, same root, but
+    /// arbitrary membership grants. `hash_kv` (already used for per-CF
+    /// snapshot integrity in `Storage::build_snapshot_cf`) binds both.
+    pub fn add_channel_member(&mut self, key: &[u8], value: &[u8]) {
+        self.channel_member_hashes.push(hash_kv(key, value));
+    }
+
+    /// Compute the state root from all four subtrees.
     ///
     /// v2 (audit 2026-06-07 W14): the concatenation is framed with a domain
     /// constant and each subtree's leaf COUNT is mixed in, so the
     /// duplicate-last-node padding in `compute_root` (CVE-2012-2459 shape — a
     /// `[a,b,c]` tree and a `[a,b,c,c]` tree share a subtree root) can no longer
-    /// forge the same *anchored* state root: the two differ by leaf count. The
-    /// `u64` counts also unambiguously frame the three fixed-width roots.
+    /// forge the same *anchored* state root: the two differ by leaf count.
+    /// v3 (audit C2, 2026-08-17): added the channel-members subtree,
+    /// following the exact same framing.
     ///
     /// **Canonical cross-node value — changing this changes every node's
     /// anchored root.** All anchoring nodes must run a build with the same
-    /// `STATE_ROOT_DOMAIN` (l2-node ≥0.62.0); a mixed fleet would diverge.
+    /// `STATE_ROOT_DOMAIN` (v2: l2-node ≥0.62.0; v3: l2-node ≥0.86.0); a
+    /// mixed fleet would diverge.
     pub fn compute_state_root(&self) -> [u8; 32] {
         let users_root = compute_root(&self.user_hashes);
         let channels_root = compute_root(&self.channel_hashes);
         let delegations_root = compute_root(&self.delegation_hashes);
+        let channel_members_root = compute_root(&self.channel_member_hashes);
 
         let mut hasher = Sha256::new();
         hasher.update(STATE_ROOT_DOMAIN);
@@ -279,6 +317,8 @@ impl StateManager {
         hasher.update(channels_root);
         hasher.update((self.delegation_hashes.len() as u64).to_be_bytes());
         hasher.update(delegations_root);
+        hasher.update((self.channel_member_hashes.len() as u64).to_be_bytes());
+        hasher.update(channel_members_root);
         hasher.finalize().into()
     }
 
@@ -293,6 +333,7 @@ impl StateManager {
         self.user_hashes.clear();
         self.channel_hashes.clear();
         self.delegation_hashes.clear();
+        self.channel_member_hashes.clear();
     }
 }
 
@@ -364,6 +405,43 @@ mod tests {
         // Same data should produce the same root
         let root2 = sm.compute_state_root();
         assert_eq!(root, root2);
+    }
+
+    #[test]
+    fn channel_member_participates_in_state_root() {
+        // C2: the channel-members subtree must actually affect the anchored
+        // root — otherwise adding it is a no-op and the fix does nothing.
+        let mut without_member = StateManager::new();
+        without_member.add_user(b"user1");
+        without_member.add_channel(b"channel1");
+        without_member.add_delegation(b"delegation1");
+
+        let mut with_member = StateManager::new();
+        with_member.add_user(b"user1");
+        with_member.add_channel(b"channel1");
+        with_member.add_delegation(b"delegation1");
+        with_member.add_channel_member(b"key1", b"member1");
+
+        assert_ne!(without_member.compute_state_root(), with_member.compute_state_root());
+    }
+
+    #[test]
+    fn channel_member_binds_key_not_just_value() {
+        // Regression: CHANNEL_MEMBERS values don't redundantly encode their
+        // key (channel_id + address) the way USERS/DELEGATIONS values do —
+        // production rows are just {"joined_at": ..., "role": ...}. If the
+        // leaf hash only covered the value, an attacker could reassign a
+        // genuine (joined_at, role) blob to a totally different
+        // (channel_id, address) key and produce the SAME root — same
+        // multiset of values, different (and forged) membership grants.
+        let mut a = StateManager::new();
+        a.add_channel_member(b"channel1:klv1alice", b"{\"joined_at\":1,\"role\":\"member\"}");
+
+        let mut b = StateManager::new();
+        // Same VALUE, different KEY — must NOT produce the same root.
+        b.add_channel_member(b"channel2:klv1mallory", b"{\"joined_at\":1,\"role\":\"member\"}");
+
+        assert_ne!(a.compute_state_root(), b.compute_state_root());
     }
 
     #[test]

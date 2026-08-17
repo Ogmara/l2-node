@@ -726,7 +726,12 @@ impl NetworkService {
             };
 
         // Create message router for P2P message processing (no PoW for gossip)
-        let router = MessageRouter::new(storage.clone(), identity, None);
+        let router = MessageRouter::new(
+            storage.clone(),
+            identity,
+            None,
+            config.network_id().to_string(),
+        );
 
         let public_url = config.api.public_url.clone();
 
@@ -3510,17 +3515,27 @@ impl NetworkService {
             }
         };
 
-        // Compute msg_id: Keccak-256(author_pubkey + payload + timestamp)
+        // msg_id + signature via the shared, network-bound helpers (fixed
+        // alongside audit 2026-08-16 C1: this hand-rolled preimage never
+        // matched `verify_ogmara_message`/`verify_klever_message` — neither
+        // has a domain separator nor a Klever prefix over a bare msg_id sign
+        // — so NodeAnnouncement envelopes were unconditionally rejected by
+        // every receiver's `verify_signature`, pre-existing and unrelated to
+        // C1. Using `crypto::compute_msg_id`/`signing::sign_ogmara_message`
+        // fixes that AND gets network binding for free.
+        let network = self.topics.network_id();
         let pubkey_bytes = self.signing_key.verifying_key().to_bytes();
-        let ts_bytes = now_ms.to_be_bytes();
-        let mut preimage = Vec::with_capacity(32 + payload_bytes.len() + 8);
-        preimage.extend_from_slice(&pubkey_bytes);
-        preimage.extend_from_slice(&payload_bytes);
-        preimage.extend_from_slice(&ts_bytes);
-        let msg_id = crate::crypto::keccak256(&preimage);
-
-        // Sign the msg_id
-        let signature = self.signing_key.sign(&msg_id);
+        let msg_id =
+            crate::crypto::compute_msg_id(network, &pubkey_bytes, &payload_bytes, now_ms);
+        let signature = crate::crypto::signing::sign_ogmara_message(
+            &self.signing_key,
+            network,
+            PROTOCOL_VERSION,
+            MessageType::NodeAnnouncement as u8,
+            &msg_id,
+            now_ms,
+            &payload_bytes,
+        );
 
         let envelope = Envelope {
             version: PROTOCOL_VERSION,

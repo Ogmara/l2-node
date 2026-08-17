@@ -1467,6 +1467,37 @@ fn gossip_topic_for_envelope(
             // resolve a recipient's encryption keys (protocol §2.4).
             Some(gossip::topic_network(network_id))
         }
+        // DeviceRevocation MUST gossip network-wide, mirroring DeviceDelegation
+        // (audit final pre-mainnet C3): register_device already propagates for
+        // free (no on-chain TX); before this fix, revoking left every OTHER
+        // node still trusting the revoked device until its own on-chain scan
+        // caught up or a once-per-process identity_sync pull happened to run —
+        // a stolen/compromised device stayed valid network-wide in the
+        // meantime. `revoked` is a permanent tombstone (identity::revoke_device
+        // is idempotent), so relaying it can never regress a wallet's state.
+        MessageType::DeviceRevocation => Some(gossip::topic_network(network_id)),
+        // Report/CounterVote MUST gossip network-wide (spec 07-moderation
+        // §3.1/§3.2: "Reports are L2 messages propagated via the
+        // /ogmara/{network}/v1/network topic" + distributed scoring requires
+        // every node to see every report/counter-vote). Before this fix each
+        // node only ever tallied its OWN locally-received reports — a
+        // distributed moderation score was structurally impossible (audit
+        // final pre-mainnet W22). Both are `requires_verified_identity()`
+        // gated at ingest on every node, so a relayed report/vote can't be
+        // forged by an unregistered relayer.
+        MessageType::Report | MessageType::CounterVote => Some(gossip::topic_network(network_id)),
+        // DeletionRequest MUST gossip network-wide (spec 08-compliance §3.5:
+        // "a signed deletion signal propagates through the network... nodes
+        // delete the content and forward the signal"). Author-scoped, not
+        // channel/DM-scoped (apply arm keys purely off `resolved_author`), so
+        // the global topic is correct regardless of where the deleted content
+        // lives. Before this fix, right-to-erasure only ever reached the
+        // home node — every other node kept serving the "deleted" content
+        // indefinitely (audit final pre-mainnet W23, GDPR/compliance
+        // blocker). Gated by `requires_verified_identity()` at ingest, and
+        // the apply arm only ever deletes `resolved_author`'s OWN content, so
+        // a relayed request can't be used to delete someone else's data.
+        MessageType::DeletionRequest => Some(gossip::topic_network(network_id)),
         _ => None,
     }
 }
@@ -4670,7 +4701,7 @@ pub struct RegisterDeviceRequest {
     /// **OPTIONAL** (l2-node 0.49.0+, P-0 dual-signed delegation):
     /// hex-encoded Ed25519 signature by the DEVICE key over the SAME
     /// canonical claim string the wallet signed
-    /// (`ogmara-device-claim:{device_pubkey_hex}:{wallet_address}:{timestamp}`,
+    /// (`ogmara-device-claim:{network}:{device_pubkey_hex}:{wallet_address}:{timestamp}`,
     /// Klever message format). This is the device's **proof-of-possession**.
     ///
     /// When BOTH the wallet signature (`wallet_signature`) and this device
@@ -4691,7 +4722,7 @@ pub struct RegisterDeviceRequest {
 /// POST /api/v1/devices/register — register a device key under a wallet.
 ///
 /// Verifies the wallet-signed claim:
-///   claim = "ogmara-device-claim:{device_pubkey_hex}:{wallet_address}:{timestamp}"
+///   claim = "ogmara-device-claim:{network}:{device_pubkey_hex}:{wallet_address}:{timestamp}"
 ///   signed by wallet key using Klever message signing format.
 pub async fn register_device(
     Extension(state): Extension<Arc<AppState>>,
@@ -4758,8 +4789,8 @@ pub async fn register_device(
     // so a non-lowercase client fails consistently (closed) instead of
     // registering locally but silently failing to propagate.
     let claim_string = format!(
-        "ogmara-device-claim:{}:{}:{}",
-        device_pubkey_hex, body.wallet_address, body.timestamp
+        "ogmara-device-claim:{}:{}:{}:{}",
+        state.klever_network, device_pubkey_hex, body.wallet_address, body.timestamp
     );
 
     let sig_bytes = match hex::decode(&body.wallet_signature) {
@@ -5018,16 +5049,21 @@ async fn build_and_gossip_dual_delegation(
         }
     };
 
-    // msg_id = Keccak-256(wallet_pubkey + payload + timestamp) — matches
-    // `verify_msg_id` on every receiver.
+    // msg_id = Keccak-256(network_id + wallet_pubkey + payload + timestamp) —
+    // matches `verify_msg_id` on every receiver (network-bound, audit C1).
     let wallet_pubkey = match crate::crypto::address_to_pubkey_bytes(wallet_address) {
         Ok(p) => p,
         Err(_) => return false,
     };
-    let msg_id = crate::crypto::compute_msg_id(&wallet_pubkey, &payload_bytes, timestamp);
+    let msg_id = crate::crypto::compute_msg_id(
+        &state.klever_network,
+        &wallet_pubkey,
+        &payload_bytes,
+        timestamp,
+    );
 
     let envelope = Envelope {
-        version: 1,
+        version: crate::messages::envelope::PROTOCOL_VERSION,
         msg_type: MessageType::DeviceDelegation,
         msg_id,
         author: wallet_address.to_string(),
@@ -5092,6 +5128,19 @@ async fn build_and_gossip_dual_delegation(
 /// By design, any device registered to the wallet can revoke sibling devices
 /// (since auth resolves device → wallet). This enables device management from
 /// any active device without requiring the wallet key directly.
+///
+/// **LOCAL-ONLY — does not propagate (audit final pre-mainnet C3).** This
+/// endpoint authorizes purely via host-bound REST auth headers; it never
+/// builds or verifies a wallet-signed `DeviceRevocation` envelope, so the
+/// node cannot gossip it (there is no signature another node could verify).
+/// A revocation made through THIS endpoint stays valid only on this node
+/// until every other node independently learns about it via a slower path
+/// (on-chain `revokeDevice` chain-scan, or a once-per-process identity_sync
+/// pull) — a revoked/stolen device keeps working network-wide in the
+/// meantime. Prefer submitting a signed `DeviceRevocation` (0x32) envelope
+/// via `POST /api/v1/messages` instead (now gossips network-wide, see
+/// `gossip_topic_for_envelope`) — sdk-js's `OgmaraClient.revokeDevice()`
+/// does this. Kept for backward compatibility / direct API callers.
 pub async fn revoke_device(
     Extension(state): Extension<Arc<AppState>>,
     Extension(auth_user): Extension<AuthUser>,
@@ -7580,5 +7629,121 @@ mod channel_resubscribe_tests {
     fn channel_create_with_corrupt_payload_yields_none() {
         let env = envelope(MessageType::ChannelCreate, vec![0xff, 0x00, 0x01]);
         assert_eq!(channel_id_for_resubscribe(&env), None);
+    }
+}
+
+#[cfg(test)]
+mod gossip_bridge_tests {
+    use super::gossip_topic_for_envelope;
+    use crate::messages::envelope::Envelope;
+    use crate::messages::types::{
+        CounterVotePayload, DeletionRequestPayload, DeletionType, DeviceRevocationPayload,
+        MessageType, ReportPayload, ReportReason, ReportTarget,
+    };
+
+    fn envelope(msg_type: MessageType, payload: Vec<u8>) -> Envelope {
+        Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type,
+            msg_id: [0u8; 32],
+            author: "klv1test".to_string(),
+            timestamp: 0,
+            lamport_ts: 0,
+            payload,
+            signature: Vec::new(),
+            relay_path: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn device_revocation_gossips_network_wide() {
+        // Regression (audit final pre-mainnet C3): DeviceRevocation had no
+        // bridge arm, so a revoked/stolen device stayed valid on every node
+        // that hadn't independently caught up via chain-scan or a
+        // once-per-process identity_sync pull. Must land on the same
+        // network-wide topic as DeviceDelegation (register_device already
+        // propagates for free — revoke must too).
+        let payload = DeviceRevocationPayload {
+            device_pub_key: "aa".repeat(32),
+        };
+        let env = envelope(MessageType::DeviceRevocation, rmp_serde::to_vec(&payload).unwrap());
+        assert_eq!(
+            gossip_topic_for_envelope(&env, "testnet"),
+            Some(crate::network::gossip::topic_network("testnet")),
+        );
+    }
+
+    #[test]
+    fn report_and_counter_vote_gossip_network_wide() {
+        // Regression (audit final pre-mainnet W22, spec 07-moderation §3.1/
+        // §3.2): neither had a bridge arm, so distributed moderation scoring
+        // was structurally impossible — each node only ever tallied its own
+        // locally-received reports/votes.
+        let report = ReportPayload {
+            target_type: ReportTarget::Message,
+            target_id: [1u8; 32],
+            reason: ReportReason::Spam,
+            details: None,
+        };
+        let env = envelope(MessageType::Report, rmp_serde::to_vec(&report).unwrap());
+        assert_eq!(
+            gossip_topic_for_envelope(&env, "testnet"),
+            Some(crate::network::gossip::topic_network("testnet")),
+        );
+
+        let vote = CounterVotePayload { target_id: [2u8; 32] };
+        let env = envelope(MessageType::CounterVote, rmp_serde::to_vec(&vote).unwrap());
+        assert_eq!(
+            gossip_topic_for_envelope(&env, "testnet"),
+            Some(crate::network::gossip::topic_network("testnet")),
+        );
+    }
+
+    #[test]
+    fn deletion_request_gossips_network_wide() {
+        // Regression (audit final pre-mainnet W23, spec 08-compliance §3.5):
+        // no bridge arm meant right-to-erasure only ever reached the home
+        // node — every other node kept serving "deleted" content forever.
+        let payload = DeletionRequestPayload {
+            delete_type: DeletionType::AllUserContent,
+            target_id: None,
+        };
+        let env = envelope(MessageType::DeletionRequest, rmp_serde::to_vec(&payload).unwrap());
+        assert_eq!(
+            gossip_topic_for_envelope(&env, "testnet"),
+            Some(crate::network::gossip::topic_network("testnet")),
+        );
+    }
+
+    #[test]
+    fn deletion_type_wire_encoding_is_variant_name_not_discriminant() {
+        // Regression: rmp-serde's DEFAULT unit-enum encoding is the variant
+        // NAME string, but it also silently ACCEPTS a plain integer on
+        // decode — as the 0-based DECLARATION-ORDER index, NOT the
+        // `#[repr(u8)]` explicit discriminant. `SingleMessage = 0x01` but
+        // serde index 0; `AllUserContent = 0x02` but serde index 1. A client
+        // that sent the numeric discriminant (1 for SingleMessage) would
+        // silently decode as AllUserContent (wrong-content deleted). Locks
+        // in that sdk-js's `buildDeletionRequest` MUST send the string name
+        // (verified empirically before writing the client fix — see
+        // audit-campaign memory).
+        assert_eq!(
+            rmp_serde::from_slice::<DeletionType>(&rmp_serde::to_vec(&0u8).unwrap()).unwrap(),
+            DeletionType::SingleMessage,
+            "numeric 0 (serde index) decodes to SingleMessage, NOT its discriminant 1",
+        );
+        assert_eq!(
+            rmp_serde::from_slice::<DeletionType>(&rmp_serde::to_vec(&1u8).unwrap()).unwrap(),
+            DeletionType::AllUserContent,
+            "numeric 1 (serde index) decodes to AllUserContent, NOT SingleMessage's discriminant",
+        );
+        // The string name (what the SDK actually sends) round-trips unambiguously.
+        assert_eq!(
+            rmp_serde::from_slice::<DeletionType>(
+                &rmp_serde::to_vec(&DeletionType::SingleMessage).unwrap()
+            )
+            .unwrap(),
+            DeletionType::SingleMessage,
+        );
     }
 }

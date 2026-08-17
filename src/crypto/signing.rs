@@ -50,17 +50,26 @@ pub fn verify_klever_message(
 
 /// Build the signed bytes for an Ogmara protocol message.
 ///
-/// Format: "ogmara-msg:" + version(1) + msg_type(1) + msg_id(32) + timestamp(8) + payload
+/// Format (protocol v2, audit 2026-08-16 C1): "ogmara-msg:" + network_id_len(1) +
+/// network_id + version(1) + msg_type(1) + msg_id(32) + timestamp(8) + payload.
+/// `network_id` ("testnet"/"mainnet") binds the signature to a single Klever
+/// network so a captured envelope from one network cannot be replayed as
+/// valid on another — the two networks share the same wallet keys.
 pub fn ogmara_signed_bytes(
+    network_id: &str,
     version: u8,
     msg_type: u8,
     msg_id: &[u8; 32],
     timestamp: u64,
     payload_bytes: &[u8],
 ) -> Vec<u8> {
-    let mut data =
-        Vec::with_capacity(OGMARA_DOMAIN_SEP.len() + 1 + 1 + 32 + 8 + payload_bytes.len());
+    let network_bytes = network_id.as_bytes();
+    let mut data = Vec::with_capacity(
+        OGMARA_DOMAIN_SEP.len() + 1 + network_bytes.len() + 1 + 1 + 32 + 8 + payload_bytes.len(),
+    );
     data.extend_from_slice(OGMARA_DOMAIN_SEP);
+    data.push(network_bytes.len() as u8);
+    data.extend_from_slice(network_bytes);
     data.push(version);
     data.push(msg_type);
     data.extend_from_slice(msg_id);
@@ -72,13 +81,15 @@ pub fn ogmara_signed_bytes(
 /// Sign an Ogmara protocol message.
 pub fn sign_ogmara_message(
     signing_key: &SigningKey,
+    network_id: &str,
     version: u8,
     msg_type: u8,
     msg_id: &[u8; 32],
     timestamp: u64,
     payload_bytes: &[u8],
 ) -> Signature {
-    let signed_bytes = ogmara_signed_bytes(version, msg_type, msg_id, timestamp, payload_bytes);
+    let signed_bytes =
+        ogmara_signed_bytes(network_id, version, msg_type, msg_id, timestamp, payload_bytes);
     let hash = keccak256(&signed_bytes);
     signing_key.sign(&hash)
 }
@@ -86,6 +97,7 @@ pub fn sign_ogmara_message(
 /// Verify an Ogmara protocol message signature.
 pub fn verify_ogmara_message(
     verifying_key: &VerifyingKey,
+    network_id: &str,
     version: u8,
     msg_type: u8,
     msg_id: &[u8; 32],
@@ -93,7 +105,8 @@ pub fn verify_ogmara_message(
     payload_bytes: &[u8],
     signature: &Signature,
 ) -> Result<(), CryptoError> {
-    let signed_bytes = ogmara_signed_bytes(version, msg_type, msg_id, timestamp, payload_bytes);
+    let signed_bytes =
+        ogmara_signed_bytes(network_id, version, msg_type, msg_id, timestamp, payload_bytes);
     let hash = keccak256(&signed_bytes);
     verifying_key
         .verify(&hash, signature)
@@ -206,11 +219,18 @@ mod tests {
         let timestamp = 1234567890u64;
         let payload = b"test payload";
 
-        let sig = sign_ogmara_message(&key, 1, 0x01, &msg_id, timestamp, payload);
-        assert!(
-            verify_ogmara_message(&key.verifying_key(), 1, 0x01, &msg_id, timestamp, payload, &sig)
-                .is_ok()
-        );
+        let sig = sign_ogmara_message(&key, "testnet", 1, 0x01, &msg_id, timestamp, payload);
+        assert!(verify_ogmara_message(
+            &key.verifying_key(),
+            "testnet",
+            1,
+            0x01,
+            &msg_id,
+            timestamp,
+            payload,
+            &sig
+        )
+        .is_ok());
     }
 
     #[test]
@@ -220,14 +240,38 @@ mod tests {
         let timestamp = 1234567890u64;
         let payload = b"test payload";
 
-        let sig = sign_ogmara_message(&key, 1, 0x01, &msg_id, timestamp, payload);
+        let sig = sign_ogmara_message(&key, "testnet", 1, 0x01, &msg_id, timestamp, payload);
         assert!(verify_ogmara_message(
             &key.verifying_key(),
+            "testnet",
             1,
             0x01,
             &msg_id,
             timestamp,
             b"tampered",
+            &sig,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn test_ogmara_protocol_cross_network_replay_fails() {
+        // C1 regression: a signature produced for "testnet" must not verify
+        // against the same fields interpreted on "mainnet".
+        let key = test_keypair();
+        let msg_id = [42u8; 32];
+        let timestamp = 1234567890u64;
+        let payload = b"test payload";
+
+        let sig = sign_ogmara_message(&key, "testnet", 1, 0x01, &msg_id, timestamp, payload);
+        assert!(verify_ogmara_message(
+            &key.verifying_key(),
+            "mainnet",
+            1,
+            0x01,
+            &msg_id,
+            timestamp,
+            payload,
             &sig,
         )
         .is_err());

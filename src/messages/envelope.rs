@@ -14,11 +14,11 @@ use super::types::MessageType;
 /// typed payload based on `msg_type` when needed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Envelope {
-    /// Protocol version (currently 1).
+    /// Protocol version (currently 2, see `PROTOCOL_VERSION`).
     pub version: u8,
     /// Message type identifier.
     pub msg_type: MessageType,
-    /// Keccak-256(author_pubkey_bytes + payload_bytes + timestamp_bytes).
+    /// Keccak-256(network_id_len + network_id + author_pubkey_bytes + payload_bytes + timestamp_bytes).
     pub msg_id: [u8; 32],
     /// Sender's Klever address (klv1...).
     pub author: String,
@@ -36,7 +36,13 @@ pub struct Envelope {
 }
 
 /// Current protocol version.
-pub const PROTOCOL_VERSION: u8 = 1;
+///
+/// Bumped 1 -> 2 for the audit 2026-08-16 C1 fix: the signed preimage and
+/// msg_id now fold in `network_id` ("testnet"/"mainnet") so an envelope
+/// captured on one Klever network can never verify as valid on the other
+/// (both share the same wallet keys). This is a hard cutover, not a
+/// negotiated upgrade — `validate_structure` rejects any other version.
+pub const PROTOCOL_VERSION: u8 = 2;
 
 /// Maximum allowed clock drift for message timestamps (±5 minutes in ms).
 pub const MAX_TIMESTAMP_DRIFT_MS: u64 = 5 * 60 * 1000;
@@ -72,8 +78,13 @@ impl Envelope {
         if self.signature.len() != 64 {
             return Err("signature must be exactly 64 bytes");
         }
-        if self.version == 0 {
-            return Err("version must be > 0");
+        // Exact match, not just non-zero: the v1 -> v2 bump (audit 2026-08-16
+        // C1) is a hard cutover — v1's signing preimage has no network_id, so
+        // silently accepting it would defeat the whole fix. Reject with a
+        // clear reason rather than letting v1 envelopes fail signature
+        // verification for an unrelated-looking cause.
+        if self.version != PROTOCOL_VERSION {
+            return Err("unsupported protocol version");
         }
         // Limit relay path to prevent amplification
         if self.relay_path.len() > 64 {

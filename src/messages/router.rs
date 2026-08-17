@@ -151,6 +151,11 @@ pub struct MessageRouter {
     rate_limits: DashMap<String, RateLimitEntry>,
     /// PoW anti-spam manager (None = PoW disabled).
     pow: Option<Arc<crate::pow::PowManager>>,
+    /// This node's Klever network ("testnet"/"mainnet", from `config.network_id()`).
+    /// Folded into every signed envelope's msg_id + signing domain (audit
+    /// 2026-08-16 C1) so an envelope captured on one network can never verify
+    /// on the other, even though both share the same wallet keys.
+    network: String,
 }
 
 /// Rejection reason for step 4d (tiered identity). Shared with
@@ -196,12 +201,14 @@ impl MessageRouter {
         storage: Storage,
         identity: IdentityResolver,
         pow: Option<Arc<crate::pow::PowManager>>,
+        network: String,
     ) -> Self {
         Self {
             storage,
             identity,
             rate_limits: DashMap::new(),
             pow,
+            network,
         }
     }
 
@@ -477,6 +484,7 @@ impl MessageRouter {
         // Try Ogmara protocol format first (most common for L2 messages)
         let ogmara_result = signing::verify_ogmara_message(
             &verifying_key,
+            &self.network,
             envelope.version,
             envelope.msg_type_u8(),
             &envelope.msg_id,
@@ -491,6 +499,7 @@ impl MessageRouter {
 
         // Fall back to Klever message format (for wallet-signed messages)
         let signed_bytes = signing::ogmara_signed_bytes(
+            &self.network,
             envelope.version,
             envelope.msg_type_u8(),
             &envelope.msg_id,
@@ -519,8 +528,10 @@ impl MessageRouter {
     ///
     /// Both the WALLET (authorizes the binding) and the DEVICE (proves it
     /// holds the key) must have signed the canonical claim string
-    /// `ogmara-device-claim:{device_pub_key_lowercase}:{wallet}:{timestamp}`
-    /// in Klever message format:
+    /// `ogmara-device-claim:{network}:{device_pub_key_lowercase}:{wallet}:{timestamp}`
+    /// in Klever message format (`network` folded in per audit 2026-08-16 C1
+    /// follow-up — this claim's signature is the sole authority and never
+    /// covers `msg_id`, so it needs its own network binding):
     ///   * `envelope.signature` — the wallet's signature, checked against
     ///     `envelope.author` (the wallet `wallet_key`).
     ///   * `payload.device_signature` — the device's signature, checked
@@ -541,11 +552,16 @@ impl MessageRouter {
                 .context("DeviceDelegation payload decode for signature verification")?;
 
         // Canonical claim string — lowercase device pubkey so the bytes the
-        // two signers signed are reproduced exactly on every node.
+        // two signers signed are reproduced exactly on every node. Network-
+        // bound (audit 2026-08-16 C1 follow-up): this claim's signature is
+        // the SOLE authority here (msg_id equality alone proves nothing — it
+        // is a public hash, not a MAC, and this claim scheme never covers
+        // msg_id), so without `self.network` in the claim itself a captured
+        // testnet claim would re-verify unchanged on mainnet.
         let device_pubkey_hex = payload.device_pub_key.to_ascii_lowercase();
         let claim = format!(
-            "ogmara-device-claim:{}:{}:{}",
-            device_pubkey_hex, envelope.author, envelope.timestamp
+            "ogmara-device-claim:{}:{}:{}:{}",
+            self.network, device_pubkey_hex, envelope.author, envelope.timestamp
         );
 
         // 1) Wallet authorizes the binding.
@@ -595,11 +611,13 @@ impl MessageRouter {
     /// The envelope is authored by the WALLET; `envelope.signature` is the wallet's
     /// Klever-message signature over a canonical claim re-derived from envelope
     /// fields (protocol §2.4), so a relaying node cannot forge it:
-    ///   * bind:   `ogmara-enc-bind:{enc_pub_lc}:{device_id_lc}:{wallet}:{timestamp}`
-    ///   * revoke: `ogmara-enc-revoke:{enc_pub_lc}:{wallet}:{timestamp}`
+    ///   * bind:   `ogmara-enc-bind:{network}:{enc_pub_lc}:{device_id_lc}:{wallet}:{timestamp}`
+    ///   * revoke: `ogmara-enc-revoke:{network}:{enc_pub_lc}:{wallet}:{timestamp}`
     /// No device co-signature: an X25519 encryption key cannot produce a signature,
     /// and the wallet signature is the sole authority (binding a key the wallet does
-    /// not control only harms that wallet).
+    /// not control only harms that wallet). `network` is folded in (audit 2026-08-16
+    /// C1 follow-up) for the same reason as `verify_device_delegation_claim`: this
+    /// claim's signature is the sole authority and never covers `msg_id`.
     fn verify_device_enc_claim(
         &self,
         envelope: &Envelope,
@@ -613,7 +631,8 @@ impl MessageRouter {
                 Self::validate_hex32(&p.enc_pub, "enc_pub")?;
                 Self::validate_hex32(&p.device_id, "device_id")?;
                 format!(
-                    "ogmara-enc-bind:{}:{}:{}:{}",
+                    "ogmara-enc-bind:{}:{}:{}:{}:{}",
+                    self.network,
                     p.enc_pub.to_ascii_lowercase(),
                     p.device_id.to_ascii_lowercase(),
                     envelope.author,
@@ -625,7 +644,8 @@ impl MessageRouter {
                     .context("DeviceEncRevoke payload decode for signature verification")?;
                 Self::validate_hex32(&p.enc_pub, "enc_pub")?;
                 format!(
-                    "ogmara-enc-revoke:{}:{}:{}",
+                    "ogmara-enc-revoke:{}:{}:{}:{}",
+                    self.network,
                     p.enc_pub.to_ascii_lowercase(),
                     envelope.author,
                     envelope.timestamp
@@ -741,6 +761,7 @@ impl MessageRouter {
             .map_err(|e| anyhow::anyhow!("invalid author address: {}", e))?;
 
         let computed = crypto::compute_msg_id(
+            &self.network,
             &author_bytes,
             &envelope.payload,
             envelope.timestamp,
@@ -3134,7 +3155,10 @@ mod enc_supersede_tests {
         let dir = TempDir::new().unwrap();
         let storage = Storage::open(dir.path()).unwrap();
         let identity = IdentityResolver::new(storage.clone());
-        (MessageRouter::new(storage, identity, None), dir)
+        (
+            MessageRouter::new(storage, identity, None, "testnet".to_string()),
+            dir,
+        )
     }
 
     fn put_enc(r: &MessageRouter, wallet: &str, enc_pub: &str, device_id: &str, ts: u64, revoked: bool) {
@@ -3208,6 +3232,92 @@ mod enc_supersede_tests {
         let (newer, to_revoke) = r.plan_enc_key_supersede(w, "", "bb", 200).unwrap();
         assert!(!newer);
         assert!(to_revoke.is_empty());
+    }
+
+    fn now_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
+    }
+
+    /// Build a wallet-authored DeviceEncBinding envelope whose `msg_id` is
+    /// computed for `msg_id_network` but whose claim (and thus signature) is
+    /// computed for `claim_network` — simulating an attacker who captured a
+    /// genuine envelope on `claim_network` and re-hashed only the (public,
+    /// secret-free) msg_id for `msg_id_network` before replaying it there.
+    fn mismatched_network_enc_binding_envelope(
+        wallet_key: &ed25519_dalek::SigningKey,
+        msg_id_network: &str,
+        claim_network: &str,
+        timestamp: u64,
+    ) -> Vec<u8> {
+        let wallet = crypto::pubkey_to_address(&wallet_key.verifying_key()).unwrap();
+        let enc_pub = "aa".repeat(32);
+        let device_id = "bb".repeat(32);
+        let payload = DeviceEncBindingPayload {
+            device_id: device_id.clone(),
+            enc_pub: enc_pub.clone(),
+        };
+        let payload_bytes = rmp_serde::to_vec_named(&payload).unwrap();
+
+        let claim = format!(
+            "ogmara-enc-bind:{}:{}:{}:{}:{}",
+            claim_network, enc_pub, device_id, wallet, timestamp
+        );
+        let wallet_sig = signing::sign_klever_message(wallet_key, claim.as_bytes());
+
+        let wallet_pubkey = wallet_key.verifying_key().to_bytes();
+        let msg_id =
+            crypto::compute_msg_id(msg_id_network, &wallet_pubkey, &payload_bytes, timestamp);
+
+        let envelope = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::DeviceEncBinding,
+            msg_id,
+            author: wallet,
+            timestamp,
+            lamport_ts: 0,
+            payload: payload_bytes,
+            signature: wallet_sig.to_bytes().to_vec(),
+            relay_path: vec![],
+        };
+        rmp_serde::to_vec_named(&envelope).unwrap()
+    }
+
+    fn mainnet_router() -> (MessageRouter, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let identity = IdentityResolver::new(storage.clone());
+        (
+            MessageRouter::new(storage, identity, None, "mainnet".to_string()),
+            dir,
+        )
+    }
+
+    #[test]
+    fn device_enc_binding_same_network_claim_accepted() {
+        // Sanity baseline: msg_id and claim built for the SAME network as the
+        // receiving router must be accepted.
+        let (r, _d) = router(); // "testnet"
+        let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let bytes = mismatched_network_enc_binding_envelope(&key, "testnet", "testnet", now_ms());
+        assert!(matches!(r.process_message(&bytes), RouteResult::Accepted { .. }));
+    }
+
+    #[test]
+    fn device_enc_binding_claim_forged_for_wrong_network_is_rejected() {
+        // C1 follow-up regression: an attacker who captured a genuine
+        // testnet DeviceEncBinding cannot force it onto mainnet merely by
+        // re-hashing msg_id for "mainnet" — the claim string (and thus the
+        // wallet signature covering it) is independently network-bound, so
+        // the signature check must fail even though msg_id matches.
+        let (r, _d) = mainnet_router();
+        let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        // msg_id recomputed for "mainnet" (what verify_msg_id expects here),
+        // but the claim — and therefore wallet_sig — was built for "testnet".
+        let bytes = mismatched_network_enc_binding_envelope(&key, "mainnet", "testnet", now_ms());
+        assert!(matches!(r.process_message(&bytes), RouteResult::Invalid(_)));
     }
 
     // --- P2 channel-scope ChannelKeyEnvelope authorization ---
@@ -3317,7 +3427,10 @@ mod cross_node_ban_kick_tests {
         let dir = TempDir::new().unwrap();
         let storage = Storage::open(dir.path()).unwrap();
         let identity = IdentityResolver::new(storage.clone());
-        (MessageRouter::new(storage, identity, None), dir)
+        (
+            MessageRouter::new(storage, identity, None, "testnet".to_string()),
+            dir,
+        )
     }
 
     fn make_channel(r: &MessageRouter, channel_id: u64, creator: &str) {
@@ -3362,17 +3475,19 @@ mod cross_node_ban_kick_tests {
         };
         let payload_bytes = rmp_serde::to_vec_named(&payload).unwrap();
         let author_pubkey: [u8; 32] = sk.verifying_key().to_bytes();
-        let msg_id = crypto::compute_msg_id(&author_pubkey, &payload_bytes, timestamp);
+        let msg_id =
+            crypto::compute_msg_id("testnet", &author_pubkey, &payload_bytes, timestamp);
         let signature = signing::sign_ogmara_message(
             sk,
-            1,
+            "testnet",
+            crate::messages::envelope::PROTOCOL_VERSION,
             MessageType::ChannelBan as u8,
             &msg_id,
             timestamp,
             &payload_bytes,
         );
         let envelope = Envelope {
-            version: 1,
+            version: crate::messages::envelope::PROTOCOL_VERSION,
             msg_type: MessageType::ChannelBan,
             msg_id,
             author: author.to_string(),

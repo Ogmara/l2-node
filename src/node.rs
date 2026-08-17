@@ -806,15 +806,17 @@ impl Node {
             None
         };
 
+        // Use the authoritative network_id from config (set during migration/validation).
+        // This is the single source of truth — also used by libp2p protocol IDs and topics.
+        let klever_network = self.config.network_id().to_string();
+
         // Start REST/WS API server
         let api_router = crate::messages::router::MessageRouter::new(
             self.storage.clone(),
             identity.clone(),
             pow_manager.clone(),
+            klever_network.clone(),
         );
-        // Use the authoritative network_id from config (set during migration/validation).
-        // This is the single source of truth — also used by libp2p protocol IDs and topics.
-        let klever_network = self.config.network_id().to_string();
 
         // Start metrics collector (spec 10-dashboard.md §6)
         let node_address = self.address().unwrap_or_default();

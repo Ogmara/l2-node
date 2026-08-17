@@ -29,7 +29,7 @@ pub enum KeyEnvelopeStore {
 /// A device registration claim proving a wallet authorized a device key.
 ///
 /// The wallet signs a claim string binding the device to the wallet address.
-/// Claim format: `"ogmara-device-claim:{device_pubkey_hex}:{wallet_address}:{timestamp}"`
+/// Claim format: `"ogmara-device-claim:{network}:{device_pubkey_hex}:{wallet_address}:{timestamp}"`
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DeviceClaim {
     /// The device's ogd1... address (derived from device Ed25519 key).
@@ -1011,7 +1011,7 @@ impl Storage {
     // --- State Anchoring ---
 
     /// Compute the current L2 state Merkle root by iterating USERS, CHANNELS,
-    /// and DELEGATIONS column families.
+    /// DELEGATIONS, and CHANNEL_MEMBERS column families.
     ///
     /// Returns `(state_root, message_count, channel_count, user_count)`.
     /// Should be called from `spawn_blocking` to avoid blocking the async runtime.
@@ -1057,6 +1057,22 @@ impl Storage {
         while iter.valid() {
             if let Some(value) = iter.value() {
                 state_mgr.add_delegation(value);
+            }
+            iter.next();
+        }
+
+        // Iterate CHANNEL_MEMBERS (v3, audit C2 — was transferred by
+        // snapshot bootstrap but not covered by the anchored commitment).
+        let members_cf = self.db.cf_handle(cf::CHANNEL_MEMBERS)
+            .context("CHANNEL_MEMBERS cf not found")?;
+        let mut iter = self.db.raw_iterator_cf(&members_cf);
+        iter.seek_to_first();
+        while iter.valid() {
+            // CHANNEL_MEMBERS values don't redundantly encode their key
+            // (channel_id + address) the way USERS/DELEGATIONS values do —
+            // the key must be hashed in too (see `add_channel_member` doc).
+            if let (Some(key), Some(value)) = (iter.key(), iter.value()) {
+                state_mgr.add_channel_member(key, value);
             }
             iter.next();
         }
