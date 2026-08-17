@@ -5,6 +5,50 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.92.0] - 2026-08-17
+
+### Fixed
+
+- **DirectMessageReaction (0x08) silently dropped (final pre-mainnet audit
+  W27).** The apply arm was `MessageType::DirectMessageReaction => {}` — a
+  DM reaction was accepted and stored in MESSAGES but never indexed or
+  gossiped. A stale comment claimed this was intentional ("DM reactions are
+  end-to-end encrypted, can't parse emoji/target_id for indexing"); this
+  turned out to be factually wrong — `ReactionPayload.emoji`/`target_id`
+  are plain fields, identical in shape to `ChatReaction`, and sdk-js's
+  `dmReactionPayload` sends them unencrypted. Fixed by reusing the
+  existing `toggle_chat_reaction` function and `chat_reactions`/
+  `chat_reaction_counts` column families (keyed purely on the
+  globally-unique `msg_id`, so no new schema is needed — the CFs are
+  already shared with `ChatReaction`/`NewsReaction`), and adding
+  `DirectMessageReaction` to the DM-topic gossip-bridge arm alongside
+  `DirectMessageEdit`/`DirectMessageDelete`. `enrich_message_json`
+  (already called by `get_dm_messages`) surfaces DM reactions for free —
+  no new read-path code needed.
+
+### Security
+
+- **DM reaction cross-conversation forgery (found during W27's own review,
+  fixed before ship).** The propagation fix above, on its own, would have
+  let any wallet submit a `DirectMessageReaction` against a `msg_id`
+  belonging to a DM conversation it has no part in — DM `msg_id`s are not
+  participant-secret (envelope headers are plaintext even though `content`
+  is E2E-encrypted, and DM-topic gossip subscription is unauthenticated),
+  and the new gossip-bridge arm would relay the forged reaction to the
+  real participants' nodes, making it appear as an honest reaction from an
+  uninvolved wallet. Closed with a new `authorize_dm_reaction` check
+  (mirrors the existing `authorize_edit_delete` pattern): looks up the
+  target DM's stored original envelope, resolves its sender, decodes its
+  `recipient`, and rejects the reaction unless `resolved_author` is one of
+  the two conversation participants. Runs inside `process_message_inner`,
+  so it applies uniformly on every ingest path (REST, WS, gossip-receive,
+  sync backfill) — a forged reaction is rejected at the very first node
+  that sees it, never stored, indexed, or relayed further.
+  `ChatReaction`/`NewsReaction` are intentionally NOT subject to this
+  check — channel/news reactions are a many-to-many social feature where
+  any member reacting to any message is the intended model; a DM is
+  strictly two-party, so this asymmetry is deliberate.
+
 ## [0.91.0] - 2026-08-17
 
 ### Security

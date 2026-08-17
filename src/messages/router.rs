@@ -394,6 +394,12 @@ impl MessageRouter {
             return RouteResult::Rejected(format!("edit/delete denied: {}", e));
         }
 
+        // Step 7d2: Authorize DM reactions — reactor must be a participant of
+        // the target DM conversation (audit W27 security follow-up).
+        if let Err(e) = self.authorize_dm_reaction(&envelope, &resolved_author) {
+            return RouteResult::Rejected(format!("dm_reaction_denied: {}", e));
+        }
+
         // Step 7e: Read-only / broadcast channel enforcement — only creator and
         // moderators can post ChatMessage / ChatEdit / ChatDelete in ReadPublic
         // channels. Reactions remain open to all members. See protocol spec §3.6.
@@ -1404,6 +1410,59 @@ impl MessageRouter {
         Ok(())
     }
 
+    /// Authorize `DirectMessageReaction` (audit final pre-mainnet W27,
+    /// security-audit follow-up): reject unless `resolved_author` is a
+    /// participant (sender or recipient) of the DM conversation the target
+    /// message belongs to.
+    ///
+    /// Without this, `toggle_chat_reaction` (reused from `ChatReaction` for
+    /// DM reactions since W27) would index — and now, since W27 also added
+    /// the gossip-bridge arm, RELAY to the real participants' nodes — a
+    /// reaction from a wallet with no relationship to the conversation at
+    /// all. DM `msg_id`s are not participant-secret: envelope headers
+    /// (`author`, `msg_id`, `timestamp`) are plaintext even though `content`
+    /// is E2E-encrypted, and DM-topic gossip subscription is unauthenticated,
+    /// so any wallet that lurks on a target's DM topic can observe a real
+    /// `msg_id` to forge a reaction against. `ChatReaction`/`NewsReaction`
+    /// intentionally have no equivalent check — channel/news reactions are a
+    /// many-to-many social feature where any member reacting to any message
+    /// in the channel is the intended model — but a DM is strictly
+    /// two-party, so an unrelated wallet's reaction appearing in it is a
+    /// privacy/integrity violation, not just a permissive default.
+    fn authorize_dm_reaction(
+        &self,
+        envelope: &Envelope,
+        resolved_author: &str,
+    ) -> Result<(), String> {
+        if envelope.msg_type != MessageType::DirectMessageReaction {
+            return Ok(());
+        }
+        let payload = rmp_serde::from_slice::<ReactionPayload>(&envelope.payload)
+            .map_err(|e| format!("failed to deserialize reaction payload: {}", e))?;
+
+        let original_bytes = self
+            .storage
+            .get_cf(schema::cf::MESSAGES, &payload.target_id)
+            .map_err(|e| format!("storage error: {}", e))?
+            .ok_or_else(|| "target message not found".to_string())?;
+        let original_envelope: Envelope = rmp_serde::from_slice(&original_bytes)
+            .map_err(|e| format!("failed to deserialize original message: {}", e))?;
+        if original_envelope.msg_type != MessageType::DirectMessage {
+            return Err("target is not a direct message".into());
+        }
+        let dm_payload = rmp_serde::from_slice::<DirectMessagePayload>(&original_envelope.payload)
+            .map_err(|e| format!("failed to deserialize original DM payload: {}", e))?;
+        let original_sender = self
+            .identity
+            .resolve(&original_envelope.author)
+            .map_err(|e| format!("failed to resolve original DM sender: {}", e))?;
+
+        if resolved_author != original_sender && resolved_author != dm_payload.recipient {
+            return Err("only DM conversation participants can react to this message".into());
+        }
+        Ok(())
+    }
+
     /// Extract the channel_id from channel-scoped message payloads.
     fn extract_channel_id(&self, envelope: &Envelope) -> Option<u64> {
         match envelope.msg_type {
@@ -2309,10 +2368,30 @@ impl MessageRouter {
                     )?;
                 }
             }
-            // DM reactions are encrypted — the reaction payload is end-to-end encrypted
-            // content, so we cannot parse emoji/target_id for indexing. The envelope is
-            // already stored in MESSAGES (step 8). No additional indexing needed.
-            MessageType::DirectMessageReaction => {}
+            // Audit final pre-mainnet W27: the prior comment here ("DM reactions
+            // are end-to-end encrypted, can't parse emoji/target_id") was wrong —
+            // `ReactionPayload.emoji`/`target_id` are plain fields, and sdk-js's
+            // `dmReactionPayload` sends them unencrypted (same shape as
+            // ChatReaction). The apply arm was simply empty, so a DM reaction was
+            // accepted, stored in MESSAGES, and then silently dropped: never
+            // indexed (same-node `GET /dm` couldn't show it either), never
+            // gossiped (see the new bridge arm in routes.rs). `toggle_chat_reaction`
+            // keys purely on `msg_id` (globally unique across chat/DM/news), so
+            // it's safe to reuse for DM reactions without a new CF —
+            // `enrich_message_json` (already called by `get_dm_messages`) already
+            // reads through the same CF and will surface these for free.
+            MessageType::DirectMessageReaction => {
+                if let Ok(payload) =
+                    rmp_serde::from_slice::<ReactionPayload>(&envelope.payload)
+                {
+                    self.storage.toggle_chat_reaction(
+                        &payload.target_id,
+                        &payload.emoji,
+                        resolved_author,
+                        payload.remove,
+                    )?;
+                }
+            }
             MessageType::NewsEdit => {
                 if let Ok(payload) =
                     rmp_serde::from_slice::<EditPayload>(&envelope.payload)
@@ -3582,5 +3661,250 @@ mod cross_node_ban_kick_tests {
         assert!(target_node.storage.get_cf(schema::cf::CHANNEL_MEMBERS, &member_key).unwrap().is_some());
         let ban_key = schema::encode_channel_ban_key(cid, banned);
         assert!(target_node.storage.get_cf(schema::cf::CHANNEL_BANS, &ban_key).unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod dm_reaction_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn router() -> (MessageRouter, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let identity = IdentityResolver::new(storage.clone());
+        (
+            MessageRouter::new(storage, identity, None, "testnet".to_string()),
+            dir,
+        )
+    }
+
+    fn now_ms() -> u64 {
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
+    }
+
+    /// Store a genuine DM (sender -> recipient) directly in MESSAGES, bypassing
+    /// full envelope signing (irrelevant to what `authorize_dm_reaction` reads
+    /// — it only reads `original_envelope.author`/`msg_type` and the decoded
+    /// `DirectMessagePayload.recipient`). Returns the DM's msg_id.
+    fn store_dm(r: &MessageRouter, sender: &str, recipient: &str, msg_id: [u8; 32]) {
+        let payload = DirectMessagePayload {
+            recipient: recipient.to_string(),
+            conversation_id: [7u8; 32],
+            content: vec![1, 2, 3],
+            nonce: [0u8; 24],
+            key_epoch: 1,
+            reply_to: None,
+            attachments: vec![],
+        };
+        let envelope = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::DirectMessage,
+            msg_id,
+            author: sender.to_string(),
+            timestamp: now_ms(),
+            lamport_ts: 0,
+            payload: rmp_serde::to_vec_named(&payload).unwrap(),
+            signature: vec![],
+            relay_path: vec![],
+        };
+        r.storage
+            .put_cf(schema::cf::MESSAGES, &msg_id, &rmp_serde::to_vec_named(&envelope).unwrap())
+            .unwrap();
+    }
+
+    /// Wire shape matches sdk-js's `dmReactionPayload`: `ReactionPayload`'s
+    /// own fields plus a `recipient`/`conversation_id` the client sends
+    /// alongside (routes.rs's bridge decodes `recipient` separately via
+    /// `RecipientExtract`; the router only cares about `ReactionPayload`'s
+    /// fields, which rmp-serde map-decoding ignores the extras for).
+    #[derive(serde::Serialize)]
+    struct WireDmReaction {
+        target_id: [u8; 32],
+        channel_id: Option<u64>,
+        recipient: String,
+        conversation_id: [u8; 32],
+        emoji: String,
+        remove: bool,
+    }
+
+    fn signed_dm_reaction_envelope(
+        sk: &ed25519_dalek::SigningKey,
+        author: &str,
+        target_id: [u8; 32],
+        emoji: &str,
+        remove: bool,
+        timestamp: u64,
+    ) -> Vec<u8> {
+        let payload = WireDmReaction {
+            target_id,
+            channel_id: None,
+            recipient: "klv1recipient".to_string(),
+            conversation_id: [7u8; 32],
+            emoji: emoji.to_string(),
+            remove,
+        };
+        let payload_bytes = rmp_serde::to_vec_named(&payload).unwrap();
+        let author_pubkey: [u8; 32] = sk.verifying_key().to_bytes();
+        let msg_id =
+            crypto::compute_msg_id("testnet", &author_pubkey, &payload_bytes, timestamp);
+        let signature = signing::sign_ogmara_message(
+            sk,
+            "testnet",
+            crate::messages::envelope::PROTOCOL_VERSION,
+            MessageType::DirectMessageReaction as u8,
+            &msg_id,
+            timestamp,
+            &payload_bytes,
+        );
+        let envelope = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::DirectMessageReaction,
+            msg_id,
+            author: author.to_string(),
+            timestamp,
+            lamport_ts: 0,
+            payload: payload_bytes,
+            signature: signature.to_bytes().to_vec(),
+            relay_path: vec![],
+        };
+        rmp_serde::to_vec_named(&envelope).unwrap()
+    }
+
+    #[test]
+    fn dm_reaction_is_indexed_via_the_shared_chat_reaction_cf() {
+        // Regression (audit final pre-mainnet W27): the apply arm was
+        // `MessageType::DirectMessageReaction => {}` — accepted, stored in
+        // MESSAGES, then silently dropped. `toggle_chat_reaction` keys purely
+        // on `msg_id` (globally unique), so DM reactions can share the same
+        // CF `enrich_message_json` already reads for chat messages — no new
+        // schema needed. The reactor here is the DM's RECIPIENT (not the
+        // original sender) — proves `authorize_dm_reaction` accepts either
+        // participant, not just the original DM author.
+        let (r, _dir) = router();
+        let dm_sender = "klv1dmsender";
+        let reactor_sk = crypto::generate_keypair();
+        let reactor = crypto::pubkey_to_address(&reactor_sk.verifying_key()).unwrap();
+        let target_id = [3u8; 32];
+        store_dm(&r, dm_sender, &reactor, target_id);
+
+        let raw =
+            signed_dm_reaction_envelope(&reactor_sk, &reactor, target_id, "🔥", false, now_ms());
+        match r.process_message(&raw) {
+            RouteResult::Accepted { .. } => {}
+            other => panic!("expected Accepted, got {:?}", other),
+        }
+
+        let reactions = r.storage.get_chat_reactions(&target_id).unwrap();
+        assert_eq!(reactions, vec![("🔥".to_string(), 1)]);
+    }
+
+    #[test]
+    fn dm_reaction_double_remove_does_not_underflow_the_count() {
+        // Each remove below is a genuinely distinct signed envelope (different
+        // timestamp/msg_id) — not a literal duplicate-relay (the router's
+        // separate msg_id-dedup layer already handles that generically for
+        // every type). This tests that `toggle_chat_reaction`'s own
+        // remove-when-absent branch safely no-ops instead of underflowing
+        // the saturating count, e.g. a double-tap "unreact" from the client.
+        let (r, _dir) = router();
+        let sk = crypto::generate_keypair();
+        let author = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        let target_id = [4u8; 32];
+        store_dm(&r, &author, "klv1recipient", target_id);
+
+        let add = signed_dm_reaction_envelope(&sk, &author, target_id, "👍", false, now_ms());
+        assert!(matches!(r.process_message(&add), RouteResult::Accepted { .. }));
+
+        let remove =
+            signed_dm_reaction_envelope(&sk, &author, target_id, "👍", true, now_ms() + 1);
+        assert!(matches!(r.process_message(&remove), RouteResult::Accepted { .. }));
+        assert_eq!(r.storage.get_chat_reactions(&target_id).unwrap(), vec![]);
+
+        let remove_again =
+            signed_dm_reaction_envelope(&sk, &author, target_id, "👍", true, now_ms() + 2);
+        assert!(matches!(r.process_message(&remove_again), RouteResult::Accepted { .. }));
+        assert_eq!(r.storage.get_chat_reactions(&target_id).unwrap(), vec![]);
+    }
+
+    #[test]
+    fn dm_reaction_from_a_non_participant_is_rejected() {
+        // Security-audit follow-up finding on W27: without this check, ANY
+        // wallet could inject a reaction into a DM conversation it has no
+        // part in, and (since W27 also gossips DM reactions) that forgery
+        // would relay to the real participants' nodes. `store_dm` makes
+        // "klv1dmsender" -> "klv1dmrecipient" the only two legitimate
+        // parties; a third wallet reacting to that msg_id must be rejected.
+        let (r, _dir) = router();
+        let target_id = [5u8; 32];
+        store_dm(&r, "klv1dmsender", "klv1dmrecipient", target_id);
+
+        let outsider_sk = crypto::generate_keypair();
+        let outsider = crypto::pubkey_to_address(&outsider_sk.verifying_key()).unwrap();
+        // signed_dm_reaction_envelope's hardcoded `recipient` field in the
+        // WIRE payload is irrelevant to authorization — only the ORIGINAL
+        // DM's stored sender/recipient matter, which the outsider is neither.
+        let raw =
+            signed_dm_reaction_envelope(&outsider_sk, &outsider, target_id, "🔥", false, now_ms());
+
+        match r.process_message(&raw) {
+            RouteResult::Rejected(reason) => {
+                assert!(
+                    reason.contains("dm_reaction_denied"),
+                    "unexpected rejection reason: {reason}"
+                );
+            }
+            other => panic!("expected Rejected(dm_reaction_denied), got {:?}", other),
+        }
+        assert_eq!(r.storage.get_chat_reactions(&target_id).unwrap(), vec![]);
+    }
+
+    #[test]
+    fn dm_reaction_targeting_a_non_dm_message_is_rejected() {
+        // Defense in depth: `target_id` must resolve to an ACTUAL
+        // DirectMessage, not e.g. a ChatMessage id smuggled through the same
+        // reaction path.
+        let (r, _dir) = router();
+        let sk = crypto::generate_keypair();
+        let author = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        let target_id = [6u8; 32];
+
+        let chat_payload = ChatMessagePayload {
+            channel_id: 1,
+            content: "hi".to_string(),
+            content_rating: Default::default(),
+            reply_to: None,
+            mentions: vec![],
+            attachments: vec![],
+            enc_content: None,
+            enc_nonce: None,
+            key_epoch: None,
+        };
+        let chat_envelope = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::ChatMessage,
+            msg_id: target_id,
+            author: author.clone(),
+            timestamp: now_ms(),
+            lamport_ts: 0,
+            payload: rmp_serde::to_vec_named(&chat_payload).unwrap(),
+            signature: vec![],
+            relay_path: vec![],
+        };
+        r.storage
+            .put_cf(
+                schema::cf::MESSAGES,
+                &target_id,
+                &rmp_serde::to_vec_named(&chat_envelope).unwrap(),
+            )
+            .unwrap();
+
+        let raw = signed_dm_reaction_envelope(&sk, &author, target_id, "🔥", false, now_ms());
+        match r.process_message(&raw) {
+            RouteResult::Rejected(reason) => {
+                assert!(reason.contains("not a direct message"), "unexpected reason: {reason}");
+            }
+            other => panic!("expected Rejected(not a direct message), got {:?}", other),
+        }
     }
 }

@@ -1489,12 +1489,17 @@ fn gossip_topic_for_envelope(
             let p: RecipientExtract = rmp_serde::from_slice(&envelope.payload).ok()?;
             Some(gossip::dm_topic(network_id, &p.recipient))
         }
-        MessageType::DirectMessageEdit | MessageType::DirectMessageDelete => {
-            // DM edits/deletes go to the recipient's DM topic, exactly like the
-            // DM content (above). Without this they fell through to `_ => None`
-            // and were NEVER gossiped — so an edit/delete only ever showed on the
-            // sender's node and never reached the recipient. The payload carries
-            // `recipient` (sent by the client alongside `target_id`).
+        MessageType::DirectMessageEdit | MessageType::DirectMessageDelete
+        | MessageType::DirectMessageReaction => {
+            // DM edits/deletes/reactions go to the recipient's DM topic, exactly
+            // like the DM content (above). Without this they fell through to
+            // `_ => None` and were NEVER gossiped — so an edit/delete/reaction
+            // only ever showed on the sender's node and never reached the
+            // recipient. The payload carries `recipient` (sent by the client
+            // alongside `target_id`). DirectMessageReaction added for audit W27
+            // — `ReactionPayload.emoji`/`target_id` are plain fields (same as
+            // ChatReaction), not encrypted, so this is safe to relay exactly
+            // like the other reaction types.
             let p: RecipientExtract = rmp_serde::from_slice(&envelope.payload).ok()?;
             Some(gossip::dm_topic(network_id, &p.recipient))
         }
@@ -8018,6 +8023,40 @@ mod gossip_bridge_tests {
         assert_eq!(
             gossip_topic_for_envelope(&env, "testnet"),
             Some(crate::network::gossip::channel_topic("testnet", 42)),
+        );
+    }
+
+    #[test]
+    fn dm_reaction_gossips_on_dm_topic() {
+        // Regression (audit final pre-mainnet W27): DirectMessageReaction had
+        // NO bridge arm — a DM reaction only ever reached the sender's own
+        // node. Wire shape matches sdk-js's `dmReactionPayload` (target_id +
+        // recipient + conversation_id + emoji + remove), decoded here with a
+        // minimal struct since `ReactionPayload` itself has no `recipient`
+        // field (that's carried alongside it on the wire, same as
+        // DirectMessage/Edit/Delete's `RecipientExtract` pattern).
+        #[derive(serde::Serialize)]
+        struct WireDmReaction {
+            target_id: [u8; 32],
+            recipient: String,
+            conversation_id: [u8; 32],
+            emoji: String,
+            remove: bool,
+        }
+        let payload = WireDmReaction {
+            target_id: [9u8; 32],
+            recipient: "klv1recipient".to_string(),
+            conversation_id: [8u8; 32],
+            emoji: "👍".to_string(),
+            remove: false,
+        };
+        let env = envelope(
+            MessageType::DirectMessageReaction,
+            rmp_serde::to_vec_named(&payload).unwrap(),
+        );
+        assert_eq!(
+            gossip_topic_for_envelope(&env, "testnet"),
+            Some(crate::network::gossip::dm_topic("testnet", "klv1recipient")),
         );
     }
 }
