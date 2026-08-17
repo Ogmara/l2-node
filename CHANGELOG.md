@@ -5,6 +5,51 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.90.0] - 2026-08-17
+
+### Security
+
+- **Dedicated moderation/follow/reaction REST endpoints never gossiped
+  (final pre-mainnet audit W25, expanded scope).** `add_moderator`,
+  `remove_moderator`, `kick_user`, `ban_user`, `unban_user`, `pin_message`,
+  `unpin_message`, and `invite_user` accepted and locally applied a signed
+  envelope but never published it to GossipSub — unlike an identically-typed
+  envelope submitted via `POST /api/v1/messages`, which already bridges via
+  `gossip_topic_for_envelope`. This meant a moderator grant, unban, or
+  invite stayed host-node-local; which endpoint a client happened to call
+  silently decided whether the action was network-wide or not.
+  Additionally, four of these message types (`ChannelAddModerator`,
+  `ChannelRemoveModerator`, `ChannelUnban`, `ChannelInvite`) had **no
+  gossip-bridge arm at all**, unlike `ChannelKick`/`ChannelBan`/
+  `ChannelPinMessage`/`ChannelUnpinMessage` in the same match block — so
+  even routing them through `POST /api/v1/messages` directly would not
+  have propagated them.
+  - Added a shared `gossip_if_applicable` helper, called after local apply
+    on all 11 affected endpoints, that re-publishes the same signed bytes
+    via the existing `gossip_topic_for_envelope` lookup — identical to
+    what `post_message` already does.
+  - Added gossip-bridge arms for `ChannelAddModerator`/
+    `ChannelRemoveModerator`/`ChannelUnban`/`ChannelInvite` → channel
+    topic. Verified relay-safety: `authorize_channel_action` re-checks
+    creator/moderator permission from `resolved_author` independently on
+    EVERY ingest path (both REST-accept and gossip-receive funnel through
+    the same `process_message_inner`), so a relayed envelope can't grant
+    itself moderator/unban/invite rights it wasn't authorized for. All
+    four apply arms are idempotent under duplicate delivery (keyed
+    put/delete on `(channel_id, target_user)`).
+  - **Scope expansion during implementation:** discovered `follow_user`,
+    `unfollow_user`, and `react_to_news` — REST handlers for `Follow`/
+    `Unfollow`/`NewsReaction`, previously believed fixed by W24 and W28 —
+    also route through dedicated endpoints, not `POST /api/v1/messages`.
+    W24/W28 only added the topic-mapping arms to
+    `gossip_topic_for_envelope`; they never took effect for real client
+    traffic (sdk-js's `client.follow()`/`unfollow()`/`reactToNews()` all
+    call the dedicated endpoints) until this fix wired those three
+    endpoints into `gossip_if_applicable` as well. W24/W28 are only fully
+    effective as of this version.
+  - No SDK/client change needed — the affected builders and endpoints
+    already existed; this is a node-side propagation fix only.
+
 ## [0.89.0] - 2026-08-17
 
 ### Security

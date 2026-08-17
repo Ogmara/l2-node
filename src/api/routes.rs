@@ -1402,6 +1402,19 @@ fn gossip_topic_for_envelope(
         // node (federation) — not just the host. authorize_channel_action gates
         // them to mods on every ingest path, so a relayed kick/ban can't be forged.
         | MessageType::ChannelKick | MessageType::ChannelBan
+        // AddModerator/RemoveModerator/Unban/Invite (audit final pre-mainnet
+        // W25): these had NO bridge arm at all, so moderator grants, unbans,
+        // and invites stayed host-node-local — a mod added on one node wasn't
+        // recognized as a mod on any other, an unbanned user stayed banned
+        // everywhere else, an invite only worked against the host. All four
+        // are re-authorized independently on every ingest node
+        // (`authorize_channel_action`: creator-only for AddModerator/
+        // RemoveModerator, mod-with-can_ban for Unban, creator-or-mod for
+        // Invite) and idempotent under duplicate relay (keyed put/delete on
+        // (channel_id, target_user), so a re-delivery overwrites with the
+        // same value or no-ops).
+        | MessageType::ChannelAddModerator | MessageType::ChannelRemoveModerator
+        | MessageType::ChannelUnban | MessageType::ChannelInvite
         // ChannelDelete MUST gossip so the deletion (tombstone) reaches every node
         // that discovered the channel via chain scan/snapshot — otherwise the
         // channel resurrects on nodes that never saw the delete. Creator-only,
@@ -3294,7 +3307,10 @@ pub async fn follow_user(
     use crate::messages::router::RouteResult;
 
     match state.router.process_message(&body) {
-        RouteResult::Accepted { .. } => Json(OkResponse { ok: true }).into_response(),
+        RouteResult::Accepted { raw_bytes, .. } => {
+            gossip_if_applicable(&state, &raw_bytes).await;
+            Json(OkResponse { ok: true }).into_response()
+        }
         RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
         RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
@@ -3313,7 +3329,10 @@ pub async fn unfollow_user(
     use crate::messages::router::RouteResult;
 
     match state.router.process_message(&body) {
-        RouteResult::Accepted { .. } => Json(OkResponse { ok: true }).into_response(),
+        RouteResult::Accepted { raw_bytes, .. } => {
+            gossip_if_applicable(&state, &raw_bytes).await;
+            Json(OkResponse { ok: true }).into_response()
+        }
         RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
         RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
@@ -3376,7 +3395,10 @@ pub async fn react_to_news(
     use crate::messages::router::RouteResult;
 
     match state.router.process_message(&body) {
-        RouteResult::Accepted { .. } => Json(OkResponse { ok: true }).into_response(),
+        RouteResult::Accepted { raw_bytes, .. } => {
+            gossip_if_applicable(&state, &raw_bytes).await;
+            Json(OkResponse { ok: true }).into_response()
+        }
         RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
         RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
@@ -3700,6 +3722,31 @@ pub async fn get_channel_bans(
     }
 }
 
+/// Gossip an `Accepted` envelope's raw bytes if it has a topic — the same
+/// publish step `post_message` already does. Used by the dedicated
+/// moderation REST endpoints below (audit final pre-mainnet W25): the
+/// bridge already HAS arms for Kick/Ban/Pin/Unpin, so the identical signed
+/// envelope federated correctly if POSTed to `/api/v1/messages` — but
+/// stayed host-local via these dedicated endpoints, silently making which
+/// endpoint a client happened to call decide whether a moderation action
+/// was network-wide or not. Fire-and-forget (no `respond_to`): these
+/// endpoints' response contract doesn't report delivery status, and the
+/// message is already durably stored before this runs regardless of
+/// whether the publish itself succeeds.
+async fn gossip_if_applicable(state: &AppState, raw_bytes: &[u8]) {
+    let Ok(envelope) = rmp_serde::from_slice::<crate::messages::envelope::Envelope>(raw_bytes)
+    else {
+        return;
+    };
+    if let Some(topic) = gossip_topic_for_envelope(&envelope, &state.klever_network) {
+        let _ = state.gossip_tx.send(crate::network::GossipPublish {
+            topic,
+            data: raw_bytes.to_vec(),
+            respond_to: None,
+        });
+    }
+}
+
 /// POST /api/v1/channels/:channel_id/moderators — add moderator (authenticated, creator only)
 pub async fn add_moderator(
     Extension(state): Extension<Arc<AppState>>,
@@ -3710,7 +3757,10 @@ pub async fn add_moderator(
     use crate::messages::router::RouteResult;
 
     match state.router.process_message(&body) {
-        RouteResult::Accepted { .. } => Json(OkResponse { ok: true }).into_response(),
+        RouteResult::Accepted { raw_bytes, .. } => {
+            gossip_if_applicable(&state, &raw_bytes).await;
+            Json(OkResponse { ok: true }).into_response()
+        }
         RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
         RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
@@ -3729,7 +3779,10 @@ pub async fn remove_moderator(
     use crate::messages::router::RouteResult;
 
     match state.router.process_message(&body) {
-        RouteResult::Accepted { .. } => Json(OkResponse { ok: true }).into_response(),
+        RouteResult::Accepted { raw_bytes, .. } => {
+            gossip_if_applicable(&state, &raw_bytes).await;
+            Json(OkResponse { ok: true }).into_response()
+        }
         RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
         RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
@@ -3748,7 +3801,10 @@ pub async fn kick_user(
     use crate::messages::router::RouteResult;
 
     match state.router.process_message(&body) {
-        RouteResult::Accepted { .. } => Json(OkResponse { ok: true }).into_response(),
+        RouteResult::Accepted { raw_bytes, .. } => {
+            gossip_if_applicable(&state, &raw_bytes).await;
+            Json(OkResponse { ok: true }).into_response()
+        }
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
         RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
             (StatusCode::BAD_REQUEST, reason).into_response()
@@ -3767,7 +3823,10 @@ pub async fn ban_user(
     use crate::messages::router::RouteResult;
 
     match state.router.process_message(&body) {
-        RouteResult::Accepted { .. } => Json(OkResponse { ok: true }).into_response(),
+        RouteResult::Accepted { raw_bytes, .. } => {
+            gossip_if_applicable(&state, &raw_bytes).await;
+            Json(OkResponse { ok: true }).into_response()
+        }
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
         RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
             (StatusCode::BAD_REQUEST, reason).into_response()
@@ -3786,7 +3845,10 @@ pub async fn unban_user(
     use crate::messages::router::RouteResult;
 
     match state.router.process_message(&body) {
-        RouteResult::Accepted { .. } => Json(OkResponse { ok: true }).into_response(),
+        RouteResult::Accepted { raw_bytes, .. } => {
+            gossip_if_applicable(&state, &raw_bytes).await;
+            Json(OkResponse { ok: true }).into_response()
+        }
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
         RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
             (StatusCode::BAD_REQUEST, reason).into_response()
@@ -3805,7 +3867,10 @@ pub async fn pin_message(
     use crate::messages::router::RouteResult;
 
     match state.router.process_message(&body) {
-        RouteResult::Accepted { .. } => Json(OkResponse { ok: true }).into_response(),
+        RouteResult::Accepted { raw_bytes, .. } => {
+            gossip_if_applicable(&state, &raw_bytes).await;
+            Json(OkResponse { ok: true }).into_response()
+        }
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
         RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
             (StatusCode::BAD_REQUEST, reason).into_response()
@@ -3824,7 +3889,10 @@ pub async fn unpin_message(
     use crate::messages::router::RouteResult;
 
     match state.router.process_message(&body) {
-        RouteResult::Accepted { .. } => Json(OkResponse { ok: true }).into_response(),
+        RouteResult::Accepted { raw_bytes, .. } => {
+            gossip_if_applicable(&state, &raw_bytes).await;
+            Json(OkResponse { ok: true }).into_response()
+        }
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
         RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
             (StatusCode::BAD_REQUEST, reason).into_response()
@@ -3843,7 +3911,10 @@ pub async fn invite_user(
     use crate::messages::router::RouteResult;
 
     match state.router.process_message(&body) {
-        RouteResult::Accepted { .. } => Json(OkResponse { ok: true }).into_response(),
+        RouteResult::Accepted { raw_bytes, .. } => {
+            gossip_if_applicable(&state, &raw_bytes).await;
+            Json(OkResponse { ok: true }).into_response()
+        }
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
         RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
             (StatusCode::BAD_REQUEST, reason).into_response()
@@ -7674,10 +7745,11 @@ mod gossip_bridge_tests {
     use super::gossip_topic_for_envelope;
     use crate::messages::envelope::Envelope;
     use crate::messages::types::{
-        CounterVotePayload, DeletePayload, DeletionRequestPayload, DeletionType,
-        DeviceRevocationPayload, EditPayload, FollowPayload, MessageType, NewsCommentPayload,
-        NewsRepostPayload, ReactionPayload, ReportPayload, ReportReason, ReportTarget,
-        UnfollowPayload,
+        ChannelAddModeratorPayload, ChannelInvitePayload, ChannelRemoveModeratorPayload,
+        ChannelUnbanPayload, CounterVotePayload, DeletePayload, DeletionRequestPayload,
+        DeletionType, DeviceRevocationPayload, EditPayload, FollowPayload, MessageType,
+        ModeratorPermissions, NewsCommentPayload, NewsRepostPayload, ReactionPayload,
+        ReportPayload, ReportReason, ReportTarget, UnfollowPayload,
     };
 
     fn envelope(msg_type: MessageType, payload: Vec<u8>) -> Envelope {
@@ -7878,6 +7950,70 @@ mod gossip_bridge_tests {
             )
             .unwrap(),
             DeletionType::SingleMessage,
+        );
+    }
+
+    #[test]
+    fn moderator_unban_and_invite_gossip_on_channel_topic() {
+        // Regression (audit final pre-mainnet W25): AddModerator (0x14),
+        // RemoveModerator (0x15), Unban (0x18), and Invite (0x1B) had NO
+        // bridge arm at all (unlike Kick/Ban/Pin/Unpin/Update in the same
+        // match block), so mod grants, unbans, and invites stayed
+        // host-node-local — which node a client happened to call decided
+        // whether the action was network-wide.
+        let add_mod = ChannelAddModeratorPayload {
+            channel_id: 42,
+            target_user: "klv1target".to_string(),
+            permissions: ModeratorPermissions {
+                can_mute: true,
+                can_kick: false,
+                can_ban: false,
+                can_pin: true,
+                can_edit_info: false,
+                can_delete_msgs: false,
+            },
+        };
+        let env = envelope(
+            MessageType::ChannelAddModerator,
+            rmp_serde::to_vec_named(&add_mod).unwrap(),
+        );
+        assert_eq!(
+            gossip_topic_for_envelope(&env, "testnet"),
+            Some(crate::network::gossip::channel_topic("testnet", 42)),
+        );
+
+        let remove_mod = ChannelRemoveModeratorPayload {
+            channel_id: 42,
+            target_user: "klv1target".to_string(),
+        };
+        let env = envelope(
+            MessageType::ChannelRemoveModerator,
+            rmp_serde::to_vec_named(&remove_mod).unwrap(),
+        );
+        assert_eq!(
+            gossip_topic_for_envelope(&env, "testnet"),
+            Some(crate::network::gossip::channel_topic("testnet", 42)),
+        );
+
+        let unban = ChannelUnbanPayload {
+            channel_id: 42,
+            target_user: "klv1target".to_string(),
+        };
+        let env = envelope(MessageType::ChannelUnban, rmp_serde::to_vec_named(&unban).unwrap());
+        assert_eq!(
+            gossip_topic_for_envelope(&env, "testnet"),
+            Some(crate::network::gossip::channel_topic("testnet", 42)),
+        );
+
+        let invite = ChannelInvitePayload {
+            channel_id: 42,
+            target_user: "klv1target".to_string(),
+            anchor_node: None,
+        };
+        let env = envelope(MessageType::ChannelInvite, rmp_serde::to_vec_named(&invite).unwrap());
+        assert_eq!(
+            gossip_topic_for_envelope(&env, "testnet"),
+            Some(crate::network::gossip::channel_topic("testnet", 42)),
         );
     }
 }
