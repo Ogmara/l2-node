@@ -5,6 +5,21 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.87.0] - 2026-08-17
+
+### Security
+
+- **Follow/Unfollow never propagated (final pre-mainnet audit W24, spec
+  CCS#1).** `ProfileUpdate` (0x30) got a gossip bridge arm in 0.82.6, but
+  `Follow`/`Unfollow` (0x34/0x35) didn't — cross-node follower graphs went
+  permanently stale after the one-shot `identity_sync` pull. Both now
+  gossip on the profile topic, alongside `ProfileUpdate`. Safe to relay:
+  the apply arm keys purely off `resolved_author` (the envelope's verified
+  signer, never the payload) with LWW-by-signed-timestamp semantics, so a
+  relayed/replayed Follow can only ever affect the sender's own follow
+  graph. No SDK/client change needed — `buildFollow`/`buildUnfollow` and
+  `OgmaraClient.follow()`/`unfollow()` already built correct envelopes.
+
 ## [0.86.0] - 2026-08-17
 
 ### Security

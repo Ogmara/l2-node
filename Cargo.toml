@@ -1,6 +1,6 @@
 [package]
 name = "ogmara-node"
-version = "0.86.0"
+version = "0.87.0"
 edition = "2021"
 authors = ["Ogmara Contributors"]
 license = "MIT"

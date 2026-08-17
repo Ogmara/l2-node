@@ -1429,7 +1429,15 @@ fn gossip_topic_for_envelope(
         MessageType::NewsPost => {
             Some(gossip::topic_news_global(network_id))
         }
-        MessageType::ProfileUpdate => {
+        // Follow/Unfollow MUST gossip network-wide (audit final pre-mainnet
+        // W24, spec CCS#1): 0x30 (ProfileUpdate) got a bridge arm in
+        // 0.82.6 but 0x34/0x35 didn't, so cross-node follower graphs went
+        // permanently stale after the one-shot identity_sync pull. Safe to
+        // relay: the apply arm keys purely off `resolved_author` (the
+        // envelope's verified signer, never the payload) with LWW-by-
+        // signed-timestamp semantics, so a relayed/replayed Follow can only
+        // ever affect the SENDER's own follow graph.
+        MessageType::ProfileUpdate | MessageType::Follow | MessageType::Unfollow => {
             Some(gossip::topic_profile(network_id))
         }
         MessageType::DirectMessage => {
@@ -7638,7 +7646,7 @@ mod gossip_bridge_tests {
     use crate::messages::envelope::Envelope;
     use crate::messages::types::{
         CounterVotePayload, DeletionRequestPayload, DeletionType, DeviceRevocationPayload,
-        MessageType, ReportPayload, ReportReason, ReportTarget,
+        FollowPayload, MessageType, ReportPayload, ReportReason, ReportTarget, UnfollowPayload,
     };
 
     fn envelope(msg_type: MessageType, payload: Vec<u8>) -> Envelope {
@@ -7653,6 +7661,27 @@ mod gossip_bridge_tests {
             signature: Vec::new(),
             relay_path: Vec::new(),
         }
+    }
+
+    #[test]
+    fn follow_and_unfollow_gossip_on_profile_topic() {
+        // Regression (audit final pre-mainnet W24, spec CCS#1): 0x30
+        // (ProfileUpdate) got a bridge arm in 0.82.6 but 0x34/0x35 didn't,
+        // so cross-node follower graphs went permanently stale after the
+        // one-shot identity_sync pull.
+        let follow = FollowPayload { target: "klv1target".to_string() };
+        let env = envelope(MessageType::Follow, rmp_serde::to_vec(&follow).unwrap());
+        assert_eq!(
+            gossip_topic_for_envelope(&env, "testnet"),
+            Some(crate::network::gossip::topic_profile("testnet")),
+        );
+
+        let unfollow = UnfollowPayload { target: "klv1target".to_string() };
+        let env = envelope(MessageType::Unfollow, rmp_serde::to_vec(&unfollow).unwrap());
+        assert_eq!(
+            gossip_topic_for_envelope(&env, "testnet"),
+            Some(crate::network::gossip::topic_profile("testnet")),
+        );
     }
 
     #[test]
