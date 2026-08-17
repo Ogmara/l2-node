@@ -5,6 +5,43 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.93.0] - 2026-08-17
+
+### Added
+
+- **`ChannelUnmute` (0x43) — reverses a `ChannelMute` (final pre-mainnet
+  audit W30).** `ChannelMute` existed and worked, but there was no way to
+  reverse it: `Storage::remove_channel_mute` already did exactly what was
+  needed (delete the `CHANNEL_MUTES` entry) but had zero callers anywhere
+  in the codebase. A permanent mute (`duration_secs: 0`, the documented
+  "permanent" sentinel) was therefore literally irrevocable short of a raw
+  DB edit — temporary mutes self-expire lazily on next read, but permanent
+  ones had no path back at all. Mirrors `ChannelBan`/`ChannelUnban`:
+  `ChannelUnmutePayload { channel_id, target_user }` (no reason/duration),
+  reuses the `can_mute` permission (no separate `can_unmute`), no
+  creator-check needed (a creator can never have a mute entry — mute
+  already blocks muting the creator). New dedicated
+  `POST`/`DELETE /api/v1/channels/{channel_id}/mute/{address}` endpoint
+  pair, mirroring `ban`/`unban`'s shape — this also closes a pre-existing
+  spec-vs-code drift (`docs/specs/03-l2-node.md` already documented the
+  `POST` half of this endpoint before it was ever implemented).
+
+### Fixed
+
+- **`ChannelMute` itself never gossiped, via any path (adjacent gap found
+  while fixing W30).** `ChannelMute` was missing from
+  `gossip_topic_for_envelope` entirely — since there was no dedicated mute
+  endpoint before this version, muting went through the generic
+  `POST /api/v1/messages`, which falls through to `_ => None` for any type
+  missing from that match. A mute therefore never propagated off the host
+  node via any path — worse than the pre-W25 state of kick/ban, which at
+  least had a (broken) dedicated endpoint. Added `ChannelMute` to the same
+  bridge match arm as `ChannelUnmute` (both route to the channel topic).
+  Safe to relay: `authorize_channel_action` re-checks `can_mute` (and the
+  creator-immunity check for `ChannelMute`) independently on every ingest
+  node; both are idempotent under duplicate delivery (keyed put/delete on
+  `(channel_id, target_user)`, same key scheme as `ChannelBan`/`ChannelUnban`).
+
 ## [0.92.0] - 2026-08-17
 
 ### Fixed

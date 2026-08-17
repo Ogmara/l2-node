@@ -745,6 +745,19 @@ pub fn validate_channel_mute(p: &ChannelMutePayload) -> Result<(), ValidationErr
     Ok(())
 }
 
+/// Validate a channel unmute payload (audit W30 — reverses `ChannelMute`).
+pub fn validate_channel_unmute(p: &ChannelUnmutePayload) -> Result<(), ValidationError> {
+    if p.channel_id == 0 {
+        return Err(ValidationError("channel_id must be > 0".into()));
+    }
+    if p.target_user.is_empty() || !p.target_user.starts_with("klv1") {
+        return Err(ValidationError(
+            "target_user must be a valid Klever address".into(),
+        ));
+    }
+    Ok(())
+}
+
 // --- Account/Device Message validation ---
 
 /// Maximum encrypted settings size: 1 MB.

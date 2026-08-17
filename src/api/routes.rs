@@ -1415,6 +1415,19 @@ fn gossip_topic_for_envelope(
         // same value or no-ops).
         | MessageType::ChannelAddModerator | MessageType::ChannelRemoveModerator
         | MessageType::ChannelUnban | MessageType::ChannelInvite
+        // ChannelMute/ChannelUnmute (audit W30): ChannelMute had NO bridge
+        // arm at all, so a mute never propagated off the host node via ANY
+        // path (there's no dedicated mute REST endpoint — it went through
+        // the generic POST /api/v1/messages, which falls through to
+        // `_ => None` for it). ChannelUnmute is new (0x43), added alongside
+        // to make a mute reversible network-wide, not just on the host — a
+        // permanent mute (duration_secs: 0) was previously irrevocable.
+        // Both re-authorize independently on every ingest node
+        // (`authorize_channel_action`: mod-with-can_mute; ChannelMute
+        // additionally blocks muting the creator) and are idempotent under
+        // duplicate relay (keyed put/delete on (channel_id, target_user),
+        // same key scheme as ChannelBan/ChannelUnban).
+        | MessageType::ChannelMute | MessageType::ChannelUnmute
         // ChannelDelete MUST gossip so the deletion (tombstone) reaches every node
         // that discovered the channel via chain scan/snapshot — otherwise the
         // channel resurrects on nodes that never saw the delete. Creator-only,
@@ -3846,6 +3859,64 @@ pub async fn ban_user(
 
 /// DELETE /api/v1/channels/:channel_id/ban/:address — unban user (authenticated)
 pub async fn unban_user(
+    Extension(state): Extension<Arc<AppState>>,
+    Extension(_auth_user): Extension<AuthUser>,
+    Path((_channel_id, _address)): Path<(u64, String)>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    use crate::messages::router::RouteResult;
+
+    match state.router.process_message(&body) {
+        RouteResult::Accepted { raw_bytes, .. } => {
+            gossip_if_applicable(&state, &raw_bytes).await;
+            Json(OkResponse { ok: true }).into_response()
+        }
+        RouteResult::PowRequired { address } => pow_required_response(&state, &address),
+        RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
+            (StatusCode::BAD_REQUEST, reason).into_response()
+        }
+        RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
+    }
+}
+
+/// POST /api/v1/channels/:channel_id/mute/:address — mute user (authenticated)
+///
+/// Audit W30: mute previously had no dedicated endpoint (unlike every other
+/// moderation action in this file) — clients built a `ChannelMute` envelope
+/// and posted it to the generic `/api/v1/messages` route. That still works
+/// (the generic path already runs the same `gossip_topic_for_envelope`
+/// lookup inline), this dedicated pair just brings mute/unmute to parity
+/// with kick/ban/pin/invite's endpoint shape and closes a pre-existing
+/// spec-vs-code drift (`docs/specs/03-l2-node.md` already documented this
+/// endpoint before it existed).
+pub async fn mute_user(
+    Extension(state): Extension<Arc<AppState>>,
+    Extension(_auth_user): Extension<AuthUser>,
+    Path((_channel_id, _address)): Path<(u64, String)>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    use crate::messages::router::RouteResult;
+
+    match state.router.process_message(&body) {
+        RouteResult::Accepted { raw_bytes, .. } => {
+            gossip_if_applicable(&state, &raw_bytes).await;
+            Json(OkResponse { ok: true }).into_response()
+        }
+        RouteResult::PowRequired { address } => pow_required_response(&state, &address),
+        RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
+            (StatusCode::BAD_REQUEST, reason).into_response()
+        }
+        RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
+    }
+}
+
+/// DELETE /api/v1/channels/:channel_id/mute/:address — unmute user (authenticated)
+///
+/// Audit W30: `ChannelUnmute` (new) reverses `ChannelMute` — see the
+/// `remove_channel_mute` doc comment in `storage/rocks.rs` and the apply
+/// arm in `messages/router.rs` for why this closes the finding (a
+/// permanent mute, `duration_secs: 0`, was previously irrevocable).
+pub async fn unmute_user(
     Extension(state): Extension<Arc<AppState>>,
     Extension(_auth_user): Extension<AuthUser>,
     Path((_channel_id, _address)): Path<(u64, String)>,
@@ -7754,9 +7825,10 @@ mod gossip_bridge_tests {
     use super::gossip_topic_for_envelope;
     use crate::messages::envelope::Envelope;
     use crate::messages::types::{
-        ChannelAddModeratorPayload, ChannelInvitePayload, ChannelRemoveModeratorPayload,
-        ChannelUnbanPayload, CounterVotePayload, DeletePayload, DeletionRequestPayload,
-        DeletionType, DeviceRevocationPayload, EditPayload, FollowPayload, MessageType,
+        ChannelAddModeratorPayload, ChannelInvitePayload, ChannelMutePayload,
+        ChannelRemoveModeratorPayload, ChannelUnbanPayload, ChannelUnmutePayload,
+        CounterVotePayload, DeletePayload, DeletionRequestPayload, DeletionType,
+        DeviceRevocationPayload, EditPayload, FollowPayload, MessageType,
         ModeratorPermissions, NewsCommentPayload, NewsRepostPayload, ReactionPayload,
         ReportPayload, ReportReason, ReportTarget, UnfollowPayload,
     };
@@ -8057,6 +8129,37 @@ mod gossip_bridge_tests {
         assert_eq!(
             gossip_topic_for_envelope(&env, "testnet"),
             Some(crate::network::gossip::dm_topic("testnet", "klv1recipient")),
+        );
+    }
+
+    #[test]
+    fn channel_mute_and_unmute_gossip_on_channel_topic() {
+        // Regression (audit W30): ChannelMute had NO bridge arm at all
+        // (unlike Kick/Ban in the same match block) — a mute never
+        // propagated off the host node via any path. ChannelUnmute is new
+        // (0x43); must gossip identically so a reversal reaches every node
+        // too, not just the one that received the unmute.
+        let mute = ChannelMutePayload {
+            channel_id: 42,
+            target_user: "klv1target".to_string(),
+            duration_secs: 0,
+            reason: None,
+        };
+        let env = envelope(MessageType::ChannelMute, rmp_serde::to_vec_named(&mute).unwrap());
+        assert_eq!(
+            gossip_topic_for_envelope(&env, "testnet"),
+            Some(crate::network::gossip::channel_topic("testnet", 42)),
+        );
+
+        let unmute = ChannelUnmutePayload {
+            channel_id: 42,
+            target_user: "klv1target".to_string(),
+        };
+        let env =
+            envelope(MessageType::ChannelUnmute, rmp_serde::to_vec_named(&unmute).unwrap());
+        assert_eq!(
+            gossip_topic_for_envelope(&env, "testnet"),
+            Some(crate::network::gossip::channel_topic("testnet", 42)),
         );
     }
 }

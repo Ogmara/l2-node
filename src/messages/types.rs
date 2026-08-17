@@ -63,6 +63,7 @@ pub enum MessageType {
     Report = 0x40,
     CounterVote = 0x41,
     ChannelMute = 0x42,
+    ChannelUnmute = 0x43,
 
     // Account Management
     DeletionRequest = 0x50,
@@ -125,6 +126,7 @@ impl MessageType {
             0x40 => Some(Self::Report),
             0x41 => Some(Self::CounterVote),
             0x42 => Some(Self::ChannelMute),
+            0x43 => Some(Self::ChannelUnmute),
             0x50 => Some(Self::DeletionRequest),
             0x60 => Some(Self::PrivateChannelKeyDistribution),
             0x61 => Some(Self::ChannelKeyEnvelope),
@@ -190,6 +192,7 @@ impl MessageType {
             | Self::Report
             | Self::CounterVote
             | Self::ChannelMute
+            | Self::ChannelUnmute
             // Account management
             | Self::DeletionRequest
             // Private channels
@@ -769,6 +772,15 @@ pub struct ChannelMutePayload {
     pub reason: Option<String>,
 }
 
+/// Reverse a `ChannelMute` (audit W30 — `ChannelMute` had no way back;
+/// `duration_secs: 0` "permanent" mutes were literally irrevocable).
+/// Mirrors `ChannelUnbanPayload`: minimal, just enough to key the delete.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelUnmutePayload {
+    pub channel_id: u64,
+    pub target_user: String,
+}
+
 // --- Account Management (spec 3.11) ---
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1002,6 +1014,7 @@ pub fn deserialize_payload(
         MessageType::Report => Ok(DeserializedPayload::Report(rmp_serde::from_slice(payload_bytes)?)),
         MessageType::CounterVote => Ok(DeserializedPayload::CounterVote(rmp_serde::from_slice(payload_bytes)?)),
         MessageType::ChannelMute => Ok(DeserializedPayload::ChannelMute(rmp_serde::from_slice(payload_bytes)?)),
+        MessageType::ChannelUnmute => Ok(DeserializedPayload::ChannelUnmute(rmp_serde::from_slice(payload_bytes)?)),
         MessageType::DeletionRequest => Ok(DeserializedPayload::DeletionRequest(rmp_serde::from_slice(payload_bytes)?)),
         MessageType::PrivateChannelKeyDistribution => Ok(DeserializedPayload::PrivateChannelKeyDistribution(rmp_serde::from_slice(payload_bytes)?)),
         MessageType::ChannelKeyEnvelope => Ok(DeserializedPayload::ChannelKeyEnvelope(rmp_serde::from_slice(payload_bytes)?)),
@@ -1048,6 +1061,7 @@ pub enum DeserializedPayload {
     Report(ReportPayload),
     CounterVote(CounterVotePayload),
     ChannelMute(ChannelMutePayload),
+    ChannelUnmute(ChannelUnmutePayload),
     DeletionRequest(DeletionRequestPayload),
     PrivateChannelKeyDistribution(PrivateChannelKeyDistributionPayload),
     ChannelKeyEnvelope(ChannelKeyEnvelopePayload),

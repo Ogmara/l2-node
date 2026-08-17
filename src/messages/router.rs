@@ -85,6 +85,7 @@ impl RateCategory {
             MessageType::NewsRepost => Self::Repost,
             MessageType::ChannelKick | MessageType::ChannelBan
             | MessageType::ChannelUnban | MessageType::ChannelMute
+            | MessageType::ChannelUnmute
             | MessageType::ChannelDelete => Self::ChannelAdmin,
             MessageType::ChannelAddModerator | MessageType::ChannelRemoveModerator
             | MessageType::PrivateChannelKeyDistribution => Self::ModeratorChange,
@@ -846,6 +847,9 @@ impl MessageRouter {
                 DeserializedPayload::Report(ref p) => validation::validate_report(p),
                 DeserializedPayload::CounterVote(ref p) => validation::validate_counter_vote(p),
                 DeserializedPayload::ChannelMute(ref p) => validation::validate_channel_mute(p),
+                DeserializedPayload::ChannelUnmute(ref p) => {
+                    validation::validate_channel_unmute(p)
+                }
                 DeserializedPayload::DeviceDelegation(ref p) => {
                     validation::validate_device_delegation(p)
                 }
@@ -1178,6 +1182,17 @@ impl MessageRouter {
                         return Err("cannot mute the channel creator".into());
                     }
                 }
+                self.require_mod_permission(channel_id, resolved_author, "can_mute")
+            }
+            // Reverses ChannelMute (audit W30). Reuses can_mute — no separate
+            // can_unmute permission, same pattern as ChannelUnban reusing
+            // can_ban. No creator-check needed: the creator can never have a
+            // CHANNEL_MUTES entry in the first place (blocked above), so
+            // unmuting them is always a harmless no-op delete.
+            MessageType::ChannelUnmute => {
+                let channel_id = self
+                    .extract_channel_id(envelope)
+                    .ok_or("missing or invalid channel_id")?;
                 self.require_mod_permission(channel_id, resolved_author, "can_mute")
             }
             // Creator + mods with can_edit_info
@@ -1531,6 +1546,10 @@ impl MessageRouter {
             }
             MessageType::ChannelMute => {
                 rmp_serde::from_slice::<ChannelMutePayload>(&envelope.payload)
+                    .ok().map(|p| p.channel_id)
+            }
+            MessageType::ChannelUnmute => {
+                rmp_serde::from_slice::<ChannelUnmutePayload>(&envelope.payload)
                     .ok().map(|p| p.channel_id)
             }
             MessageType::PrivateChannelKeyDistribution => {
@@ -3119,6 +3138,19 @@ impl MessageRouter {
                     )?;
                 }
             }
+            // Reverses ChannelMute (audit W30). `remove_channel_mute` already
+            // existed (RocksDB delete_cf on CHANNEL_MUTES) but had zero
+            // callers — a permanent mute (duration_secs: 0) was literally
+            // irrevocable. Idempotent: deleting an already-absent key is a
+            // no-op, not an error.
+            MessageType::ChannelUnmute => {
+                if let Ok(payload) =
+                    rmp_serde::from_slice::<ChannelUnmutePayload>(&envelope.payload)
+                {
+                    self.storage
+                        .remove_channel_mute(payload.channel_id, &payload.target_user)?;
+                }
+            }
             MessageType::NodeAnnouncement => {
                 if let Ok(payload) =
                     rmp_serde::from_slice::<NodeAnnouncementPayload>(&envelope.payload)
@@ -3905,6 +3937,247 @@ mod dm_reaction_tests {
                 assert!(reason.contains("not a direct message"), "unexpected reason: {reason}");
             }
             other => panic!("expected Rejected(not a direct message), got {:?}", other),
+        }
+    }
+}
+
+#[cfg(test)]
+mod channel_mute_unmute_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn router() -> (MessageRouter, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let identity = IdentityResolver::new(storage.clone());
+        (
+            MessageRouter::new(storage, identity, None, "testnet".to_string()),
+            dir,
+        )
+    }
+
+    fn make_channel(r: &MessageRouter, channel_id: u64, creator: &str) {
+        let meta = serde_json::json!({
+            "channel_id": channel_id,
+            "channel_type": 2u8,
+            "creator": creator,
+            "member_count": 2u64,
+        });
+        r.storage
+            .put_cf(schema::cf::CHANNELS, &channel_id.to_be_bytes(), meta.to_string().as_bytes())
+            .unwrap();
+        add_member(r, channel_id, creator);
+    }
+
+    fn add_member(r: &MessageRouter, channel_id: u64, addr: &str) {
+        let key = schema::encode_channel_member_key(channel_id, addr);
+        r.storage.put_cf(schema::cf::CHANNEL_MEMBERS, &key, b"{}").unwrap();
+    }
+
+    fn register_user(r: &MessageRouter, address: &str, registered_at: u64) {
+        let rec = serde_json::json!({ "address": address, "registered_at": registered_at });
+        r.storage
+            .put_cf(schema::cf::USERS, address.as_bytes(), rec.to_string().as_bytes())
+            .unwrap();
+    }
+
+    fn now_ms() -> u64 {
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
+    }
+
+    fn signed_mute_envelope(
+        sk: &ed25519_dalek::SigningKey,
+        author: &str,
+        channel_id: u64,
+        target_user: &str,
+        duration_secs: u64,
+        timestamp: u64,
+    ) -> Vec<u8> {
+        let payload = ChannelMutePayload {
+            channel_id,
+            target_user: target_user.to_string(),
+            duration_secs,
+            reason: Some("test".into()),
+        };
+        let payload_bytes = rmp_serde::to_vec_named(&payload).unwrap();
+        let author_pubkey: [u8; 32] = sk.verifying_key().to_bytes();
+        let msg_id =
+            crypto::compute_msg_id("testnet", &author_pubkey, &payload_bytes, timestamp);
+        let signature = signing::sign_ogmara_message(
+            sk,
+            "testnet",
+            crate::messages::envelope::PROTOCOL_VERSION,
+            MessageType::ChannelMute as u8,
+            &msg_id,
+            timestamp,
+            &payload_bytes,
+        );
+        let envelope = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::ChannelMute,
+            msg_id,
+            author: author.to_string(),
+            timestamp,
+            lamport_ts: 0,
+            payload: payload_bytes,
+            signature: signature.to_bytes().to_vec(),
+            relay_path: vec![],
+        };
+        rmp_serde::to_vec_named(&envelope).unwrap()
+    }
+
+    fn signed_unmute_envelope(
+        sk: &ed25519_dalek::SigningKey,
+        author: &str,
+        channel_id: u64,
+        target_user: &str,
+        timestamp: u64,
+    ) -> Vec<u8> {
+        let payload = ChannelUnmutePayload {
+            channel_id,
+            target_user: target_user.to_string(),
+        };
+        let payload_bytes = rmp_serde::to_vec_named(&payload).unwrap();
+        let author_pubkey: [u8; 32] = sk.verifying_key().to_bytes();
+        let msg_id =
+            crypto::compute_msg_id("testnet", &author_pubkey, &payload_bytes, timestamp);
+        let signature = signing::sign_ogmara_message(
+            sk,
+            "testnet",
+            crate::messages::envelope::PROTOCOL_VERSION,
+            MessageType::ChannelUnmute as u8,
+            &msg_id,
+            timestamp,
+            &payload_bytes,
+        );
+        let envelope = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::ChannelUnmute,
+            msg_id,
+            author: author.to_string(),
+            timestamp,
+            lamport_ts: 0,
+            payload: payload_bytes,
+            signature: signature.to_bytes().to_vec(),
+            relay_path: vec![],
+        };
+        rmp_serde::to_vec_named(&envelope).unwrap()
+    }
+
+    #[test]
+    fn permanent_mute_is_reversible_via_unmute() {
+        // The literal W30 regression: before this fix, `duration_secs: 0`
+        // ("permanent", per ChannelMutePayload's own doc comment) had NO
+        // code path back — `remove_channel_mute` existed but had zero
+        // callers. This test fails on pre-fix code (the mute would still
+        // be active after the "unmute" envelope, since ChannelUnmute
+        // didn't exist and the envelope would fail to even construct).
+        let (r, _dir) = router();
+        let sk = crypto::generate_keypair();
+        let creator = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        let muted = "klv1muteduser";
+        let cid = 42u64;
+        make_channel(&r, cid, &creator);
+        add_member(&r, cid, muted);
+        register_user(&r, &creator, 1_000);
+
+        let mute_raw = signed_mute_envelope(&sk, &creator, cid, muted, 0, now_ms());
+        assert!(matches!(r.process_message(&mute_raw), RouteResult::Accepted { .. }));
+        assert!(r.storage.is_channel_muted(cid, muted).unwrap(), "must be muted");
+
+        let unmute_raw = signed_unmute_envelope(&sk, &creator, cid, muted, now_ms() + 1);
+        match r.process_message(&unmute_raw) {
+            RouteResult::Accepted { .. } => {}
+            other => panic!("expected Accepted, got {:?}", other),
+        }
+        assert!(!r.storage.is_channel_muted(cid, muted).unwrap(), "must be unmuted");
+    }
+
+    #[test]
+    fn unmute_rejected_without_can_mute_permission() {
+        let (r, _dir) = router();
+        let sk = crypto::generate_keypair();
+        let creator = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        let muted = "klv1muteduser";
+        let cid = 42u64;
+        make_channel(&r, cid, &creator);
+        add_member(&r, cid, muted);
+        register_user(&r, &creator, 1_000);
+
+        let mute_raw = signed_mute_envelope(&sk, &creator, cid, muted, 0, now_ms());
+        assert!(matches!(r.process_message(&mute_raw), RouteResult::Accepted { .. }));
+
+        // A random member with no moderator permissions tries to unmute.
+        // Registered too, so the rejection is unambiguously about the
+        // can_mute permission gate, not the separate registration gate.
+        let outsider_sk = crypto::generate_keypair();
+        let outsider = crypto::pubkey_to_address(&outsider_sk.verifying_key()).unwrap();
+        add_member(&r, cid, &outsider);
+        register_user(&r, &outsider, 1_000);
+        let unmute_raw =
+            signed_unmute_envelope(&outsider_sk, &outsider, cid, muted, now_ms() + 1);
+
+        match r.process_message(&unmute_raw) {
+            RouteResult::Rejected(reason) => {
+                assert!(
+                    reason.contains("unauthorized"),
+                    "expected the authorization gate, not another rejection: {reason}"
+                );
+            }
+            other => panic!("expected Rejected(unauthorized), got {:?}", other),
+        }
+        assert!(r.storage.is_channel_muted(cid, muted).unwrap(), "must remain muted");
+    }
+
+    #[test]
+    fn unmute_of_never_muted_target_is_a_harmless_noop() {
+        let (r, _dir) = router();
+        let sk = crypto::generate_keypair();
+        let creator = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        let target = "klv1nevermuted";
+        let cid = 42u64;
+        make_channel(&r, cid, &creator);
+        add_member(&r, cid, target);
+        register_user(&r, &creator, 1_000);
+
+        let unmute_raw = signed_unmute_envelope(&sk, &creator, cid, target, now_ms());
+        match r.process_message(&unmute_raw) {
+            RouteResult::Accepted { .. } => {}
+            other => panic!("expected Accepted (delete-of-missing-key is a no-op), got {:?}", other),
+        }
+        assert!(!r.storage.is_channel_muted(cid, target).unwrap());
+    }
+
+    #[test]
+    fn unmute_idempotent_across_two_independent_nodes() {
+        // Mirrors cross_node_ban_kick_tests's two-node pattern: the same
+        // signed ChannelUnmute envelope applied on two independently-built
+        // routers (simulating gossip delivery to both the origin node and
+        // a relaying peer) must succeed cleanly on both, not error on the
+        // second application.
+        let (host, _d1) = router();
+        let (peer, _d2) = router();
+
+        let sk = crypto::generate_keypair();
+        let creator = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        let muted = "klv1muteduser";
+        let cid = 42u64;
+
+        for r in [&host, &peer] {
+            make_channel(r, cid, &creator);
+            add_member(r, cid, muted);
+            register_user(r, &creator, 1_000);
+        }
+
+        let mute_raw = signed_mute_envelope(&sk, &creator, cid, muted, 0, now_ms());
+        for r in [&host, &peer] {
+            assert!(matches!(r.process_message(&mute_raw), RouteResult::Accepted { .. }));
+        }
+
+        let unmute_raw = signed_unmute_envelope(&sk, &creator, cid, muted, now_ms() + 1);
+        for r in [&host, &peer] {
+            assert!(matches!(r.process_message(&unmute_raw), RouteResult::Accepted { .. }));
+            assert!(!r.storage.is_channel_muted(cid, muted).unwrap());
         }
     }
 }

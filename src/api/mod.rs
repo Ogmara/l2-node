@@ -222,6 +222,10 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
             "/api/v1/channels/{channel_id}/invite/{address}",
             post(routes::invite_user),
         )
+        .route(
+            "/api/v1/channels/{channel_id}/mute/{address}",
+            post(routes::mute_user).delete(routes::unmute_user),
+        )
         // Private-channel federation (F1): subscribe + replicate to the caller's node
         .route(
             "/api/v1/channels/{channel_id}/federate",
