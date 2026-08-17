@@ -5,6 +5,23 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.89.0] - 2026-08-17
+
+### Security
+
+- **NewsEdit/NewsDelete/NewsComment/NewsRepost had no live propagation
+  (final pre-mainnet audit W29).** The gossip bridge only ever published
+  `NewsPost` — edits, comments, and reposts made after a node had already
+  synced a post's history never arrived on any other node (only a
+  one-shot `news_sync` backfill, triggered when `NEWS_FEED` was empty,
+  could ever surface them, and only for a cold-joining node). All four now
+  gossip on the news-global topic alongside `NewsPost`. Safe to relay:
+  `NewsEdit`/`NewsDelete` re-verify authorship against the ORIGINAL
+  message's author on every node independently (a forged relay can't
+  edit/delete someone else's post); `NewsComment`/`NewsRepost` are simple
+  msg_id-keyed index writes, idempotent under a duplicate relay. No
+  SDK/client change needed — all four builders already existed.
+
 ## [0.88.0] - 2026-08-17
 
 ### Security

@@ -1441,6 +1441,23 @@ fn gossip_topic_for_envelope(
         MessageType::NewsReaction => {
             Some(gossip::topic_news_global(network_id))
         }
+        // NewsEdit/NewsDelete/NewsComment/NewsRepost MUST gossip network-wide
+        // (audit final pre-mainnet W29): the bridge only ever gossiped
+        // NewsPost — edits/comments/reposts made after a node had already
+        // synced a post's history never arrived on any other node (only the
+        // ONE-SHOT news_sync backfill, run when NEWS_FEED is empty, could
+        // ever surface them, and only for nodes still cold-joining). Safe to
+        // relay: NewsEdit/NewsDelete re-verify authorship against the
+        // ORIGINAL message's author on every node independently (a forger
+        // can't edit/delete someone else's post via a relayed envelope);
+        // NewsComment/NewsRepost are simple msg_id-keyed index writes,
+        // idempotent under a duplicate relay.
+        MessageType::NewsEdit
+        | MessageType::NewsDelete
+        | MessageType::NewsComment
+        | MessageType::NewsRepost => {
+            Some(gossip::topic_news_global(network_id))
+        }
         // Follow/Unfollow MUST gossip network-wide (audit final pre-mainnet
         // W24, spec CCS#1): 0x30 (ProfileUpdate) got a bridge arm in
         // 0.82.6 but 0x34/0x35 didn't, so cross-node follower graphs went
@@ -7657,8 +7674,9 @@ mod gossip_bridge_tests {
     use super::gossip_topic_for_envelope;
     use crate::messages::envelope::Envelope;
     use crate::messages::types::{
-        CounterVotePayload, DeletionRequestPayload, DeletionType, DeviceRevocationPayload,
-        FollowPayload, MessageType, ReactionPayload, ReportPayload, ReportReason, ReportTarget,
+        CounterVotePayload, DeletePayload, DeletionRequestPayload, DeletionType,
+        DeviceRevocationPayload, EditPayload, FollowPayload, MessageType, NewsCommentPayload,
+        NewsRepostPayload, ReactionPayload, ReportPayload, ReportReason, ReportTarget,
         UnfollowPayload,
     };
 
@@ -7689,6 +7707,61 @@ mod gossip_bridge_tests {
             remove: false,
         };
         let env = envelope(MessageType::NewsReaction, rmp_serde::to_vec(&payload).unwrap());
+        assert_eq!(
+            gossip_topic_for_envelope(&env, "testnet"),
+            Some(crate::network::gossip::topic_news_global("testnet")),
+        );
+    }
+
+    #[test]
+    fn news_edit_delete_comment_repost_gossip_on_news_global_topic() {
+        // Regression (audit final pre-mainnet W29): the bridge only ever
+        // gossiped NewsPost — edits/comments/reposts made after a node had
+        // already synced a post's history never arrived on any other node.
+        let edit = EditPayload {
+            target_id: [4u8; 32],
+            channel_id: None,
+            content: "edited".to_string(),
+            edited_at: 1_700_000_000_000,
+            title: None,
+            tags: None,
+            attachments: None,
+            enc_content: None,
+            enc_nonce: None,
+            key_epoch: None,
+        };
+        let env = envelope(MessageType::NewsEdit, rmp_serde::to_vec(&edit).unwrap());
+        assert_eq!(
+            gossip_topic_for_envelope(&env, "testnet"),
+            Some(crate::network::gossip::topic_news_global("testnet")),
+        );
+
+        let delete = DeletePayload { target_id: [5u8; 32], channel_id: None };
+        let env = envelope(MessageType::NewsDelete, rmp_serde::to_vec(&delete).unwrap());
+        assert_eq!(
+            gossip_topic_for_envelope(&env, "testnet"),
+            Some(crate::network::gossip::topic_news_global("testnet")),
+        );
+
+        let comment = NewsCommentPayload {
+            post_id: [6u8; 32],
+            content: "nice post".to_string(),
+            reply_to: None,
+            mentions: Vec::new(),
+            attachments: Vec::new(),
+        };
+        let env = envelope(MessageType::NewsComment, rmp_serde::to_vec(&comment).unwrap());
+        assert_eq!(
+            gossip_topic_for_envelope(&env, "testnet"),
+            Some(crate::network::gossip::topic_news_global("testnet")),
+        );
+
+        let repost = NewsRepostPayload {
+            original_id: [7u8; 32],
+            original_author: "klv1author".to_string(),
+            comment: None,
+        };
+        let env = envelope(MessageType::NewsRepost, rmp_serde::to_vec(&repost).unwrap());
         assert_eq!(
             gossip_topic_for_envelope(&env, "testnet"),
             Some(crate::network::gossip::topic_news_global("testnet")),
