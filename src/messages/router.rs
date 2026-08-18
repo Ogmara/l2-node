@@ -1711,6 +1711,49 @@ impl MessageRouter {
         Ok(())
     }
 
+    /// Resolve a DM's `conversation_id` from its `target_id` (msg_id) by
+    /// looking up the original `DirectMessage` envelope. Used by
+    /// `DirectMessageEdit`/`DirectMessageDelete` indexing (audit final
+    /// pre-mainnet W6): `EditPayload`/`DeletePayload` carry no
+    /// `conversation_id` field, only `target_id`, so the DM edit/delete
+    /// side-index has to recover it the same way `authorize_edit_delete`
+    /// already does. `None` on any lookup/decode failure — a defensive
+    /// no-op (skip indexing), never a hard error, since `authorize_edit_delete`
+    /// has already run by the time `update_indexes` is called and guarantees
+    /// the target exists for a genuinely authorized edit/delete.
+    fn resolve_dm_conversation_id(&self, target_id: &[u8; 32]) -> Option<[u8; 32]> {
+        let raw = self.storage.get_cf(schema::cf::MESSAGES, target_id).ok().flatten()?;
+        let original: Envelope = rmp_serde::from_slice(&raw).ok()?;
+        let payload: DirectMessagePayload = rmp_serde::from_slice(&original.payload).ok()?;
+        Some(payload.conversation_id)
+    }
+
+    /// Resolve a ChatEdit/ChatDelete's real `channel_id` from its `target_id`
+    /// (msg_id) by looking up the original `ChatMessage` envelope, mirroring
+    /// `resolve_dm_conversation_id`.
+    ///
+    /// Security-audit follow-up on W6 (2026-08-18): the original W6 fix keyed
+    /// the `CHANNEL_EDIT_DELETE_MSGS` side-index off `EditPayload`/
+    /// `DeletePayload::channel_id` directly — a field the AUTHOR controls and
+    /// `authorize_edit_delete` never validates (it only checks author identity
+    /// and edit-window, not that `channel_id` matches the target's real
+    /// channel). Any wallet editing/deleting its own message could therefore
+    /// put an arbitrary (or absent) `channel_id` in the payload: at best it
+    /// pollutes a channel that message was never in; at worst — `channel_id:
+    /// None` on a genuine delete — the marker is silently indexed nowhere,
+    /// reproducing the exact "deleted content resurfaces on a backfilling
+    /// node" bug W6 exists to close, for that one message. Deriving the
+    /// channel_id from the original `ChatMessagePayload` instead (which is
+    /// itself part of a SIGNED, already-accepted envelope — not attacker
+    /// input at this point) closes both: the value can no longer be spoofed
+    /// or omitted.
+    fn resolve_chat_channel_id(&self, target_id: &[u8; 32]) -> Option<u64> {
+        let raw = self.storage.get_cf(schema::cf::MESSAGES, target_id).ok().flatten()?;
+        let original: Envelope = rmp_serde::from_slice(&raw).ok()?;
+        let payload: ChatMessagePayload = rmp_serde::from_slice(&original.payload).ok()?;
+        Some(payload.channel_id)
+    }
+
     /// Update storage indexes based on message type.
     fn update_indexes(&self, envelope: &Envelope, resolved_author: &str) -> Result<()> {
         // P-1 (identity-sync): index a user's signed identity envelopes
@@ -2340,6 +2383,27 @@ impl MessageRouter {
                         envelope.timestamp,
                         &envelope.msg_id,
                     )?;
+                    // Audit final pre-mainnet W6: index into a side CF (never
+                    // CHANNEL_MSGS itself — that's read directly by
+                    // `GET /channel/messages` with no msg_type filter) so the
+                    // channel-history reconcile can also ship this edit to a
+                    // backfilling node, not just the original message.
+                    //
+                    // Security-audit follow-up: use `resolve_chat_channel_id`
+                    // (the ORIGINAL message's own channel_id), NOT
+                    // `payload.channel_id` — the latter is author-controlled
+                    // and unvalidated by `authorize_edit_delete`, so trusting
+                    // it would let an author spoof/omit the channel and
+                    // silently evade this very index.
+                    if let Some(cid) = self.resolve_chat_channel_id(&payload.target_id) {
+                        let key = schema::encode_channel_msg_key(
+                            cid,
+                            envelope.timestamp,
+                            &envelope.msg_id,
+                        );
+                        self.storage
+                            .put_cf(schema::cf::CHANNEL_EDIT_DELETE_MSGS, &key, &[])?;
+                    }
                 }
             }
             MessageType::ChatDelete => {
@@ -2351,6 +2415,21 @@ impl MessageRouter {
                         resolved_author,
                         envelope.timestamp,
                     )?;
+                    // Audit final pre-mainnet W6 + security-audit follow-up
+                    // (see ChatEdit above): without this, "deleted for
+                    // everyone" content is re-served forever by any
+                    // fresh/cold-joining node, and using the verified
+                    // original channel_id (not the author-controlled
+                    // payload field) closes the spoof/omit evasion.
+                    if let Some(cid) = self.resolve_chat_channel_id(&payload.target_id) {
+                        let key = schema::encode_channel_msg_key(
+                            cid,
+                            envelope.timestamp,
+                            &envelope.msg_id,
+                        );
+                        self.storage
+                            .put_cf(schema::cf::CHANNEL_EDIT_DELETE_MSGS, &key, &[])?;
+                    }
                 }
             }
             MessageType::ChatReaction => {
@@ -2374,6 +2453,21 @@ impl MessageRouter {
                         envelope.timestamp,
                         &envelope.msg_id,
                     )?;
+                    // Audit final pre-mainnet W6: side-CF index (never
+                    // DM_MESSAGES itself — read directly by
+                    // `GET /dm/messages` with no msg_type filter) so dm-sync
+                    // can also ship this edit to a backfilling node.
+                    // `EditPayload` has no `conversation_id` field, so it's
+                    // recovered from the target DM's own payload.
+                    if let Some(conv_id) = self.resolve_dm_conversation_id(&payload.target_id) {
+                        let key = schema::encode_dm_msg_key(
+                            &conv_id,
+                            envelope.timestamp,
+                            &envelope.msg_id,
+                        );
+                        self.storage
+                            .put_cf(schema::cf::DM_EDIT_DELETE_MSGS, &key, &[])?;
+                    }
                 }
             }
             MessageType::DirectMessageDelete => {
@@ -2385,6 +2479,16 @@ impl MessageRouter {
                         resolved_author,
                         envelope.timestamp,
                     )?;
+                    // Audit final pre-mainnet W6 (see DirectMessageEdit above).
+                    if let Some(conv_id) = self.resolve_dm_conversation_id(&payload.target_id) {
+                        let key = schema::encode_dm_msg_key(
+                            &conv_id,
+                            envelope.timestamp,
+                            &envelope.msg_id,
+                        );
+                        self.storage
+                            .put_cf(schema::cf::DM_EDIT_DELETE_MSGS, &key, &[])?;
+                    }
                 }
             }
             // Audit final pre-mainnet W27: the prior comment here ("DM reactions
@@ -2420,6 +2524,14 @@ impl MessageRouter {
                         envelope.timestamp,
                         &envelope.msg_id,
                     )?;
+                    // Audit final pre-mainnet W6: News shares the identical
+                    // gap Chat/DM had (see ChatEdit above) — side-CF index,
+                    // never NEWS_FEED itself (`GET /api/v1/news` has no
+                    // msg_type filter).
+                    let key =
+                        schema::encode_news_key(envelope.timestamp, &envelope.msg_id);
+                    self.storage
+                        .put_cf(schema::cf::NEWS_EDIT_DELETE, &key, &[])?;
                 }
             }
             MessageType::NewsDelete => {
@@ -2431,6 +2543,11 @@ impl MessageRouter {
                         resolved_author,
                         envelope.timestamp,
                     )?;
+                    // Audit final pre-mainnet W6 (see NewsEdit above).
+                    let key =
+                        schema::encode_news_key(envelope.timestamp, &envelope.msg_id);
+                    self.storage
+                        .put_cf(schema::cf::NEWS_EDIT_DELETE, &key, &[])?;
                 }
             }
             MessageType::SettingsSync => {
@@ -4179,5 +4296,363 @@ mod channel_mute_unmute_tests {
             assert!(matches!(r.process_message(&unmute_raw), RouteResult::Accepted { .. }));
             assert!(!r.storage.is_channel_muted(cid, muted).unwrap());
         }
+    }
+}
+
+#[cfg(test)]
+mod edit_delete_index_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    // Regression tests for audit final pre-mainnet W6: backfill previously
+    // omitted edit/delete markers, so "deleted for everyone" content was
+    // re-served forever by any fresh/cold-joining node. These verify the
+    // producer side — that `update_indexes` writes the new side-CF row for
+    // each of the six edit/delete types. The consumer side (reconcile/
+    // dm-sync/news-sync ride-along) is tested in each protocol's own module.
+
+    fn router() -> (MessageRouter, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let identity = IdentityResolver::new(storage.clone());
+        (
+            MessageRouter::new(storage, identity, None, "testnet".to_string()),
+            dir,
+        )
+    }
+
+    fn now_ms() -> u64 {
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
+    }
+
+    fn register_user(r: &MessageRouter, address: &str, registered_at: u64) {
+        let rec = serde_json::json!({ "address": address, "registered_at": registered_at });
+        r.storage
+            .put_cf(schema::cf::USERS, address.as_bytes(), rec.to_string().as_bytes())
+            .unwrap();
+    }
+
+    /// Store a genuine ChatMessage directly in MESSAGES, bypassing full
+    /// envelope signing (mirrors `dm_reaction_tests::store_dm` — irrelevant
+    /// to what `authorize_edit_delete` reads, which is only
+    /// `original_envelope.author`/`timestamp`).
+    fn store_chat_message(r: &MessageRouter, author: &str, channel_id: u64, msg_id: [u8; 32], timestamp: u64) {
+        let payload = ChatMessagePayload {
+            channel_id,
+            content: "hello".to_string(),
+            content_rating: Default::default(),
+            reply_to: None,
+            mentions: vec![],
+            attachments: vec![],
+            enc_content: None,
+            enc_nonce: None,
+            key_epoch: None,
+        };
+        let envelope = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::ChatMessage,
+            msg_id,
+            author: author.to_string(),
+            timestamp,
+            lamport_ts: 0,
+            payload: rmp_serde::to_vec_named(&payload).unwrap(),
+            signature: vec![],
+            relay_path: vec![],
+        };
+        r.storage
+            .put_cf(schema::cf::MESSAGES, &msg_id, &rmp_serde::to_vec_named(&envelope).unwrap())
+            .unwrap();
+    }
+
+    /// Store a genuine DirectMessage directly in MESSAGES (mirrors
+    /// `dm_reaction_tests::store_dm`, parameterized on `conversation_id` so
+    /// the resolve-conversation-id lookup can be asserted against it).
+    fn store_dm(
+        r: &MessageRouter,
+        sender: &str,
+        recipient: &str,
+        conversation_id: [u8; 32],
+        msg_id: [u8; 32],
+        timestamp: u64,
+    ) {
+        let payload = DirectMessagePayload {
+            recipient: recipient.to_string(),
+            conversation_id,
+            content: vec![1, 2, 3],
+            nonce: [0u8; 24],
+            key_epoch: 1,
+            reply_to: None,
+            attachments: vec![],
+        };
+        let envelope = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::DirectMessage,
+            msg_id,
+            author: sender.to_string(),
+            timestamp,
+            lamport_ts: 0,
+            payload: rmp_serde::to_vec_named(&payload).unwrap(),
+            signature: vec![],
+            relay_path: vec![],
+        };
+        r.storage
+            .put_cf(schema::cf::MESSAGES, &msg_id, &rmp_serde::to_vec_named(&envelope).unwrap())
+            .unwrap();
+    }
+
+    /// Store a genuine NewsPost directly in MESSAGES.
+    fn store_news_post(r: &MessageRouter, author: &str, msg_id: [u8; 32], timestamp: u64) {
+        let payload = NewsPostPayload {
+            title: "headline".to_string(),
+            content: "body".to_string(),
+            content_rating: Default::default(),
+            tags: vec![],
+            attachments: vec![],
+            visibility: Default::default(),
+        };
+        let envelope = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::NewsPost,
+            msg_id,
+            author: author.to_string(),
+            timestamp,
+            lamport_ts: 0,
+            payload: rmp_serde::to_vec_named(&payload).unwrap(),
+            signature: vec![],
+            relay_path: vec![],
+        };
+        r.storage
+            .put_cf(schema::cf::MESSAGES, &msg_id, &rmp_serde::to_vec_named(&envelope).unwrap())
+            .unwrap();
+    }
+
+    /// Build a fully signed edit/delete envelope (real msg_id + real Ed25519
+    /// signature), ready to feed into `process_message`.
+    fn signed_edit_or_delete_envelope(
+        sk: &ed25519_dalek::SigningKey,
+        author: &str,
+        msg_type: MessageType,
+        target_id: [u8; 32],
+        channel_id: Option<u64>,
+        timestamp: u64,
+    ) -> Vec<u8> {
+        let payload_bytes = match msg_type {
+            MessageType::ChatEdit | MessageType::DirectMessageEdit | MessageType::NewsEdit => {
+                let payload = EditPayload {
+                    target_id,
+                    channel_id,
+                    content: "edited".to_string(),
+                    edited_at: timestamp,
+                    title: None,
+                    tags: None,
+                    attachments: None,
+                    // DM edits carry ciphertext, not plaintext content —
+                    // `validate_dm_edit` requires it.
+                    enc_content: matches!(msg_type, MessageType::DirectMessageEdit)
+                        .then(|| vec![9u8, 9, 9]),
+                    enc_nonce: None,
+                    key_epoch: None,
+                };
+                rmp_serde::to_vec_named(&payload).unwrap()
+            }
+            MessageType::ChatDelete | MessageType::DirectMessageDelete | MessageType::NewsDelete => {
+                let payload = DeletePayload { target_id, channel_id };
+                rmp_serde::to_vec_named(&payload).unwrap()
+            }
+            _ => unreachable!("not an edit/delete type"),
+        };
+        let author_pubkey: [u8; 32] = sk.verifying_key().to_bytes();
+        let msg_id =
+            crypto::compute_msg_id("testnet", &author_pubkey, &payload_bytes, timestamp);
+        let signature = signing::sign_ogmara_message(
+            sk,
+            "testnet",
+            crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type as u8,
+            &msg_id,
+            timestamp,
+            &payload_bytes,
+        );
+        let envelope = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type,
+            msg_id,
+            author: author.to_string(),
+            timestamp,
+            lamport_ts: 0,
+            payload: payload_bytes,
+            signature: signature.to_bytes().to_vec(),
+            relay_path: vec![],
+        };
+        rmp_serde::to_vec_named(&envelope).unwrap()
+    }
+
+    #[test]
+    fn chat_edit_and_delete_are_indexed_into_the_side_cf() {
+        let (r, _dir) = router();
+        let sk = crypto::generate_keypair();
+        let author = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        register_user(&r, &author, 1_000); // ChatEdit/ChatDelete are "advanced" (tiered identity)
+        let channel_id = 42u64;
+        let original_ts = now_ms();
+        let original_id = [1u8; 32];
+        store_chat_message(&r, &author, channel_id, original_id, original_ts);
+
+        let edit_ts = original_ts + 1;
+        let edit_raw = signed_edit_or_delete_envelope(
+            &sk, &author, MessageType::ChatEdit, original_id, Some(channel_id), edit_ts,
+        );
+        assert!(matches!(r.process_message(&edit_raw), RouteResult::Accepted { .. }));
+
+        let delete_ts = original_ts + 2;
+        let delete_raw = signed_edit_or_delete_envelope(
+            &sk, &author, MessageType::ChatDelete, original_id, Some(channel_id), delete_ts,
+        );
+        assert!(matches!(r.process_message(&delete_raw), RouteResult::Accepted { .. }));
+
+        let prefix = channel_id.to_be_bytes();
+        let rows = r
+            .storage
+            .prefix_iter_cf(schema::cf::CHANNEL_EDIT_DELETE_MSGS, &prefix, 10)
+            .unwrap();
+        assert_eq!(rows.len(), 2, "expected both the edit and the delete indexed");
+        // Keys are (channel_id, timestamp, msg_id) — ascending, so the edit
+        // (earlier timestamp) sorts before the delete.
+        let ts_of = |key: &[u8]| u64::from_be_bytes(key[8..16].try_into().unwrap());
+        assert_eq!(ts_of(&rows[0].0), edit_ts);
+        assert_eq!(ts_of(&rows[1].0), delete_ts);
+    }
+
+    #[test]
+    fn dm_edit_and_delete_resolve_conversation_id_and_are_indexed() {
+        // `EditPayload`/`DeletePayload` carry no `conversation_id` field —
+        // this proves `resolve_dm_conversation_id` correctly recovers it
+        // from the ORIGINAL DirectMessage's own payload.
+        let (r, _dir) = router();
+        let sk = crypto::generate_keypair();
+        let sender = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        register_user(&r, &sender, 1_000); // DirectMessageDelete is "advanced" (tiered identity)
+        let recipient = "klv1recipient";
+        let conversation_id = [7u8; 32];
+        let original_ts = now_ms();
+        let original_id = [2u8; 32];
+        store_dm(&r, &sender, recipient, conversation_id, original_id, original_ts);
+
+        let delete_ts = original_ts + 1;
+        let delete_raw = signed_edit_or_delete_envelope(
+            &sk, &sender, MessageType::DirectMessageDelete, original_id, None, delete_ts,
+        );
+        assert!(matches!(r.process_message(&delete_raw), RouteResult::Accepted { .. }));
+
+        let rows = r
+            .storage
+            .prefix_iter_cf(schema::cf::DM_EDIT_DELETE_MSGS, &conversation_id[..], 10)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let ts = u64::from_be_bytes(rows[0].0[32..40].try_into().unwrap());
+        assert_eq!(ts, delete_ts);
+        let msg_id: [u8; 32] = rows[0].0[40..72].try_into().unwrap();
+        assert_eq!(msg_id, {
+            // Recompute the delete's own msg_id the same way the helper did.
+            let pk: [u8; 32] = sk.verifying_key().to_bytes();
+            let payload = DeletePayload { target_id: original_id, channel_id: None };
+            let payload_bytes = rmp_serde::to_vec_named(&payload).unwrap();
+            crypto::compute_msg_id("testnet", &pk, &payload_bytes, delete_ts)
+        });
+    }
+
+    #[test]
+    fn news_edit_and_delete_are_indexed_into_the_side_cf() {
+        let (r, _dir) = router();
+        let sk = crypto::generate_keypair();
+        let author = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        register_user(&r, &author, 1_000); // NewsEdit requires registration
+        let original_ts = now_ms();
+        let original_id = [3u8; 32];
+        store_news_post(&r, &author, original_id, original_ts);
+
+        let edit_ts = original_ts + 1;
+        let edit_raw = signed_edit_or_delete_envelope(
+            &sk, &author, MessageType::NewsEdit, original_id, None, edit_ts,
+        );
+        assert!(matches!(r.process_message(&edit_raw), RouteResult::Accepted { .. }));
+
+        let delete_ts = original_ts + 2;
+        let delete_raw = signed_edit_or_delete_envelope(
+            &sk, &author, MessageType::NewsDelete, original_id, None, delete_ts,
+        );
+        assert!(matches!(r.process_message(&delete_raw), RouteResult::Accepted { .. }));
+
+        let rows = r
+            .storage
+            .prefix_iter_cf(schema::cf::NEWS_EDIT_DELETE, &[], 10)
+            .unwrap();
+        assert_eq!(rows.len(), 2, "expected both the edit and the delete indexed");
+    }
+
+    #[test]
+    fn chat_edit_indexes_under_the_real_channel_even_with_a_spoofed_payload_channel_id() {
+        // Security-audit follow-up on W6: the original ChatMessage is in
+        // channel 1, but the edit's OWN payload claims `channel_id: None`
+        // (an author-controlled field `authorize_edit_delete` never
+        // validates). Before the fix this silently skipped indexing
+        // entirely — an author could omit or spoof the field to evade the
+        // backfill index for their own delete/edit. The fix derives the
+        // channel_id from the ORIGINAL message instead, so the row must
+        // land under the REAL channel (1) regardless of what the payload
+        // claims.
+        let (r, _dir) = router();
+        let sk = crypto::generate_keypair();
+        let author = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        register_user(&r, &author, 1_000);
+        let original_ts = now_ms();
+        let original_id = [4u8; 32];
+        let real_channel_id = 1u64;
+        store_chat_message(&r, &author, real_channel_id, original_id, original_ts);
+
+        let edit_raw = signed_edit_or_delete_envelope(
+            &sk, &author, MessageType::ChatEdit, original_id, None, original_ts + 1,
+        );
+        assert!(matches!(r.process_message(&edit_raw), RouteResult::Accepted { .. }));
+
+        let rows = r
+            .storage
+            .prefix_iter_cf(schema::cf::CHANNEL_EDIT_DELETE_MSGS, &real_channel_id.to_be_bytes(), 10)
+            .unwrap();
+        assert_eq!(rows.len(), 1, "must be indexed under the real channel despite the spoofed payload field");
+
+        // A wrong (not just missing) channel_id in the payload must be
+        // ignored too — a completely different channel (99) must NOT get a
+        // row for this edit.
+        let spoof_rows = r
+            .storage
+            .prefix_iter_cf(schema::cf::CHANNEL_EDIT_DELETE_MSGS, &99u64.to_be_bytes(), 10)
+            .unwrap();
+        assert!(spoof_rows.is_empty());
+    }
+
+    #[test]
+    fn chat_edit_target_not_found_is_not_indexed() {
+        // Defensive: if the original message lookup fails for any reason,
+        // `resolve_chat_channel_id` returns `None` and indexing is simply
+        // skipped — no panic, no garbage-keyed row.
+        let (r, _dir) = router();
+        let sk = crypto::generate_keypair();
+        let author = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        register_user(&r, &author, 1_000);
+        // No `store_chat_message` call — the target genuinely doesn't
+        // exist, so `authorize_edit_delete` itself rejects the envelope
+        // before `update_indexes` ever runs.
+        let missing_target = [42u8; 32];
+        let edit_raw = signed_edit_or_delete_envelope(
+            &sk, &author, MessageType::ChatEdit, missing_target, Some(1), now_ms(),
+        );
+        assert!(matches!(r.process_message(&edit_raw), RouteResult::Rejected(_)));
+
+        let rows = r
+            .storage
+            .prefix_iter_cf(schema::cf::CHANNEL_EDIT_DELETE_MSGS, &1u64.to_be_bytes(), 10)
+            .unwrap();
+        assert!(rows.is_empty());
     }
 }

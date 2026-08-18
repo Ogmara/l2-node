@@ -25,6 +25,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use tracing::warn;
 
 use crate::crypto::signing;
 use crate::storage::rocks::Storage;
@@ -65,14 +66,21 @@ pub const AUTH_MAX_AGE_SECS: u64 = 120;
 /// backfill, including pagination and fanout to multiple peers.
 pub const WALLET_AUTH_MAX_AGE_SECS: u64 = 300;
 
-/// True iff `msg_type` is the DirectMessage type (`0x05`) — the only type DM-sync
-/// serves or accepts. The receiver's type-smuggling defense so a responder can't
-/// inject another type through this path.
+/// True iff `msg_type` is a DM-sync content type — the receiver's
+/// type-smuggling defense so a responder can't inject another type through
+/// this path. Originally `DirectMessage` (`0x05`) only; widened to also
+/// accept `DirectMessageEdit` (`0x06`) / `DirectMessageDelete` (`0x07`)
+/// (audit final pre-mainnet W6) so the edit/delete ride-along
+/// (`dm_edit_delete_envelopes`) isn't silently dropped on receipt.
 pub fn is_dm_type(msg_type: u8) -> bool {
     use crate::messages::types::MessageType;
     matches!(
         MessageType::from_u8(msg_type),
-        Some(MessageType::DirectMessage)
+        Some(
+            MessageType::DirectMessage
+                | MessageType::DirectMessageEdit
+                | MessageType::DirectMessageDelete
+        )
     )
 }
 
@@ -461,6 +469,13 @@ pub fn build_response(
 
     if !has_more {
         next_cursor = None;
+        // Audit final pre-mainnet W6: ride edit/delete envelopes along on the
+        // session's LAST page only. All pages of one dm-sync session are
+        // requested/applied strictly in order against a single peer, so by
+        // the last page every original DM the session could have delivered
+        // has already been applied — which `authorize_edit_delete` requires
+        // before an edit/delete can be accepted.
+        envelopes.extend(dm_edit_delete_envelopes(storage, &conv_ids, min_ts));
     }
 
     (
@@ -473,6 +488,70 @@ pub fn build_response(
         },
         scanned_all,
     )
+}
+
+/// Gather the wallet's `DirectMessageEdit`/`DirectMessageDelete` envelopes
+/// (audit final pre-mainnet W6) across all of `conv_ids`. Without this,
+/// edit/delete envelopes never reach a backfilling node at all — the
+/// primary `DM_MESSAGES` scan above only ever contains original
+/// `DirectMessage` rows — so "deleted for everyone" content is re-served
+/// forever. Bounded + best-effort, same tradeoff already accepted for the
+/// main scan's `MAX_CONVERSATIONS` cap: a wallet with more markers than the
+/// cap just doesn't get its excess markers this session (they'll still
+/// arrive via live gossip for anything edited/deleted going forward).
+fn dm_edit_delete_envelopes(
+    storage: &Storage,
+    conv_ids: &[[u8; 32]],
+    min_ts: u64,
+) -> Vec<Vec<u8>> {
+    const DM_EDIT_DELETE_CAP: usize = 1_000;
+    let mut out = Vec::new();
+    for cid in conv_ids {
+        if out.len() >= DM_EDIT_DELETE_CAP {
+            warn!(
+                cap = DM_EDIT_DELETE_CAP,
+                "dm-sync: wallet has more edit/delete markers than the ride-along cap; \
+                 remaining conversations' markers were not shipped this session"
+            );
+            break;
+        }
+        let budget = DM_EDIT_DELETE_CAP - out.len();
+        // Security-audit follow-up (2026-08-18): `DM_EDIT_DELETE_MSGS` keys
+        // use a forward (non-negated) timestamp, so a FORWARD prefix scan
+        // is oldest-first — `.take(budget)` on that would silently drop the
+        // NEWEST excess markers in a conversation that exceeds its budget.
+        // Reverse-scan from the upper bound instead so overflow drops the
+        // OLDEST markers within this conversation.
+        let rows = match storage.reverse_iter_cf(
+            schema::cf::DM_EDIT_DELETE_MSGS,
+            &schema::message_key_upper_bound(&cid[..]),
+            &cid[..],
+            budget.saturating_add(1),
+        ) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        for (key, _) in rows.into_iter().take(budget) {
+            // key = (conversation_id:32, timestamp:8 BE, msg_id:32) = 72 bytes,
+            // same shape as DM_MESSAGES.
+            if key.len() < 72 {
+                continue;
+            }
+            let ts = u64::from_be_bytes(match key[32..40].try_into() {
+                Ok(b) => b,
+                Err(_) => continue,
+            });
+            if ts < min_ts {
+                continue;
+            }
+            let mut msg_id = [0u8; 32];
+            msg_id.copy_from_slice(&key[40..72]);
+            if let Ok(Some(raw)) = storage.get_cf(schema::cf::MESSAGES, &msg_id) {
+                out.push(raw);
+            }
+        }
+    }
+    out
 }
 
 // --- Responder rate limiting (per peer) ---
@@ -879,6 +958,146 @@ mod tests {
         assert!(
             inner.served.contains_key(&overflow_peer),
             "the new insert itself must be present"
+        );
+    }
+}
+
+#[cfg(test)]
+mod edit_delete_ride_along_tests {
+    use super::*;
+    use crate::messages::envelope::Envelope;
+    use crate::messages::types::{DeletePayload, DirectMessagePayload, MessageType};
+    use crate::storage::rocks::Storage;
+    use tempfile::TempDir;
+
+    fn put_dm(storage: &Storage, wallet: &str, peer: &str, conv: [u8; 32], msg_id: [u8; 32], ts: u64) {
+        let payload = DirectMessagePayload {
+            recipient: peer.to_string(),
+            conversation_id: conv,
+            content: vec![1, 2, 3],
+            nonce: [0u8; 24],
+            key_epoch: 1,
+            reply_to: None,
+            attachments: vec![],
+        };
+        let env = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::DirectMessage,
+            msg_id,
+            author: wallet.to_string(),
+            timestamp: ts,
+            lamport_ts: 0,
+            payload: rmp_serde::to_vec_named(&payload).unwrap(),
+            signature: vec![],
+            relay_path: vec![],
+        };
+        storage
+            .put_cf(schema::cf::DM_MESSAGES, &schema::encode_dm_msg_key(&conv, ts, &msg_id), &[])
+            .unwrap();
+        storage
+            .store_message(&msg_id, &rmp_serde::to_vec_named(&env).unwrap())
+            .unwrap();
+        storage
+            .put_cf(
+                schema::cf::DM_CONVERSATIONS,
+                &schema::encode_dm_conversation_key(wallet.as_bytes(), ts, &conv),
+                peer.as_bytes(),
+            )
+            .unwrap();
+    }
+
+    fn put_dm_delete(
+        storage: &Storage,
+        wallet: &str,
+        conv: [u8; 32],
+        target_id: [u8; 32],
+        msg_id: [u8; 32],
+        ts: u64,
+    ) {
+        let payload = DeletePayload { target_id, channel_id: None };
+        let env = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::DirectMessageDelete,
+            msg_id,
+            author: wallet.to_string(),
+            timestamp: ts,
+            lamport_ts: 0,
+            payload: rmp_serde::to_vec_named(&payload).unwrap(),
+            signature: vec![],
+            relay_path: vec![],
+        };
+        storage
+            .put_cf(schema::cf::DM_EDIT_DELETE_MSGS, &schema::encode_dm_msg_key(&conv, ts, &msg_id), &[])
+            .unwrap();
+        storage
+            .store_message(&msg_id, &rmp_serde::to_vec_named(&env).unwrap())
+            .unwrap();
+    }
+
+    fn contains_type(envelopes: &[Vec<u8>], msg_type: MessageType) -> bool {
+        envelopes.iter().any(|e| {
+            rmp_serde::from_slice::<Envelope>(e)
+                .map(|env| env.msg_type == msg_type)
+                .unwrap_or(false)
+        })
+    }
+
+    /// Regression for audit final pre-mainnet W6: without the ride-along, a
+    /// fresh node backfilling via dm-sync would receive the wallet's 3
+    /// original DMs but never learn one was deleted. Also proves the
+    /// ordering constraint: the ride-along must NOT appear on a non-final
+    /// (`has_more = true`) page, since the target might not have been
+    /// delivered yet.
+    #[test]
+    fn ride_along_only_appears_on_the_final_page() {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let wallet = "klv1wallet";
+        let conv = [0xDDu8; 32];
+        let base_ts = 1_700_000_000_000u64;
+        let mut deleted_target = [0u8; 32];
+        for n in 0u8..3 {
+            let mut mid = [0u8; 32];
+            mid[0] = n + 1;
+            if n == 0 {
+                deleted_target = mid;
+            }
+            put_dm(&storage, wallet, "klv1peer", conv, mid, base_ts + n as u64);
+        }
+        put_dm_delete(&storage, wallet, conv, deleted_target, [9u8; 32], base_ts + 100);
+
+        // Page 1: cap=2 DMs (< 3 total) → has_more → no ride-along.
+        let req1 = DmSyncRequest {
+            wallet: wallet.into(),
+            requester_pubkey: vec![0u8; 32],
+            timestamp: base_ts,
+            signature: vec![0u8; 64],
+            max_age_secs: u64::MAX,
+            cursor: None,
+            wallet_claim: None,
+        };
+        let (resp1, _) = build_response(&storage, wallet, &req1, 2, base_ts + 1000, u64::MAX);
+        assert!(resp1.has_more, "page 1 should be capped (2 of 3 DMs)");
+        assert!(
+            !contains_type(&resp1.envelopes, MessageType::DirectMessageDelete),
+            "delete must not ride along on a non-final page"
+        );
+
+        // Page 2 (final): remaining DM, under cap → ride-along present.
+        let req2 = DmSyncRequest {
+            wallet: wallet.into(),
+            requester_pubkey: vec![0u8; 32],
+            timestamp: base_ts,
+            signature: vec![0u8; 64],
+            max_age_secs: u64::MAX,
+            cursor: resp1.next_cursor,
+            wallet_claim: None,
+        };
+        let (resp2, _) = build_response(&storage, wallet, &req2, 2, base_ts + 1000, u64::MAX);
+        assert!(!resp2.has_more, "page 2 should be the final page");
+        assert!(
+            contains_type(&resp2.envelopes, MessageType::DirectMessageDelete),
+            "delete must ride along on the final page"
         );
     }
 }

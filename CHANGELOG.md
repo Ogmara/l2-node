@@ -5,6 +5,99 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.95.0] - 2026-08-18
+
+### Security
+
+- **Backfill omitted edit/delete markers — "deleted for everyone" content
+  was re-served forever by every fresh/cold-joining node (final pre-mainnet
+  audit W6).** `ChatEdit`/`ChatDelete`/`DirectMessageEdit`/
+  `DirectMessageDelete`/`NewsEdit`/`NewsDelete` were only ever written into
+  the marker CFs (`DELETION_MARKERS`/`EDIT_HISTORY`, keyed by the *original*
+  msg_id) — they never got their own row in the channel/DM/news backfill
+  indexes (`CHANNEL_MSGS`/`DM_MESSAGES`/`NEWS_FEED`). A node backfilling via
+  reconcile, dm-sync, or news-sync received the original message but never
+  the edit/delete that followed it. No attacker required — this happened on
+  every normal cold-join. News shares the identical gap (not originally
+  named in the audit finding, but the same bug — `news_sync::is_news_type`
+  already anticipated `NewsEdit`/`NewsDelete` on the receive side, the
+  producer side just never wrote them).
+  - Added 3 new backfill-only side-index CFs — `CHANNEL_EDIT_DELETE_MSGS`,
+    `DM_EDIT_DELETE_MSGS`, `NEWS_EDIT_DELETE` — reusing the existing key
+    encoders (`encode_channel_msg_key`/`encode_dm_msg_key`/
+    `encode_news_key`). Kept SEPARATE from `CHANNEL_MSGS`/`DM_MESSAGES`/
+    `NEWS_FEED` deliberately: those CFs are read directly by
+    `GET /channel/messages`/`GET /dm/messages`/`GET /api/v1/news` with no
+    msg_type filter, so mixing edit/delete envelopes in would have made
+    them render as garbage entries in every client's message list. Mirrors
+    the existing `CHANNEL_META_MSGS` precedent (a backfill-only ride-along
+    index never read by any listing route).
+  - `reconcile.rs`/`dm_sync.rs`/`news_sync.rs` each gained a bounded
+    ride-along fetch that appends edit/delete envelopes to a response, but
+    ONLY on the session's LAST page (`!hit_cap` / `!has_more`). All pages
+    of one backfill session are requested/applied strictly in order against
+    a single peer, so by the last page every original message the session
+    could have delivered has already been applied — which
+    `authorize_edit_delete` requires before an edit/delete can be accepted
+    (it looks up the target by `target_id` and hard-rejects if missing).
+  - `dm_sync::is_dm_type` (the receiver's type-smuggling defense) widened
+    from `DirectMessage` (0x05) only to also accept `DirectMessageEdit`
+    (0x06) / `DirectMessageDelete` (0x07) — it was silently dropping these
+    even when a responder sent them.
+  - New one-time migration `backfill_edit_delete_markers()` (guarded by
+    `EDIT_DELETE_MARKERS_INDEXED`, run at startup) makes the fix
+    retroactive: it scans existing `MESSAGES` for edit/delete envelopes
+    applied before this upgrade and populates the new indexes, so nodes
+    already deployed don't need their history wiped to benefit.
+  - **Post-fix Code Audit + Security Audit pass caught two real bugs before
+    this shipped, both fixed:** (1) the channel-side index trusted
+    `EditPayload`/`DeletePayload::channel_id` — an author-controlled,
+    unvalidated field — instead of deriving it from the original message
+    like the DM side already correctly did; a spoofed/omitted value could
+    pollute an unrelated channel or silently evade the fix entirely for
+    that message. Fixed with a new `resolve_chat_channel_id` lookup,
+    applied to both the live indexing path and the retroactive migration.
+    (2) `channel_edit_delete_envelopes`/`dm_edit_delete_envelopes` dropped
+    the NEWEST markers under cap overflow instead of the oldest (a forward
+    scan on non-negated-timestamp keys is oldest-first; `news_sync.rs`'s
+    equivalent was correct by accident since its keys ARE negated). Fixed
+    by reverse-scanning from the upper bound in both files.
+  - Out of scope, flagged as a residual gap: the legacy sync protocol
+    (`network/sync.rs`, fires on every peer reconnect, not just cold-join)
+    still reads `CHANNEL_MSGS` directly and doesn't carry the ride-along —
+    same shape as the still-open W7 finding (no scope filter at all on that
+    protocol). A node that was briefly offline can still miss an edit/delete
+    that happened during the outage until W7 is addressed.
+
+### Fixed
+
+- Corrected `docs/specs/03-l2-node.md`'s dm-sync section (it explicitly
+  documented the pre-fix "edits/deletes are NOT pulled by dm-sync"
+  limitation as permanent) and added new `docs/specs/01-protocol.md`
+  §8.3.9/§8.5.4 sections documenting the reconcile/news-sync ride-along
+  behavior (mirroring the existing §8.3.8 channel-metadata ride-along
+  precedent) — Spec Compliance follow-up caught that the first draft of
+  this entry claimed all three were corrected when only dm-sync's doc had
+  actually been touched.
+
+### Security (dependency)
+
+- Bumped `h2` 0.4.13 → 0.4.16 (`cargo update -p h2 --precise 0.4.16`, no
+  `Cargo.toml` change) — closes RUSTSEC-2026-0258 (unbounded empty DATA
+  frames), a runtime-path advisory (h2 is the HTTP/2 layer under `hyper`,
+  used by `axum`/`reqwest`/`tonic`). Security-audit follow-up: even
+  package-scoped `cargo update` re-resolves the whole graph, so this also
+  reshuffled a handful of already-multi-versioned transitive edges
+  (`socket2`, `windows-sys`) to other already-compatible versions already
+  present elsewhere in the lockfile — verified via `cargo audit` (no
+  advisory tied to either the old or new edge versions) and confirmed this
+  is NOT something `--precise`/manual lockfile surgery can avoid (a plain
+  `cargo build` with no update at all touches only the version bump; ANY
+  `cargo update` invocation, precise or not, produces the identical
+  broader reshuffle). Full test suite + clippy stayed green throughout. The
+  2 known-deferred `hickory-proto` advisories (RUSTSEC-2026-0118/0119,
+  blocked on the `libp2p` `^0.25.2` pin) are unchanged.
+
 ## [0.94.0] - 2026-08-18
 
 ### Security

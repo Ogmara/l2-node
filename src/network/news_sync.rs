@@ -15,6 +15,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use tracing::warn;
 
 use crate::storage::rocks::Storage;
 use crate::storage::schema;
@@ -203,6 +204,16 @@ pub fn build_response(
         next_cursor = None;
     }
 
+    // Audit final pre-mainnet W6: ride edit/delete envelopes along on the
+    // session's LAST (oldest) page only. News-sync walks newest→oldest, but
+    // pages are still requested/applied strictly in order against a single
+    // peer, so by the last page every post the session could have
+    // delivered has already been applied — which `authorize_edit_delete`
+    // requires before an edit/delete can be accepted.
+    if !has_more {
+        envelopes.extend(news_edit_delete_envelopes(storage, min_ts));
+    }
+
     NewsSyncResponse {
         envelopes,
         has_more,
@@ -210,6 +221,53 @@ pub fn build_response(
         server_capped: false,
         completeness_root: None,
     }
+}
+
+/// Gather `NewsEdit`/`NewsDelete` envelopes within the window (audit final
+/// pre-mainnet W6 — News shares the identical gap Chat/DM had, not
+/// originally named in the finding). Without this, edit/delete envelopes
+/// never reach a backfilling node at all — the primary `NEWS_FEED` scan
+/// above only ever contains original `NewsPost`/`NewsComment` rows — so
+/// "deleted for everyone" content is re-served forever. Bounded +
+/// best-effort, same tradeoff already accepted elsewhere in this file.
+fn news_edit_delete_envelopes(storage: &Storage, min_ts: u64) -> Vec<Vec<u8>> {
+    const NEWS_EDIT_DELETE_CAP: usize = 2_000;
+    let rows = match storage.prefix_iter_cf(
+        schema::cf::NEWS_EDIT_DELETE,
+        &[],
+        NEWS_EDIT_DELETE_CAP.saturating_add(1),
+    ) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    if rows.len() > NEWS_EDIT_DELETE_CAP {
+        warn!(
+            cap = NEWS_EDIT_DELETE_CAP,
+            "news-sync: more edit/delete markers than the ride-along cap; \
+             oldest excess markers were not shipped this session"
+        );
+    }
+    let mut out = Vec::with_capacity(rows.len().min(NEWS_EDIT_DELETE_CAP));
+    for (key, _) in rows.into_iter().take(NEWS_EDIT_DELETE_CAP) {
+        // Key shape matches NEWS_FEED: !timestamp:8 ++ msg_id:32.
+        if key.len() < 8 + 32 {
+            continue;
+        }
+        let neg = u64::from_be_bytes(match key[0..8].try_into() {
+            Ok(b) => b,
+            Err(_) => continue,
+        });
+        let ts = !neg;
+        if ts < min_ts {
+            continue;
+        }
+        let mut msg_id = [0u8; 32];
+        msg_id.copy_from_slice(&key[8..40]);
+        if let Ok(Some(raw)) = storage.get_cf(schema::cf::MESSAGES, &msg_id) {
+            out.push(raw);
+        }
+    }
+    out
 }
 
 // --- Responder rate limiting (per peer; the feed is global) ---
@@ -314,5 +372,117 @@ mod tests {
     fn is_news_type_excludes_unrelated_types() {
         assert!(!is_news_type(MessageType::ChatMessage as u8));
         assert!(!is_news_type(MessageType::Follow as u8));
+    }
+}
+
+#[cfg(test)]
+mod edit_delete_ride_along_tests {
+    use super::*;
+    use crate::messages::envelope::Envelope;
+    use crate::messages::types::{DeletePayload, MessageType, NewsPostPayload};
+    use tempfile::TempDir;
+
+    fn put_news_post(storage: &Storage, author: &str, msg_id: [u8; 32], ts: u64) {
+        let payload = NewsPostPayload {
+            title: "headline".to_string(),
+            content: "body".to_string(),
+            content_rating: Default::default(),
+            tags: vec![],
+            attachments: vec![],
+            visibility: Default::default(),
+        };
+        let env = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::NewsPost,
+            msg_id,
+            author: author.to_string(),
+            timestamp: ts,
+            lamport_ts: 0,
+            payload: rmp_serde::to_vec_named(&payload).unwrap(),
+            signature: vec![],
+            relay_path: vec![],
+        };
+        storage
+            .put_cf(schema::cf::NEWS_FEED, &schema::encode_news_key(ts, &msg_id), &[])
+            .unwrap();
+        storage
+            .put_cf(schema::cf::MESSAGES, &msg_id, &rmp_serde::to_vec_named(&env).unwrap())
+            .unwrap();
+    }
+
+    fn put_news_delete(storage: &Storage, author: &str, target_id: [u8; 32], msg_id: [u8; 32], ts: u64) {
+        let payload = DeletePayload { target_id, channel_id: None };
+        let env = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::NewsDelete,
+            msg_id,
+            author: author.to_string(),
+            timestamp: ts,
+            lamport_ts: 0,
+            payload: rmp_serde::to_vec_named(&payload).unwrap(),
+            signature: vec![],
+            relay_path: vec![],
+        };
+        storage
+            .put_cf(schema::cf::NEWS_EDIT_DELETE, &schema::encode_news_key(ts, &msg_id), &[])
+            .unwrap();
+        storage
+            .put_cf(schema::cf::MESSAGES, &msg_id, &rmp_serde::to_vec_named(&env).unwrap())
+            .unwrap();
+    }
+
+    fn contains_type(envelopes: &[Vec<u8>], msg_type: MessageType) -> bool {
+        envelopes.iter().any(|e| {
+            rmp_serde::from_slice::<Envelope>(e)
+                .map(|env| env.msg_type == msg_type)
+                .unwrap_or(false)
+        })
+    }
+
+    /// Regression for audit final pre-mainnet W6 (News shares the identical
+    /// gap Chat/DM had, not originally named in the finding). News-sync
+    /// walks newest→oldest, so "final page" means the OLDEST page — this
+    /// proves the ride-along still fires there (not on an earlier, newer
+    /// page) since pages are applied strictly in order regardless of scan
+    /// direction.
+    #[test]
+    fn ride_along_only_appears_on_the_final_oldest_page() {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let author = "klv1author";
+        let base_ts = 1_700_000_000_000u64;
+        let mut ids = Vec::new();
+        for n in 0u8..3 {
+            let mut mid = [0u8; 32];
+            mid[0] = n + 1;
+            put_news_post(&storage, author, mid, base_ts + n as u64);
+            ids.push(mid);
+        }
+        // Delete the OLDEST post (ids[0], ts = base_ts) — its marker has a
+        // LATER timestamp than the post itself, same as real usage.
+        put_news_delete(&storage, author, ids[0], [9u8; 32], base_ts + 100);
+
+        // Page 1 (newest-first): cap=2 (< 3 total) → has_more → no ride-along.
+        let req1 = NewsSyncRequest { max_age_secs: u64::MAX, cursor: None, overlap_digest: vec![], round: 0 };
+        let resp1 = build_response(&storage, &req1, 2, base_ts + 1000, u64::MAX);
+        assert!(resp1.has_more, "page 1 should be capped (2 of 3 posts)");
+        assert!(
+            !contains_type(&resp1.envelopes, MessageType::NewsDelete),
+            "delete must not ride along on a non-final page"
+        );
+
+        // Page 2 (final/oldest): remaining post, under cap → ride-along present.
+        let req2 = NewsSyncRequest {
+            max_age_secs: u64::MAX,
+            cursor: resp1.next_cursor,
+            overlap_digest: vec![],
+            round: 0,
+        };
+        let resp2 = build_response(&storage, &req2, 2, base_ts + 1000, u64::MAX);
+        assert!(!resp2.has_more, "page 2 should be the final page");
+        assert!(
+            contains_type(&resp2.envelopes, MessageType::NewsDelete),
+            "delete must ride along on the final page"
+        );
     }
 }

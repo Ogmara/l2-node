@@ -129,11 +129,14 @@ impl Storage {
             .map(|name| {
                 let mut cf_opts = Options::default();
                 // Use prefix bloom filters for index CFs
-                if *name == cf::CHANNEL_MSGS {
+                if *name == cf::CHANNEL_MSGS || *name == cf::CHANNEL_EDIT_DELETE_MSGS {
                     // Key: (channel_id:8, lamport_ts:8, msg_id:32) — prefix by channel_id
                     cf_opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(8));
                 }
-                if *name == cf::DM_MESSAGES || *name == cf::NEWS_COMMENTS {
+                if *name == cf::DM_MESSAGES
+                    || *name == cf::NEWS_COMMENTS
+                    || *name == cf::DM_EDIT_DELETE_MSGS
+                {
                     // DM_MESSAGES key: (conversation_id:32, timestamp:8, msg_id:32)
                     // NEWS_COMMENTS key: (post_id:32, timestamp:8, msg_id:32)
                     cf_opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(32));
@@ -1813,6 +1816,140 @@ impl Storage {
         Ok(())
     }
 
+    /// One-time backfill of `CHANNEL_EDIT_DELETE_MSGS`/`DM_EDIT_DELETE_MSGS`/
+    /// `NEWS_EDIT_DELETE` from existing `MESSAGES` (audit final pre-mainnet W6:
+    /// backfill previously omitted edit/delete markers, so "deleted for
+    /// everyone" content was re-served forever by any fresh/cold-joining
+    /// node). Streams every envelope and indexes `ChatEdit`/`ChatDelete`/
+    /// `DirectMessageEdit`/`DirectMessageDelete`/`NewsEdit`/`NewsDelete` into
+    /// their side-index CF. Without this migration, only edits/deletes made
+    /// AFTER the upgrade would ever backfill correctly — this makes the fix
+    /// retroactive. Idempotent — guarded by `EDIT_DELETE_MARKERS_INDEXED`.
+    pub fn backfill_edit_delete_markers(&self) -> Result<()> {
+        use crate::messages::envelope::Envelope;
+        use crate::messages::types::{
+            ChatMessagePayload, DeletePayload, DirectMessagePayload, EditPayload, MessageType,
+        };
+        use tracing::info;
+
+        let cf = self
+            .db
+            .cf_handle(cf::MESSAGES)
+            .with_context(|| "column family 'messages' not found")?;
+        let mut iter = self.db.raw_iterator_cf(&cf);
+        iter.seek_to_first();
+
+        let mut indexed = 0u64;
+        while iter.valid() {
+            if let Some(raw) = iter.value() {
+                if let Ok(envelope) = rmp_serde::from_slice::<Envelope>(raw) {
+                    match envelope.msg_type {
+                        MessageType::ChatEdit | MessageType::ChatDelete => {
+                            // Security-audit follow-up on W6 (2026-08-18):
+                            // derive channel_id from the ORIGINAL message,
+                            // never from `EditPayload`/`DeletePayload::
+                            // channel_id` — that field is author-controlled
+                            // and unvalidated, so trusting it (as the first
+                            // version of this migration did) would let a
+                            // spoofed/omitted value index nowhere or pollute
+                            // an unrelated channel. Mirrors the DM branch
+                            // below, which already did this correctly.
+                            let target_id = if envelope.msg_type == MessageType::ChatEdit {
+                                rmp_serde::from_slice::<EditPayload>(&envelope.payload)
+                                    .ok()
+                                    .map(|p| p.target_id)
+                            } else {
+                                rmp_serde::from_slice::<DeletePayload>(&envelope.payload)
+                                    .ok()
+                                    .map(|p| p.target_id)
+                            };
+                            let channel_id = target_id.and_then(|target_id| {
+                                self.get_cf(cf::MESSAGES, &target_id)
+                                    .ok()
+                                    .flatten()
+                                    .and_then(|orig_raw| {
+                                        rmp_serde::from_slice::<Envelope>(&orig_raw).ok()
+                                    })
+                                    .and_then(|orig_env| {
+                                        rmp_serde::from_slice::<ChatMessagePayload>(
+                                            &orig_env.payload,
+                                        )
+                                        .ok()
+                                    })
+                                    .map(|p| p.channel_id)
+                            });
+                            if let Some(cid) = channel_id {
+                                let key = super::schema::encode_channel_msg_key(
+                                    cid,
+                                    envelope.timestamp,
+                                    &envelope.msg_id,
+                                );
+                                self.put_cf(cf::CHANNEL_EDIT_DELETE_MSGS, &key, &[])?;
+                                indexed += 1;
+                            }
+                        }
+                        MessageType::DirectMessageEdit | MessageType::DirectMessageDelete => {
+                            let target_id = if envelope.msg_type == MessageType::DirectMessageEdit
+                            {
+                                rmp_serde::from_slice::<EditPayload>(&envelope.payload)
+                                    .ok()
+                                    .map(|p| p.target_id)
+                            } else {
+                                rmp_serde::from_slice::<DeletePayload>(&envelope.payload)
+                                    .ok()
+                                    .map(|p| p.target_id)
+                            };
+                            let conv_id = target_id.and_then(|target_id| {
+                                self.get_cf(cf::MESSAGES, &target_id)
+                                    .ok()
+                                    .flatten()
+                                    .and_then(|orig_raw| {
+                                        rmp_serde::from_slice::<Envelope>(&orig_raw).ok()
+                                    })
+                                    .and_then(|orig_env| {
+                                        rmp_serde::from_slice::<DirectMessagePayload>(
+                                            &orig_env.payload,
+                                        )
+                                        .ok()
+                                    })
+                                    .map(|p| p.conversation_id)
+                            });
+                            if let Some(conv_id) = conv_id {
+                                let key = super::schema::encode_dm_msg_key(
+                                    &conv_id,
+                                    envelope.timestamp,
+                                    &envelope.msg_id,
+                                );
+                                self.put_cf(cf::DM_EDIT_DELETE_MSGS, &key, &[])?;
+                                indexed += 1;
+                            }
+                        }
+                        MessageType::NewsEdit | MessageType::NewsDelete => {
+                            let key = super::schema::encode_news_key(
+                                envelope.timestamp,
+                                &envelope.msg_id,
+                            );
+                            self.put_cf(cf::NEWS_EDIT_DELETE, &key, &[])?;
+                            indexed += 1;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            iter.next();
+        }
+
+        if indexed > 0 {
+            info!(indexed, "Backfilled edit/delete marker indexes from MESSAGES");
+        }
+        self.put_cf(
+            cf::NODE_STATE,
+            super::schema::state_keys::EDIT_DELETE_MARKERS_INDEXED,
+            &1u64.to_be_bytes(),
+        )?;
+        Ok(())
+    }
+
     /// One-time re-index: CHANNEL_MSGS keys used `lamport_ts`, but clients always
     /// send `lamport_ts: 0`, so the index sorted by msg_id (random) — breaking
     /// chronological pagination and the unread fast-skip (`0 <= read_cursor` was
@@ -3200,5 +3337,201 @@ mod message_pagination_tests {
         for (key, _) in &entries {
             assert!(key.starts_with(&prefix_200));
         }
+    }
+}
+
+#[cfg(test)]
+mod backfill_edit_delete_markers_tests {
+    use super::*;
+    use crate::messages::envelope::Envelope;
+    use crate::messages::types::{
+        ChatMessagePayload, DeletePayload, DirectMessagePayload, MessageType,
+    };
+    use tempfile::TempDir;
+
+    fn db() -> (Storage, TempDir) {
+        let dir = TempDir::new().unwrap();
+        (Storage::open(dir.path()).unwrap(), dir)
+    }
+
+    fn put_message(s: &Storage, envelope: &Envelope) {
+        s.put_cf(
+            cf::MESSAGES,
+            &envelope.msg_id,
+            &rmp_serde::to_vec_named(envelope).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Regression for audit final pre-mainnet W6: a fresh node upgraded to
+    /// 0.95.0+ must still learn about ChatDelete/DirectMessageDelete
+    /// envelopes that were applied and stored BEFORE the upgrade — this is
+    /// what makes the backfill fix retroactive rather than only covering
+    /// edits/deletes made going forward.
+    #[test]
+    fn backfills_existing_chat_and_dm_deletes_from_messages() {
+        let (s, _d) = db();
+
+        // A ChatDelete already stored (as if applied by a pre-0.95.0 node),
+        // with NO corresponding CHANNEL_EDIT_DELETE_MSGS row yet. The
+        // original ChatMessage it targets must also exist — the migration
+        // (post security-audit fix) derives channel_id from THAT message,
+        // never from the delete's own (author-controlled, unvalidated)
+        // payload field.
+        let channel_id = 55u64;
+        let chat_target = [1u8; 32];
+        let chat_delete_id = [2u8; 32];
+        put_message(
+            &s,
+            &Envelope {
+                version: crate::messages::envelope::PROTOCOL_VERSION,
+                msg_type: MessageType::ChatMessage,
+                msg_id: chat_target,
+                author: "klv1author".to_string(),
+                timestamp: 800,
+                lamport_ts: 0,
+                payload: rmp_serde::to_vec_named(&ChatMessagePayload {
+                    channel_id,
+                    content: "original".to_string(),
+                    content_rating: Default::default(),
+                    reply_to: None,
+                    mentions: vec![],
+                    attachments: vec![],
+                    enc_content: None,
+                    enc_nonce: None,
+                    key_epoch: None,
+                })
+                .unwrap(),
+                signature: vec![],
+                relay_path: vec![],
+            },
+        );
+        put_message(
+            &s,
+            &Envelope {
+                version: crate::messages::envelope::PROTOCOL_VERSION,
+                msg_type: MessageType::ChatDelete,
+                msg_id: chat_delete_id,
+                author: "klv1author".to_string(),
+                timestamp: 1_000,
+                lamport_ts: 0,
+                payload: rmp_serde::to_vec_named(&DeletePayload {
+                    target_id: chat_target,
+                    // Deliberately a DIFFERENT channel_id than the real one
+                    // (55) — proves the migration ignores this field and
+                    // derives the real channel from the original message.
+                    channel_id: Some(999),
+                })
+                .unwrap(),
+                signature: vec![],
+                relay_path: vec![],
+            },
+        );
+
+        // A DirectMessage + its DirectMessageDelete, same pre-upgrade state.
+        let conversation_id = [9u8; 32];
+        let dm_target = [3u8; 32];
+        let dm_delete_id = [4u8; 32];
+        put_message(
+            &s,
+            &Envelope {
+                version: crate::messages::envelope::PROTOCOL_VERSION,
+                msg_type: MessageType::DirectMessage,
+                msg_id: dm_target,
+                author: "klv1sender".to_string(),
+                timestamp: 900,
+                lamport_ts: 0,
+                payload: rmp_serde::to_vec_named(&DirectMessagePayload {
+                    recipient: "klv1recipient".to_string(),
+                    conversation_id,
+                    content: vec![1, 2, 3],
+                    nonce: [0u8; 24],
+                    key_epoch: 1,
+                    reply_to: None,
+                    attachments: vec![],
+                })
+                .unwrap(),
+                signature: vec![],
+                relay_path: vec![],
+            },
+        );
+        put_message(
+            &s,
+            &Envelope {
+                version: crate::messages::envelope::PROTOCOL_VERSION,
+                msg_type: MessageType::DirectMessageDelete,
+                msg_id: dm_delete_id,
+                author: "klv1sender".to_string(),
+                timestamp: 1_100,
+                lamport_ts: 0,
+                payload: rmp_serde::to_vec_named(&DeletePayload {
+                    target_id: dm_target,
+                    channel_id: None,
+                })
+                .unwrap(),
+                signature: vec![],
+                relay_path: vec![],
+            },
+        );
+
+        // A plain ChatMessage must NOT be indexed (only edit/delete types).
+        put_message(
+            &s,
+            &Envelope {
+                version: crate::messages::envelope::PROTOCOL_VERSION,
+                msg_type: MessageType::ChatMessage,
+                msg_id: [5u8; 32],
+                author: "klv1author".to_string(),
+                timestamp: 950,
+                lamport_ts: 0,
+                payload: rmp_serde::to_vec_named(&ChatMessagePayload {
+                    channel_id,
+                    content: "hi".to_string(),
+                    content_rating: Default::default(),
+                    reply_to: None,
+                    mentions: vec![],
+                    attachments: vec![],
+                    enc_content: None,
+                    enc_nonce: None,
+                    key_epoch: None,
+                })
+                .unwrap(),
+                signature: vec![],
+                relay_path: vec![],
+            },
+        );
+
+        // Sentinel absent before the migration runs.
+        assert_eq!(s.get_stat(crate::storage::schema::state_keys::EDIT_DELETE_MARKERS_INDEXED).unwrap(), 0);
+
+        s.backfill_edit_delete_markers().unwrap();
+
+        // Sentinel now set (idempotency guard).
+        assert!(s.get_stat(crate::storage::schema::state_keys::EDIT_DELETE_MARKERS_INDEXED).unwrap() > 0);
+
+        // ChatDelete indexed under CHANNEL_EDIT_DELETE_MSGS[channel_id].
+        let chat_rows = s
+            .prefix_iter_cf(cf::CHANNEL_EDIT_DELETE_MSGS, &channel_id.to_be_bytes(), 10)
+            .unwrap();
+        assert_eq!(chat_rows.len(), 1);
+        let msg_id: [u8; 32] = chat_rows[0].0[16..48].try_into().unwrap();
+        assert_eq!(msg_id, chat_delete_id);
+
+        // DirectMessageDelete indexed under DM_EDIT_DELETE_MSGS[conversation_id]
+        // — proves the migration recovered conversation_id from the ORIGINAL
+        // DirectMessage's own payload, same as the live indexing path.
+        let dm_rows = s
+            .prefix_iter_cf(cf::DM_EDIT_DELETE_MSGS, &conversation_id[..], 10)
+            .unwrap();
+        assert_eq!(dm_rows.len(), 1);
+        let dm_msg_id: [u8; 32] = dm_rows[0].0[40..72].try_into().unwrap();
+        assert_eq!(dm_msg_id, dm_delete_id);
+
+        // Re-running is a no-op that doesn't duplicate rows (idempotent).
+        s.backfill_edit_delete_markers().unwrap();
+        let chat_rows_again = s
+            .prefix_iter_cf(cf::CHANNEL_EDIT_DELETE_MSGS, &channel_id.to_be_bytes(), 10)
+            .unwrap();
+        assert_eq!(chat_rows_again.len(), 1);
     }
 }

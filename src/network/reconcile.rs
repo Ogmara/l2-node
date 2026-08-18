@@ -434,6 +434,20 @@ pub fn build_response(
         }
     }
 
+    // Audit final pre-mainnet W6: ride edit/delete envelopes along on the
+    // session's LAST chat page only (`!hit_cap`). All pages of one reconcile
+    // session are requested/applied strictly in order against a single
+    // peer, so by the time this is the last page every original message the
+    // session could have delivered has already been applied — which
+    // `authorize_edit_delete` requires before an edit/delete can be accepted.
+    if !hit_cap {
+        envelopes.extend(channel_edit_delete_envelopes(
+            storage,
+            request.channel_id,
+            min_timestamp,
+        ));
+    }
+
     ReconcileResponse {
         channel_id: request.channel_id,
         envelopes,
@@ -477,6 +491,76 @@ fn channel_meta_envelopes(storage: &Storage, channel_id: u64) -> Vec<Vec<u8>> {
     out
 }
 
+/// Gather a channel's `ChatEdit`/`ChatDelete` envelopes (audit final
+/// pre-mainnet W6) to ride along on the LAST page of a reconcile session.
+/// Without this, edit/delete envelopes never reach a backfilling node at
+/// all — the primary `CHANNEL_MSGS` scan above only ever contains original
+/// `ChatMessage` rows — so "deleted for everyone" content is re-served
+/// forever by any fresh/cold-joining node. Unlike `channel_meta_envelopes`
+/// (which rides the FIRST page), this rides the LAST page (`build_response`
+/// only calls it when `!hit_cap`): all pages of one reconcile session are
+/// requested/applied strictly in order against a single peer, so by the
+/// last page every original message the session could have delivered has
+/// already been applied — which `authorize_edit_delete` requires before an
+/// edit/delete can be accepted (it looks up the target by `target_id` and
+/// hard-rejects if missing). Bounded + best-effort, same tradeoff already
+/// accepted for `channel_meta_envelopes`: a channel with more markers than
+/// the cap just doesn't get its oldest excess markers this session (they'll
+/// still arrive via live gossip for anything edited/deleted going forward).
+fn channel_edit_delete_envelopes(
+    storage: &Storage,
+    channel_id: u64,
+    min_timestamp: u64,
+) -> Vec<Vec<u8>> {
+    const CHANNEL_EDIT_DELETE_CAP: usize = 2_000;
+    let prefix = channel_id.to_be_bytes();
+    // Security-audit follow-up (2026-08-18): `CHANNEL_EDIT_DELETE_MSGS` keys
+    // use a forward (non-negated) timestamp, so a FORWARD prefix scan is
+    // oldest-first — `.take(cap)` on that would silently drop the NEWEST
+    // excess markers under overflow, exactly backwards from the intent (and
+    // from what the warning below claims). Reverse-scan from the upper
+    // bound instead so overflow drops the OLDEST markers, matching
+    // `news_edit_delete_envelopes` (whose `!timestamp`-negated keys make a
+    // forward scan newest-first there).
+    let rows = match storage.reverse_iter_cf(
+        schema::cf::CHANNEL_EDIT_DELETE_MSGS,
+        &schema::message_key_upper_bound(&prefix),
+        &prefix,
+        CHANNEL_EDIT_DELETE_CAP.saturating_add(1),
+    ) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    if rows.len() > CHANNEL_EDIT_DELETE_CAP {
+        warn!(
+            channel_id,
+            cap = CHANNEL_EDIT_DELETE_CAP,
+            "reconcile: channel has more edit/delete markers than the ride-along cap; \
+             oldest excess markers were not shipped this session"
+        );
+    }
+    let mut out = Vec::new();
+    for (key, _) in rows.into_iter().take(CHANNEL_EDIT_DELETE_CAP) {
+        // Key shape matches CHANNEL_MSGS: channel_id:8 ++ timestamp:8 ++ msg_id:32.
+        if key.len() != 48 {
+            continue;
+        }
+        let ts_ms = u64::from_be_bytes(match key[8..16].try_into() {
+            Ok(b) => b,
+            Err(_) => continue,
+        });
+        if ts_ms / 1000 < min_timestamp {
+            continue;
+        }
+        let mut msg_id = [0u8; 32];
+        msg_id.copy_from_slice(&key[16..48]);
+        if let Ok(Some(raw)) = storage.get_message(&msg_id) {
+            out.push(raw);
+        }
+    }
+    out
+}
+
 /// Inspect the `CHANNELS` metadata row for `channel_id` and return
 /// `true` if it is marked `channel_type = 2` (private). Used by
 /// [`build_response`] to refuse private-channel history over the
@@ -513,6 +597,159 @@ pub fn capped_response(request: &ReconcileRequest) -> ReconcileResponse {
         next_cursor: None,
         server_capped: true,
         epoch_root: None,
+    }
+}
+
+#[cfg(test)]
+mod edit_delete_ride_along_tests {
+    use super::*;
+    use crate::messages::envelope::Envelope;
+    use crate::messages::types::{ChatMessagePayload, DeletePayload, MessageType};
+    use crate::storage::rocks::Storage;
+    use tempfile::TempDir;
+
+    fn db() -> (Storage, TempDir) {
+        let dir = TempDir::new().unwrap();
+        (Storage::open(dir.path()).unwrap(), dir)
+    }
+
+    fn put_chat_message(s: &Storage, channel_id: u64, msg_id: [u8; 32], ts: u64) {
+        let payload = ChatMessagePayload {
+            channel_id,
+            content: "hi".to_string(),
+            content_rating: Default::default(),
+            reply_to: None,
+            mentions: vec![],
+            attachments: vec![],
+            enc_content: None,
+            enc_nonce: None,
+            key_epoch: None,
+        };
+        let env = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::ChatMessage,
+            msg_id,
+            author: "klv1author".to_string(),
+            timestamp: ts,
+            lamport_ts: 0,
+            payload: rmp_serde::to_vec_named(&payload).unwrap(),
+            signature: vec![],
+            relay_path: vec![],
+        };
+        s.put_cf(
+            schema::cf::CHANNEL_MSGS,
+            &schema::encode_channel_msg_key(channel_id, ts, &msg_id),
+            &[],
+        )
+        .unwrap();
+        s.put_cf(schema::cf::MESSAGES, &msg_id, &rmp_serde::to_vec_named(&env).unwrap())
+            .unwrap();
+    }
+
+    fn put_chat_delete(s: &Storage, channel_id: u64, target_id: [u8; 32], msg_id: [u8; 32], ts: u64) {
+        let payload = DeletePayload {
+            target_id,
+            channel_id: Some(channel_id),
+        };
+        let env = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::ChatDelete,
+            msg_id,
+            author: "klv1author".to_string(),
+            timestamp: ts,
+            lamport_ts: 0,
+            payload: rmp_serde::to_vec_named(&payload).unwrap(),
+            signature: vec![],
+            relay_path: vec![],
+        };
+        s.put_cf(
+            schema::cf::CHANNEL_EDIT_DELETE_MSGS,
+            &schema::encode_channel_msg_key(channel_id, ts, &msg_id),
+            &[],
+        )
+        .unwrap();
+        s.put_cf(schema::cf::MESSAGES, &msg_id, &rmp_serde::to_vec_named(&env).unwrap())
+            .unwrap();
+    }
+
+    fn contains_type(envelopes: &[Vec<u8>], msg_type: MessageType) -> bool {
+        envelopes.iter().any(|e| {
+            rmp_serde::from_slice::<Envelope>(e)
+                .map(|env| env.msg_type == msg_type)
+                .unwrap_or(false)
+        })
+    }
+
+    /// Regression for audit final pre-mainnet W6: without the ride-along,
+    /// a fresh node backfilling via reconcile would receive the 3 original
+    /// ChatMessages but never learn `[1u8;32]` was deleted — "deleted for
+    /// everyone" content resurfaces on every cold-joining node. Also proves
+    /// the ordering constraint: the ride-along must NOT appear on a
+    /// non-final (capped) page, since the target might not have been
+    /// delivered yet.
+    #[test]
+    fn ride_along_only_appears_on_the_final_page() {
+        let (s, _d) = db();
+        let channel_id = 77u64;
+        for i in 0..3u64 {
+            put_chat_message(&s, channel_id, [i as u8 + 1; 32], 1_000 + i);
+        }
+        put_chat_delete(&s, channel_id, [1u8; 32], [9u8; 32], 2_000);
+
+        // Page 1: cap=2 chat messages (< 3 total) → hits cap → no ride-along.
+        let req1 = ReconcileRequest {
+            channel_id,
+            max_age_secs: u64::MAX,
+            cursor: None,
+            fingerprint: Vec::new(),
+            epoch_root_known: None,
+            round: 0,
+        };
+        let resp1 = build_response(&s, &req1, 2, 5_000);
+        assert!(resp1.has_more, "page 1 should be capped (2 of 3 messages)");
+        assert!(
+            !contains_type(&resp1.envelopes, MessageType::ChatDelete),
+            "delete must not ride along on a non-final page"
+        );
+
+        // Page 2 (final): remaining 1 chat message, under cap → ride-along present.
+        let req2 = ReconcileRequest {
+            channel_id,
+            max_age_secs: u64::MAX,
+            cursor: resp1.next_cursor,
+            fingerprint: Vec::new(),
+            epoch_root_known: None,
+            round: 0,
+        };
+        let resp2 = build_response(&s, &req2, 2, 5_000);
+        assert!(!resp2.has_more, "page 2 should be the final page");
+        assert!(
+            contains_type(&resp2.envelopes, MessageType::ChatDelete),
+            "delete must ride along on the final page"
+        );
+    }
+
+    /// A small channel that fits entirely on page 1 (never hits the cap)
+    /// gets the ride-along immediately — the gate is `!hit_cap`, not "page
+    /// 2 specifically".
+    #[test]
+    fn ride_along_present_on_a_single_page_session() {
+        let (s, _d) = db();
+        let channel_id = 78u64;
+        put_chat_message(&s, channel_id, [1u8; 32], 1_000);
+        put_chat_delete(&s, channel_id, [1u8; 32], [9u8; 32], 2_000);
+
+        let req = ReconcileRequest {
+            channel_id,
+            max_age_secs: u64::MAX,
+            cursor: None,
+            fingerprint: Vec::new(),
+            epoch_root_known: None,
+            round: 0,
+        };
+        let resp = build_response(&s, &req, 500, 5_000);
+        assert!(!resp.has_more);
+        assert!(contains_type(&resp.envelopes, MessageType::ChatDelete));
     }
 }
 

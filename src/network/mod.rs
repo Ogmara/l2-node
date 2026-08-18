@@ -455,9 +455,11 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Smuggling defense for dm-sync responses (Phase 2): accept ONLY the
-/// DirectMessage type, so a responder can't inject another type through this
-/// path. Every envelope is still signature-validated by `process_synced_message`.
+/// Smuggling defense for dm-sync responses (Phase 2): accept only DM content
+/// types (`dm_sync::is_dm_type` — `DirectMessage`/`DirectMessageEdit`/
+/// `DirectMessageDelete` as of audit final pre-mainnet W6), so a responder
+/// can't inject another type through this path. Every envelope is still
+/// signature-validated by `process_synced_message`.
 fn envelope_targets_dm(env_bytes: &[u8]) -> bool {
     use crate::messages::envelope::Envelope;
     let envelope: Envelope = match rmp_serde::from_slice(env_bytes) {

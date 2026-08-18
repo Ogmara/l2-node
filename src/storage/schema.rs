@@ -225,6 +225,36 @@ pub mod cf {
     /// 0.53.0+.)
     pub const CHANNEL_META_MSGS: &str = "channel_meta_msgs";
 
+    /// (channel_id:8 BE, timestamp:8 BE, msg_id:32) → () — same key shape as
+    /// `CHANNEL_MSGS`, but for `ChatEdit`/`ChatDelete` envelopes only. Kept as
+    /// a SEPARATE index (not folded into `CHANNEL_MSGS`) because
+    /// `GET /channel/messages` reads `CHANNEL_MSGS` directly with no msg_type
+    /// filter — mixing edit/delete envelopes in would make them render as
+    /// garbage chat entries. This CF exists purely so the channel-history
+    /// reconcile can ALSO ship edit/delete envelopes to a backfilling node
+    /// (audit final pre-mainnet W6): without it, "deleted for everyone"
+    /// content is re-served forever by any fresh/cold-joining node. Written
+    /// in `router::update_indexes`; one-time backfilled via
+    /// `EDIT_DELETE_MARKERS_INDEXED`. (l2-node 0.95.0+.)
+    pub const CHANNEL_EDIT_DELETE_MSGS: &str = "channel_edit_delete_msgs";
+
+    /// (conversation_id:32, timestamp:8 BE, msg_id:32) → () — same key shape
+    /// as `DM_MESSAGES`, but for `DirectMessageEdit`/`DirectMessageDelete`
+    /// envelopes only. Separate from `DM_MESSAGES` for the same reason as
+    /// `CHANNEL_EDIT_DELETE_MSGS` above (`GET /dm/messages` reads
+    /// `DM_MESSAGES` with no msg_type filter). Consulted only by dm-sync's
+    /// backfill (audit final pre-mainnet W6). (l2-node 0.95.0+.)
+    pub const DM_EDIT_DELETE_MSGS: &str = "dm_edit_delete_msgs";
+
+    /// (!timestamp:8 BE, msg_id:32) → () — same key shape as `NEWS_FEED`, but
+    /// for `NewsEdit`/`NewsDelete` envelopes only. Separate from `NEWS_FEED`
+    /// for the same reason as the two CFs above (`GET /api/v1/news` reads
+    /// `NEWS_FEED` with no msg_type filter). Consulted only by news-sync's
+    /// backfill (audit final pre-mainnet W6 — News shares the identical gap,
+    /// not originally named in the finding but the same bug). (l2-node
+    /// 0.95.0+.)
+    pub const NEWS_EDIT_DELETE: &str = "news_edit_delete";
+
     /// All column family names for database initialization.
     pub const ALL: &[&str] = &[
         MESSAGES,
@@ -283,6 +313,9 @@ pub mod cf {
         DEVICE_REVOCATIONS,
         FOLLOW_EDGE_TS,
         CHANNEL_META_MSGS,
+        CHANNEL_EDIT_DELETE_MSGS,
+        DM_EDIT_DELETE_MSGS,
+        NEWS_EDIT_DELETE,
     ];
 }
 
@@ -318,6 +351,10 @@ pub mod state_keys {
     /// Sentinel: set to 1 after CHANNEL_META_MSGS is backfilled from existing
     /// MESSAGES (P-3b channel-metadata index, l2-node 0.53.0+).
     pub const CHANNEL_META_INDEXED: &[u8] = b"migration_channel_meta_indexed";
+    /// Sentinel: set to 1 after CHANNEL_EDIT_DELETE_MSGS/DM_EDIT_DELETE_MSGS/
+    /// NEWS_EDIT_DELETE are backfilled from existing MESSAGES (audit final
+    /// pre-mainnet W6, l2-node 0.95.0+).
+    pub const EDIT_DELETE_MARKERS_INDEXED: &[u8] = b"migration_edit_delete_markers_indexed";
     /// Sentinel: set to 1 after CHANNEL_MSGS is re-keyed from `lamport_ts` (always
     /// 0 from clients) to the wall-clock `timestamp` — chronological ordering +
     /// working unread fast-skip (l2-node 0.58.0+).

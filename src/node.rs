@@ -143,6 +143,19 @@ impl Node {
             }
         }
 
+        // Backfill CHANNEL_EDIT_DELETE_MSGS/DM_EDIT_DELETE_MSGS/NEWS_EDIT_DELETE
+        // from MESSAGES (one-time, audit final pre-mainnet W6) so edits/deletes
+        // that predate this migration also propagate via reconcile/dm-sync/
+        // news-sync backfill instead of being permanently unerasable on any
+        // fresh/cold-joining node.
+        let edit_delete_markers_indexed =
+            storage.get_stat(state_keys::EDIT_DELETE_MARKERS_INDEXED)? > 0;
+        if !edit_delete_markers_indexed {
+            if let Err(e) = storage.backfill_edit_delete_markers() {
+                warn!(error = %e, "Failed to backfill edit/delete marker indexes");
+            }
+        }
+
         // Re-key CHANNEL_MSGS from lamport_ts (always 0) to wall-clock timestamp
         // so the channel index is chronological + the unread fast-skip works.
         let channel_msgs_ts_reindexed =
