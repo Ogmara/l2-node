@@ -18,6 +18,30 @@ use serde::{Deserialize, Serialize};
 pub const MAX_BUILD_BYTES_PER_CF: u64 = 256 * 1024 * 1024;
 /// Maximum number of `(key, value)` entries per CF during a snapshot build.
 pub const MAX_BUILD_ENTRIES_PER_CF: u64 = 5_000_000;
+/// Sanity ceiling on a single chunk's DECLARED `uncompressed_bytes`
+/// (security-audit follow-up on W16, 2026-08-18). `decode_chunk`'s
+/// `Read::take` bound (added for W16) stops a chunk from decompressing to
+/// MORE than its own declared size, but the declared size itself is an
+/// honest producer's advisory value carried in `ChunkHeader` — nothing
+/// previously stopped a malicious/Sybil producer from declaring a huge but
+/// INTERNALLY CONSISTENT size (matching its own honest content and
+/// `chunk_hash`) for a single chunk, up to `u32::MAX` (~4.3 GiB), which
+/// `decode_chunk` would then happily allocate and read in full — the
+/// dishonesty (a single chunk far exceeding any sane producer's
+/// `chunk_size_bytes` target) would only be caught by the aggregate
+/// Merkle-root recompute AFTER every chunk in every CF has already been
+/// fetched and decoded. 128 MiB is 32x the default `chunk_size_bytes`
+/// (4 MiB) and matches libzstd's own default window-log ceiling
+/// (`ZSTD_WINDOWLOG_LIMIT_DEFAULT` = 2^27), giving generous headroom for
+/// any plausible operator configuration while keeping worst-case
+/// single-chunk decode memory small enough for the modest hardware this
+/// project targets. Enforced in TWO places (defense in depth): here in
+/// `decode_chunk` itself (the actual point of risk, so safety holds
+/// regardless of any upstream validation gap) and in
+/// `network::snapshot::SnapshotManifest::validate()` (fail-fast: reject an
+/// obviously-hostile manifest before spending any bandwidth on its
+/// chunks).
+pub const MAX_CHUNK_UNCOMPRESSED_BYTES: u32 = 128 * 1024 * 1024;
 
 /// Header describing a single chunk within a CF.
 ///
@@ -180,8 +204,15 @@ pub(crate) fn finish_chunk(
 /// Decode a chunk payload back into `(key, value)` rows.
 ///
 /// `compressed_bytes` is the on-wire payload; `codec_id` and `expected_hash`
-/// come from the manifest's `ChunkHeader`. Returns an error if the chunk
-/// hash doesn't match — receivers MUST drop the peer and refetch.
+/// come from the manifest's `ChunkHeader`. `uncompressed_bytes` is the
+/// header's DECLARED post-decompression size — used to bound the ZSTD
+/// decode itself (Security Audit W16: `zstd::stream::decode_all` had no
+/// output-size cap and ran BEFORE the hash check below, so a malicious or
+/// corrupt quorum mirror could answer `GetChunk` with a small zstd bomb
+/// (~100000:1 ratio) and OOM-kill the bootstrapping node before the
+/// mismatch was ever detected). Returns an error if the chunk hash doesn't
+/// match, OR if the decompressed size doesn't match what the header
+/// declared — receivers MUST drop the peer and refetch either way.
 ///
 /// Provided for use by the Phase 2/3 client. Verified by Phase 1 unit tests
 /// to keep the build/decode pair from silently diverging across releases.
@@ -189,13 +220,45 @@ pub fn decode_chunk(
     compressed_bytes: &[u8],
     codec_id: u8,
     expected_hash: &[u8; 32],
+    uncompressed_bytes: u32,
 ) -> Result<ChunkPayload> {
     use crate::crypto::merkle::hash_leaf;
+    use std::io::Read;
+
+    // Security-audit follow-up on W16: reject an internally-consistent but
+    // absurdly large declared size BEFORE attempting to decode it at all —
+    // see `MAX_CHUNK_UNCOMPRESSED_BYTES`'s doc comment for the full
+    // rationale (this is the "declared size itself is honest but huge"
+    // gap the take()-bound alone doesn't close).
+    if uncompressed_bytes > MAX_CHUNK_UNCOMPRESSED_BYTES {
+        anyhow::bail!(
+            "snapshot chunk declares {} uncompressed bytes, exceeding the {} sanity ceiling",
+            uncompressed_bytes,
+            MAX_CHUNK_UNCOMPRESSED_BYTES
+        );
+    }
 
     let uncompressed: Vec<u8> = match codec_id {
         id if id == super::schema::snapshot::codec::ZSTD => {
-            zstd::stream::decode_all(compressed_bytes)
-                .context("zstd decompressing snapshot chunk")?
+            let decoder = zstd::stream::Decoder::new(compressed_bytes)
+                .context("constructing zstd decoder for snapshot chunk")?;
+            // Read at most declared+1 bytes: enough to detect "the stream
+            // is LARGER than declared" without ever buffering a full bomb.
+            let cap = u64::from(uncompressed_bytes) + 1;
+            let mut buf = Vec::new();
+            decoder
+                .take(cap)
+                .read_to_end(&mut buf)
+                .context("zstd decompressing snapshot chunk")?;
+            if buf.len() as u64 > u64::from(uncompressed_bytes) {
+                anyhow::bail!(
+                    "snapshot chunk decompressed size exceeds declared uncompressed_bytes \
+                     ({} > {})",
+                    buf.len(),
+                    uncompressed_bytes
+                );
+            }
+            buf
         }
         id if id == super::schema::snapshot::codec::NONE => compressed_bytes.to_vec(),
         other => anyhow::bail!("unsupported snapshot codec id: {}", other),
@@ -269,7 +332,10 @@ mod tests {
         assert_eq!(header.last_key, b"c");
         assert_eq!(header.codec, codec::ZSTD);
 
-        let decoded = decode_chunk(&payload, header.codec, &header.chunk_hash).unwrap();
+        let decoded = decode_chunk(
+            &payload, header.codec, &header.chunk_hash, header.uncompressed_bytes,
+        )
+        .unwrap();
         assert_eq!(decoded.cf_name, "users");
         assert_eq!(decoded.seq, 0);
         assert_eq!(decoded.entries, sample_rows());
@@ -281,7 +347,10 @@ mod tests {
         assert_eq!(header.codec, codec::NONE);
         assert_eq!(header.uncompressed_bytes, header.compressed_bytes);
 
-        let decoded = decode_chunk(&payload, header.codec, &header.chunk_hash).unwrap();
+        let decoded = decode_chunk(
+            &payload, header.codec, &header.chunk_hash, header.uncompressed_bytes,
+        )
+        .unwrap();
         assert_eq!(decoded.entries, sample_rows());
     }
 
@@ -292,14 +361,55 @@ mod tests {
         if !payload.is_empty() {
             payload[0] ^= 0xff;
         }
-        let result = decode_chunk(&payload, header.codec, &header.chunk_hash);
+        let result = decode_chunk(
+            &payload, header.codec, &header.chunk_hash, header.uncompressed_bytes,
+        );
         assert!(result.is_err(), "tampered payload must be rejected");
     }
 
     #[test]
     fn decode_chunk_rejects_unknown_codec() {
-        let result = decode_chunk(b"abc", 99, &[0u8; 32]);
+        let result = decode_chunk(b"abc", 99, &[0u8; 32], 3);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn decode_chunk_rejects_zstd_bomb_exceeding_declared_size() {
+        // Security Audit W16: a chunk whose header UNDER-declares its real
+        // decompressed size (deliberately, to disguise a bomb, or simply
+        // corrupt) must be rejected — and rejected without ever buffering
+        // the full bomb. Build a genuine chunk, then lie about its declared
+        // uncompressed_bytes to simulate a malicious/corrupt header.
+        let (header, payload) = run_finish_chunk_with(codec::ZSTD);
+        assert!(header.uncompressed_bytes > 0, "sanity: sample rows encode to something");
+        let lied_uncompressed_bytes = header.uncompressed_bytes - 1;
+        let result = decode_chunk(
+            &payload, header.codec, &header.chunk_hash, lied_uncompressed_bytes,
+        );
+        assert!(
+            result.is_err(),
+            "a chunk that decompresses larger than its declared size must be rejected"
+        );
+    }
+
+    #[test]
+    fn decode_chunk_rejects_declared_size_above_the_sanity_ceiling() {
+        // Security-audit follow-up on W16: an INTERNALLY CONSISTENT chunk
+        // (genuine payload, genuine hash) that simply declares an absurdly
+        // large uncompressed_bytes must still be rejected — before any
+        // decompression is even attempted (a real bomb's payload bytes
+        // are irrelevant here; the ceiling check runs first).
+        let (header, payload) = run_finish_chunk_with(codec::ZSTD);
+        let result = decode_chunk(
+            &payload,
+            header.codec,
+            &header.chunk_hash,
+            MAX_CHUNK_UNCOMPRESSED_BYTES + 1,
+        );
+        assert!(
+            result.is_err(),
+            "a declared size above MAX_CHUNK_UNCOMPRESSED_BYTES must be rejected outright"
+        );
     }
 
     #[test]

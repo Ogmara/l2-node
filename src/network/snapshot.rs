@@ -162,6 +162,38 @@ impl SnapshotManifest {
             if cf.cf_name.len() > 64 {
                 anyhow::bail!("cf_name too long ({} > 64)", cf.cf_name.len());
             }
+            // Security-audit follow-up on W16 (2026-08-18): reject a
+            // manifest that declares an internally-consistent but
+            // absurdly large single chunk up-front, before any `GetChunk`
+            // round-trip is spent on it — `decode_chunk` enforces the same
+            // ceiling per-chunk as a second, independent layer (defense in
+            // depth), but failing here means a hostile producer's whole
+            // manifest is rejected in one cheap pass instead of partway
+            // through a multi-chunk fetch.
+            for chunk in &cf.chunks {
+                if chunk.uncompressed_bytes
+                    > crate::storage::snapshot::MAX_CHUNK_UNCOMPRESSED_BYTES
+                {
+                    anyhow::bail!(
+                        "cf '{}' chunk {} declares {} uncompressed bytes, exceeding the {} \
+                         sanity ceiling",
+                        cf.cf_name,
+                        chunk.seq,
+                        chunk.uncompressed_bytes,
+                        crate::storage::snapshot::MAX_CHUNK_UNCOMPRESSED_BYTES
+                    );
+                }
+                if chunk.compressed_bytes > MAX_CHUNK_BYTES {
+                    anyhow::bail!(
+                        "cf '{}' chunk {} declares {} compressed bytes, exceeding the {} \
+                         wire cap",
+                        cf.cf_name,
+                        chunk.seq,
+                        chunk.compressed_bytes,
+                        MAX_CHUNK_BYTES
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -798,6 +830,70 @@ mod tests {
             })
             .collect();
         assert!(m.validate().is_err());
+    }
+
+    fn chunk_with(uncompressed_bytes: u32, compressed_bytes: u32) -> crate::storage::snapshot::ChunkHeader {
+        crate::storage::snapshot::ChunkHeader {
+            seq: 0,
+            first_key: vec![],
+            last_key: vec![],
+            uncompressed_bytes,
+            compressed_bytes,
+            chunk_hash: [0u8; 32],
+            codec: crate::storage::schema::snapshot::codec::ZSTD,
+            num_entries: 1,
+        }
+    }
+
+    #[test]
+    fn validate_rejects_chunk_declaring_uncompressed_bytes_above_ceiling() {
+        // Security-audit follow-up on W16: fail-fast at the manifest level,
+        // before any GetChunk round-trip is spent on a hostile producer.
+        let mut m = good_manifest();
+        m.cfs = vec![crate::storage::snapshot::CfManifest {
+            cf_name: "users".into(),
+            num_entries: 1,
+            total_bytes: 100,
+            chunk_size_bytes: 4 * 1024 * 1024,
+            chunks: vec![chunk_with(
+                crate::storage::snapshot::MAX_CHUNK_UNCOMPRESSED_BYTES + 1,
+                1024,
+            )],
+            cf_root: [0u8; 32],
+        }];
+        assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_chunk_declaring_compressed_bytes_above_wire_cap() {
+        let mut m = good_manifest();
+        m.cfs = vec![crate::storage::snapshot::CfManifest {
+            cf_name: "users".into(),
+            num_entries: 1,
+            total_bytes: 100,
+            chunk_size_bytes: 4 * 1024 * 1024,
+            chunks: vec![chunk_with(1024, MAX_CHUNK_BYTES + 1)],
+            cf_root: [0u8; 32],
+        }];
+        assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_chunk_at_exactly_the_ceilings() {
+        // Boundary check: exactly-at-the-limit values must still pass.
+        let mut m = good_manifest();
+        m.cfs = vec![crate::storage::snapshot::CfManifest {
+            cf_name: "users".into(),
+            num_entries: 1,
+            total_bytes: 100,
+            chunk_size_bytes: 4 * 1024 * 1024,
+            chunks: vec![chunk_with(
+                crate::storage::snapshot::MAX_CHUNK_UNCOMPRESSED_BYTES,
+                MAX_CHUNK_BYTES,
+            )],
+            cf_root: [0u8; 32],
+        }];
+        assert!(m.validate().is_ok());
     }
 
     #[test]

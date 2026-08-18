@@ -5,6 +5,44 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.97.0] - 2026-08-18
+
+### Security
+
+- **Snapshot chunk decompression had no output-size cap — a malicious or
+  corrupt quorum mirror could OOM-kill a bootstrapping node with a small
+  zstd bomb (final pre-mainnet audit W16).** `decode_chunk` ran
+  `zstd::stream::decode_all` unconditionally, before the SHA-256 hash
+  check — so a ~100000:1 compression-ratio payload would fully expand into
+  memory before any corruption/tampering was ever detected. Snapshot
+  bootstrap is default-on and chunks come from quorum mirrors (semi-trusted,
+  not the local node's own data).
+  - `decode_chunk` now takes the manifest's declared `uncompressed_bytes`
+    and bounds the ZSTD decode with `zstd::stream::Decoder` +
+    `Read::take(uncompressed_bytes + 1)` — at most one byte more than
+    declared is ever buffered, regardless of how large the ACTUAL
+    decompressed content turns out to be. If the real decompressed size
+    exceeds what was declared, the chunk is rejected (same "drop the peer
+    and refetch" handling as a hash mismatch).
+  - **Security-audit follow-up, same day:** the `take()` bound alone left
+    a second gap — the declared `uncompressed_bytes` itself was honest
+    producer input up to `u32::MAX` (~4.3 GiB) with no sanity ceiling, so
+    a hostile producer could declare (and honestly provide) a single
+    internally-consistent chunk that large, which `decode_chunk` would
+    then dutifully allocate and read in full — the aggregate Merkle check
+    that would eventually flag such a dishonest producer only runs AFTER
+    every chunk in every CF has already been fetched and decoded. Added
+    `MAX_CHUNK_UNCOMPRESSED_BYTES` (128 MiB — 32x the default
+    `chunk_size_bytes`, matching libzstd's own default window-log
+    ceiling), enforced in two places: inside `decode_chunk` itself (the
+    actual point of risk) and in `SnapshotManifest::validate()` (fail-fast:
+    reject a hostile manifest before spending any bandwidth on its
+    chunks). Also added a matching `compressed_bytes` ceiling check in
+    `validate()` against the existing wire cap (`MAX_CHUNK_BYTES`, 16 MiB).
+  - All 12 `decode_chunk` call sites (1 production, 11 test — including
+    the Round 2 regression test below) pass `header.uncompressed_bytes`
+    through.
+
 ## [0.96.0] - 2026-08-18
 
 ### Security

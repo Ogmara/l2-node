@@ -450,8 +450,11 @@ async fn fetch_one_chunk(
                     ));
                     continue;
                 }
-                // decode_chunk verifies the SHA-256 hash against header.chunk_hash.
-                match decode_chunk(&payload, header.codec, &header.chunk_hash) {
+                // decode_chunk verifies the SHA-256 hash against header.chunk_hash
+                // and bounds decompression at header.uncompressed_bytes (W16).
+                match decode_chunk(
+                    &payload, header.codec, &header.chunk_hash, header.uncompressed_bytes,
+                ) {
                     Ok(p) => return Ok(p),
                     Err(e) => {
                         last_err = Some(e.context(format!("decode chunk from peer {}", peer)));
@@ -1415,7 +1418,9 @@ mod tests {
             for header in &cf.chunks {
                 let p = cache.chunks.get(&(cf.cf_name.clone(), header.seq)).unwrap();
                 by_cf.push(
-                    crate::storage::snapshot::decode_chunk(p.as_slice(), header.codec, &header.chunk_hash)
+                    crate::storage::snapshot::decode_chunk(
+                        p.as_slice(), header.codec, &header.chunk_hash, header.uncompressed_bytes,
+                    )
                         .unwrap(),
                 );
             }
@@ -1451,7 +1456,9 @@ mod tests {
             for header in &cf.chunks {
                 let p = cache.chunks.get(&(cf.cf_name.clone(), header.seq)).unwrap();
                 by_cf.push(
-                    crate::storage::snapshot::decode_chunk(p.as_slice(), header.codec, &header.chunk_hash)
+                    crate::storage::snapshot::decode_chunk(
+                        p.as_slice(), header.codec, &header.chunk_hash, header.uncompressed_bytes,
+                    )
                         .unwrap(),
                 );
             }
@@ -1649,6 +1656,7 @@ mod tests {
                     payload_arc.as_slice(),
                     header.codec,
                     &header.chunk_hash,
+                    header.uncompressed_bytes,
                 )
                 .expect("decode chunk");
                 by_cf.push(payload);
@@ -1745,6 +1753,7 @@ mod tests {
                     payload_arc.as_slice(),
                     header.codec,
                     &header.chunk_hash,
+                    header.uncompressed_bytes,
                 )
                 .expect("decode chunk");
                 by_cf.push(payload);
@@ -2060,6 +2069,7 @@ mod tests {
                         payload_arc.as_slice(),
                         header.codec,
                         &header.chunk_hash,
+                        header.uncompressed_bytes,
                     )
                     .unwrap(),
                 );
