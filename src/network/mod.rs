@@ -62,6 +62,32 @@ const RECONNECT_BASE_SECS: u64 = 5;
 /// Maximum backoff cap (seconds).
 const RECONNECT_MAX_SECS: u64 = 300;
 
+/// Requester-side abort threshold (audit final pre-mainnet W9): after this
+/// many CONSECUTIVE backfill pages with zero admitted envelopes (whether
+/// empty, fully cross-scope-dropped, or fully router-rejected), stop
+/// paging that session — the responder is stalling, not making progress.
+/// Shared across all four paginated backfill protocols (reconcile,
+/// identity-sync, news-sync, dm-sync); a legitimate large channel/wallet/
+/// feed keeps `admitted > 0` on nearly every real page, so this has a low
+/// false-positive rate against honest peers while stopping a peer that
+/// simply claims `has_more: true` forever with garbage.
+const MAX_CONSECUTIVE_UNPRODUCTIVE_PAGES: u32 = 5;
+/// Requester-side hard backstop on total pages per backfill session,
+/// regardless of productivity — bounds worst-case round-trips even
+/// against a peer that evades the consecutive-unproductive check above by
+/// interleaving one throwaway-valid envelope periodically. Comfortably
+/// above any HONEST peer's worst case (reconcile's own
+/// `total_envelopes_cap` default of 200k ÷ 1000/page = 200 pages;
+/// dm/news/identity-sync's own caps are 4-5k ÷ 200/page ≈ 20-25 pages).
+/// This bound on PAGE COUNT is only meaningful because each response
+/// handler separately caps PAGE SIZE too (security-audit follow-up): a
+/// malicious responder isn't bound by any protocol's own
+/// `MAX_ENVELOPES_PER_RESPONSE`, so without that companion check this
+/// constant alone wouldn't actually bound total verification work — see
+/// each `handle_*_event`'s oversized-page guard, right before its
+/// envelope-verification loop.
+const MAX_PAGES_PER_SESSION: u32 = 500;
+
 /// The running network layer.
 pub struct NetworkService {
     /// The libp2p swarm managing all protocols.
@@ -206,11 +232,11 @@ pub struct NetworkService {
     identity_sync_triggered: HashSet<String>,
     /// Server-side rate-limit state for inbound news-sync requests (P-3).
     news_sync_limits: Arc<news_sync::NewsResponderLimits>,
-    /// Outstanding outbound news-sync requests → the peer they went to (for
-    /// race-cancel + paging).
+    /// Outstanding outbound news-sync requests → the peer they went to plus
+    /// the requester-side paging budget (for race-cancel + paging; W9).
     pending_news_sync_requests: HashMap<
         libp2p::request_response::OutboundRequestId,
-        PeerId,
+        NewsSyncPending,
     >,
     /// Set once the one-time global-news backfill has been fired this process
     /// lifetime (only fires when NEWS_FEED was empty and peers existed).
@@ -338,6 +364,12 @@ struct PresenceValidationOutcome {
 struct ReconcilePending {
     peer_id: PeerId,
     channel_id: u64,
+    /// Requester-side paging budget state (audit final pre-mainnet W9).
+    /// `0`/`0` on the session's first request; threaded forward and
+    /// incremented on each subsequent page. See
+    /// `MAX_PAGES_PER_SESSION`/`MAX_CONSECUTIVE_UNPRODUCTIVE_PAGES`.
+    pages_fetched: u32,
+    consecutive_unproductive_pages: u32,
 }
 
 /// Per-pending-outbound-identity-sync state (P-1).
@@ -346,6 +378,9 @@ struct IdentitySyncPending {
     peer_id: PeerId,
     wallet: String,
     scopes: u8,
+    /// See `ReconcilePending`'s doc comment (audit final pre-mainnet W9).
+    pages_fetched: u32,
+    consecutive_unproductive_pages: u32,
 }
 
 /// Per-pending-outbound-dm-sync state (offline store-and-forward Phase 2).
@@ -353,6 +388,20 @@ struct IdentitySyncPending {
 struct DmSyncPending {
     peer_id: PeerId,
     wallet: String,
+    /// See `ReconcilePending`'s doc comment (audit final pre-mainnet W9).
+    pages_fetched: u32,
+    consecutive_unproductive_pages: u32,
+}
+
+/// Per-pending-outbound-news-sync state (P-3). Audit final pre-mainnet W9:
+/// previously a bare `PeerId` (news-sync has no per-subject key, it's a
+/// single global feed) — now a small struct so the requester-side paging
+/// budget (see `ReconcilePending`'s doc comment) has somewhere to live.
+#[derive(Debug, Clone)]
+struct NewsSyncPending {
+    peer_id: PeerId,
+    pages_fetched: u32,
+    consecutive_unproductive_pages: u32,
 }
 
 /// Command from the API/router task → network task asking it to lazily pull a
@@ -2062,7 +2111,13 @@ impl NetworkService {
                 .send_request(&peer, request.clone());
             self.pending_identity_sync_requests.insert(
                 id,
-                IdentitySyncPending { peer_id: peer, wallet: wallet.clone(), scopes },
+                IdentitySyncPending {
+                    peer_id: peer,
+                    wallet: wallet.clone(),
+                    scopes,
+                    pages_fetched: 0,
+                    consecutive_unproductive_pages: 0,
+                },
             );
         }
     }
@@ -2153,23 +2208,58 @@ impl NetworkService {
                 let env_count = response.envelopes.len();
                 let mut admitted = 0usize;
                 let mut dropped = 0usize;
-                for env_bytes in response.envelopes {
-                    // Smuggling defense: only apply identity envelopes of the
-                    // requested scopes (every envelope is still signature-
-                    // validated by the router below).
-                    if !envelope_targets_scope(&env_bytes, pending.scopes) {
-                        dropped += 1;
-                        continue;
-                    }
-                    match self.router.process_synced_message(&env_bytes) {
-                        RouteResult::Accepted { .. } | RouteResult::Duplicate => admitted += 1,
-                        RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
-                            warn!(peer = %peer, wallet = %pending.wallet, reason = %reason, "identity-sync: envelope rejected by router");
+                // Security-audit follow-up on W9: a malicious responder isn't
+                // bound by `identity_sync::MAX_ENVELOPES_PER_RESPONSE` — it
+                // can pack a raw wire response with far more envelopes (up to
+                // libp2p's response-size ceiling) to force real Ed25519
+                // verification work on every one of them before the W9
+                // paging-budget counters below even see the page. Refuse to
+                // verify ANY envelope in an oversized page — this protocol
+                // violation is treated as fully unproductive, feeding the
+                // SAME consecutive-unproductive-pages counter, so a peer
+                // that keeps over-sending gets cut off within a few pages
+                // without ever paying the verification cost.
+                if env_count > identity_sync::MAX_ENVELOPES_PER_RESPONSE {
+                    warn!(
+                        peer = %peer, wallet = %pending.wallet, received = env_count,
+                        expected_max = identity_sync::MAX_ENVELOPES_PER_RESPONSE,
+                        "identity-sync: response exceeds this protocol's own max page size; refusing to verify, treating as unproductive"
+                    );
+                } else {
+                    for env_bytes in response.envelopes {
+                        // Smuggling defense: only apply identity envelopes of the
+                        // requested scopes (every envelope is still signature-
+                        // validated by the router below).
+                        if !envelope_targets_scope(&env_bytes, pending.scopes) {
+                            dropped += 1;
+                            continue;
                         }
-                        RouteResult::PowRequired { .. } => {}
+                        match self.router.process_synced_message(&env_bytes) {
+                            RouteResult::Accepted { .. } | RouteResult::Duplicate => admitted += 1,
+                            RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
+                                warn!(peer = %peer, wallet = %pending.wallet, reason = %reason, "identity-sync: envelope rejected by router");
+                            }
+                            RouteResult::PowRequired { .. } => {}
+                        }
                     }
                 }
                 info!(peer = %peer, wallet = %pending.wallet, received = env_count, admitted, dropped, has_more = response.has_more, "identity-sync: applied bundle");
+
+                // Audit final pre-mainnet W9: requester-side paging budget.
+                let pages_fetched = pending.pages_fetched + 1;
+                let consecutive_unproductive_pages = if admitted > 0 {
+                    0
+                } else {
+                    pending.consecutive_unproductive_pages + 1
+                };
+                if pages_fetched >= MAX_PAGES_PER_SESSION {
+                    warn!(peer = %peer, wallet = %pending.wallet, pages_fetched, "identity-sync: hit page-count backstop; stopping this session");
+                    return;
+                }
+                if consecutive_unproductive_pages >= MAX_CONSECUTIVE_UNPRODUCTIVE_PAGES {
+                    warn!(peer = %peer, wallet = %pending.wallet, consecutive_unproductive_pages, "identity-sync: peer made no progress for too many consecutive pages; stopping this session");
+                    return;
+                }
 
                 if response.has_more {
                     if let Some(cursor) = response.next_cursor {
@@ -2191,6 +2281,8 @@ impl NetworkService {
                                 peer_id: pending.peer_id,
                                 wallet: pending.wallet,
                                 scopes: pending.scopes,
+                                pages_fetched,
+                                consecutive_unproductive_pages,
                             },
                         );
                     }
@@ -2258,7 +2350,10 @@ impl NetworkService {
                 .behaviour_mut()
                 .news_sync
                 .send_request(&peer, request.clone());
-            self.pending_news_sync_requests.insert(id, peer);
+            self.pending_news_sync_requests.insert(
+                id,
+                NewsSyncPending { peer_id: peer, pages_fetched: 0, consecutive_unproductive_pages: 0 },
+            );
         }
         self.news_backfill_triggered = true;
     }
@@ -2331,9 +2426,9 @@ impl NetworkService {
                 message: Message::Response { request_id, response },
                 connection_id: _,
             } => {
-                if self.pending_news_sync_requests.remove(&request_id).is_none() {
+                let Some(pending) = self.pending_news_sync_requests.remove(&request_id) else {
                     return;
-                }
+                };
                 if response.server_capped {
                     return;
                 }
@@ -2341,25 +2436,56 @@ impl NetworkService {
                     return;
                 }
                 // Race-winner: cancel sibling requests to other peers.
-                self.pending_news_sync_requests.retain(|_, p| *p == peer);
+                self.pending_news_sync_requests.retain(|_, p| p.peer_id == peer);
 
                 let count = response.envelopes.len();
                 let mut admitted = 0usize;
                 let mut dropped = 0usize;
-                for env_bytes in response.envelopes {
-                    if !envelope_targets_news(&env_bytes) {
-                        dropped += 1;
-                        continue;
-                    }
-                    match self.router.process_synced_message(&env_bytes) {
-                        RouteResult::Accepted { .. } | RouteResult::Duplicate => admitted += 1,
-                        RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
-                            warn!(peer = %peer, reason = %reason, "news-sync: envelope rejected by router");
+                // Security-audit follow-up on W9: see identity-sync's arm
+                // above for the full rationale — refuse to verify ANY
+                // envelope in a page that exceeds this protocol's own max
+                // page size, treating it as unproductive rather than
+                // paying the verification cost.
+                if count > news_sync::MAX_ENVELOPES_PER_RESPONSE {
+                    warn!(
+                        peer = %peer, received = count,
+                        expected_max = news_sync::MAX_ENVELOPES_PER_RESPONSE,
+                        "news-sync: response exceeds this protocol's own max page size; refusing to verify, treating as unproductive"
+                    );
+                } else {
+                    for env_bytes in response.envelopes {
+                        if !envelope_targets_news(&env_bytes) {
+                            dropped += 1;
+                            continue;
                         }
-                        RouteResult::PowRequired { .. } => {}
+                        match self.router.process_synced_message(&env_bytes) {
+                            RouteResult::Accepted { .. } | RouteResult::Duplicate => admitted += 1,
+                            RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
+                                warn!(peer = %peer, reason = %reason, "news-sync: envelope rejected by router");
+                            }
+                            RouteResult::PowRequired { .. } => {}
+                        }
                     }
                 }
                 info!(peer = %peer, received = count, admitted, dropped, has_more = response.has_more, "news-sync: applied batch");
+
+                // Audit final pre-mainnet W9: requester-side paging budget —
+                // stop asking this peer for more once it's clearly not
+                // making progress, or unconditionally past a hard backstop.
+                let pages_fetched = pending.pages_fetched + 1;
+                let consecutive_unproductive_pages = if admitted > 0 {
+                    0
+                } else {
+                    pending.consecutive_unproductive_pages + 1
+                };
+                if pages_fetched >= MAX_PAGES_PER_SESSION {
+                    warn!(peer = %peer, pages_fetched, "news-sync: hit page-count backstop; stopping this session");
+                    return;
+                }
+                if consecutive_unproductive_pages >= MAX_CONSECUTIVE_UNPRODUCTIVE_PAGES {
+                    warn!(peer = %peer, consecutive_unproductive_pages, "news-sync: peer made no progress for too many consecutive pages; stopping this session");
+                    return;
+                }
 
                 if response.has_more {
                     if let Some(cursor) = response.next_cursor {
@@ -2374,7 +2500,10 @@ impl NetworkService {
                             .behaviour_mut()
                             .news_sync
                             .send_request(&peer, next_req);
-                        self.pending_news_sync_requests.insert(next_id, peer);
+                        self.pending_news_sync_requests.insert(
+                            next_id,
+                            NewsSyncPending { peer_id: peer, pages_fetched, consecutive_unproductive_pages },
+                        );
                     }
                 }
             }
@@ -2499,7 +2628,12 @@ impl NetworkService {
                 .send_request(&peer, request);
             self.pending_dm_sync_requests.insert(
                 id,
-                DmSyncPending { peer_id: peer, wallet: wallet.to_string() },
+                DmSyncPending {
+                    peer_id: peer,
+                    wallet: wallet.to_string(),
+                    pages_fetched: 0,
+                    consecutive_unproductive_pages: 0,
+                },
             );
         }
         // Mark triggered even if all requests ultimately fail — re-auth retries
@@ -2628,20 +2762,49 @@ impl NetworkService {
                 let count = response.envelopes.len();
                 let mut admitted = 0usize;
                 let mut dropped = 0usize;
-                for env_bytes in response.envelopes {
-                    if !envelope_targets_dm(&env_bytes) {
-                        dropped += 1;
-                        continue;
-                    }
-                    match self.router.process_synced_message(&env_bytes) {
-                        RouteResult::Accepted { .. } | RouteResult::Duplicate => admitted += 1,
-                        RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
-                            warn!(peer = %peer, reason = %reason, "dm-sync: envelope rejected by router");
+                // Security-audit follow-up on W9: see identity-sync's arm
+                // above for the full rationale — refuse to verify ANY
+                // envelope in a page that exceeds this protocol's own max
+                // page size, treating it as unproductive rather than
+                // paying the verification cost.
+                if count > dm_sync::MAX_ENVELOPES_PER_RESPONSE {
+                    warn!(
+                        peer = %peer, wallet = %wallet, received = count,
+                        expected_max = dm_sync::MAX_ENVELOPES_PER_RESPONSE,
+                        "dm-sync: response exceeds this protocol's own max page size; refusing to verify, treating as unproductive"
+                    );
+                } else {
+                    for env_bytes in response.envelopes {
+                        if !envelope_targets_dm(&env_bytes) {
+                            dropped += 1;
+                            continue;
                         }
-                        RouteResult::PowRequired { .. } => {}
+                        match self.router.process_synced_message(&env_bytes) {
+                            RouteResult::Accepted { .. } | RouteResult::Duplicate => admitted += 1,
+                            RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
+                                warn!(peer = %peer, reason = %reason, "dm-sync: envelope rejected by router");
+                            }
+                            RouteResult::PowRequired { .. } => {}
+                        }
                     }
                 }
                 info!(peer = %peer, wallet = %wallet, received = count, admitted, dropped, has_more = response.has_more, "dm-sync: applied batch");
+
+                // Audit final pre-mainnet W9: requester-side paging budget.
+                let pages_fetched = pending.pages_fetched + 1;
+                let consecutive_unproductive_pages = if admitted > 0 {
+                    0
+                } else {
+                    pending.consecutive_unproductive_pages + 1
+                };
+                if pages_fetched >= MAX_PAGES_PER_SESSION {
+                    warn!(peer = %peer, wallet = %wallet, pages_fetched, "dm-sync: hit page-count backstop; stopping this session");
+                    return;
+                }
+                if consecutive_unproductive_pages >= MAX_CONSECUTIVE_UNPRODUCTIVE_PAGES {
+                    warn!(peer = %peer, wallet = %wallet, consecutive_unproductive_pages, "dm-sync: peer made no progress for too many consecutive pages; stopping this session");
+                    return;
+                }
 
                 if response.has_more {
                     if let Some(cursor) = response.next_cursor {
@@ -2670,8 +2833,10 @@ impl NetworkService {
                             .behaviour_mut()
                             .dm_sync
                             .send_request(&peer, next_req);
-                        self.pending_dm_sync_requests
-                            .insert(next_id, DmSyncPending { peer_id: peer, wallet });
+                        self.pending_dm_sync_requests.insert(
+                            next_id,
+                            DmSyncPending { peer_id: peer, wallet, pages_fetched, consecutive_unproductive_pages },
+                        );
                     }
                 }
             }
@@ -2844,6 +3009,8 @@ impl NetworkService {
                 ReconcilePending {
                     peer_id: peer,
                     channel_id,
+                    pages_fetched: 0,
+                    consecutive_unproductive_pages: 0,
                 },
             );
         }
@@ -2977,48 +3144,66 @@ impl NetworkService {
                 let env_count = response.envelopes.len();
                 let mut admitted = 0usize;
                 let mut cross_channel_dropped = 0usize;
-                for env_bytes in response.envelopes {
-                    // Security Audit W1 (0.47.0): cross-channel
-                    // smuggling defense. The responder could otherwise
-                    // stuff envelopes for channel B into a response
-                    // we sent for channel A; signatures verify (the
-                    // original authors really signed them) so the
-                    // router would happily index them under B in our
-                    // local CHANNEL_MSGS. Reject any envelope whose
-                    // payload-extracted channel_id does not equal the
-                    // channel we asked for. We can't fully validate
-                    // until after the router has deserialised the
-                    // payload, so we do a cheap pre-check on the
-                    // payload bytes here.
-                    if !envelope_targets_channel(
-                        &env_bytes,
-                        pending.channel_id,
-                    ) {
-                        cross_channel_dropped += 1;
-                        continue;
-                    }
-                    match self.router.process_synced_message(&env_bytes) {
-                        crate::messages::router::RouteResult::Accepted { .. } => {
-                            admitted += 1;
+                // Security-audit follow-up on W9: see identity-sync's arm
+                // (earlier in this file) for the full rationale — refuse to
+                // verify ANY envelope in a page that exceeds this node's
+                // OWN configured max page size, treating it as unproductive
+                // rather than paying the verification cost. Config-driven
+                // (not a fixed constant like the other three protocols)
+                // since reconcile's page size is an operator knob.
+                let max_page_size = self.backfill_config.max_envelopes_per_response;
+                if env_count > max_page_size {
+                    warn!(
+                        peer = %peer,
+                        channel_id = pending.channel_id,
+                        received = env_count,
+                        expected_max = max_page_size,
+                        "reconcile: response exceeds this node's own max page size; refusing to verify, treating as unproductive"
+                    );
+                } else {
+                    for env_bytes in response.envelopes {
+                        // Security Audit W1 (0.47.0): cross-channel
+                        // smuggling defense. The responder could otherwise
+                        // stuff envelopes for channel B into a response
+                        // we sent for channel A; signatures verify (the
+                        // original authors really signed them) so the
+                        // router would happily index them under B in our
+                        // local CHANNEL_MSGS. Reject any envelope whose
+                        // payload-extracted channel_id does not equal the
+                        // channel we asked for. We can't fully validate
+                        // until after the router has deserialised the
+                        // payload, so we do a cheap pre-check on the
+                        // payload bytes here.
+                        if !envelope_targets_channel(
+                            &env_bytes,
+                            pending.channel_id,
+                        ) {
+                            cross_channel_dropped += 1;
+                            continue;
                         }
-                        crate::messages::router::RouteResult::Duplicate => {
-                            // Already had this envelope locally —
-                            // counted as "won the race" but no
-                            // storage write needed.
-                            admitted += 1;
-                        }
-                        crate::messages::router::RouteResult::Rejected(reason)
-                        | crate::messages::router::RouteResult::Invalid(reason) => {
-                            warn!(
-                                peer = %peer,
-                                channel_id = pending.channel_id,
-                                reason = %reason,
-                                "reconcile: peer envelope rejected by router"
-                            );
-                        }
-                        crate::messages::router::RouteResult::PowRequired { .. } => {
-                            // Sync messages are PoW-exempt — should
-                            // not fire. Skip if it does.
+                        match self.router.process_synced_message(&env_bytes) {
+                            crate::messages::router::RouteResult::Accepted { .. } => {
+                                admitted += 1;
+                            }
+                            crate::messages::router::RouteResult::Duplicate => {
+                                // Already had this envelope locally —
+                                // counted as "won the race" but no
+                                // storage write needed.
+                                admitted += 1;
+                            }
+                            crate::messages::router::RouteResult::Rejected(reason)
+                            | crate::messages::router::RouteResult::Invalid(reason) => {
+                                warn!(
+                                    peer = %peer,
+                                    channel_id = pending.channel_id,
+                                    reason = %reason,
+                                    "reconcile: peer envelope rejected by router"
+                                );
+                            }
+                            crate::messages::router::RouteResult::PowRequired { .. } => {
+                                // Sync messages are PoW-exempt — should
+                                // not fire. Skip if it does.
+                            }
                         }
                     }
                 }
@@ -3031,6 +3216,22 @@ impl NetworkService {
                     has_more = response.has_more,
                     "reconcile: applied response batch"
                 );
+
+                // Audit final pre-mainnet W9: requester-side paging budget.
+                let pages_fetched = pending.pages_fetched + 1;
+                let consecutive_unproductive_pages = if admitted > 0 {
+                    0
+                } else {
+                    pending.consecutive_unproductive_pages + 1
+                };
+                if pages_fetched >= MAX_PAGES_PER_SESSION {
+                    warn!(peer = %peer, channel_id = pending.channel_id, pages_fetched, "reconcile: hit page-count backstop; stopping this session");
+                    return;
+                }
+                if consecutive_unproductive_pages >= MAX_CONSECUTIVE_UNPRODUCTIVE_PAGES {
+                    warn!(peer = %peer, channel_id = pending.channel_id, consecutive_unproductive_pages, "reconcile: peer made no progress for too many consecutive pages; stopping this session");
+                    return;
+                }
 
                 // Continue paging from the winning peer if the
                 // responder signalled more data.
@@ -3061,6 +3262,8 @@ impl NetworkService {
                             ReconcilePending {
                                 peer_id: pending.peer_id,
                                 channel_id: pending.channel_id,
+                                pages_fetched,
+                                consecutive_unproductive_pages,
                             },
                         );
                     }

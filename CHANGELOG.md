@@ -5,6 +5,71 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.98.0] - 2026-08-18
+
+### Security
+
+- **Requester-side backfill paging was unbounded — a malicious responder
+  could hold the swarm event loop in an infinite validation loop (final
+  pre-mainnet audit W9).** All four paginated backfill protocols
+  (reconcile, identity-sync, news-sync, dm-sync) re-requested the next
+  page unconditionally whenever a response claimed `has_more: true`, with
+  no requester-side budget of any kind — `TOTAL_ENVELOPES_CAP`/
+  `total_envelopes_cap` are the RESPONDER's own self-imposed limits; an
+  honest peer stops itself, but nothing stopped a peer that simply crafts
+  raw wire responses claiming `has_more: true` forever with zero or
+  garbage envelopes, each page still costing a Keccak+Ed25519 validation
+  pass inline in the shared swarm loop. Reachable automatically — cold-join
+  backfill fires without any user action.
+  - Each protocol's outbound-request tracking state now carries a
+    requester-side paging budget: `pages_fetched` and
+    `consecutive_unproductive_pages` (pages where nothing was actually
+    admitted — empty, fully cross-scope-dropped, or fully router-rejected).
+    A session stops paging once either threshold is hit
+    (`MAX_CONSECUTIVE_UNPRODUCTIVE_PAGES = 5`,
+    `MAX_PAGES_PER_SESSION = 500`, both in `network/mod.rs`, shared across
+    all four protocols).
+  - Chose "consecutive unproductive pages" over a low flat page-count cap
+    deliberately: a legitimate large channel/wallet/feed genuinely needs
+    many pages of real content, and that's fine — the vulnerability is a
+    peer making NO progress, not a peer serving a lot of genuine data.
+  - `network/sync.rs` (the W7 "legacy" protocol) is unaffected — its
+    response handler never re-requests on `has_more` at all, so it was
+    already immune to this class.
+  - Scoped narrowly: "drop the peer" (the finding's suggested fix text)
+    means stop paging this session, not a libp2p-level disconnect/ban —
+    actual peer reputation/scoring is W10's job (gossipsub peer scoring),
+    not this fix's.
+  - **Security-audit follow-up, same day:** the page-count budget alone
+    still let a malicious responder pack a raw wire response with far more
+    envelopes than any protocol's own documented page size (up to
+    libp2p's much larger response-size ceiling), and game the
+    `admitted`-tracking (which already counts `RouteResult::Duplicate` the
+    same as `Accepted`) by resending one already-known envelope every few
+    pages to stay under the consecutive-unproductive threshold — forcing
+    real Ed25519 verification on every envelope of every oversized page,
+    up to the 500-page hard backstop. Fixed by refusing to verify ANY
+    envelope in a page whose count exceeds that protocol's own expected
+    max (`identity_sync`/`news_sync`/`dm_sync::MAX_ENVELOPES_PER_RESPONSE`
+    = 200; reconcile's own configured `max_envelopes_per_response`) —
+    an oversized page is itself unambiguous misbehavior (no honest
+    responder ever exceeds its own documented cap), so it's treated as a
+    zero-`admitted` page and fed into the SAME W9 threshold machinery
+    rather than adding a parallel abort path.
+  - **Considered and deliberately deferred**, same review: also bounding
+    each protocol's CBOR codec at the libp2p transport layer
+    (`set_response_size_maximum`, following the existing `snapshot`
+    protocol's precedent in `network/behaviour.rs`) as defense-in-depth
+    against raw wire-byte bloat. Not applied here — unlike snapshot chunks
+    (a single well-known size), right-sizing a byte cap per protocol risks
+    breaking legitimate large content (e.g. `news_sync`'s own
+    `MAX_NEWS_CONTENT` allows single posts up to 64 KiB, so 200 envelopes
+    can legitimately approach the transport's existing 10 MiB default) —
+    and the envelope-COUNT cap above already closes the actual CPU-cost
+    vulnerability (unbounded Ed25519 verification), which was the crux of
+    the finding. Left as a follow-up for whenever the per-protocol byte
+    budgets are worth the calibration risk.
+
 ## [0.97.0] - 2026-08-18
 
 ### Security
