@@ -5,6 +5,32 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.99.0] - 2026-08-18
+
+### Security
+
+- **`get_comment_count`/`get_counter_vote_count` materialized up to 10,000
+  full rows just to count them, on a hot feed-enrichment path called once
+  per post per request (final pre-mainnet audit W20).** Both called
+  `prefix_iter_cf(..., 10_000)` and took `.len()` — heap-copying every key
+  AND value into an owned `Vec<(Vec<u8>, Vec<u8>)>` only to discard the
+  bytes immediately. A post with thousands of comments, multiplied by
+  every post on a page in the default feed, meant real CPU/allocation
+  amplification within the existing per-IP rate limit.
+  - New `Storage::count_prefix_cf` walks the identical
+    `raw_iterator_cf`/`seek`/prefix-check/`next` loop as `prefix_iter_cf`
+    but never calls `.to_vec()` on anything — same O(n) row traversal,
+    zero allocation. Both hot functions now call it directly.
+  - Deliberately NOT switched to a cached running-counter CF (the audit's
+    other suggested option, `REACTION_COUNTS`/`REPOST_COUNTS`-style):
+    `NEWS_COMMENTS` is keyed by `(post_id, timestamp, msg_id)` so an
+    increment-only counter would be safe there, but `COUNTER_VOTES` is
+    keyed by `(target_id, voter)` — a second vote from the same voter
+    overwrites their own row rather than creating a new one (idempotent,
+    one vote per voter), so a naive increment-only counter would have
+    double-counted repeat voters. A raw recount avoids that whole class of
+    bug for free and needs no new CF or migration.
+
 ## [0.98.0] - 2026-08-18
 
 ### Security

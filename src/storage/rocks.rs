@@ -370,6 +370,45 @@ impl Storage {
         Ok(results)
     }
 
+    /// Count entries under a prefix without materializing their keys/values.
+    ///
+    /// Security audit final pre-mainnet W20: `get_comment_count`/
+    /// `get_counter_vote_count` used to call `prefix_iter_cf(..., 10_000)`
+    /// and take `.len()` — heap-copying every key AND value into an owned
+    /// `Vec<(Vec<u8>, Vec<u8>)>` (up to 10,000 entries) just to discard the
+    /// bytes and keep a count, on a hot feed-enrichment path called once per
+    /// post per request. This walks the same rows via the identical
+    /// `raw_iterator_cf`/`seek`/prefix-check/`next` loop as `prefix_iter_cf`
+    /// but never calls `.to_vec()` on anything — same O(n) row traversal,
+    /// zero allocation.
+    pub fn count_prefix_cf(&self, cf_name: &str, prefix: &[u8], limit: usize) -> Result<u64> {
+        let cf = self
+            .db
+            .cf_handle(cf_name)
+            .with_context(|| format!("column family '{}' not found", cf_name))?;
+
+        let mut iter = self.db.raw_iterator_cf(&cf);
+        iter.seek(prefix);
+
+        // Security-audit follow-up: unlike `prefix_iter_cf`, this only
+        // reads `iter.key()`, never `iter.value()` — safe because
+        // `DBRawIteratorWithThreadMode::key()`/`value()` are both gated on
+        // the identical `valid()` check with no mutation between them
+        // (rust-rocksdb), so a `Some` key with an unreadable value can't
+        // occur outside DB corruption; the two functions walk the same
+        // row set.
+        let mut count = 0u64;
+        while iter.valid() && (count as usize) < limit {
+            match iter.key() {
+                Some(key) if key.starts_with(prefix) => count += 1,
+                _ => break,
+            }
+            iter.next();
+        }
+
+        Ok(count)
+    }
+
     /// Iterate over a column family starting strictly after a given key.
     ///
     /// Seeks to `start_key`, skips it, then iterates forward within the prefix.
@@ -2171,8 +2210,7 @@ impl Storage {
 
     /// Get the comment count for a news post by prefix-scanning NEWS_COMMENTS.
     pub fn get_comment_count(&self, post_id: &[u8; 32]) -> Result<u64> {
-        let entries = self.prefix_iter_cf(cf::NEWS_COMMENTS, post_id, 10_000)?;
-        Ok(entries.len() as u64)
+        self.count_prefix_cf(cf::NEWS_COMMENTS, post_id, 10_000)
     }
 
     // --- Deletion Markers ---
@@ -2378,8 +2416,7 @@ impl Storage {
 
     /// Get the counter-vote count for a target.
     pub fn get_counter_vote_count(&self, target_id: &[u8; 32]) -> Result<u64> {
-        let entries = self.prefix_iter_cf(cf::COUNTER_VOTES, target_id, 10_000)?;
-        Ok(entries.len() as u64)
+        self.count_prefix_cf(cf::COUNTER_VOTES, target_id, 10_000)
     }
 
     /// Store a channel mute record.
@@ -3533,5 +3570,101 @@ mod backfill_edit_delete_markers_tests {
             .prefix_iter_cf(cf::CHANNEL_EDIT_DELETE_MSGS, &channel_id.to_be_bytes(), 10)
             .unwrap();
         assert_eq!(chat_rows_again.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod count_prefix_cf_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn db() -> (Storage, TempDir) {
+        let dir = TempDir::new().unwrap();
+        (Storage::open(dir.path()).unwrap(), dir)
+    }
+
+    /// Security audit final pre-mainnet W20: `count_prefix_cf` must return
+    /// the exact same count `prefix_iter_cf(...).len()` would, without
+    /// materializing any key/value bytes.
+    #[test]
+    fn count_prefix_cf_matches_prefix_iter_cf_len() {
+        let (s, _d) = db();
+        let prefix = [7u8; 32];
+        for i in 0..5u8 {
+            let mut key = prefix.to_vec();
+            key.push(i);
+            s.put_cf(cf::COUNTER_VOTES, &key, b"x").unwrap();
+        }
+        // An unrelated prefix must not be counted.
+        s.put_cf(cf::COUNTER_VOTES, &[9u8; 33], b"x").unwrap();
+
+        let counted = s.count_prefix_cf(cf::COUNTER_VOTES, &prefix, 10_000).unwrap();
+        let materialized = s.prefix_iter_cf(cf::COUNTER_VOTES, &prefix, 10_000).unwrap();
+        assert_eq!(counted, 5);
+        assert_eq!(counted as usize, materialized.len());
+    }
+
+    #[test]
+    fn count_prefix_cf_respects_limit() {
+        let (s, _d) = db();
+        let prefix = [3u8; 32];
+        for i in 0..10u8 {
+            let mut key = prefix.to_vec();
+            key.push(i);
+            s.put_cf(cf::COUNTER_VOTES, &key, b"x").unwrap();
+        }
+        assert_eq!(s.count_prefix_cf(cf::COUNTER_VOTES, &prefix, 4).unwrap(), 4);
+        assert_eq!(s.count_prefix_cf(cf::COUNTER_VOTES, &prefix, 10_000).unwrap(), 10);
+    }
+
+    #[test]
+    fn count_prefix_cf_no_matches_is_zero() {
+        let (s, _d) = db();
+        assert_eq!(s.count_prefix_cf(cf::COUNTER_VOTES, &[1u8; 32], 10_000).unwrap(), 0);
+    }
+
+    #[test]
+    fn count_prefix_cf_with_a_genuinely_empty_prefix_counts_the_whole_cf() {
+        // Code-audit follow-up on W20: the previous "empty prefix" test
+        // actually used a full 32-byte prefix with no matches, not an
+        // empty `&[]` prefix. `&[]` is a real, valid input (every key
+        // "starts_with" an empty slice), so it should count every row in
+        // the column family regardless of which of several distinct
+        // prefixes each row happens to have.
+        let (s, _d) = db();
+        s.put_cf(cf::COUNTER_VOTES, &[1u8; 33], b"x").unwrap();
+        s.put_cf(cf::COUNTER_VOTES, &[2u8; 33], b"x").unwrap();
+        s.put_cf(cf::COUNTER_VOTES, &[3u8; 33], b"x").unwrap();
+        assert_eq!(s.count_prefix_cf(cf::COUNTER_VOTES, &[], 10_000).unwrap(), 3);
+    }
+
+    #[test]
+    fn get_comment_count_reflects_real_writes() {
+        let (s, _d) = db();
+        let post_id = [4u8; 32];
+        for i in 0..3u8 {
+            let key = crate::storage::schema::encode_news_comment_key(&post_id, 1_000 + i as u64, &[i; 32]);
+            s.put_cf(cf::NEWS_COMMENTS, &key, &[]).unwrap();
+        }
+        assert_eq!(s.get_comment_count(&post_id).unwrap(), 3);
+        assert_eq!(s.get_comment_count(&[0u8; 32]).unwrap(), 0);
+    }
+
+    #[test]
+    fn get_counter_vote_count_reflects_real_writes() {
+        let (s, _d) = db();
+        let target_id = [5u8; 32];
+        s.store_counter_vote(&target_id, "klv1voter1", 1_000).unwrap();
+        s.store_counter_vote(&target_id, "klv1voter2", 1_001).unwrap();
+        assert_eq!(s.get_counter_vote_count(&target_id).unwrap(), 2);
+
+        // Same voter voting again overwrites their own row (idempotent,
+        // one vote per voter) rather than double-counting — this is the
+        // EXISTING `encode_counter_vote_key(target, voter)` semantic,
+        // unchanged by this fix; a naive increment-only cached counter
+        // would have gotten this wrong, which is why this fix uses a raw
+        // recount instead.
+        s.store_counter_vote(&target_id, "klv1voter1", 1_002).unwrap();
+        assert_eq!(s.get_counter_vote_count(&target_id).unwrap(), 2);
     }
 }
