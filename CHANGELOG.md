@@ -5,6 +5,38 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.96.0] - 2026-08-18
+
+### Security
+
+- **Legacy sync protocol had no inbound rate limit and no response scope
+  filter (final pre-mainnet audit W7).** `network/sync.rs` is the ONLY
+  mechanism that fills the gap when a node reconnects after being briefly
+  offline (`reconcile.rs`'s cold-join backfill only fires when a channel
+  has zero local history; GossipSub has no message-history replay) — the
+  "legacy" name predates the newer sync-protocol family and doesn't mean
+  vestigial. Explicitly considered retiring it instead of hardening it
+  (mainnet won't carry testnet-era cruft, and testnet can be reset) but
+  verified it's load-bearing with an unbounded gap otherwise (a node down
+  for days relies solely on this path to catch up), so hardened it per the
+  audit's original suggestion.
+  - Inbound `SyncRequest`s now go through the same `(peer, channel)`
+    concurrency + cumulative-envelope cap every sibling protocol already
+    has — reuses `reconcile::ResponderLimits`/`ResponderGuard` directly
+    rather than a duplicate type, since `ChannelMessages` (the only sync
+    request type with a live requester) is `(peer, channel_id)`-shaped,
+    identical to `ReconcileRequest`'s key space.
+  - Outbound sync requests now track their `channel_id` by
+    `OutboundRequestId`, so the response handler can reject any envelope
+    that doesn't match the channel actually requested (mirrors reconcile's
+    `envelope_targets_channel` smuggling defense) — previously a
+    responder could return content for an entirely different channel with
+    no detection.
+  - `SyncResponse` gains a `server_capped: bool` field (`#[serde(default)]`
+    — old-shaped CBOR still decodes, no protocol-version bump needed, no
+    hard cutover required for the 2-node testnet fleet to upgrade
+    one-at-a-time), matching every sibling response type.
+
 ## [0.95.0] - 2026-08-18
 
 ### Security

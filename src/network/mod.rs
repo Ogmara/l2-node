@@ -176,6 +176,21 @@ pub struct NetworkService {
     /// (e.g., the channel is genuinely silent). Cleared on process
     /// restart.
     reconcile_triggered: HashSet<u64>,
+    /// Server-side rate-limit state for inbound `sync::SyncRequest`s (audit
+    /// final pre-mainnet W7). Reuses `reconcile::ResponderLimits` directly
+    /// rather than a duplicate type — `SyncRequestType::ChannelMessages` is
+    /// `(peer, channel_id)`-shaped, identical to `ReconcileRequest`'s key
+    /// space, since both are per-channel content-fetch protocols.
+    sync_limits: Arc<reconcile::ResponderLimits>,
+    /// Outstanding outbound sync-protocol requests, keyed by libp2p
+    /// `OutboundRequestId` → the `channel_id` the request was for. Used by
+    /// the response handler as a smuggling defense (audit final
+    /// pre-mainnet W7): a responder can't answer a `ChannelMessages`
+    /// request for channel A with envelopes for channel B. No peer_id
+    /// needed here (unlike `pending_reconcile_requests`) — `sync_channels_
+    /// with_peer` dials one specific peer directly per channel, no
+    /// fanout/racing to cancel.
+    pending_sync_requests: HashMap<libp2p::request_response::OutboundRequestId, u64>,
     /// Server-side rate-limit state for inbound `IdentitySyncRequest`s,
     /// keyed by `(peer, wallet)` (P-1, l2-node 0.50.0+).
     identity_sync_limits: Arc<identity_sync::IdentityResponderLimits>,
@@ -797,6 +812,8 @@ impl NetworkService {
             reconcile_limits: Arc::new(reconcile::ResponderLimits::default()),
             pending_reconcile_requests: HashMap::new(),
             reconcile_triggered: HashSet::new(),
+            sync_limits: Arc::new(reconcile::ResponderLimits::default()),
+            pending_sync_requests: HashMap::new(),
             identity_sync_limits: Arc::new(identity_sync::IdentityResponderLimits::default()),
             pending_identity_sync_requests: HashMap::new(),
             identity_sync_triggered: HashSet::new(),
@@ -3206,14 +3223,56 @@ impl NetworkService {
                     "Received sync request"
                 );
 
-                let response = sync::build_sync_response(request, &self.storage);
+                // Audit final pre-mainnet W7: rate-limit + cumulative cap
+                // before doing any storage work, mirroring reconcile's
+                // Request-arm handling. Reuses `reconcile::ResponderLimits`
+                // directly (see `sync_limits`'s field doc). Unimplemented
+                // request types (no live requester) fall back to
+                // `channel_id.unwrap_or(0)` — gating them too is harmless
+                // (they already produce an empty response for free) and
+                // keeps this uniform with every other protocol's
+                // unconditional gating. Security-audit follow-up: this
+                // shared bucket relies on `channel_id == 0` never being a
+                // valid channel (enforced in `messages/validation.rs`, 11
+                // separate checks) — if that invariant ever changes, this
+                // would silently become a starvation vector between free
+                // stub-type spam and legitimate channel-0 traffic.
+                let request_type = request.request_type;
+                let channel_id = request.channel_id.unwrap_or(0);
+                let guard = self.sync_limits.try_acquire(
+                    peer,
+                    channel_id,
+                    sync::SERVER_MAX_CONCURRENT_PER_PEER,
+                    sync::SERVER_MAX_CONCURRENT_PER_CHANNEL,
+                    sync::TOTAL_ENVELOPES_CAP,
+                );
+                let response = if guard.is_none() {
+                    debug!(
+                        peer = %peer,
+                        channel_id,
+                        "sync: rate-limited or session-cap exhausted; \
+                         responding server_capped"
+                    );
+                    sync::capped_response(request_type)
+                } else {
+                    sync::build_sync_response(request, &self.storage)
+                };
 
                 info!(
                     peer = %peer,
                     messages = response.messages.len(),
                     has_more = response.has_more,
+                    server_capped = response.server_capped,
                     "Sending sync response"
                 );
+
+                if !response.messages.is_empty() {
+                    self.sync_limits.add_served(
+                        peer,
+                        channel_id,
+                        response.messages.len() as u64,
+                    );
+                }
 
                 if self
                     .swarm
@@ -3230,8 +3289,8 @@ impl NetworkService {
                 peer,
                 message:
                     request_response::Message::Response {
+                        request_id,
                         response,
-                        ..
                     },
                 ..
             } => {
@@ -3240,12 +3299,44 @@ impl NetworkService {
                     request_type = ?response.request_type,
                     messages = response.messages.len(),
                     has_more = response.has_more,
+                    server_capped = response.server_capped,
                     "Received sync response"
                 );
 
+                // Audit final pre-mainnet W7: look up which channel THIS
+                // request was for; drop any envelope that doesn't match
+                // (smuggling defense — mirrors reconcile's
+                // `envelope_targets_channel` check on its own response
+                // path). An unknown request_id (already handled, or from a
+                // race) is logged and ignored, same shape as reconcile's
+                // "response for unknown request_id" case.
+                let Some(expected_channel) = self.pending_sync_requests.remove(&request_id)
+                else {
+                    debug!(
+                        peer = %peer,
+                        ?request_id,
+                        "sync: response for unknown request_id (already handled or stale)"
+                    );
+                    return;
+                };
+
+                if response.server_capped {
+                    debug!(
+                        peer = %peer,
+                        expected_channel,
+                        "sync: peer responded server_capped; back off"
+                    );
+                    return;
+                }
+
                 let mut accepted = 0u32;
                 let mut rejected = 0u32;
+                let mut cross_channel_dropped = 0u32;
                 for msg_bytes in &response.messages {
+                    if !envelope_targets_channel(msg_bytes, expected_channel) {
+                        cross_channel_dropped += 1;
+                        continue;
+                    }
                     self.counters.add_bytes_in(msg_bytes.len() as u64);
                     self.counters.inc_messages_received();
                     match self.router.process_synced_message(msg_bytes) {
@@ -3265,14 +3356,23 @@ impl NetworkService {
                         }
                     }
                 }
+                if cross_channel_dropped > 0 {
+                    warn!(
+                        peer = %peer,
+                        expected_channel,
+                        cross_channel_dropped,
+                        "sync: dropped envelopes targeting a different channel than requested"
+                    );
+                }
                 if accepted > 0 || rejected > 0 {
                     info!(accepted, rejected, "Sync response processed");
                 }
             }
 
             request_response::Event::OutboundFailure {
-                peer, error, ..
+                peer, request_id, error, ..
             } => {
+                self.pending_sync_requests.remove(&request_id);
                 warn!(peer = %peer, error = %error, "Sync request failed");
             }
 
@@ -3494,10 +3594,16 @@ impl NetworkService {
                 proof_timestamp: None,
             };
 
-            self.swarm
+            let request_id = self
+                .swarm
                 .behaviour_mut()
                 .request_response
                 .send_request(&peer_id, request);
+            // Audit final pre-mainnet W7: remember which channel this
+            // request was for, so the response handler can reject envelopes
+            // for any OTHER channel (a responder answering a ChannelMessages
+            // request for channel A with envelopes for channel B).
+            self.pending_sync_requests.insert(request_id, channel_id);
         }
     }
 

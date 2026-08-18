@@ -61,6 +61,15 @@ pub struct SyncResponse {
     pub messages: Vec<Vec<u8>>,
     /// Whether more data is available (pagination).
     pub has_more: bool,
+    /// `true` when the responder hit its per-peer or per-channel rate limit
+    /// (audit final pre-mainnet W7). `messages` is empty in this case; the
+    /// requester should back off and retry later. `#[serde(default)]` keeps
+    /// old-shaped CBOR bytes decodable (decodes to `false`) — no protocol
+    /// version bump needed, mirrors every sibling response type
+    /// (`ReconcileResponse`/`DmSyncResponse`/`NewsSyncResponse`) which
+    /// already has this field.
+    #[serde(default)]
+    pub server_capped: bool,
 }
 
 /// Codec type alias for the sync protocol.
@@ -118,6 +127,42 @@ pub fn build_sync_response(request: SyncRequest, storage: &Storage) -> SyncRespo
         request_type: request.request_type,
         messages,
         has_more,
+        server_capped: false,
+    }
+}
+
+// --- Responder rate limiting (audit final pre-mainnet W7) ---
+//
+// `ChannelMessages` (the only request type with a live requester —
+// `DirectMessages`/`NewsPosts`/`NewsPostsByTag`/`UserPosts` are unimplemented
+// stubs; `PrivateChannelMessages`/`PrivateChannelKeys` are W8, confirmed
+// unreachable) is `(peer, channel_id)`-shaped — identical to
+// `reconcile::ReconcileRequest`'s key space, since both are "per-channel
+// content fetch" protocols. `network/mod.rs` reuses
+// `reconcile::ResponderLimits`/`ResponderGuard` directly rather than
+// duplicating them here.
+
+/// Per-peer concurrency cap for inbound sync requests, mirroring
+/// `[backfill] server_max_concurrent_per_peer`'s default.
+pub const SERVER_MAX_CONCURRENT_PER_PEER: usize = 4;
+/// Per-(peer, channel) concurrency cap, mirroring
+/// `[backfill] server_max_concurrent_per_channel`'s default.
+pub const SERVER_MAX_CONCURRENT_PER_CHANNEL: usize = 1;
+/// Cumulative envelopes one (peer, channel) pair may pull per process
+/// lifetime. Smaller than reconcile's 200_000 default: sync.rs is an
+/// incremental reconnect-catchup protocol (bounded by `after_timestamp`),
+/// not a bulk full-history transfer.
+pub const TOTAL_ENVELOPES_CAP: u64 = 5_000;
+
+/// Construct a `server_capped` response (no envelopes) — used when the
+/// per-peer or per-channel rate limit denies the request (audit final
+/// pre-mainnet W7).
+pub fn capped_response(request_type: SyncRequestType) -> SyncResponse {
+    SyncResponse {
+        request_type,
+        messages: Vec::new(),
+        has_more: false,
+        server_capped: true,
     }
 }
 
