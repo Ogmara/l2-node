@@ -5,6 +5,69 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.100.0] - 2026-08-18
+
+### Security
+
+- **Non-presence gossip had no per-peer rate limit and gossipsub peer
+  scoring was never enabled — a flood of invalid envelopes on any
+  channel/DM/news topic ran full Keccak+Ed25519+storage validation inline
+  on the single swarm event-loop task with nothing to slow it down (final
+  pre-mainnet audit W10).** `handle_presence_message` already had this
+  protection (async + `Semaphore`-bounded); every other gossip topic did
+  not.
+  - New per-peer fixed-window rate limiter (`NetworkService::gossip_rate_limiter`,
+    50 msgs/sec, 16,384-peer Sybil soft cap mirroring `PresenceRateLimiter`)
+    is checked in `handle_swarm_event` **before** `handle_gossip_message`
+    runs, so a flooding peer's messages never reach the router at all.
+  - Enabled gossipsub peer scoring (`with_peer_score`, library-default
+    `PeerScoreParams`/`PeerScoreThresholds`) in `behaviour.rs`. Read the
+    vendored gossipsub 0.49.4 source to confirm scope: P1-P4 (per-topic
+    mesh-quality scoring) requires `TopicScoreParams` registered per
+    topic, which doesn't fit Ogmara's large/dynamic per-channel/per-wallet
+    topic space, so `topics` is left empty (P1-P4 inert); P7
+    (`behaviour_penalty`) only fires from gossipsub's own internal
+    GRAFT-flood/broken-IWANT-promise detection, unrelated to this
+    finding. The public `set_application_score` API (P5) is exactly the
+    right tool — topic-independent, fully app-driven.
+  - `handle_gossip_message`'s existing `RouteResult` classification now
+    drives P5 directly: `Invalid` (the only branch representing genuine
+    attacker-grade badness — `Rejected`/`PowRequired`/`Duplicate` cover
+    honest peers and are untouched) penalizes the peer's tracked score;
+    `Accepted` recovers it, at half the rate of the penalty so an
+    attacker can't stay under threshold by interleaving one good message
+    per bad one. A handful of invalid messages is enough to cross
+    gossipsub's default `graylist_threshold`.
+  - No manual disconnect/ban logic added on top — gossipsub's own
+    score-driven behavior (stop gossiping to/relaying from low-scored
+    peers, eventual graylisting) is the enforcement mechanism, consistent
+    with this campaign's existing scope boundary between per-session
+    guards (W9) and mesh-wide reputation (W10).
+  - No new dependency — reuses existing `std`/`tokio` primitives, same
+    shape as `PresenceRateLimiter`.
+  - Post-fix Security Audit found one real gap, fixed same day: the
+    tracked P5 score map was pruned by *value* (`== 0`) rather than
+    staleness, so a peer that connects once with a free keypair, sends a
+    single invalid envelope, and disconnects forever left a permanent
+    entry — an unbounded-growth path under a slow, one-shot-PeerId Sybil
+    campaign, contradicting the pruning's own stated purpose. Fixed by
+    tracking a `last_touched: Instant` per entry and pruning by staleness
+    (1 hour, matching gossipsub's own default `retain_score` so a
+    reconnecting peer's tracked score doesn't get forgotten sooner than
+    gossipsub's own native score would be).
+  - Two informational notes from the audit, not code changes: (1) there
+    is no per-source-IP connection limit anywhere in `network/` (a
+    pre-existing gap, not introduced by this fix) — `connection_limits`'
+    25-incoming-slot cap is node-wide, so one host can occupy a large
+    fraction of it with distinct free PeerIds; (2) the fix's actual
+    steady-state guarantee against a peer that never sends anything
+    gossipsub scores as invalid is a per-peer ceiling of 50 msg/s (not
+    zero) — up to ~1,250 msg/s of fully-validated traffic from one host
+    at the connection-limit ceiling above. Both are useful capacity-
+    planning inputs for a future per-IP limiting pass, not blockers for
+    this fix, which closes the finding's actual complaint (no limit and
+    no scoring at all).
+
 ## [0.99.0] - 2026-08-18
 
 ### Security

@@ -118,11 +118,33 @@ pub fn build_swarm(config: &Config, keypair: Keypair) -> Result<Swarm<OgmaraBeha
         .build()
         .map_err(|e| anyhow::anyhow!("gossipsub config error: {}", e))?;
 
-    let gossipsub = gossipsub::Behaviour::new(
+    let mut gossipsub = gossipsub::Behaviour::new(
         MessageAuthenticity::Signed(keypair.clone()),
         gossipsub_config,
     )
     .map_err(|e| anyhow::anyhow!("gossipsub behaviour error: {}", e))?;
+
+    // Peer scoring (audit final pre-mainnet W10, l2-node 0.100.0). Library
+    // defaults throughout: `topics` stays empty (P1-P4 mesh-quality scoring is
+    // inert — Ogmara's per-channel/per-wallet-DM topic space is large and
+    // dynamic, so pre-registering `TopicScoreParams` for all of it is out of
+    // scope here), P6 (IP colocation) and P7 (behaviour_penalty, gossipsub's
+    // own GRAFT-flood / broken-IWANT-promise detection) come for free.
+    // Deliberately NOT hand-tuning thresholds the way the mesh parameters
+    // above were tuned — those were mesh-membership params that needed
+    // adjustment for Ogmara's small/asymmetric testnet fleet (the B4 fix);
+    // peer-score thresholds are an orthogonal per-peer accept/relay gate
+    // evaluated independently of mesh size, so the well-tested ecosystem
+    // defaults apply without that same risk. P5 (app-specific score) is
+    // driven explicitly from `NetworkService::handle_gossip_message`'s
+    // existing `RouteResult::Invalid` classification via
+    // `gossipsub.set_application_score()` — see mod.rs.
+    gossipsub
+        .with_peer_score(
+            gossipsub::PeerScoreParams::default(),
+            gossipsub::PeerScoreThresholds::default(),
+        )
+        .map_err(|e| anyhow::anyhow!("gossipsub peer score config error: {}", e))?;
 
     // Kademlia DHT — protocol includes network_id for cross-network isolation
     let kad_protocol = format!("/ogmara/{}/kad/1.0.0", config.network_id());

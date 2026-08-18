@@ -24,7 +24,7 @@ pub mod tor;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use futures::StreamExt;
@@ -87,6 +87,105 @@ const MAX_CONSECUTIVE_UNPRODUCTIVE_PAGES: u32 = 5;
 /// each `handle_*_event`'s oversized-page guard, right before its
 /// envelope-verification loop.
 const MAX_PAGES_PER_SESSION: u32 = 500;
+
+/// Per-peer non-presence gossip rate limit (audit final pre-mainnet W10):
+/// max messages accepted from a single peer within [`GOSSIP_RATE_WINDOW`]
+/// before `handle_swarm_event` starts reporting `Ignore` without running
+/// `handle_gossip_message` at all. Generous for legitimate chat/news/
+/// control-message traffic relayed across the mesh; far below flood rates
+/// (an attacker holding the single-threaded swarm event loop hostage needs
+/// to send fast and continuously to matter).
+const GOSSIP_RATE_LIMIT_PER_WINDOW: u32 = 50;
+/// Window size for [`GOSSIP_RATE_LIMIT_PER_WINDOW`]. Fixed-window (not
+/// sliding/token-bucket) — simplest correct implementation for a
+/// single-owner, no-lock counter; the boundary-doubling edge case (up to
+/// ~2x burst across a window boundary) is an acceptable tradeoff at this
+/// generosity of limit.
+const GOSSIP_RATE_WINDOW: Duration = Duration::from_secs(1);
+/// Soft cap on distinct PeerIds tracked by `gossip_rate_limiter` /
+/// `gossip_app_score` between prunes — mirrors `PresenceRateLimiter`'s
+/// `PRESENCE_RATE_LIMITER_SOFT_CAP` defense against a Sybil flood of
+/// unique PeerIds growing either map without bound. Existing peers keep
+/// being tracked even at the cap; only new-peer inserts are refused.
+const GOSSIP_RATE_LIMITER_SOFT_CAP: usize = 16_384;
+/// Penalty applied to a peer's tracked P5 app-score on each
+/// `RouteResult::Invalid` verdict (genuine crypto/structural invalidity —
+/// the only classification in `handle_gossip_message` that represents
+/// attacker-grade badness; `Rejected`/`PowRequired`/`Duplicate` cover
+/// honest peers and are left untouched). With gossipsub's default
+/// `app_specific_weight` (10.0), reaching `graylist_threshold` (-80) from
+/// the P5 contribution alone needs a tracked score of -8 — i.e. a burst
+/// of `INVALID_MESSAGE_SCORE_PENALTY.abs()`-scaled invalid messages
+/// crosses it in a handful of messages, not one.
+const INVALID_MESSAGE_SCORE_PENALTY: i64 = 2;
+/// Recovery nudge applied on each `RouteResult::Accepted` verdict.
+/// Deliberately smaller than [`INVALID_MESSAGE_SCORE_PENALTY`] (fast
+/// penalty, slow recovery) so a peer can't stay just under threshold by
+/// interleaving one good message per bad one.
+const VALID_MESSAGE_SCORE_RECOVERY: i64 = 1;
+/// Floor on the tracked P5 app-score — bounds how negative a single
+/// peer's score can go so a long-sustained flood doesn't grow the
+/// pushed value without bound (gossipsub's own thresholds already stop
+/// mattering well above this floor; it's a sanity bound, not a tuning
+/// knob).
+const GOSSIP_APP_SCORE_FLOOR: i64 = -100;
+/// Staleness threshold for pruning `gossip_app_score` entries (Security
+/// Audit, W10 follow-up — see the field doc on
+/// `NetworkService::gossip_app_score`). Matches gossipsub's own default
+/// `PeerScoreParams::retain_score` (1 hour): a disconnected peer's
+/// NATIVE gossipsub score state survives that long before gossipsub
+/// itself forgets it, so this node's own tracked P5 contribution
+/// shouldn't be forgotten any sooner — pruning at the same cadence
+/// keeps a reconnecting peer's app-score picking back up consistently
+/// with its native score, rather than getting a clean slate early.
+const GOSSIP_APP_SCORE_MAX_IDLE: Duration = Duration::from_secs(3600);
+
+/// Per-peer state for the non-presence gossip rate limiter
+/// (`NetworkService::gossip_rate_limiter`).
+struct GossipRateWindow {
+    /// Start of the current fixed window.
+    window_start: Instant,
+    /// Messages counted in the current window.
+    count: u32,
+}
+
+/// Per-peer state for `NetworkService::gossip_app_score`.
+struct GossipAppScoreEntry {
+    /// Tracked raw P5 score, clamped to [`GOSSIP_APP_SCORE_FLOOR`], `0`.
+    score: i64,
+    /// Last time this entry was touched by `adjust_gossip_app_score`.
+    /// Drives staleness-based pruning — see [`GOSSIP_APP_SCORE_MAX_IDLE`].
+    last_touched: Instant,
+}
+
+impl GossipRateWindow {
+    /// Pure fixed-window policy, factored out of
+    /// `NetworkService::check_gossip_rate_limit` so it's unit-testable
+    /// without a live `Instant` clock or a constructed swarm (audit final
+    /// pre-mainnet W10 — mirrors W9's note that this file has no
+    /// precedent for testing swarm-event-handler bodies directly; this
+    /// factoring keeps the actual policy logic covered anyway). Mutates
+    /// `self` in place and returns whether the message may proceed.
+    fn check_and_record(&mut self, now: Instant, limit: u32, window: Duration) -> bool {
+        if now.duration_since(self.window_start) >= window {
+            self.window_start = now;
+            self.count = 1;
+            true
+        } else if self.count < limit {
+            self.count += 1;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Pure clamp-and-combine for the P5 app-score adjustment, factored out
+/// of `NetworkService::adjust_gossip_app_score` for unit testing (audit
+/// final pre-mainnet W10).
+fn clamp_gossip_app_score(current: i64, delta: i64, floor: i64) -> i64 {
+    (current + delta).clamp(floor, 0)
+}
 
 /// The running network layer.
 pub struct NetworkService {
@@ -305,6 +404,33 @@ pub struct NetworkService {
     /// tasks → CPU/memory exhaustion. When no permit is free the message is
     /// reported `Ignore` (dropped, not verified) instead of spawning.
     presence_verify_sem: Arc<tokio::sync::Semaphore>,
+    /// Per-peer sliding-window message counter for non-presence gossip
+    /// (audit final pre-mainnet W10, l2-node 0.100.0). Checked in
+    /// `handle_swarm_event` BEFORE `handle_gossip_message` runs, so a
+    /// flooding peer's messages are dropped without paying the
+    /// Keccak/Ed25519/storage cost — mirrors `presence_verify_sem`'s
+    /// "gate before expensive work" shape, but as a rate limit (many
+    /// messages/sec are legitimate on chat/news topics) rather than a
+    /// concurrency cap. Single-owner field (only touched from
+    /// `handle_swarm_event`/`handle_gossip_message`, both `&mut self`
+    /// on this task) — no lock needed, unlike `PresenceRateLimiter`
+    /// which is shared with spawned async verifier tasks.
+    gossip_rate_limiter: HashMap<PeerId, GossipRateWindow>,
+    /// Per-peer application-controlled gossipsub score (P5), driven by
+    /// `handle_gossip_message`'s existing `RouteResult` classification
+    /// (audit final pre-mainnet W10). Raw tracked value pushed to
+    /// gossipsub via `set_application_score`; NOT the same number as
+    /// the peer's overall gossipsub score (which also folds in P6/P7
+    /// and the configured `app_specific_weight`). Pruned by staleness
+    /// (`GossipAppScoreEntry::last_touched`), not just by value —
+    /// Security Audit (W10 follow-up): a value-only prune (drop iff
+    /// `== 0`) left a permanent entry for any peer that connects once,
+    /// sends a single `Invalid` message, and disconnects forever,
+    /// letting a slow one-shot-PeerId Sybil campaign grow this map
+    /// without bound (cheap: a new keypair is free, and each such peer
+    /// self-prunes out of `gossip_rate_limiter` on the very next sweep,
+    /// so the rate-limiter's soft cap never engages to stop it either).
+    gossip_app_score: HashMap<PeerId, GossipAppScoreEntry>,
     /// Per-peer live-connection direction counts, keyed by libp2p
     /// `PeerId`. Maintained from `ConnectionEstablished` /
     /// `ConnectionClosed` (`endpoint.is_dialer()` gives the direction).
@@ -882,6 +1008,8 @@ impl NetworkService {
             presence_validation_rx,
             // ≤64 concurrent presence-record Ed25519 verifies (audit W5).
             presence_verify_sem: Arc::new(tokio::sync::Semaphore::new(64)),
+            gossip_rate_limiter: HashMap::new(),
+            gossip_app_score: HashMap::new(),
             peer_directions: HashMap::new(),
         })
     }
@@ -1245,6 +1373,11 @@ impl NetworkService {
                 }
                 _ = mesh_stats_interval.tick() => {
                     self.refresh_mesh_stats();
+                    // W10: piggyback the gossip rate-limiter/app-score sweep
+                    // on this existing 30s tick rather than adding a
+                    // dedicated interval — bounds `gossip_rate_limiter` /
+                    // `gossip_app_score` memory under peer churn.
+                    self.prune_gossip_rate_state();
                 }
                 _ = presence_interval.tick() => {
                     // Steady-state rebroadcast — don't care about
@@ -1339,6 +1472,24 @@ impl NetworkService {
                         message_id,
                         message.data,
                     );
+                } else if !self.check_gossip_rate_limit(propagation_source) {
+                    // Audit final pre-mainnet W10: per-peer rate limit,
+                    // checked BEFORE `handle_gossip_message` so a flooding
+                    // peer's messages are dropped without paying the
+                    // Keccak/Ed25519/storage cost of `process_message`.
+                    // `Ignore`, not `Reject` — a burst alone isn't proof of
+                    // malice (the dedicated P5 scoring path below handles
+                    // actual invalidity), and this avoids stacking an extra
+                    // gossipsub-side penalty on top of it.
+                    let _ = self
+                        .swarm
+                        .behaviour_mut()
+                        .gossipsub
+                        .report_message_validation_result(
+                            &message_id,
+                            &propagation_source,
+                            libp2p::gossipsub::MessageAcceptance::Ignore,
+                        );
                 } else {
                     // Spec 13 §10.3 + v0.48.0: gossipsub is configured with
                     // `.validate_messages()`, so EVERY received message must
@@ -1346,7 +1497,7 @@ impl NetworkService {
                     // now distinguishes structurally-INVALID envelopes (→
                     // Reject + peer penalty) from valid-but-unaccepted ones (→
                     // Ignore) — audit 2026-06-07 W6.
-                    let acceptance = self.handle_gossip_message(&message.data);
+                    let acceptance = self.handle_gossip_message(propagation_source, &message.data);
                     let _ = self
                         .swarm
                         .behaviour_mut()
@@ -4128,6 +4279,73 @@ impl NetworkService {
         }
     }
 
+    /// Per-peer non-presence gossip rate limit (audit final pre-mainnet
+    /// W10). Fixed-window counter, checked BEFORE `handle_gossip_message`
+    /// runs so a flooding peer never pays the Keccak/Ed25519/storage cost.
+    /// Returns `true` if the message may proceed to full validation.
+    fn check_gossip_rate_limit(&mut self, peer: PeerId) -> bool {
+        let now = Instant::now();
+        match self.gossip_rate_limiter.get_mut(&peer) {
+            Some(window) => {
+                window.check_and_record(now, GOSSIP_RATE_LIMIT_PER_WINDOW, GOSSIP_RATE_WINDOW)
+            }
+            None => {
+                // New peer — apply the soft cap (Sybil defense, mirrors
+                // `PresenceRateLimiter::check_and_record`).
+                if self.gossip_rate_limiter.len() >= GOSSIP_RATE_LIMITER_SOFT_CAP {
+                    return false;
+                }
+                self.gossip_rate_limiter.insert(
+                    peer,
+                    GossipRateWindow {
+                        window_start: now,
+                        count: 1,
+                    },
+                );
+                true
+            }
+        }
+    }
+
+    /// Drop stale entries from `gossip_rate_limiter` / `gossip_app_score`
+    /// so the maps don't grow unboundedly under peer churn (audit final
+    /// pre-mainnet W10). Called from the existing 30s `mesh_stats_interval`
+    /// tick — see `run`.
+    fn prune_gossip_rate_state(&mut self) {
+        let now = Instant::now();
+        self.gossip_rate_limiter
+            .retain(|_, w| now.duration_since(w.window_start) < GOSSIP_RATE_WINDOW * 4);
+        // Staleness-based, not value-based (Security Audit, W10
+        // follow-up) — see the field doc on `gossip_app_score` for why a
+        // value-only (`score != 0`) prune left an exploitable gap.
+        self.gossip_app_score
+            .retain(|_, e| now.duration_since(e.last_touched) < GOSSIP_APP_SCORE_MAX_IDLE);
+    }
+
+    /// Update a peer's tracked P5 app-score by `delta` (clamped to
+    /// [`GOSSIP_APP_SCORE_FLOOR`], `0`) and push the new value to
+    /// gossipsub via `set_application_score` (audit final pre-mainnet
+    /// W10). `delta` is negative for invalid messages, positive for
+    /// accepted ones — see `INVALID_MESSAGE_SCORE_PENALTY`/
+    /// `VALID_MESSAGE_SCORE_RECOVERY`.
+    fn adjust_gossip_app_score(&mut self, peer: PeerId, delta: i64) {
+        let now = Instant::now();
+        let entry = self
+            .gossip_app_score
+            .entry(peer)
+            .or_insert(GossipAppScoreEntry {
+                score: 0,
+                last_touched: now,
+            });
+        entry.score = clamp_gossip_app_score(entry.score, delta, GOSSIP_APP_SCORE_FLOOR);
+        entry.last_touched = now;
+        let new_score = entry.score as f64;
+        self.swarm
+            .behaviour_mut()
+            .gossipsub
+            .set_application_score(&peer, new_score);
+    }
+
     /// Handle a received GossipSub message through the full validation pipeline.
     /// Process a gossip message and return the gossipsub validation verdict
     /// (audit 2026-06-07 W6). Structurally/cryptographically invalid envelopes
@@ -4135,7 +4353,18 @@ impl NetworkService {
     /// valid-but-unaccepted-here (policy/authz/dup/unproven-wallet) → `Ignore`
     /// (we don't propagate, but don't penalize an honest relay); accepted →
     /// `Accept` (propagate across the mesh).
-    fn handle_gossip_message(&self, data: &[u8]) -> libp2p::gossipsub::MessageAcceptance {
+    ///
+    /// Also drives the P5 (app-specific) gossipsub peer score (audit final
+    /// pre-mainnet W10): `Invalid` — the only classification here that
+    /// represents genuine attacker-grade badness — penalizes the source
+    /// peer's tracked score; `Accepted` nudges it back toward 0. See
+    /// `adjust_gossip_app_score` and the `with_peer_score` call in
+    /// `behaviour.rs`.
+    fn handle_gossip_message(
+        &mut self,
+        propagation_source: PeerId,
+        data: &[u8],
+    ) -> libp2p::gossipsub::MessageAcceptance {
         use libp2p::gossipsub::MessageAcceptance;
         // Track incoming bytes and messages for dashboard metrics
         self.counters.add_bytes_in(data.len() as u64);
@@ -4154,6 +4383,7 @@ impl NetworkService {
                 );
 
                 self.counters.inc_messages_stored();
+                self.adjust_gossip_app_score(propagation_source, VALID_MESSAGE_SCORE_RECOVERY);
 
                 // Feed to notification engine for mention detection (fire-and-forget)
                 if let Some(ref engine) = self.notification_engine {
@@ -4175,6 +4405,7 @@ impl NetworkService {
             RouteResult::Invalid(reason) => {
                 self.counters.inc_failed_validations();
                 warn!(reason = %reason, "Invalid message from gossip — rejecting (penalize peer)");
+                self.adjust_gossip_app_score(propagation_source, -INVALID_MESSAGE_SCORE_PENALTY);
                 MessageAcceptance::Reject
             }
             RouteResult::Rejected(reason) => {
@@ -4202,5 +4433,81 @@ impl NetworkService {
                 MessageAcceptance::Ignore
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod gossip_flood_protection_tests {
+    //! Audit final pre-mainnet W10. Covers the pure logic factored out of
+    //! `NetworkService::check_gossip_rate_limit` / `adjust_gossip_app_score`
+    //! — see the note on `GossipRateWindow::check_and_record` for why the
+    //! swarm-event-handler methods themselves aren't tested directly here.
+    use super::*;
+
+    #[test]
+    fn rate_window_allows_up_to_the_limit_then_blocks() {
+        let start = Instant::now();
+        let mut window = GossipRateWindow {
+            window_start: start,
+            count: 0,
+        };
+        for _ in 0..GOSSIP_RATE_LIMIT_PER_WINDOW {
+            assert!(window.check_and_record(start, GOSSIP_RATE_LIMIT_PER_WINDOW, GOSSIP_RATE_WINDOW));
+        }
+        assert!(!window.check_and_record(start, GOSSIP_RATE_LIMIT_PER_WINDOW, GOSSIP_RATE_WINDOW));
+    }
+
+    #[test]
+    fn rate_window_resets_after_the_window_elapses() {
+        let start = Instant::now();
+        let mut window = GossipRateWindow {
+            window_start: start,
+            count: GOSSIP_RATE_LIMIT_PER_WINDOW,
+        };
+        assert!(!window.check_and_record(start, GOSSIP_RATE_LIMIT_PER_WINDOW, GOSSIP_RATE_WINDOW));
+        let after = start + GOSSIP_RATE_WINDOW;
+        assert!(window.check_and_record(after, GOSSIP_RATE_LIMIT_PER_WINDOW, GOSSIP_RATE_WINDOW));
+        assert_eq!(window.count, 1);
+        assert_eq!(window.window_start, after);
+    }
+
+    #[test]
+    fn app_score_penalty_reaches_graylist_equivalent_within_a_handful_of_invalid_messages() {
+        // Default gossipsub `app_specific_weight` is 10.0 and
+        // `graylist_threshold` is -80.0 (library defaults, see
+        // behaviour.rs). The P5 contribution alone crosses graylist once
+        // the tracked score reaches -8, so this should take only a few
+        // `INVALID_MESSAGE_SCORE_PENALTY`-sized steps, not dozens.
+        let mut score = 0i64;
+        let mut steps = 0;
+        while score > -8 && steps < 20 {
+            score = clamp_gossip_app_score(score, -INVALID_MESSAGE_SCORE_PENALTY, GOSSIP_APP_SCORE_FLOOR);
+            steps += 1;
+        }
+        assert!(steps <= 10, "took {steps} invalid messages to reach graylist-equivalent");
+    }
+
+    #[test]
+    fn app_score_recovery_is_slower_than_penalty_and_cannot_exceed_zero() {
+        let penalized = clamp_gossip_app_score(0, -INVALID_MESSAGE_SCORE_PENALTY, GOSSIP_APP_SCORE_FLOOR);
+        let recovered = clamp_gossip_app_score(penalized, VALID_MESSAGE_SCORE_RECOVERY, GOSSIP_APP_SCORE_FLOOR);
+        // One bad message followed by one good message must not fully
+        // cancel out — otherwise an attacker can interleave 1 good : 1
+        // bad forever and stay at score 0 indefinitely.
+        assert!(recovered < 0, "recovery must not fully offset a penalty in one step");
+        assert_eq!(
+            clamp_gossip_app_score(0, VALID_MESSAGE_SCORE_RECOVERY, GOSSIP_APP_SCORE_FLOOR),
+            0,
+            "recovery must not push the score above 0"
+        );
+    }
+
+    #[test]
+    fn app_score_floor_bounds_a_sustained_flood() {
+        let mut score = 0i64;
+        for _ in 0..1000 {
+            score = clamp_gossip_app_score(score, -INVALID_MESSAGE_SCORE_PENALTY, GOSSIP_APP_SCORE_FLOOR);
+        }
+        assert_eq!(score, GOSSIP_APP_SCORE_FLOOR);
     }
 }
