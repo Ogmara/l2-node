@@ -65,7 +65,7 @@ impl Node {
 
         // Load or generate node identity key
         let signing_key = load_or_generate_key(&storage)?;
-        let node_id = compute_node_id(&signing_key);
+        let node_id = crypto::compute_node_id(&signing_key.verifying_key());
 
         // Rebuild stat counters if they're zero but data exists
         // (handles first upgrade from pre-stats versions)
@@ -409,9 +409,11 @@ impl Node {
             tokio::sync::mpsc::unbounded_channel::<crate::network::IdentitySyncCommand>();
 
         // Channel for API/WS → network: subscribe a wallet's DM gossip topic on WS
-        // connect so this node receives that user's cross-node DMs (0.60.0).
+        // connect so this node receives that user's cross-node DMs (0.60.0),
+        // optionally carrying a wallet-signed dm-sync backfill authorization
+        // for this node (audit W5).
         let (dm_subscribe_tx, dm_subscribe_rx) =
-            tokio::sync::mpsc::unbounded_channel::<String>();
+            tokio::sync::mpsc::unbounded_channel::<crate::network::DmSubscribeEvent>();
 
         // Subscribe to all existing channels from storage so the node
         // participates in GossipSub for channels it already knows about.
@@ -1305,15 +1307,6 @@ fn load_or_generate_key(storage: &Storage) -> Result<SigningKey> {
             Ok(key)
         }
     }
-}
-
-/// Compute the node ID: Base58(SHA-256(public_key)[:20]).
-fn compute_node_id(signing_key: &SigningKey) -> String {
-    use sha2::{Digest, Sha256};
-    let pubkey = signing_key.verifying_key();
-    let hash = Sha256::digest(pubkey.as_bytes());
-    // Take first 20 bytes and encode as base58
-    bs58::encode(&hash[..20]).into_string()
 }
 
 /// Detect and recover from a half-applied snapshot bootstrap (Phase 2).

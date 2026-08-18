@@ -5,6 +5,55 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.94.0] - 2026-08-18
+
+### Security
+
+- **Any Sybil node could scrape any wallet's entire DM history (final
+  pre-mainnet audit W5).** `dm_sync::verify_request_auth` only proved the
+  REQUESTING NODE controlled some Ed25519 keypair — it never proved the
+  WALLET whose DMs were being requested had authorized that node. An
+  attacker could generate a fresh throwaway node keypair, connect to any
+  node storing DMs for wallet W, and pull W's entire DM history (E2E
+  ciphertext + metadata: conversation graph, timestamps, sizes) going back
+  `retention_days` (default 30 days).
+  - Added a new wallet-signed authorization claim,
+    `ogmara-dm-sync-auth:{network}:{node_id}:{wallet}:{timestamp}`,
+    mirroring the existing `ogmara-device-claim:`/`ogmara-enc-bind:`
+    domain-separated pattern. Signed by the WALLET directly (v1 —
+    deliberately no delegated-device support, keeping verification a pure
+    bech32-decode with zero local-state dependency, same property
+    `crypto::address_to_verifying_key` already gives `DeviceDelegation`/
+    `DeviceEncBinding`). `node_id` is derived from the ALREADY-VERIFIED
+    `requester_pubkey` in the existing node-self-signature, so a claim
+    minted for one node can never be presented by a different one.
+    Freshness window 300s (`WALLET_AUTH_MAX_AGE_SECS`), signed once at
+    login and reused across the whole backfill session's fanout and
+    pagination.
+  - `DmSyncRequest` gains an optional `wallet_claim` field
+    (`#[serde(default)]` — old CBOR bytes still decode, they just get
+    `auth_failed_response()` once the new check runs; no protocol-string
+    bump needed). Pre-fix clients simply lose dm-sync backfill until they
+    upgrade — Phase 1 live-gossip DM delivery is completely unaffected.
+  - Clients attach the claim via two new optional REST headers
+    (`X-Ogmara-DmSync-Auth-Timestamp`/`X-Ogmara-DmSync-Auth`) or two new
+    optional WS auth-frame fields (`dm_sync_timestamp`/`dm_sync_signature`),
+    self-verified by the receiving node (against the RESOLVED wallet, not
+    the possibly-device signing address) before being handed to the network
+    task, so a bogus claim never wastes a P2P round-trip.
+  - Moved `compute_node_id` from a private `node.rs` helper to a public
+    `crypto::compute_node_id(&VerifyingKey)`, since `dm_sync`'s responder
+    verification only ever holds a `VerifyingKey` reconstructed from wire
+    bytes, never a private key.
+- **`DmResponderLimits`'s per-peer cumulative-served cap was resettable**
+  (bundled fix, directly adjacent to W5): the `served` tracker was cleared
+  WHOLESALE at 100k distinct peers, letting an attacker cycling fresh peer
+  IDs reset everyone's `TOTAL_ENVELOPES_CAP`. Now evicts a single oldest
+  entry on overflow instead. The identical bug shape in
+  `identity_sync::IdentityResponderLimits` (keyed `(PeerId, wallet)`) is
+  fixed the same way — `news_sync`'s copy is lower severity (public/global
+  data, not per-wallet-private) and left for later.
+
 ## [0.93.0] - 2026-08-17
 
 ### Added

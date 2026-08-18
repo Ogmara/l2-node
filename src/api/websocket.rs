@@ -29,6 +29,12 @@ struct WsAuthMessage {
     /// 2026-06-07 host-binding fix — same scheme as the REST auth header.
     #[serde(default)]
     nonce: String,
+    /// W5 dm-sync backfill authorization (optional, wallet-direct signature) —
+    /// see `network::dm_sync` and `api::auth`'s module doc for the design.
+    #[serde(default)]
+    dm_sync_timestamp: Option<u64>,
+    #[serde(default)]
+    dm_sync_signature: Option<String>, // base64-encoded
 }
 
 /// The fixed path the WS auth signature is bound to.
@@ -39,7 +45,10 @@ const WS_AUTH_PATH: &str = "/api/v1/ws";
 /// Binds `network` + `node_id` (this node's own) and a single-use `nonce`
 /// exactly like the REST verifier (audit 2026-06-07 host-binding), so a
 /// captured WS-auth frame is neither fleet-portable nor same-node replayable.
-async fn verify_ws_auth(text: &str, state: &AppState) -> Result<String, String> {
+async fn verify_ws_auth(
+    text: &str,
+    state: &AppState,
+) -> Result<(String, Option<crate::network::dm_sync::WalletAuthClaim>), String> {
     let auth: WsAuthMessage =
         serde_json::from_str(text).map_err(|e| format!("invalid auth JSON: {}", e))?;
 
@@ -78,7 +87,17 @@ async fn verify_ws_auth(text: &str, state: &AppState) -> Result<String, String> 
     // Burn the nonce (same-node replay protection).
     super::auth::claim_nonce(state, &auth.address, &auth.nonce).await?;
 
-    Ok(auth.address)
+    // W5: raw (unverified against the RESOLVED wallet) claim, if attached —
+    // the caller self-verifies once it knows the resolved wallet address.
+    let wallet_claim_raw = auth.dm_sync_timestamp.zip(auth.dm_sync_signature.as_deref()).and_then(
+        |(timestamp, sig_b64)| {
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, sig_b64)
+                .ok()
+                .map(|signature| crate::network::dm_sync::WalletAuthClaim { timestamp, signature })
+        },
+    );
+
+    Ok((auth.address, wallet_claim_raw))
 }
 
 // --- WebSocket message types ---
@@ -142,10 +161,10 @@ async fn handle_authenticated_ws(socket: WebSocket, state: Arc<AppState>) {
 
     // Parse and verify auth message
     let auth_result = verify_ws_auth(&auth_text, &state).await;
-    let auth_address = match auth_result {
-        Ok(addr) => {
+    let (auth_address, wallet_claim_raw) = match auth_result {
+        Ok((addr, claim)) => {
             debug!(address = %addr, "WebSocket client authenticated");
-            addr
+            (addr, claim)
         }
         Err(e) => {
             let _ = sender
@@ -167,10 +186,24 @@ async fn handle_authenticated_ws(socket: WebSocket, state: Arc<AppState>) {
     // the wallet address (not the device/signing key) with the engine.
     let wallet_address = state.identity.resolve(&auth_address).unwrap_or_else(|_| auth_address.clone());
 
+    // W5: self-verify the raw claim against the RESOLVED wallet before
+    // handing it to the network task (a device-signing-address claim
+    // wouldn't match — this claim is deliberately wallet-direct only).
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let wallet_claim = wallet_claim_raw.filter(|c| {
+        crate::network::dm_sync::verify_wallet_claim(c, &state.klever_network, &state.node_id, &wallet_address, now)
+    });
+
     // Subscribe this node to the user's DM gossip topic so DMs sent to them from
     // OTHER nodes are received and indexed here (the network task owns the swarm).
     // Idempotent in the topic layer; safe to send on every connect.
-    let _ = state.dm_subscribe_tx.send(wallet_address.clone());
+    let _ = state.dm_subscribe_tx.send(crate::network::DmSubscribeEvent {
+        wallet: wallet_address.clone(),
+        wallet_claim,
+    });
 
     // Register this user with the notification engine for mention detection
     if let Some(ref engine) = state.notification_engine {

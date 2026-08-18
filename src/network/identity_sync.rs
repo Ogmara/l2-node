@@ -292,12 +292,22 @@ pub struct IdentityResponderLimits {
     inner: Mutex<IdentityLimitsInner>,
 }
 
+/// Soft ceiling on distinct `(peer, wallet)` cumulative-served entries.
+/// Previously cleared WHOLESALE on overflow — a Sybil cycling fresh PeerIds
+/// could reset everyone's cumulative "served" counters, defeating
+/// `total_envelopes_cap` (audit W5, bundled fix — identical bug shape to
+/// `dm_sync::DmResponderLimits`). Now the single oldest entry is evicted per
+/// overflow insert instead.
+const MAX_TRACKED_SERVED: usize = 100_000;
+
 #[derive(Debug, Default)]
 struct IdentityLimitsInner {
     /// Active in-flight requests per peer.
     per_peer: HashMap<libp2p::PeerId, usize>,
     /// Cumulative envelopes served per (peer, wallet) this process lifetime.
     served: HashMap<(libp2p::PeerId, String), u64>,
+    /// Insertion order of `served` keys, oldest-first (audit W5).
+    served_order: std::collections::VecDeque<(libp2p::PeerId, String)>,
 }
 
 impl IdentityResponderLimits {
@@ -311,15 +321,7 @@ impl IdentityResponderLimits {
         max_concurrent_per_peer: usize,
         total_envelopes_cap: u64,
     ) -> Option<IdentityResponderGuard> {
-        /// Soft ceiling on distinct `(peer, wallet)` cumulative-served entries.
-        /// On overflow the whole map is cleared — it's an abuse limiter, not a
-        /// security invariant, so the worst case is a few peers re-earning
-        /// their cap. Bounds the otherwise process-lifetime growth.
-        const MAX_TRACKED: usize = 100_000;
         let mut inner = self.inner.lock().ok()?;
-        if inner.served.len() >= MAX_TRACKED {
-            inner.served.clear();
-        }
         let in_flight = inner.per_peer.get(&peer).copied().unwrap_or(0);
         if in_flight >= max_concurrent_per_peer {
             return None;
@@ -342,7 +344,17 @@ impl IdentityResponderLimits {
     /// Record envelopes served toward the per-(peer, wallet) cumulative cap.
     pub fn add_served(&self, peer: libp2p::PeerId, wallet: &str, count: u64) {
         if let Ok(mut inner) = self.inner.lock() {
-            *inner.served.entry((peer, wallet.to_string())).or_insert(0) += count;
+            let key = (peer, wallet.to_string());
+            let is_new = !inner.served.contains_key(&key);
+            if is_new {
+                if inner.served.len() >= MAX_TRACKED_SERVED {
+                    if let Some(oldest) = inner.served_order.pop_front() {
+                        inner.served.remove(&oldest);
+                    }
+                }
+                inner.served_order.push_back(key.clone());
+            }
+            *inner.served.entry(key).or_insert(0) += count;
         }
     }
 }

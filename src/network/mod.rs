@@ -214,6 +214,15 @@ pub struct NetworkService {
     /// Wallets this node has triggered a dm-sync backfill for at least once this
     /// process lifetime — dedups repeated first-seen triggers (per auth).
     dm_backfill_triggered: HashSet<String>,
+    /// Wallet → last wallet-signed dm-sync authorization claim received for
+    /// it this session (audit W5). Populated by `maybe_trigger_dm_backfill`;
+    /// consulted there AND by the pagination-continuation arm of
+    /// `handle_dm_sync_event` (which doesn't go through
+    /// `register_local_dm_user` again, so can't get a fresh one re-threaded
+    /// through `DmSyncPending`). Fine to go stale — a later fanout attempt
+    /// with a stale claim just fails `verify_wallet_claim` (safe degrade).
+    /// Bounded/cleared the same way `dm_backfill_triggered` is.
+    wallet_claims: HashMap<String, dm_sync::WalletAuthClaim>,
     /// Wallet → last time (ms) we persisted its `LOCAL_DM_USERS` row this
     /// session. Lets the per-REST-request registration path skip redundant
     /// RocksDB work, while still refreshing `last_active_ms` on a throttle so
@@ -338,6 +347,16 @@ struct DmSyncPending {
 pub struct IdentitySyncCommand {
     pub wallet: String,
     pub scopes: u8,
+}
+
+/// Command from the API/WS layer → network task: a wallet authenticated
+/// here, optionally with a wallet-signed dm-sync backfill authorization for
+/// THIS node (audit W5). Sent over `dm_subscribe_tx` on every REST
+/// authenticated call and every WS connect.
+#[derive(Debug, Clone)]
+pub struct DmSubscribeEvent {
+    pub wallet: String,
+    pub wallet_claim: Option<dm_sync::WalletAuthClaim>,
 }
 
 /// Cross-channel smuggling defense (Security Audit W1, 0.47.0).
@@ -786,6 +805,7 @@ impl NetworkService {
             dm_sync_limits: Arc::new(dm_sync::DmResponderLimits::default()),
             pending_dm_sync_requests: HashMap::new(),
             dm_backfill_triggered: HashSet::new(),
+            wallet_claims: HashMap::new(),
             local_dm_users_seen: HashMap::new(),
             presence_manager,
             presence_topic_hash,
@@ -879,7 +899,7 @@ impl NetworkService {
     /// restart — receiving that user's cross-node DMs even while they are OFFLINE
     /// — then subscribes immediately, evicts the least-recently-active user if
     /// over the cap, and lazily fires a one-time dm-sync backfill for missed DMs.
-    fn register_local_dm_user(&mut self, wallet: &str) {
+    fn register_local_dm_user(&mut self, wallet: &str, wallet_claim: Option<dm_sync::WalletAuthClaim>) {
         // How often we re-persist `last_active_ms` for an already-known wallet.
         // The per-REST-request path calls this on every request; the throttle
         // keeps it O(1) most of the time while still letting LRU eviction see
@@ -945,7 +965,7 @@ impl NetworkService {
 
         // Lazily backfill missed DMs for this wallet, once per process (self-
         // dedups; retries on a later call if no peers were connected yet).
-        self.maybe_trigger_dm_backfill(wallet);
+        self.maybe_trigger_dm_backfill(wallet, wallet_claim);
     }
 
     /// Evict least-recently-active local DM users until the count is within
@@ -1041,8 +1061,9 @@ impl NetworkService {
         // us to lazily pull that wallet's identity bundle from peers.
         mut identity_sync_rx: tokio::sync::mpsc::UnboundedReceiver<IdentitySyncCommand>,
         // API/WS → network: subscribe a wallet's DM gossip topic on WS connect so
-        // this node receives that user's cross-node DMs.
-        mut dm_subscribe_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+        // this node receives that user's cross-node DMs, optionally carrying a
+        // wallet-signed dm-sync backfill authorization for this node (W5).
+        mut dm_subscribe_rx: tokio::sync::mpsc::UnboundedReceiver<DmSubscribeEvent>,
     ) {
         info!(
             peer_id = %self.swarm.local_peer_id(),
@@ -1110,13 +1131,14 @@ impl NetworkService {
                 Some(cmd) = identity_sync_rx.recv() => {
                     self.maybe_trigger_identity_sync(cmd.wallet, cmd.scopes);
                 }
-                Some(addr) = dm_subscribe_rx.recv() => {
+                Some(event) = dm_subscribe_rx.recv() => {
                     // A wallet authenticated here. Persist it as a local DM user
                     // (so we re-subscribe on restart and receive its DMs while
                     // offline), subscribe now, enforce the LRU cap, and lazily
-                    // backfill any DMs missed while this node was down.
-                    self.register_local_dm_user(&addr);
-                    debug!(%addr, "Registered local DM user + subscribed to DM gossip topic");
+                    // backfill any DMs missed while this node was down (gated
+                    // on a wallet-signed authorization, audit W5).
+                    self.register_local_dm_user(&event.wallet, event.wallet_claim);
+                    debug!(wallet = %event.wallet, "Registered local DM user + subscribed to DM gossip topic");
                 }
                 Some(channel_id) = channel_rx.recv() => {
                     // Code Audit W2 (0.47.0): route chain-discovered
@@ -2391,11 +2413,22 @@ impl NetworkService {
     /// once per wallet per process — when that wallet first authenticates here —
     /// pulling its recent DMs from up to `FANOUT` peers (first non-empty wins).
     /// Covers the fresh-node / home-node-was-down case Phase 1 can't. Each
-    /// request is node-signed + host-bound to its responder (`dm_sync::sign_request`).
-    fn maybe_trigger_dm_backfill(&mut self, wallet: &str) {
+    /// request is node-signed + host-bound to its responder (`dm_sync::sign_request`),
+    /// AND (audit W5) carries a wallet-signed claim proving the wallet itself
+    /// authorized THIS node — without one, no responder will serve anything.
+    fn maybe_trigger_dm_backfill(&mut self, wallet: &str, wallet_claim: Option<dm_sync::WalletAuthClaim>) {
         if self.dm_backfill_triggered.contains(wallet) {
             return;
         }
+        // W5: resolve the freshest available wallet-signed authorization —
+        // prefer one attached to THIS call, else fall back to one cached from
+        // an earlier auth this session. Without one, retry on a later
+        // registration call once one arrives — mirrors the "no peers
+        // connected yet" early-return below (don't mark triggered).
+        let Some(claim) = wallet_claim.or_else(|| self.wallet_claims.get(wallet).cloned()) else {
+            return;
+        };
+
         let mut candidates: Vec<PeerId> = self.swarm.connected_peers().copied().collect();
         if candidates.is_empty() {
             return; // no peers yet — retry on the wallet's next auth/registration
@@ -2419,6 +2452,16 @@ impl NetworkService {
             backfill_max_age_days = self.dm_config.backfill_max_age_days,
             "dm-sync: triggering bounded DM backfill"
         );
+
+        // Cache for the pagination-continuation arm + subsequent triggers this
+        // session. Bound mirrors `dm_backfill_triggered` below (not a
+        // security cap — worst case of clearing is one redundant re-sign
+        // later).
+        if self.wallet_claims.len() >= 100_000 {
+            self.wallet_claims.clear();
+        }
+        self.wallet_claims.insert(wallet.to_string(), claim.clone());
+
         for peer in candidates {
             let request = dm_sync::sign_request(
                 &self.signing_key,
@@ -2428,6 +2471,7 @@ impl NetworkService {
                 now,
                 max_age_secs,
                 None,
+                Some(claim.clone()),
             );
             let id = self
                 .swarm
@@ -2588,6 +2632,10 @@ impl NetworkService {
                         } else {
                             self.dm_config.backfill_max_age_days.saturating_mul(24 * 3600)
                         };
+                        // W5: reuse the cached wallet claim (this arm doesn't
+                        // go through register_local_dm_user, so there's no
+                        // freshly-attached one to prefer).
+                        let claim = self.wallet_claims.get(&wallet).cloned();
                         let next_req = dm_sync::sign_request(
                             &self.signing_key,
                             &network,
@@ -2596,6 +2644,7 @@ impl NetworkService {
                             now_ms(),
                             max_age_secs,
                             Some(cursor),
+                            claim,
                         );
                         let next_id = self
                             .swarm

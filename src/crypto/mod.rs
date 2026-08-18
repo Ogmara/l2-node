@@ -103,6 +103,18 @@ pub fn is_device_address(address: &str) -> bool {
     address.starts_with("ogd1")
 }
 
+/// Compute the Ogmara `node_id` (`Base58(SHA-256(pubkey)[:20])`) directly
+/// from a `VerifyingKey`. Moved here from `node.rs` (was private,
+/// `&SigningKey`-only) so callers that only ever hold a `VerifyingKey`
+/// reconstructed from wire bytes — e.g. `network::dm_sync`'s W5
+/// wallet-claim verification, which never has a private key — can compute
+/// the same `node_id` a client learns from `GET /api/v1/health`.
+pub fn compute_node_id(pubkey: &VerifyingKey) -> String {
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(pubkey.as_bytes());
+    bs58::encode(&hash[..20]).into_string()
+}
+
 /// Derive the Ogmara `node_id` (Base58-encoded SHA-256[..20] of the
 /// 32-byte raw public key) from a bech32 wallet/device address. This
 /// matches the derivation used by `NodeAnnouncement` (verifying that
@@ -117,10 +129,10 @@ pub fn is_device_address(address: &str) -> bool {
 /// `node_id`. This helper bridges the two ID spaces deterministically
 /// without any round-trip.
 pub fn address_to_node_id(address: &str) -> Result<String, CryptoError> {
-    use sha2::{Digest, Sha256};
     let pubkey_bytes = address_to_pubkey_bytes(address)?;
-    let hash = Sha256::digest(pubkey_bytes);
-    Ok(bs58::encode(&hash[..20]).into_string())
+    let vk = VerifyingKey::from_bytes(&pubkey_bytes)
+        .map_err(|e| CryptoError::InvalidPublicKey(e.to_string()))?;
+    Ok(compute_node_id(&vk))
 }
 
 /// Generate a new random Ed25519 key pair for node identity.
@@ -215,5 +227,22 @@ mod channel_scope_tests {
         h.update(1u64.to_be_bytes());
         let expected: [u8; 32] = h.finalize().into();
         assert_eq!(compute_channel_scope(1), expected);
+    }
+}
+
+#[cfg(test)]
+mod node_id_tests {
+    use super::*;
+
+    #[test]
+    fn compute_node_id_matches_address_to_node_id() {
+        // Locks the two derivations together (audit W5): `dm_sync` computes
+        // node_id from a `VerifyingKey` it only ever has as wire bytes,
+        // while other callers derive it from a bech32 address — they must
+        // never drift apart.
+        let sk = generate_keypair();
+        let vk = sk.verifying_key();
+        let address = pubkey_to_address(&vk).unwrap();
+        assert_eq!(compute_node_id(&vk), address_to_node_id(&address).unwrap());
     }
 }

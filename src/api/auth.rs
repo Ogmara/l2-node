@@ -19,6 +19,16 @@
 //! After signature verification, the middleware resolves the signing address
 //! (device key) to its owning wallet address via the IdentityResolver.
 //! If no mapping exists, the signing address IS the wallet (built-in wallet mode).
+//!
+//! Two further OPTIONAL headers (audit W5, dm-sync backfill authorization):
+//!   X-Ogmara-DmSync-Auth-Timestamp: unix timestamp in milliseconds
+//!   X-Ogmara-DmSync-Auth:           base64(Ed25519 signature)
+//! A wallet-direct (never device-delegated) signature over
+//! `dm_sync::build_wallet_auth_claim(network, node_id, wallet, timestamp)`,
+//! proving the WALLET itself — not just this request's signer — authorized
+//! THIS node to backfill its DM history. Absent/malformed headers never
+//! reject the request; they only gate whether dm-sync backfill can fire for
+//! it. See `network::dm_sync` for the full design.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -275,12 +285,44 @@ fn extract_and_verify(req: &Request, app_state: &AppState) -> Result<(AuthUser, 
             scopes: crate::network::identity_sync::SCOPE_ALL,
         });
 
+    // W5: optional wallet-signed dm-sync backfill authorization, proving the
+    // WALLET (not just this request's signer) authorized THIS node to pull
+    // its DM history on its behalf. Absent/malformed → no claim attached;
+    // this NEVER rejects the request itself, it only gates whether dm-sync
+    // backfill can fire. Self-verified here (against the RESOLVED wallet,
+    // not the possibly-device signing address) before being handed to the
+    // network task, so a bogus claim doesn't waste a P2P round-trip.
+    let wallet_claim_raw = headers
+        .get("x-ogmara-dmsync-auth-timestamp")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .zip(headers.get("x-ogmara-dmsync-auth").and_then(|v| v.to_str().ok()))
+        .and_then(|(timestamp, sig_b64)| {
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, sig_b64)
+                .ok()
+                .map(|signature| crate::network::dm_sync::WalletAuthClaim { timestamp, signature })
+        });
+    let had_raw_claim = wallet_claim_raw.is_some();
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+    let wallet_claim = wallet_claim_raw.filter(|c| {
+        crate::network::dm_sync::verify_wallet_claim(c, network, node_id, &resolved_address, now)
+    });
+    if had_raw_claim && wallet_claim.is_none() {
+        tracing::debug!(
+            address = %resolved_address,
+            "dm-sync wallet claim present but failed self-verification; ignoring"
+        );
+    }
+
     // DM offline store-and-forward Phase 1: register this wallet as a local DM
     // user so the node persistently subscribes to its DM gossip topic and
     // receives its cross-node DMs even while offline (REST-only clients get the
     // same coverage as WS clients this way). The network task dedups per session,
     // so firing per request is cheap; `let _ =` ignores a closed channel.
-    let _ = app_state.dm_subscribe_tx.send(resolved_address.clone());
+    let _ = app_state.dm_subscribe_tx.send(crate::network::DmSubscribeEvent {
+        wallet: resolved_address.clone(),
+        wallet_claim,
+    });
 
     Ok((
         AuthUser {

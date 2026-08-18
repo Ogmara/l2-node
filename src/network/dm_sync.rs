@@ -58,6 +58,12 @@ pub const MAX_CONVERSATIONS: usize = 2_000;
 /// Auth freshness window: a request's signed timestamp must be within this many
 /// seconds of the responder's clock (in either direction, to tolerate skew).
 pub const AUTH_MAX_AGE_SECS: u64 = 120;
+/// Freshness window for the WALLET's dm-sync authorization claim (audit W5).
+/// Wider than `AUTH_MAX_AGE_SECS`, which governs the per-request/per-page
+/// NODE self-signature (refreshed every page) — this claim is signed ONCE
+/// by the wallet at login/connect and reused for the whole session's
+/// backfill, including pagination and fanout to multiple peers.
+pub const WALLET_AUTH_MAX_AGE_SECS: u64 = 300;
 
 /// True iff `msg_type` is the DirectMessage type (`0x05`) — the only type DM-sync
 /// serves or accepts. The receiver's type-smuggling defense so a responder can't
@@ -88,7 +94,64 @@ pub fn build_auth_string(
     format!("ogmara-dm-sync:{network}:{responder_peer_id}:{wallet}:{timestamp_ms}")
 }
 
+/// Build the dm-sync WALLET-authorization claim string (audit W5): proves
+/// the wallet at `wallet` authorized `node_id` SPECIFICALLY to backfill its
+/// DMs. Mirrors the domain-separated claim pattern already used for
+/// `DeviceDelegation`/`DeviceEncBinding` (`ogmara-device-claim:`/
+/// `ogmara-enc-bind:`, see `messages::router::verify_device_delegation_claim`/
+/// `verify_device_enc_claim`). `node_id` is the SAME value a client already
+/// fetches from `GET /api/v1/health` for the existing host-bound REST/WS
+/// auth — no new node-identity discovery mechanism needed.
+///
+/// Deliberately wallet-direct only (v1) — no delegated-device signing
+/// support. This keeps `verify_wallet_claim` a pure bech32-decode with zero
+/// local-state/lookup dependency, matching the same property
+/// `crypto::address_to_verifying_key` already gives `DeviceDelegation`/
+/// `DeviceEncBinding` claims: a dm-sync RESPONDER that has never seen this
+/// wallet before can still verify the claim. Extending this to delegated
+/// device keys is a deliberate, deferred follow-up, not an oversight.
+pub fn build_wallet_auth_claim(network: &str, node_id: &str, wallet: &str, timestamp_ms: u64) -> String {
+    format!("ogmara-dm-sync-auth:{network}:{node_id}:{wallet}:{timestamp_ms}")
+}
+
+/// Verify a wallet's dm-sync authorization claim against a SPECIFIC
+/// `node_id`. Pure function, zero local-state dependency. Called from BOTH
+/// the requesting node (self-check on receipt, before using the claim) and
+/// the responder (the real security gate, inside `verify_request_auth`).
+pub fn verify_wallet_claim(
+    claim: &WalletAuthClaim,
+    network: &str,
+    node_id: &str,
+    wallet: &str,
+    now_ms: u64,
+) -> bool {
+    if claim.signature.len() != 64 {
+        return false;
+    }
+    if now_ms.abs_diff(claim.timestamp) > WALLET_AUTH_MAX_AGE_SECS.saturating_mul(1000) {
+        return false;
+    }
+    let Ok(vk) = crate::crypto::address_to_verifying_key(wallet) else {
+        return false;
+    };
+    let Ok(sig) = ed25519_dalek::Signature::from_slice(&claim.signature) else {
+        return false;
+    };
+    let claim_string = build_wallet_auth_claim(network, node_id, wallet, claim.timestamp);
+    signing::verify_klever_message(&vk, claim_string.as_bytes(), &sig).is_ok()
+}
+
 // --- Wire types ---
+
+/// A wallet's own Ed25519 signature authorizing a SPECIFIC node (by
+/// `node_id`) to backfill its DMs on its behalf (audit W5). `None` on a
+/// `DmSyncRequest` means a pre-fix client, or one that didn't attach one —
+/// the responder must reject either way (fail closed).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WalletAuthClaim {
+    pub timestamp: u64,
+    pub signature: Vec<u8>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DmSyncRequest {
@@ -108,6 +171,13 @@ pub struct DmSyncRequest {
     pub max_age_secs: u64,
     /// Opaque paging cursor (continue after this point, across conversations).
     pub cursor: Option<DmCursor>,
+    /// Wallet-signed proof that `wallet` authorized THIS node (by node_id)
+    /// to backfill on its behalf (audit W5). `#[serde(default)]` keeps
+    /// old-shaped CBOR bytes decodable (decode to `None`) — no
+    /// `protocol_string()` bump needed; a pre-fix peer's request just gets
+    /// `auth_failed_response()` once the new check runs.
+    #[serde(default)]
+    pub wallet_claim: Option<WalletAuthClaim>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -163,6 +233,7 @@ pub fn auth_failed_response() -> DmSyncResponse {
 
 /// Sign a DM-sync request as the requesting node. `responder_peer_id` is the
 /// `to_string()` of the peer being dialed (host-binding target).
+#[allow(clippy::too_many_arguments)]
 pub fn sign_request(
     signing_key: &ed25519_dalek::SigningKey,
     network: &str,
@@ -171,6 +242,7 @@ pub fn sign_request(
     timestamp_ms: u64,
     max_age_secs: u64,
     cursor: Option<DmCursor>,
+    wallet_claim: Option<WalletAuthClaim>,
 ) -> DmSyncRequest {
     let auth_string = build_auth_string(network, responder_peer_id, wallet, timestamp_ms);
     let sig = signing::sign_klever_message(signing_key, auth_string.as_bytes());
@@ -181,6 +253,7 @@ pub fn sign_request(
         signature: sig.to_bytes().to_vec(),
         max_age_secs,
         cursor,
+        wallet_claim,
     }
 }
 
@@ -191,7 +264,14 @@ pub fn sign_request(
 ///  2. the signed `timestamp` is within `AUTH_MAX_AGE_SECS` of `now_ms`;
 ///  3. the signature verifies over the host-bound auth string built with the
 ///     RESPONDER's own PeerId (so a captured request can't be replayed to a
-///     different node).
+///     different node);
+///  4. (audit W5) `wallet_claim` is present and verifies: the WALLET whose
+///     DMs are requested must have itself authorized THIS specific node.
+///     `node_id` is derived from the ALREADY-VERIFIED `requester_pubkey`
+///     (step 1 proved this node controls it), so a claim minted for a
+///     different node can never satisfy this — closes the Sybil-scraping
+///     gap where any freshly-generated node key could request any wallet's
+///     history.
 pub fn verify_request_auth(
     request: &DmSyncRequest,
     responder_peer_id: &str,
@@ -230,7 +310,16 @@ pub fn verify_request_auth(
         Err(_) => return false,
     };
     let auth_string = build_auth_string(network, responder_peer_id, &request.wallet, request.timestamp);
-    signing::verify_klever_message(&vk, auth_string.as_bytes(), &sig).is_ok()
+    if signing::verify_klever_message(&vk, auth_string.as_bytes(), &sig).is_err() {
+        return false;
+    }
+    // 4. Wallet W5: the wallet whose DMs are requested must have authorized
+    //    THIS node specifically.
+    let node_id = crate::crypto::compute_node_id(&vk);
+    match &request.wallet_claim {
+        Some(claim) => verify_wallet_claim(claim, network, &node_id, &request.wallet, now_ms),
+        None => false,
+    }
 }
 
 /// Build a response: page a wallet's DMs across conversations (stable ascending
@@ -394,10 +483,21 @@ pub struct DmResponderLimits {
     inner: Mutex<DmLimitsInner>,
 }
 
+/// Soft ceiling on distinct per-peer cumulative-served entries. Previously
+/// cleared WHOLESALE on overflow — a Sybil cycling fresh PeerIds could reset
+/// everyone's cumulative "served" counter, defeating `TOTAL_ENVELOPES_CAP`
+/// (audit W5, bundled fix). Now the single oldest entry is evicted per
+/// overflow insert instead, so a new identity can only ever displace ONE
+/// other peer's counter, not all of them.
+pub(crate) const MAX_TRACKED_SERVED_PEERS: usize = 100_000;
+
 #[derive(Debug, Default)]
 struct DmLimitsInner {
     per_peer: HashMap<libp2p::PeerId, usize>,
     served: HashMap<libp2p::PeerId, u64>,
+    /// Insertion order of `served` keys, oldest-first — lets `add_served`
+    /// evict a single oldest entry on overflow (audit W5).
+    served_order: std::collections::VecDeque<libp2p::PeerId>,
 }
 
 impl DmResponderLimits {
@@ -408,13 +508,7 @@ impl DmResponderLimits {
         max_concurrent_per_peer: usize,
         total_envelopes_cap: u64,
     ) -> Option<DmResponderGuard> {
-        /// Soft ceiling on distinct per-peer cumulative-served entries; cleared
-        /// on overflow (abuse limiter, not a security invariant).
-        const MAX_TRACKED: usize = 100_000;
         let mut inner = self.inner.lock().ok()?;
-        if inner.served.len() >= MAX_TRACKED {
-            inner.served.clear();
-        }
         let in_flight = inner.per_peer.get(&peer).copied().unwrap_or(0);
         if in_flight >= max_concurrent_per_peer {
             return None;
@@ -431,6 +525,15 @@ impl DmResponderLimits {
 
     pub fn add_served(&self, peer: libp2p::PeerId, count: u64) {
         if let Ok(mut inner) = self.inner.lock() {
+            let is_new = !inner.served.contains_key(&peer);
+            if is_new {
+                if inner.served.len() >= MAX_TRACKED_SERVED_PEERS {
+                    if let Some(oldest) = inner.served_order.pop_front() {
+                        inner.served.remove(&oldest);
+                    }
+                }
+                inner.served_order.push_back(peer);
+            }
             *inner.served.entry(peer).or_insert(0) += count;
         }
     }
@@ -470,11 +573,38 @@ mod tests {
         (sk, peer)
     }
 
+    /// A separate, real WALLET keypair (distinct from the node's own key
+    /// above) whose bech32 address can round-trip through
+    /// `crypto::address_to_verifying_key` — required for `verify_wallet_claim`
+    /// (audit W5), unlike the old placeholder `"klv1abc"` string.
+    fn wallet_keypair() -> (SigningKey, String) {
+        let sk = SigningKey::from_bytes(&[9u8; 32]);
+        let address = crate::crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        (sk, address)
+    }
+
+    /// Build a valid wallet claim authorizing `node_sk`'s node (by its
+    /// derived node_id) to backfill `wallet`'s DMs, signed by `wallet_sk`.
+    fn valid_claim(
+        wallet_sk: &SigningKey,
+        node_sk: &SigningKey,
+        network: &str,
+        wallet: &str,
+        timestamp_ms: u64,
+    ) -> WalletAuthClaim {
+        let node_id = crate::crypto::compute_node_id(&node_sk.verifying_key());
+        let claim_string = build_wallet_auth_claim(network, &node_id, wallet, timestamp_ms);
+        let sig = signing::sign_klever_message(wallet_sk, claim_string.as_bytes());
+        WalletAuthClaim { timestamp: timestamp_ms, signature: sig.to_bytes().to_vec() }
+    }
+
     #[test]
     fn auth_roundtrip_accepts_valid_request() {
         let (sk, peer) = keypair();
+        let (wallet_sk, wallet) = wallet_keypair();
         let now = 1_700_000_000_000u64;
-        let req = sign_request(&sk, "testnet", &peer.to_string(), "klv1abc", now, 3600, None);
+        let claim = valid_claim(&wallet_sk, &sk, "testnet", &wallet, now);
+        let req = sign_request(&sk, "testnet", &peer.to_string(), &wallet, now, 3600, None, Some(claim));
         assert!(verify_request_auth(&req, &peer.to_string(), "testnet", now, &peer));
     }
 
@@ -482,8 +612,10 @@ mod tests {
     fn auth_rejects_cross_responder_replay() {
         // A request signed for responder A must fail verification at responder B.
         let (sk, peer) = keypair();
+        let (wallet_sk, wallet) = wallet_keypair();
         let now = 1_700_000_000_000u64;
-        let req = sign_request(&sk, "testnet", "RESPONDER_A", "klv1abc", now, 3600, None);
+        let claim = valid_claim(&wallet_sk, &sk, "testnet", &wallet, now);
+        let req = sign_request(&sk, "testnet", "RESPONDER_A", &wallet, now, 3600, None, Some(claim));
         // Responder B re-derives its OWN peer id into the auth string → mismatch.
         assert!(!verify_request_auth(&req, "RESPONDER_B", "testnet", now, &peer));
     }
@@ -491,17 +623,21 @@ mod tests {
     #[test]
     fn auth_rejects_tampered_wallet() {
         let (sk, peer) = keypair();
+        let (wallet_sk, wallet) = wallet_keypair();
         let now = 1_700_000_000_000u64;
-        let mut req = sign_request(&sk, "testnet", &peer.to_string(), "klv1abc", now, 3600, None);
-        req.wallet = "klv1evil".into(); // signature no longer covers this wallet
+        let claim = valid_claim(&wallet_sk, &sk, "testnet", &wallet, now);
+        let mut req = sign_request(&sk, "testnet", &peer.to_string(), &wallet, now, 3600, None, Some(claim));
+        req.wallet = "klv1evil000000000000000000000000000".into(); // signature no longer covers this wallet
         assert!(!verify_request_auth(&req, &peer.to_string(), "testnet", now, &peer));
     }
 
     #[test]
     fn auth_rejects_stale_timestamp() {
         let (sk, peer) = keypair();
+        let (wallet_sk, wallet) = wallet_keypair();
         let signed_at = 1_700_000_000_000u64;
-        let req = sign_request(&sk, "testnet", &peer.to_string(), "klv1abc", signed_at, 3600, None);
+        let claim = valid_claim(&wallet_sk, &sk, "testnet", &wallet, signed_at);
+        let req = sign_request(&sk, "testnet", &peer.to_string(), &wallet, signed_at, 3600, None, Some(claim));
         // now is well beyond AUTH_MAX_AGE_SECS past the signed timestamp.
         let now = signed_at + (AUTH_MAX_AGE_SECS + 60) * 1000;
         assert!(!verify_request_auth(&req, &peer.to_string(), "testnet", now, &peer));
@@ -510,11 +646,75 @@ mod tests {
     #[test]
     fn auth_rejects_pubkey_not_matching_connection_peer() {
         let (sk, _peer) = keypair();
+        let (wallet_sk, wallet) = wallet_keypair();
         let now = 1_700_000_000_000u64;
         // Sign honestly, but present the request over a DIFFERENT peer's stream.
         let other_peer = libp2p::identity::Keypair::generate_ed25519().public().to_peer_id();
-        let req = sign_request(&sk, "testnet", &other_peer.to_string(), "klv1abc", now, 3600, None);
+        let claim = valid_claim(&wallet_sk, &sk, "testnet", &wallet, now);
+        let req = sign_request(&sk, "testnet", &other_peer.to_string(), &wallet, now, 3600, None, Some(claim));
         assert!(!verify_request_auth(&req, &other_peer.to_string(), "testnet", now, &other_peer));
+    }
+
+    // --- W5: wallet-signed dm-sync authorization claim ---
+
+    #[test]
+    fn verify_wallet_claim_accepts_valid_claim() {
+        let (node_sk, _peer) = keypair();
+        let (wallet_sk, wallet) = wallet_keypair();
+        let now = 1_700_000_000_000u64;
+        let node_id = crate::crypto::compute_node_id(&node_sk.verifying_key());
+        let claim = valid_claim(&wallet_sk, &node_sk, "testnet", &wallet, now);
+        assert!(verify_wallet_claim(&claim, "testnet", &node_id, &wallet, now));
+    }
+
+    #[test]
+    fn verify_wallet_claim_rejects_wrong_node_id() {
+        // The wallet's claim for node N doesn't verify when presented as
+        // node C — the whole point of binding the claim to a node_id.
+        let (node_sk, _peer) = keypair();
+        let (wallet_sk, wallet) = wallet_keypair();
+        let now = 1_700_000_000_000u64;
+        let claim = valid_claim(&wallet_sk, &node_sk, "testnet", &wallet, now);
+        let wrong_node_id = "not-the-authorized-node".to_string();
+        assert!(!verify_wallet_claim(&claim, "testnet", &wrong_node_id, &wallet, now));
+    }
+
+    #[test]
+    fn verify_wallet_claim_rejects_stale_timestamp() {
+        let (node_sk, _peer) = keypair();
+        let (wallet_sk, wallet) = wallet_keypair();
+        let signed_at = 1_700_000_000_000u64;
+        let node_id = crate::crypto::compute_node_id(&node_sk.verifying_key());
+        let claim = valid_claim(&wallet_sk, &node_sk, "testnet", &wallet, signed_at);
+        let now = signed_at + (WALLET_AUTH_MAX_AGE_SECS + 60) * 1000;
+        assert!(!verify_wallet_claim(&claim, "testnet", &node_id, &wallet, now));
+    }
+
+    #[test]
+    fn verify_wallet_claim_rejects_tampered_wallet() {
+        // Signed for one wallet, presented as authorizing a different one.
+        let (node_sk, _peer) = keypair();
+        let (wallet_sk, wallet) = wallet_keypair();
+        let (_other_sk, other_wallet) = {
+            let sk = SigningKey::from_bytes(&[11u8; 32]);
+            let addr = crate::crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+            (sk, addr)
+        };
+        let now = 1_700_000_000_000u64;
+        let node_id = crate::crypto::compute_node_id(&node_sk.verifying_key());
+        let claim = valid_claim(&wallet_sk, &node_sk, "testnet", &wallet, now);
+        assert!(!verify_wallet_claim(&claim, "testnet", &node_id, &other_wallet, now));
+    }
+
+    #[test]
+    fn verify_request_auth_rejects_missing_wallet_claim() {
+        // A pre-fix client (or one that omitted the claim) — everything ELSE
+        // about the request is valid, isolating the failure to the new check.
+        let (sk, peer) = keypair();
+        let (_wallet_sk, wallet) = wallet_keypair();
+        let now = 1_700_000_000_000u64;
+        let req = sign_request(&sk, "testnet", &peer.to_string(), &wallet, now, 3600, None, None);
+        assert!(!verify_request_auth(&req, &peer.to_string(), "testnet", now, &peer));
     }
 
     // --- build_response multi-conversation cursor paging ---
@@ -578,6 +778,7 @@ mod tests {
                 signature: vec![0u8; 64],
                 max_age_secs: u64::MAX,
                 cursor: cursor.clone(),
+                wallet_claim: None,
             };
             let (resp, scanned_all) = build_response(&storage, wallet, &req, 2, now, u64::MAX);
             assert!(scanned_all);
@@ -637,9 +838,47 @@ mod tests {
             signature: vec![0u8; 64],
             max_age_secs: 24 * 3600,
             cursor: None,
+            wallet_claim: None,
         };
         let (resp, _) = build_response(&storage, wallet, &req, 200, now, u64::MAX);
         assert_eq!(resp.envelopes.len(), 1);
         assert_eq!(resp.envelopes[0].as_slice(), new_id.as_slice());
+    }
+
+    // --- W5 bundled fix: DmResponderLimits eviction, not clear-all ---
+
+    #[test]
+    fn add_served_evicts_oldest_not_everyone() {
+        // `PeerId::random()` (no real keypair derivation needed — this test
+        // only exercises the eviction bookkeeping, not signature validity)
+        // keeps 100k inserts fast enough for a unit test.
+        let limits = DmResponderLimits::default();
+        let first_peer = libp2p::PeerId::random();
+        limits.add_served(first_peer, 1);
+        for _ in 1..MAX_TRACKED_SERVED_PEERS - 1 {
+            limits.add_served(libp2p::PeerId::random(), 1);
+        }
+        let last_peer = libp2p::PeerId::random();
+        limits.add_served(last_peer, 1);
+
+        // One more, over capacity — must evict the FIRST-inserted peer only,
+        // not clear the whole map (audit W5).
+        let overflow_peer = libp2p::PeerId::random();
+        limits.add_served(overflow_peer, 1);
+
+        let inner = limits.inner.lock().unwrap();
+        assert_eq!(inner.served.len(), MAX_TRACKED_SERVED_PEERS);
+        assert!(
+            !inner.served.contains_key(&first_peer),
+            "oldest peer's counter must be evicted"
+        );
+        assert!(
+            inner.served.contains_key(&last_peer),
+            "a recently-inserted peer's counter must survive"
+        );
+        assert!(
+            inner.served.contains_key(&overflow_peer),
+            "the new insert itself must be present"
+        );
     }
 }

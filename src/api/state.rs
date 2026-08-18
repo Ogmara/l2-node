@@ -253,8 +253,10 @@ pub struct AppState {
     pub identity_sync_tx:
         tokio::sync::mpsc::UnboundedSender<crate::network::IdentitySyncCommand>,
     /// Tells the network task to subscribe to a wallet's DM gossip topic so this
-    /// node receives that user's cross-node DMs. Sent on each WS connect.
-    pub dm_subscribe_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    /// node receives that user's cross-node DMs. Sent on each WS connect and
+    /// each REST authenticated call, optionally carrying a wallet-signed
+    /// dm-sync backfill authorization for this node (audit W5).
+    pub dm_subscribe_tx: tokio::sync::mpsc::UnboundedSender<crate::network::DmSubscribeEvent>,
     /// Tells the network task to subscribe to a channel's gossip topic so this
     /// node receives that channel's cross-node messages/keys (private-channel
     /// federation, F1). Fired by the `/channels/{id}/federate` endpoint. Reuses the
@@ -545,7 +547,7 @@ impl AppState {
         peer_count: Arc<AtomicU32>,
         gossip_tx: tokio::sync::mpsc::UnboundedSender<crate::network::GossipPublish>,
         identity_sync_tx: tokio::sync::mpsc::UnboundedSender<crate::network::IdentitySyncCommand>,
-        dm_subscribe_tx: tokio::sync::mpsc::UnboundedSender<String>,
+        dm_subscribe_tx: tokio::sync::mpsc::UnboundedSender<crate::network::DmSubscribeEvent>,
         channel_subscribe_tx: tokio::sync::mpsc::UnboundedSender<u64>,
         connected_peers: Arc<RwLock<HashMap<String, ConnectedPeerInfo>>>,
         counters: Arc<NetworkCounters>,
