@@ -200,10 +200,20 @@ async fn handle_authenticated_ws(socket: WebSocket, state: Arc<AppState>) {
     // Subscribe this node to the user's DM gossip topic so DMs sent to them from
     // OTHER nodes are received and indexed here (the network task owns the swarm).
     // Idempotent in the topic layer; safe to send on every connect.
-    let _ = state.dm_subscribe_tx.send(crate::network::DmSubscribeEvent {
-        wallet: wallet_address.clone(),
-        wallet_claim,
-    });
+    //
+    // Gated on PoW-known (audit final pre-mainnet W11) — same rationale and
+    // fail-open shape as the REST auth path (`api/auth.rs`).
+    let dm_enrollment_allowed = state
+        .pow
+        .as_ref()
+        .map(|pow| pow.is_wallet_known(&wallet_address))
+        .unwrap_or(true);
+    if dm_enrollment_allowed {
+        let _ = state.dm_subscribe_tx.send(crate::network::DmSubscribeEvent {
+            wallet: wallet_address.clone(),
+            wallet_claim,
+        });
+    }
 
     // Register this user with the notification engine for mention detection
     if let Some(ref engine) = state.notification_engine {

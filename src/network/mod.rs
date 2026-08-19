@@ -140,6 +140,26 @@ const GOSSIP_APP_SCORE_FLOOR: i64 = -100;
 /// with its native score, rather than getting a clean slate early.
 const GOSSIP_APP_SCORE_MAX_IDLE: Duration = Duration::from_secs(3600);
 
+/// DM retention reaper (audit final pre-mainnet W11, l2-node 0.101.0+):
+/// max rows actually DELETED per sweep, per pass. Bounds the write cost of
+/// one `dm_reap_interval` tick.
+const DM_REAP_BATCH_LIMIT: usize = 2_000;
+/// DM retention reaper: max rows FETCHED/examined per sweep, per pass —
+/// bounds wall-clock/read cost even when a sweep's batch is dominated by
+/// rows that turn out not to be expired yet (e.g. one very active
+/// conversation/wallet). Each pass uses a simple linear scan over this
+/// batch (no seek-ahead-past-a-whole-group optimization): every row's
+/// timestamp is checked individually, and non-expired rows are simply
+/// skipped rather than jumping the RocksDB seek position. This trades a
+/// small amount of steady-state efficiency for a large conversation/wallet
+/// (its still-fresh rows get re-examined, not re-deleted, on repeated
+/// ticks until they age out) for much simpler, easier-to-verify logic — no
+/// manual 256-bit big-endian increment/overflow handling. Correctness is
+/// unaffected either way: the persisted cursor always advances past the
+/// examined batch, so every sweep makes forward progress and nothing is
+/// ever missed or double-processed.
+const DM_REAP_MAX_ROWS_EXAMINED: usize = 20_000;
+
 /// Per-peer state for the non-presence gossip rate limiter
 /// (`NetworkService::gossip_rate_limiter`).
 struct GossipRateWindow {
@@ -185,6 +205,90 @@ impl GossipRateWindow {
 /// final pre-mainnet W10).
 fn clamp_gossip_app_score(current: i64, delta: i64, floor: i64) -> i64 {
     (current + delta).clamp(floor, 0)
+}
+
+/// Pure planning step for the DM retention reaper's Pass A/Pass C (audit
+/// final pre-mainnet W11): given a batch of `DM_MESSAGES`- or
+/// `DM_EDIT_DELETE_MSGS`-shaped rows (keyed
+/// `conversation_id(32)++timestamp_be(8)++msg_id(32)`) and a cutoff,
+/// returns the keys to delete (capped at `batch_limit`) and the next cursor
+/// to resume from (`None` means the batch was empty — wrap to the start of
+/// the CF). No I/O — factored out purely so the cutoff/key-parsing logic is
+/// unit-testable without a live `Storage`/swarm (this campaign's established
+/// workaround, see W10's `GossipRateWindow::check_and_record`).
+fn plan_dm_msg_shaped_reap(
+    rows: &[(Vec<u8>, Vec<u8>)],
+    cutoff_ms: u64,
+    batch_limit: usize,
+) -> (Vec<Vec<u8>>, Option<Vec<u8>>) {
+    if rows.is_empty() {
+        return (Vec::new(), None);
+    }
+    let mut to_delete = Vec::new();
+    let mut last_key: &[u8] = &rows[0].0;
+    for (key, _) in rows {
+        // Code Audit follow-up (W11): `last_key` must only advance to a row
+        // this iteration actually EXAMINES. Setting it before the
+        // batch-limit check meant the cursor could skip past a row whose
+        // expiry was never evaluated — that row would then never be
+        // reconsidered by any future sweep (its key sorts before the
+        // persisted cursor forever), permanently orphaning it from the
+        // reaper regardless of how expired it later becomes.
+        if to_delete.len() >= batch_limit {
+            break;
+        }
+        last_key = key;
+        if key.len() != 72 {
+            continue; // defensive — malformed key, not this reaper's job to fix
+        }
+        let ts = u64::from_be_bytes(key[32..40].try_into().unwrap());
+        if ts >= cutoff_ms {
+            continue; // not expired yet — leave it, don't jump the cursor past it
+        }
+        to_delete.push(key.clone());
+    }
+    let mut next_cursor = last_key.to_vec();
+    next_cursor.push(0); // sorts immediately after `last_key` itself
+    (to_delete, Some(next_cursor))
+}
+
+/// Pure planning step for the DM retention reaper's Pass B: given a batch of
+/// `DM_CONVERSATIONS` rows (keyed `wallet_address(variable, ≤70 bytes) ++
+/// !timestamp_be(8) ++ conversation_id(32)`) and a cutoff, returns the keys
+/// to delete and the next cursor. The wallet-address prefix is NOT
+/// fixed-width (see `reap_dm_conversations`'s doc comment) — its length is
+/// derived from `key.len() - 40`, never a hardcoded start offset.
+fn plan_dm_conversations_reap(
+    rows: &[(Vec<u8>, Vec<u8>)],
+    cutoff_ms: u64,
+    batch_limit: usize,
+) -> (Vec<Vec<u8>>, Option<Vec<u8>>) {
+    if rows.is_empty() {
+        return (Vec::new(), None);
+    }
+    let mut to_delete = Vec::new();
+    let mut last_key: &[u8] = &rows[0].0;
+    for (key, _) in rows {
+        // See the matching comment in `plan_dm_msg_shaped_reap` — `last_key`
+        // must only advance to a row actually examined this iteration.
+        if to_delete.len() >= batch_limit {
+            break;
+        }
+        last_key = key;
+        if key.len() <= 40 {
+            continue; // defensive — malformed key
+        }
+        let wallet_len = key.len() - 40;
+        let neg_ts = u64::from_be_bytes(key[wallet_len..wallet_len + 8].try_into().unwrap());
+        let ts = !neg_ts; // key stores the bitwise complement of the timestamp
+        if ts >= cutoff_ms {
+            continue;
+        }
+        to_delete.push(key.clone());
+    }
+    let mut next_cursor = last_key.to_vec();
+    next_cursor.push(0);
+    (to_delete, Some(next_cursor))
 }
 
 /// The running network layer.
@@ -942,6 +1046,7 @@ impl NetworkService {
             identity,
             None,
             config.network_id().to_string(),
+            dm_config.max_stored_messages_per_recipient,
         );
 
         let public_url = config.api.public_url.clone();
@@ -1221,6 +1326,167 @@ impl NetworkService {
         }
     }
 
+    /// DM retention reaper entry point (audit final pre-mainnet W11). Runs 3
+    /// independent, self-contained sweeps, each keyed off timestamp bytes
+    /// already present verbatim in the row being examined — never by
+    /// re-deriving one CF's delete-key from another CF's decoded content
+    /// (identity resolution can change over the retention window; that class
+    /// of bug has bitten this campaign before, e.g. W6's
+    /// channel_id-from-untrusted-field). `retention_days == 0` means
+    /// "unlimited" — disables all three passes, matching the pre-existing
+    /// documented config semantic.
+    fn reap_expired_dms(&mut self) {
+        if self.dm_config.retention_days == 0 {
+            return;
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let cutoff_ms = now_ms.saturating_sub(
+            self.dm_config
+                .retention_days
+                .saturating_mul(24 * 3600 * 1000),
+        );
+        self.reap_dm_msg_shaped_cf(
+            schema::cf::DM_MESSAGES,
+            schema::state_keys::DM_REAP_CURSOR_MESSAGES,
+            cutoff_ms,
+            true, // Pass A: also decrement the per-recipient counter
+        );
+        self.reap_dm_conversations(cutoff_ms);
+        self.reap_dm_msg_shaped_cf(
+            schema::cf::DM_EDIT_DELETE_MSGS,
+            schema::state_keys::DM_REAP_CURSOR_EDIT_DELETE,
+            cutoff_ms,
+            false, // Pass C: edit/delete envelopes were never counted, don't decrement
+        );
+    }
+
+    /// Pass A / Pass C: reaps a `DM_MESSAGES`- or `DM_EDIT_DELETE_MSGS`-shaped
+    /// CF (both keyed `conversation_id(32) ++ timestamp_be(8) ++ msg_id(32)`).
+    /// For every expired row: deletes the index row itself, deletes the
+    /// envelope's `MESSAGES[msg_id]` content, opportunistically deletes any
+    /// `DELETION_MARKERS[msg_id]` (cheap, msg_id already in hand), and — only
+    /// for Pass A (`decrement_counter`) — decrements the recipient's
+    /// `DM_RECIPIENT_MSG_COUNTS` entry (paired with the increment in
+    /// `MessageRouter::update_indexes`; edit/delete envelopes are never
+    /// indexed into `DM_MESSAGES` so they were never counted, W6 note).
+    /// The tricky key-parsing/cutoff decision is factored into the pure
+    /// `plan_dm_msg_shaped_reap` (unit tested); this method is just the I/O
+    /// shell around it.
+    fn reap_dm_msg_shaped_cf(
+        &mut self,
+        cf_name: &str,
+        cursor_key: &[u8],
+        cutoff_ms: u64,
+        decrement_counter: bool,
+    ) {
+        let cursor = self
+            .storage
+            .get_cf(schema::cf::NODE_STATE, cursor_key)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let rows = match self
+            .storage
+            .iter_cf_from(cf_name, &cursor, &[], DM_REAP_MAX_ROWS_EXAMINED)
+        {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(cf = cf_name, error = %e, "reap_dm_msg_shaped_cf: scan failed");
+                return;
+            }
+        };
+        let (to_delete, next_cursor) =
+            plan_dm_msg_shaped_reap(&rows, cutoff_ms, DM_REAP_BATCH_LIMIT);
+        for key in &to_delete {
+            let msg_id = &key[40..72];
+            let _ = self.storage.delete_cf(cf_name, key);
+            if decrement_counter {
+                if let Ok(Some(content)) = self.storage.get_cf(schema::cf::MESSAGES, msg_id) {
+                    if let Ok(envelope) = rmp_serde::from_slice::<crate::messages::envelope::Envelope>(&content) {
+                        if let Ok(payload) =
+                            rmp_serde::from_slice::<crate::messages::types::DirectMessagePayload>(
+                                &envelope.payload,
+                            )
+                        {
+                            let _ = self
+                                .storage
+                                .decrement_dm_recipient_count(payload.recipient.as_bytes());
+                        }
+                    }
+                }
+            }
+            let _ = self.storage.delete_cf(schema::cf::MESSAGES, msg_id);
+            let _ = self
+                .storage
+                .delete_cf(schema::cf::DELETION_MARKERS, msg_id);
+        }
+        // Persist the cursor just past the last row this sweep looked at (or
+        // wrap to the start if the CF is empty/exhausted), so the next tick
+        // resumes forward progress regardless of how many rows were expired.
+        match next_cursor {
+            Some(nc) => {
+                let _ = self.storage.put_cf(schema::cf::NODE_STATE, cursor_key, &nc);
+            }
+            None => {
+                let _ = self.storage.delete_cf(schema::cf::NODE_STATE, cursor_key);
+            }
+        }
+    }
+
+    /// Pass B: reaps `DM_CONVERSATIONS`, keyed
+    /// `wallet_address(variable, ≤70 bytes) ++ !timestamp_be(8) ++
+    /// conversation_id(32)`. The wallet-address prefix is NOT fixed-width —
+    /// the recipient-side row's prefix is `DirectMessagePayload.recipient`,
+    /// an attacker-controlled field only bounded by `MAX_KLEVER_ADDRESS_LEN`
+    /// (70), not guaranteed to be exactly 62 bytes like a real resolved
+    /// wallet — so the wallet length is derived from the END of the key
+    /// (`key.len() - 40`, the trailing `!ts(8)+conversation_id(32)` is always
+    /// fixed-width), never a hardcoded offset from the start. See
+    /// `plan_dm_conversations_reap` (pure, unit tested) for the actual logic.
+    fn reap_dm_conversations(&mut self, cutoff_ms: u64) {
+        let cursor = self
+            .storage
+            .get_cf(schema::cf::NODE_STATE, schema::state_keys::DM_REAP_CURSOR_CONVERSATIONS)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let rows = match self.storage.iter_cf_from(
+            schema::cf::DM_CONVERSATIONS,
+            &cursor,
+            &[],
+            DM_REAP_MAX_ROWS_EXAMINED,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(error = %e, "reap_dm_conversations: scan failed");
+                return;
+            }
+        };
+        let (to_delete, next_cursor) =
+            plan_dm_conversations_reap(&rows, cutoff_ms, DM_REAP_BATCH_LIMIT);
+        for key in &to_delete {
+            let _ = self.storage.delete_cf(schema::cf::DM_CONVERSATIONS, key);
+        }
+        match next_cursor {
+            Some(nc) => {
+                let _ = self.storage.put_cf(
+                    schema::cf::NODE_STATE,
+                    schema::state_keys::DM_REAP_CURSOR_CONVERSATIONS,
+                    &nc,
+                );
+            }
+            None => {
+                let _ = self.storage.delete_cf(
+                    schema::cf::NODE_STATE,
+                    schema::state_keys::DM_REAP_CURSOR_CONVERSATIONS,
+                );
+            }
+        }
+    }
+
     /// Publish a raw message to a GossipSub topic.
     pub fn publish(
         &mut self,
@@ -1319,6 +1585,14 @@ impl NetworkService {
         // on mesh stabilization, not at boot.
         presence_interval.tick().await;
 
+        // DM retention reaper cadence (audit final pre-mainnet W11, l2-node
+        // 0.101.0+). Own interval, not piggybacked on `mesh_stats_interval`
+        // like W10's cheap prune — a reap sweep does real cross-CF deletion
+        // work and shouldn't compete with mesh-stats' tight 30s budget.
+        let mut dm_reap_interval =
+            tokio::time::interval(Duration::from_secs(self.dm_config.reap_interval_secs.max(1)));
+        dm_reap_interval.tick().await; // skip immediate tick
+
         loop {
             tokio::select! {
                 event = self.swarm.select_next_some() => {
@@ -1383,6 +1657,9 @@ impl NetworkService {
                     // Steady-state rebroadcast — don't care about
                     // success here; the next tick fires regardless.
                     let _ = self.publish_presence_self_record();
+                }
+                _ = dm_reap_interval.tick() => {
+                    self.reap_expired_dms();
                 }
                 _ = announce_interval.tick() => {
                     self.publish_node_announcement();
@@ -4509,5 +4786,114 @@ mod gossip_flood_protection_tests {
             score = clamp_gossip_app_score(score, -INVALID_MESSAGE_SCORE_PENALTY, GOSSIP_APP_SCORE_FLOOR);
         }
         assert_eq!(score, GOSSIP_APP_SCORE_FLOOR);
+    }
+}
+
+#[cfg(test)]
+mod dm_reaper_tests {
+    //! Audit final pre-mainnet W11. Covers the pure planning logic factored
+    //! out of `NetworkService::reap_dm_msg_shaped_cf`/`reap_dm_conversations`
+    //! — see the note on `plan_dm_msg_shaped_reap` for why the `&mut self`
+    //! reaper methods themselves aren't tested directly here.
+    use super::*;
+
+    fn dm_msg_row(conversation_id: [u8; 32], ts: u64, msg_id: [u8; 32]) -> (Vec<u8>, Vec<u8>) {
+        (schema::encode_dm_msg_key(&conversation_id, ts, &msg_id), Vec::new())
+    }
+
+    #[test]
+    fn plan_dm_msg_shaped_reap_deletes_only_expired_rows() {
+        let conv = [1u8; 32];
+        let rows = vec![
+            dm_msg_row(conv, 100, [1u8; 32]), // expired
+            dm_msg_row(conv, 200, [2u8; 32]), // not expired
+            dm_msg_row(conv, 50, [3u8; 32]),  // expired
+        ];
+        let (to_delete, next_cursor) = plan_dm_msg_shaped_reap(&rows, 150, 100);
+        assert_eq!(to_delete.len(), 2);
+        assert!(to_delete.contains(&rows[0].0));
+        assert!(to_delete.contains(&rows[2].0));
+        assert!(!to_delete.contains(&rows[1].0));
+        assert!(next_cursor.is_some());
+    }
+
+    #[test]
+    fn plan_dm_msg_shaped_reap_respects_batch_limit() {
+        let conv = [1u8; 32];
+        let rows: Vec<_> = (0..10)
+            .map(|i| dm_msg_row(conv, 0, [i as u8; 32])) // all expired (ts=0)
+            .collect();
+        let (to_delete, next_cursor) = plan_dm_msg_shaped_reap(&rows, 1000, 3);
+        assert_eq!(to_delete.len(), 3);
+        // Code Audit follow-up: the cursor must resume from just past the
+        // LAST EXAMINED row (index 2, the 3rd), never past an unexamined
+        // one (index 3) — an earlier draft set `last_key` before the
+        // batch-limit break, which silently orphaned row 3 from every
+        // future sweep regardless of how expired it later became.
+        let expected_cursor = {
+            let mut c = rows[2].0.clone();
+            c.push(0);
+            c
+        };
+        assert_eq!(next_cursor, Some(expected_cursor));
+    }
+
+    #[test]
+    fn plan_dm_msg_shaped_reap_empty_batch_returns_none_cursor() {
+        let (to_delete, next_cursor) = plan_dm_msg_shaped_reap(&[], 1000, 100);
+        assert!(to_delete.is_empty());
+        assert!(next_cursor.is_none());
+    }
+
+    #[test]
+    fn plan_dm_msg_shaped_reap_cursor_advances_past_last_examined_row_even_if_nothing_deleted() {
+        let conv = [1u8; 32];
+        let rows = vec![dm_msg_row(conv, 999_999, [9u8; 32])]; // not expired
+        let (to_delete, next_cursor) = plan_dm_msg_shaped_reap(&rows, 100, 100);
+        assert!(to_delete.is_empty());
+        let cursor = next_cursor.expect("cursor must still advance to make forward progress");
+        assert!(cursor > rows[0].0, "cursor must sort strictly after the last examined row");
+    }
+
+    fn dm_conv_row(wallet: &[u8], last_activity_ts: u64, conversation_id: [u8; 32]) -> (Vec<u8>, Vec<u8>) {
+        (
+            schema::encode_dm_conversation_key(wallet, last_activity_ts, &conversation_id),
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn plan_dm_conversations_reap_handles_variable_length_wallet_prefix() {
+        // A real resolved wallet is 62 bytes; an attacker-controlled
+        // `payload.recipient` string can be shorter (only bounded at 70 by
+        // MAX_KLEVER_ADDRESS_LEN). Both must be parsed correctly — this is
+        // exactly the bug an earlier draft of this fix had (hardcoded 62).
+        let short_wallet = b"klv1short";
+        let full_wallet = [b'a'; 62];
+        let rows = vec![
+            dm_conv_row(short_wallet, 100, [1u8; 32]), // expired
+            dm_conv_row(&full_wallet, 100, [2u8; 32]), // expired
+        ];
+        let (to_delete, _) = plan_dm_conversations_reap(&rows, 150, 100);
+        assert_eq!(to_delete.len(), 2, "both variable-length wallet prefixes must be reaped correctly");
+    }
+
+    #[test]
+    fn plan_dm_conversations_reap_respects_negated_timestamp_ordering() {
+        let wallet = b"klv1abc";
+        let rows = vec![
+            dm_conv_row(wallet, 200, [1u8; 32]), // not expired
+            dm_conv_row(wallet, 50, [2u8; 32]),  // expired
+        ];
+        let (to_delete, _) = plan_dm_conversations_reap(&rows, 150, 100);
+        assert_eq!(to_delete.len(), 1);
+        assert_eq!(to_delete[0], rows[1].0);
+    }
+
+    #[test]
+    fn plan_dm_conversations_reap_empty_batch_returns_none_cursor() {
+        let (to_delete, next_cursor) = plan_dm_conversations_reap(&[], 1000, 100);
+        assert!(to_delete.is_empty());
+        assert!(next_cursor.is_none());
     }
 }

@@ -233,6 +233,24 @@ ttl_seconds = 86400
 max_size_mb = 1024
 auto_pin_on_interaction = true
 
+[dm]
+# DM offline store-and-forward (spec 03 §3.5.1, l2-node 0.69.0+)
+# Max persistent DM-topic subscriptions for this node's local users.
+# LRU-evicted on last_active_ms when exceeded. 0 = unbounded (test-only).
+max_local_subscriptions = 5000
+# Days a DM row is retained (also bounds how far back dm-sync serves).
+# 0 = unlimited. Enforced by the DM retention reaper (W11, l2-node 0.101.0+).
+retention_days = 30
+# dm-sync backfill window: on a user's first auth, pull only DMs newer than
+# now - backfill_max_age_days from peers. 0 = unlimited.
+backfill_max_age_days = 30
+# Max DM_MESSAGES rows per recipient wallet, aggregate across all senders
+# (W11). Enforced by rejecting new DMs to an at-cap recipient, never by
+# evicting their existing stored messages. 0 = unlimited (test-only).
+max_stored_messages_per_recipient = 2000
+# How often the DM retention reaper sweeps for expired rows (W11).
+reap_interval_secs = 900
+
 [push_gateway]
 enabled = false
 url = ""

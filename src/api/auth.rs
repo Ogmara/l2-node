@@ -319,10 +319,27 @@ fn extract_and_verify(req: &Request, app_state: &AppState) -> Result<(AuthUser, 
     // receives its cross-node DMs even while offline (REST-only clients get the
     // same coverage as WS clients this way). The network task dedups per session,
     // so firing per request is cheap; `let _ =` ignores a closed channel.
-    let _ = app_state.dm_subscribe_tx.send(crate::network::DmSubscribeEvent {
-        wallet: resolved_address.clone(),
-        wallet_claim,
-    });
+    //
+    // Gated on PoW-known (audit final pre-mainnet W11): `subscribe_dm` is the
+    // ONLY thing that gets a wallet's DMs delivered at all (live or offline),
+    // so an unbounded free-keypair enrollment here is exactly what let an
+    // attacker flood LOCAL_DM_USERS and LRU-evict genuine users. Same
+    // fail-open shape as `is_wallet_known` itself (PoW disabled → no gate) and
+    // the existing gossip message-send gate (routes.rs). Self-healing: a
+    // gated wallet becomes known via the public /api/v1/pow/challenge +
+    // /api/v1/pow/verify flow or its first accepted message, and its very
+    // next authenticated request enrolls normally — no retry plumbing needed.
+    let dm_enrollment_allowed = app_state
+        .pow
+        .as_ref()
+        .map(|pow| pow.is_wallet_known(&resolved_address))
+        .unwrap_or(true);
+    if dm_enrollment_allowed {
+        let _ = app_state.dm_subscribe_tx.send(crate::network::DmSubscribeEvent {
+            wallet: resolved_address.clone(),
+            wallet_claim,
+        });
+    }
 
     Ok((
         AuthUser {

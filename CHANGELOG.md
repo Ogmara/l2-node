@@ -5,6 +5,110 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.101.0] - 2026-08-19
+
+### Security
+
+- **DM store-and-forward had no retention reaper and no per-recipient cap —
+  disk-fill and LRU-eviction attacks (final pre-mainnet audit W11).** Any
+  wallet with a free keypair could enroll in `LOCAL_DM_USERS` and get a
+  persistent DM-topic subscription with no admission cost, and nothing ever
+  deleted stored DM rows once `retention_days` (default 30) elapsed — both
+  already documented as explicitly deferred "later phase" work.
+  - **Retention reaper**: 3 independent sweeps (`DM_MESSAGES`+`MESSAGES`,
+    `DM_CONVERSATIONS`, `DM_EDIT_DELETE_MSGS`), each keyed off timestamp
+    bytes already present in the row being examined (never re-derived from
+    another CF's decoded content — identity resolution can change over the
+    retention window). Batch-capped (2,000 deletions / 20,000 rows examined
+    per tick) with a persisted cursor per pass, so a large post-upgrade
+    backlog drains incrementally across ticks instead of blocking. New
+    `[dm] reap_interval_secs` (default 900s/15min).
+  - **PoW-gated `LOCAL_DM_USERS` enrollment**: reuses the existing
+    `PowManager::is_wallet_known` check (already gating gossip message
+    sends) at both the REST auth and WebSocket auth call sites, before the
+    DM-topic subscription is created. Same fail-open shape as every other
+    PoW gate in this codebase (disabled subsystem = no gate). **User-facing
+    behavior change**: `subscribe_dm` is the *only* mechanism that gets a
+    wallet's DMs delivered at all, live or offline — a wallet that has
+    never solved PoW (no message ever sent) now receives zero DMs until it
+    does, self-serve via the existing public `/api/v1/pow/challenge` +
+    `/api/v1/pow/verify` endpoints or its first accepted message. Client
+    SDKs that want new wallets to receive DMs immediately should solve PoW
+    eagerly on wallet creation rather than waiting for the first message.
+  - **Per-recipient DM storage cap** (`[dm] max_stored_messages_per_recipient`,
+    default 2000): new `DM_RECIPIENT_MSG_COUNTS` counter CF, incremented on
+    every stored DM and decremented by the reaper. Deliberately **rejects**
+    new DMs to an at-cap recipient rather than evicting their oldest stored
+    message — `DirectMessagePayload.recipient` is an unauthenticated,
+    sender-chosen field, so an evict-oldest cap would let a single
+    PoW-solved attacker wallet (subject only to the existing per-SENDER
+    30/min rate limit, not a per-recipient one) address a stream of
+    throwaway DMs at a real victim and permanently evict their genuine DM
+    history — recreating this same finding's eviction-attack shape one
+    layer down, inside the fix meant to close it.
+  - `ogmara.example.toml` gains a `[dm]` section (previously absent
+    entirely; defaults applied silently via serde) documenting all five
+    knobs.
+  - 16 new unit tests: reaper cutoff/cursor/batch-limit logic (including
+    `DM_CONVERSATIONS`' variable-length wallet-address key prefix — an
+    earlier draft of this fix assumed a fixed 62-byte prefix, which is
+    wrong for the attacker-controlled `recipient` side of the index),
+    counter increment/decrement pairing, and the cap's reject-not-evict
+    behavior under the exact weaponization scenario it defends against
+    (many distinct throwaway senders naming one victim recipient).
+  - **Post-fix Code Audit + Security Audit pass found two real bugs, both
+    fixed same day:**
+    - **Cursor could skip a row it never examined.** In both reaper
+      planning functions, the "last row seen" pointer was updated BEFORE
+      checking whether the per-tick deletion budget was already
+      exhausted, so hitting the batch limit mid-batch advanced the
+      persisted cursor past a row whose expiry was never evaluated —
+      permanently orphaning it from every future sweep, regardless of how
+      expired it later became. Fixed by only advancing the pointer for
+      rows actually examined; regression test asserts the exact cursor
+      value after a batch-limited sweep, not just the deletion count.
+    - **TOCTOU race on the per-recipient counter.** `process_message` runs
+      concurrently across many Axum handlers against one shared
+      `MessageRouter`, and the counter increment was a plain
+      read-then-write with no synchronization, separated from the Step 7g
+      cap check by the full message-store step — concurrent
+      `DirectMessage`s to the same recipient could all pass the check
+      before any of them incremented, overshooting the cap, repeatably,
+      per burst of concurrency. Fixed by making check-and-increment one
+      atomic step under a new lock (`reserve_dm_recipient_slot`), with the
+      reservation rolled back if the subsequent storage write fails.
+      Verified with a real multi-threaded regression test (40 concurrent
+      senders racing a cap of 5) asserting the persisted count never
+      exceeds the cap.
+  - **Security Audit also surfaced three residual findings, deliberately
+    NOT fixed in this change — documented here rather than silently
+    dropped:**
+    - The reaper's fixed per-tick batch cap (2,000 deletions/~900s ≈ 2.2/s
+      sustained ceiling) can be outpaced by a sustained flood from a
+      handful of PoW-passed, WS-connected Sybil wallets (each allowed
+      30 DirectMessage/min under the existing per-sender rate limit,
+      addressed at unbounded distinct throwaway recipients so the
+      per-recipient cap never engages) — net DM storage can grow
+      net-positive for as long as such an attack is sustained, though it
+      drains back down once the attack stops (unlike the pre-fix state,
+      where nothing ever drained it). Raising the batch cap or making it
+      adaptive/backlog-aware is a real follow-up, deferred pending real
+      operational data on organic vs. attack ingest rates.
+    - The PoW gate's real-world cost is far below the module's own "2-3
+      seconds" doc-comment assumption (calibrated for browser JS, not
+      native attacker code) — this is a **pre-existing property of the
+      whole PoW subsystem**, not introduced by this fix, which merely
+      reuses the existing `is_wallet_known` check. A difficulty
+      recalibration affects every PoW gate in the codebase (including
+      message-sending) and needs its own dedicated session with UX input
+      from client teams, not a unilateral change inside a DM-specific fix.
+    - WebSocket-delivered messages bypass the per-IP HTTP governor
+      entirely (the governor only gates the `/api/v1/ws` upgrade request,
+      not subsequent frames) — a **pre-existing, systemic gap** that
+      undercuts every per-IP-governor-based mitigation in the codebase,
+      not specific to DMs. Flagged as a standing follow-up item, not
+      addressed here.
+
 ## [0.100.0] - 2026-08-18
 
 ### Security

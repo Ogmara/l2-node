@@ -246,6 +246,19 @@ pub mod cf {
     /// backfill (audit final pre-mainnet W6). (l2-node 0.95.0+.)
     pub const DM_EDIT_DELETE_MSGS: &str = "dm_edit_delete_msgs";
 
+    /// recipient_wallet_address → count:8 BE — how many `DM_MESSAGES` rows
+    /// currently name this wallet as `DirectMessagePayload.recipient`
+    /// (audit final pre-mainnet W11). Maintained incrementally: `+1` on
+    /// every DM store (`MessageRouter::update_indexes`), `-1` (saturating)
+    /// when the DM reaper expires a row (`NetworkService::reap_dm_messages`).
+    /// Enforces `[dm] max_stored_messages_per_recipient` by REJECTING new
+    /// DMs to an at-cap recipient rather than evicting their existing
+    /// stored messages — see the doc comment on
+    /// `DmConfig::max_stored_messages_per_recipient` for why eviction would
+    /// be trivially weaponizable (recipient is an unauthenticated,
+    /// sender-chosen field).
+    pub const DM_RECIPIENT_MSG_COUNTS: &str = "dm_recipient_msg_counts";
+
     /// (!timestamp:8 BE, msg_id:32) → () — same key shape as `NEWS_FEED`, but
     /// for `NewsEdit`/`NewsDelete` envelopes only. Separate from `NEWS_FEED`
     /// for the same reason as the two CFs above (`GET /api/v1/news` reads
@@ -316,6 +329,7 @@ pub mod cf {
         CHANNEL_EDIT_DELETE_MSGS,
         DM_EDIT_DELETE_MSGS,
         NEWS_EDIT_DELETE,
+        DM_RECIPIENT_MSG_COUNTS,
     ];
 }
 
@@ -384,6 +398,17 @@ pub mod state_keys {
     /// completes AND the chain scanner has advanced past the cutoff height
     /// (proving the snapshot was good). Empty = no rollback pending.
     pub const SNAPSHOT_ROLLBACK_DIR: &[u8] = b"snapshot_rollback_dir";
+    /// DM retention reaper (audit final pre-mainnet W11, l2-node 0.101.0+):
+    /// persisted cursor for the `DM_MESSAGES`/`MESSAGES` sweep — the raw key
+    /// bytes to resume `iter_cf_from` at on the next tick. Absent/empty =
+    /// resume from the start of the CF. Persisting this (rather than keeping
+    /// it in-memory only) means a large post-upgrade backlog drains
+    /// incrementally across restarts instead of restarting from scratch.
+    pub const DM_REAP_CURSOR_MESSAGES: &[u8] = b"dm_reap_cursor_messages";
+    /// DM retention reaper: persisted cursor for the `DM_CONVERSATIONS` sweep.
+    pub const DM_REAP_CURSOR_CONVERSATIONS: &[u8] = b"dm_reap_cursor_conversations";
+    /// DM retention reaper: persisted cursor for the `DM_EDIT_DELETE_MSGS` sweep.
+    pub const DM_REAP_CURSOR_EDIT_DELETE: &[u8] = b"dm_reap_cursor_edit_delete";
 }
 
 /// Snapshot bootstrap (spec 11-snapshot-sync.md).

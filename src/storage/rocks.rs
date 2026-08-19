@@ -1398,6 +1398,40 @@ impl Storage {
         Ok(new_val)
     }
 
+    // --- DM Recipient Message Counter (audit final pre-mainnet W11) ---
+    //
+    // Dedicated pair rather than a generalized `increment_stat`/`decrement_stat`
+    // over an arbitrary CF: those two are hardcoded to `cf::NODE_STATE` and have
+    // exactly one call site here, so a small dedicated pair is simpler than
+    // widening a shared helper's signature for a single new caller.
+
+    /// Read the number of `DM_MESSAGES` rows currently attributed to `recipient`
+    /// (`DM_RECIPIENT_MSG_COUNTS`). Missing/malformed entries read as 0.
+    pub fn get_dm_recipient_count(&self, recipient: &[u8]) -> Result<u64> {
+        match self.get_cf(cf::DM_RECIPIENT_MSG_COUNTS, recipient)? {
+            Some(bytes) if bytes.len() == 8 => {
+                Ok(u64::from_be_bytes(bytes.try_into().unwrap()))
+            }
+            _ => Ok(0),
+        }
+    }
+
+    /// Increment `recipient`'s stored-DM count by 1. Called once per stored
+    /// `DirectMessage`, from `MessageRouter::update_indexes`.
+    pub fn increment_dm_recipient_count(&self, recipient: &[u8]) -> Result<u64> {
+        let new_val = self.get_dm_recipient_count(recipient)? + 1;
+        self.put_cf(cf::DM_RECIPIENT_MSG_COUNTS, recipient, &new_val.to_be_bytes())?;
+        Ok(new_val)
+    }
+
+    /// Decrement `recipient`'s stored-DM count by 1, saturating at zero.
+    /// Called once per reaped `DM_MESSAGES` row, from the DM retention reaper.
+    pub fn decrement_dm_recipient_count(&self, recipient: &[u8]) -> Result<u64> {
+        let new_val = self.get_dm_recipient_count(recipient)?.saturating_sub(1);
+        self.put_cf(cf::DM_RECIPIENT_MSG_COUNTS, recipient, &new_val.to_be_bytes())?;
+        Ok(new_val)
+    }
+
     /// Estimate total database size in bytes from RocksDB properties.
     ///
     /// Uses `rocksdb.estimate-live-data-size` across all column families.
@@ -3666,5 +3700,48 @@ mod count_prefix_cf_tests {
         // recount instead.
         s.store_counter_vote(&target_id, "klv1voter1", 1_002).unwrap();
         assert_eq!(s.get_counter_vote_count(&target_id).unwrap(), 2);
+    }
+}
+
+#[cfg(test)]
+mod dm_recipient_count_tests {
+    //! Audit final pre-mainnet W11.
+    use super::*;
+    use tempfile::TempDir;
+
+    fn db() -> (Storage, TempDir) {
+        let dir = TempDir::new().unwrap();
+        (Storage::open(dir.path()).unwrap(), dir)
+    }
+
+    #[test]
+    fn increment_and_decrement_are_paired() {
+        let (s, _d) = db();
+        let recipient = b"klv1recipient";
+        assert_eq!(s.get_dm_recipient_count(recipient).unwrap(), 0);
+        s.increment_dm_recipient_count(recipient).unwrap();
+        s.increment_dm_recipient_count(recipient).unwrap();
+        assert_eq!(s.get_dm_recipient_count(recipient).unwrap(), 2);
+        s.decrement_dm_recipient_count(recipient).unwrap();
+        assert_eq!(s.get_dm_recipient_count(recipient).unwrap(), 1);
+    }
+
+    #[test]
+    fn decrement_saturates_at_zero() {
+        let (s, _d) = db();
+        let recipient = b"klv1recipient";
+        s.decrement_dm_recipient_count(recipient).unwrap();
+        s.decrement_dm_recipient_count(recipient).unwrap();
+        assert_eq!(s.get_dm_recipient_count(recipient).unwrap(), 0);
+    }
+
+    #[test]
+    fn counts_are_independent_per_recipient() {
+        let (s, _d) = db();
+        s.increment_dm_recipient_count(b"klv1alice").unwrap();
+        s.increment_dm_recipient_count(b"klv1alice").unwrap();
+        s.increment_dm_recipient_count(b"klv1bob").unwrap();
+        assert_eq!(s.get_dm_recipient_count(b"klv1alice").unwrap(), 2);
+        assert_eq!(s.get_dm_recipient_count(b"klv1bob").unwrap(), 1);
     }
 }

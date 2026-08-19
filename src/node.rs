@@ -831,6 +831,7 @@ impl Node {
             identity.clone(),
             pow_manager.clone(),
             klever_network.clone(),
+            self.config.dm.max_stored_messages_per_recipient,
         );
 
         // Start metrics collector (spec 10-dashboard.md §6)

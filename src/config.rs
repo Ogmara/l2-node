@@ -606,11 +606,12 @@ pub struct DmConfig {
     /// Bounds gossipsub subscription state + the startup re-subscribe cost.
     #[serde(default = "default_dm_max_local_subscriptions")]
     pub max_local_subscriptions: usize,
-    /// Days a DM row is retained before the (Phase 3) reaper deletes it. Also
-    /// the natural ceiling on how far back `dm-sync` backfill can reach — you
+    /// Days a DM row is retained before the reaper deletes it. Also the
+    /// natural ceiling on how far back `dm-sync` backfill can reach — you
     /// cannot serve what was reaped. `0` = unlimited. Default 30 (matches the
-    /// spec's NOTIFICATIONS retention). The reaper itself lands in a later phase;
-    /// this value is the agreed policy.
+    /// spec's NOTIFICATIONS retention). Enforced by the DM retention reaper
+    /// (`NetworkService::reap_expired_dms`, ticking every `reap_interval_secs`
+    /// — audit final pre-mainnet W11, l2-node 0.101.0+).
     #[serde(default = "default_dm_retention_days")]
     pub retention_days: u64,
     /// Lazy `dm-sync` backfill window in days: on a user's first auth this
@@ -619,6 +620,28 @@ pub struct DmConfig {
     /// practice. The per-page + total caps in `network::dm_sync` apply on top.
     #[serde(default = "default_dm_backfill_max_age_days")]
     pub backfill_max_age_days: u64,
+    /// Max `DM_MESSAGES` rows attributable to a single recipient wallet,
+    /// aggregate across all senders/conversations (audit final pre-mainnet
+    /// W11). Enforced at write time by REJECTING further incoming DMs to an
+    /// at-cap recipient — deliberately NOT by evicting their oldest stored
+    /// messages: `DirectMessagePayload.recipient` is an unauthenticated,
+    /// sender-chosen field, so an evict-oldest cap would let a single
+    /// PoW-solved attacker wallet blow through any cap by addressing many
+    /// throwaway DMs at a real victim, then keep evicting the victim's
+    /// genuine DM history forever — recreating this same finding's
+    /// eviction-attack shape one layer down. `0` = unlimited (test-only).
+    /// Default 2000 (comfortably above organic single-recipient volume
+    /// within `retention_days`).
+    #[serde(default = "default_dm_max_stored_messages_per_recipient")]
+    pub max_stored_messages_per_recipient: usize,
+    /// How often the DM retention reaper sweeps `DM_MESSAGES`/`MESSAGES`/
+    /// `DM_CONVERSATIONS`/`DM_EDIT_DELETE_MSGS` for rows older than
+    /// `retention_days`. Each sweep is batch-capped and resumes from a
+    /// persisted cursor (`state_keys::DM_REAP_CURSOR_*`), so a large
+    /// post-upgrade backlog drains incrementally across many ticks rather
+    /// than blocking. Default 900 (15 min).
+    #[serde(default = "default_dm_reap_interval_secs")]
+    pub reap_interval_secs: u64,
 }
 
 impl Default for DmConfig {
@@ -627,6 +650,8 @@ impl Default for DmConfig {
             max_local_subscriptions: default_dm_max_local_subscriptions(),
             retention_days: default_dm_retention_days(),
             backfill_max_age_days: default_dm_backfill_max_age_days(),
+            max_stored_messages_per_recipient: default_dm_max_stored_messages_per_recipient(),
+            reap_interval_secs: default_dm_reap_interval_secs(),
         }
     }
 }
@@ -639,6 +664,12 @@ fn default_dm_retention_days() -> u64 {
 }
 fn default_dm_backfill_max_age_days() -> u64 {
     30
+}
+fn default_dm_max_stored_messages_per_recipient() -> usize {
+    2000
+}
+fn default_dm_reap_interval_secs() -> u64 {
+    900
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2415,6 +2446,24 @@ ttl_seconds = 86400
 max_size_mb = 1024
 auto_pin_on_interaction = true
 
+[dm]
+# DM offline store-and-forward (spec 03 §3.5.1, l2-node 0.69.0+)
+# Max persistent DM-topic subscriptions for this node's local users.
+# LRU-evicted on last_active_ms when exceeded. 0 = unbounded (test-only).
+max_local_subscriptions = 5000
+# Days a DM row is retained (also bounds how far back dm-sync serves).
+# 0 = unlimited. Enforced by the DM retention reaper (W11, l2-node 0.101.0+).
+retention_days = 30
+# dm-sync backfill window: on a user's first auth, pull only DMs newer than
+# now - backfill_max_age_days from peers. 0 = unlimited.
+backfill_max_age_days = 30
+# Max DM_MESSAGES rows per recipient wallet, aggregate across all senders
+# (W11). Enforced by rejecting new DMs to an at-cap recipient, never by
+# evicting their existing stored messages. 0 = unlimited (test-only).
+max_stored_messages_per_recipient = 2000
+# How often the DM retention reaper sweeps for expired rows (W11).
+reap_interval_secs = 900
+
 [push_gateway]
 enabled = false
 url = ""
@@ -3193,6 +3242,7 @@ mod tests {
             "[api.admin]",
             "[storage]",
             "[cache]",
+            "[dm]",
             "[push_gateway]",
             "[anchoring]",
             "[anchoring.metadata]",

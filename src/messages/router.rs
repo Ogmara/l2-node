@@ -157,6 +157,22 @@ pub struct MessageRouter {
     /// 2026-08-16 C1) so an envelope captured on one network can never verify
     /// on the other, even though both share the same wallet keys.
     network: String,
+    /// Max `DM_MESSAGES` rows attributable to a single recipient wallet
+    /// (`DmConfig::max_stored_messages_per_recipient`, audit final
+    /// pre-mainnet W11). `0` = unlimited. See `reserve_dm_recipient_slot`.
+    dm_recipient_cap: usize,
+    /// Guards the read-then-write in `reserve_dm_recipient_slot` (Security
+    /// Audit follow-up, W11): `process_message` is called concurrently from
+    /// many Axum handlers against this same shared `MessageRouter`, so the
+    /// cap check and the counter increment must happen as one atomic step
+    /// under this lock — otherwise concurrent `DirectMessage`s to the same
+    /// recipient can all pass a separate check before any of them
+    /// increments, overshooting the configured cap. Global (not
+    /// per-recipient): the critical section is two cheap RocksDB point
+    /// operations (no content write inside the lock — `store_message`
+    /// happens in Step 8, after the reservation), so contention cost is
+    /// negligible relative to the rest of the pipeline.
+    dm_recipient_cap_lock: std::sync::Mutex<()>,
 }
 
 /// Rejection reason for step 4d (tiered identity). Shared with
@@ -203,6 +219,7 @@ impl MessageRouter {
         identity: IdentityResolver,
         pow: Option<Arc<crate::pow::PowManager>>,
         network: String,
+        dm_recipient_cap: usize,
     ) -> Self {
         Self {
             storage,
@@ -210,6 +227,8 @@ impl MessageRouter {
             rate_limits: DashMap::new(),
             pow,
             network,
+            dm_recipient_cap,
+            dm_recipient_cap_lock: std::sync::Mutex::new(()),
         }
     }
 
@@ -414,8 +433,31 @@ impl MessageRouter {
             return RouteResult::Rejected(format!("channel_encryption_required: {}", e));
         }
 
+        // Step 7g (audit final pre-mainnet W11): per-recipient DM storage cap.
+        // Atomically checks AND reserves (increments) the slot — see
+        // `reserve_dm_recipient_slot` doc for why check-then-later-increment
+        // was a TOCTOU race under concurrent requests. Rejects rather than
+        // evicts. Must run BEFORE Step 8's unconditional store, or a
+        // rejected message would still consume disk as an orphaned,
+        // unindexed MESSAGES row.
+        if let Err(e) = self.reserve_dm_recipient_slot(&envelope) {
+            return RouteResult::Rejected(format!("dm_recipient_cap_exceeded: {}", e));
+        }
+
         // Step 8: Store message (atomically increments total_messages counter)
         if let Err(e) = self.storage.store_message(&envelope.msg_id, raw_bytes) {
+            // Roll back the Step 7g reservation — the message was never
+            // actually stored, so it must not count against the recipient's
+            // cap (W11 Security Audit follow-up).
+            if envelope.msg_type == MessageType::DirectMessage {
+                if let Ok(payload) =
+                    rmp_serde::from_slice::<DirectMessagePayload>(&envelope.payload)
+                {
+                    let _ = self
+                        .storage
+                        .decrement_dm_recipient_count(payload.recipient.as_bytes());
+                }
+            }
             return RouteResult::Rejected(format!("storage error: {}", e));
         }
 
@@ -1032,6 +1074,67 @@ impl MessageRouter {
             ));
         }
         Ok(())
+    }
+
+    /// Per-recipient DM storage cap (audit final pre-mainnet W11). Only gates
+    /// `DirectMessage` (edits/deletes/reactions don't grow `DM_MESSAGES`).
+    /// Atomically CHECKS the cap and, if under it, immediately INCREMENTS
+    /// the counter — both under `dm_recipient_cap_lock` — rather than
+    /// checking here and incrementing later in `update_indexes` (Security
+    /// Audit follow-up: `process_message` runs concurrently across Axum
+    /// handlers against one shared `MessageRouter`/`Storage`, and
+    /// `Storage::increment_dm_recipient_count` is a plain read-then-write,
+    /// not an atomic RMW — a separate check-then-later-increment left a
+    /// TOCTOU window where concurrent `DirectMessage`s to the same
+    /// recipient could all pass the check before any of them incremented,
+    /// overshooting the cap, repeatably, per burst of concurrency). If a
+    /// LATER step rejects the envelope (e.g. Step 8's storage write fails),
+    /// the caller must roll back this reservation — see the `store_message`
+    /// error path below.
+    ///
+    /// Deliberately REJECTS the new message rather than evicting the
+    /// recipient's oldest stored one: `DirectMessagePayload.recipient` is an
+    /// unauthenticated, sender-chosen field (never checked against the
+    /// sender's actual authority to address that wallet), so an evict-oldest
+    /// cap would let a single PoW-solved attacker wallet — subject only to
+    /// the existing PER-SENDER 30/min rate limit, not a per-recipient one —
+    /// address a stream of throwaway DMs at a real victim and permanently
+    /// evict the victim's genuine DM history forever. That would recreate
+    /// this exact finding's own LRU-eviction-attack shape one layer down,
+    /// inside the very fix meant to close it. Rejecting instead means the
+    /// attacker's own spam simply stops landing once the victim is at cap;
+    /// nothing the victim already has is ever destroyed. Trade-off: a
+    /// legitimate wallet that receives more than the cap's worth of DMs
+    /// within `retention_days` before the reaper frees space also sees new
+    /// DMs rejected — acceptable given the cap (default 2000) is set well
+    /// above organic single-recipient volume.
+    fn reserve_dm_recipient_slot(&self, envelope: &Envelope) -> Result<(), String> {
+        if envelope.msg_type != MessageType::DirectMessage || self.dm_recipient_cap == 0 {
+            return Ok(());
+        }
+        let payload = match rmp_serde::from_slice::<DirectMessagePayload>(&envelope.payload) {
+            Ok(p) => p,
+            Err(_) => return Ok(()), // malformed → let validation reject it
+        };
+        let _guard = self
+            .dm_recipient_cap_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let count = self
+            .storage
+            .get_dm_recipient_count(payload.recipient.as_bytes())
+            .unwrap_or(0);
+        if count >= self.dm_recipient_cap as u64 {
+            return Err(format!(
+                "recipient {} has reached the max stored DM count ({})",
+                payload.recipient, self.dm_recipient_cap
+            ));
+        }
+        let _ = self
+            .storage
+            .increment_dm_recipient_count(payload.recipient.as_bytes());
+        Ok(())
+        // `_guard` drops here, releasing the lock.
     }
 
     fn check_readonly_channel(&self, envelope: &Envelope, resolved_author: &str) -> Result<(), String> {
@@ -1887,6 +1990,15 @@ impl MessageRouter {
                         &recipient_conv_key,
                         resolved_author.as_bytes(),
                     )?;
+
+                    // The recipient's stored-DM counter is bumped earlier,
+                    // atomically with the cap check, by
+                    // `reserve_dm_recipient_slot` (Step 7g in
+                    // `process_message_inner`) — NOT here. Incrementing a
+                    // second time in this arm would double-count every DM
+                    // (W11 Security Audit follow-up: moved the increment to
+                    // close a TOCTOU race between a separate check and a
+                    // later increment).
                 }
             }
             MessageType::NewsPost => {
@@ -3384,7 +3496,7 @@ mod enc_supersede_tests {
         let storage = Storage::open(dir.path()).unwrap();
         let identity = IdentityResolver::new(storage.clone());
         (
-            MessageRouter::new(storage, identity, None, "testnet".to_string()),
+            MessageRouter::new(storage, identity, None, "testnet".to_string(), usize::MAX),
             dir,
         )
     }
@@ -3518,7 +3630,7 @@ mod enc_supersede_tests {
         let storage = Storage::open(dir.path()).unwrap();
         let identity = IdentityResolver::new(storage.clone());
         (
-            MessageRouter::new(storage, identity, None, "mainnet".to_string()),
+            MessageRouter::new(storage, identity, None, "mainnet".to_string(), usize::MAX),
             dir,
         )
     }
@@ -3656,7 +3768,7 @@ mod cross_node_ban_kick_tests {
         let storage = Storage::open(dir.path()).unwrap();
         let identity = IdentityResolver::new(storage.clone());
         (
-            MessageRouter::new(storage, identity, None, "testnet".to_string()),
+            MessageRouter::new(storage, identity, None, "testnet".to_string(), usize::MAX),
             dir,
         )
     }
@@ -3823,7 +3935,7 @@ mod dm_reaction_tests {
         let storage = Storage::open(dir.path()).unwrap();
         let identity = IdentityResolver::new(storage.clone());
         (
-            MessageRouter::new(storage, identity, None, "testnet".to_string()),
+            MessageRouter::new(storage, identity, None, "testnet".to_string(), usize::MAX),
             dir,
         )
     }
@@ -4068,7 +4180,7 @@ mod channel_mute_unmute_tests {
         let storage = Storage::open(dir.path()).unwrap();
         let identity = IdentityResolver::new(storage.clone());
         (
-            MessageRouter::new(storage, identity, None, "testnet".to_string()),
+            MessageRouter::new(storage, identity, None, "testnet".to_string(), usize::MAX),
             dir,
         )
     }
@@ -4316,7 +4428,7 @@ mod edit_delete_index_tests {
         let storage = Storage::open(dir.path()).unwrap();
         let identity = IdentityResolver::new(storage.clone());
         (
-            MessageRouter::new(storage, identity, None, "testnet".to_string()),
+            MessageRouter::new(storage, identity, None, "testnet".to_string(), usize::MAX),
             dir,
         )
     }
@@ -4654,5 +4766,179 @@ mod edit_delete_index_tests {
             .prefix_iter_cf(schema::cf::CHANNEL_EDIT_DELETE_MSGS, &1u64.to_be_bytes(), 10)
             .unwrap();
         assert!(rows.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod dm_recipient_cap_tests {
+    //! Audit final pre-mainnet W11: per-recipient DM storage cap.
+    use super::*;
+    use tempfile::TempDir;
+
+    fn router_with_cap(cap: usize) -> (MessageRouter, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let identity = IdentityResolver::new(storage.clone());
+        (
+            MessageRouter::new(storage, identity, None, "testnet".to_string(), cap),
+            dir,
+        )
+    }
+
+    fn now_ms() -> u64 {
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
+    }
+
+    /// Full signed DirectMessage envelope, ready for `process_message` —
+    /// unlike this module's sibling `store_dm` helpers (which write directly
+    /// to MESSAGES for tests that only exercise post-storage logic), this
+    /// one must pass the FULL pipeline (sig, dedup, rate limit, payload
+    /// validation) to reach the new Step 7g cap check.
+    fn signed_dm_envelope(
+        sk: &ed25519_dalek::SigningKey,
+        recipient: &str,
+        timestamp: u64,
+    ) -> Vec<u8> {
+        let author = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        let payload = DirectMessagePayload {
+            recipient: recipient.to_string(),
+            conversation_id: crypto::compute_conversation_id(&author, recipient),
+            content: vec![1, 2, 3],
+            nonce: [0u8; 24],
+            key_epoch: 1,
+            reply_to: None,
+            attachments: vec![],
+        };
+        let payload_bytes = rmp_serde::to_vec_named(&payload).unwrap();
+        let author_pubkey: [u8; 32] = sk.verifying_key().to_bytes();
+        let msg_id = crypto::compute_msg_id("testnet", &author_pubkey, &payload_bytes, timestamp);
+        let signature = signing::sign_ogmara_message(
+            sk,
+            "testnet",
+            crate::messages::envelope::PROTOCOL_VERSION,
+            MessageType::DirectMessage as u8,
+            &msg_id,
+            timestamp,
+            &payload_bytes,
+        );
+        let envelope = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::DirectMessage,
+            msg_id,
+            author,
+            timestamp,
+            lamport_ts: 0,
+            payload: payload_bytes,
+            signature: signature.to_bytes().to_vec(),
+            relay_path: vec![],
+        };
+        rmp_serde::to_vec_named(&envelope).unwrap()
+    }
+
+    #[test]
+    fn dm_within_cap_is_accepted_and_increments_the_counter() {
+        let (r, _dir) = router_with_cap(5);
+        let sk = crypto::generate_keypair();
+        let recipient = "klv1victim";
+        let raw = signed_dm_envelope(&sk, recipient, now_ms());
+        assert!(matches!(r.process_message(&raw), RouteResult::Accepted { .. }));
+        assert_eq!(r.storage.get_dm_recipient_count(recipient.as_bytes()).unwrap(), 1);
+    }
+
+    #[test]
+    fn dm_at_cap_is_rejected_not_evicted() {
+        // The weaponization scenario this design explicitly guards against:
+        // many DISTINCT throwaway senders (not rate-limited against each
+        // other — the 30/min limit is per-sender) all naming the SAME
+        // victim recipient. Once at cap, further DMs must be REJECTED, and
+        // — critically — the victim's already-stored messages must survive
+        // untouched (no eviction).
+        let (r, _dir) = router_with_cap(3);
+        let recipient = "klv1victim";
+        let mut accepted_msg_ids = Vec::new();
+        for i in 0..3u8 {
+            let sk = crypto::generate_keypair();
+            let raw = signed_dm_envelope(&sk, recipient, now_ms() + i as u64);
+            match r.process_message(&raw) {
+                RouteResult::Accepted { msg_id, .. } => accepted_msg_ids.push(msg_id),
+                other => panic!("expected Accepted, got {other:?}"),
+            }
+        }
+        assert_eq!(r.storage.get_dm_recipient_count(recipient.as_bytes()).unwrap(), 3);
+
+        // A 4th distinct attacker wallet, still well under the per-sender
+        // rate limit, must be rejected — not silently evicting one of the
+        // 3 already-accepted messages.
+        let attacker_sk = crypto::generate_keypair();
+        let raw = signed_dm_envelope(&attacker_sk, recipient, now_ms() + 100);
+        assert!(matches!(r.process_message(&raw), RouteResult::Rejected(reason) if reason.contains("dm_recipient_cap_exceeded")));
+        assert_eq!(r.storage.get_dm_recipient_count(recipient.as_bytes()).unwrap(), 3, "cap rejection must not change the count");
+
+        // Every one of the victim's genuine 3 messages must still be present.
+        for msg_id in accepted_msg_ids {
+            assert!(r.storage.get_cf(schema::cf::MESSAGES, &msg_id).unwrap().is_some(), "an existing stored message must never be evicted by the cap");
+        }
+    }
+
+    #[test]
+    fn cap_is_per_recipient_not_global() {
+        let (r, _dir) = router_with_cap(1);
+        let sk_a = crypto::generate_keypair();
+        let sk_b = crypto::generate_keypair();
+        let raw_a = signed_dm_envelope(&sk_a, "klv1alice", now_ms());
+        let raw_b = signed_dm_envelope(&sk_b, "klv1bob", now_ms() + 1);
+        assert!(matches!(r.process_message(&raw_a), RouteResult::Accepted { .. }));
+        assert!(matches!(r.process_message(&raw_b), RouteResult::Accepted { .. }), "a different recipient must have its own independent budget");
+    }
+
+    #[test]
+    fn zero_cap_means_unlimited() {
+        let (r, _dir) = router_with_cap(0);
+        let recipient = "klv1victim";
+        for i in 0..5u8 {
+            let sk = crypto::generate_keypair();
+            let raw = signed_dm_envelope(&sk, recipient, now_ms() + i as u64);
+            assert!(matches!(r.process_message(&raw), RouteResult::Accepted { .. }));
+        }
+    }
+
+    #[test]
+    fn concurrent_dms_to_the_same_recipient_never_overshoot_the_cap() {
+        // Security Audit follow-up (W11): `reserve_dm_recipient_slot` must
+        // check-and-increment atomically under `dm_recipient_cap_lock`. A
+        // separate-check-then-later-increment design let concurrent
+        // `DirectMessage`s to the same recipient all pass the check before
+        // any of them incremented, overshooting the cap. Prove it holds
+        // under REAL concurrency, not just sequential calls.
+        let cap = 5usize;
+        let (r, _dir) = router_with_cap(cap);
+        let r = std::sync::Arc::new(r);
+        let recipient = "klv1victim";
+        let sks: Vec<_> = (0..40).map(|_| crypto::generate_keypair()).collect();
+
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        std::thread::scope(|scope| {
+            for (i, sk) in sks.iter().enumerate() {
+                let r = r.clone();
+                let accepted = accepted.clone();
+                scope.spawn(move || {
+                    let raw = signed_dm_envelope(sk, recipient, now_ms() + i as u64);
+                    if matches!(r.process_message(&raw), RouteResult::Accepted { .. }) {
+                        accepted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+
+        assert_eq!(
+            accepted.load(std::sync::atomic::Ordering::SeqCst),
+            cap,
+            "exactly `cap` DMs must be accepted, regardless of concurrency"
+        );
+        assert_eq!(
+            r.storage.get_dm_recipient_count(recipient.as_bytes()).unwrap(),
+            cap as u64,
+            "the persisted counter must never exceed the cap under concurrent load"
+        );
     }
 }
