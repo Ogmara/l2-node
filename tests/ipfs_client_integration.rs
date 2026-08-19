@@ -67,6 +67,60 @@ impl FakeBlob {
 struct FakeKuboState {
     /// CID → blob. CIDs not in the map cause "not local" responses.
     blobs: Arc<dashmap::DashMap<String, FakeBlob>>,
+    /// When set, `/api/v0/add` always reports this CID regardless of the
+    /// uploaded bytes — simulates a peer whose `add` response doesn't
+    /// match what the caller (`add_and_verify_cid`) expected (W4).
+    add_returns_hash: Arc<std::sync::Mutex<Option<String>>>,
+    /// CIDs the fake server has received an `/api/v0/pin/rm` call for,
+    /// in call order — lets a test assert whether/what got unpinned.
+    unpin_calls: Arc<std::sync::Mutex<Vec<String>>>,
+    /// When true, `/api/v0/pin/rm` responds with a Kubo-style HTTP-level
+    /// failure instead of success — simulates the Security Audit W4
+    /// follow-up scenario (Kubo rejects the unpin; `unpin()` must
+    /// surface that as `Err`, not silently report success).
+    pin_rm_fails: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[derive(Deserialize)]
+struct ArgQuery {
+    arg: String,
+}
+
+async fn add_handler(State(state): State<FakeKuboState>) -> impl IntoResponse {
+    // The real handler doesn't need to inspect the multipart body — the
+    // fake always reports either the configured override hash (W4 tests)
+    // or a fixed default "content-addressed" placeholder. Tests that care
+    // about the returned hash set `add_returns_hash` first.
+    let hash = state
+        .add_returns_hash
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap_or_else(|| "bafyDEFAULTADDHASH".to_string());
+    Json(serde_json::json!({
+        "Hash": hash,
+        "Size": "0",
+        "Name": "peer-fallback",
+    }))
+    .into_response()
+}
+
+async fn pin_rm_handler(
+    State(state): State<FakeKuboState>,
+    Query(q): Query<ArgQuery>,
+) -> impl IntoResponse {
+    if state.pin_rm_fails.load(std::sync::atomic::Ordering::SeqCst) {
+        // Real Kubo signals pin/rm failure via a non-2xx status (matching
+        // the convention `pin()` already defends against, per Security
+        // Audit W4 follow-up).
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"Message": "not pinned or pinned indirectly", "Type": "error"})),
+        )
+            .into_response();
+    }
+    state.unpin_calls.lock().unwrap().push(q.arg.clone());
+    Json(serde_json::json!({ "Pins": [q.arg] })).into_response()
 }
 
 #[derive(Deserialize)]
@@ -168,6 +222,8 @@ impl FakeKubo {
         let app: Router = Router::new()
             .route("/api/v0/cat", post(cat_handler))
             .route("/api/v0/files/stat", post(files_stat_handler))
+            .route("/api/v0/add", post(add_handler))
+            .route("/api/v0/pin/rm", post(pin_rm_handler))
             .with_state(state.clone());
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -199,6 +255,25 @@ impl FakeKubo {
 
     fn insert(&self, cid: &str, blob: FakeBlob) {
         self.state.blobs.insert(cid.to_string(), blob);
+    }
+
+    /// Make `/api/v0/add` always report `hash`, regardless of upload
+    /// content — simulates a peer whose delivered bytes don't match the
+    /// CID the caller asked for (W4).
+    fn set_add_returns_hash(&self, hash: &str) {
+        *self.state.add_returns_hash.lock().unwrap() = Some(hash.to_string());
+    }
+
+    /// CIDs unpinned so far, in call order.
+    fn unpin_calls(&self) -> Vec<String> {
+        self.state.unpin_calls.lock().unwrap().clone()
+    }
+
+    /// Make `/api/v0/pin/rm` respond with a Kubo-style HTTP failure.
+    fn set_pin_rm_fails(&self, fails: bool) {
+        self.state
+            .pin_rm_fails
+            .store(fails, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn client(&self) -> IpfsClient {
@@ -339,5 +414,75 @@ async fn get_size_uses_files_stat_offline_param() {
         msg.contains("files/stat"),
         "error should reference files/stat (offline path); got: {}",
         msg
+    );
+}
+
+#[tokio::test]
+async fn add_and_verify_cid_unpins_on_mismatch() {
+    // Security Audit final pre-mainnet W4: Kubo's `add?pin=true` pins the
+    // blob before add_and_verify_cid can see the CID mismatch. Simulates
+    // a peer whose content doesn't hash to the CID the caller asked for
+    // (e.g. winning the select_ok race with valid-but-wrong media) and
+    // asserts the wrongly-pinned CID gets explicitly unpinned, not left
+    // to a GC that (per Kubo's actual behavior) will never reclaim it.
+    let kubo = FakeKubo::spawn().await;
+    let expected_cid = cid_for("wanted1234");
+    let wrong_cid = "bafyWRONGCONTENTHASH".to_string();
+    kubo.set_add_returns_hash(&wrong_cid);
+
+    let result = kubo
+        .client()
+        .add_and_verify_cid(&expected_cid, b"peer-supplied bytes".to_vec())
+        .await;
+
+    assert!(result.is_err(), "CID mismatch must be rejected");
+    let msg = format!("{:?}", result.unwrap_err());
+    assert!(msg.contains(&wrong_cid) && msg.contains(&expected_cid));
+
+    assert_eq!(
+        kubo.unpin_calls(),
+        vec![wrong_cid],
+        "the wrongly-pinned CID must be unpinned exactly once"
+    );
+}
+
+#[tokio::test]
+async fn add_and_verify_cid_does_not_unpin_on_match() {
+    // Regression guard against over-eager unpinning: the success path
+    // (the common case) must never touch pin/rm — the whole point of
+    // pin=true on add is that verified content stays pinned.
+    let kubo = FakeKubo::spawn().await;
+    let cid = cid_for("matching1234");
+    kubo.set_add_returns_hash(&cid);
+
+    kubo.client()
+        .add_and_verify_cid(&cid, b"peer-supplied bytes".to_vec())
+        .await
+        .expect("matching CID must be accepted");
+
+    assert!(
+        kubo.unpin_calls().is_empty(),
+        "verified content must never be unpinned"
+    );
+}
+
+#[tokio::test]
+async fn unpin_surfaces_kubo_http_failure_as_err() {
+    // Security Audit follow-up (W4): `unpin()` previously treated ANY
+    // HTTP response from Kubo as success — `reqwest::send()` only errors
+    // on transport-level failures, not on Kubo returning a non-2xx. That
+    // meant a real pin/rm failure (busy, disk contention, races) was
+    // silently reported as `Ok(())`, so `add_and_verify_cid`'s
+    // mismatch-cleanup `warn!` would almost never fire in practice.
+    // Mirrors `pin()`'s existing, already-correct status check.
+    let kubo = FakeKubo::spawn().await;
+    let cid = cid_for("failingunpin1234");
+    kubo.set_pin_rm_fails(true);
+
+    let result = kubo.client().unpin(&cid).await;
+
+    assert!(
+        result.is_err(),
+        "a Kubo-reported pin/rm failure must surface as Err, not be silently swallowed"
     );
 }

@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use serde::Deserialize;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::config::IpfsConfig;
 
@@ -433,9 +433,21 @@ impl IpfsClient {
     ///   * HTTP 200 + `{"Error": "..."}` body (older builds, and a
     ///     plausible future regression — Kubo's HTTP API has flipped
     ///     between these before)
+    ///
     /// We treat BOTH as "not local" to make the probe stable across
     /// Kubo upgrades. A successful response with no `Error` key is
     /// the only path that reports the CID as local.
+    ///
+    /// Exposed for the peer-fallback streaming path
+    /// ([`crate::api::media_fallback::fetch_one`]) which streams the
+    /// peer's response body and aborts mid-stream once this cap is
+    /// reached. Defense-in-depth against a hostile peer streaming an
+    /// oversized body to exhaust requester memory before
+    /// [`Self::add_and_verify_cid`] gets to reject it.
+    pub fn max_upload_bytes(&self) -> u64 {
+        self.max_upload_bytes
+    }
+
     /// Add untrusted bytes received from a peer to the local Kubo,
     /// pin them, and verify the returned CID matches `expected_cid`.
     /// Used by the v0.46.7 media peer-fallback path
@@ -448,6 +460,16 @@ impl IpfsClient {
     /// effect is desired — once verified, subsequent local lookups
     /// hit and no further fallback is needed.
     ///
+    /// **On CID mismatch, we explicitly unpin** (Security Audit final
+    /// pre-mainnet W4). Kubo's `add?pin=true` already pins the blob
+    /// before this function can see the mismatch, and — despite an
+    /// earlier version of this comment claiming otherwise — Kubo's
+    /// background GC never reclaims pinned objects. Without the unpin,
+    /// every mismatch (e.g. a registered peer winning the `select_ok`
+    /// race with valid-but-wrong media) permanently grew the pinset —
+    /// an unbounded-storage DoS vector. The unpin is best-effort: its
+    /// own failure is logged but never masks the mismatch error itself.
+    ///
     /// **CID version handling.** Kubo's `add` defaults to CIDv0 for
     /// dag-pb leaves and CIDv1 with `cid-version=1`. We invoke with
     /// the version that matches the expected CID's prefix (`Qm...`
@@ -455,22 +477,6 @@ impl IpfsClient {
     /// string-equality. If the expected CID format is exotic we
     /// fall back to v1 (the multibase prefix space is well-defined
     /// for v1).
-    ///
-    /// On CID mismatch we DO NOT attempt to unpin — Kubo's add was
-    /// successful for the actual content, the bytes are just not
-    /// what the caller asked for. Background GC will reclaim them;
-    /// keeping the side-effect simple avoids fragile cleanup paths
-    /// on the hot security boundary.
-    /// Exposed for the peer-fallback streaming path
-    /// ([`crate::api::media_fallback::fetch_one`]) which streams the
-    /// peer's response body and aborts mid-stream once this cap is
-    /// reached. Defense-in-depth against a hostile peer streaming an
-    /// oversized body to exhaust requester memory before
-    /// [`Self::add_and_verify_cid`] gets to reject it.
-    pub fn max_upload_bytes(&self) -> u64 {
-        self.max_upload_bytes
-    }
-
     pub async fn add_and_verify_cid(
         &self,
         expected_cid: &str,
@@ -508,6 +514,24 @@ impl IpfsClient {
             .context("parsing IPFS add response for peer-fallback")?;
 
         if resp.hash != expected_cid {
+            // Security Audit final pre-mainnet W4: Kubo's `add?pin=true`
+            // already pinned the wrong-content blob before we could see
+            // the mismatch. The doc comment above USED to say "Background
+            // GC will reclaim them" — false, Kubo GC never reclaims
+            // pinned objects, so every mismatch (a registered peer
+            // winning the `select_ok` race with valid-but-wrong media)
+            // permanently grew the pinset. Undo the pin explicitly.
+            // Best-effort: if `unpin` itself fails, the mismatch error
+            // (the actually important one — it's what tells the caller
+            // this content is unusable) must still be returned, not
+            // masked by a secondary cleanup failure.
+            if let Err(e) = self.unpin(&resp.hash).await {
+                warn!(
+                    cid = %resp.hash,
+                    error = %e,
+                    "peer-fallback: failed to unpin mismatched-CID content — pinset may grow"
+                );
+            }
             anyhow::bail!(
                 "peer-fallback CID mismatch: peer delivered content for CID {} \
                  but caller asked for {}",
@@ -636,11 +660,32 @@ impl IpfsClient {
         validate_cid(cid)?;
         let url = format!("{}/api/v0/pin/rm?arg={}", self.api_url, cid);
 
-        self.http
+        let resp = self
+            .http
             .post(&url)
             .send()
             .await
             .context("unpinning from IPFS")?;
+
+        // Security Audit follow-up (W4, l2-node 0.103.0): mirror `pin()`'s
+        // status check — Kubo signals pin/rm failure (already-unpinned
+        // races, disk contention, etc.) via a non-2xx status, and
+        // `reqwest::send()` alone does NOT treat that as an `Err`. Without
+        // this check, `unpin()` always returned `Ok(())` regardless of
+        // whether Kubo actually removed the pin, which meant
+        // `add_and_verify_cid`'s mismatch-cleanup `warn!` on a failed
+        // unpin would almost never fire — the exact silent-failure
+        // pattern `pin()` already had to fix once before (see its own
+        // comment above).
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "pin/rm HTTP {}: {}",
+                status,
+                crate::util::truncate_str(&body, 200)
+            );
+        }
 
         debug!(cid = %cid, "Unpinned from IPFS");
         Ok(())

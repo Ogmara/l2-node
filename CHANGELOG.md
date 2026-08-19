@@ -5,6 +5,50 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.103.0] - 2026-08-19
+
+### Security
+
+- **Mismatched-CID peer-fallback content was pinned and never unpinned —
+  unbounded IPFS pinset growth (final pre-mainnet audit W4).**
+  `add_and_verify_cid` (`ipfs/client.rs`) calls Kubo's `add?pin=true`
+  before it can check whether the returned CID actually matches what the
+  caller asked for — a registered peer winning the `select_ok` race with
+  valid-but-wrong media gets its junk blob pinned, verification then
+  fails and the request 404s, but the blob stayed pinned forever. The
+  existing doc comment claimed "background GC will reclaim them" — false;
+  Kubo's GC never reclaims pinned objects, so every mismatch permanently
+  grew the pinset. Fixed by calling the existing `unpin()` on a CID
+  mismatch before returning the error (best-effort — an unpin failure is
+  logged but never masks the mismatch error itself, which is the one the
+  caller actually needs). Corrected the stale doc comment in place (it
+  was also misattached to the wrong function, `max_upload_bytes` instead
+  of `add_and_verify_cid` — fixed both issues together). 3 new integration
+  tests against the existing `FakeKubo` test harness (extended with
+  `/api/v0/add` + `/api/v0/pin/rm` routes): mismatch triggers exactly one
+  unpin of the wrong CID; the success path never unpins; a Kubo-reported
+  pin/rm failure surfaces as `Err`.
+  - **Post-fix Code Audit + Security Audit found two real issues, fixed
+    same day.** Security Audit (HIGH): `unpin()` never checked Kubo's HTTP
+    response status — `reqwest`'s `send()` only errors on transport-level
+    failures, so a real Kubo-side pin/rm failure (busy, disk contention, a
+    pin-state race) was silently reported as `Ok(())`. That meant the
+    fix's own `warn!`-on-unpin-failure path would almost never fire in
+    practice — a milder, quieter version of the original bug (content
+    stays pinned, but now with an actively-misleading `debug!` "Unpinned
+    from IPFS" log instead of visible silence). `pin()` already had this
+    exact fix from a prior audit (its own comment records it); `unpin()`
+    just never got the same treatment. Fixed by mirroring `pin()`'s
+    `status.is_success()` check. Code Audit: the doc-comment relocation
+    described above didn't actually happen in the first cut — the new W4
+    explanation was added to the *same* misattached block (still sitting
+    above `max_upload_bytes`), so `add_and_verify_cid` — the
+    security-sensitive function the docs are actually about — still had
+    no doc comment of its own. Properly relocated this time, plus fixed
+    an adjacent pre-existing `doc_lazy_continuation` clippy warning
+    (a bullet list glued to its following paragraph with no blank line)
+    surfaced as a side effect of tracing through the misattachment.
+
 ## [0.102.0] - 2026-08-19
 
 ### Security
