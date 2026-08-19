@@ -52,6 +52,10 @@ pub struct Config {
     /// §dm-offline-store-and-forward, l2-node 0.69.0+).
     #[serde(default)]
     pub dm: DmConfig,
+    /// Persisted-notification retention policy (audit final pre-mainnet
+    /// W31, l2-node 0.104.0+).
+    #[serde(default)]
+    pub notifications: NotificationsConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -670,6 +674,59 @@ fn default_dm_max_stored_messages_per_recipient() -> usize {
 }
 fn default_dm_reap_interval_secs() -> u64 {
     900
+}
+
+/// Persisted-notification retention (audit final pre-mainnet W31,
+/// l2-node 0.104.0+). `GET /api/v1/notifications` reads from the
+/// `NOTIFICATIONS` CF; before this reaper, nothing ever deleted a row —
+/// an attacker posting unbounded messages that each mention the same
+/// locally-connected wallet grew the CF without bound (per-message
+/// mentions are capped, but there was no bound over time). `store.rs`'s
+/// schema comment has long documented "30-day TTL" as the policy; this
+/// config makes that policy actually enforced, and operator-tunable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationsConfig {
+    /// Days a stored notification is retained before the reaper deletes
+    /// it. `0` = unlimited. Default 30 (the long-documented, previously
+    /// unenforced policy).
+    #[serde(default = "default_notifications_retention_days")]
+    pub retention_days: u64,
+    /// How often the retention reaper sweeps `NOTIFICATIONS` for expired
+    /// rows. Batch-capped and resumes from a persisted cursor, so a
+    /// large post-upgrade backlog drains incrementally. Default 900
+    /// (15 min) — same cadence as the DM retention reaper (W11).
+    #[serde(default = "default_notifications_reap_interval_secs")]
+    pub reap_interval_secs: u64,
+    /// Max stored notifications per target address, enforced at write
+    /// time by evicting the OLDEST stored notification for that address
+    /// (Security Audit follow-up, W31). The time-based reaper above
+    /// bounds growth only if ingest stays under its fixed drain rate — a
+    /// single already-rate-limited sender can flood far faster than that
+    /// (30 ChatMessages/min × 50 mentions/message), so this orthogonal
+    /// per-address cap bounds worst-case storage regardless of flood
+    /// rate. `0` = unlimited (test-only). Default 1000.
+    #[serde(default = "default_notifications_max_stored_per_address")]
+    pub max_stored_per_address: u64,
+}
+
+impl Default for NotificationsConfig {
+    fn default() -> Self {
+        Self {
+            retention_days: default_notifications_retention_days(),
+            reap_interval_secs: default_notifications_reap_interval_secs(),
+            max_stored_per_address: default_notifications_max_stored_per_address(),
+        }
+    }
+}
+
+fn default_notifications_retention_days() -> u64 {
+    30
+}
+fn default_notifications_reap_interval_secs() -> u64 {
+    900
+}
+fn default_notifications_max_stored_per_address() -> u64 {
+    1000
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2464,6 +2521,20 @@ max_stored_messages_per_recipient = 2000
 # How often the DM retention reaper sweeps for expired rows (W11).
 reap_interval_secs = 900
 
+[notifications]
+# Persisted-notification retention (W31, l2-node 0.104.0+)
+# Days a stored notification is retained. 0 = unlimited. Enforced by the
+# notification retention reaper.
+retention_days = 30
+# How often the notification retention reaper sweeps for expired rows.
+reap_interval_secs = 900
+# Max stored notifications per target address, enforced at write time by
+# evicting the oldest. The time-based reaper above only bounds growth if
+# ingest stays under its fixed drain rate; this orthogonal cap bounds
+# worst-case per-address storage regardless of flood rate. 0 = unlimited
+# (test-only).
+max_stored_per_address = 1000
+
 [push_gateway]
 enabled = false
 url = ""
@@ -3243,6 +3314,7 @@ mod tests {
             "[storage]",
             "[cache]",
             "[dm]",
+            "[notifications]",
             "[push_gateway]",
             "[anchoring]",
             "[anchoring.metadata]",

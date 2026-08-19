@@ -5,6 +5,75 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.104.0] - 2026-08-19
+
+### Security
+
+- **NOTIFICATIONS 30-day TTL cleanup was never scheduled — unbounded
+  RocksDB growth (final pre-mainnet audit W31).** The schema comment has
+  long documented "30-day TTL" as policy, and a `cleanup_old_notifications`
+  function existed to enforce it — but it was per-address (needs a caller
+  to enumerate every address with notifications) and had zero callers
+  anywhere. Nothing ever deleted a `NOTIFICATIONS` row. An attacker
+  posting unbounded messages that each mention the same locally-connected
+  wallet grows the CF without bound over time (per-message mentions are
+  capped at 50, bounding a single message, but there was no bound across
+  time).
+  - New retention reaper (`reap_expired_notifications`), same batch-capped,
+    cursor-resuming design as the DM retention reaper (W11): a whole-CF
+    sweep rather than reusing the per-address function, since there's no
+    reliable way to enumerate "every address that currently has
+    notifications" without a full scan anyway. New `[notifications]`
+    config section (`retention_days`, default 30 — matching the
+    already-documented policy; `reap_interval_secs`, default 900).
+  - `cleanup_old_notifications` is left in place, unused — a genuinely
+    different per-address shape that could still back a future
+    self-service "clear my notification history" endpoint; not deleted
+    since it isn't in conflict with the new whole-CF sweep.
+  - 5 new unit tests covering the pure planning logic (cutoff/cursor/
+    batch-limit correctness, including a direct regression test for the
+    exact cursor-skip class of bug the W11 DM reaper's post-fix Code
+    Audit caught).
+  - **Post-fix Code Audit + Security Audit pass: Code Audit came back
+    fully clean. Security Audit found the time-based reaper alone doesn't
+    actually close the finding, fixed same day with a second, orthogonal
+    mechanism.** A single already-rate-limited sender can generate
+    ~25 notification rows/sec indefinitely (30 `ChatMessages`/min × 50
+    mentions/message, using only free WS-connected "victim" keys the
+    attacker controls itself) — over 11x the reaper's fixed drain
+    ceiling (2,000 deletions per 900s tick ≈ 2.2/sec). A sustained flood
+    still grows the CF without bound, just slower than before: the exact
+    same "throughput ceiling vs. attacker-achievable ingest rate" gap
+    class already found and accepted-as-deferred in W17, except here a
+    materially simpler orthogonal fix was available and the original
+    finding's own text had already named it as a valid alternative
+    ("a per-address row cap on write") — so it was fixed rather than
+    deferred. New `Storage::store_notification_capped` enforces
+    `[notifications] max_stored_per_address` (default 1000) at write
+    time, evicting the target address's OLDEST stored notification when
+    at cap. Evict-oldest (not reject-newest, unlike the W11 DM
+    per-recipient cap) is the correct choice here: a notification is a
+    low-stakes, recoverable POINTER — the chat/news message it
+    references is still fully readable in its channel — not
+    irreplaceable content like a DM, so losing the oldest one under
+    flood is an acceptable trade-off, and rejecting new notifications
+    instead would just silently stop a flooded user's feed from
+    updating. Threaded through as a new required `NotificationEngine`
+    constructor parameter (both call sites in `node.rs` updated). 4 new
+    unit tests (eviction at cap, no eviction under cap, per-address
+    independence, `0` = unlimited).
+    Verification pass confirmed the oldest-row lookup (reverse-seek to a
+    constructed max-possible-key for the address's prefix, correct given
+    the negated-timestamp key encoding) and `count_prefix_cf`'s
+    boundary behavior are both off-by-one-free. One accepted, documented
+    trade-off: the count-check → evict → store sequence is not atomic
+    (no lock, unlike the W11 DM cap), so concurrent deliveries to the
+    same address could transiently push a few rows over cap — judged
+    acceptable, not fixed, because (unlike the DM cap, a hard security
+    bound) this is a soft, self-correcting storage backstop over
+    evictable content: the next write re-checks and evicts again, so the
+    overshoot never compounds or grows unboundedly.
+
 ## [0.103.0] - 2026-08-19
 
 ### Security

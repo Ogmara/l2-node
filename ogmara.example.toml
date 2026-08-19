@@ -251,6 +251,20 @@ max_stored_messages_per_recipient = 2000
 # How often the DM retention reaper sweeps for expired rows (W11).
 reap_interval_secs = 900
 
+[notifications]
+# Persisted-notification retention (W31, l2-node 0.104.0+)
+# Days a stored notification is retained. 0 = unlimited. Enforced by the
+# notification retention reaper.
+retention_days = 30
+# How often the notification retention reaper sweeps for expired rows.
+reap_interval_secs = 900
+# Max stored notifications per target address, enforced at write time by
+# evicting the oldest. The time-based reaper above only bounds growth if
+# ingest stays under its fixed drain rate; this orthogonal cap bounds
+# worst-case per-address storage regardless of flood rate. 0 = unlimited
+# (test-only).
+max_stored_per_address = 1000
+
 [push_gateway]
 enabled = false
 url = ""

@@ -65,6 +65,12 @@ pub struct NotificationEngine {
     http: reqwest::Client,
     /// Persistent storage for notification history retrieval via API.
     storage: Option<Storage>,
+    /// Max stored notifications per target address, enforced at write
+    /// time by evicting the oldest (audit final pre-mainnet W31 —
+    /// Security Audit follow-up). See
+    /// `Storage::store_notification_capped`'s doc comment for the full
+    /// rationale. `0` = unlimited.
+    max_stored_per_address: u64,
 }
 
 impl NotificationEngine {
@@ -72,6 +78,7 @@ impl NotificationEngine {
         ws_broadcast: broadcast::Sender<Arc<WsOutbound>>,
         push_gateway_url: Option<String>,
         push_gateway_token: Option<String>,
+        max_stored_per_address: u64,
     ) -> Self {
         Self {
             local_users: Arc::new(RwLock::new(HashSet::new())),
@@ -83,6 +90,7 @@ impl NotificationEngine {
                 .build()
                 .unwrap_or_default(),
             storage: None,
+            max_stored_per_address,
         }
     }
 
@@ -661,11 +669,12 @@ impl NotificationEngine {
                 "preview": notification.preview,
                 "timestamp": notification.timestamp,
             });
-            if let Err(e) = storage.store_notification(
+            if let Err(e) = storage.store_notification_capped(
                 target_address,
                 notification_id,
                 notification.timestamp,
                 &notification_json,
+                self.max_stored_per_address,
             ) {
                 warn!(error = %e, "Failed to persist notification to storage");
             }

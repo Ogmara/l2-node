@@ -2579,6 +2579,64 @@ impl Storage {
         self.put_cf(cf::NOTIFICATIONS, &key, &value)
     }
 
+    /// Store a notification, evicting the target address's OLDEST stored
+    /// notification first if they're already at `max_per_address`
+    /// (Security Audit follow-up, audit final pre-mainnet W31).
+    ///
+    /// The scheduled retention reaper (`reap_expired_notifications`,
+    /// `node.rs`) bounds growth over TIME, but its fixed per-tick
+    /// throughput (2,000 deletions / 15 min ≈ 2.2/sec) is far below what
+    /// a single already-rate-limited sender can generate (30
+    /// ChatMessages/min × 50 mentions/message ≈ 25 notification
+    /// rows/sec) — a sustained flood still grows the CF unboundedly,
+    /// just slower. This per-address cap is the orthogonal, O(1)-per-row
+    /// backstop the original finding's own text named as an alternative
+    /// fix ("a per-address row cap on write"): it bounds worst-case
+    /// storage per address regardless of how fast an attacker floods.
+    ///
+    /// Evict-oldest (not reject-newest, unlike the DM per-recipient cap
+    /// from W11) is the correct choice here: a notification is a
+    /// low-stakes, recoverable POINTER (the underlying chat/news message
+    /// it references is still fully readable in the channel itself), not
+    /// irreplaceable content like a DM — so losing the oldest one under
+    /// sustained flood is an acceptable degradation, and rejecting new
+    /// notifications instead would just make the notification feed stop
+    /// updating for a flooded user, arguably worse.
+    ///
+    /// `max_per_address == 0` disables the cap (test-only / explicit
+    /// opt-out — callers should not pass 0 in production).
+    pub fn store_notification_capped(
+        &self,
+        target_address: &str,
+        notification_id: &[u8; 32],
+        timestamp: u64,
+        notification: &serde_json::Value,
+        max_per_address: u64,
+    ) -> Result<()> {
+        if max_per_address > 0 {
+            let mut prefix = Vec::with_capacity(target_address.len() + 1);
+            prefix.extend_from_slice(target_address.as_bytes());
+            prefix.push(0xFF);
+            let count = self.count_prefix_cf(cf::NOTIFICATIONS, &prefix, max_per_address as usize)?;
+            if count >= max_per_address {
+                // Oldest row = highest raw key within this address's
+                // prefix range (keys are negated-timestamp, so ascending
+                // key order is newest-first) — seek to the maximum
+                // possible key for this prefix and walk backward one.
+                let mut upper_bound = prefix.clone();
+                upper_bound.extend(std::iter::repeat(0xFFu8).take(40)); // !ts(8) + id(32)
+                if let Some((oldest_key, _)) = self
+                    .reverse_iter_cf(cf::NOTIFICATIONS, &upper_bound, &prefix, 1)?
+                    .into_iter()
+                    .next()
+                {
+                    self.delete_cf(cf::NOTIFICATIONS, &oldest_key)?;
+                }
+            }
+        }
+        self.store_notification(target_address, notification_id, timestamp, notification)
+    }
+
     /// Get notifications for a user, optionally filtered by a since timestamp.
     ///
     /// Returns notifications in reverse-chronological order (newest first).
@@ -3743,5 +3801,88 @@ mod dm_recipient_count_tests {
         s.increment_dm_recipient_count(b"klv1bob").unwrap();
         assert_eq!(s.get_dm_recipient_count(b"klv1alice").unwrap(), 2);
         assert_eq!(s.get_dm_recipient_count(b"klv1bob").unwrap(), 1);
+    }
+}
+
+#[cfg(test)]
+mod store_notification_capped_tests {
+    //! Security Audit follow-up, audit final pre-mainnet W31: the
+    //! time-based notification reaper alone doesn't bound growth under a
+    //! sustained flood from a single already-rate-limited sender; this
+    //! per-address cap is the orthogonal backstop.
+    use super::*;
+    use tempfile::TempDir;
+
+    fn db() -> (Storage, TempDir) {
+        let dir = TempDir::new().unwrap();
+        (Storage::open(dir.path()).unwrap(), dir)
+    }
+
+    fn n(i: u8) -> serde_json::Value {
+        serde_json::json!({"n": i})
+    }
+
+    #[test]
+    fn evicts_oldest_when_at_cap() {
+        let (s, _d) = db();
+        let addr = "klv1alice";
+        for i in 0..5u8 {
+            s.store_notification_capped(addr, &[i; 32], 1000 + i as u64, &n(i), 5)
+                .unwrap();
+        }
+        // At cap (5). The 6th store must evict the oldest (timestamp 1000).
+        s.store_notification_capped(addr, &[5; 32], 1005, &n(5), 5)
+            .unwrap();
+
+        let stored = s.get_notifications(addr, None, 100).unwrap();
+        assert_eq!(stored.len(), 5, "count must stay at cap, not grow to 6");
+        let survivors: Vec<u64> = stored.iter().map(|v| v["n"].as_u64().unwrap()).collect();
+        assert!(
+            !survivors.contains(&0),
+            "the oldest notification (n=0, ts=1000) must have been evicted"
+        );
+        assert!(
+            survivors.contains(&5),
+            "the newly-stored notification (n=5) must be present"
+        );
+    }
+
+    #[test]
+    fn does_not_evict_when_under_cap() {
+        let (s, _d) = db();
+        let addr = "klv1bob";
+        for i in 0..3u8 {
+            s.store_notification_capped(addr, &[i; 32], 1000 + i as u64, &n(i), 10)
+                .unwrap();
+        }
+        let stored = s.get_notifications(addr, None, 100).unwrap();
+        assert_eq!(stored.len(), 3, "under cap — nothing should be evicted");
+    }
+
+    #[test]
+    fn cap_is_per_address_not_global() {
+        let (s, _d) = db();
+        for i in 0..3u8 {
+            s.store_notification_capped("klv1alice", &[i; 32], 1000 + i as u64, &n(i), 3)
+                .unwrap();
+        }
+        // A different address must have its own independent budget —
+        // storing for bob must not evict any of alice's rows even though
+        // the CF-wide total is now over what a single address's cap is.
+        s.store_notification_capped("klv1bob", &[9; 32], 2000, &n(9), 3)
+            .unwrap();
+        assert_eq!(s.get_notifications("klv1alice", None, 100).unwrap().len(), 3);
+        assert_eq!(s.get_notifications("klv1bob", None, 100).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn zero_cap_means_unlimited() {
+        let (s, _d) = db();
+        let addr = "klv1carol";
+        for i in 0..10u8 {
+            s.store_notification_capped(addr, &[i; 32], 1000 + i as u64, &n(i), 0)
+                .unwrap();
+        }
+        assert_eq!(s.get_notifications(addr, None, 100).unwrap().len(), 10);
     }
 }

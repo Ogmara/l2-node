@@ -409,6 +409,10 @@ pub mod state_keys {
     pub const DM_REAP_CURSOR_CONVERSATIONS: &[u8] = b"dm_reap_cursor_conversations";
     /// DM retention reaper: persisted cursor for the `DM_EDIT_DELETE_MSGS` sweep.
     pub const DM_REAP_CURSOR_EDIT_DELETE: &[u8] = b"dm_reap_cursor_edit_delete";
+    /// Notification retention reaper (audit final pre-mainnet W31, l2-node
+    /// 0.104.0+): persisted cursor for the `NOTIFICATIONS` sweep. Same
+    /// resume-across-restarts rationale as the DM reaper cursors above.
+    pub const NOTIFICATION_REAP_CURSOR: &[u8] = b"notification_reap_cursor";
 }
 
 /// Snapshot bootstrap (spec 11-snapshot-sync.md).

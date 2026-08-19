@@ -16,6 +16,136 @@ use crate::crypto;
 use crate::storage::rocks::Storage;
 use crate::storage::schema::state_keys;
 
+/// Notification retention reaper (audit final pre-mainnet W31): max rows
+/// actually DELETED per sweep. Mirrors the DM retention reaper's (W11)
+/// `DM_REAP_BATCH_LIMIT`.
+const NOTIFICATION_REAP_BATCH_LIMIT: usize = 2_000;
+/// Notification retention reaper: max rows FETCHED/examined per sweep —
+/// bounds wall-clock cost even when a sweep's batch is dominated by rows
+/// that aren't expired yet. Mirrors `DM_REAP_MAX_ROWS_EXAMINED`.
+const NOTIFICATION_REAP_MAX_ROWS_EXAMINED: usize = 20_000;
+
+/// Pure planning step for the notification retention reaper (audit final
+/// pre-mainnet W31): given a batch of `NOTIFICATIONS` rows (keyed
+/// `address(variable, ≤70 bytes) ++ 0xFF ++ !timestamp_be(8) ++
+/// notification_id(32)`) and a cutoff, returns the keys to delete
+/// (capped at `batch_limit`) and the next cursor to resume from (`None`
+/// means the batch was empty — wrap to the start of the CF). No I/O —
+/// factored out purely so the cutoff/key-parsing logic is unit-testable
+/// without a live `Storage` (same workaround shape as the W11 DM reaper's
+/// `plan_dm_msg_shaped_reap`/`plan_dm_conversations_reap`).
+///
+/// The address prefix is variable-width — `target_address` comes from
+/// `NotificationEngine::deliver`, a delegation-resolved klv1 wallet
+/// address (`encode_notification_key`, schema.rs), not attacker-supplied
+/// raw text, but its exact length still isn't fixed the way a hash is —
+/// so, consistent with the W11 lesson, the address length is derived
+/// from the END of the key (`key.len() - 41`, the trailing
+/// `0xFF(1)+!timestamp(8)+notification_id(32)` is always fixed-width),
+/// never a hardcoded start offset.
+fn plan_notification_reap(
+    rows: &[(Vec<u8>, Vec<u8>)],
+    cutoff_ms: u64,
+    batch_limit: usize,
+) -> (Vec<Vec<u8>>, Option<Vec<u8>>) {
+    if rows.is_empty() {
+        return (Vec::new(), None);
+    }
+    let mut to_delete = Vec::new();
+    let mut last_key: &[u8] = &rows[0].0;
+    for (key, _) in rows {
+        // See the W11 lesson (feedback_backend_rust_patterns): only
+        // advance `last_key` for rows actually examined this iteration —
+        // advancing it before the batch-limit check would let the cursor
+        // skip past a row whose expiry was never evaluated.
+        if to_delete.len() >= batch_limit {
+            break;
+        }
+        last_key = key;
+        if key.len() <= 41 {
+            continue; // defensive — malformed key
+        }
+        let suffix_start = key.len() - 41;
+        let neg_ts =
+            u64::from_be_bytes(key[suffix_start + 1..suffix_start + 9].try_into().unwrap());
+        let ts = !neg_ts; // key stores the bitwise complement of the timestamp
+        if ts >= cutoff_ms {
+            continue; // not expired yet
+        }
+        to_delete.push(key.clone());
+    }
+    let mut next_cursor = last_key.to_vec();
+    next_cursor.push(0); // sorts immediately after `last_key` itself
+    (to_delete, Some(next_cursor))
+}
+
+/// Notification retention reaper (audit final pre-mainnet W31, l2-node
+/// 0.104.0+): sweeps `NOTIFICATIONS` for rows older than
+/// `[notifications] retention_days`, deleting them. Before this,
+/// `Storage::cleanup_old_notifications` (still present, unused — kept as
+/// a possible building block for a future self-service "clear my
+/// notifications" endpoint, a genuinely different per-address shape than
+/// this whole-CF sweep needs) had zero callers, and nothing ever
+/// enforced the "30-day TTL" the schema comment has long documented as
+/// policy.
+///
+/// Batch-capped (mirrors the DM retention reaper, W11) with a persisted
+/// cursor so a large post-upgrade backlog drains incrementally across
+/// ticks instead of blocking. `retention_days == 0` means "unlimited" —
+/// disables the sweep, matching the `[dm]` config's identical semantic.
+/// A free function (not a `Node` method) so it can be called from a
+/// spawned task holding only a cloned `Storage`, not a borrow of `Node`.
+fn reap_expired_notifications(storage: &Storage, retention_days: u64) {
+    if retention_days == 0 {
+        return;
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let cutoff_ms = now_ms.saturating_sub(retention_days.saturating_mul(24 * 3600 * 1000));
+    let cursor = storage
+        .get_cf(
+            crate::storage::schema::cf::NODE_STATE,
+            state_keys::NOTIFICATION_REAP_CURSOR,
+        )
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let rows = match storage.iter_cf_from(
+        crate::storage::schema::cf::NOTIFICATIONS,
+        &cursor,
+        &[],
+        NOTIFICATION_REAP_MAX_ROWS_EXAMINED,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(error = %e, "reap_expired_notifications: scan failed");
+            return;
+        }
+    };
+    let (to_delete, next_cursor) =
+        plan_notification_reap(&rows, cutoff_ms, NOTIFICATION_REAP_BATCH_LIMIT);
+    for key in &to_delete {
+        let _ = storage.delete_cf(crate::storage::schema::cf::NOTIFICATIONS, key);
+    }
+    match next_cursor {
+        Some(nc) => {
+            let _ = storage.put_cf(
+                crate::storage::schema::cf::NODE_STATE,
+                state_keys::NOTIFICATION_REAP_CURSOR,
+                &nc,
+            );
+        }
+        None => {
+            let _ = storage.delete_cf(
+                crate::storage::schema::cf::NODE_STATE,
+                state_keys::NOTIFICATION_REAP_CURSOR,
+            );
+        }
+    }
+}
+
 /// Spawns `fut`, plus a lightweight second task that awaits its completion
 /// purely to surface a genuine panic through structured logging (audit
 /// final pre-mainnet W17). tokio's default panic hook only prints to raw
@@ -320,6 +450,7 @@ impl Node {
                 } else {
                     Some(self.config.push_gateway.auth_token.clone())
                 },
+                self.config.notifications.max_stored_per_address,
             );
             engine.set_storage(self.storage.clone());
             info!(
@@ -333,6 +464,7 @@ impl Node {
                 ws_broadcast.clone(),
                 None,
                 None,
+                self.config.notifications.max_stored_per_address,
             );
             engine.set_storage(self.storage.clone());
             info!("Notification engine initialized (WS-only, no push gateway)");
@@ -1254,6 +1386,29 @@ impl Node {
             }
         });
 
+        // Notification retention reaper (audit final pre-mainnet W31):
+        // own interval, not folded into the cleanup task above — that
+        // one only touches cheap in-memory maps, this does real batched
+        // RocksDB deletion work (same reasoning as the DM reaper, W11).
+        let notification_reap_storage = self.storage.clone();
+        let notification_retention_days = self.config.notifications.retention_days;
+        let notification_reap_interval_secs = self.config.notifications.reap_interval_secs;
+        let mut notification_reap_shutdown_rx = self.shutdown_rx();
+        spawn_supervised("notification_reaper", async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+                notification_reap_interval_secs.max(1),
+            ));
+            interval.tick().await; // skip immediate tick
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        reap_expired_notifications(&notification_reap_storage, notification_retention_days);
+                    }
+                    _ = notification_reap_shutdown_rx.recv() => break,
+                }
+            }
+        });
+
         let api_config = self.config.clone();
         let api_shutdown_rx = self.shutdown_rx();
         let mut api_task = tokio::spawn(async move {
@@ -1591,5 +1746,87 @@ mod supervised_task_tests {
         tokio::task::yield_now().await;
         assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
         assert!(abort_handle.is_finished());
+    }
+}
+
+#[cfg(test)]
+mod notification_reaper_tests {
+    //! Audit final pre-mainnet W31. Covers the pure planning logic
+    //! factored out of `reap_expired_notifications` — see the note on
+    //! `plan_notification_reap` for why the I/O shell itself isn't
+    //! tested directly here (same swarm/live-Storage testing gap as the
+    //! W11 DM reaper).
+    use super::*;
+
+    fn notification_row(address: &str, ts: u64, id: [u8; 32]) -> (Vec<u8>, Vec<u8>) {
+        (
+            crate::storage::schema::encode_notification_key(address, ts, &id),
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn deletes_only_expired_rows() {
+        let rows = vec![
+            notification_row("klv1alice", 100, [1u8; 32]), // expired
+            notification_row("klv1alice", 200, [2u8; 32]), // not expired
+            notification_row("klv1bob", 50, [3u8; 32]),    // expired
+        ];
+        let (to_delete, next_cursor) = plan_notification_reap(&rows, 150, 100);
+        assert_eq!(to_delete.len(), 2);
+        assert!(to_delete.contains(&rows[0].0));
+        assert!(to_delete.contains(&rows[2].0));
+        assert!(!to_delete.contains(&rows[1].0));
+        assert!(next_cursor.is_some());
+    }
+
+    #[test]
+    fn respects_batch_limit_and_cursor_never_skips_an_unexamined_row() {
+        // Regression for the exact class of bug the W11 DM reaper's
+        // post-fix Code Audit caught: the cursor must resume from the
+        // LAST EXAMINED row, never an unexamined one skipped by the
+        // batch-limit break.
+        let rows: Vec<_> = (0..10)
+            .map(|i| notification_row("klv1alice", 0, [i as u8; 32])) // all expired
+            .collect();
+        let (to_delete, next_cursor) = plan_notification_reap(&rows, 1000, 3);
+        assert_eq!(to_delete.len(), 3);
+        let expected_cursor = {
+            let mut c = rows[2].0.clone();
+            c.push(0);
+            c
+        };
+        assert_eq!(next_cursor, Some(expected_cursor));
+    }
+
+    #[test]
+    fn handles_variable_length_addresses() {
+        // Klever addresses are a fixed-format bech32 string in practice,
+        // but the key encoding doesn't assume a fixed length (W11
+        // lesson) — prove both a short and a long address parse
+        // correctly via the same 0xFF-delimited, length-derived-from-end
+        // logic.
+        let rows = vec![
+            notification_row("klv1short", 100, [1u8; 32]),
+            notification_row(&format!("klv1{}", "a".repeat(58)), 100, [2u8; 32]),
+        ];
+        let (to_delete, _) = plan_notification_reap(&rows, 150, 100);
+        assert_eq!(to_delete.len(), 2, "both address lengths must be reaped correctly");
+    }
+
+    #[test]
+    fn empty_batch_returns_none_cursor() {
+        let (to_delete, next_cursor) = plan_notification_reap(&[], 1000, 100);
+        assert!(to_delete.is_empty());
+        assert!(next_cursor.is_none());
+    }
+
+    #[test]
+    fn cursor_advances_even_when_nothing_deleted() {
+        let rows = vec![notification_row("klv1alice", 999_999, [9u8; 32])]; // not expired
+        let (to_delete, next_cursor) = plan_notification_reap(&rows, 100, 100);
+        assert!(to_delete.is_empty());
+        let cursor = next_cursor.expect("cursor must still advance to make forward progress");
+        assert!(cursor > rows[0].0);
     }
 }
