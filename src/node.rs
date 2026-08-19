@@ -25,6 +25,15 @@ const NOTIFICATION_REAP_BATCH_LIMIT: usize = 2_000;
 /// that aren't expired yet. Mirrors `DM_REAP_MAX_ROWS_EXAMINED`.
 const NOTIFICATION_REAP_MAX_ROWS_EXAMINED: usize = 20_000;
 
+/// Device-enc-key tombstone reaper (audit final pre-mainnet W15): max rows
+/// actually DELETED per sweep. Same magnitude as the notification reaper —
+/// this CF is expected to grow far more slowly (rare, rate-limited event),
+/// so the cap is a wall-clock/backlog-drain safety net, not a routinely-hit
+/// limit.
+const DEVICE_ENC_REAP_BATCH_LIMIT: usize = 2_000;
+/// Device-enc-key tombstone reaper: max rows FETCHED/examined per sweep.
+const DEVICE_ENC_REAP_MAX_ROWS_EXAMINED: usize = 20_000;
+
 /// Pure planning step for the notification retention reaper (audit final
 /// pre-mainnet W31): given a batch of `NOTIFICATIONS` rows (keyed
 /// `address(variable, ≤70 bytes) ++ 0xFF ++ !timestamp_be(8) ++
@@ -141,6 +150,125 @@ fn reap_expired_notifications(storage: &Storage, retention_days: u64) {
             let _ = storage.delete_cf(
                 crate::storage::schema::cf::NODE_STATE,
                 state_keys::NOTIFICATION_REAP_CURSOR,
+            );
+        }
+    }
+}
+
+/// Pure planning step for the device-enc-key tombstone reaper (audit final
+/// pre-mainnet W15): given a batch of `DEVICE_ENC_KEYS` rows and a cutoff,
+/// returns the keys to delete (capped at `batch_limit`) and the next cursor
+/// to resume from. No I/O — same factoring rationale as the DM/notification
+/// reapers' planner functions.
+///
+/// Unlike those two, `DEVICE_ENC_KEYS` keys embed NO timestamp (they're
+/// `wallet ++ 0xFF ++ enc_pub_hex`) — the timestamp is value-only, in the
+/// stored JSON's `"ts"` field. So this planner must decode each row's value
+/// rather than parse timestamp bytes out of the key, and there's no useful
+/// key ordering to exploit for a "skip whole non-expired group" shortcut
+/// the way the DM reaper's Pass A has — every row in the batch is decoded
+/// and checked individually.
+///
+/// **Critical invariant**: only a row with `"revoked": true` may EVER be
+/// deleted, regardless of `"ts"`. A row with `"revoked": false` (or the
+/// field absent/malformed) is an ACTIVE device encryption key — it has no
+/// TTL, and deleting one would break real E2E encryption for that device.
+/// Getting this backwards is the one way this reaper could cause an actual
+/// security regression rather than just a missed cleanup.
+fn plan_device_enc_tombstone_reap(
+    rows: &[(Vec<u8>, Vec<u8>)],
+    cutoff_ms: u64,
+    batch_limit: usize,
+) -> (Vec<Vec<u8>>, Option<Vec<u8>>) {
+    if rows.is_empty() {
+        return (Vec::new(), None);
+    }
+    let mut to_delete = Vec::new();
+    let mut last_key: &[u8] = &rows[0].0;
+    for (key, value) in rows {
+        // See the W11/W31 lesson (feedback_backend_rust_patterns): only
+        // advance `last_key` for rows actually examined this iteration.
+        if to_delete.len() >= batch_limit {
+            break;
+        }
+        last_key = key;
+        let Ok(record) = serde_json::from_slice::<serde_json::Value>(value) else {
+            continue; // malformed value — not this reaper's job to fix
+        };
+        let revoked = record.get("revoked").and_then(|v| v.as_bool()).unwrap_or(false);
+        if !revoked {
+            continue; // ACTIVE key — never delete, regardless of age
+        }
+        let ts = record.get("ts").and_then(|v| v.as_u64());
+        match ts {
+            Some(ts) if ts < cutoff_ms => to_delete.push(key.clone()),
+            _ => {} // no ts, or not expired yet — leave it
+        }
+    }
+    let mut next_cursor = last_key.to_vec();
+    next_cursor.push(0); // sorts immediately after `last_key` itself
+    (to_delete, Some(next_cursor))
+}
+
+/// Device-enc-key tombstone reaper (audit final pre-mainnet W15, l2-node
+/// 0.105.0+): sweeps `DEVICE_ENC_KEYS` for tombstoned (`"revoked": true`)
+/// rows older than `[device_enc] tombstone_retention_days`, deleting them.
+/// Before this, every accepted `DeviceEncBinding`/`DeviceEncRevoke` wrote a
+/// permanent row — active or immediately superseded/revoked — and nothing
+/// ever pruned an old tombstone. Combined with the `DeviceEnc` rate
+/// category (`messages/router.rs`), this closes the finding from both the
+/// ingest side (rate limit) and the storage side (this reaper).
+///
+/// Batch-capped with a persisted cursor, same shape as the DM/notification
+/// reapers. `tombstone_retention_days == 0` means "unlimited" — disables
+/// the sweep.
+fn reap_device_enc_tombstones(storage: &Storage, tombstone_retention_days: u64) {
+    if tombstone_retention_days == 0 {
+        return;
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let cutoff_ms =
+        now_ms.saturating_sub(tombstone_retention_days.saturating_mul(24 * 3600 * 1000));
+    let cursor = storage
+        .get_cf(
+            crate::storage::schema::cf::NODE_STATE,
+            state_keys::DEVICE_ENC_TOMBSTONE_REAP_CURSOR,
+        )
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let rows = match storage.iter_cf_from(
+        crate::storage::schema::cf::DEVICE_ENC_KEYS,
+        &cursor,
+        &[],
+        DEVICE_ENC_REAP_MAX_ROWS_EXAMINED,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(error = %e, "reap_device_enc_tombstones: scan failed");
+            return;
+        }
+    };
+    let (to_delete, next_cursor) =
+        plan_device_enc_tombstone_reap(&rows, cutoff_ms, DEVICE_ENC_REAP_BATCH_LIMIT);
+    for key in &to_delete {
+        let _ = storage.delete_cf(crate::storage::schema::cf::DEVICE_ENC_KEYS, key);
+    }
+    match next_cursor {
+        Some(nc) => {
+            let _ = storage.put_cf(
+                crate::storage::schema::cf::NODE_STATE,
+                state_keys::DEVICE_ENC_TOMBSTONE_REAP_CURSOR,
+                &nc,
+            );
+        }
+        None => {
+            let _ = storage.delete_cf(
+                crate::storage::schema::cf::NODE_STATE,
+                state_keys::DEVICE_ENC_TOMBSTONE_REAP_CURSOR,
             );
         }
     }
@@ -1409,6 +1537,28 @@ impl Node {
             }
         });
 
+        // Device-enc-key tombstone reaper (audit final pre-mainnet W15):
+        // own interval, same reasoning as the notification reaper above.
+        let device_enc_reap_storage = self.storage.clone();
+        let device_enc_tombstone_retention_days =
+            self.config.device_enc.tombstone_retention_days;
+        let device_enc_reap_interval_secs = self.config.device_enc.reap_interval_secs;
+        let mut device_enc_reap_shutdown_rx = self.shutdown_rx();
+        spawn_supervised("device_enc_tombstone_reaper", async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+                device_enc_reap_interval_secs.max(1),
+            ));
+            interval.tick().await; // skip immediate tick
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        reap_device_enc_tombstones(&device_enc_reap_storage, device_enc_tombstone_retention_days);
+                    }
+                    _ = device_enc_reap_shutdown_rx.recv() => break,
+                }
+            }
+        });
+
         let api_config = self.config.clone();
         let api_shutdown_rx = self.shutdown_rx();
         let mut api_task = tokio::spawn(async move {
@@ -1825,6 +1975,98 @@ mod notification_reaper_tests {
     fn cursor_advances_even_when_nothing_deleted() {
         let rows = vec![notification_row("klv1alice", 999_999, [9u8; 32])]; // not expired
         let (to_delete, next_cursor) = plan_notification_reap(&rows, 100, 100);
+        assert!(to_delete.is_empty());
+        let cursor = next_cursor.expect("cursor must still advance to make forward progress");
+        assert!(cursor > rows[0].0);
+    }
+}
+
+#[cfg(test)]
+mod device_enc_tombstone_reaper_tests {
+    //! Audit final pre-mainnet W15. Covers the pure planning logic
+    //! factored out of `reap_device_enc_tombstones`. The single most
+    //! important property tested here: an ACTIVE key (`"revoked": false`)
+    //! must NEVER be deleted, regardless of age — unlike the DM/
+    //! notification reapers, a bug here would be a real security
+    //! regression (breaking device encryption), not just a missed
+    //! cleanup.
+    use super::*;
+
+    fn row(wallet: &str, enc_pub: &str, value: serde_json::Value) -> (Vec<u8>, Vec<u8>) {
+        (
+            crate::storage::schema::encode_device_enc_key(wallet, enc_pub),
+            serde_json::to_vec(&value).unwrap(),
+        )
+    }
+
+    fn active(ts: u64) -> serde_json::Value {
+        serde_json::json!({"ts": ts, "revoked": false})
+    }
+    fn revoked(ts: u64) -> serde_json::Value {
+        serde_json::json!({"ts": ts, "revoked": true})
+    }
+
+    #[test]
+    fn deletes_only_revoked_and_expired_rows() {
+        let rows = vec![
+            row("klv1alice", "enc1", revoked(100)), // revoked + expired
+            row("klv1alice", "enc2", revoked(200)), // revoked, not expired
+            row("klv1alice", "enc3", active(50)),   // active + "expired" ts, must survive
+        ];
+        let (to_delete, _) = plan_device_enc_tombstone_reap(&rows, 150, 100);
+        assert_eq!(to_delete.len(), 1);
+        assert_eq!(to_delete[0], rows[0].0);
+    }
+
+    #[test]
+    fn never_deletes_an_active_key_regardless_of_age() {
+        // The one property this reaper must never get wrong: an active
+        // binding has no TTL, full stop.
+        let rows = vec![row("klv1alice", "enc1", active(0))]; // ts=0, oldest possible
+        let (to_delete, _) = plan_device_enc_tombstone_reap(&rows, u64::MAX, 100);
+        assert!(to_delete.is_empty(), "an active key must never be reaped, no matter how old");
+    }
+
+    #[test]
+    fn missing_or_malformed_revoked_field_defaults_to_never_delete() {
+        // Absent/malformed "revoked" must be treated as "not revoked" (fail
+        // safe toward NOT deleting), not as revoked.
+        let rows = vec![
+            (
+                crate::storage::schema::encode_device_enc_key("klv1alice", "enc1"),
+                serde_json::to_vec(&serde_json::json!({"ts": 0})).unwrap(), // no "revoked" key
+            ),
+        ];
+        let (to_delete, _) = plan_device_enc_tombstone_reap(&rows, u64::MAX, 100);
+        assert!(to_delete.is_empty());
+    }
+
+    #[test]
+    fn respects_batch_limit_and_cursor_never_skips_an_unexamined_row() {
+        let rows: Vec<_> = (0..10)
+            .map(|i| row("klv1alice", &format!("enc{i}"), revoked(0))) // all revoked+expired
+            .collect();
+        let (to_delete, next_cursor) = plan_device_enc_tombstone_reap(&rows, 1000, 3);
+        assert_eq!(to_delete.len(), 3);
+        let expected_cursor = {
+            let mut c = rows[2].0.clone();
+            c.push(0);
+            c
+        };
+        assert_eq!(next_cursor, Some(expected_cursor));
+    }
+
+    #[test]
+    fn empty_batch_returns_none_cursor() {
+        let (to_delete, next_cursor) = plan_device_enc_tombstone_reap(&[], 1000, 100);
+        assert!(to_delete.is_empty());
+        assert!(next_cursor.is_none());
+    }
+
+    #[test]
+    fn cursor_advances_even_when_nothing_deleted() {
+        let rows = vec![row("klv1alice", "enc1", active(999_999))];
+        let (to_delete, next_cursor) = plan_device_enc_tombstone_reap(&rows, 100, 100);
         assert!(to_delete.is_empty());
         let cursor = next_cursor.expect("cursor must still advance to make forward progress");
         assert!(cursor > rows[0].0);

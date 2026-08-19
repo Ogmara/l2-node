@@ -413,6 +413,10 @@ pub mod state_keys {
     /// 0.104.0+): persisted cursor for the `NOTIFICATIONS` sweep. Same
     /// resume-across-restarts rationale as the DM reaper cursors above.
     pub const NOTIFICATION_REAP_CURSOR: &[u8] = b"notification_reap_cursor";
+    /// Device-enc-key tombstone reaper (audit final pre-mainnet W15, l2-node
+    /// 0.105.0+): persisted cursor for the `DEVICE_ENC_KEYS` sweep. Same
+    /// resume-across-restarts rationale as the DM/notification reaper cursors above.
+    pub const DEVICE_ENC_TOMBSTONE_REAP_CURSOR: &[u8] = b"device_enc_tombstone_reap_cursor";
 }
 
 /// Snapshot bootstrap (spec 11-snapshot-sync.md).

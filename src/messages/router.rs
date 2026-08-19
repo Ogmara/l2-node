@@ -51,6 +51,7 @@ enum RateCategory {
     ChannelInvite,     // 20 per hour
     PinUnpin,          // 20 per hour
     KeyVault,          // 10 per minute (E2E vault — debounced LWW republish)
+    DeviceEnc,         // 10 per hour (audit final pre-mainnet W15)
     Other,             // fallback: 100 per minute
 }
 
@@ -69,6 +70,16 @@ impl RateCategory {
             // Legit clients publish a 4 s-debounced last-write-wins vault; 10/min is
             // generous for that while bounding the 2 MB-per-write storage churn.
             Self::KeyVault => (10, 60_000),
+            // Audit final pre-mainnet W15: device (re)binding is a rare, manual user
+            // action (setting up a new device, occasional key rotation) — not a
+            // high-frequency pattern, unlike this previously fell into `Other`'s
+            // 100/min, which let a single wallet mint ~144,000 permanent
+            // DEVICE_ENC_KEYS tombstone rows/day (each accepted DeviceEncBinding/
+            // DeviceEncRevoke writes one, whether the enc_pub ends up active or
+            // immediately superseded/revoked). 10/hour is generous for a user
+            // configuring several devices in one sitting while cutting the abuse
+            // ceiling ~600x (144,000/day → 240/day).
+            Self::DeviceEnc => (10, 3_600_000),
             Self::Other => (100, 60_000),
         }
     }
@@ -92,6 +103,7 @@ impl RateCategory {
             MessageType::ChannelInvite => Self::ChannelInvite,
             MessageType::ChannelPinMessage | MessageType::ChannelUnpinMessage => Self::PinUnpin,
             MessageType::KeyVaultSync => Self::KeyVault,
+            MessageType::DeviceEncBinding | MessageType::DeviceEncRevoke => Self::DeviceEnc,
             _ => Self::Other,
         }
     }
@@ -731,6 +743,18 @@ impl MessageRouter {
 
     /// Count active (non-revoked, non-tombstoned) enc keys for a wallet, excluding
     /// `skip_enc_pub` so re-binding an existing key is not counted against the cap.
+    ///
+    /// Audit final pre-mainnet W15 note: this 256-row prefix scan is NOT ordered by
+    /// recency — `DEVICE_ENC_KEYS` keys embed `enc_pub` directly with no timestamp, so
+    /// `prefix_iter_cf` returns whichever 256 rows sort lexicographically first,
+    /// unrelated to age. If a wallet's TOTAL row count (active + tombstoned) ever
+    /// exceeds 256, this scan (and `plan_enc_key_supersede`'s identical one) could
+    /// silently miss real active/stale rows. Not independently hardened here (e.g. via
+    /// a maintained counter CF) because the DeviceEnc rate limit (10/hour, was 100/min)
+    /// plus the tombstone reaper (`reap_device_enc_tombstones`, `node.rs`) together
+    /// keep any wallet's realistic total row count far below 256 under both normal use
+    /// and the new, much lower abuse ceiling — this comment documents that dependency
+    /// so a future change to either doesn't silently reopen the 256-row blind spot.
     fn count_active_enc_keys(&self, wallet: &str, skip_enc_pub: &str) -> Result<usize> {
         let mut prefix = wallet.as_bytes().to_vec();
         prefix.push(0xFF);

@@ -56,6 +56,10 @@ pub struct Config {
     /// W31, l2-node 0.104.0+).
     #[serde(default)]
     pub notifications: NotificationsConfig,
+    /// Device encryption-key tombstone retention policy (audit final
+    /// pre-mainnet W15, l2-node 0.105.0+).
+    #[serde(default)]
+    pub device_enc: DeviceEncConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -727,6 +731,54 @@ fn default_notifications_reap_interval_secs() -> u64 {
 }
 fn default_notifications_max_stored_per_address() -> u64 {
     1000
+}
+
+/// Device encryption-key tombstone retention (audit final pre-mainnet
+/// W15, l2-node 0.105.0+). Every accepted `DeviceEncBinding`/
+/// `DeviceEncRevoke` writes a permanent `DEVICE_ENC_KEYS` row keyed by
+/// `enc_pub` — active or immediately superseded/revoked — and nothing
+/// deleted a tombstoned row before this. This config makes the reaper's
+/// cadence/retention operator-tunable, alongside the `DeviceEnc` rate
+/// category (`messages/router.rs`) that closes the same growth vector
+/// from the ingest side.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceEncConfig {
+    /// Days a `DEVICE_ENC_KEYS` tombstone (`"revoked": true`) is retained
+    /// before the reaper deletes it. `0` = unlimited. ACTIVE bindings
+    /// (`"revoked": false`) are NEVER deleted by the reaper regardless of
+    /// age — only tombstones have a TTL. Default 7 — short relative to
+    /// DM/notification retention (30 days) because no sync/backfill
+    /// protocol delivers these two message types (confirmed by checking
+    /// every `process_synced_message` call site), so the only path an
+    /// envelope can arrive is live gossip already gated to ±5 minutes by
+    /// the general timestamp-freshness check — 7 days is generous
+    /// margin, not a requirement. If a future change ever adds these
+    /// types to a backfill protocol's scope, this default should be
+    /// re-derived against that protocol's own max-age window.
+    #[serde(default = "default_device_enc_tombstone_retention_days")]
+    pub tombstone_retention_days: u64,
+    /// How often the reaper sweeps `DEVICE_ENC_KEYS` for expired
+    /// tombstones. Default 3600 (1h) — less frequent than the DM/
+    /// notification reapers' 900s since this CF grows far more slowly
+    /// under both normal use and the tightened `DeviceEnc` rate limit.
+    #[serde(default = "default_device_enc_reap_interval_secs")]
+    pub reap_interval_secs: u64,
+}
+
+impl Default for DeviceEncConfig {
+    fn default() -> Self {
+        Self {
+            tombstone_retention_days: default_device_enc_tombstone_retention_days(),
+            reap_interval_secs: default_device_enc_reap_interval_secs(),
+        }
+    }
+}
+
+fn default_device_enc_tombstone_retention_days() -> u64 {
+    7
+}
+fn default_device_enc_reap_interval_secs() -> u64 {
+    3600
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2535,6 +2587,15 @@ reap_interval_secs = 900
 # (test-only).
 max_stored_per_address = 1000
 
+[device_enc]
+# Device encryption-key tombstone retention (W15, l2-node 0.105.0+)
+# Days a DEVICE_ENC_KEYS tombstone is retained. 0 = unlimited. Active
+# bindings are never deleted regardless of age -- only tombstones have a
+# TTL. Enforced by the device-enc tombstone reaper.
+tombstone_retention_days = 7
+# How often the reaper sweeps for expired tombstones.
+reap_interval_secs = 3600
+
 [push_gateway]
 enabled = false
 url = ""
@@ -3315,6 +3376,7 @@ mod tests {
             "[cache]",
             "[dm]",
             "[notifications]",
+            "[device_enc]",
             "[push_gateway]",
             "[anchoring]",
             "[anchoring.metadata]",

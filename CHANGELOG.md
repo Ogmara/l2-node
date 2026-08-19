@@ -5,6 +5,57 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.105.0] - 2026-08-19
+
+### Security
+
+- **DEVICE_ENC_KEYS tombstones accumulated forever, and rate-limiting for
+  `DeviceEncBinding`/`DeviceEncRevoke` fell into the generic 100/min
+  `Other` category (final pre-mainnet audit W15).** Every device
+  encryption key supersede/revoke writes a permanent tombstone row
+  (`wallet ++ 0xFF ++ enc_pub_hex`); nothing ever pruned old tombstones,
+  and the loose 100/min cap allowed ~144,000 rows/day/wallet.
+  - New `RateCategory::DeviceEnc` (10/hour, generous for legitimate
+    multi-device setup, ~600x tighter abuse ceiling: 240 rows/day/wallet
+    vs. 144,000).
+  - New tombstone reaper (`reap_device_enc_tombstones`), same
+    batch-capped, cursor-resuming shape as the DM (W11) and notification
+    (W31) reapers, wired via `spawn_supervised`. Unlike those two CFs,
+    `DEVICE_ENC_KEYS` has no timestamp in the key, so this reaper decodes
+    each row's JSON value and only deletes rows where `revoked == true`
+    AND `ts` is past the retention cutoff — an active binding
+    (`revoked == false`) is never touched regardless of age, since
+    deleting one would break real E2E encryption for that device. New
+    `[device_enc]` config section (`tombstone_retention_days`, default 7;
+    `reap_interval_secs`, default 3600).
+  - Retention-window analysis: exhaustively checked every
+    `process_synced_message` call site (identity_sync/news_sync/
+    dm_sync/reconcile) — none backfill `DeviceEncBinding`/
+    `DeviceEncRevoke` today, so the only path an envelope of these types
+    reaches the router is live gossip, already gated to a ±5 minute
+    freshness window. The true minimum safe tombstone retention is
+    therefore small (~10-30 min of propagation margin); 7 days is chosen
+    as a generous operational margin and defense-in-depth against a
+    future protocol change that adds these types to a backfill scope —
+    documented explicitly in code so that dependency doesn't silently
+    rot.
+  - Same-root-cause correctness note (not independently fixed):
+    `count_active_enc_keys`/`plan_enc_key_supersede`'s 256-row
+    `prefix_iter_cf` scan is not ordered by recency (the key embeds
+    `enc_pub` hex directly, no timestamp), so the per-wallet active-key
+    cap could silently be bypassed once a wallet's total row count
+    exceeds 256. Documented in a code comment as mitigated-by-growth-
+    bound: the new rate limit + reaper keep realistic row counts far
+    below 256 under both normal use and the new abuse ceiling. An
+    independent fix (a maintained counter CF, mirroring W11's
+    DM-recipient-count design) is out of scope unless real-world data
+    shows otherwise.
+  - 6 new unit tests covering the pure planning logic (only-revoked-and-
+    expired deletion, active keys never deleted regardless of age,
+    missing/malformed `revoked` defaults to never-delete, batch-limit +
+    cursor-never-skips-an-unexamined-row regression, empty batch, cursor
+    advances even when nothing deleted).
+
 ## [0.104.0] - 2026-08-19
 
 ### Security

@@ -265,6 +265,15 @@ reap_interval_secs = 900
 # (test-only).
 max_stored_per_address = 1000
 
+[device_enc]
+# Device encryption-key tombstone retention (W15, l2-node 0.105.0+)
+# Days a DEVICE_ENC_KEYS tombstone is retained. 0 = unlimited. Active
+# bindings are never deleted regardless of age -- only tombstones have a
+# TTL. Enforced by the device-enc tombstone reaper.
+tombstone_retention_days = 7
+# How often the reaper sweeps for expired tombstones.
+reap_interval_secs = 3600
+
 [push_gateway]
 enabled = false
 url = ""
