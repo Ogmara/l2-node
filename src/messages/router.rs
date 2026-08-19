@@ -1795,98 +1795,14 @@ impl MessageRouter {
         }
     }
 
-    /// Add a member to a channel (idempotent — skips if already member).
-    /// Updates the member_count in channel metadata.
-    fn add_channel_member(&self, channel_id: u64, address: &str, timestamp: u64, role: &str) -> Result<bool> {
-        // Check channel exists
-        let channel_key = channel_id.to_be_bytes();
-        let channel_data = self.storage.get_cf(schema::cf::CHANNELS, &channel_key)?;
-        if channel_data.is_none() {
-            return Ok(false); // channel doesn't exist
-        }
-
-        let member_key = schema::encode_channel_member_key(channel_id, address);
-        if self.storage.get_cf(schema::cf::CHANNEL_MEMBERS, &member_key)?.is_some() {
-            return Ok(false); // already a member
-        }
-
-        let record = serde_json::json!({
-            "joined_at": timestamp,
-            "role": role,
-        });
-        let record_bytes = serde_json::to_vec(&record)
-            .context("serializing member record")?;
-        self.storage.put_cf(schema::cf::CHANNEL_MEMBERS, &member_key, &record_bytes)?;
-
-        // Update member_count in channel metadata
-        if let Some(data) = channel_data {
-            if let Ok(mut meta) = serde_json::from_slice::<serde_json::Value>(&data) {
-                let count = meta.get("member_count").and_then(|v| v.as_u64()).unwrap_or(0);
-                meta["member_count"] = serde_json::json!(count + 1);
-                if let Ok(bytes) = serde_json::to_vec(&meta) {
-                    let _ = self.storage.put_cf(schema::cf::CHANNELS, &channel_key, &bytes);
-                }
-            }
-        }
-
-        Ok(true)
-    }
-
-    /// Raise a PRIVATE channel's key-epoch FLOOR after a member is removed (P2d
-    /// rotation). The floor is the lowest epoch a client may encrypt under; it is set
-    /// to `max(existing_floor, current_max_epoch + 1)` so every key the removed
-    /// member held (epochs ≤ current_max) falls below it. Clients then re-key to ≥
-    /// floor and refuse to send under a below-floor (compromised) epoch — the node
-    /// can't generate keys itself (E2E), so it only publishes the floor; rotation is
-    /// client-driven. Monotonic + idempotent: runs on every ingest path (API/gossip/
-    /// reconcile) and converges. No-op for public/read-public channels (not encrypted).
-    fn raise_channel_key_epoch_floor(&self, channel_id: u64) -> Result<()> {
-        let channel_key = channel_id.to_be_bytes();
-        let Some(data) = self.storage.get_cf(schema::cf::CHANNELS, &channel_key)? else {
-            return Ok(());
-        };
-        let Ok(mut meta) = serde_json::from_slice::<serde_json::Value>(&data) else {
-            return Ok(());
-        };
-        // Only private channels (channel_type == 2) rotate.
-        let ctype = meta.get("channel_type").and_then(|v| v.as_u64()).unwrap_or(0);
-        if ctype != 2 {
-            return Ok(());
-        }
-        let scope = crate::crypto::compute_channel_scope(channel_id);
-        let max_epoch = self.storage.max_channel_key_epoch(&scope)?;
-        let cur_floor = meta.get("key_epoch_floor").and_then(|v| v.as_u64()).unwrap_or(0);
-        let new_floor = cur_floor.max(max_epoch.saturating_add(1));
-        if new_floor != cur_floor {
-            if let Some(obj) = meta.as_object_mut() {
-                obj.insert("key_epoch_floor".into(), serde_json::json!(new_floor));
-                if let Ok(bytes) = serde_json::to_vec(&meta) {
-                    self.storage.put_cf(schema::cf::CHANNELS, &channel_key, &bytes)?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Remove a member from a channel. Updates member_count.
-    fn remove_channel_member(&self, channel_id: u64, address: &str) -> Result<()> {
-        let member_key = schema::encode_channel_member_key(channel_id, address);
-        self.storage.delete_cf(schema::cf::CHANNEL_MEMBERS, &member_key)?;
-
-        // Decrement member_count in channel metadata
-        let channel_key = channel_id.to_be_bytes();
-        if let Some(data) = self.storage.get_cf(schema::cf::CHANNELS, &channel_key)? {
-            if let Ok(mut meta) = serde_json::from_slice::<serde_json::Value>(&data) {
-                let count = meta.get("member_count").and_then(|v| v.as_u64()).unwrap_or(1);
-                meta["member_count"] = serde_json::json!(count.saturating_sub(1));
-                if let Ok(bytes) = serde_json::to_vec(&meta) {
-                    let _ = self.storage.put_cf(schema::cf::CHANNELS, &channel_key, &bytes);
-                }
-            }
-        }
-
-        Ok(())
-    }
+    // Audit final pre-mainnet W18: channel membership add/remove + the P2d
+    // key-epoch-floor raise used to live here as 3 separate unbatched,
+    // unlocked RMWs of the same `CHANNELS` row. Moved into
+    // `Storage::add_channel_member` / `Storage::remove_channel_member_and_
+    // raise_epoch_floor` (storage/rocks.rs) as one lock-guarded, batched
+    // operation each — see those doc comments for the failure scenario this
+    // closes (a crash between member-removal and floor-raise permanently
+    // defeated P2d forward secrecy for the removed member).
 
     /// Resolve a DM's `conversation_id` from its `target_id` (msg_id) by
     /// looking up the original `DirectMessage` envelope. Used by
@@ -2019,7 +1935,7 @@ impl MessageRouter {
                         .increment_stat(schema::state_keys::TOTAL_CHANNEL_MESSAGES)?;
 
                     // Auto-add author as channel member on first message
-                    let _ = self.add_channel_member(
+                    let _ = self.storage.add_channel_member(
                         payload.channel_id,
                         resolved_author,
                         envelope.timestamp,
@@ -2230,7 +2146,7 @@ impl MessageRouter {
                             .increment_stat(schema::state_keys::TOTAL_CHANNELS)?;
 
                         // Add creator as first member (increments member_count to 1)
-                        let _ = self.add_channel_member(
+                        let _ = self.storage.add_channel_member(
                             payload.channel_id,
                             resolved_author,
                             envelope.timestamp,
@@ -2258,7 +2174,7 @@ impl MessageRouter {
                     rmp_serde::from_slice::<ChannelJoinPayload>(&envelope.payload)
                 {
                     // Validates channel exists and is idempotent (skips if already member)
-                    let _ = self.add_channel_member(
+                    let _ = self.storage.add_channel_member(
                         payload.channel_id,
                         resolved_author,
                         envelope.timestamp,
@@ -2270,9 +2186,13 @@ impl MessageRouter {
                 if let Ok(payload) =
                     rmp_serde::from_slice::<ChannelLeavePayload>(&envelope.payload)
                 {
-                    self.remove_channel_member(payload.channel_id, resolved_author)?;
-                    // P2d: rotate — a leaver must not read messages sent after they go.
-                    self.raise_channel_key_epoch_floor(payload.channel_id)?;
+                    // Atomic (W18): member-removal + P2d epoch-floor raise in one
+                    // batched, lock-guarded write — a leaver must not read messages
+                    // sent after they go.
+                    self.storage.remove_channel_member_and_raise_epoch_floor(
+                        payload.channel_id,
+                        resolved_author,
+                    )?;
                 }
             }
             MessageType::ChannelDelete => {
@@ -2385,19 +2305,26 @@ impl MessageRouter {
                 if let Ok(payload) =
                     rmp_serde::from_slice::<ChannelKickPayload>(&envelope.payload)
                 {
-                    self.remove_channel_member(payload.channel_id, &payload.target_user)?;
-                    // P2d: rotate so the kicked member can't read future messages.
-                    self.raise_channel_key_epoch_floor(payload.channel_id)?;
+                    // Atomic (W18): member-removal + P2d epoch-floor raise (so the
+                    // kicked member can't read future messages) in one batched,
+                    // lock-guarded write.
+                    self.storage.remove_channel_member_and_raise_epoch_floor(
+                        payload.channel_id,
+                        &payload.target_user,
+                    )?;
                 }
             }
             MessageType::ChannelBan => {
                 if let Ok(payload) =
                     rmp_serde::from_slice::<ChannelBanPayload>(&envelope.payload)
                 {
-                    // Remove from members (updates member_count)
-                    self.remove_channel_member(payload.channel_id, &payload.target_user)?;
-                    // P2d: rotate so the banned member can't read future messages.
-                    self.raise_channel_key_epoch_floor(payload.channel_id)?;
+                    // Atomic (W18): member-removal (updates member_count) + P2d
+                    // epoch-floor raise (so the banned member can't read future
+                    // messages) in one batched, lock-guarded write.
+                    self.storage.remove_channel_member_and_raise_epoch_floor(
+                        payload.channel_id,
+                        &payload.target_user,
+                    )?;
 
                     // Add to bans
                     let ban_key = schema::encode_channel_ban_key(

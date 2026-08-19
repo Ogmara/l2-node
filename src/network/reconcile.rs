@@ -64,6 +64,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::messages::envelope::Envelope;
+use crate::messages::types::MessageType;
 use crate::storage::rocks::Storage;
 use crate::storage::schema;
 
@@ -459,12 +460,57 @@ pub fn build_response(
 }
 
 /// Gather a channel's L2 metadata + membership envelopes (P-3b) to ride along
-/// with the first reconcile page. ChannelCreate (0x10) / ChannelUpdate (0x11)
-/// — which carry display_name/logo_cid/description — sort before
-/// ChannelJoin/Leave in the `CHANNEL_META_MSGS` key (msg_type is the second
-/// key field), so the name/logo are always included even if a large membership
-/// list is truncated at the cap. Bounded; the requester re-validates each
+/// with the first reconcile page. Bounded; the requester re-validates each
 /// envelope through `process_synced_message`.
+///
+/// Audit final pre-mainnet W12: `CHANNEL_META_MSGS`'s key is `channel_id ++
+/// msg_type ++ ts ++ msg_id`, so `prefix_iter_cf` returns rows sorted by
+/// msg_type FIRST, timestamp second — NOT chronologically. The requester
+/// applies `ReconcileResponse::envelopes` in vector order (a plain `for`
+/// loop over `process_synced_message`), so serving order = replay order.
+/// Moderation discriminants don't sort chronologically (e.g. `ChannelBan`
+/// 0x17 < `ChannelUnban` 0x18), so a naive key-order serve could replay
+/// banned@t1, unbanned@t2, re-banned@t3 as Ban, Ban, Unban — converging to
+/// the WRONG final state (unbanned) on the requesting node.
+///
+/// Fix: a two-tier sort key `(tier, ts)`, computed directly from the KEY
+/// bytes (msg_type is `key[8]`, ts is `key[9..17]` — see
+/// `encode_channel_meta_key`) rather than decoding each envelope:
+/// - Tier 0: `ChannelCreate`/`ChannelUpdate` (0x10/0x11), always first,
+///   regardless of `ts`. Code Audit follow-up: a PURE timestamp sort would
+///   let a `ChannelJoin`/`ChannelLeave`/etc envelope with an
+///   (unvalidated on the sync path) earlier `ts` than the channel's own
+///   `ChannelCreate` replay BEFORE it — and `add_channel_member`/
+///   `remove_channel_member_and_raise_epoch_floor` are no-ops when the
+///   `CHANNELS` row doesn't exist yet, so that membership change would be
+///   silently and permanently lost (the envelope is deduped, never
+///   re-applied). Pinning Create/Update to tier 0 preserves the original
+///   key-order's implicit "channel exists before membership/moderation
+///   ops run" guarantee.
+/// - Tier 1: everything else (including Ban/Unban), sorted by `ts` — this
+///   is the actual W12 fix.
+///
+/// Reading straight from the key (rather than decoding the full `Envelope`)
+/// also avoids a full msgpack decode per row on this serving path, and
+/// avoids a behavior change where a row whose stored bytes fail to decode
+/// locally would otherwise be silently dropped instead of forwarded for the
+/// requester to validate — same as the pre-fix code.
+///
+/// Security Audit follow-up, accepted residual (not fixed here): the sort
+/// key `ts` is the ORIGINATING envelope's self-reported `timestamp`, which
+/// `process_synced_message` (the sync/backfill ingest path) does not
+/// subject to the live-gossip ±5-minute drift check — so an envelope that
+/// entered via backfill with an arbitrary far-future `timestamp` sorts last
+/// on every subsequent serve from this node, permanently "winning" tier-1
+/// convergence. Every type this actually affects is still independently
+/// permission-gated against the RECEIVING node's current state
+/// (`authorize_channel_action` re-checks live, not against replay order),
+/// so this is not a straightforward privilege-escalation path, and it is
+/// NOT a regression — raw key order already converged to the same
+/// worst-case final state for Ban/Unban before this fix. Left as a residual
+/// rather than in-session-fixed since closing it means adding drift
+/// validation to the sync ingest path generally, a broader change than this
+/// function.
 fn channel_meta_envelopes(storage: &Storage, channel_id: u64) -> Vec<Vec<u8>> {
     const CHANNEL_META_CAP: usize = 256;
     let prefix = channel_id.to_be_bytes();
@@ -476,19 +522,32 @@ fn channel_meta_envelopes(storage: &Storage, channel_id: u64) -> Vec<Vec<u8>> {
         Ok(r) => r,
         Err(_) => return Vec::new(),
     };
-    let mut out = Vec::new();
+    let mut out: Vec<((u8, u64), Vec<u8>)> = Vec::new();
     for (key, _) in rows {
         // key: channel_id:8 ++ msg_type:1 ++ ts:8 ++ msg_id:32 = 49 bytes.
         if key.len() != 8 + 1 + 8 + 32 {
             continue;
         }
+        let msg_type = key[8];
+        let tier = if msg_type == MessageType::ChannelCreate as u8
+            || msg_type == MessageType::ChannelUpdate as u8
+        {
+            0u8
+        } else {
+            1u8
+        };
+        let ts = u64::from_be_bytes(key[9..17].try_into().unwrap());
         let mut msg_id = [0u8; 32];
         msg_id.copy_from_slice(&key[17..49]);
-        if let Ok(Some(raw)) = storage.get_message(&msg_id) {
-            out.push(raw);
-        }
+        let Ok(Some(raw)) = storage.get_message(&msg_id) else {
+            continue;
+        };
+        out.push(((tier, ts), raw));
     }
-    out
+    // Stable sort: ties (identical tier+ts) keep the CF's own key-order
+    // (msg_type-then-msg_id) as a deterministic tiebreak.
+    out.sort_by_key(|(k, _)| *k);
+    out.into_iter().map(|(_, raw)| raw).collect()
 }
 
 /// Gather a channel's `ChatEdit`/`ChatDelete` envelopes (audit final
@@ -750,6 +809,107 @@ mod edit_delete_ride_along_tests {
         let resp = build_response(&s, &req, 500, 5_000);
         assert!(!resp.has_more);
         assert!(contains_type(&resp.envelopes, MessageType::ChatDelete));
+    }
+}
+
+#[cfg(test)]
+mod channel_meta_order_tests {
+    //! Audit final pre-mainnet W12: `CHANNEL_META_MSGS`'s key is
+    //! `channel_id ++ msg_type ++ ts ++ msg_id`, so a naive `prefix_iter_cf`
+    //! scan returns rows sorted by msg_type FIRST — `ChannelBan` (0x17)
+    //! always sorts before `ChannelUnban` (0x18) regardless of real
+    //! chronological order. `channel_meta_envelopes` must re-sort by the
+    //! envelope's real signed `timestamp` before returning, or a
+    //! backfilling node replays banned@t1, re-banned@t3, THEN unbanned@t2
+    //! (raw key order) instead of the true banned@t1, unbanned@t2,
+    //! re-banned@t3 — converging to the wrong final state (unbanned).
+    use super::*;
+    use crate::messages::envelope::Envelope;
+    use crate::messages::types::MessageType;
+    use crate::storage::rocks::Storage;
+    use tempfile::TempDir;
+
+    fn db() -> (Storage, TempDir) {
+        let dir = TempDir::new().unwrap();
+        (Storage::open(dir.path()).unwrap(), dir)
+    }
+
+    /// Index a bare envelope into `CHANNEL_META_MSGS` + `MESSAGES`, mirroring
+    /// `router.rs`'s P-3b indexing (payload content is irrelevant to this
+    /// ordering test — only `msg_type` and `timestamp` matter).
+    fn put_meta_envelope(s: &Storage, channel_id: u64, msg_type: MessageType, msg_id: [u8; 32], ts: u64) {
+        let env = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type,
+            msg_id,
+            author: "klv1author".to_string(),
+            timestamp: ts,
+            lamport_ts: 0,
+            payload: Vec::new(),
+            signature: vec![],
+            relay_path: vec![],
+        };
+        s.put_cf(
+            schema::cf::CHANNEL_META_MSGS,
+            &schema::encode_channel_meta_key(channel_id, msg_type as u8, ts, &msg_id),
+            &[],
+        )
+        .unwrap();
+        s.put_cf(schema::cf::MESSAGES, &msg_id, &rmp_serde::to_vec_named(&env).unwrap())
+            .unwrap();
+    }
+
+    fn msg_types_in_order(envelopes: &[Vec<u8>]) -> Vec<MessageType> {
+        envelopes
+            .iter()
+            .map(|e| rmp_serde::from_slice::<Envelope>(e).unwrap().msg_type)
+            .collect()
+    }
+
+    #[test]
+    fn moderation_envelopes_replay_in_chronological_not_key_order() {
+        let (s, _d) = db();
+        let channel_id = 42u64;
+        // banned@1000, unbanned@2000, re-banned@3000 — real chronological
+        // order. Raw CHANNEL_META_MSGS key order would instead group both
+        // Bans (0x17) before the Unban (0x18): Ban(1000), Ban(3000), Unban(2000).
+        put_meta_envelope(&s, channel_id, MessageType::ChannelBan, [1u8; 32], 1_000);
+        put_meta_envelope(&s, channel_id, MessageType::ChannelUnban, [2u8; 32], 2_000);
+        put_meta_envelope(&s, channel_id, MessageType::ChannelBan, [3u8; 32], 3_000);
+
+        let out = channel_meta_envelopes(&s, channel_id);
+        assert_eq!(
+            msg_types_in_order(&out),
+            vec![MessageType::ChannelBan, MessageType::ChannelUnban, MessageType::ChannelBan],
+            "must replay in real timestamp order (Ban,Unban,Ban → converges banned), \
+             not raw CHANNEL_META_MSGS key order (Ban,Ban,Unban → would converge unbanned)"
+        );
+    }
+
+    /// Code Audit follow-up: a PURE timestamp sort would let a `ChannelJoin`
+    /// with an earlier `ts` than the channel's own `ChannelCreate` (client
+    /// clock skew — the sync ingest path doesn't validate drift) replay
+    /// BEFORE the create. `add_channel_member` is a no-op when the
+    /// `CHANNELS` row doesn't exist yet, and the envelope is deduped, so
+    /// that membership would be lost forever. The two-tier sort must always
+    /// place `ChannelCreate` first regardless of its timestamp.
+    #[test]
+    fn channel_create_always_sorts_first_even_with_a_later_timestamp() {
+        let (s, _d) = db();
+        let channel_id = 43u64;
+        // Join has an EARLIER timestamp than Create (clock skew) — raw
+        // timestamp order alone would replay Join before Create.
+        put_meta_envelope(&s, channel_id, MessageType::ChannelJoin, [1u8; 32], 500);
+        put_meta_envelope(&s, channel_id, MessageType::ChannelCreate, [2u8; 32], 1_000);
+
+        let out = channel_meta_envelopes(&s, channel_id);
+        assert_eq!(
+            msg_types_in_order(&out),
+            vec![MessageType::ChannelCreate, MessageType::ChannelJoin],
+            "ChannelCreate must always replay first, regardless of timestamp — \
+             otherwise a skewed-clock Join can be permanently lost \
+             (add_channel_member no-ops when the channel doesn't exist yet)"
+        );
     }
 }
 

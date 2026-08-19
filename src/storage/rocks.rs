@@ -15,6 +15,61 @@ use super::schema::{cf, encode_wallet_device_key};
 /// Type alias for the multi-threaded RocksDB instance.
 pub type RocksDb = DBWithThreadMode<MultiThreaded>;
 
+/// Associative merge operator for `NODE_STATE`'s `stat_*`/`TOTAL_*` counter
+/// keys (audit final pre-mainnet W19b) — accumulates signed `i64` deltas
+/// (`+1`/`-1`, 8-byte big-endian) without any application-level lock,
+/// replacing the prior racy get-then-put on the hottest write path in the
+/// node (`store_message`, called for every message ingested).
+///
+/// RocksDB invokes this SAME callback for both "full merge" (an existing
+/// base value + operands → the value a `Get` returns) and "partial merge"
+/// (operands + operands → one combined operand, used internally during
+/// compaction) — the function cannot tell which case it's in from its
+/// arguments. This is why the accumulation below is UNCLAMPED: a per-call
+/// `saturating_sub`-at-zero (mirroring the old `decrement_stat`'s per-call
+/// behavior) would not be associative — RocksDB is free to combine operands
+/// in any order/grouping during compaction, and clamping mid-accumulation
+/// would silently produce a different final value depending on which
+/// grouping happened to run. Instead: sum unclamped as `i64` here, and clamp
+/// to zero only at READ time, in `Storage::get_stat`.
+///
+/// Code Audit follow-up: clamping only at read means an unmatched
+/// `decrement_stat` (a decrement with no corresponding earlier increment for
+/// that specific entity) is no longer self-correcting the way the old
+/// get-then-put was — the debt persists in storage and silently absorbs
+/// future genuine increments until enough of them pay it down, rather than
+/// the old behavior of clamping to 0 on that same write. The one call site
+/// this was concretely reachable from (`tombstone_channel` decrementing
+/// `TOTAL_CHANNELS` for a channel whose `CHANNELS` row it never actually
+/// counted, e.g. a backfilled `ChannelDelete` for a channel this node never
+/// locally created) is fixed at its call site (gated on
+/// `Storage::exists_cf(cf::CHANNELS, ...)` before decrementing) rather than
+/// here — any FUTURE decrement call site must observe the same discipline
+/// (only decrement what it can show was actually counted).
+///
+/// Security Audit follow-up, operational note: once any key in `NODE_STATE`
+/// has merge operands recorded, downgrading to a build that predates this
+/// merge-operator registration will fail `Get`/compaction on that key —
+/// this is effectively a one-way schema change, not just a code change.
+/// Treat it as a hard-cutover deploy (same class as prior PROTOCOL_VERSION
+/// bumps), not a droppable-in-place patch.
+fn stat_counter_merge(
+    _key: &[u8],
+    existing: Option<&[u8]>,
+    operands: &rocksdb::MergeOperands,
+) -> Option<Vec<u8>> {
+    let mut total: i64 = existing
+        .and_then(|b| <[u8; 8]>::try_from(b).ok())
+        .map(i64::from_be_bytes)
+        .unwrap_or(0);
+    for op in operands {
+        if let Ok(d) = <[u8; 8]>::try_from(op) {
+            total = total.saturating_add(i64::from_be_bytes(d));
+        }
+    }
+    Some(total.to_be_bytes().to_vec())
+}
+
 /// Outcome of a first-write-wins channel-key-envelope store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyEnvelopeStore {
@@ -82,6 +137,44 @@ pub struct Storage {
     /// own clone), so this must be an `Arc` to actually serialize across
     /// them, not a per-clone lock.
     pending_channel_delete_lock: Arc<std::sync::Mutex<()>>,
+    /// Serializes `add_channel_member`/`remove_channel_member_and_raise_epoch_floor`
+    /// (audit final pre-mainnet W18) — both read-modify-write the SAME
+    /// `CHANNELS` row (`member_count`, and for private channels
+    /// `key_epoch_floor`). One global (not per-channel) lock, same
+    /// tolerance already accepted for `dm_recipient_cap_lock` (a
+    /// `MessageRouter` field, `messages/router.rs`), which gates a far
+    /// hotter path (every `DirectMessage`) than channel
+    /// join/leave/kick/ban ever will. `Arc` for the same cross-clone reason
+    /// as `pending_channel_delete_lock`.
+    channel_membership_lock: Arc<std::sync::Mutex<()>>,
+    /// Serializes `put_channel_key_envelope_fww` (audit final pre-mainnet
+    /// W19a) — without this, two concurrent publishers for the same
+    /// `(key_scope, target, author, device, epoch)` can both pass the
+    /// existence check and both `put_cf`, with the LAST write physically
+    /// winning — violating the documented first-write-wins guarantee that
+    /// exists specifically to stop a hostile publisher from clobbering a
+    /// victim's already-published wrapped key.
+    ///
+    /// Security Audit follow-up, accepted tradeoff (not fixed here): the
+    /// guarded body includes a bounded (`MAX_CHANNEL_KEY_ENVELOPES_PER_
+    /// SCOPE` = 4096) `prefix_iter_cf` scope scan, now serialized
+    /// node-wide instead of running concurrently, and `ChannelKeyEnvelope`
+    /// skips per-wallet rate limiting on the sync/backfill ingest path
+    /// (`is_sync`, `router.rs`) same as every other type. A peer flooding
+    /// key envelopes during reconcile could contend this lock more than
+    /// before. Judged acceptable given W19a's actual exploit (silent key
+    /// clobber) is worse than a throughput/contention concern, and the
+    /// underlying scan cost is pre-existing (not introduced by this lock) —
+    /// candidate for per-`key_scope` striping if contention shows up in
+    /// practice, same class of note as W10's per-IP-limiting deferral.
+    channel_key_envelope_lock: Arc<std::sync::Mutex<()>>,
+    /// Serializes `follow`/`unfollow`/`toggle_news_reaction`/
+    /// `toggle_chat_reaction`/`add_repost` (audit final pre-mainnet W19b) —
+    /// each is an idempotency-checked (exists-then-count-then-write) RMW;
+    /// grouped under one lock since all five share the identical shape and
+    /// are low-frequency relative to message sends (drift-only if raced,
+    /// not a security bypass — contrast `channel_key_envelope_lock` above).
+    social_counters_lock: Arc<std::sync::Mutex<()>>,
 }
 
 impl Storage {
@@ -155,6 +248,14 @@ impl Storage {
                     // klv1 bech32 addresses with 32-byte Ed25519 keys are 62 characters
                     cf_opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(62));
                 }
+                if *name == cf::NODE_STATE {
+                    // Audit final pre-mainnet W19b: lock-free counter accumulation
+                    // for the `stat_*`/`TOTAL_*` keys (see `stat_counter_merge`'s
+                    // doc comment). Only invoked for keys actually written via
+                    // `merge_cf`; every other NODE_STATE key (chain cursor,
+                    // migration sentinels, etc.) is unaffected, still a plain put/get.
+                    cf_opts.set_merge_operator_associative("stat_counter_merge", stat_counter_merge);
+                }
                 ColumnFamilyDescriptor::new(*name, cf_opts)
             })
             .collect();
@@ -165,6 +266,9 @@ impl Storage {
         Ok(Self {
             db: Arc::new(db),
             pending_channel_delete_lock: Arc::new(std::sync::Mutex::new(())),
+            channel_membership_lock: Arc::new(std::sync::Mutex::new(())),
+            channel_key_envelope_lock: Arc::new(std::sync::Mutex::new(())),
+            social_counters_lock: Arc::new(std::sync::Mutex::new(())),
         })
     }
 
@@ -206,6 +310,19 @@ impl Storage {
         Ok(self.get_cf(cf_name, key)?.is_some())
     }
 
+    /// Apply a RocksDB `merge` to a column family (see `stat_counter_merge` —
+    /// currently only registered on `NODE_STATE`, for lock-free counter
+    /// accumulation; audit final pre-mainnet W19b).
+    pub fn merge_cf(&self, cf_name: &str, key: &[u8], value: &[u8]) -> Result<()> {
+        let cf = self
+            .db
+            .cf_handle(cf_name)
+            .with_context(|| format!("column family '{}' not found", cf_name))?;
+        self.db
+            .merge_cf(&cf, key, value)
+            .with_context(|| format!("merging into cf '{}'", cf_name))
+    }
+
     /// Execute a write batch atomically across multiple column families.
     pub fn write_batch(&self, batch: WriteBatch) -> Result<()> {
         self.db
@@ -229,8 +346,24 @@ impl Storage {
     /// `channel_deleted` WS event to everyone who was a member — it can't
     /// derive that itself after the fact, since by the time it processes the
     /// envelope, `CHANNEL_MEMBERS` has already been emptied by this function.
+    ///
+    /// Code Audit follow-up (W18 adjacency): the idempotency-check-through-
+    /// `CHANNELS`-delete section runs under `channel_membership_lock` — the
+    /// SAME lock `add_channel_member`/`remove_channel_member_and_raise_epoch_
+    /// floor` take — so a membership op whose read of the `CHANNELS` row
+    /// lands before this delete can no longer write its updated row back
+    /// AFTER this delete, which would otherwise silently resurrect a
+    /// just-deleted channel. The guard is dropped explicitly right after
+    /// that section — the bulk cleanup below (up to 5×10,000 rows) is
+    /// best-effort/safe-if-partial and has no resurrection risk on its own,
+    /// so it deliberately does NOT hold this node-wide lock for its
+    /// duration.
     pub fn tombstone_channel(&self, channel_id: u64, deleted_at: u64) -> Result<()> {
         let channel_key = channel_id.to_be_bytes();
+        let _guard = self
+            .channel_membership_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         // Idempotency: a channel already tombstoned is a pure no-op — must NOT
         // rewrite the tombstone value. It carries the member list captured at
@@ -243,6 +376,18 @@ impl Storage {
         if self.exists_cf(cf::DELETED_CHANNELS, &channel_key)? {
             return Ok(());
         }
+
+        // Code Audit follow-up: only a channel this node actually counted
+        // (i.e. had a `CHANNELS` row) should decrement `TOTAL_CHANNELS`
+        // below — e.g. a `ChannelDelete` backfilled/gossiped for a channel
+        // whose `ChannelCreate` this node never saw was never incremented,
+        // and decrementing it anyway would drive the counter into permanent
+        // negative debt (the new merge-operator counter, audit W19b,
+        // accumulates deltas rather than clamping at write time the way the
+        // old get-then-put did, so an unmatched decrement here no longer
+        // self-corrects on the next write — it silently eats future genuine
+        // increments until enough of them pay the debt down).
+        let channel_existed = self.exists_cf(cf::CHANNELS, &channel_key)?;
 
         // Capture BEFORE the cleanup loop below wipes CHANNEL_MEMBERS. Best-effort:
         // an empty/failed capture just means the delete notification has no
@@ -276,6 +421,7 @@ impl Storage {
         batch.delete_cf(&channels_cf, channel_key);
         self.write_batch(batch)
             .context("writing channel deletion batch")?;
+        drop(_guard);
 
         // Bulk cleanup — the tombstone already prevents resurrection, so a partial
         // failure here is safe (the leftover rows are unreachable once CHANNELS is gone).
@@ -301,8 +447,10 @@ impl Storage {
             }
         }
 
-        if let Err(e) = self.decrement_stat(crate::storage::schema::state_keys::TOTAL_CHANNELS) {
-            tracing::warn!(channel_id, error = %e, "Failed to decrement TOTAL_CHANNELS");
+        if channel_existed {
+            if let Err(e) = self.decrement_stat(crate::storage::schema::state_keys::TOTAL_CHANNELS) {
+                tracing::warn!(channel_id, error = %e, "Failed to decrement TOTAL_CHANNELS");
+            }
         }
         Ok(())
     }
@@ -345,7 +493,16 @@ impl Storage {
             "requested_at": requested_at,
         }))
         .context("serializing pending channel delete claim")?;
-        let _guard = self.pending_channel_delete_lock.lock().unwrap();
+        // Code Audit / Security Audit follow-up (both independently flagged
+        // this): the 3 newer locks (channel_membership_lock etc, audit
+        // W12/W18/W19) all use `unwrap_or_else(|p| p.into_inner())` so one
+        // panic while holding a lock can't permanently poison it and brick
+        // every future caller node-wide. Aligning this pre-existing lock to
+        // the same idiom for consistency.
+        let _guard = self
+            .pending_channel_delete_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.put_cf(
             cf::PENDING_CHANNEL_DELETES,
             &channel_id.to_be_bytes(),
@@ -360,7 +517,16 @@ impl Storage {
     /// Serialized against `put_pending_channel_delete` — see that method's doc comment.
     pub fn take_pending_channel_delete(&self, channel_id: u64) -> Result<Option<(String, u64)>> {
         let key = channel_id.to_be_bytes();
-        let _guard = self.pending_channel_delete_lock.lock().unwrap();
+        // Code Audit / Security Audit follow-up (both independently flagged
+        // this): the 3 newer locks (channel_membership_lock etc, audit
+        // W12/W18/W19) all use `unwrap_or_else(|p| p.into_inner())` so one
+        // panic while holding a lock can't permanently poison it and brick
+        // every future caller node-wide. Aligning this pre-existing lock to
+        // the same idiom for consistency.
+        let _guard = self
+            .pending_channel_delete_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let claim = match self.get_cf(cf::PENDING_CHANNEL_DELETES, &key)? {
             Some(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)
                 .ok()
@@ -396,6 +562,162 @@ impl Storage {
             }
         }
         Ok(max)
+    }
+
+    /// Add a member to a channel, atomically updating `member_count`.
+    ///
+    /// Audit final pre-mainnet W18: previously this was two separate
+    /// unbatched, unlocked reads/writes of the `CHANNELS` row (once by the
+    /// caller to check the channel exists, once here to bump
+    /// `member_count`), letting concurrent membership changes on the same
+    /// channel race and drop/duplicate a `member_count` update. Now: one
+    /// `channel_membership_lock`-guarded critical section, one `WriteBatch`
+    /// covering the member row and the updated `CHANNELS` row. Returns
+    /// `false` (no-op) if the channel doesn't exist or `address` is already
+    /// a member — same idempotent contract as before.
+    pub fn add_channel_member(
+        &self,
+        channel_id: u64,
+        address: &str,
+        timestamp: u64,
+        role: &str,
+    ) -> Result<bool> {
+        let _guard = self
+            .channel_membership_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let channel_key = channel_id.to_be_bytes();
+        let Some(channel_data) = self.get_cf(cf::CHANNELS, &channel_key)? else {
+            return Ok(false); // channel doesn't exist
+        };
+        let member_key = super::schema::encode_channel_member_key(channel_id, address);
+        if self.exists_cf(cf::CHANNEL_MEMBERS, &member_key)? {
+            return Ok(false); // already a member
+        }
+
+        let record = serde_json::json!({
+            "joined_at": timestamp,
+            "role": role,
+        });
+        let record_bytes = serde_json::to_vec(&record).context("serializing member record")?;
+
+        let members_cf = self.cf_handle(cf::CHANNEL_MEMBERS)?;
+        let channels_cf = self.cf_handle(cf::CHANNELS)?;
+        let mut batch = WriteBatch::default();
+        batch.put_cf(&members_cf, &member_key, &record_bytes);
+        if let Ok(mut meta) = serde_json::from_slice::<serde_json::Value>(&channel_data) {
+            // Code Audit follow-up: `meta["member_count"] = ...` (`IndexMut`)
+            // PANICS if `meta` decoded as valid-but-non-object JSON (the chain
+            // scanner has its own defensive check for exactly this shape —
+            // `scanner.rs`'s "CHANNELS record is not a JSON object" branch —
+            // so it's a real, if rare, stored state). `as_object_mut()` is a
+            // safe no-op instead of a panic; `saturating_add` avoids a
+            // debug-build overflow panic on the count itself.
+            if let Some(obj) = meta.as_object_mut() {
+                let count = obj.get("member_count").and_then(|v| v.as_u64()).unwrap_or(0);
+                obj.insert("member_count".into(), serde_json::json!(count.saturating_add(1)));
+            }
+            if let Ok(bytes) = serde_json::to_vec(&meta) {
+                batch.put_cf(&channels_cf, channel_key, bytes);
+            }
+        }
+        self.write_batch(batch)?;
+        Ok(true)
+    }
+
+    /// Remove a member from a channel and — for private channels — raise the
+    /// P2d key-epoch floor, atomically.
+    ///
+    /// Audit final pre-mainnet W18: previously `remove_channel_member` (member
+    /// delete + `member_count` decrement) and `raise_channel_key_epoch_floor`
+    /// (a THIRD independent read-modify-write of the same `CHANNELS` row) were
+    /// separate, unbatched, unlocked operations. A crash between them left a
+    /// removed member's old epoch keys valid forever (defeats P2d forward
+    /// secrecy for that member) since the envelope that triggered the removal
+    /// is already stored/deduped and never re-runs. Concurrent `CHANNELS`
+    /// writers could also race the JSON RMW into member_count drift or a lost
+    /// floor raise. Now: one `channel_membership_lock`-guarded critical
+    /// section (the SAME lock as `add_channel_member`, since both mutate
+    /// `member_count` on possibly the same channel) computes the decremented
+    /// `member_count` AND (if `channel_type == 2`) the new `key_epoch_floor`
+    /// together, and writes both plus the member-row delete in one
+    /// `WriteBatch`.
+    ///
+    /// **Known pre-existing gap, NOT closed by W18, flagged independently by
+    /// both the Code Audit and Security Audit passes on this fix**: if the
+    /// `CHANNELS` row doesn't exist locally yet (e.g. a `ChannelLeave`
+    /// reaching a node via gossip/reconcile before its `ChannelCreate` —
+    /// `ChannelLeave` has no `authorize_channel_action` gate requiring the
+    /// channel to exist, unlike Kick/Ban), the member-delete still runs (a
+    /// safe no-op if the row was never present either) but the floor raise
+    /// is silently skipped — identical to the pre-W18 code's own
+    /// `raise_channel_key_epoch_floor` early return on a missing row. W18
+    /// only fixed the ordering/atomicity BETWEEN the two writes, not this
+    /// separate "target unknown" case. Unlike `ChannelDelete`-before-
+    /// `ChannelCreate` (W14, which persists a `PENDING_CHANNEL_DELETES`
+    /// claim consumed once the channel becomes known), there is no
+    /// equivalent pending-claim mechanism here — the floor raise is lost
+    /// forever once this envelope dedupes. Left as a documented residual
+    /// for a future finding rather than an in-session redesign, since
+    /// closing it properly means replicating W14's full pending-claim shape
+    /// for a second envelope class.
+    pub fn remove_channel_member_and_raise_epoch_floor(
+        &self,
+        channel_id: u64,
+        address: &str,
+    ) -> Result<()> {
+        let _guard = self
+            .channel_membership_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let channel_key = channel_id.to_be_bytes();
+        let member_key = super::schema::encode_channel_member_key(channel_id, address);
+        let members_cf = self.cf_handle(cf::CHANNEL_MEMBERS)?;
+        let channels_cf = self.cf_handle(cf::CHANNELS)?;
+        // Code Audit follow-up: check BEFORE staging the delete — the old
+        // pre-W18 code decremented `member_count` unconditionally on every
+        // call, including for a `Kick`/`Ban`/`Leave` whose target was never
+        // actually a local member (e.g. reconciled out of order, or a
+        // duplicate removal) — permanent undercount drift. Only decrement
+        // when there was really a row to remove; the delete_cf below is a
+        // safe no-op either way.
+        let was_member = self.exists_cf(cf::CHANNEL_MEMBERS, &member_key)?;
+        let mut batch = WriteBatch::default();
+        batch.delete_cf(&members_cf, &member_key);
+
+        if let Some(data) = self.get_cf(cf::CHANNELS, &channel_key)? {
+            if let Ok(mut meta) = serde_json::from_slice::<serde_json::Value>(&data) {
+                // Code Audit follow-up: `as_object_mut()` guard, same
+                // panic-safety rationale as `add_channel_member` above.
+                if was_member {
+                    if let Some(obj) = meta.as_object_mut() {
+                        let count = obj.get("member_count").and_then(|v| v.as_u64()).unwrap_or(0);
+                        obj.insert("member_count".into(), serde_json::json!(count.saturating_sub(1)));
+                    }
+                }
+
+                // Only private channels (channel_type == 2) rotate.
+                let ctype = meta.get("channel_type").and_then(|v| v.as_u64()).unwrap_or(0);
+                if ctype == 2 {
+                    let scope = crate::crypto::compute_channel_scope(channel_id);
+                    let max_epoch = self.max_channel_key_epoch(&scope)?;
+                    let cur_floor = meta.get("key_epoch_floor").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let new_floor = cur_floor.max(max_epoch.saturating_add(1));
+                    if new_floor != cur_floor {
+                        if let Some(obj) = meta.as_object_mut() {
+                            obj.insert("key_epoch_floor".into(), serde_json::json!(new_floor));
+                        }
+                    }
+                }
+
+                if let Ok(bytes) = serde_json::to_vec(&meta) {
+                    batch.put_cf(&channels_cf, channel_key, bytes);
+                }
+            }
+        }
+        self.write_batch(batch)
     }
 
     /// Get a column family handle for use in WriteBatch operations.
@@ -597,6 +919,13 @@ impl Storage {
     ///
     /// Uses a WriteBatch to ensure the message and its counter update are
     /// written together, preventing counter drift on partial failure.
+    ///
+    /// Audit final pre-mainnet W19b: the counter update is a RocksDB `merge`
+    /// (see `stat_counter_merge`), not a get-then-put — this both closes the
+    /// prior TOCTOU (concurrent `store_message` calls used to race the same
+    /// read-modified-write of `TOTAL_MESSAGES`, causing permanent drift under
+    /// concurrency) and removes a synchronous read from the hottest write
+    /// path in the node.
     pub fn store_message(
         &self,
         msg_id: &[u8; 32],
@@ -604,11 +933,14 @@ impl Storage {
     ) -> Result<()> {
         let messages_cf = self.cf_handle(cf::MESSAGES)?;
         let state_cf = self.cf_handle(cf::NODE_STATE)?;
-        let new_count = self.get_stat(super::schema::state_keys::TOTAL_MESSAGES)? + 1;
 
         let mut batch = WriteBatch::default();
         batch.put_cf(&messages_cf, msg_id, envelope_bytes);
-        batch.put_cf(&state_cf, super::schema::state_keys::TOTAL_MESSAGES, &new_count.to_be_bytes());
+        batch.merge_cf(
+            &state_cf,
+            super::schema::state_keys::TOTAL_MESSAGES,
+            1i64.to_be_bytes(),
+        );
         self.write_batch(batch)
     }
 
@@ -723,7 +1055,16 @@ impl Storage {
     // --- Social graph (follows) ---
 
     /// Record a follow relationship and update counts atomically via WriteBatch.
+    ///
+    /// Audit final pre-mainnet W19b: guarded by `social_counters_lock` — the
+    /// exists-check + count reads + batched write below are otherwise a TOCTOU
+    /// RMW (two concurrent `follow()` calls for the same edge could both pass
+    /// the exists-check and both compute counts from the same stale read).
     pub fn follow(&self, follower: &str, followed: &str) -> Result<()> {
+        let _guard = self
+            .social_counters_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let follow_key = super::schema::encode_follow_key(follower, followed);
 
         // Check if already following (idempotent)
@@ -759,7 +1100,14 @@ impl Storage {
     }
 
     /// Remove a follow relationship and update counts atomically via WriteBatch.
+    ///
+    /// Audit final pre-mainnet W19b: guarded by `social_counters_lock`, same
+    /// TOCTOU rationale as `follow()` above.
     pub fn unfollow(&self, follower: &str, followed: &str) -> Result<()> {
+        let _guard = self
+            .social_counters_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let follow_key = super::schema::encode_follow_key(follower, followed);
 
         // Check if actually following (idempotent)
@@ -889,6 +1237,9 @@ impl Storage {
     // --- News Reactions ---
 
     /// Add or remove a reaction on a news post, updating cached counts atomically.
+    ///
+    /// Audit final pre-mainnet W19b: guarded by `social_counters_lock` — same
+    /// exists-then-count-then-write TOCTOU shape as `follow()`.
     pub fn toggle_news_reaction(
         &self,
         msg_id: &[u8; 32],
@@ -896,6 +1247,10 @@ impl Storage {
         author: &str,
         remove: bool,
     ) -> Result<()> {
+        let _guard = self
+            .social_counters_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         use super::schema;
         let reaction_key = schema::encode_news_reaction_key(msg_id, emoji, author);
         let count_key = schema::encode_reaction_count_key(msg_id, emoji);
@@ -974,12 +1329,19 @@ impl Storage {
     // --- Reposts ---
 
     /// Record a repost and update the count atomically.
+    ///
+    /// Audit final pre-mainnet W19b: guarded by `social_counters_lock` — same
+    /// exists-then-count-then-write TOCTOU shape as `follow()`.
     pub fn add_repost(
         &self,
         original_id: &[u8; 32],
         reposter: &str,
         repost_msg_id: &[u8; 32],
     ) -> Result<()> {
+        let _guard = self
+            .social_counters_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let key = super::schema::encode_repost_key(original_id, reposter);
         if self.exists_cf(cf::REPOSTS, &key)? {
             return Ok(()); // idempotent
@@ -1440,28 +1802,50 @@ impl Storage {
 
     // --- Network Stats Counters ---
 
-    /// Read a u64 stat counter from NODE_STATE.
+    /// Read a u64 stat counter (or any other 8-byte big-endian NODE_STATE
+    /// value) — clamped at zero.
+    ///
+    /// Audit final pre-mainnet W19b: the 5 `TOTAL_*` counter keys are now
+    /// written via RocksDB `merge` (signed `i64` deltas, see
+    /// `stat_counter_merge`), and `Get` transparently folds any pending
+    /// merge operands — no other caller needs to change. Every OTHER
+    /// NODE_STATE value this function reads (migration sentinels,
+    /// `CHAIN_CURSOR`, `LAST_ANCHOR_TS`, etc.) is still written via a plain
+    /// `put_cf` and is small/non-negative, so reinterpreting the stored
+    /// bytes as `i64` instead of `u64` is a no-op for them (identical bit
+    /// pattern, nowhere near `i64::MAX`).
     pub fn get_stat(&self, key: &[u8]) -> Result<u64> {
         match self.get_cf(cf::NODE_STATE, key)? {
             Some(bytes) if bytes.len() == 8 => {
-                Ok(u64::from_be_bytes(bytes.try_into().unwrap()))
+                let signed = i64::from_be_bytes(bytes.try_into().unwrap());
+                Ok(signed.max(0) as u64)
             }
             _ => Ok(0),
         }
     }
 
     /// Increment a u64 stat counter in NODE_STATE by 1.
-    pub fn increment_stat(&self, key: &[u8]) -> Result<u64> {
-        let new_val = self.get_stat(key)? + 1;
-        self.put_cf(cf::NODE_STATE, key, &new_val.to_be_bytes())?;
-        Ok(new_val)
+    ///
+    /// Audit final pre-mainnet W19b: was a plain get-then-put (racy TOCTOU
+    /// under concurrent callers — permanent drift). Now a RocksDB `merge`,
+    /// which RocksDB itself makes safe under arbitrary concurrency without
+    /// an application-level lock — this is called on every message store,
+    /// the hottest path in the node, where a coarse `Mutex` (the fix used
+    /// for every other RMW in this batch) would be a real throughput cost.
+    pub fn increment_stat(&self, key: &[u8]) -> Result<()> {
+        self.merge_cf(cf::NODE_STATE, key, &1i64.to_be_bytes())
     }
 
     /// Decrement a u64 stat counter, saturating at zero.
-    pub fn decrement_stat(&self, key: &[u8]) -> Result<u64> {
-        let new_val = self.get_stat(key)?.saturating_sub(1);
-        self.put_cf(cf::NODE_STATE, key, &new_val.to_be_bytes())?;
-        Ok(new_val)
+    ///
+    /// Note: the "saturating at zero" guarantee is now over the AGGREGATE
+    /// net total (across however many concurrent increments/decrements land
+    /// before the next read), not per individual call — a behavior change
+    /// only observable under the exact concurrent bursts that already
+    /// produced nondeterministic results under the old racy code, so this is
+    /// a strict improvement, not a regression.
+    pub fn decrement_stat(&self, key: &[u8]) -> Result<()> {
+        self.merge_cf(cf::NODE_STATE, key, &(-1i64).to_be_bytes())
     }
 
     // --- DM Recipient Message Counter (audit final pre-mainnet W11) ---
@@ -2397,7 +2781,8 @@ impl Storage {
     /// Add or remove a reaction on a channel chat message, updating cached counts atomically.
     ///
     /// Mirrors [`toggle_news_reaction`] but operates on the CHAT_REACTIONS
-    /// and CHAT_REACTION_COUNTS column families.
+    /// and CHAT_REACTION_COUNTS column families. Audit final pre-mainnet
+    /// W19b: guarded by `social_counters_lock`, same rationale.
     pub fn toggle_chat_reaction(
         &self,
         msg_id: &[u8; 32],
@@ -2405,6 +2790,10 @@ impl Storage {
         author: &str,
         remove: bool,
     ) -> Result<()> {
+        let _guard = self
+            .social_counters_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         use super::schema;
         let reaction_key = schema::encode_chat_reaction_key(msg_id, emoji, author);
         let count_key = schema::encode_chat_reaction_count_key(msg_id, emoji);
@@ -3134,6 +3523,15 @@ impl Storage {
     /// no-op. First-write-wins prevents a later (possibly hostile) publisher from
     /// clobbering a good key already cached for `(key_scope, epoch, target, device)`;
     /// the cap bounds storage per scope against a flood of bogus envelopes.
+    ///
+    /// Audit final pre-mainnet W19a: the whole body runs under
+    /// `channel_key_envelope_lock`. Without it, two concurrent publishers for
+    /// the same `(key_scope, target, author, device, epoch)` could both pass
+    /// the `exists_cf` check below and both reach the final `put_cf` — the
+    /// LAST write physically wins, silently violating the first-write-wins
+    /// guarantee this function exists to provide (an attacker racing a
+    /// victim's genuine key-envelope publish, observable via gossip, could
+    /// clobber the victim's wrapped key).
     pub fn put_channel_key_envelope_fww(
         &self,
         key_scope: &[u8; 32],
@@ -3144,6 +3542,10 @@ impl Storage {
         value: &[u8],
         scope_cap: usize,
     ) -> Result<KeyEnvelopeStore> {
+        let _guard = self
+            .channel_key_envelope_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         use super::schema;
         let key = schema::encode_channel_key(key_scope, target, author, device_id_hex, epoch);
         if self.exists_cf(cf::CHANNEL_KEYS, &key)? {
@@ -3171,7 +3573,18 @@ impl Storage {
             let lowest = existing.iter().min_by_key(|(k, _)| epoch_of(k));
             match lowest {
                 Some((lk, _)) if epoch_of(lk) < epoch => {
-                    self.delete_cf(cf::CHANNEL_KEYS, lk)?;
+                    // Security Audit follow-up: evict-then-store as one
+                    // WriteBatch, not two separate writes — under the new
+                    // lock this was already concurrency-safe, but a crash
+                    // between a bare `delete_cf` and a later `put_cf` would
+                    // have lost the evicted entry without ever storing its
+                    // replacement (worse than either write alone).
+                    let cf_handle = self.cf_handle(cf::CHANNEL_KEYS)?;
+                    let mut batch = WriteBatch::default();
+                    batch.delete_cf(&cf_handle, lk);
+                    batch.put_cf(&cf_handle, &key, value);
+                    self.write_batch(batch)?;
+                    return Ok(KeyEnvelopeStore::Stored);
                 }
                 _ => return Ok(KeyEnvelopeStore::ScopeFull),
             }
@@ -3444,6 +3857,72 @@ mod tombstone_channel_tests {
         let (s, _d) = db();
         assert_eq!(s.deleted_channel_members(999).unwrap(), Vec::<String>::new());
     }
+
+    /// Code Audit follow-up: `TOTAL_CHANNELS` must only be decremented for a
+    /// channel this node actually counted (had a `CHANNELS` row for) — e.g.
+    /// a `ChannelDelete` backfilled/gossiped for a channel whose
+    /// `ChannelCreate` this node never locally saw was never incremented.
+    /// Decrementing anyway would (with the new merge-operator counter,
+    /// audit W19b) drive `TOTAL_CHANNELS` into permanent negative debt that
+    /// silently eats future genuine increments, unlike the old
+    /// clamp-at-write `decrement_stat`.
+    #[test]
+    fn deleting_a_channel_never_locally_created_does_not_decrement_total_channels() {
+        let (s, _d) = db();
+        // A genuine, counted channel first, to prove the counter isn't just
+        // stuck at 0 for an unrelated reason.
+        s.increment_stat(crate::storage::schema::state_keys::TOTAL_CHANNELS).unwrap();
+        assert_eq!(s.get_stat(crate::storage::schema::state_keys::TOTAL_CHANNELS).unwrap(), 1);
+
+        // Tombstone a DIFFERENT channel_id that never had a CHANNELS row —
+        // e.g. a ChannelDelete this node backfilled without ever seeing the
+        // matching ChannelCreate.
+        let never_created_channel_id = 9999u64;
+        assert!(s.get_cf(cf::CHANNELS, &never_created_channel_id.to_be_bytes()).unwrap().is_none());
+        s.tombstone_channel(never_created_channel_id, 1_000).unwrap();
+
+        assert_eq!(
+            s.get_stat(crate::storage::schema::state_keys::TOTAL_CHANNELS).unwrap(),
+            1,
+            "TOTAL_CHANNELS must be unaffected by tombstoning a channel that was never counted"
+        );
+    }
+
+    /// Code Audit follow-up (W18 adjacency): `tombstone_channel` now shares
+    /// `channel_membership_lock` with `add_channel_member`/
+    /// `remove_channel_member_and_raise_epoch_floor` — a membership op that
+    /// reads the CHANNELS row before a concurrent delete, then writes its
+    /// updated row after, would otherwise resurrect a just-deleted channel.
+    #[test]
+    fn concurrent_removal_never_resurrects_a_channel_being_tombstoned() {
+        let (s, _d) = db();
+        let s = std::sync::Arc::new(s);
+        let channel_id = 558u64;
+        s.put_cf(
+            cf::CHANNELS,
+            &channel_id.to_be_bytes(),
+            &serde_json::to_vec(&serde_json::json!({"member_count": 1, "channel_type": 0})).unwrap(),
+        )
+        .unwrap();
+        s.add_channel_member(channel_id, "klv1lastmember", 1_000, "member").unwrap();
+
+        std::thread::scope(|scope| {
+            let s1 = s.clone();
+            scope.spawn(move || {
+                s1.tombstone_channel(channel_id, 2_000).unwrap();
+            });
+            let s2 = s.clone();
+            scope.spawn(move || {
+                let _ = s2.remove_channel_member_and_raise_epoch_floor(channel_id, "klv1lastmember");
+            });
+        });
+
+        assert!(
+            s.get_cf(cf::CHANNELS, &channel_id.to_be_bytes()).unwrap().is_none(),
+            "CHANNELS row must stay deleted — a racing member-removal must never resurrect it"
+        );
+        assert!(s.deleted_channel_members(channel_id).unwrap().len() <= 1);
+    }
 }
 
 #[cfg(test)]
@@ -3534,6 +4013,276 @@ mod pending_channel_delete_lock_tests {
             total_observed <= total_puts,
             "can never observe more values than were ever written"
         );
+    }
+}
+
+#[cfg(test)]
+mod channel_membership_lock_tests {
+    //! Audit final pre-mainnet W18: `add_channel_member` and
+    //! `remove_channel_member_and_raise_epoch_floor` used to be 3 separate
+    //! unbatched, unlocked read-modify-writes of the same `CHANNELS` row
+    //! (member add, member remove, epoch-floor raise). A crash between
+    //! member-removal and the epoch-floor raise permanently defeated P2d
+    //! forward secrecy for the removed member; concurrent writers could also
+    //! race the JSON RMW into `member_count` drift. This drives heavy
+    //! concurrent join/leave churn on one channel and asserts the final
+    //! `member_count` matches the net effect exactly — any lost or
+    //! double-applied update would show up as drift.
+    use super::*;
+    use tempfile::TempDir;
+
+    fn db() -> (Storage, TempDir) {
+        let dir = TempDir::new().unwrap();
+        (Storage::open(dir.path()).unwrap(), dir)
+    }
+
+    fn member_count(s: &Storage, channel_id: u64) -> u64 {
+        let data = s.get_cf(cf::CHANNELS, &channel_id.to_be_bytes()).unwrap().unwrap();
+        let meta: serde_json::Value = serde_json::from_slice(&data).unwrap();
+        meta.get("member_count").and_then(|v| v.as_u64()).unwrap_or(0)
+    }
+
+    #[test]
+    fn concurrent_joins_and_leaves_never_drift_member_count() {
+        let (s, _d) = db();
+        let channel_id = 555u64;
+        s.put_cf(
+            cf::CHANNELS,
+            &channel_id.to_be_bytes(),
+            &serde_json::to_vec(&serde_json::json!({"member_count": 0, "channel_type": 0})).unwrap(),
+        )
+        .unwrap();
+
+        const MEMBERS: u64 = 40;
+        // Every thread joins its own unique address, then immediately leaves
+        // — net effect on `member_count` must be exactly 0, regardless of
+        // how many threads interleave their add/remove critical sections.
+        std::thread::scope(|scope| {
+            for i in 0..MEMBERS {
+                let s = &s;
+                scope.spawn(move || {
+                    let addr = format!("klv1member{i}");
+                    let added = s.add_channel_member(channel_id, &addr, 1_000, "member").unwrap();
+                    assert!(added, "each unique address must successfully join exactly once");
+                    s.remove_channel_member_and_raise_epoch_floor(channel_id, &addr).unwrap();
+                });
+            }
+        });
+
+        assert_eq!(
+            member_count(&s, channel_id),
+            0,
+            "member_count must net back to 0 — any drift means a concurrent \
+             add/remove pair raced the CHANNELS row RMW"
+        );
+    }
+
+    /// Private channels (channel_type == 2) must have their key-epoch floor
+    /// raised on every removal, even under heavy concurrent churn on
+    /// DIFFERENT members of the same channel — the floor write must never be
+    /// silently lost to a racing `member_count` update on the same row.
+    #[test]
+    fn concurrent_removals_on_private_channel_always_leave_a_floor_raised() {
+        let (s, _d) = db();
+        let channel_id = 556u64;
+        s.put_cf(
+            cf::CHANNELS,
+            &channel_id.to_be_bytes(),
+            &serde_json::to_vec(&serde_json::json!({"member_count": 0, "channel_type": 2})).unwrap(),
+        )
+        .unwrap();
+
+        const MEMBERS: u64 = 20;
+        for i in 0..MEMBERS {
+            s.add_channel_member(channel_id, &format!("klv1priv{i}"), 1_000, "member").unwrap();
+        }
+        assert_eq!(member_count(&s, channel_id), MEMBERS);
+
+        std::thread::scope(|scope| {
+            for i in 0..MEMBERS {
+                let s = &s;
+                scope.spawn(move || {
+                    s.remove_channel_member_and_raise_epoch_floor(channel_id, &format!("klv1priv{i}"))
+                        .unwrap();
+                });
+            }
+        });
+
+        assert_eq!(member_count(&s, channel_id), 0, "all members removed");
+        // No CHANNEL_KEYS envelopes exist for this scope, so max_channel_key_epoch
+        // is 0 and the floor should have been raised to 1 (max_epoch + 1) by
+        // the first removal to observe an unraised floor — and never reset by
+        // a later racing removal, since `new_floor` is monotonic (`cur.max(...)`).
+        let data = s.get_cf(cf::CHANNELS, &channel_id.to_be_bytes()).unwrap().unwrap();
+        let meta: serde_json::Value = serde_json::from_slice(&data).unwrap();
+        let floor = meta.get("key_epoch_floor").and_then(|v| v.as_u64()).unwrap_or(0);
+        assert_eq!(floor, 1, "key_epoch_floor must be raised, not lost, under concurrent removals");
+    }
+
+    /// Code Audit follow-up: removing a wallet that was never actually a
+    /// local member (e.g. a `ChannelKick`/`ChannelBan`/`ChannelLeave`
+    /// reconciled for a wallet whose `ChannelJoin` this node never
+    /// received) must NOT decrement `member_count` — the pre-W18 code did
+    /// this unconditionally and this rewrite must not resurrect that bug.
+    #[test]
+    fn removing_a_non_member_does_not_decrement_member_count() {
+        let (s, _d) = db();
+        let channel_id = 557u64;
+        s.put_cf(
+            cf::CHANNELS,
+            &channel_id.to_be_bytes(),
+            &serde_json::to_vec(&serde_json::json!({"member_count": 3, "channel_type": 0})).unwrap(),
+        )
+        .unwrap();
+
+        s.remove_channel_member_and_raise_epoch_floor(channel_id, "klv1never-a-member")
+            .unwrap();
+
+        assert_eq!(
+            member_count(&s, channel_id),
+            3,
+            "member_count must be unchanged — the removed address was never a member"
+        );
+    }
+}
+
+#[cfg(test)]
+mod channel_key_envelope_lock_tests {
+    //! Audit final pre-mainnet W19a: `put_channel_key_envelope_fww`'s
+    //! exists-check + put used to have no lock, so two concurrent publishers
+    //! for the SAME `(key_scope, target, author, device, epoch)` tuple could
+    //! both pass the exists-check and both write — the LAST write physically
+    //! wins, violating the documented first-write-wins guarantee (an
+    //! attacker racing a victim's genuine key-envelope publish could clobber
+    //! the victim's wrapped key). This proves the OUTCOME the lock
+    //! guarantees (exactly one `Stored`, all others `AlreadyPresent`) rather
+    //! than an external timing measurement — see
+    //! `pending_channel_delete_lock_tests` above for why an
+    //! outside-the-call probe can't prove mutual exclusion.
+    use super::*;
+    use tempfile::TempDir;
+
+    fn db() -> (Storage, TempDir) {
+        let dir = TempDir::new().unwrap();
+        (Storage::open(dir.path()).unwrap(), dir)
+    }
+
+    #[test]
+    fn concurrent_publishers_for_the_same_tuple_yield_exactly_one_stored() {
+        let (s, _d) = db();
+        let s = std::sync::Arc::new(s);
+        let key_scope = [7u8; 32];
+        const RACERS: usize = 24;
+        let stored_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        std::thread::scope(|scope| {
+            for i in 0..RACERS {
+                let s = s.clone();
+                let stored_count = stored_count.clone();
+                scope.spawn(move || {
+                    // Distinct VALUE per racer (so a wrong winner would be
+                    // detectable), identical scope/target/author/device/epoch
+                    // — the FWW identity tuple that must serialize.
+                    let value = format!("envelope-from-racer-{i}").into_bytes();
+                    let outcome = s
+                        .put_channel_key_envelope_fww(
+                            &key_scope, "target", "author", "device1", 1, &value, 100,
+                        )
+                        .unwrap();
+                    if outcome == KeyEnvelopeStore::Stored {
+                        stored_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+
+        assert_eq!(
+            stored_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "exactly one concurrent publisher must win Stored for the same \
+             (scope,target,author,device,epoch) — more than one means the \
+             FWW guarantee was violated (a later write clobbered an earlier one)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod stat_counter_merge_tests {
+    //! Audit final pre-mainnet W19b: `increment_stat`/`decrement_stat` used
+    //! to be a plain get-then-put — concurrent callers raced the same
+    //! read-modify-write, causing permanent counter drift. Now backed by a
+    //! RocksDB merge (`stat_counter_merge`), which accumulates deltas
+    //! without any application-level lock. This drives concurrent
+    //! increments AND decrements from many threads and asserts the final
+    //! `get_stat` value matches the exact net total — any drift would mean
+    //! the merge operator lost or double-applied an operand.
+    use super::*;
+    use tempfile::TempDir;
+
+    fn db() -> (Storage, TempDir) {
+        let dir = TempDir::new().unwrap();
+        (Storage::open(dir.path()).unwrap(), dir)
+    }
+
+    #[test]
+    fn concurrent_increments_and_decrements_match_exact_net_total() {
+        let (s, _d) = db();
+        let s = std::sync::Arc::new(s);
+        let key = super::super::schema::state_keys::TOTAL_MESSAGES;
+
+        const INCREMENTERS: u64 = 30;
+        const INCS_PER_THREAD: u64 = 50;
+        const DECREMENTERS: u64 = 10;
+        const DECS_PER_THREAD: u64 = 50;
+        let expected_net = INCREMENTERS * INCS_PER_THREAD - DECREMENTERS * DECS_PER_THREAD;
+
+        std::thread::scope(|scope| {
+            for _ in 0..INCREMENTERS {
+                let s = s.clone();
+                scope.spawn(move || {
+                    for _ in 0..INCS_PER_THREAD {
+                        s.increment_stat(key).unwrap();
+                    }
+                });
+            }
+            for _ in 0..DECREMENTERS {
+                let s = s.clone();
+                scope.spawn(move || {
+                    for _ in 0..DECS_PER_THREAD {
+                        s.decrement_stat(key).unwrap();
+                    }
+                });
+            }
+        });
+
+        assert_eq!(
+            s.get_stat(key).unwrap(),
+            expected_net,
+            "the merge operator must accumulate every concurrent delta exactly \
+             — any drift would mean an operand was lost or double-applied"
+        );
+    }
+
+    /// The merge function is invoked identically for full-merge (base +
+    /// operands) and partial-merge (operands + operands, used internally
+    /// during compaction) — this forces a real compaction between writes so
+    /// partial-merge actually runs, not just full-merge at read time.
+    #[test]
+    fn survives_compaction_between_merges() {
+        let (s, _d) = db();
+        let key = super::super::schema::state_keys::TOTAL_CHANNELS;
+        for _ in 0..25 {
+            s.increment_stat(key).unwrap();
+        }
+        s.decrement_stat(key).unwrap();
+        s.decrement_stat(key).unwrap();
+        // Force compaction so any pending merge operands are resolved via
+        // partial_merge / full_merge, not just read-time folding.
+        s.db.compact_range_cf::<&[u8], &[u8]>(&s.cf_handle(cf::NODE_STATE).unwrap(), None, None);
+        for _ in 0..5 {
+            s.increment_stat(key).unwrap();
+        }
+        assert_eq!(s.get_stat(key).unwrap(), 25 - 2 + 5);
     }
 }
 

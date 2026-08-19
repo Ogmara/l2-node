@@ -5,6 +5,117 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.107.0] - 2026-08-19
+
+### Fixed
+
+- **Moderation state could converge to the wrong final value on a backfilling
+  node — a truly-banned user could appear unbanned (final pre-mainnet audit
+  W12).** `CHANNEL_META_MSGS`'s key is `channel_id ++ msg_type ++ ts ++
+  msg_id`, so `prefix_iter_cf` returns rows sorted by msg_type FIRST,
+  timestamp second — NOT chronologically (`ChannelBan` 0x17 sorts before
+  `ChannelUnban` 0x18 regardless of real time). A node reconciling a
+  channel's history applies the served envelopes in vector order via
+  `process_synced_message`, so serve order = replay order: banned@t1,
+  unbanned@t2, re-banned@t3 could replay as Ban, Ban, Unban — converging to
+  UNBANNED. `channel_meta_envelopes` (reconcile.rs) now sorts the served
+  batch by a two-tier key computed straight from each row's `CHANNEL_META_MSGS`
+  key bytes (no envelope decode needed): `ChannelCreate`/`ChannelUpdate`
+  always first (preserving the pre-existing "channel exists before any
+  membership/moderation op tries to apply" guarantee, and the truncation-
+  survival property for name/logo under the existing 256-row cap), then
+  everything else by real timestamp — closing the actual convergence bug.
+- **Channel-membership removal and the P2d key-epoch-floor raise were 3
+  separate unbatched, unlocked writes to the same `CHANNELS` row — a crash
+  between them permanently defeated forward secrecy for the removed member
+  (final pre-mainnet audit W18).** The removed member's old epoch keys kept
+  decrypting future traffic, since the triggering envelope is already
+  stored/deduped and never re-runs; concurrent writers could also race the
+  JSON read-modify-write into `member_count` drift or a lost floor raise.
+  New `Storage::add_channel_member`/`Storage::remove_channel_member_and_
+  raise_epoch_floor` replace the 3 old `router.rs` methods: each is guarded
+  by a new `channel_membership_lock` and writes the member-row change plus
+  the updated `CHANNELS` row (member_count, and for private channels
+  key_epoch_floor) in ONE `WriteBatch`. `tombstone_channel` now takes the
+  same lock around its `CHANNELS`-row deletion, closing an adjacent
+  resurrection risk (a concurrent membership op that read the row before the
+  delete could otherwise write it back after).
+- **The channel-key-envelope first-write-wins store could be raced — an
+  attacker could clobber a victim's wrapped E2E key by racing the publish
+  (final pre-mainnet audit W19a, the highest-stakes finding in this
+  release).** `put_channel_key_envelope_fww`'s exists-check-then-`put_cf` had
+  no lock: two concurrent publishers for the same `(key_scope, target,
+  author, device, epoch)` could both pass the existence check, and the LAST
+  write physically won — silently violating the documented FWW guarantee.
+  The whole function body now runs under a new `channel_key_envelope_lock`;
+  its scope-full eviction path was also changed from a bare `delete_cf` then
+  `put_cf` to one `WriteBatch`, so a crash mid-eviction can no longer lose
+  the evicted entry without storing its replacement.
+- **Several social-graph counters and 5 pure additive node-wide stat
+  counters were racy read-modify-writes with no lock, causing count drift
+  under concurrency (final pre-mainnet audit W19b, prior N10).**
+  `follow`/`unfollow`/`toggle_news_reaction`/`toggle_chat_reaction`/
+  `add_repost` each gained a shared `social_counters_lock` (low-frequency,
+  drift-only if raced, unlike W19a). The 5 `TOTAL_*` counters in
+  `NODE_STATE` (messages/channel-messages/news-messages/users/channels) —
+  which gate every single message store, the hottest write path in the node
+  — switched from a racy get-then-put to a RocksDB merge operator
+  (`stat_counter_merge`, registered on the `NODE_STATE` CF), which
+  accumulates signed `i64` deltas without any application-level lock.
+  `get_stat` now clamps to zero at read time instead of at write time.
+- **Adjacent correctness fixes found by the post-build Code/Security Audit
+  pass on the above (all pre-existing, not introduced by this release, but
+  fixed while in the same code):** `remove_channel_member_and_raise_epoch_
+  floor` no longer decrements `member_count` for a wallet that was never
+  actually a local member (the pre-W18 code did this unconditionally);
+  `tombstone_channel` no longer decrements `TOTAL_CHANNELS` for a channel
+  this node never actually counted (e.g. one it only learned of via a
+  backfilled `ChannelDelete`) — with the new merge-operator counter this
+  would otherwise have driven `TOTAL_CHANNELS` into permanent negative debt
+  that silently ate future genuine increments, instead of self-correcting
+  the way the old clamp-at-write `decrement_stat` did; `add_channel_member`/
+  `remove_channel_member_and_raise_epoch_floor` no longer risk a panic via
+  `serde_json`'s `IndexMut` on a valid-but-non-object `CHANNELS` value (a
+  stored shape the chain scanner already defends against elsewhere);
+  `pending_channel_delete_lock` (audit W14) now uses the same poison-
+  tolerant `unwrap_or_else(|p| p.into_inner())` idiom as the 3 new locks
+  above, so one panic while holding it can no longer permanently brick
+  channel deletion node-wide.
+
+### Security
+
+- The W19a fix (first-write-wins channel-key-envelope clobber) is the
+  security-relevant item in this release — see above. All other W12/W18/W19
+  fixes are correctness/availability, not exploitable-by-design bypasses.
+- Accepted, documented tradeoffs (not fixed in this release): the sync
+  ingest path (`process_synced_message`) doesn't apply the live-gossip
+  ±5-minute drift check to backfilled envelopes, so an envelope with an
+  arbitrary far-future timestamp can permanently "win" the new W12
+  chronological sort — every affected type is still independently
+  permission-gated against the receiving node's CURRENT state, so this is
+  not a privilege-escalation path, and it is not a regression (raw key
+  order already converged to the same worst case for Ban/Unban).
+  `channel_key_envelope_lock`'s critical section includes a bounded
+  (≤4096-row) per-scope scan, now serialized node-wide instead of running
+  concurrently, on a path that skips per-wallet rate limiting during sync —
+  judged acceptable since the underlying scan cost predates this fix and
+  W19a's actual exploit (silent key clobber) is worse than the throughput
+  concern; candidate for per-`key_scope` striping if contention shows up in
+  practice. A separate, pre-existing gap (not part of this release, flagged
+  for a future finding): a removal/moderation envelope for a channel not yet
+  known locally still silently drops its epoch-floor raise forever (no
+  pending-claim mechanism like W14's `ChannelDelete`-before-`ChannelCreate`
+  fix) — this is the SAME behavior the pre-W18 code already had, not
+  something this release introduced.
+
+### Changed
+
+- Registering a RocksDB merge operator on `NODE_STATE` is a one-way schema
+  change for that CF: once merge operands exist, downgrading to a build that
+  predates this release will fail `Get`/compaction on the affected keys.
+  Treat this as a hard-cutover deploy, same as prior `PROTOCOL_VERSION`
+  bumps — not a droppable-in-place patch.
+
 ## [0.106.0] - 2026-08-19
 
 ### Fixed
