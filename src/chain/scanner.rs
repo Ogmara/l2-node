@@ -586,6 +586,22 @@ impl ChainScanner {
                         let _ = self.storage.put_cf(cf::CHANNEL_MEMBERS, &member_key, &member_bytes);
                     }
 
+                    // W14: this on-chain scan is the first time this channel_id's
+                    // creator has become known on this node — consume any pending
+                    // delete claim recorded (via a `ChannelDelete` envelope) while the
+                    // channel was still unknown here. Mirrors the identical check in
+                    // `messages::router::update_indexes`'s `ChannelCreate` handler,
+                    // which covers the other possible "creator becomes known first"
+                    // path (an L2 envelope beating the chain scanner to it).
+                    if let Ok(claim) = self.storage.take_pending_channel_delete(channel_id) {
+                        if crate::messages::router::channel_delete_claim_matches(
+                            claim.as_ref(),
+                            &creator,
+                        ) {
+                            self.storage.tombstone_channel(channel_id, timestamp)?;
+                        }
+                    }
+
                     // Notify network layer to subscribe to this channel's GossipSub
                     // topic — only for a genuinely NEW channel. A `ChannelCreated`
                     // event for an already-known channel can keep re-parsing on

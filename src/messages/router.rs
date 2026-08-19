@@ -39,6 +39,16 @@ struct RateLimitEntry {
     window_start: u64,
 }
 
+/// Result of checking whether `address` is the creator of `channel_id`, distinguishing
+/// "not the creator" from "the channel doesn't exist locally yet" (audit final
+/// pre-mainnet W14). See `channel_creator_check`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChannelCreatorCheck {
+    IsCreator,
+    NotCreator,
+    Unknown,
+}
+
 /// Rate limit categories with per-spec limits (spec Part 5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum RateCategory {
@@ -134,6 +144,16 @@ fn channel_encryption_defaults(payload: &ChannelCreatePayload) -> (bool, u8) {
         }
     };
     (enc, hist)
+}
+
+/// Whether a pending `ChannelDelete` claim (audit final pre-mainnet W14) should be
+/// honored against a channel that was just created with the given `creator`. Shared by
+/// both places a channel's creator becomes known for the first time
+/// (`update_indexes`'s `ChannelCreate` handler and the chain scanner's `ChannelCreated`
+/// handler) so the match logic has one definition and a direct unit test independent of
+/// either call site's storage I/O.
+pub(crate) fn channel_delete_claim_matches(claim: Option<&(String, u64)>, creator: &str) -> bool {
+    matches!(claim, Some((claimant, _)) if claimant == creator)
 }
 
 /// Max active encryption keys retained per wallet (protocol §2.4). Bounds the
@@ -1251,15 +1271,22 @@ impl MessageRouter {
                 }
                 Ok(())
             }
-            // Creator-only: deleting the channel
+            // Creator-only: deleting the channel. A channel this node has never seen
+            // locally (out-of-order gossip / chain-scan lag, audit final pre-mainnet
+            // W14) is deliberately let through here rather than rejected — creator
+            // identity can't be checked until the channel actually exists, so
+            // `update_indexes` defers by recording a pending claim instead of
+            // authorizing the delete outright. See `channel_creator_check`.
             MessageType::ChannelDelete => {
                 let channel_id = self
                     .extract_channel_id(envelope)
                     .ok_or("missing or invalid channel_id")?;
-                if !self.is_channel_creator(channel_id, resolved_author)? {
-                    return Err("only the channel creator can delete the channel".into());
+                match self.channel_creator_check(channel_id, resolved_author)? {
+                    ChannelCreatorCheck::IsCreator | ChannelCreatorCheck::Unknown => Ok(()),
+                    ChannelCreatorCheck::NotCreator => {
+                        Err("only the channel creator can delete the channel".into())
+                    }
                 }
-                Ok(())
             }
             // Creator + mods with can_kick
             MessageType::ChannelKick => {
@@ -1698,6 +1725,29 @@ impl MessageRouter {
                 }
             }
             Ok(None) => Err(format!("channel {} not found", channel_id)),
+            Err(e) => Err(format!("storage error: {}", e)),
+        }
+    }
+
+    /// Same lookup as `is_channel_creator`, but distinguishes "the channel doesn't
+    /// exist locally yet" from "it exists and `address` isn't the creator" instead of
+    /// folding both into one error (audit final pre-mainnet W14) — callers that need to
+    /// defer rather than hard-reject on the former (currently just `ChannelDelete`'s
+    /// authorization) need that distinction. `is_channel_creator` is left as-is for its
+    /// other call sites, which all want the existing hard-error-on-unknown behavior.
+    fn channel_creator_check(
+        &self,
+        channel_id: u64,
+        address: &str,
+    ) -> Result<ChannelCreatorCheck, String> {
+        match self.storage.get_cf(schema::cf::CHANNELS, &channel_id.to_be_bytes()) {
+            Ok(Some(data)) => Ok(match serde_json::from_slice::<serde_json::Value>(&data) {
+                Ok(meta) if meta.get("creator").and_then(|v| v.as_str()) == Some(address) => {
+                    ChannelCreatorCheck::IsCreator
+                }
+                _ => ChannelCreatorCheck::NotCreator,
+            }),
+            Ok(None) => Ok(ChannelCreatorCheck::Unknown),
             Err(e) => Err(format!("storage error: {}", e)),
         }
     }
@@ -2186,6 +2236,20 @@ impl MessageRouter {
                             envelope.timestamp,
                             "creator",
                         );
+
+                        // W14: this is the first time this channel_id's creator has
+                        // become known on this node — consume any pending delete claim
+                        // recorded while the channel was still unknown. A match means
+                        // the real creator already asked to delete it (we just hadn't
+                        // seen the create yet); converge straight to deleted instead of
+                        // momentarily resurrecting it. A mismatch (or no claim) is a
+                        // silent no-op — the claim is gone either way, one-shot.
+                        if let Ok(claim) = self.storage.take_pending_channel_delete(payload.channel_id) {
+                            if channel_delete_claim_matches(claim.as_ref(), resolved_author) {
+                                self.storage
+                                    .tombstone_channel(payload.channel_id, envelope.timestamp)?;
+                            }
+                        }
                     }
                 }
             }
@@ -2215,10 +2279,30 @@ impl MessageRouter {
                 if let Ok(payload) =
                     rmp_serde::from_slice::<ChannelDeletePayload>(&envelope.payload)
                 {
-                    // Authorization (creator-only) already enforced in
-                    // authorize_channel_action on every ingest path (API + gossip +
-                    // sync), so applying the tombstone here is safe. Idempotent.
-                    self.storage.tombstone_channel(payload.channel_id, envelope.timestamp)?;
+                    // Re-check fresh rather than trusting the authorize_channel_action
+                    // result blindly (W14): that check ran before this envelope was
+                    // stored, and a concurrent message could have created the channel
+                    // in between. IsCreator is the normal case (authorization already
+                    // enforced on every ingest path, so tombstoning here is safe and
+                    // idempotent). Unknown means the channel still doesn't exist —
+                    // record a pending claim instead of a tombstone, consumed later by
+                    // whichever creation path (L2 envelope or chain scan) sees the
+                    // channel first. NotCreator/storage-error is defensive-only: authz
+                    // should already have blocked NotCreator.
+                    match self.channel_creator_check(payload.channel_id, resolved_author) {
+                        Ok(ChannelCreatorCheck::IsCreator) => {
+                            self.storage
+                                .tombstone_channel(payload.channel_id, envelope.timestamp)?;
+                        }
+                        Ok(ChannelCreatorCheck::Unknown) => {
+                            self.storage.put_pending_channel_delete(
+                                payload.channel_id,
+                                resolved_author,
+                                envelope.timestamp,
+                            )?;
+                        }
+                        Ok(ChannelCreatorCheck::NotCreator) | Err(_) => {}
+                    }
                 }
             }
             MessageType::NewsComment => {
@@ -3946,6 +4030,273 @@ mod cross_node_ban_kick_tests {
         assert!(target_node.storage.get_cf(schema::cf::CHANNEL_MEMBERS, &member_key).unwrap().is_some());
         let ban_key = schema::encode_channel_ban_key(cid, banned);
         assert!(target_node.storage.get_cf(schema::cf::CHANNEL_BANS, &ban_key).unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod channel_delete_claim_matches_tests {
+    //! Audit final pre-mainnet W14. Pure-fn unit tests for the shared
+    //! matching logic both `update_indexes` (router.rs) and the chain
+    //! scanner's `ChannelCreated` handler use to decide whether to honor a
+    //! pending delete claim.
+    use super::*;
+
+    #[test]
+    fn no_claim_never_matches() {
+        assert!(!channel_delete_claim_matches(None, "klv1creator"));
+    }
+
+    #[test]
+    fn matching_claimant_matches() {
+        let claim = ("klv1creator".to_string(), 1_000);
+        assert!(channel_delete_claim_matches(Some(&claim), "klv1creator"));
+    }
+
+    #[test]
+    fn mismatched_claimant_does_not_match() {
+        let claim = ("klv1attacker".to_string(), 1_000);
+        assert!(!channel_delete_claim_matches(Some(&claim), "klv1creator"));
+    }
+}
+
+#[cfg(test)]
+mod channel_delete_before_create_tests {
+    //! Audit final pre-mainnet W14: a `ChannelDelete` received before this
+    //! node knows the channel (out-of-order gossip / chain-scan lag) must
+    //! not be permanently lost, but also must never let a non-creator force
+    //! a delete or block a legitimate future creation.
+    use super::*;
+    use tempfile::TempDir;
+
+    fn router() -> (MessageRouter, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let identity = IdentityResolver::new(storage.clone());
+        (
+            MessageRouter::new(storage, identity, None, "testnet".to_string(), usize::MAX),
+            dir,
+        )
+    }
+
+    fn make_channel(r: &MessageRouter, channel_id: u64, creator: &str) {
+        let meta = serde_json::json!({
+            "channel_id": channel_id,
+            "channel_type": 2u8,
+            "creator": creator,
+            "member_count": 1u64,
+        });
+        r.storage
+            .put_cf(schema::cf::CHANNELS, &channel_id.to_be_bytes(), meta.to_string().as_bytes())
+            .unwrap();
+    }
+
+    fn register_user(r: &MessageRouter, address: &str, registered_at: u64) {
+        let rec = serde_json::json!({ "address": address, "registered_at": registered_at });
+        r.storage
+            .put_cf(schema::cf::USERS, address.as_bytes(), rec.to_string().as_bytes())
+            .unwrap();
+    }
+
+    fn signed_delete_envelope(
+        sk: &ed25519_dalek::SigningKey,
+        author: &str,
+        channel_id: u64,
+        timestamp: u64,
+    ) -> Vec<u8> {
+        let payload = ChannelDeletePayload { channel_id };
+        let payload_bytes = rmp_serde::to_vec_named(&payload).unwrap();
+        let author_pubkey: [u8; 32] = sk.verifying_key().to_bytes();
+        let msg_id =
+            crypto::compute_msg_id("testnet", &author_pubkey, &payload_bytes, timestamp);
+        let signature = signing::sign_ogmara_message(
+            sk,
+            "testnet",
+            crate::messages::envelope::PROTOCOL_VERSION,
+            MessageType::ChannelDelete as u8,
+            &msg_id,
+            timestamp,
+            &payload_bytes,
+        );
+        let envelope = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::ChannelDelete,
+            msg_id,
+            author: author.to_string(),
+            timestamp,
+            lamport_ts: 0,
+            payload: payload_bytes,
+            signature: signature.to_bytes().to_vec(),
+            relay_path: vec![],
+        };
+        rmp_serde::to_vec_named(&envelope).unwrap()
+    }
+
+    fn signed_create_envelope(
+        sk: &ed25519_dalek::SigningKey,
+        author: &str,
+        channel_id: u64,
+        slug: &str,
+        timestamp: u64,
+    ) -> Vec<u8> {
+        let payload = ChannelCreatePayload {
+            channel_id,
+            slug: slug.to_string(),
+            channel_type: ChannelType::Private,
+            display_name: None,
+            description: None,
+            content_rating: Default::default(),
+            moderation: ModerationPolicy { admins: vec![], rules: None },
+            encryption_enabled: None,
+            history_visibility: None,
+        };
+        let payload_bytes = rmp_serde::to_vec_named(&payload).unwrap();
+        let author_pubkey: [u8; 32] = sk.verifying_key().to_bytes();
+        let msg_id =
+            crypto::compute_msg_id("testnet", &author_pubkey, &payload_bytes, timestamp);
+        let signature = signing::sign_ogmara_message(
+            sk,
+            "testnet",
+            crate::messages::envelope::PROTOCOL_VERSION,
+            MessageType::ChannelCreate as u8,
+            &msg_id,
+            timestamp,
+            &payload_bytes,
+        );
+        let envelope = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::ChannelCreate,
+            msg_id,
+            author: author.to_string(),
+            timestamp,
+            lamport_ts: 0,
+            payload: payload_bytes,
+            signature: signature.to_bytes().to_vec(),
+            relay_path: vec![],
+        };
+        rmp_serde::to_vec_named(&envelope).unwrap()
+    }
+
+    fn now_ms() -> u64 {
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
+    }
+
+    #[test]
+    fn delete_for_unknown_channel_is_accepted_and_records_a_pending_claim() {
+        let (r, _d) = router();
+        let sk = crypto::generate_keypair();
+        let claimant = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        register_user(&r, &claimant, 1_000);
+        let cid = 4242u64;
+
+        let raw = signed_delete_envelope(&sk, &claimant, cid, now_ms());
+        match r.process_message(&raw) {
+            RouteResult::Accepted { .. } => {}
+            other => panic!("expected Accepted (deferred, not rejected), got {:?}", other),
+        }
+        assert!(
+            r.storage.get_cf(schema::cf::PENDING_CHANNEL_DELETES, &cid.to_be_bytes()).unwrap().is_some(),
+            "pending delete claim must be recorded"
+        );
+        assert!(
+            r.storage.exists_cf(schema::cf::DELETED_CHANNELS, &cid.to_be_bytes()).unwrap_or(false) == false,
+            "must not tombstone a channel it has never seen"
+        );
+    }
+
+    #[test]
+    fn later_create_by_same_wallet_converges_to_deleted() {
+        let (r, _d) = router();
+        let sk = crypto::generate_keypair();
+        let creator = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        register_user(&r, &creator, 1_000);
+        let cid = 4243u64;
+
+        let delete_raw = signed_delete_envelope(&sk, &creator, cid, now_ms());
+        assert!(matches!(r.process_message(&delete_raw), RouteResult::Accepted { .. }));
+
+        let create_raw = signed_create_envelope(&sk, &creator, cid, "test-channel", now_ms() + 1);
+        assert!(matches!(r.process_message(&create_raw), RouteResult::Accepted { .. }));
+
+        assert!(
+            r.storage.get_cf(schema::cf::CHANNELS, &cid.to_be_bytes()).unwrap().is_none(),
+            "channel must converge to deleted, not resurrected"
+        );
+        assert!(
+            r.storage.exists_cf(schema::cf::DELETED_CHANNELS, &cid.to_be_bytes()).unwrap_or(false),
+            "tombstone must exist"
+        );
+        assert!(
+            r.storage.get_cf(schema::cf::PENDING_CHANNEL_DELETES, &cid.to_be_bytes()).unwrap().is_none(),
+            "claim must be consumed"
+        );
+    }
+
+    #[test]
+    fn later_create_by_different_wallet_is_not_deleted_and_claim_is_dropped() {
+        let (r, _d) = router();
+        let attacker_sk = crypto::generate_keypair();
+        let attacker = crypto::pubkey_to_address(&attacker_sk.verifying_key()).unwrap();
+        register_user(&r, &attacker, 1_000);
+        let real_creator_sk = crypto::generate_keypair();
+        let real_creator = crypto::pubkey_to_address(&real_creator_sk.verifying_key()).unwrap();
+        register_user(&r, &real_creator, 1_000);
+        let cid = 4244u64;
+
+        // Attacker guesses the not-yet-used channel_id and claims to delete it.
+        let delete_raw = signed_delete_envelope(&attacker_sk, &attacker, cid, now_ms());
+        assert!(matches!(r.process_message(&delete_raw), RouteResult::Accepted { .. }));
+
+        // The real creator later actually creates it.
+        let create_raw =
+            signed_create_envelope(&real_creator_sk, &real_creator, cid, "test-channel", now_ms() + 1);
+        assert!(matches!(r.process_message(&create_raw), RouteResult::Accepted { .. }));
+
+        assert!(
+            r.storage.get_cf(schema::cf::CHANNELS, &cid.to_be_bytes()).unwrap().is_some(),
+            "channel must be created normally — a mismatched claim must never block creation"
+        );
+        assert!(
+            !r.storage.exists_cf(schema::cf::DELETED_CHANNELS, &cid.to_be_bytes()).unwrap_or(false),
+            "must not be tombstoned — the claimant was never the real creator"
+        );
+        assert!(
+            r.storage.get_cf(schema::cf::PENDING_CHANNEL_DELETES, &cid.to_be_bytes()).unwrap().is_none(),
+            "the stale, non-matching claim must still be consumed (one-shot)"
+        );
+    }
+
+    #[test]
+    fn delete_for_existing_channel_by_non_creator_still_rejected() {
+        let (r, _d) = router();
+        let creator = "klv1realcreator";
+        make_channel(&r, 4245, creator);
+        let attacker_sk = crypto::generate_keypair();
+        let attacker = crypto::pubkey_to_address(&attacker_sk.verifying_key()).unwrap();
+        register_user(&r, &attacker, 1_000);
+
+        let raw = signed_delete_envelope(&attacker_sk, &attacker, 4245, now_ms());
+        match r.process_message(&raw) {
+            RouteResult::Rejected(_) => {}
+            other => panic!("expected Rejected, got {:?}", other),
+        }
+        assert!(!r.storage.exists_cf(schema::cf::DELETED_CHANNELS, &4245u64.to_be_bytes()).unwrap_or(false));
+    }
+
+    #[test]
+    fn delete_for_existing_channel_by_creator_still_tombstones_immediately() {
+        let (r, _d) = router();
+        let sk = crypto::generate_keypair();
+        let creator = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        register_user(&r, &creator, 1_000);
+        make_channel(&r, 4246, &creator);
+
+        let raw = signed_delete_envelope(&sk, &creator, 4246, now_ms());
+        assert!(matches!(r.process_message(&raw), RouteResult::Accepted { .. }));
+        assert!(r.storage.exists_cf(schema::cf::DELETED_CHANNELS, &4246u64.to_be_bytes()).unwrap_or(false));
+        assert!(
+            r.storage.get_cf(schema::cf::PENDING_CHANNEL_DELETES, &4246u64.to_be_bytes()).unwrap().is_none(),
+            "the normal (non-deferred) path never touches the pending-claim CF"
+        );
     }
 }
 

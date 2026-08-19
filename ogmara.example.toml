@@ -274,6 +274,15 @@ tombstone_retention_days = 7
 # How often the reaper sweeps for expired tombstones.
 reap_interval_secs = 3600
 
+[channel_delete]
+# Pending channel-delete-claim retention (W14, l2-node 0.106.0+)
+# Hours a pending delete claim (recorded when a ChannelDelete arrives
+# before this node knows the channel) is retained before the reaper
+# expires it unclaimed. 0 = unlimited.
+pending_retention_hours = 24
+# How often the reaper sweeps for expired pending claims.
+reap_interval_secs = 3600
+
 [push_gateway]
 enabled = false
 url = ""

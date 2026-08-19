@@ -113,6 +113,15 @@ pub mod cf {
     /// Prevents chain scanner from re-creating channels that were intentionally deleted.
     pub const DELETED_CHANNELS: &str = "deleted_channels";
 
+    /// channel_id (8 bytes BE) → PendingChannelDelete JSON (claimant, requested_at) —
+    /// a `ChannelDelete` received before the channel is known locally (out-of-order
+    /// gossip / chain-scan lag, audit final pre-mainnet W14). Consumed the first time
+    /// the channel is actually created: if the creator matches `claimant`, the channel
+    /// is immediately tombstoned instead of resurrected; otherwise the claim is dropped.
+    /// One row per channel_id (latest claim wins). Reaped after
+    /// `[channel_delete] pending_retention_hours`.
+    pub const PENDING_CHANNEL_DELETES: &str = "pending_channel_deletes";
+
     // --- Edit/Delete Tracking ---
 
     /// msg_id (32 bytes) → DeletionRecord JSON (deleted_by, deleted_at, msg_type)
@@ -308,6 +317,7 @@ pub mod cf {
         CHANNEL_READ_STATE,
         DM_READ_STATE,
         DELETED_CHANNELS,
+        PENDING_CHANNEL_DELETES,
         DELETION_MARKERS,
         EDIT_HISTORY,
         CHAT_REACTIONS,
@@ -417,6 +427,10 @@ pub mod state_keys {
     /// 0.105.0+): persisted cursor for the `DEVICE_ENC_KEYS` sweep. Same
     /// resume-across-restarts rationale as the DM/notification reaper cursors above.
     pub const DEVICE_ENC_TOMBSTONE_REAP_CURSOR: &[u8] = b"device_enc_tombstone_reap_cursor";
+    /// Pending-channel-delete-claim reaper (audit final pre-mainnet W14, l2-node
+    /// 0.106.0+): persisted cursor for the `PENDING_CHANNEL_DELETES` sweep. Same
+    /// resume-across-restarts rationale as the reaper cursors above.
+    pub const CHANNEL_DELETE_CLAIM_REAP_CURSOR: &[u8] = b"channel_delete_claim_reap_cursor";
 }
 
 /// Snapshot bootstrap (spec 11-snapshot-sync.md).

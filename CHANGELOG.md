@@ -5,6 +5,96 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.106.0] - 2026-08-19
+
+### Fixed
+
+- **`ChannelDelete` received before this node knew the channel (out-of-order
+  gossip / independent chain-scan timing) was permanently lost, letting a
+  later `ChannelCreate` resurrect a channel its own creator had already
+  deleted (final pre-mainnet audit W14).** `is_channel_creator` requires the
+  `CHANNELS` row to exist; when it didn't, the delete was hard-rejected at
+  authorization — before the envelope was ever stored, indexed, or gossiped
+  onward — leaving no `DELETED_CHANNELS` tombstone. A later create (from
+  gossip, chain scan, or reconcile) found no tombstone and recreated the
+  channel, with no memory a delete was ever attempted. A research pass
+  confirmed reconcile/backfill was NOT the vector (channel metadata is
+  indexed `(channel_id, msg_type, ts, msg_id)`, so `ChannelCreate` always
+  sorts before `ChannelDelete` on the wire regardless of real order) — the
+  entire remaining risk was the live-gossip / chain-scan-lag race, and it is
+  not self-healing: reconcile only serves what the responding node itself
+  successfully applied, so the resurrection could propagate to every
+  syncing node, not just the one that first raced.
+  - New `channel_creator_check` distinguishes "not the creator" (still hard
+    rejected) from "the channel doesn't exist locally yet" (now deferred
+    instead of rejected) — `is_channel_creator` is left unchanged for its
+    other 8 call sites. A delete-of-unknown-channel is now `Accepted` and
+    records a pending claim (`claimant`, `requested_at`) in a new
+    `PENDING_CHANNEL_DELETES` CF, keyed by `channel_id` (one row per
+    channel_id — a channel has exactly one eventual real creator, so only
+    the latest claim matters).
+  - The claim is consumed the first time the channel is actually created —
+    at both places a creator becomes known for the first time
+    (`messages::router`'s `ChannelCreate` new-channel branch, and the chain
+    scanner's `ChannelCreated` first-time branch, sharing one pure
+    `channel_delete_claim_matches` comparison function). A matching
+    claimant converges the channel straight to deleted instead of
+    momentarily resurrecting it; a mismatched or absent claim is a silent
+    no-op — `channel_id` isn't attacker-choosable identity, and a forged
+    claimant can never match the real signature-verified creator, so this
+    cannot be used to grief a legitimate future creation.
+  - **Bonus propagation fix**: gossip relay only happens on
+    `RouteResult::Accepted`. A node that previously rejected a
+    delete-of-unknown-channel also never relayed it onward — a peer that
+    already had the channel and could apply the tombstone immediately might
+    never even hear about the delete via this node. Turning this into an
+    `Accepted` outcome fixes that gap too.
+  - New retention reaper for the new CF (`ChannelDelete` already requires
+    on-chain-verified identity and sits in the 30/hour `ChannelAdmin` rate
+    category — same threat model already accepted elsewhere this campaign),
+    same batch-capped/cursor-resuming shape as the DM (W11), notification
+    (W31), and device-enc (W15) reapers. New `[channel_delete]` config
+    section (`pending_retention_hours`, default 24; `reap_interval_secs`,
+    default 3600). Unlike the device-enc reaper, there's no never-delete
+    invariant to protect — an expired, still-unclaimed pending row is safe
+    to drop unconditionally; a legitimately-late creator can simply
+    re-issue the delete once the channel exists locally.
+  - 19 new unit/integration tests: the reaper's pure planner (age-based
+    deletion, batch-limit + cursor-never-skips-an-unexamined-row
+    regression, empty batch, cursor-advances-on-nothing-deleted), the
+    shared claim-match function, and 5 end-to-end scenarios through
+    `process_message` (unknown-channel delete is accepted + claim
+    recorded; same-wallet create-after-delete converges to deleted;
+    different-wallet create-after-delete is unaffected and the stale claim
+    is dropped; existing-channel delete by a non-creator is still rejected;
+    existing-channel delete by the real creator still tombstones
+    immediately via the normal, non-deferred path — the last two are
+    regression guards on unchanged behavior).
+  - **Post-fix Code Audit + Security Audit pass: Code Audit fully clean.
+    Security Audit found a real WARNING, fixed same day** (Code Audit and
+    Security Audit converging on real findings before a fix ships has been
+    a reliable signal this campaign; here Code Audit found nothing and
+    Security Audit found one non-blocking issue — still fixed, since it
+    was cheap and clean to close). `put_pending_channel_delete`/
+    `take_pending_channel_delete` had no synchronization between them: a
+    `take` (a `ChannelCreate` consuming a stale, non-matching claim) could
+    read-then-delete while a concurrent `put` (a genuine new delete claim
+    for the same channel_id) landed in the gap, silently discarding the
+    genuine claim. Narrow and self-recovering (the creator can simply
+    re-issue the delete once the channel exists, taking the immediate,
+    unaffected `IsCreator` path) — not the kind of hard security bound
+    the W11 DM cap's lock protects — but cheap to close cleanly: `Storage`
+    gained a new `Arc<Mutex<()>>` (`Storage` is cloned freely across
+    `MessageRouter` and the chain scanner, so the lock must be shared via
+    `Arc`, not per-clone) guarding both methods' bodies. 1 new stress test
+    under heavy real concurrency (8 writer + 8 reader threads, 1,600
+    puts/takes racing one row) — see the test's own doc comment for why an
+    outside-the-call timing probe can't actually prove mutual exclusion
+    here (it measures the whole call, not the lock-held section inside
+    it), so the test instead checks the mechanism doesn't silently no-op
+    or poison under contention rather than asserting an exact
+    interleaving.
+
 ## [0.105.0] - 2026-08-19
 
 ### Security

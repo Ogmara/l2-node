@@ -274,6 +274,124 @@ fn reap_device_enc_tombstones(storage: &Storage, tombstone_retention_days: u64) 
     }
 }
 
+/// Pending-channel-delete-claim reaper (audit final pre-mainnet W14): max
+/// rows actually DELETED per sweep. Same magnitude as the device-enc
+/// reaper — `ChannelDelete` is verified-identity-gated and rate-limited
+/// (30/hour, `ChannelAdmin`), so this CF grows slowly; the cap is a
+/// wall-clock/backlog-drain safety net, not a routinely-hit limit.
+const CHANNEL_DELETE_CLAIM_REAP_BATCH_LIMIT: usize = 2_000;
+/// Pending-channel-delete-claim reaper: max rows FETCHED/examined per sweep.
+const CHANNEL_DELETE_CLAIM_REAP_MAX_ROWS_EXAMINED: usize = 20_000;
+
+/// Pure planning step for the pending-channel-delete-claim reaper (audit
+/// final pre-mainnet W14): given a batch of `PENDING_CHANNEL_DELETES` rows
+/// (keyed `channel_id_be8`, valued `{"claimant","requested_at"}` JSON) and a
+/// cutoff, returns the keys to delete (capped at `batch_limit`) and the next
+/// cursor to resume from. No I/O — same factoring rationale as the other
+/// reapers this session. Unlike the device-enc reaper, there's no
+/// never-delete invariant to protect here: an expired, still-unclaimed
+/// pending row is just a claim that never got consumed by a matching
+/// `ChannelCreate` — dropping it only means a legitimately-late create (past
+/// `[channel_delete] pending_retention_hours`) resurrects the channel
+/// instead of converging to deleted, at which point the creator can simply
+/// re-issue the delete (the channel exists locally by then, so it applies
+/// immediately via the normal, non-deferred path).
+fn plan_channel_delete_claim_reap(
+    rows: &[(Vec<u8>, Vec<u8>)],
+    cutoff_ms: u64,
+    batch_limit: usize,
+) -> (Vec<Vec<u8>>, Option<Vec<u8>>) {
+    if rows.is_empty() {
+        return (Vec::new(), None);
+    }
+    let mut to_delete = Vec::new();
+    let mut last_key: &[u8] = &rows[0].0;
+    for (key, value) in rows {
+        // See the W11/W31/W15 lesson (feedback_backend_rust_patterns): only
+        // advance `last_key` for rows actually examined this iteration.
+        if to_delete.len() >= batch_limit {
+            break;
+        }
+        last_key = key;
+        let Ok(record) = serde_json::from_slice::<serde_json::Value>(value) else {
+            continue; // malformed value — not this reaper's job to fix
+        };
+        let requested_at = record.get("requested_at").and_then(|v| v.as_u64());
+        match requested_at {
+            Some(ts) if ts < cutoff_ms => to_delete.push(key.clone()),
+            _ => {} // no timestamp, or not expired yet — leave it
+        }
+    }
+    let mut next_cursor = last_key.to_vec();
+    next_cursor.push(0); // sorts immediately after `last_key` itself
+    (to_delete, Some(next_cursor))
+}
+
+/// Pending-channel-delete-claim reaper (audit final pre-mainnet W14,
+/// l2-node 0.106.0+): sweeps `PENDING_CHANNEL_DELETES` for claims older
+/// than `[channel_delete] pending_retention_hours`, deleting them. A claim
+/// is recorded when a signed `ChannelDelete` arrives for a `channel_id`
+/// this node doesn't know about yet (out-of-order gossip / chain-scan lag)
+/// — normally consumed the moment the channel is actually created (see
+/// `messages::router::channel_delete_claim_matches` and its two call
+/// sites); this reaper only cleans up claims that were never consumed
+/// because no matching create ever arrived (a fake/never-used channel_id,
+/// or one that genuinely never got created).
+///
+/// Batch-capped with a persisted cursor, same shape as the other reapers
+/// this session. `pending_retention_hours == 0` means "unlimited" —
+/// disables the sweep.
+fn reap_channel_delete_claims(storage: &Storage, pending_retention_hours: u64) {
+    if pending_retention_hours == 0 {
+        return;
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let cutoff_ms = now_ms.saturating_sub(pending_retention_hours.saturating_mul(3_600_000));
+    let cursor = storage
+        .get_cf(
+            crate::storage::schema::cf::NODE_STATE,
+            state_keys::CHANNEL_DELETE_CLAIM_REAP_CURSOR,
+        )
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let rows = match storage.iter_cf_from(
+        crate::storage::schema::cf::PENDING_CHANNEL_DELETES,
+        &cursor,
+        &[],
+        CHANNEL_DELETE_CLAIM_REAP_MAX_ROWS_EXAMINED,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(error = %e, "reap_channel_delete_claims: scan failed");
+            return;
+        }
+    };
+    let (to_delete, next_cursor) =
+        plan_channel_delete_claim_reap(&rows, cutoff_ms, CHANNEL_DELETE_CLAIM_REAP_BATCH_LIMIT);
+    for key in &to_delete {
+        let _ = storage.delete_cf(crate::storage::schema::cf::PENDING_CHANNEL_DELETES, key);
+    }
+    match next_cursor {
+        Some(nc) => {
+            let _ = storage.put_cf(
+                crate::storage::schema::cf::NODE_STATE,
+                state_keys::CHANNEL_DELETE_CLAIM_REAP_CURSOR,
+                &nc,
+            );
+        }
+        None => {
+            let _ = storage.delete_cf(
+                crate::storage::schema::cf::NODE_STATE,
+                state_keys::CHANNEL_DELETE_CLAIM_REAP_CURSOR,
+            );
+        }
+    }
+}
+
 /// Spawns `fut`, plus a lightweight second task that awaits its completion
 /// purely to surface a genuine panic through structured logging (audit
 /// final pre-mainnet W17). tokio's default panic hook only prints to raw
@@ -1559,6 +1677,28 @@ impl Node {
             }
         });
 
+        // Pending-channel-delete-claim reaper (audit final pre-mainnet W14):
+        // own interval, same reasoning as the reapers above.
+        let channel_delete_reap_storage = self.storage.clone();
+        let channel_delete_pending_retention_hours =
+            self.config.channel_delete.pending_retention_hours;
+        let channel_delete_reap_interval_secs = self.config.channel_delete.reap_interval_secs;
+        let mut channel_delete_reap_shutdown_rx = self.shutdown_rx();
+        spawn_supervised("channel_delete_claim_reaper", async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+                channel_delete_reap_interval_secs.max(1),
+            ));
+            interval.tick().await; // skip immediate tick
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        reap_channel_delete_claims(&channel_delete_reap_storage, channel_delete_pending_retention_hours);
+                    }
+                    _ = channel_delete_reap_shutdown_rx.recv() => break,
+                }
+            }
+        });
+
         let api_config = self.config.clone();
         let api_shutdown_rx = self.shutdown_rx();
         let mut api_task = tokio::spawn(async move {
@@ -2067,6 +2207,76 @@ mod device_enc_tombstone_reaper_tests {
     fn cursor_advances_even_when_nothing_deleted() {
         let rows = vec![row("klv1alice", "enc1", active(999_999))];
         let (to_delete, next_cursor) = plan_device_enc_tombstone_reap(&rows, 100, 100);
+        assert!(to_delete.is_empty());
+        let cursor = next_cursor.expect("cursor must still advance to make forward progress");
+        assert!(cursor > rows[0].0);
+    }
+}
+
+#[cfg(test)]
+mod channel_delete_claim_reaper_tests {
+    //! Audit final pre-mainnet W14. Covers the pure planning logic factored
+    //! out of `reap_channel_delete_claims`. Unlike the device-enc reaper,
+    //! there's no never-delete invariant here — an expired unclaimed
+    //! pending row is safe to drop unconditionally.
+    use super::*;
+
+    fn row(channel_id: u64, claimant: &str, requested_at: u64) -> (Vec<u8>, Vec<u8>) {
+        (
+            channel_id.to_be_bytes().to_vec(),
+            serde_json::to_vec(&serde_json::json!({
+                "claimant": claimant,
+                "requested_at": requested_at,
+            }))
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn deletes_only_expired_rows() {
+        let rows = vec![
+            row(1, "klv1alice", 100), // expired
+            row(2, "klv1bob", 200),   // not expired
+        ];
+        let (to_delete, _) = plan_channel_delete_claim_reap(&rows, 150, 100);
+        assert_eq!(to_delete.len(), 1);
+        assert_eq!(to_delete[0], rows[0].0);
+    }
+
+    #[test]
+    fn missing_or_malformed_requested_at_defaults_to_never_delete() {
+        let rows = vec![(
+            1u64.to_be_bytes().to_vec(),
+            serde_json::to_vec(&serde_json::json!({"claimant": "klv1alice"})).unwrap(),
+        )];
+        let (to_delete, _) = plan_channel_delete_claim_reap(&rows, u64::MAX, 100);
+        assert!(to_delete.is_empty());
+    }
+
+    #[test]
+    fn respects_batch_limit_and_cursor_never_skips_an_unexamined_row() {
+        let rows: Vec<_> = (0..10u64).map(|i| row(i, "klv1alice", 0)).collect();
+        let (to_delete, next_cursor) = plan_channel_delete_claim_reap(&rows, 1000, 3);
+        assert_eq!(to_delete.len(), 3);
+        let expected_cursor = {
+            let mut c = rows[2].0.clone();
+            c.push(0);
+            c
+        };
+        assert_eq!(next_cursor, Some(expected_cursor));
+    }
+
+    #[test]
+    fn empty_batch_returns_none_cursor() {
+        let (to_delete, next_cursor) = plan_channel_delete_claim_reap(&[], 1000, 100);
+        assert!(to_delete.is_empty());
+        assert!(next_cursor.is_none());
+    }
+
+    #[test]
+    fn cursor_advances_even_when_nothing_deleted() {
+        let rows = vec![row(1, "klv1alice", 999_999)];
+        let (to_delete, next_cursor) = plan_channel_delete_claim_reap(&rows, 100, 100);
         assert!(to_delete.is_empty());
         let cursor = next_cursor.expect("cursor must still advance to make forward progress");
         assert!(cursor > rows[0].0);

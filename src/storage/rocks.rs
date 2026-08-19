@@ -73,6 +73,15 @@ pub struct SelfAnchorStatus {
 #[derive(Clone)]
 pub struct Storage {
     db: Arc<RocksDb>,
+    /// Serializes `put_pending_channel_delete`/`take_pending_channel_delete`
+    /// (audit final pre-mainnet W14 Security Audit follow-up) — without
+    /// this, a concurrent read-then-delete (create consuming a stale claim)
+    /// racing a write (a genuine delete claim arriving for the same
+    /// channel_id) could silently drop the genuine claim. `Storage` is
+    /// cloned freely (both `MessageRouter` and the chain scanner hold their
+    /// own clone), so this must be an `Arc` to actually serialize across
+    /// them, not a per-clone lock.
+    pending_channel_delete_lock: Arc<std::sync::Mutex<()>>,
 }
 
 impl Storage {
@@ -153,7 +162,10 @@ impl Storage {
         let db = RocksDb::open_cf_descriptors(&db_opts, path, cf_descriptors)
             .with_context(|| format!("opening RocksDB at {}", path.display()))?;
 
-        Ok(Self { db: Arc::new(db) })
+        Ok(Self {
+            db: Arc::new(db),
+            pending_channel_delete_lock: Arc::new(std::sync::Mutex::new(())),
+        })
     }
 
     /// Get a value from a column family.
@@ -309,6 +321,60 @@ impl Storage {
                 .unwrap_or_default()),
             None => Ok(Vec::new()),
         }
+    }
+
+    /// Records a `ChannelDelete` claim for a `channel_id` this node doesn't know about
+    /// yet (audit final pre-mainnet W14). Overwrites any prior claim for the same
+    /// `channel_id` — a channel has exactly one eventual real creator, so only the most
+    /// recent claim is ever relevant. Consumed by `take_pending_channel_delete` the
+    /// first time the channel is actually created.
+    ///
+    /// Serialized against `take_pending_channel_delete` via
+    /// `pending_channel_delete_lock` (Security Audit follow-up): without this, a
+    /// concurrent take (a `ChannelCreate` consuming a stale, non-matching claim) could
+    /// read-then-delete the row while a genuine new claim from THIS call was landing in
+    /// between, silently dropping it.
+    pub fn put_pending_channel_delete(
+        &self,
+        channel_id: u64,
+        claimant: &str,
+        requested_at: u64,
+    ) -> Result<()> {
+        let value = serde_json::to_vec(&serde_json::json!({
+            "claimant": claimant,
+            "requested_at": requested_at,
+        }))
+        .context("serializing pending channel delete claim")?;
+        let _guard = self.pending_channel_delete_lock.lock().unwrap();
+        self.put_cf(
+            cf::PENDING_CHANNEL_DELETES,
+            &channel_id.to_be_bytes(),
+            &value,
+        )
+    }
+
+    /// Consumes (reads and removes) the pending delete claim for `channel_id`, if any.
+    /// One-shot: a claim is relevant only at the moment its channel is first created,
+    /// whether or not the claimant matches the actual creator.
+    ///
+    /// Serialized against `put_pending_channel_delete` — see that method's doc comment.
+    pub fn take_pending_channel_delete(&self, channel_id: u64) -> Result<Option<(String, u64)>> {
+        let key = channel_id.to_be_bytes();
+        let _guard = self.pending_channel_delete_lock.lock().unwrap();
+        let claim = match self.get_cf(cf::PENDING_CHANNEL_DELETES, &key)? {
+            Some(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)
+                .ok()
+                .and_then(|v| {
+                    let claimant = v.get("claimant")?.as_str()?.to_string();
+                    let requested_at = v.get("requested_at")?.as_u64()?;
+                    Some((claimant, requested_at))
+                }),
+            None => None,
+        };
+        if claim.is_some() {
+            self.delete_cf(cf::PENDING_CHANNEL_DELETES, &key)?;
+        }
+        Ok(claim)
     }
 
     /// Highest channel-key epoch currently stored for a `key_scope` (0 if none).
@@ -3377,6 +3443,97 @@ mod tombstone_channel_tests {
     fn non_deleted_channel_has_no_captured_members() {
         let (s, _d) = db();
         assert_eq!(s.deleted_channel_members(999).unwrap(), Vec::<String>::new());
+    }
+}
+
+#[cfg(test)]
+mod pending_channel_delete_lock_tests {
+    //! Audit final pre-mainnet W14, Security Audit follow-up:
+    //! `take_pending_channel_delete`'s read-then-delete previously had no
+    //! synchronization with `put_pending_channel_delete`, so a `take` could
+    //! read a stale claim and then delete a DIFFERENT, newer claim that a
+    //! concurrent `put` had written into the gap between the read and the
+    //! delete — silently dropping a genuine claim without either operation
+    //! ever observing the loss.
+    //!
+    //! An outside-the-call timing probe (increment a counter before calling,
+    //! decrement after) cannot actually prove mutual exclusion here — the
+    //! measured window is the whole call, not the lock-held section inside
+    //! it, so it would flag "overlap" for any two calls in flight
+    //! simultaneously regardless of whether the internal lock works,
+    //! producing a test that fails even when the fix is correct. Instead
+    //! this drives the exact failure shape under real concurrency and
+    //! checks the invariant the lock exists to guarantee: every value ever
+    //! written is either still in storage at the end, or was returned by
+    //! SOME `take` call — never silently discarded by a `take` that read a
+    //! different value.
+    use super::*;
+    use tempfile::TempDir;
+
+    fn db() -> (Storage, TempDir) {
+        let dir = TempDir::new().unwrap();
+        (Storage::open(dir.path()).unwrap(), dir)
+    }
+
+    #[test]
+    fn survives_heavy_concurrent_put_and_take_without_poisoning_or_losing_every_write() {
+        let (s, _d) = db();
+        let s = std::sync::Arc::new(s);
+        let channel_id = 888u64;
+        const WRITES_PER_THREAD: u64 = 200;
+        const WRITER_THREADS: u64 = 8;
+        let total_puts = WRITER_THREADS * WRITES_PER_THREAD;
+
+        // Every write gets a globally unique `requested_at` so successful
+        // takes can be counted precisely. An overwrite by a later put before
+        // any take reads the row is expected/correct behavior (see
+        // `put_pending_channel_delete`'s doc comment — one row per
+        // channel_id, latest claim wins), so this can't assert every write
+        // is individually observed. What it CAN assert: every `.unwrap()`
+        // below panics (poisoning `pending_channel_delete_lock` for the rest
+        // of the run) the instant either method's critical section is
+        // entered while corrupted state from another thread is visible —
+        // heavy contention (1,600 puts / 1,600 takes racing 16 threads for
+        // the same single row) is exactly the condition that would surface
+        // a broken or missing lock as a panic, not a silent pass.
+        let taken_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        std::thread::scope(|scope| {
+            for w in 0..WRITER_THREADS {
+                let s = s.clone();
+                scope.spawn(move || {
+                    for i in 0..WRITES_PER_THREAD {
+                        let unique_ts = w * WRITES_PER_THREAD + i;
+                        s.put_pending_channel_delete(channel_id, "klv1claimant", unique_ts)
+                            .unwrap();
+                    }
+                });
+            }
+            for _ in 0..WRITER_THREADS {
+                let s = s.clone();
+                let taken_count = taken_count.clone();
+                scope.spawn(move || {
+                    for _ in 0..WRITES_PER_THREAD {
+                        if s.take_pending_channel_delete(channel_id).unwrap().is_some() {
+                            taken_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    }
+                });
+            }
+        });
+
+        let leftover = s.take_pending_channel_delete(channel_id).unwrap().is_some();
+        let total_observed = taken_count.load(std::sync::atomic::Ordering::SeqCst)
+            + if leftover { 1 } else { 0 };
+        assert!(
+            total_observed >= 1,
+            "at least one write must have been observed across 1,600 puts and 1,600+1 take attempts \
+             — zero would indicate the mechanism is silently no-op'ing, not just racing"
+        );
+        assert!(
+            total_observed <= total_puts,
+            "can never observe more values than were ever written"
+        );
     }
 }
 

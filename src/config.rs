@@ -60,6 +60,10 @@ pub struct Config {
     /// pre-mainnet W15, l2-node 0.105.0+).
     #[serde(default)]
     pub device_enc: DeviceEncConfig,
+    /// Pending channel-delete-claim retention policy (audit final
+    /// pre-mainnet W14, l2-node 0.106.0+).
+    #[serde(default)]
+    pub channel_delete: ChannelDeleteConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -778,6 +782,51 @@ fn default_device_enc_tombstone_retention_days() -> u64 {
     7
 }
 fn default_device_enc_reap_interval_secs() -> u64 {
+    3600
+}
+
+/// Pending channel-delete-claim retention (audit final pre-mainnet W14,
+/// l2-node 0.106.0+). A `ChannelDelete` received before this node knows
+/// the channel (out-of-order gossip / chain-scan lag) can't be
+/// authorized immediately — creator identity isn't knowable until the
+/// channel exists — so it's recorded as a pending claim instead of
+/// rejected, and consumed (converging to deleted, or silently dropped on
+/// a claimant mismatch) the first time the channel is actually created.
+/// This config makes the reaper that expires an unclaimed pending row
+/// operator-tunable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelDeleteConfig {
+    /// Hours a pending delete claim is retained before the reaper expires
+    /// it unclaimed. `0` = unlimited. Default 24 — the real bug window is
+    /// bounded by chain-scan interval (default 3s) plus normal gossip
+    /// propagation, typically low-single-digit seconds, but a node
+    /// catching up from a backlog could plausibly take longer; 24h costs
+    /// nothing extra since the CF is small and reaped, so there's no
+    /// reason to cut the margin close.
+    #[serde(default = "default_channel_delete_pending_retention_hours")]
+    pub pending_retention_hours: u64,
+    /// How often the reaper sweeps `PENDING_CHANNEL_DELETES` for expired
+    /// claims. Default 3600 (1h), matching the device-enc reaper's
+    /// low-growth cadence — `ChannelDelete` requires on-chain-verified
+    /// identity and sits in the 30/hour `ChannelAdmin` rate category, so
+    /// this CF grows slowly even under sustained abuse.
+    #[serde(default = "default_channel_delete_reap_interval_secs")]
+    pub reap_interval_secs: u64,
+}
+
+impl Default for ChannelDeleteConfig {
+    fn default() -> Self {
+        Self {
+            pending_retention_hours: default_channel_delete_pending_retention_hours(),
+            reap_interval_secs: default_channel_delete_reap_interval_secs(),
+        }
+    }
+}
+
+fn default_channel_delete_pending_retention_hours() -> u64 {
+    24
+}
+fn default_channel_delete_reap_interval_secs() -> u64 {
     3600
 }
 
@@ -2596,6 +2645,15 @@ tombstone_retention_days = 7
 # How often the reaper sweeps for expired tombstones.
 reap_interval_secs = 3600
 
+[channel_delete]
+# Pending channel-delete-claim retention (W14, l2-node 0.106.0+)
+# Hours a pending delete claim (recorded when a ChannelDelete arrives
+# before this node knows the channel) is retained before the reaper
+# expires it unclaimed. 0 = unlimited.
+pending_retention_hours = 24
+# How often the reaper sweeps for expired pending claims.
+reap_interval_secs = 3600
+
 [push_gateway]
 enabled = false
 url = ""
@@ -3377,6 +3435,7 @@ mod tests {
             "[dm]",
             "[notifications]",
             "[device_enc]",
+            "[channel_delete]",
             "[push_gateway]",
             "[anchoring]",
             "[anchoring.metadata]",
