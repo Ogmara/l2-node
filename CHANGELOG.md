@@ -5,6 +5,119 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.102.0] - 2026-08-19
+
+### Security
+
+- **Death of a critical subsystem task was silent — the node kept reporting
+  `/health` "ok" while gossip/federation/backfill were dead (final
+  pre-mainnet audit W17).** All subsystems run as `tokio::spawn`ed tasks;
+  none of their `JoinHandle`s were ever polled until shutdown (`.abort()`
+  only). A panic inside `NetworkService::run` — the sole writer of the
+  `peer_count` metric — silently killed the entire P2P layer while REST
+  stayed up and alerts read a permanently-frozen peer count that could
+  never trigger. A zombie node on unattended mainnet, invisible to
+  monitoring and to this campaign's own "re-verify on live fleet" gate.
+  - **Fail-fast for the three genuinely critical tasks** (network, chain
+    scanner, API server — the ones whose death makes the node
+    non-functional, not just degraded): added as three new branches to the
+    existing shutdown `tokio::select!` in `Node::run`. An unexpected exit
+    (panic, or a return that isn't the normal shutdown path) now falls
+    through into the exact same shutdown/cleanup sequence a normal SIGINT/
+    SIGTERM already triggers — no new code path, no restructuring. Relies
+    on the fleet's existing systemd/Docker restart policies to recover;
+    a hard process exit is also a strictly stronger signal (connection
+    refused) than a `/health` flag a monitor might not be checking.
+  - **Panic visibility for the ~9 auxiliary subsystems** (presence sweep,
+    Lamport persist, snapshot cache rebuild, metrics collector, alert
+    engine, SC discovery, metadata reconciler, periodic cleanup, media
+    limiter sweep): new `spawn_supervised`/`supervise_handle` helpers wrap
+    each spawn with a lightweight watcher that logs a panic through
+    structured `tracing` output — previously invisible outside raw stderr,
+    since tokio's default panic hook doesn't go through the app's logging.
+    Deliberately NOT fail-fast for these — losing one degrades a specific
+    feature, it doesn't make the node invisible to the network the way the
+    three critical tasks do. Correctly distinguishes an intentional
+    `.abort()` (every task gets one during normal shutdown) from a genuine
+    panic via `JoinError::is_cancelled()`, so shutdown never gets
+    misreported as a crash.
+  - **Deliberately not addressed in this pass, documented rather than
+    silently dropped**: a *hang* — a subsystem stuck in some await forever,
+    never returning and never panicking — is invisible to any
+    `JoinHandle`-based mechanism; only a heartbeat/last-alive-timestamp
+    catches that. The finding's own named scenario is specifically a panic,
+    which this fix fully closes; a hang is a distinct, deeper concern for a
+    future pass. `/health` itself is unchanged — fail-fast means the
+    signal is a process exit, not a degraded-but-alive JSON flag.
+  - 3 new unit tests proving the `is_cancelled()` distinction directly
+    against real tokio tasks (a panic, an explicit abort, and that the
+    returned `AbortHandle` genuinely still controls the task).
+  - **Post-fix Security Audit found a real critical issue, fixed same
+    day**: converting "one subsystem panics" into "the whole node exits"
+    means any PRE-EXISTING panic reachable from unauthenticated peer input
+    is now a full-node remote-crash primitive, not just a degraded
+    subsystem — and one such panic already existed. `network/mod.rs`'s
+    Identify-info handler byte-sliced a peer-supplied `agent_version`
+    string (`agent_ver[..256]`) with no UTF-8 char-boundary check; any
+    connected peer (Identify runs on every fresh connection, unauthenticated,
+    ungated) could trigger a panic with an `agent_version` engineered to put
+    a multi-byte codepoint across byte 256. Before this fix that killed only
+    the network task (bad, but the exact "zombie" class W17 exists to
+    catch); after it, the same trigger would have crash-looped the entire
+    process, repeatably, on demand. Fixed by reusing the codebase's existing
+    char-boundary-safe `util::truncate_str` (already used correctly
+    elsewhere, e.g. `chain/scanner.rs`) instead of a raw byte-range index —
+    already covered by `truncate_str`'s own exhaustive multibyte-boundary
+    test suite, no new test needed. This bug predates W17 (traced to the
+    v0.29.0 network-isolation commit); W17 is what materially widened its
+    blast radius, so fixing it alongside is treated as in-scope, not a
+    separate follow-up.
+  - **Also surfaced, deliberately accepted rather than changed**: the
+    Security Audit noted that `ChainScanner::new()`/`start_api_server`
+    construction/bind failures at startup (e.g. a port transiently held
+    during a restart race) now also trigger the fail-fast exit, where the
+    old behavior was to log a warning and keep running without that one
+    subsystem. Judged intentional, not a regression, on reflection: a node
+    whose API never starts is not meaningfully "up" for any client regardless
+    of what else is running, so restarting (with the process supervisor's
+    backoff) to retry is the more honest behavior than silently persisting
+    in an unusable state — consistent with this fix's whole premise that a
+    silently-degraded subsystem is worse than a visible restart. Flagging
+    the restart-loop tail risk explicitly: neither `docker-compose.yml`
+    (Docker's own built-in exponential backoff applies) nor the reference
+    systemd unit override `StartLimitBurst`/`StartLimitIntervalSec` beyond
+    `RestartSec=5` — a deterministic, easily-retriggered crash (like the
+    fixed `agent_version` panic would have been) could in principle hit
+    systemd's default start-limit and land the unit in `failed` state,
+    requiring a manual `systemctl reset-failed`. Not fixed here (an ops/
+    deployment config change, not a code change); noted for a future
+    deployment-hardening pass.
+  - **Post-fix Spec Compliance found a second real bug, fixed same day —
+    and this one would have defeated the entire fix's premise on the
+    fleet's systemd-deployed node.** The first cut of the 3 fail-fast
+    branches only logged an error and fell through into the SAME cleanup
+    sequence that ends in `Ok(())` — meaning the process exited with
+    status code **0**, indistinguishable from a normal SIGINT/SIGTERM
+    shutdown. `systemd`'s `Restart=on-failure` (what §6.2's own new note
+    recommends, and what the reference unit at
+    `docs/deployment/systemd-services.md` already has) explicitly does
+    **not** restart on a clean exit-0 — only on non-zero exit or an
+    abnormal signal. So a critical-task panic on the systemd-deployed node
+    would have exited cleanly and then **stayed down**, unrecovered,
+    requiring a manual restart — worse in one respect than the pre-fix
+    behavior (which at least left REST/other subsystems running). Docker's
+    `restart: unless-stopped` was unaffected (Docker restarts regardless
+    of exit code), so this only bit the systemd deployment mode. Fixed by
+    tracking the failure reason in a `critical_task_failure: Option<String>`
+    set by the 3 branches, checked at the very end of `run()`: `None` →
+    `Ok(())` as before; `Some(reason)` → `anyhow::bail!(...)`, which
+    `main.rs`'s `#[tokio::main] async fn main() -> Result<()>` turns into
+    exit code 1 via `std::process::Termination`'s standard impl for
+    `Result<(), E: Debug>` — no new mechanism, just correctly using the
+    one already in place. All graceful cleanup (Lamport persist, anchor
+    task's shutdown-grace window, task aborts) still runs identically
+    before the non-zero exit; only the final return value changed.
+
 ## [0.101.0] - 2026-08-19
 
 ### Security

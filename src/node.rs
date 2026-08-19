@@ -9,12 +9,56 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
 use secrecy::ExposeSecret;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
 use crate::crypto;
 use crate::storage::rocks::Storage;
 use crate::storage::schema::state_keys;
+
+/// Spawns `fut`, plus a lightweight second task that awaits its completion
+/// purely to surface a genuine panic through structured logging (audit
+/// final pre-mainnet W17). tokio's default panic hook only prints to raw
+/// stderr, invisible to anything consuming `tracing` output — so a panic in
+/// a non-critical background subsystem (alert engine, sc_discovery, etc.)
+/// previously left no trace in logs at all. This is visibility-only, NOT
+/// fail-fast: unlike the three CRITICAL tasks (network/chain/api, handled
+/// directly in `Node::run`'s shutdown select), a panic here is logged but
+/// does not bring down the node — losing one of these degrades a specific
+/// feature, it doesn't make the node non-functional.
+///
+/// Returns an `AbortHandle` (not the full `JoinHandle`, which the watcher
+/// task owns) so callers that need to abort this task at shutdown still
+/// can — `AbortHandle::abort()` works independently of who, if anyone, is
+/// awaiting the underlying `JoinHandle`.
+fn spawn_supervised<F>(name: &'static str, fut: F) -> tokio::task::AbortHandle
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    supervise_handle(name, tokio::spawn(fut))
+}
+
+/// Like `spawn_supervised`, but for a task that was already spawned
+/// elsewhere and has returned its `JoinHandle` (e.g.
+/// `MediaLimiter::spawn_sweep_task`, which calls `tokio::spawn` internally)
+/// rather than being spawned directly by the caller.
+fn supervise_handle(
+    name: &'static str,
+    handle: tokio::task::JoinHandle<()>,
+) -> tokio::task::AbortHandle {
+    let abort_handle = handle.abort_handle();
+    tokio::spawn(async move {
+        if let Err(e) = handle.await {
+            // Don't misreport an INTENTIONAL abort (shutdown cleanup calls
+            // .abort() on every task) as a panic — JoinError::is_cancelled()
+            // distinguishes the two cleanly.
+            if !e.is_cancelled() {
+                tracing::error!(task = name, error = %e, "background task panicked");
+            }
+        }
+    });
+    abort_handle
+}
 
 /// The running L2 node instance.
 pub struct Node {
@@ -401,7 +445,7 @@ impl Node {
         if let Some(ref mgr) = presence_manager_handle {
             let sweep_mgr = mgr.clone();
             let sweep_shutdown_rx = self.shutdown_rx();
-            tokio::spawn(async move {
+            spawn_supervised("presence_sweep", async move {
                 sweep_mgr.run_sweep(sweep_shutdown_rx).await;
             });
         }
@@ -463,7 +507,7 @@ impl Node {
         let lamport = self.lamport_counter.clone();
         let mut lamport_shutdown_rx = self.shutdown_rx();
 
-        let lamport_task = tokio::spawn(async move {
+        let lamport_task = spawn_supervised("lamport_persist", async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
             loop {
                 tokio::select! {
@@ -489,7 +533,7 @@ impl Node {
 
         // Run network event loop in a task
         let network_shutdown_rx = self.shutdown_rx();
-        let network_task = tokio::spawn(async move {
+        let mut network_task = tokio::spawn(async move {
             network
                 .run(network_shutdown_rx, channel_rx, gossip_rx, sc_reconnect_rx, identity_sync_rx, dm_subscribe_rx)
                 .await;
@@ -567,7 +611,7 @@ impl Node {
         let chain_config = self.config.klever.clone();
         let chain_storage = self.storage.clone();
         let chain_shutdown_rx = self.shutdown_rx();
-        let chain_task = tokio::spawn(async move {
+        let mut chain_task = tokio::spawn(async move {
             match crate::chain::scanner::ChainScanner::new(chain_config, chain_storage, channel_tx) {
                 Ok(mut scanner) => scanner.run(chain_shutdown_rx).await,
                 Err(e) => warn!(error = %e, "Failed to start chain scanner"),
@@ -586,7 +630,7 @@ impl Node {
             let snap_cache = snapshot_cache.clone();
             let snap_config = self.config.snapshot.clone();
             let mut snap_shutdown_rx = self.shutdown_rx();
-            let _snapshot_task = tokio::spawn(async move {
+            let _snapshot_task = spawn_supervised("snapshot_cache_rebuild", async move {
                 let mut tick = tokio::time::interval(std::time::Duration::from_secs(
                     snap_config.serve_rebuild_interval_secs.max(60),
                 ));
@@ -853,7 +897,7 @@ impl Node {
 
         if self.config.metrics.enabled {
             let metrics_shutdown_rx = self.shutdown_rx();
-            tokio::spawn(async move {
+            spawn_supervised("metrics_collector", async move {
                 metrics_collector.run(metrics_shutdown_rx).await;
             });
             info!("Metrics collector started");
@@ -879,7 +923,7 @@ impl Node {
             alert_engine.set_history(alert_history.clone());
             let alert_metrics = metrics_latest.clone();
             let alert_shutdown_rx = self.shutdown_rx();
-            tokio::spawn(async move {
+            spawn_supervised("alert_engine", async move {
                 alert_engine.run(alert_metrics, alert_shutdown_rx).await;
             });
             info!("Alert engine started");
@@ -942,7 +986,7 @@ impl Node {
             let sc_disc_bootstrap_empty = self.config.network.bootstrap_nodes.is_empty();
             let sc_disc_max_candidates =
                 self.config.network.sc_discovery.max_candidates as usize;
-            tokio::spawn(async move {
+            spawn_supervised("sc_discovery", async move {
                 match crate::network::sc_discovery::ScDiscovery::new(
                     sc_disc_klever_url,
                     sc_disc_contract,
@@ -994,7 +1038,7 @@ impl Node {
                 None
             };
             let recon_shutdown_rx = self.shutdown_rx();
-            tokio::spawn(async move {
+            spawn_supervised("metadata_reconciler", async move {
                 match crate::chain::metadata_reconcile::MetadataReconciler::new(
                     recon_klever_url,
                     recon_contract,
@@ -1181,16 +1225,19 @@ impl Node {
         // its own tokio task slot and exits on shutdown_rx signal.
         // No need to await it during graceful shutdown; the sweep
         // doesn't hold any resources that must be flushed.
-        let _ = app_state
-            .media_limiter
-            .clone()
-            .spawn_sweep_task(std::time::Duration::from_secs(300), self.shutdown_rx());
+        let _ = supervise_handle(
+            "media_limiter_sweep",
+            app_state
+                .media_limiter
+                .clone()
+                .spawn_sweep_task(std::time::Duration::from_secs(300), self.shutdown_rx()),
+        );
 
         // Periodic cleanup task: evict stale rate limit entries and expired PoW challenges.
         // Runs every 5 minutes to prevent unbounded memory growth.
         let cleanup_state = app_state.clone();
         let mut cleanup_shutdown_rx = self.shutdown_rx();
-        let cleanup_task = tokio::spawn(async move {
+        let cleanup_task = spawn_supervised("periodic_cleanup", async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
             loop {
                 tokio::select! {
@@ -1209,7 +1256,7 @@ impl Node {
 
         let api_config = self.config.clone();
         let api_shutdown_rx = self.shutdown_rx();
-        let api_task = tokio::spawn(async move {
+        let mut api_task = tokio::spawn(async move {
             if let Err(e) = crate::api::start_api_server(&api_config, app_state, api_shutdown_rx).await {
                 tracing::error!(error = %e, "API server error");
             }
@@ -1227,6 +1274,20 @@ impl Node {
             tokio::signal::unix::SignalKind::terminate(),
         )
         .context("registering SIGTERM handler")?;
+        // Spec Compliance follow-up (W17): set on a critical-task fail-fast
+        // branch below, checked at the end of this function. Falling
+        // through the SAME cleanup sequence as a normal shutdown but then
+        // returning `Err` (rather than `Ok(())`) is what makes `main.rs`'s
+        // `#[tokio::main] async fn main() -> Result<()>` exit non-zero —
+        // required for `systemd`'s `Restart=on-failure` to actually
+        // restart the node. A first cut of this fix logged the failure but
+        // still returned `Ok(())`, meaning the process exited 0 — clean-
+        // shutdown-shaped, so `Restart=on-failure` would NOT have
+        // restarted it (that directive only fires on non-zero exit / an
+        // abnormal signal), silently defeating this entire fix's premise
+        // on the systemd deployment (Docker's `restart: unless-stopped`
+        // restarts regardless of exit code, so that path was unaffected).
+        let mut critical_task_failure: Option<String> = None;
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 info!("Received SIGINT (Ctrl+C), shutting down...");
@@ -1245,6 +1306,49 @@ impl Node {
             }
             _ = shutdown_rx.recv() => {
                 info!("Shutdown signal received");
+            }
+            // W17 (audit final pre-mainnet, l2-node 0.102.0+): fail fast if
+            // a CRITICAL subsystem task exits unexpectedly — panic or an
+            // early return that isn't the normal shutdown path. Without
+            // this, e.g. a panic inside `NetworkService::run` silently
+            // killed gossip/federation/backfill while REST/`/health` kept
+            // reporting "ok" and `peer_count` (written only by that task)
+            // froze — a "zombie node" invisible to monitoring on an
+            // unattended mainnet deployment. Falling through into the same
+            // unconditional shutdown/cleanup sequence below (rather than a
+            // separate code path) relies on both fleet deployment modes
+            // (systemd, Docker) restarting on process exit — a hard exit
+            // is also a strictly stronger signal (connection refused) than
+            // a `/health` flag a monitor might not be checking. Recording
+            // into `critical_task_failure` (checked at the end of this
+            // function) is what actually makes that exit non-zero.
+            // `&mut task` (not consuming the handle) matters: the existing
+            // `.abort()` calls below still run on whichever handle DIDN'T
+            // fire this branch, and calling `.abort()` on the one that DID
+            // is a harmless no-op on an already-completed task.
+            result = &mut network_task => {
+                let reason = match result {
+                    Ok(()) => "network task exited unexpectedly (not via shutdown)".to_string(),
+                    Err(e) => format!("network task panicked: {e}"),
+                };
+                error!(%reason, "shutting down");
+                critical_task_failure = Some(reason);
+            }
+            result = &mut chain_task => {
+                let reason = match result {
+                    Ok(()) => "chain scanner task exited unexpectedly (not via shutdown)".to_string(),
+                    Err(e) => format!("chain scanner task panicked: {e}"),
+                };
+                error!(%reason, "shutting down");
+                critical_task_failure = Some(reason);
+            }
+            result = &mut api_task => {
+                let reason = match result {
+                    Ok(()) => "API server task exited unexpectedly (not via shutdown)".to_string(),
+                    Err(e) => format!("API server task panicked: {e}"),
+                };
+                error!(%reason, "shutting down");
+                critical_task_failure = Some(reason);
             }
         }
 
@@ -1287,7 +1391,17 @@ impl Node {
         api_task.abort();
 
         info!("Node stopped");
-        Ok(())
+        // W17: an unexpected critical-task death must produce a non-zero
+        // process exit (`main.rs`'s `#[tokio::main] async fn main() ->
+        // Result<()>` turns a returned `Err` into exit code 1) — a clean
+        // `Ok(())` here would be indistinguishable from a normal SIGINT/
+        // SIGTERM shutdown to `systemd`'s `Restart=on-failure`, which does
+        // NOT restart on exit code 0. See the comment on
+        // `critical_task_failure`'s declaration above.
+        match critical_task_failure {
+            Some(reason) => anyhow::bail!("critical subsystem task failed: {reason}"),
+            None => Ok(()),
+        }
     }
 }
 
@@ -1428,4 +1542,54 @@ fn check_snapshot_apply_recovery(storage: Storage, db_path: &std::path::Path) ->
     );
 
     Ok(storage)
+}
+
+#[cfg(test)]
+mod supervised_task_tests {
+    //! Audit final pre-mainnet W17. `spawn_supervised`/`supervise_handle`'s
+    //! entire correctness rests on `JoinError::is_cancelled()` correctly
+    //! distinguishing an intentional `.abort()` (must NOT be logged as a
+    //! panic — every task is `.abort()`'d during normal shutdown) from a
+    //! genuine panic (must be logged). Prove that distinction directly
+    //! against real tokio tasks, rather than assuming library behavior.
+    use super::*;
+
+    #[tokio::test]
+    async fn genuine_panic_is_not_reported_as_cancelled() {
+        let handle = tokio::spawn(async {
+            panic!("boom");
+        });
+        let err = handle.await.expect_err("a panicking task must yield Err(JoinError)");
+        assert!(!err.is_cancelled(), "a genuine panic must not be classified as a cancellation");
+    }
+
+    #[tokio::test]
+    async fn intentional_abort_is_reported_as_cancelled() {
+        let handle = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        handle.abort();
+        let err = handle.await.expect_err("an aborted task must yield Err(JoinError)");
+        assert!(err.is_cancelled(), "an intentional .abort() must be classified as a cancellation, never logged as a panic");
+    }
+
+    #[tokio::test]
+    async fn spawn_supervised_abort_handle_can_still_abort_the_task() {
+        // Confirms the AbortHandle returned by spawn_supervised (not the
+        // JoinHandle, which the internal watcher task owns) genuinely
+        // controls the underlying task — this is the property
+        // `lamport_task.abort()`/`cleanup_task.abort()` at shutdown rely on.
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran2 = ran.clone();
+        let abort_handle = spawn_supervised("test_task", async move {
+            std::future::pending::<()>().await;
+            // Unreachable unless the abort fails to take effect.
+            ran2.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        abort_handle.abort();
+        // Give the runtime a moment to actually process the abort.
+        tokio::task::yield_now().await;
+        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(abort_handle.is_finished());
+    }
 }

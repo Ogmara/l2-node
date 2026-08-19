@@ -1983,11 +1983,26 @@ impl NetworkService {
                             // Defensive cap to prevent unbounded growth
                             if peers.len() < 1024 || peers.contains_key(&node_id) {
                                 peers.insert(node_id, ConnectedPeerInfo {
-                                    agent_version: if agent_ver.len() > 256 {
-                                        agent_ver[..256].to_string()
-                                    } else {
-                                        agent_ver
-                                    },
+                                    // Security Audit follow-up (W17, l2-node
+                                    // 0.102.0): `agent_ver` is raw,
+                                    // unauthenticated peer-supplied data from
+                                    // libp2p Identify — every fresh
+                                    // connection sends one, no PoW/auth
+                                    // gates it. A byte-range index
+                                    // (`agent_ver[..256]`) panics if 256
+                                    // doesn't land on a UTF-8 char boundary,
+                                    // trivially triggerable (255 ASCII bytes
+                                    // + one multi-byte codepoint). Before
+                                    // W17 this only killed the network task;
+                                    // W17's fail-fast design means the same
+                                    // panic now kills the whole process —
+                                    // this was a pre-existing bug whose
+                                    // blast radius W17 materially widened,
+                                    // so it's fixed alongside it.
+                                    // `truncate_str` (util.rs) is the
+                                    // existing char-boundary-safe pattern,
+                                    // already used elsewhere (chain/scanner.rs).
+                                    agent_version: crate::util::truncate_str(&agent_ver, 256).to_string(),
                                     source,
                                     peer_id: peer_id.to_base58(),
                                 });
