@@ -96,6 +96,14 @@ pub struct StateAnchorer {
     /// `None` when the operator runs with `alerts.enabled = false` —
     /// in that case the watcher logs but does not fire alerts.
     alert_event_tx: Option<AlertEventSender>,
+    /// Audit final pre-mainnet W35: shared with `ChainScanner`/
+    /// `MetadataReconciler`/`ScDiscovery` — see `ChainScanner::klever_health`'s
+    /// doc comment. Recorded once per successful anchor submission (this
+    /// module's own top-level tick, `interval_seconds`, default 1h) — coarser
+    /// than the chain scanner's signal (which ticks far more often and will
+    /// dominate the alert's actual responsiveness in practice), but still a
+    /// real, additional data point when it fires.
+    klever_health: Arc<AtomicU64>,
 }
 
 impl StateAnchorer {
@@ -113,6 +121,7 @@ impl StateAnchorer {
         divergence_counter: Arc<AtomicU32>,
         canonical_counter: Arc<AtomicU64>,
         alert_event_tx: Option<AlertEventSender>,
+        klever_health: Arc<AtomicU64>,
     ) -> Result<Self> {
         let sender_address = crypto::pubkey_to_address(&signing_key.verifying_key())
             .map_err(|e| anyhow::anyhow!("computing anchor wallet address: {}", e))?;
@@ -134,6 +143,7 @@ impl StateAnchorer {
             canonical_counter,
             divergence_observed: HashSet::new(),
             alert_event_tx,
+            klever_health,
         })
     }
 
@@ -513,6 +523,11 @@ impl StateAnchorer {
             Ok(tx_hash) => {
                 self.consecutive_failures = 0;
                 info!(tx_hash = %tx_hash, "State anchor submitted successfully");
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                self.klever_health.store(now_ms, Ordering::Relaxed);
                 false
             }
             Err(e) => {
@@ -914,6 +929,7 @@ mod tests {
             std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
             std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             None, // alert_event_tx — tests don't need the alert channel
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)), // klever_health
         )
         .unwrap();
 

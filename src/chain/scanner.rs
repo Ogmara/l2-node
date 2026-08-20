@@ -55,6 +55,16 @@ pub struct ChainScanner {
     /// source of chain-scan rate-limit amplification. `Mutex` for interior
     /// mutability (resolution runs on `&self`).
     slug_cache: std::sync::Mutex<std::collections::HashMap<String, u64>>,
+    /// Audit final pre-mainnet W35: shared millis-since-epoch of the last
+    /// successful Klever RPC call, read by `MetricsCollector` into
+    /// `MetricsSnapshot::klever_rpc_last_success_ms` for the
+    /// `KleverDisconnected` alert. Recorded once per successful `poll_blocks`
+    /// tick (which always makes at least one real RPC call —
+    /// `get_latest_block_height` — even when there's nothing new to
+    /// process), not at every individual HTTP call site: a full tick
+    /// succeeding is a faithful, single-point connectivity signal, cheaper
+    /// than instrumenting every low-level call.
+    klever_health: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl ChainScanner {
@@ -66,6 +76,7 @@ impl ChainScanner {
         config: KleverConfig,
         storage: Storage,
         channel_tx: tokio::sync::mpsc::UnboundedSender<u64>,
+        klever_health: std::sync::Arc<std::sync::atomic::AtomicU64>,
     ) -> Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
@@ -100,6 +111,7 @@ impl ChainScanner {
             consecutive_429s: 0,
             channel_tx,
             slug_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+            klever_health,
         })
     }
 
@@ -149,6 +161,13 @@ impl ChainScanner {
                             }
                             self.backoff = Duration::ZERO;
                             self.consecutive_429s = 0;
+                            // W35: a successful tick always makes at least
+                            // one real Klever RPC call.
+                            let now_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as u64;
+                            self.klever_health.store(now_ms, std::sync::atomic::Ordering::Relaxed);
                         }
                         Err(e) => {
                             let err_str = e.to_string();
@@ -567,9 +586,15 @@ impl ChainScanner {
                     };
                     serde_json::to_vec(&record)?
                 };
-                self.storage
-                    .put_cf(cf::CHANNELS, &channel_key, &bytes)?;
                 if is_new {
+                    // Code Audit WARNING #2 fix: the row write and the pending
+                    // member-removal-claim replay must be ONE
+                    // `channel_membership_lock`-guarded critical section — see
+                    // `put_channel_and_replay_pending_member_removals`'s doc
+                    // comment for the orphaned-claim race this closes.
+                    self.storage
+                        .put_channel_and_replay_pending_member_removals(channel_id, &bytes)?;
+
                     self.storage.increment_stat(
                         crate::storage::schema::state_keys::TOTAL_CHANNELS,
                     )?;
@@ -615,6 +640,9 @@ impl ChainScanner {
                     // it still triggers `maybe_trigger_backfill`'s peer fanout).
                     let _ = self.channel_tx.send(channel_id);
                     info!(channel_id, slug = %slug, "Channel created (on-chain)");
+                } else {
+                    self.storage
+                        .put_cf(cf::CHANNELS, &channel_key, &bytes)?;
                 }
             }
 

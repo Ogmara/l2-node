@@ -43,8 +43,6 @@ pub const MAX_REASON: usize = 256;
 pub const MAX_REPOST_COMMENT: usize = 512;
 /// Maximum website URL length (256 chars).
 pub const MAX_WEBSITE_URL: usize = 256;
-/// Maximum content request limit (per spec 5.5.2).
-pub const MAX_CONTENT_REQUEST_LIMIT: u32 = 500;
 /// Maximum channel tags.
 pub const MAX_CHANNEL_TAGS: usize = 5;
 /// Maximum pinned messages per channel.
@@ -689,20 +687,6 @@ pub fn validate_channel_invite(p: &ChannelInvitePayload) -> Result<(), Validatio
                 "anchor_node must not point to private/internal addresses".into(),
             ));
         }
-    }
-    Ok(())
-}
-
-/// Validate a content request payload.
-pub fn validate_content_request(p: &ContentRequest) -> Result<(), ValidationError> {
-    if p.limit > MAX_CONTENT_REQUEST_LIMIT {
-        return Err(ValidationError(format!(
-            "content request limit too large: {} > {}",
-            p.limit, MAX_CONTENT_REQUEST_LIMIT
-        )));
-    }
-    if p.limit == 0 {
-        return Err(ValidationError("content request limit must be > 0".into()));
     }
     Ok(())
 }

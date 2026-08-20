@@ -392,6 +392,115 @@ fn reap_channel_delete_claims(storage: &Storage, pending_retention_hours: u64) {
     }
 }
 
+/// Pending-channel-member-removal-claim reaper batch cap (W18 residual) —
+/// same numbers as `CHANNEL_DELETE_CLAIM_REAP_BATCH_LIMIT`/`_MAX_ROWS_EXAMINED`,
+/// same rationale (`ChannelKick`/`Ban`/`Leave` also require on-chain-verified
+/// identity and sit in low-frequency rate categories, so this CF also grows
+/// slowly; the cap is a backlog-drain safety net, not a routinely-hit limit).
+const CHANNEL_MEMBER_REMOVAL_REAP_BATCH_LIMIT: usize = 2_000;
+const CHANNEL_MEMBER_REMOVAL_REAP_MAX_ROWS_EXAMINED: usize = 20_000;
+
+/// Pure planning step for the pending-channel-member-removal-claim reaper
+/// (W18 residual, found + fixed 2026-08-19). Structurally identical to
+/// `plan_channel_delete_claim_reap` but the value is a raw 8-byte BE
+/// `requested_at` (no JSON — see `PENDING_CHANNEL_MEMBER_REMOVALS`'s schema
+/// doc comment), not a JSON record. Same "no never-delete invariant" shape:
+/// an expired, still-unclaimed pending row just means a legitimately-late
+/// `ChannelCreate` won't have this removal replayed against it — acceptable
+/// same as the sibling reaper's own reasoning.
+fn plan_channel_member_removal_reap(
+    rows: &[(Vec<u8>, Vec<u8>)],
+    cutoff_ms: u64,
+    batch_limit: usize,
+) -> (Vec<Vec<u8>>, Option<Vec<u8>>) {
+    if rows.is_empty() {
+        return (Vec::new(), None);
+    }
+    let mut to_delete = Vec::new();
+    let mut last_key: &[u8] = &rows[0].0;
+    for (key, value) in rows {
+        // Only advance `last_key` for rows actually examined this iteration
+        // (feedback_backend_rust_patterns cursor-correctness lesson).
+        if to_delete.len() >= batch_limit {
+            break;
+        }
+        last_key = key;
+        let Ok(ts_bytes) = <[u8; 8]>::try_from(value.as_slice()) else {
+            continue; // malformed value — not this reaper's job to fix
+        };
+        let requested_at = u64::from_be_bytes(ts_bytes);
+        if requested_at < cutoff_ms {
+            to_delete.push(key.clone());
+        }
+    }
+    let mut next_cursor = last_key.to_vec();
+    next_cursor.push(0); // sorts immediately after `last_key` itself
+    (to_delete, Some(next_cursor))
+}
+
+/// Pending-channel-member-removal-claim reaper (W18 residual, l2-node
+/// 0.108.0+): sweeps `PENDING_CHANNEL_MEMBER_REMOVALS` for claims older than
+/// `[channel_member_removal] pending_retention_hours`, deleting them. A claim
+/// is recorded when a `ChannelKick`/`Ban`/`Leave` arrives for a `channel_id`
+/// this node doesn't know about yet — normally consumed the moment the
+/// channel is actually created (see
+/// `Storage::take_pending_channel_member_removals` and its two call sites);
+/// this reaper only cleans up claims that were never consumed because no
+/// matching create ever arrived.
+fn reap_channel_member_removal_claims(storage: &Storage, pending_retention_hours: u64) {
+    if pending_retention_hours == 0 {
+        return;
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let cutoff_ms = now_ms.saturating_sub(pending_retention_hours.saturating_mul(3_600_000));
+    let cursor = storage
+        .get_cf(
+            crate::storage::schema::cf::NODE_STATE,
+            state_keys::CHANNEL_MEMBER_REMOVAL_REAP_CURSOR,
+        )
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let rows = match storage.iter_cf_from(
+        crate::storage::schema::cf::PENDING_CHANNEL_MEMBER_REMOVALS,
+        &cursor,
+        &[],
+        CHANNEL_MEMBER_REMOVAL_REAP_MAX_ROWS_EXAMINED,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(error = %e, "reap_channel_member_removal_claims: scan failed");
+            return;
+        }
+    };
+    let (to_delete, next_cursor) = plan_channel_member_removal_reap(
+        &rows,
+        cutoff_ms,
+        CHANNEL_MEMBER_REMOVAL_REAP_BATCH_LIMIT,
+    );
+    for key in &to_delete {
+        let _ = storage.delete_cf(crate::storage::schema::cf::PENDING_CHANNEL_MEMBER_REMOVALS, key);
+    }
+    match next_cursor {
+        Some(nc) => {
+            let _ = storage.put_cf(
+                crate::storage::schema::cf::NODE_STATE,
+                state_keys::CHANNEL_MEMBER_REMOVAL_REAP_CURSOR,
+                &nc,
+            );
+        }
+        None => {
+            let _ = storage.delete_cf(
+                crate::storage::schema::cf::NODE_STATE,
+                state_keys::CHANNEL_MEMBER_REMOVAL_REAP_CURSOR,
+            );
+        }
+    }
+}
+
 /// Spawns `fut`, plus a lightweight second task that awaits its completion
 /// purely to surface a genuine panic through structured logging (audit
 /// final pre-mainnet W17). tokio's default panic hook only prints to raw
@@ -985,12 +1094,25 @@ impl Node {
             }
         }
 
+        // Audit final pre-mainnet W35: shared millis-since-epoch of the last
+        // successful Klever RPC call, written by ChainScanner/StateAnchorer/
+        // MetadataReconciler/ScDiscovery, read by MetricsCollector into
+        // MetricsSnapshot::klever_rpc_last_success_ms for the
+        // KleverDisconnected alert. `0` (never succeeded) is a meaningful
+        // initial value — the alert fires from cold start until the first
+        // success, same as the existing `ipfs_connected` check's own
+        // "not yet confirmed = unreachable" default. Declared here (before
+        // the chain scanner spawn below) since it's the first of the 4
+        // Klever-calling tasks to start.
+        let klever_health = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
         // Start chain scanner
         let chain_config = self.config.klever.clone();
         let chain_storage = self.storage.clone();
         let chain_shutdown_rx = self.shutdown_rx();
+        let chain_klever_health = klever_health.clone();
         let mut chain_task = tokio::spawn(async move {
-            match crate::chain::scanner::ChainScanner::new(chain_config, chain_storage, channel_tx) {
+            match crate::chain::scanner::ChainScanner::new(chain_config, chain_storage, channel_tx, chain_klever_health) {
                 Ok(mut scanner) => scanner.run(chain_shutdown_rx).await,
                 Err(e) => warn!(error = %e, "Failed to start chain scanner"),
             }
@@ -1126,6 +1248,7 @@ impl Node {
             let anchor_node_id = self.node_id.clone();
             let anchor_divergence_for_task = anchor_divergence_counter.clone();
             let anchor_canonical_for_task = anchor_canonical_counter.clone();
+            let anchor_klever_health = klever_health.clone();
 
             // Resolve wallet key: env var > config file > node identity key.
             // Both candidate sources are wrapped in `SecretString` so the
@@ -1148,12 +1271,20 @@ impl Node {
                     let hex_str = secret.expose_secret();
                     let mut bytes = hex::decode(hex_str)
                         .context("decoding anchor wallet key hex")?;
-                    let mut key_bytes: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
-                        anyhow::anyhow!(
-                            "anchor wallet key must be 32 bytes, got {}",
-                            bytes.len()
-                        )
-                    })?;
+                    // Security Audit NOTE-2 fix (same gap independently
+                    // flagged in `alert_channel.rs::load_alert_signing_key`):
+                    // check the length BEFORE building `key_bytes`, zeroizing
+                    // `bytes` on EITHER exit path. `try_into().map_err(...)?`
+                    // used to return on a length mismatch before reaching the
+                    // `fill(0)` below, leaving decoded secret bytes
+                    // unzeroized in the `Vec` its `Drop` then just frees as-is.
+                    if bytes.len() != 32 {
+                        let len = bytes.len();
+                        bytes.fill(0);
+                        anyhow::bail!("anchor wallet key must be 32 bytes, got {len}");
+                    }
+                    let mut key_bytes: [u8; 32] =
+                        bytes.as_slice().try_into().expect("length checked above");
                     let key = SigningKey::from_bytes(&key_bytes);
                     // Zeroize BOTH the decoded `bytes` Vec AND the
                     // intermediate `[u8; 32]` array — neither is wrapped
@@ -1191,6 +1322,7 @@ impl Node {
                     anchor_divergence_for_task,
                     anchor_canonical_for_task,
                     anchor_alert_for_task,
+                    anchor_klever_health,
                 ) {
                     Ok(mut anchorer) => anchorer.run(anchor_shutdown_rx, trigger_rx).await,
                     Err(e) => warn!(error = %e, "Failed to start state anchorer"),
@@ -1254,6 +1386,7 @@ impl Node {
             pow_manager.clone(),
             klever_network.clone(),
             self.config.dm.max_stored_messages_per_recipient,
+            network_counters.clone(),
         );
 
         // Start metrics collector (spec 10-dashboard.md §6)
@@ -1269,6 +1402,8 @@ impl Node {
             self.config.klever.api_url.clone(),
             node_address.clone(),
             anchor_divergence_counter.clone(),
+            self.config.storage.max_db_size_gb,
+            klever_health.clone(),
         );
         let metrics_latest = metrics_collector.latest_handle();
         let metrics_history = metrics_collector.history_handle();
@@ -1292,11 +1427,80 @@ impl Node {
         // `anchor_alert_tx`/`sc_alert_tx` handles passed to background
         // tasks were already gated to `None`, so they no-op cleanly.
         if self.config.alerts.enabled {
+            // Audit final pre-mainnet W34: build the Ogmara-channel alert
+            // dispatcher when configured. Every failure mode here degrades
+            // gracefully to `None` (alert dispatch just skips this one
+            // channel) rather than failing node startup — same tolerance
+            // as anchoring/IPFS misconfiguration elsewhere in this function.
+            let channel_dispatcher = if self.config.alerts.ogmara_channel.enabled {
+                match crate::notifications::alert_channel::load_alert_signing_key(
+                    &self.config.alerts.ogmara_channel,
+                ) {
+                    Ok(Some(key)) => {
+                        match crate::crypto::pubkey_to_address(&key.verifying_key()) {
+                            Ok(derived_address)
+                                if derived_address == self.config.alerts.ogmara_channel.wallet_address =>
+                            {
+                                Some(crate::notifications::alert_channel::AlertChannelDispatcher::new(
+                                    self.storage.clone(),
+                                    identity.clone(),
+                                    gossip_tx.clone(),
+                                    klever_network.clone(),
+                                    key,
+                                    derived_address,
+                                    self.config.alerts.ogmara_channel.channel_id,
+                                    network_counters.clone(),
+                                ))
+                            }
+                            Ok(derived_address) => {
+                                warn!(
+                                    configured = %self.config.alerts.ogmara_channel.wallet_address,
+                                    derived = %derived_address,
+                                    "ogmara_channel alert signing key's derived address does not \
+                                     match configured wallet_address — disabling this dispatch \
+                                     channel rather than posting as the wrong identity"
+                                );
+                                None
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "failed to derive address from ogmara_channel alert signing key");
+                                None
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        warn!(
+                            "alerts.ogmara_channel.enabled = true but no signing key configured \
+                             (set OGMARA_ALERT_SIGNING_KEY or signing_key_path) — disabling this \
+                             dispatch channel"
+                        );
+                        None
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "failed to load ogmara_channel alert signing key — disabling this dispatch channel");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            // Code Audit WARNING #4: same "Klever configured" predicate
+            // `ChainScanner::run` already uses to no-op an unconfigured
+            // isolated-subnet node — gates `KleverDisconnected` so it can't
+            // permanently false-positive on a node that never makes a
+            // Klever RPC call in the first place.
+            let klever_configured = !self.config.klever.node_url.is_empty()
+                && !self.config.klever.api_url.is_empty()
+                && !self.config.klever.contract_address.is_empty();
             let mut alert_engine =
                 crate::notifications::alerts::AlertEngine::new(
                     self.config.alerts.clone(),
                     self.node_id.clone(),
                     alert_event_rx,
+                    self.config.anchoring.interval_seconds,
+                    channel_dispatcher,
+                    klever_configured,
                 );
             alert_engine.set_history(alert_history.clone());
             let alert_metrics = metrics_latest.clone();
@@ -1364,6 +1568,7 @@ impl Node {
             let sc_disc_bootstrap_empty = self.config.network.bootstrap_nodes.is_empty();
             let sc_disc_max_candidates =
                 self.config.network.sc_discovery.max_candidates as usize;
+            let sc_disc_klever_health = klever_health.clone();
             spawn_supervised("sc_discovery", async move {
                 match crate::network::sc_discovery::ScDiscovery::new(
                     sc_disc_klever_url,
@@ -1381,6 +1586,7 @@ impl Node {
                     sc_disc_retry_interval,
                     sc_disc_bootstrap_empty,
                     sc_disc_max_candidates,
+                    sc_disc_klever_health,
                 ) {
                     Ok(disc) => disc.run(sc_disc_shutdown_rx).await,
                     Err(e) => warn!(error = %e, "Failed to start sc_discovery"),
@@ -1416,6 +1622,7 @@ impl Node {
                 None
             };
             let recon_shutdown_rx = self.shutdown_rx();
+            let recon_klever_health = klever_health.clone();
             spawn_supervised("metadata_reconciler", async move {
                 match crate::chain::metadata_reconcile::MetadataReconciler::new(
                     recon_klever_url,
@@ -1428,6 +1635,7 @@ impl Node {
                     recon_tor_cfg,
                     recon_drift,
                     recon_alert_tx,
+                    recon_klever_health,
                 ) {
                     Ok(recon) => recon.run(recon_shutdown_rx).await,
                     Err(e) => warn!(error = %e, "Failed to start metadata_reconcile"),
@@ -1695,6 +1903,32 @@ impl Node {
                         reap_channel_delete_claims(&channel_delete_reap_storage, channel_delete_pending_retention_hours);
                     }
                     _ = channel_delete_reap_shutdown_rx.recv() => break,
+                }
+            }
+        });
+
+        // Pending-channel-member-removal-claim reaper (W18 residual, found +
+        // fixed 2026-08-19): own interval, same reasoning as the reapers above.
+        let channel_member_removal_reap_storage = self.storage.clone();
+        let channel_member_removal_pending_retention_hours =
+            self.config.channel_member_removal.pending_retention_hours;
+        let channel_member_removal_reap_interval_secs =
+            self.config.channel_member_removal.reap_interval_secs;
+        let mut channel_member_removal_reap_shutdown_rx = self.shutdown_rx();
+        spawn_supervised("channel_member_removal_claim_reaper", async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+                channel_member_removal_reap_interval_secs.max(1),
+            ));
+            interval.tick().await; // skip immediate tick
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        reap_channel_member_removal_claims(
+                            &channel_member_removal_reap_storage,
+                            channel_member_removal_pending_retention_hours,
+                        );
+                    }
+                    _ = channel_member_removal_reap_shutdown_rx.recv() => break,
                 }
             }
         });
@@ -2280,5 +2514,65 @@ mod channel_delete_claim_reaper_tests {
         assert!(to_delete.is_empty());
         let cursor = next_cursor.expect("cursor must still advance to make forward progress");
         assert!(cursor > rows[0].0);
+    }
+}
+
+#[cfg(test)]
+mod channel_member_removal_reaper_tests {
+    //! W18 residual, found + fixed 2026-08-19. Covers the pure planning
+    //! logic factored out of `reap_channel_member_removal_claims`. Same
+    //! shape as `channel_delete_claim_reaper_tests`, except the value is a
+    //! raw 8-byte BE timestamp (no JSON) — see
+    //! `PENDING_CHANNEL_MEMBER_REMOVALS`'s schema doc comment.
+    use super::*;
+
+    fn row(channel_id: u64, address: &str, requested_at: u64) -> (Vec<u8>, Vec<u8>) {
+        (
+            crate::storage::schema::encode_channel_member_key(channel_id, address),
+            requested_at.to_be_bytes().to_vec(),
+        )
+    }
+
+    #[test]
+    fn deletes_only_expired_rows() {
+        let rows = vec![
+            row(1, "klv1alice", 100), // expired
+            row(1, "klv1bob", 200),   // not expired
+        ];
+        let (to_delete, _) = plan_channel_member_removal_reap(&rows, 150, 100);
+        assert_eq!(to_delete.len(), 1);
+        assert_eq!(to_delete[0], rows[0].0);
+    }
+
+    #[test]
+    fn malformed_value_is_skipped_never_deleted() {
+        let rows = vec![(
+            crate::storage::schema::encode_channel_member_key(1, "klv1alice"),
+            b"not-8-bytes".to_vec(),
+        )];
+        let (to_delete, _) = plan_channel_member_removal_reap(&rows, u64::MAX, 100);
+        assert!(to_delete.is_empty());
+    }
+
+    #[test]
+    fn respects_batch_limit_and_cursor_never_skips_an_unexamined_row() {
+        let rows: Vec<_> = (0..10u64)
+            .map(|i| row(1, &format!("klv1addr{i}"), 0))
+            .collect();
+        let (to_delete, next_cursor) = plan_channel_member_removal_reap(&rows, 1000, 3);
+        assert_eq!(to_delete.len(), 3);
+        let expected_cursor = {
+            let mut c = rows[2].0.clone();
+            c.push(0);
+            c
+        };
+        assert_eq!(next_cursor, Some(expected_cursor));
+    }
+
+    #[test]
+    fn empty_batch_returns_none_cursor() {
+        let (to_delete, next_cursor) = plan_channel_member_removal_reap(&[], 1000, 100);
+        assert!(to_delete.is_empty());
+        assert!(next_cursor.is_none());
     }
 }

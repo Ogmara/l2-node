@@ -164,6 +164,10 @@ pub struct ScDiscovery {
     /// preserving the larger candidate pool for the steady-state 1h
     /// refresh (which uses `usize::MAX` as cap).
     cold_start_max_candidates: usize,
+    /// Audit final pre-mainnet W35: shared with `ChainScanner`/
+    /// `StateAnchorer`/`MetadataReconciler` — see
+    /// `ChainScanner::klever_health`'s doc comment.
+    klever_health: Arc<AtomicU64>,
 }
 
 impl ScDiscovery {
@@ -181,6 +185,7 @@ impl ScDiscovery {
         cold_start_retry_interval: Duration,
         bootstrap_nodes_empty: bool,
         cold_start_max_candidates: usize,
+        klever_health: Arc<AtomicU64>,
     ) -> anyhow::Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
@@ -215,6 +220,7 @@ impl ScDiscovery {
             cold_start_retry_interval,
             bootstrap_nodes_empty,
             cold_start_max_candidates,
+            klever_health,
         })
     }
 
@@ -412,6 +418,11 @@ impl ScDiscovery {
             .await
             {
                 Ok(page) => {
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    self.klever_health.store(now_ms, Ordering::Relaxed);
                     let page_len = page.len();
                     if page_len == 0 {
                         break;

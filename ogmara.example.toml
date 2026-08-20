@@ -283,6 +283,15 @@ pending_retention_hours = 24
 # How often the reaper sweeps for expired pending claims.
 reap_interval_secs = 3600
 
+[channel_member_removal]
+# Pending channel-member-removal-claim retention (W18 residual, l2-node 0.108.0+)
+# Hours a pending removal claim (recorded when a Kick/Ban/Leave arrives
+# before this node knows the channel) is retained before the reaper
+# expires it unclaimed. 0 = unlimited.
+pending_retention_hours = 24
+# How often the reaper sweeps for expired pending claims.
+reap_interval_secs = 3600
+
 [push_gateway]
 enabled = false
 url = ""

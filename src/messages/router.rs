@@ -62,6 +62,7 @@ enum RateCategory {
     PinUnpin,          // 20 per hour
     KeyVault,          // 10 per minute (E2E vault — debounced LWW republish)
     DeviceEnc,         // 10 per hour (audit final pre-mainnet W15)
+    ChannelMembership, // 20 per hour (join/leave — audit final pre-mainnet Code Audit CRITICAL #1)
     Other,             // fallback: 100 per minute
 }
 
@@ -90,6 +91,16 @@ impl RateCategory {
             // configuring several devices in one sitting while cutting the abuse
             // ceiling ~600x (144,000/day → 240/day).
             Self::DeviceEnc => (10, 3_600_000),
+            // Audit final pre-mainnet Code Audit CRITICAL #1: ChannelLeave has no
+            // `requires_verified_identity()` gate and previously fell into `Other`'s
+            // 100/min, letting a single wallet mint up to 144,000/day
+            // `PENDING_CHANNEL_MEMBER_REMOVALS` rows (one per Leave against an
+            // as-yet-unknown channel_id) — ~3x the reaper's drain ceiling of
+            // 48,000/day (`CHANNEL_MEMBER_REMOVAL_REAP_BATCH_LIMIT` 2,000 rows/hour,
+            // node.rs). Real join/leave activity is bursty-but-rare per wallet; 20/hour
+            // is generous headroom while capping worst-case growth at 480/day/wallet,
+            // well under the reaper's throughput.
+            Self::ChannelMembership => (20, 3_600_000),
             Self::Other => (100, 60_000),
         }
     }
@@ -114,6 +125,7 @@ impl RateCategory {
             MessageType::ChannelPinMessage | MessageType::ChannelUnpinMessage => Self::PinUnpin,
             MessageType::KeyVaultSync => Self::KeyVault,
             MessageType::DeviceEncBinding | MessageType::DeviceEncRevoke => Self::DeviceEnc,
+            MessageType::ChannelJoin | MessageType::ChannelLeave => Self::ChannelMembership,
             _ => Self::Other,
         }
     }
@@ -205,6 +217,11 @@ pub struct MessageRouter {
     /// happens in Step 8, after the reservation), so contention cost is
     /// negligible relative to the rest of the pipeline.
     dm_recipient_cap_lock: std::sync::Mutex<()>,
+    /// Shared with `NetworkService`/`MetricsCollector`/`AppState` (audit
+    /// final pre-mainnet W35) — used here only to increment
+    /// `failed_signature_verifications` on a Step 4b rejection, feeding the
+    /// `FailedSignatureSpike` alert.
+    counters: Arc<crate::metrics::counters::NetworkCounters>,
 }
 
 /// Rejection reason for step 4d (tiered identity). Shared with
@@ -252,6 +269,7 @@ impl MessageRouter {
         pow: Option<Arc<crate::pow::PowManager>>,
         network: String,
         dm_recipient_cap: usize,
+        counters: Arc<crate::metrics::counters::NetworkCounters>,
     ) -> Self {
         Self {
             storage,
@@ -261,6 +279,7 @@ impl MessageRouter {
             network,
             dm_recipient_cap,
             dm_recipient_cap_lock: std::sync::Mutex::new(()),
+            counters,
         }
     }
 
@@ -293,6 +312,38 @@ impl MessageRouter {
             return RouteResult::Invalid(format!("invalid envelope: {}", e));
         }
 
+        // Step 2b: Reject envelope-pipeline-ineligible network types (Security
+        // Audit follow-up, audit final pre-mainnet W8 removal). `Ping`/`Pong`/
+        // `StateRoot`/`SyncRequest`/`SyncResponse` have no dedicated payload
+        // type, no apply arm, and no legitimate reason to ever be
+        // client-submitted or gossip-relayed as an `Envelope` — the real
+        // ping/pong/sync mechanisms are separate libp2p protocols entirely
+        // (`network::sync::SyncRequest` etc, NOT this MessageType). Before
+        // this session, `SyncRequest` (0xF3) at least had to decode as the
+        // narrow `ContentRequest` struct to pass validation; removing that
+        // dead type (W8) left it — and its siblings, which already had this
+        // gap — falling to the generic `Raw` catchall with NO payload shape
+        // or size validation, `is_network()` making them exempt from
+        // per-wallet rate limiting, and unconditional permanent storage on
+        // `Accepted`. `NodeAnnouncement` (0xE0) is the ONLY `is_network()`
+        // type with real handling (dedicated payload, apply arm) and is
+        // deliberately NOT included here — this check is enumerated, not a
+        // blanket `is_network()` reject, specifically so it doesn't break
+        // legitimate NodeAnnouncement gossip relay.
+        if matches!(
+            envelope.msg_type,
+            MessageType::Ping
+                | MessageType::Pong
+                | MessageType::StateRoot
+                | MessageType::SyncRequest
+                | MessageType::SyncResponse
+        ) {
+            return RouteResult::Invalid(format!(
+                "{:?} is not a valid envelope-pipeline message type",
+                envelope.msg_type
+            ));
+        }
+
         // Step 3: Check duplicate
         match self.storage.message_exists(&envelope.msg_id) {
             Ok(true) => return RouteResult::Duplicate,
@@ -307,6 +358,10 @@ impl MessageRouter {
 
         // Step 4b: Verify Ed25519 signature (against device/signing key)
         if let Err(e) = self.verify_signature(&envelope) {
+            // Audit final pre-mainnet W35: dedicated counter (isolated from
+            // the broader `failed_validations` bucket) feeding the
+            // `FailedSignatureSpike` alert.
+            self.counters.inc_failed_signature_verifications();
             return RouteResult::Invalid(format!("signature verification failed: {}", e));
         }
 
@@ -417,6 +472,13 @@ impl MessageRouter {
         if !is_sync && envelope.msg_type.requires_registration() {
             let category = RateCategory::from_msg_type(envelope.msg_type);
             if self.is_rate_limited(&resolved_author, category, now_ms) {
+                // Code Audit NOTE #6: `HighRateLimitTriggers` (W35) only
+                // observed HTTP-layer 429s (`GovernorLayer::error_handler`,
+                // W36) — this router-level, per-wallet-per-category limit is
+                // a separate, lower rejection point that counter never saw.
+                // Same counter, so the alert's rate-delta check now reflects
+                // both sources.
+                self.counters.inc_rate_limited();
                 return RouteResult::Rejected(format!("rate limited ({:?})", category));
             }
         }
@@ -971,9 +1033,6 @@ impl MessageRouter {
                 }
                 DeserializedPayload::NewsRepost(ref p) => {
                     validation::validate_news_repost(resolved_author, p)
-                }
-                DeserializedPayload::ContentRequest(ref p) => {
-                    validation::validate_content_request(p)
                 }
                 DeserializedPayload::DirectMessage(ref p) => {
                     validation::validate_direct_message(resolved_author, p)
@@ -2141,7 +2200,16 @@ impl MessageRouter {
                         });
                         let meta_bytes = serde_json::to_vec(&meta)
                             .context("serializing channel metadata")?;
-                        self.storage.put_cf(schema::cf::CHANNELS, &key, &meta_bytes)?;
+                        // Code Audit WARNING #2 fix: the row write and the pending
+                        // member-removal-claim replay must be ONE
+                        // `channel_membership_lock`-guarded critical section — see
+                        // `put_channel_and_replay_pending_member_removals`'s doc
+                        // comment for the orphaned-claim race this closes.
+                        self.storage
+                            .put_channel_and_replay_pending_member_removals(
+                                payload.channel_id,
+                                &meta_bytes,
+                            )?;
                         self.storage
                             .increment_stat(schema::state_keys::TOTAL_CHANNELS)?;
 
@@ -3531,7 +3599,7 @@ mod enc_supersede_tests {
         let storage = Storage::open(dir.path()).unwrap();
         let identity = IdentityResolver::new(storage.clone());
         (
-            MessageRouter::new(storage, identity, None, "testnet".to_string(), usize::MAX),
+            MessageRouter::new(storage, identity, None, "testnet".to_string(), usize::MAX, std::sync::Arc::new(crate::metrics::counters::NetworkCounters::new())),
             dir,
         )
     }
@@ -3665,7 +3733,7 @@ mod enc_supersede_tests {
         let storage = Storage::open(dir.path()).unwrap();
         let identity = IdentityResolver::new(storage.clone());
         (
-            MessageRouter::new(storage, identity, None, "mainnet".to_string(), usize::MAX),
+            MessageRouter::new(storage, identity, None, "mainnet".to_string(), usize::MAX, std::sync::Arc::new(crate::metrics::counters::NetworkCounters::new())),
             dir,
         )
     }
@@ -3803,7 +3871,7 @@ mod cross_node_ban_kick_tests {
         let storage = Storage::open(dir.path()).unwrap();
         let identity = IdentityResolver::new(storage.clone());
         (
-            MessageRouter::new(storage, identity, None, "testnet".to_string(), usize::MAX),
+            MessageRouter::new(storage, identity, None, "testnet".to_string(), usize::MAX, std::sync::Arc::new(crate::metrics::counters::NetworkCounters::new())),
             dir,
         )
     }
@@ -4000,7 +4068,7 @@ mod channel_delete_before_create_tests {
         let storage = Storage::open(dir.path()).unwrap();
         let identity = IdentityResolver::new(storage.clone());
         (
-            MessageRouter::new(storage, identity, None, "testnet".to_string(), usize::MAX),
+            MessageRouter::new(storage, identity, None, "testnet".to_string(), usize::MAX, std::sync::Arc::new(crate::metrics::counters::NetworkCounters::new())),
             dir,
         )
     }
@@ -4237,7 +4305,7 @@ mod dm_reaction_tests {
         let storage = Storage::open(dir.path()).unwrap();
         let identity = IdentityResolver::new(storage.clone());
         (
-            MessageRouter::new(storage, identity, None, "testnet".to_string(), usize::MAX),
+            MessageRouter::new(storage, identity, None, "testnet".to_string(), usize::MAX, std::sync::Arc::new(crate::metrics::counters::NetworkCounters::new())),
             dir,
         )
     }
@@ -4482,7 +4550,7 @@ mod channel_mute_unmute_tests {
         let storage = Storage::open(dir.path()).unwrap();
         let identity = IdentityResolver::new(storage.clone());
         (
-            MessageRouter::new(storage, identity, None, "testnet".to_string(), usize::MAX),
+            MessageRouter::new(storage, identity, None, "testnet".to_string(), usize::MAX, std::sync::Arc::new(crate::metrics::counters::NetworkCounters::new())),
             dir,
         )
     }
@@ -4730,7 +4798,7 @@ mod edit_delete_index_tests {
         let storage = Storage::open(dir.path()).unwrap();
         let identity = IdentityResolver::new(storage.clone());
         (
-            MessageRouter::new(storage, identity, None, "testnet".to_string(), usize::MAX),
+            MessageRouter::new(storage, identity, None, "testnet".to_string(), usize::MAX, std::sync::Arc::new(crate::metrics::counters::NetworkCounters::new())),
             dir,
         )
     }
@@ -5082,7 +5150,7 @@ mod dm_recipient_cap_tests {
         let storage = Storage::open(dir.path()).unwrap();
         let identity = IdentityResolver::new(storage.clone());
         (
-            MessageRouter::new(storage, identity, None, "testnet".to_string(), cap),
+            MessageRouter::new(storage, identity, None, "testnet".to_string(), cap, std::sync::Arc::new(crate::metrics::counters::NetworkCounters::new())),
             dir,
         )
     }
@@ -5241,6 +5309,103 @@ mod dm_recipient_cap_tests {
             r.storage.get_dm_recipient_count(recipient.as_bytes()).unwrap(),
             cap as u64,
             "the persisted counter must never exceed the cap under concurrent load"
+        );
+    }
+}
+
+#[cfg(test)]
+mod rate_limit_counter_tests {
+    //! Code Audit NOTE #6: the router's own Step 6 rate-limit rejection must
+    //! increment the shared `NetworkCounters` — not just the HTTP-layer 429
+    //! path (`GovernorLayer::error_handler`, W36) — so `HighRateLimitTriggers`
+    //! (W35) sees both rejection sources, not only requests that never made
+    //! it past the axum layer.
+    use super::*;
+    use tempfile::TempDir;
+
+    fn router() -> (
+        MessageRouter,
+        TempDir,
+        std::sync::Arc<crate::metrics::counters::NetworkCounters>,
+    ) {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let identity = IdentityResolver::new(storage.clone());
+        let counters = std::sync::Arc::new(crate::metrics::counters::NetworkCounters::new());
+        (
+            MessageRouter::new(
+                storage,
+                identity,
+                None,
+                "testnet".to_string(),
+                usize::MAX,
+                counters.clone(),
+            ),
+            dir,
+            counters,
+        )
+    }
+
+    fn now_ms() -> u64 {
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
+    }
+
+    fn signed_channel_leave_envelope(
+        sk: &ed25519_dalek::SigningKey,
+        channel_id: u64,
+        timestamp: u64,
+    ) -> Vec<u8> {
+        let author = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        let payload = ChannelLeavePayload { channel_id };
+        let payload_bytes = rmp_serde::to_vec_named(&payload).unwrap();
+        let author_pubkey: [u8; 32] = sk.verifying_key().to_bytes();
+        let msg_id = crypto::compute_msg_id("testnet", &author_pubkey, &payload_bytes, timestamp);
+        let signature = signing::sign_ogmara_message(
+            sk,
+            "testnet",
+            crate::messages::envelope::PROTOCOL_VERSION,
+            MessageType::ChannelLeave as u8,
+            &msg_id,
+            timestamp,
+            &payload_bytes,
+        );
+        let envelope = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::ChannelLeave,
+            msg_id,
+            author,
+            timestamp,
+            lamport_ts: 0,
+            payload: payload_bytes,
+            signature: signature.to_bytes().to_vec(),
+            relay_path: vec![],
+        };
+        rmp_serde::to_vec_named(&envelope).unwrap()
+    }
+
+    #[test]
+    fn router_level_rate_limit_rejection_increments_shared_counter() {
+        let (r, _dir, counters) = router();
+        let sk = crypto::generate_keypair();
+        let channel_id = 4242u64;
+        let base = now_ms();
+
+        // `RateCategory::ChannelMembership` (Code Audit CRITICAL #1 fix) caps
+        // ChannelJoin/ChannelLeave at 20/hour — send 21 distinct-msg_id
+        // ChannelLeave envelopes from the SAME wallet within the same window.
+        let mut last_result = None;
+        for i in 0..21u64 {
+            let raw = signed_channel_leave_envelope(&sk, channel_id, base + i);
+            last_result = Some(r.process_message(&raw));
+        }
+        assert!(
+            matches!(last_result, Some(RouteResult::Rejected(ref reason)) if reason.contains("rate limited")),
+            "the 21st ChannelLeave from the same wallet within the hour must be rate limited"
+        );
+        assert!(
+            counters.snapshot().rate_limited_requests >= 1,
+            "the router's own rate-limit rejection must increment the shared counter, \
+             not just the HTTP-layer 429 path (Code Audit NOTE #6)"
         );
     }
 }

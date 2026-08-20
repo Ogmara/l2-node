@@ -277,14 +277,26 @@ pub fn build_response(
     now_unix: u64,
 ) -> ReconcileResponse {
     // Security Audit C1 (0.47.0): private channels are not served
-    // via the reconcile protocol — the wire types don't carry the
-    // signed `requester`/`proof` fields the existing
-    // `network::sync::verify_private_channel_access` requires.
-    // Until v0.47.x adds those auth fields, private-channel
-    // history backfill MUST happen over the authenticated
-    // `sync.rs::PrivateChannelMessages` path. Refuse with an
-    // empty response so a malicious peer cannot pull ciphertext +
-    // metadata for a channel they were never a member of.
+    // via the reconcile protocol — the wire types don't carry any
+    // signed requester/proof fields, so there is no way to verify
+    // the requester is actually a member. This refusal MUST stay
+    // regardless of what (if anything) handles private-channel
+    // history backfill elsewhere — refuse with an empty response so
+    // a malicious peer cannot pull ciphertext + metadata for a
+    // channel they were never a member of.
+    //
+    // Audit final pre-mainnet W8 (2026-08-19): the authenticated
+    // alternative this comment used to point to
+    // (`sync.rs::PrivateChannelMessages`, an authenticated libp2p
+    // request-response path) was removed — confirmed unreachable,
+    // no caller anywhere in the org ever constructed one. That means
+    // there is currently NO working mechanism for a node to backfill
+    // a private channel's message HISTORY it missed while offline
+    // (live delivery still works via GossipSub once (re)joined; key
+    // material still delivers via `PrivateChannelKeyDistribution`).
+    // This is a real, pre-existing functional gap — not introduced by
+    // removing dead code that nothing called — flagged for a future
+    // session, not fixed here.
     if is_private_channel(storage, request.channel_id) {
         debug!(
             channel_id = request.channel_id,

@@ -122,6 +122,35 @@ pub mod cf {
     /// `[channel_delete] pending_retention_hours`.
     pub const PENDING_CHANNEL_DELETES: &str = "pending_channel_deletes";
 
+    /// `channel_id(8) ++ address` (same key shape as `CHANNEL_MEMBERS`, via
+    /// `encode_channel_member_key`) → `requested_at` (8 bytes BE) — a
+    /// `ChannelKick`/`ChannelBan`/`ChannelLeave` whose removal (and, for
+    /// private channels, P2d key-epoch-floor raise) couldn't be applied
+    /// because the `CHANNELS` row didn't exist locally yet (W18 residual,
+    /// found + fixed 2026-08-19). Unlike `PENDING_CHANNEL_DELETES`, multiple
+    /// independent rows can exist per channel_id (one per removed address) —
+    /// several different wallets can each need their removal replayed once
+    /// the channel becomes known. Consumed (all rows for a channel_id,
+    /// replayed through `Storage::remove_channel_member_and_raise_epoch_floor`)
+    /// the first time the channel is actually created. Capped at 256 rows per
+    /// channel_id (best-effort drop beyond, matches `CHANNEL_META_CAP`).
+    /// Reaped after `[channel_member_removal] pending_retention_hours`.
+    ///
+    /// **Accepted residual (Code Audit WARNING #3, reviewed + deferred
+    /// 2026-08-19)**: replay re-applies a claim's removal without
+    /// re-checking who was authorized to kick/ban at replay time — a
+    /// moderator demoted between the original (unknown-channel) attempt and
+    /// the channel's eventual creation still gets their removal applied.
+    /// Judged low-impact and left as-is: `ChannelLeave` (the only type that
+    /// reaches this path live, per this CF's own doc above) can only ever
+    /// target the sender's own membership — there is no "authorization" to
+    /// re-check for a self-removal. Kick/Ban never reach this path at all
+    /// (they hard-reject on an unknown channel via `require_mod_permission`/
+    /// `is_channel_creator`), so the gap is theoretical for them today. If a
+    /// future change lets Kick/Ban reach the pending-claim path, this
+    /// residual should be revisited.
+    pub const PENDING_CHANNEL_MEMBER_REMOVALS: &str = "pending_channel_member_removals";
+
     // --- Edit/Delete Tracking ---
 
     /// msg_id (32 bytes) → DeletionRecord JSON (deleted_by, deleted_at, msg_type)
@@ -318,6 +347,7 @@ pub mod cf {
         DM_READ_STATE,
         DELETED_CHANNELS,
         PENDING_CHANNEL_DELETES,
+        PENDING_CHANNEL_MEMBER_REMOVALS,
         DELETION_MARKERS,
         EDIT_HISTORY,
         CHAT_REACTIONS,
@@ -431,6 +461,10 @@ pub mod state_keys {
     /// 0.106.0+): persisted cursor for the `PENDING_CHANNEL_DELETES` sweep. Same
     /// resume-across-restarts rationale as the reaper cursors above.
     pub const CHANNEL_DELETE_CLAIM_REAP_CURSOR: &[u8] = b"channel_delete_claim_reap_cursor";
+    /// Pending-channel-member-removal-claim reaper (W18 residual, l2-node
+    /// 0.108.0+): persisted cursor for the `PENDING_CHANNEL_MEMBER_REMOVALS`
+    /// sweep. Same resume-across-restarts rationale as the reaper cursors above.
+    pub const CHANNEL_MEMBER_REMOVAL_REAP_CURSOR: &[u8] = b"channel_member_removal_reap_cursor";
 }
 
 /// Snapshot bootstrap (spec 11-snapshot-sync.md).

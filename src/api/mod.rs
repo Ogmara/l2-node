@@ -366,6 +366,20 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
             .expect("valid governor config"),
     );
 
+    // Audit final pre-mainnet W36: the dashboard's `rate_limited_total`
+    // counter had zero callers, so it always read 0 even during a real 429
+    // storm. `error_handler` is the one hook `tower_governor` exposes for
+    // observing a rejection; `err.into()` preserves the crate's own default
+    // response conversion (`impl From<GovernorError> for Response<Body>`) —
+    // this only ADDS the counter increment, it doesn't change any response.
+    let rate_limit_counters = app_state.counters.clone();
+    let governor_error_handler = move |err: tower_governor::errors::GovernorError| {
+        if matches!(err, tower_governor::errors::GovernorError::TooManyRequests { .. }) {
+            rate_limit_counters.inc_rate_limited();
+        }
+        err.into()
+    };
+
     // Compose all routes with body size limit (10 MB for media uploads)
     Router::new()
         .merge(public_routes)
@@ -375,7 +389,7 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
         .merge(ws_routes)
         .merge(admin_routes)
         .layer(axum::extract::DefaultBodyLimit::max(10 * 1024 * 1024))
-        .layer(GovernorLayer::new(governor_conf))
+        .layer(GovernorLayer::new(governor_conf).error_handler(governor_error_handler))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .layer(axum::Extension(app_state))

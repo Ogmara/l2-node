@@ -160,6 +160,10 @@ pub struct MetadataReconciler {
     /// Alert sender — `None` when alerts are disabled. Sender is
     /// cloneable; we keep a single copy here for the loop.
     alert_event_tx: Option<AlertEventSender>,
+    /// Audit final pre-mainnet W35: shared with `ChainScanner`/
+    /// `StateAnchorer`/`ScDiscovery` — see `ChainScanner::klever_health`'s
+    /// doc comment.
+    klever_health: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl MetadataReconciler {
@@ -177,6 +181,7 @@ impl MetadataReconciler {
         tor_config: crate::config::TorConfig,
         drift: SharedMetadataDrift,
         alert_event_tx: Option<AlertEventSender>,
+        klever_health: std::sync::Arc<std::sync::atomic::AtomicU64>,
     ) -> anyhow::Result<Self> {
         let klever_view_http = reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
@@ -193,6 +198,7 @@ impl MetadataReconciler {
             tor_config,
             drift,
             alert_event_tx,
+            klever_health,
         })
     }
 
@@ -284,7 +290,14 @@ impl MetadataReconciler {
         )
         .await
         {
-            Ok(v) => Some(v),
+            Ok(v) => {
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                self.klever_health.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+                Some(v)
+            }
             Err(e) => {
                 debug!(
                     error = %e,

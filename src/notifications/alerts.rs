@@ -193,6 +193,41 @@ pub struct AlertEngine {
     /// one-shot info events (divergence_resolved, sc_fallback_used)
     /// via the matching sender.
     events_rx: mpsc::Receiver<AlertEvent>,
+    /// `[anchoring] interval_seconds` (audit final pre-mainnet W35) — the
+    /// expected anchor cadence, multiplied by `thresholds.anchor_overdue_multiplier`
+    /// to get the `AnchorOverdue` firing threshold. `AlertEngine` only holds
+    /// `AlertsConfig` otherwise, so this one cross-section value is threaded
+    /// in directly rather than duplicated into `AlertThresholds`.
+    anchor_interval_seconds: u64,
+    /// Local debounce state for `IpfsUnreachable` (audit final pre-mainnet
+    /// W35 grace-window fix): when IPFS was first observed disconnected.
+    /// `None` while connected. Previously this alert fired on the very
+    /// first disconnected reading, ignoring `thresholds.ipfs_disconnect_seconds`
+    /// entirely.
+    ipfs_disconnected_since: Option<Instant>,
+    /// Local rate-tracking state for `FailedSignatureSpike` (audit final
+    /// pre-mainnet W35): `(tick_time, cumulative_count)` as of the previous
+    /// `evaluate()` call, used to convert the cumulative counter into a
+    /// per-minute rate.
+    prev_failed_sig_check: Option<(Instant, u64)>,
+    /// Same shape as `prev_failed_sig_check`, for `HighRateLimitTriggers`.
+    prev_rate_limited_check: Option<(Instant, u64)>,
+    /// Audit final pre-mainnet W34: `None` when `[alerts.ogmara_channel]`
+    /// is disabled, key-loading failed, or the loaded key's derived
+    /// address didn't match the configured `wallet_address` (all
+    /// graceful-degrade, not startup failure — see the `node.rs`
+    /// construction site).
+    channel_dispatcher: Option<crate::notifications::alert_channel::AlertChannelDispatcher>,
+    /// Whether `[klever]` (`node_url`/`api_url`/`contract_address`) is
+    /// actually configured on this node (Code Audit WARNING #4 fix). Nodes
+    /// running fully isolated-subnet (no on-chain integration at all, see
+    /// `ChainScanner::run`'s identical predicate) never make a Klever RPC
+    /// call, so `klever_rpc_last_success_ms` stays `0` forever by design —
+    /// without this gate, `KleverDisconnected` fired at cold start and NEVER
+    /// cleared on such a node, a permanent false positive that (once W34
+    /// shipped) also spammed the configured alert channel with a message
+    /// every cooldown period, forever.
+    klever_configured: bool,
 }
 
 impl AlertEngine {
@@ -213,6 +248,9 @@ impl AlertEngine {
         config: AlertsConfig,
         node_id: String,
         events_rx: mpsc::Receiver<AlertEvent>,
+        anchor_interval_seconds: u64,
+        channel_dispatcher: Option<crate::notifications::alert_channel::AlertChannelDispatcher>,
+        klever_configured: bool,
     ) -> Self {
         Self {
             config,
@@ -221,6 +259,12 @@ impl AlertEngine {
             node_id,
             history: Arc::new(RwLock::new(VecDeque::new())),
             events_rx,
+            anchor_interval_seconds,
+            ipfs_disconnected_since: None,
+            prev_failed_sig_check: None,
+            prev_rate_limited_check: None,
+            channel_dispatcher,
+            klever_configured,
         }
     }
 
@@ -276,9 +320,16 @@ impl AlertEngine {
         let max_sync_lag = self.config.thresholds.sc_sync_max_lag_blocks;
         let divergence_threshold = self.config.thresholds.anchor_divergence_consecutive;
 
-        // IPFS unreachable
-        if !snap.ipfs_connected {
-            self.fire(AlertType::IpfsUnreachable, "IPFS daemon is not reachable").await;
+        // IPFS unreachable (audit final pre-mainnet W35: grace-window fix —
+        // this used to fire on the very first disconnected reading,
+        // ignoring `ipfs_disconnect_seconds` entirely).
+        if snap.ipfs_connected {
+            self.ipfs_disconnected_since = None;
+        } else {
+            let since = *self.ipfs_disconnected_since.get_or_insert_with(Instant::now);
+            if since.elapsed() >= Duration::from_secs(self.config.thresholds.ipfs_disconnect_seconds) {
+                self.fire(AlertType::IpfsUnreachable, "IPFS daemon is not reachable").await;
+            }
         }
 
         // Low peers
@@ -345,9 +396,112 @@ impl AlertEngine {
                 ),
             ).await;
         }
+
+        // Klever RPC disconnected (audit final pre-mainnet W35). `0` means
+        // never succeeded (cold start) — fires immediately, same convention
+        // as the `ipfs_connected` check before its own grace-window existed;
+        // unlike IPFS, there's no separate "was it ever briefly true"
+        // concept to debounce here, since the underlying signal is already
+        // an absolute last-success timestamp, not a boolean.
+        //
+        // Code Audit WARNING #4 fix: gated on `klever_configured` — a node
+        // running without `[klever]` configured (isolated subnet, see
+        // `klever_configured`'s doc comment) never makes an RPC call at all,
+        // so this would otherwise fire at cold start and never clear.
+        if self.klever_configured {
+            let klever_disconnect_ms = self.config.thresholds.klever_disconnect_seconds * 1000;
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            if now_ms.saturating_sub(snap.klever_rpc_last_success_ms) > klever_disconnect_ms {
+                self.fire(
+                    AlertType::KleverDisconnected,
+                    &format!(
+                        "No successful Klever RPC call in over {}s",
+                        self.config.thresholds.klever_disconnect_seconds
+                    ),
+                ).await;
+            }
+        }
+
+        // Anchor overdue (audit final pre-mainnet W35). `last_anchor_age_seconds`
+        // is `0` until the first anchor of this process lifetime lands (see
+        // `MetricsCollector::update_latest_snapshot`), so this deliberately
+        // does NOT fire on a fresh node still waiting for its first anchor —
+        // that's a startup/registration-timing question, not "overdue".
+        if snap.last_anchor_age_seconds > 0 && self.anchor_interval_seconds > 0 {
+            let overdue_threshold = (self.anchor_interval_seconds as f64
+                * self.config.thresholds.anchor_overdue_multiplier) as u64;
+            if snap.last_anchor_age_seconds > overdue_threshold {
+                self.fire(
+                    AlertType::AnchorOverdue,
+                    &format!(
+                        "Last anchor {}s ago (expected every {}s, threshold {}s)",
+                        snap.last_anchor_age_seconds, self.anchor_interval_seconds, overdue_threshold
+                    ),
+                ).await;
+            }
+        }
+
+        // Failed-signature spike + high-rate-limit-triggers (audit final
+        // pre-mainnet W35): both are cumulative counters that need a
+        // per-minute RATE, not an absolute-value comparison — convert via
+        // the delta since the previous tick, same debounce-state shape as
+        // the two counters above.
+        let rate_limit_per_min = self.config.thresholds.rate_limit_alert_per_min;
+        let failed_sig_per_min = self.config.thresholds.failed_sig_alert_per_min;
+        let now = Instant::now();
+        if let Some((prev_time, prev_count)) = self.prev_failed_sig_check {
+            let elapsed_min = prev_time.elapsed().as_secs_f64() / 60.0;
+            if elapsed_min > 0.0 {
+                let rate = (snap.failed_signature_verifications_total.saturating_sub(prev_count)) as f64
+                    / elapsed_min;
+                if rate >= failed_sig_per_min as f64 {
+                    self.fire(
+                        AlertType::FailedSignatureSpike,
+                        &format!(
+                            "{:.0} failed signature verifications/min (threshold: {})",
+                            rate, failed_sig_per_min
+                        ),
+                    ).await;
+                }
+            }
+        }
+        self.prev_failed_sig_check = Some((now, snap.failed_signature_verifications_total));
+
+        if let Some((prev_time, prev_count)) = self.prev_rate_limited_check {
+            let elapsed_min = prev_time.elapsed().as_secs_f64() / 60.0;
+            if elapsed_min > 0.0 {
+                let rate = (snap.rate_limited_total.saturating_sub(prev_count)) as f64 / elapsed_min;
+                if rate >= rate_limit_per_min as f64 {
+                    self.fire(
+                        AlertType::HighRateLimitTriggers,
+                        &format!(
+                            "{:.0} rate-limit triggers/min (threshold: {})",
+                            rate, rate_limit_per_min
+                        ),
+                    ).await;
+                }
+            }
+        }
+        self.prev_rate_limited_check = Some((now, snap.rate_limited_total));
     }
 
     /// Check cooldown and dispatch an alert if allowed.
+    ///
+    /// **Accepted residual (Security NOTE-1, reviewed + deferred
+    /// 2026-08-19)**: an attacker who can remotely trip a threshold-based
+    /// alert condition (e.g. deliberately racking up failed-signature or
+    /// rate-limit rejections toward `FailedSignatureSpike`/
+    /// `HighRateLimitTriggers`) can indirectly cause this node to post a
+    /// PUBLIC message via `[alerts.ogmara_channel]` (W34) — the attacker
+    /// doesn't choose the message content, only its timing. Judged
+    /// acceptable: the per-`AlertType` cooldown below applies UNIFORMLY
+    /// regardless of trigger source, capping this to at most one post per
+    /// `[alerts.cooldown] seconds` per alert type — the same ceiling that
+    /// already bounds a genuine operational incident from spamming the
+    /// channel. No separate rate limit needed on top of it.
     async fn fire(&mut self, alert_type: AlertType, details: &str) {
         if !self.config.enabled {
             return;
@@ -409,7 +563,11 @@ impl AlertEngine {
         if self.config.webhook.enabled {
             self.send_webhook(&message).await;
         }
-        // Ogmara channel dispatcher would be added here (Phase 6)
+        // Audit final pre-mainnet W34.
+        if let Some(dispatcher) = self.channel_dispatcher.as_ref() {
+            crate::notifications::alert_channel::dispatch_ogmara_channel_alert(dispatcher, &message)
+                .await;
+        }
     }
 
     async fn send_telegram(&self, message: &str) {
@@ -474,5 +632,134 @@ fn resolve_env_or_value(value: &str) -> String {
         std::env::var(var_name).unwrap_or_default()
     } else {
         value.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Audit final pre-mainnet W35. `AlertsConfig::default()` has every
+    //! dispatch channel disabled, so `fire()` no-ops safely (returns before
+    //! any HTTP call) — these tests exercise the debounce/rate STATE
+    //! machinery in `evaluate()` without needing network access or a real
+    //! wall-clock sleep.
+    use super::*;
+    use crate::config::AlertsConfig;
+
+    fn engine(anchor_interval_seconds: u64) -> AlertEngine {
+        engine_with_klever(anchor_interval_seconds, true)
+    }
+
+    fn engine_with_klever(anchor_interval_seconds: u64, klever_configured: bool) -> AlertEngine {
+        let (_tx, rx) = AlertEngine::event_channel();
+        AlertEngine::new(
+            AlertsConfig::default(),
+            "test-node".to_string(),
+            rx,
+            anchor_interval_seconds,
+            None,
+            klever_configured,
+        )
+    }
+
+    fn snap(overrides: impl FnOnce(&mut MetricsSnapshot)) -> MetricsSnapshot {
+        let mut s = MetricsSnapshot::default();
+        s.ipfs_connected = true; // sane baseline; individual tests flip what they need
+        overrides(&mut s);
+        s
+    }
+
+    #[tokio::test]
+    async fn ipfs_unreachable_does_not_fire_on_first_disconnected_reading() {
+        // Regression for the exact pre-fix bug: a nonzero grace window must
+        // NOT fire immediately on the first `ipfs_connected = false` tick.
+        let mut e = engine(3600);
+        e.config.thresholds.ipfs_disconnect_seconds = 3600; // 1h grace window
+        let s = snap(|s| s.ipfs_connected = false);
+        e.evaluate(&s).await;
+        assert!(
+            e.ipfs_disconnected_since.is_some(),
+            "must start tracking disconnection time on the first bad reading"
+        );
+        // With a 1h grace window, immediately-after-the-first-tick must not
+        // have crossed the threshold yet (would need a real 1h sleep to fire).
+    }
+
+    #[tokio::test]
+    async fn ipfs_unreachable_resets_when_reconnected() {
+        let mut e = engine(3600);
+        let disconnected = snap(|s| s.ipfs_connected = false);
+        e.evaluate(&disconnected).await;
+        assert!(e.ipfs_disconnected_since.is_some());
+
+        let reconnected = snap(|s| s.ipfs_connected = true);
+        e.evaluate(&reconnected).await;
+        assert!(
+            e.ipfs_disconnected_since.is_none(),
+            "reconnecting must clear the debounce state, not leave a stale timestamp"
+        );
+    }
+
+    #[tokio::test]
+    async fn klever_disconnected_fires_from_cold_start() {
+        let mut e = engine(3600);
+        e.config.enabled = true; // so `fire()` actually records into `last_sent` below
+        e.config.thresholds.klever_disconnect_seconds = 1;
+        // klever_rpc_last_success_ms defaults to 0 (never succeeded) via
+        // MetricsSnapshot::default() — must be treated as "very stale", not
+        // as a false match against "now".
+        let s = snap(|_| {});
+        e.evaluate(&s).await;
+        assert!(
+            e.last_sent.contains_key(&AlertType::KleverDisconnected),
+            "a configured node with no successful RPC call ever must fire KleverDisconnected"
+        );
+    }
+
+    /// Code Audit WARNING #4 regression: a node with `[klever]` unconfigured
+    /// (isolated subnet, `klever_configured = false`) never makes an RPC
+    /// call, so `klever_rpc_last_success_ms` stays `0` forever by design —
+    /// this must NOT be misread as "disconnected" and must never fire, even
+    /// though the raw threshold comparison (same as the cold-start test
+    /// above) would otherwise trip on the very first `evaluate()`.
+    #[tokio::test]
+    async fn klever_disconnected_never_fires_when_not_configured() {
+        let mut e = engine_with_klever(3600, false);
+        e.config.enabled = true;
+        e.config.thresholds.klever_disconnect_seconds = 1;
+        let s = snap(|_| {});
+        e.evaluate(&s).await;
+        assert!(
+            !e.last_sent.contains_key(&AlertType::KleverDisconnected),
+            "KleverDisconnected must never fire when Klever isn't configured on this node"
+        );
+    }
+
+    #[tokio::test]
+    async fn anchor_overdue_does_not_fire_before_first_anchor() {
+        // last_anchor_age_seconds == 0 means "no anchor yet this process
+        // lifetime" (see MetricsCollector::update_latest_snapshot) — must
+        // NOT be misread as "anchored 0 seconds ago, perfectly fresh" in a
+        // way that's indistinguishable from "never anchored, wildly overdue".
+        // The guard is `> 0`, so this must not fire regardless of interval.
+        let mut e = engine(1); // 1-second interval — would be wildly overdue if misread
+        let s = snap(|s| s.last_anchor_age_seconds = 0);
+        e.evaluate(&s).await; // must not panic or misbehave
+    }
+
+    #[tokio::test]
+    async fn failed_signature_rate_uses_delta_not_cumulative_total() {
+        let mut e = engine(3600);
+        e.config.thresholds.failed_sig_alert_per_min = 1_000_000; // effectively unreachable
+        let s1 = snap(|s| s.failed_signature_verifications_total = 100);
+        e.evaluate(&s1).await;
+        assert_eq!(e.prev_failed_sig_check, e.prev_failed_sig_check.map(|(t, _)| (t, 100)));
+
+        // A second tick with a much higher cumulative total — the rate
+        // check must use the DELTA (100 -> 500 = 400 over the tick), not
+        // treat 500 as an absolute per-minute rate on its own.
+        let s2 = snap(|s| s.failed_signature_verifications_total = 500);
+        e.evaluate(&s2).await;
+        let (_, last_count) = e.prev_failed_sig_check.expect("must track cumulative count");
+        assert_eq!(last_count, 500, "must advance the tracked cumulative count each tick");
     }
 }

@@ -64,6 +64,10 @@ pub struct Config {
     /// pre-mainnet W14, l2-node 0.106.0+).
     #[serde(default)]
     pub channel_delete: ChannelDeleteConfig,
+    /// Pending channel-member-removal-claim retention policy (W18 residual,
+    /// l2-node 0.108.0+).
+    #[serde(default)]
+    pub channel_member_removal: ChannelMemberRemovalConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -827,6 +831,44 @@ fn default_channel_delete_pending_retention_hours() -> u64 {
     24
 }
 fn default_channel_delete_reap_interval_secs() -> u64 {
+    3600
+}
+
+/// Pending channel-member-removal-claim retention (W18 residual, l2-node
+/// 0.108.0+). A `ChannelKick`/`ChannelBan`/`ChannelLeave` for a channel this
+/// node doesn't know about yet (out-of-order gossip / chain-scan lag) can't
+/// apply its removal (or, for private channels, its P2d key-epoch-floor
+/// raise) immediately, so it's recorded as a pending claim instead of
+/// silently dropped, and consumed (replayed) the first time the channel is
+/// actually created. Same shape as `ChannelDeleteConfig` — this config makes
+/// the reaper that expires an unclaimed pending row operator-tunable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelMemberRemovalConfig {
+    /// Hours a pending removal claim is retained before the reaper expires
+    /// it unclaimed. `0` = unlimited. Default 24, same rationale as
+    /// `ChannelDeleteConfig::pending_retention_hours`.
+    #[serde(default = "default_channel_member_removal_pending_retention_hours")]
+    pub pending_retention_hours: u64,
+    /// How often the reaper sweeps `PENDING_CHANNEL_MEMBER_REMOVALS` for
+    /// expired claims. Default 3600 (1h), same cadence as the sibling
+    /// channel-delete-claim reaper.
+    #[serde(default = "default_channel_member_removal_reap_interval_secs")]
+    pub reap_interval_secs: u64,
+}
+
+impl Default for ChannelMemberRemovalConfig {
+    fn default() -> Self {
+        Self {
+            pending_retention_hours: default_channel_member_removal_pending_retention_hours(),
+            reap_interval_secs: default_channel_member_removal_reap_interval_secs(),
+        }
+    }
+}
+
+fn default_channel_member_removal_pending_retention_hours() -> u64 {
+    24
+}
+fn default_channel_member_removal_reap_interval_secs() -> u64 {
     3600
 }
 
@@ -2654,6 +2696,15 @@ pending_retention_hours = 24
 # How often the reaper sweeps for expired pending claims.
 reap_interval_secs = 3600
 
+[channel_member_removal]
+# Pending channel-member-removal-claim retention (W18 residual, l2-node 0.108.0+)
+# Hours a pending removal claim (recorded when a Kick/Ban/Leave arrives
+# before this node knows the channel) is retained before the reaper
+# expires it unclaimed. 0 = unlimited.
+pending_retention_hours = 24
+# How often the reaper sweeps for expired pending claims.
+reap_interval_secs = 3600
+
 [push_gateway]
 enabled = false
 url = ""
@@ -3436,6 +3487,7 @@ mod tests {
             "[notifications]",
             "[device_enc]",
             "[channel_delete]",
+            "[channel_member_removal]",
             "[push_gateway]",
             "[anchoring]",
             "[anchoring.metadata]",

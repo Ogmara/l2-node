@@ -175,6 +175,20 @@ pub struct Storage {
     /// are low-frequency relative to message sends (drift-only if raced,
     /// not a security bypass — contrast `channel_key_envelope_lock` above).
     social_counters_lock: Arc<std::sync::Mutex<()>>,
+    /// Serializes `put_pending_channel_member_removal`/
+    /// `take_pending_channel_member_removals` (W18 residual, found+fixed
+    /// 2026-08-19) — same TOCTOU rationale as `pending_channel_delete_lock`,
+    /// but a DEDICATED lock rather than reusing it or `channel_membership_lock`:
+    /// `put_pending_channel_member_removal` is called from inside
+    /// `remove_channel_member_and_raise_epoch_floor`'s "CHANNELS absent"
+    /// branch, which already holds `channel_membership_lock` — reusing that
+    /// lock here would be redundant (already exclusive) but reusing
+    /// `pending_channel_delete_lock` would conflate two unrelated claim
+    /// types under one lock for no reason. A dedicated lock avoids any
+    /// lock-ordering question entirely: `take_pending_channel_member_removals`
+    /// (called from router.rs/scanner.rs, which don't hold
+    /// `channel_membership_lock`) only ever acquires this one.
+    pending_channel_member_removal_lock: Arc<std::sync::Mutex<()>>,
 }
 
 impl Storage {
@@ -269,6 +283,7 @@ impl Storage {
             channel_membership_lock: Arc::new(std::sync::Mutex::new(())),
             channel_key_envelope_lock: Arc::new(std::sync::Mutex::new(())),
             social_counters_lock: Arc::new(std::sync::Mutex::new(())),
+            pending_channel_member_removal_lock: Arc::new(std::sync::Mutex::new(())),
         })
     }
 
@@ -543,6 +558,96 @@ impl Storage {
         Ok(claim)
     }
 
+    /// Max pending member-removal claims retained per channel_id — matches
+    /// `reconcile::channel_meta_envelopes`'s `CHANNEL_META_CAP`. Best-effort:
+    /// beyond this, new claims are silently dropped (same tolerance as every
+    /// other per-scope cap in this codebase).
+    const PENDING_CHANNEL_MEMBER_REMOVAL_CAP: usize = 256;
+
+    /// Records that `address`'s removal from `channel_id` (P2d key-epoch-floor
+    /// raise included) couldn't be applied because the `CHANNELS` row doesn't
+    /// exist locally yet (W18 residual). Called from inside
+    /// `remove_channel_member_and_raise_epoch_floor`'s "CHANNELS absent"
+    /// branch — see `pending_channel_member_removal_lock`'s doc comment for
+    /// why this is a dedicated lock, not a reuse of `channel_membership_lock`
+    /// (already held by the caller) or `pending_channel_delete_lock`.
+    ///
+    /// Security Audit follow-up (WARNING-3): the stored timestamp is this
+    /// node's OWN clock read at persist time, never a caller-supplied value.
+    /// The envelope's `timestamp` field is attacker-controlled (any signed
+    /// `ChannelLeave` sets it), and the reaper (`node.rs`'s
+    /// `plan_channel_member_removal_reap`) compares this stored value against
+    /// a local retention cutoff — a claim stamped with a far-future timestamp
+    /// would never expire, letting an attacker defeat the reaper's cleanup
+    /// entirely across many fabricated `channel_id`s. Using the local clock
+    /// closes that off; it does not change the pending-claim's semantics
+    /// (only the reaper's expiry math reads this value).
+    fn put_pending_channel_member_removal(&self, channel_id: u64, address: &str) -> Result<()> {
+        let _guard = self
+            .pending_channel_member_removal_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let prefix = channel_id.to_be_bytes();
+        let existing = self.prefix_iter_cf(
+            cf::PENDING_CHANNEL_MEMBER_REMOVALS,
+            &prefix,
+            Self::PENDING_CHANNEL_MEMBER_REMOVAL_CAP,
+        )?;
+        if existing.len() >= Self::PENDING_CHANNEL_MEMBER_REMOVAL_CAP {
+            return Ok(()); // best-effort drop beyond cap
+        }
+        let key = super::schema::encode_channel_member_key(channel_id, address);
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        self.put_cf(
+            cf::PENDING_CHANNEL_MEMBER_REMOVALS,
+            &key,
+            &now_ms.to_be_bytes(),
+        )
+    }
+
+    /// Consumes (reads and removes) ALL pending member-removal claims for
+    /// `channel_id`. Unlike `take_pending_channel_delete` (one claim per
+    /// channel_id), multiple independent rows can exist here — several
+    /// different wallets can each need their removal replayed once the
+    /// channel becomes known — so this returns every `(address, requested_at)`
+    /// pair recorded.
+    pub fn take_pending_channel_member_removals(
+        &self,
+        channel_id: u64,
+    ) -> Result<Vec<(String, u64)>> {
+        let _guard = self
+            .pending_channel_member_removal_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let prefix = channel_id.to_be_bytes();
+        let rows = self.prefix_iter_cf(
+            cf::PENDING_CHANNEL_MEMBER_REMOVALS,
+            &prefix,
+            Self::PENDING_CHANNEL_MEMBER_REMOVAL_CAP,
+        )?;
+        let mut out = Vec::with_capacity(rows.len());
+        for (key, value) in &rows {
+            // key: channel_id(8) ++ address — address is everything after byte 8.
+            if key.len() <= 8 {
+                continue;
+            }
+            let Ok(address) = String::from_utf8(key[8..].to_vec()) else {
+                continue;
+            };
+            let Ok(ts_bytes) = <[u8; 8]>::try_from(value.as_slice()) else {
+                continue;
+            };
+            out.push((address, u64::from_be_bytes(ts_bytes)));
+        }
+        for (key, _) in &rows {
+            self.delete_cf(cf::PENDING_CHANNEL_MEMBER_REMOVALS, key)?;
+        }
+        Ok(out)
+    }
+
     /// Highest channel-key epoch currently stored for a `key_scope` (0 if none).
     ///
     /// `channel_keys` rows end in an 8-byte big-endian epoch
@@ -644,24 +749,23 @@ impl Storage {
     /// together, and writes both plus the member-row delete in one
     /// `WriteBatch`.
     ///
-    /// **Known pre-existing gap, NOT closed by W18, flagged independently by
-    /// both the Code Audit and Security Audit passes on this fix**: if the
-    /// `CHANNELS` row doesn't exist locally yet (e.g. a `ChannelLeave`
-    /// reaching a node via gossip/reconcile before its `ChannelCreate` —
-    /// `ChannelLeave` has no `authorize_channel_action` gate requiring the
-    /// channel to exist, unlike Kick/Ban), the member-delete still runs (a
-    /// safe no-op if the row was never present either) but the floor raise
-    /// is silently skipped — identical to the pre-W18 code's own
-    /// `raise_channel_key_epoch_floor` early return on a missing row. W18
-    /// only fixed the ordering/atomicity BETWEEN the two writes, not this
-    /// separate "target unknown" case. Unlike `ChannelDelete`-before-
-    /// `ChannelCreate` (W14, which persists a `PENDING_CHANNEL_DELETES`
-    /// claim consumed once the channel becomes known), there is no
-    /// equivalent pending-claim mechanism here — the floor raise is lost
-    /// forever once this envelope dedupes. Left as a documented residual
-    /// for a future finding rather than an in-session redesign, since
-    /// closing it properly means replicating W14's full pending-claim shape
-    /// for a second envelope class.
+    /// **W18 residual, found + FIXED 2026-08-19** (previously documented here
+    /// as a known-open gap, flagged independently by both the Code Audit and
+    /// Security Audit passes on the original W18 fix): if the `CHANNELS` row
+    /// doesn't exist locally yet (e.g. a `ChannelLeave` reaching a node via
+    /// gossip/reconcile before its `ChannelCreate` — `ChannelLeave` has no
+    /// `authorize_channel_action` gate requiring the channel to exist,
+    /// unlike Kick/Ban), the member-delete still runs (a safe no-op if the
+    /// row was never present either) and the floor raise is now persisted as
+    /// a pending claim (`Storage::put_pending_channel_member_removal`) rather
+    /// than silently dropped — consumed (replayed through this same
+    /// function) the first time the channel becomes known, mirroring
+    /// `ChannelDelete`-before-`ChannelCreate`'s W14 pending-claim mechanism.
+    ///
+    /// No `requested_at` parameter (Security Audit WARNING-3 fix, see
+    /// `put_pending_channel_member_removal`'s doc comment): the pending
+    /// claim's retention timestamp is always this node's own clock, never
+    /// caller-supplied, so there is nothing for a caller to pass through.
     pub fn remove_channel_member_and_raise_epoch_floor(
         &self,
         channel_id: u64,
@@ -671,7 +775,22 @@ impl Storage {
             .channel_membership_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.remove_channel_member_and_raise_epoch_floor_locked(channel_id, address)
+    }
 
+    /// Body of `remove_channel_member_and_raise_epoch_floor`, assuming
+    /// `channel_membership_lock` is ALREADY held by the caller. Split out
+    /// (Code Audit WARNING #2 fix) so `put_channel_and_replay_pending_member_removals`
+    /// can run the create-write and the replay loop under ONE lock
+    /// acquisition instead of calling back into the public, self-locking
+    /// method (which would deadlock on the non-reentrant `std::sync::Mutex`).
+    /// Never call this directly except from inside a block that already
+    /// holds `channel_membership_lock`.
+    fn remove_channel_member_and_raise_epoch_floor_locked(
+        &self,
+        channel_id: u64,
+        address: &str,
+    ) -> Result<()> {
         let channel_key = channel_id.to_be_bytes();
         let member_key = super::schema::encode_channel_member_key(channel_id, address);
         let members_cf = self.cf_handle(cf::CHANNEL_MEMBERS)?;
@@ -687,7 +806,17 @@ impl Storage {
         let mut batch = WriteBatch::default();
         batch.delete_cf(&members_cf, &member_key);
 
-        if let Some(data) = self.get_cf(cf::CHANNELS, &channel_key)? {
+        let channel_data = self.get_cf(cf::CHANNELS, &channel_key)?;
+        if channel_data.is_none() {
+            // Channel not known locally yet — persist a pending claim so the
+            // floor raise (and, harmlessly, a re-attempt of the member
+            // removal) replays once the channel is created. Best-effort: a
+            // failure here just means this one removal's floor raise stays
+            // lost, same as the pre-fix behavior — never blocks the member
+            // delete this function already committed to applying.
+            let _ = self.put_pending_channel_member_removal(channel_id, address);
+        }
+        if let Some(data) = channel_data {
             if let Ok(mut meta) = serde_json::from_slice::<serde_json::Value>(&data) {
                 // Code Audit follow-up: `as_object_mut()` guard, same
                 // panic-safety rationale as `add_channel_member` above.
@@ -718,6 +847,51 @@ impl Storage {
             }
         }
         self.write_batch(batch)
+    }
+
+    /// Writes a newly-created channel's `CHANNELS` row and replays any
+    /// pending member-removal claims recorded while the channel was still
+    /// unknown (W18 residual), as ONE `channel_membership_lock`-guarded
+    /// critical section (Code Audit WARNING #2 fix).
+    ///
+    /// Without this, the row write (`put_cf`) and the claim replay used to
+    /// be two separate, unlocked/differently-locked steps (`scanner.rs`'s
+    /// `ChannelCreated` handler and `router.rs`'s `ChannelCreate` handler
+    /// each did: raw `put_cf(CHANNELS, ...)`, then later
+    /// `take_pending_channel_member_removals` + replay). A concurrent
+    /// `remove_channel_member_and_raise_epoch_floor` call for the SAME
+    /// channel_id could interleave between them: it takes
+    /// `channel_membership_lock`, sees `CHANNELS` still absent (the create's
+    /// unlocked write hadn't landed yet, or hadn't been observed), and
+    /// persists a brand-new pending claim — which, if that write lands after
+    /// this method's own claim-consuming read, is silently orphaned (never
+    /// replayed, only ever swept un-applied once the reaper's retention
+    /// window expires).
+    ///
+    /// Holding `channel_membership_lock` across BOTH the row write and the
+    /// replay closes this: any concurrent removal's own lock-guarded
+    /// absent-check is now strictly ordered before or after this entire
+    /// critical section. If before, its claim is already durably persisted
+    /// (by the time IT releases the lock) and gets picked up by this call's
+    /// replay. If after, it will observe `CHANNELS` as already present (this
+    /// call already wrote it) and apply directly instead of writing a claim
+    /// at all. Either way, no window remains for an orphaned claim.
+    pub fn put_channel_and_replay_pending_member_removals(
+        &self,
+        channel_id: u64,
+        channel_bytes: &[u8],
+    ) -> Result<()> {
+        let _guard = self
+            .channel_membership_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let channel_key = channel_id.to_be_bytes();
+        self.put_cf(cf::CHANNELS, &channel_key, channel_bytes)?;
+        let removals = self.take_pending_channel_member_removals(channel_id)?;
+        for (address, _requested_at) in removals {
+            self.remove_channel_member_and_raise_epoch_floor_locked(channel_id, &address)?;
+        }
+        Ok(())
     }
 
     /// Get a column family handle for use in WriteBatch operations.
@@ -4064,7 +4238,8 @@ mod channel_membership_lock_tests {
                     let addr = format!("klv1member{i}");
                     let added = s.add_channel_member(channel_id, &addr, 1_000, "member").unwrap();
                     assert!(added, "each unique address must successfully join exactly once");
-                    s.remove_channel_member_and_raise_epoch_floor(channel_id, &addr).unwrap();
+                    s.remove_channel_member_and_raise_epoch_floor(channel_id, &addr)
+                        .unwrap();
                 });
             }
         });
@@ -4143,6 +4318,157 @@ mod channel_membership_lock_tests {
             3,
             "member_count must be unchanged — the removed address was never a member"
         );
+    }
+}
+
+#[cfg(test)]
+mod pending_channel_member_removal_tests {
+    //! W18 residual, found + fixed 2026-08-19: a removal for a channel not
+    //! yet known locally now persists a pending claim instead of silently
+    //! dropping the P2d key-epoch-floor raise forever — mirrors W14's
+    //! `ChannelDelete`-before-`ChannelCreate` pending-claim mechanism.
+    use super::*;
+    use tempfile::TempDir;
+
+    fn db() -> (Storage, TempDir) {
+        let dir = TempDir::new().unwrap();
+        (Storage::open(dir.path()).unwrap(), dir)
+    }
+
+    /// Code Audit WARNING #2 regression: a concurrent removal racing the
+    /// exact moment a channel is created must never have its pending claim
+    /// orphaned. Before the fix, the create path's row write and its claim
+    /// replay were separate critical sections (or entirely unlocked), so a
+    /// racing removal could squeeze a fresh claim into the gap between them
+    /// and have it missed forever. Now both run under one
+    /// `channel_membership_lock` acquisition
+    /// (`put_channel_and_replay_pending_member_removals`), so any racing
+    /// removal is strictly ordered before or after that whole critical
+    /// section: before → its claim is durably persisted in time to be
+    /// replayed; after → it observes `CHANNELS` already present and applies
+    /// directly, never writing a claim at all. Either way nothing survives
+    /// as a dangling claim. Runs many fresh channel_ids to exercise both
+    /// interleavings across scheduler runs.
+    #[test]
+    fn concurrent_removal_racing_channel_creation_is_never_orphaned() {
+        for i in 0..50u64 {
+            let (s, _d) = db();
+            let s = std::sync::Arc::new(s);
+            let channel_id = 10_000 + i;
+            let channel_bytes = serde_json::to_vec(
+                &serde_json::json!({"member_count": 0, "channel_type": 2}),
+            )
+            .unwrap();
+
+            std::thread::scope(|scope| {
+                let s1 = s.clone();
+                let bytes = channel_bytes.clone();
+                scope.spawn(move || {
+                    s1.put_channel_and_replay_pending_member_removals(channel_id, &bytes)
+                        .unwrap();
+                });
+                let s2 = s.clone();
+                scope.spawn(move || {
+                    s2.remove_channel_member_and_raise_epoch_floor(channel_id, "klv1racer")
+                        .unwrap();
+                });
+            });
+
+            let claims = s.take_pending_channel_member_removals(channel_id).unwrap();
+            assert!(
+                claims.is_empty(),
+                "iteration {i}: a pending claim survived a create/removal race — \
+                 orphaned (WARNING #2 regression)"
+            );
+        }
+    }
+
+    #[test]
+    fn removal_for_unknown_channel_persists_a_pending_claim() {
+        let (s, _d) = db();
+        let channel_id = 700u64;
+        // Channel doesn't exist locally yet.
+        s.remove_channel_member_and_raise_epoch_floor(channel_id, "klv1late")
+            .unwrap();
+
+        // Security Audit WARNING-3 fix: the persisted timestamp is the
+        // node's own clock (not caller-supplied), so this only asserts the
+        // address round-trips — not an exact stamp value.
+        let claims = s.take_pending_channel_member_removals(channel_id).unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].0, "klv1late");
+    }
+
+    #[test]
+    fn multiple_independent_removals_all_persist_and_replay() {
+        let (s, _d) = db();
+        let channel_id = 701u64;
+        s.remove_channel_member_and_raise_epoch_floor(channel_id, "klv1a")
+            .unwrap();
+        s.remove_channel_member_and_raise_epoch_floor(channel_id, "klv1b")
+            .unwrap();
+        s.remove_channel_member_and_raise_epoch_floor(channel_id, "klv1c")
+            .unwrap();
+
+        let mut claims: Vec<String> = s
+            .take_pending_channel_member_removals(channel_id)
+            .unwrap()
+            .into_iter()
+            .map(|(addr, _ts)| addr)
+            .collect();
+        claims.sort();
+        assert_eq!(claims, vec!["klv1a", "klv1b", "klv1c"]);
+        // One-shot: consumed claims are gone.
+        assert!(s.take_pending_channel_member_removals(channel_id).unwrap().is_empty());
+    }
+
+    /// End-to-end convergence: a private channel's key-epoch floor still
+    /// gets raised for a member removed BEFORE the channel existed locally,
+    /// once the channel is created and the claim replayed — the actual
+    /// property W14's pending-claim pattern exists to guarantee.
+    #[test]
+    fn floor_raise_survives_removal_before_channel_create_once_replayed() {
+        let (s, _d) = db();
+        let channel_id = 702u64;
+
+        // Late removal arrives first — channel unknown, claim persisted.
+        s.remove_channel_member_and_raise_epoch_floor(channel_id, "klv1departed")
+            .unwrap();
+
+        // Channel now gets created (private) with the departed member never
+        // having been re-added — mirrors router.rs's ChannelCreate handler:
+        // create the row, then replay pending removal claims.
+        s.put_cf(
+            cf::CHANNELS,
+            &channel_id.to_be_bytes(),
+            &serde_json::to_vec(&serde_json::json!({"member_count": 0, "channel_type": 2})).unwrap(),
+        )
+        .unwrap();
+        let claims = s.take_pending_channel_member_removals(channel_id).unwrap();
+        for (address, _requested_at) in claims {
+            s.remove_channel_member_and_raise_epoch_floor(channel_id, &address)
+                .unwrap();
+        }
+
+        let data = s.get_cf(cf::CHANNELS, &channel_id.to_be_bytes()).unwrap().unwrap();
+        let meta: serde_json::Value = serde_json::from_slice(&data).unwrap();
+        let floor = meta.get("key_epoch_floor").and_then(|v| v.as_u64()).unwrap_or(0);
+        assert_eq!(
+            floor, 1,
+            "key_epoch_floor must be raised on replay — this is the actual W18 residual bug fixed"
+        );
+    }
+
+    #[test]
+    fn cap_drops_beyond_256_per_channel() {
+        let (s, _d) = db();
+        let channel_id = 703u64;
+        for i in 0..300u64 {
+            s.remove_channel_member_and_raise_epoch_floor(channel_id, &format!("klv1n{i}"))
+                .unwrap();
+        }
+        let claims = s.take_pending_channel_member_removals(channel_id).unwrap();
+        assert!(claims.len() <= 256, "must not exceed the per-channel cap");
     }
 }
 

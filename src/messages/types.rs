@@ -901,69 +901,16 @@ pub struct ChannelKeyEnvelopePayload {
     pub wrapped: Vec<u8>,
 }
 
-// --- Content Request/Response (spec 5.5.2) ---
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[repr(u8)]
-pub enum ContentRequestType {
-    ChannelMessages = 0x01,
-    DirectMessages = 0x02,
-    NewsPosts = 0x03,
-    NewsPostsByTag = 0x04,
-    UserPosts = 0x05,
-    PersonalFeed = 0x06,
-    /// Authenticated request for private channel messages (anchor node only).
-    PrivateChannelMessages = 0x07,
-    /// Authenticated request for private channel group key material.
-    PrivateChannelKeys = 0x08,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ContentRequest {
-    pub request_type: ContentRequestType,
-    pub channel_id: Option<u64>,
-    pub conversation_id: Option<[u8; 32]>,
-    pub before_id: Option<[u8; 32]>,
-    pub after_id: Option<[u8; 32]>,
-    pub after_timestamp: Option<u64>,
-    /// Max messages (max 500).
-    pub limit: u32,
-}
-
-/// Authenticated content request for private channels (spec 5.5.5).
-///
-/// Used between nodes for cross-node private channel access. The requesting
-/// node proves membership by signing (channel_id + timestamp + requester).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PrivateContentRequest {
-    pub request_type: ContentRequestType,
-    pub channel_id: u64,
-    /// The member requesting access.
-    pub requester: String,
-    /// Ed25519 signature over (channel_id_be8 ++ timestamp_be8 ++ requester_bytes).
-    pub proof: Vec<u8>,
-    /// Timestamp used in the signature (for replay protection).
-    pub timestamp: u64,
-    pub before_id: Option<[u8; 32]>,
-    pub after_id: Option<[u8; 32]>,
-    /// Max messages (max 500).
-    pub limit: u32,
-}
-
-/// Private channel live subscription request (spec 5.5.5).
-///
-/// Replaces GossipSub for private channels — a direct authenticated
-/// libp2p stream between the member's home node and the anchor node.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PrivateChannelSubscribe {
-    pub channel_id: u64,
-    /// The subscribing member's address.
-    pub subscriber: String,
-    /// Ed25519 signature proving membership.
-    pub proof: Vec<u8>,
-    /// Timestamp for replay protection.
-    pub timestamp: u64,
-}
+// Audit final pre-mainnet W8: this used to be a "Content Request/Response
+// (spec 5.5.2)" block (`ContentRequestType`/`ContentRequest`/
+// `PrivateContentRequest`/`PrivateChannelSubscribe`) — the never-fully-wired
+// design for spec 5.5.5's "anchor node model". Confirmed dead: no apply arm
+// (`MessageType::SyncRequest` fell to the generic `Raw` catchall even before
+// this removal), `PrivateContentRequest`/`PrivateChannelSubscribe` were never
+// even referenced outside their own definitions, and no client anywhere in
+// the org ever constructed any of these. Removed rather than left as
+// misleadingly-"real-looking" dead scaffolding. Private-channel key delivery
+// actually works via `PrivateChannelKeyDistribution` (0x60) gossip instead.
 
 /// Deserialize a payload from MessagePack bytes based on the message type.
 ///
@@ -1019,8 +966,14 @@ pub fn deserialize_payload(
         MessageType::PrivateChannelKeyDistribution => Ok(DeserializedPayload::PrivateChannelKeyDistribution(rmp_serde::from_slice(payload_bytes)?)),
         MessageType::ChannelKeyEnvelope => Ok(DeserializedPayload::ChannelKeyEnvelope(rmp_serde::from_slice(payload_bytes)?)),
         MessageType::NodeAnnouncement => Ok(DeserializedPayload::NodeAnnouncement(rmp_serde::from_slice(payload_bytes)?)),
-        MessageType::SyncRequest => Ok(DeserializedPayload::ContentRequest(rmp_serde::from_slice(payload_bytes)?)),
-        // Ping, Pong, StateRoot, SyncResponse carry opaque bytes
+        // Ping, Pong, StateRoot, SyncRequest, SyncResponse carry opaque bytes.
+        // Audit final pre-mainnet W8: SyncRequest previously special-cased into
+        // ContentRequest — that type + its validation + PrivateContentRequest/
+        // PrivateChannelSubscribe (spec 5.5.5's never-fully-wired anchor-node
+        // model) were confirmed unreachable (no apply arm, no client anywhere
+        // ever constructs one) and removed. The libp2p request-response
+        // `network::sync::SyncRequest`/`SyncResponse` (a different, actually-used
+        // mechanism with an unfortunate identical name) is unaffected.
         _ => Ok(DeserializedPayload::Raw(payload_bytes.to_vec())),
     }
 }
@@ -1066,6 +1019,5 @@ pub enum DeserializedPayload {
     PrivateChannelKeyDistribution(PrivateChannelKeyDistributionPayload),
     ChannelKeyEnvelope(ChannelKeyEnvelopePayload),
     NodeAnnouncement(NodeAnnouncementPayload),
-    ContentRequest(ContentRequest),
     Raw(Vec<u8>),
 }

@@ -1386,7 +1386,11 @@ struct KeyEnvelopeRouteExtract {
     channel_id: Option<u64>,
 }
 
-fn gossip_topic_for_envelope(
+/// `pub(crate)` (audit final pre-mainnet W34) so the Ogmara-channel alert
+/// dispatcher (`notifications::alerts`) can reuse the exact same topic
+/// selection as every other envelope-gossiping path, rather than
+/// re-deriving channel-topic logic in a second place.
+pub(crate) fn gossip_topic_for_envelope(
     envelope: &crate::messages::envelope::Envelope,
     network_id: &str,
 ) -> Option<String> {
@@ -2800,7 +2804,21 @@ pub async fn federate_channel(
             "federated_from": base,
         });
         let bytes = serde_json::to_vec(&meta).unwrap_or_default();
-        if let Err(e) = state.storage.put_cf(cf::CHANNELS, &channel_id.to_be_bytes(), &bytes) {
+        // Auditor follow-up (same class as the router.rs/scanner.rs W18-residual
+        // TOCTOU fix, found during that fix's independent final-audit pass): this
+        // write can be this node's FIRST knowledge of `channel_id` (federating a
+        // private channel it never locally created or chain-scanned) — a raw
+        // `put_cf` here left a window for a concurrent `ChannelLeave` targeting
+        // this same channel_id to observe `CHANNELS` absent and persist a pending
+        // member-removal claim that this endpoint would never consume, orphaning
+        // it. Reuses the same `channel_membership_lock`-guarded atomic
+        // write-then-replay used by the L2 `ChannelCreate` handler and the chain
+        // scanner. Harmless no-op on a re-federation refresh (no pending claims to
+        // find) or on a channel with no P2d floor concept yet raised.
+        if let Err(e) = state
+            .storage
+            .put_channel_and_replay_pending_member_removals(channel_id, &bytes)
+        {
             return (StatusCode::INTERNAL_SERVER_ERROR, format!("storage error: {}", e)).into_response();
         }
     }

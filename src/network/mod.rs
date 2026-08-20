@@ -1047,6 +1047,7 @@ impl NetworkService {
             None,
             config.network_id().to_string(),
             dm_config.max_stored_messages_per_recipient,
+            counters.clone(),
         );
 
         let public_url = config.api.public_url.clone();
@@ -4235,9 +4236,6 @@ impl NetworkService {
                 after_id: None,
                 after_timestamp,
                 limit: 500,
-                requester: None,
-                proof: None,
-                proof_timestamp: None,
             };
 
             let request_id = self

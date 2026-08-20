@@ -69,6 +69,15 @@ pub struct MetricsSnapshot {
     // Chain
     pub klever_last_block: u64,
     pub klever_sync_lag_blocks: u64,
+    /// Millis-since-epoch of the last successful Klever RPC call, across
+    /// the chain scanner/anchorer/metadata-reconciler/sc_discovery (audit
+    /// final pre-mainnet W35). `0` = never succeeded (cold start). Drives
+    /// the `KleverDisconnected` alert.
+    pub klever_rpc_last_success_ms: u64,
+    /// Cumulative Ed25519 signature verification failures (audit final
+    /// pre-mainnet W35). Drives the `FailedSignatureSpike` alert (rate,
+    /// computed by `AlertEngine` from the delta between snapshots).
+    pub failed_signature_verifications_total: u64,
 
     // Anchoring
     pub last_anchor_height: u64,
@@ -90,6 +99,21 @@ pub struct MetricsSnapshot {
     /// `getCanonicalAnchor`); read by `MetricsCollector` into each
     /// snapshot, then by the alert engine.
     pub anchor_divergence_count: u32,
+}
+
+/// Pure threshold check for `W32`'s warn-only `max_db_size_gb` enforcement.
+/// `max_bytes == 0` means unlimited (no check, per `Config`'s existing
+/// `0 = unlimited` convention used throughout this codebase's retention knobs).
+fn db_size_exceeds_cap(db_size_bytes: u64, max_bytes: u64) -> bool {
+    max_bytes > 0 && db_size_bytes > max_bytes
+}
+
+/// Whether the W32 db-size-cap warning should fire THIS tick — the
+/// false→true rising edge only (Code Audit NOTE #8), given this tick's
+/// `db_size_exceeds_cap` result and the previous tick's stored state. A pure
+/// fn, unit-tested independently of `collect_storage_stats`'s RocksDB I/O.
+fn should_warn_on_db_size_rising_edge(currently_over_cap: bool, previously_over_cap: bool) -> bool {
+    currently_over_cap && !previously_over_cap
 }
 
 /// Cached storage statistics (refreshed at storage_interval).
@@ -137,6 +161,28 @@ pub struct MetricsCollector {
     /// alert engine can fire `anchor_divergence` when the count
     /// crosses `anchor_divergence_consecutive`.
     anchor_divergence_counter: Arc<AtomicU32>,
+    /// `storage.max_db_size_gb` pre-converted to bytes (0 = unlimited).
+    /// Audit final pre-mainnet W32: warn-only observability, not
+    /// enforcement — logged when `estimate_db_size()` exceeds this on each
+    /// `storage_interval_seconds` refresh. Deliberately a plain `warn!`, not
+    /// a new `AlertType`/`AlertThresholds` field: `AlertEngine` only holds
+    /// `AlertsConfig`, not the full `Config`, and this is a `[storage]`
+    /// setting, not an `[alerts]` one — duplicating it into thresholds just
+    /// to route through the alert engine would be more machinery than a
+    /// warn-only requirement justifies.
+    max_db_size_bytes: u64,
+    /// Audit final pre-mainnet W35: shared with `ChainScanner`/
+    /// `StateAnchorer`/`MetadataReconciler`/`ScDiscovery` — see
+    /// `MetricsSnapshot::klever_rpc_last_success_ms`'s doc comment.
+    klever_health: Arc<std::sync::atomic::AtomicU64>,
+    /// Whether the last `collect_storage_stats` tick observed
+    /// `db_size_exceeds_cap` as true (Code Audit NOTE #8). Without this, the
+    /// W32 warn re-logged on EVERY `storage_interval_seconds` tick for as
+    /// long as a node stayed over the cap — pure log spam for a condition
+    /// that, by design, has no automatic remediation to wait on. Only warns
+    /// on the false→true rising edge; a fresh warn fires again after a
+    /// true→false→true cycle (e.g. an operator's manual pruning didn't hold).
+    db_size_over_cap: bool,
 
     // Internal state
     system_collector: SystemCollector,
@@ -163,6 +209,8 @@ impl MetricsCollector {
         klever_api_url: String,
         node_address: String,
         anchor_divergence_counter: Arc<AtomicU32>,
+        max_db_size_gb: u64,
+        klever_health: Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
         // Clamp capacity: min 60 (1 hour), max 10080 (1 week at 1-min resolution)
         let capacity = (config.history_capacity as usize).clamp(60, 10080);
@@ -180,6 +228,9 @@ impl MetricsCollector {
                 .build()
                 .unwrap_or_default(),
             anchor_divergence_counter,
+            max_db_size_bytes: max_db_size_gb.saturating_mul(1024 * 1024 * 1024),
+            klever_health,
+            db_size_over_cap: false,
             system_collector: SystemCollector::new(data_dir),
             prev_counter_snapshot: CounterSnapshot::default(),
             prev_counter_time: Instant::now(),
@@ -289,6 +340,8 @@ impl MetricsCollector {
             failed_validations_total: counter_snap.failed_validations,
             rate_limited_total: counter_snap.rate_limited_requests,
             pow_required_total: counter_snap.pow_required,
+            failed_signature_verifications_total: counter_snap.failed_signature_verifications,
+            klever_rpc_last_success_ms: self.klever_health.load(Ordering::Relaxed),
             db_size_bytes: ss.db_size,
             messages_total: ss.messages_total,
             channel_messages_total: ss.channel_messages,
@@ -320,7 +373,7 @@ impl MetricsCollector {
     }
 
     /// Collect storage statistics from RocksDB and NODE_STATE counters.
-    fn collect_storage_stats(&self, ss: &mut StorageStats) {
+    fn collect_storage_stats(&mut self, ss: &mut StorageStats) {
         ss.messages_total = self.storage.get_stat(state_keys::TOTAL_MESSAGES).unwrap_or(0);
         ss.channel_messages = self.storage.get_stat(state_keys::TOTAL_CHANNEL_MESSAGES).unwrap_or(0);
         ss.news_messages = self.storage.get_stat(state_keys::TOTAL_NEWS_MESSAGES).unwrap_or(0);
@@ -337,6 +390,24 @@ impl MetricsCollector {
 
         // Estimate database size from RocksDB properties
         ss.db_size = self.storage.estimate_db_size().unwrap_or(0);
+
+        // Audit final pre-mainnet W32: warn-only observability when the live
+        // RocksDB size exceeds the configured cap. `db_size_exceeds_cap` is a
+        // pure fn, unit-tested separately. Code Audit NOTE #8: only warn on
+        // the false→true rising edge (`db_size_over_cap`) — a node parked
+        // over the cap would otherwise re-log this on every
+        // `storage_interval_seconds` tick forever, for a condition with no
+        // automatic remediation to wait out.
+        let over_cap = db_size_exceeds_cap(ss.db_size, self.max_db_size_bytes);
+        if should_warn_on_db_size_rising_edge(over_cap, self.db_size_over_cap) {
+            warn!(
+                db_size_bytes = ss.db_size,
+                max_db_size_bytes = self.max_db_size_bytes,
+                "RocksDB data directory exceeds storage.max_db_size_gb — no automatic \
+                 enforcement, operator should review retention settings or grow disk"
+            );
+        }
+        self.db_size_over_cap = over_cap;
     }
 
     /// Refresh IPFS health and stats.
@@ -396,5 +467,57 @@ impl MetricsCollector {
             }
             _ => {} // silently skip on network errors (will retry next cycle)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Audit final pre-mainnet W32: `db_size_exceeds_cap`'s threshold logic.
+    use super::*;
+
+    #[test]
+    fn zero_max_means_unlimited() {
+        assert!(!db_size_exceeds_cap(u64::MAX, 0));
+    }
+
+    #[test]
+    fn under_cap_does_not_exceed() {
+        assert!(!db_size_exceeds_cap(50, 100));
+    }
+
+    #[test]
+    fn exactly_at_cap_does_not_exceed() {
+        assert!(!db_size_exceeds_cap(100, 100));
+    }
+
+    #[test]
+    fn over_cap_exceeds() {
+        assert!(db_size_exceeds_cap(101, 100));
+    }
+
+    /// Code Audit NOTE #8: `should_warn_on_db_size_rising_edge`'s
+    /// false→true / stays-true / true→false / re-trip cycle.
+    #[test]
+    fn rising_edge_only_warns_on_the_transition_into_over_cap() {
+        assert!(
+            should_warn_on_db_size_rising_edge(true, false),
+            "first tick observing over-cap must warn"
+        );
+        assert!(
+            !should_warn_on_db_size_rising_edge(true, true),
+            "staying over cap on a later tick must NOT warn again"
+        );
+        assert!(
+            !should_warn_on_db_size_rising_edge(false, true),
+            "dropping back under cap must not itself warn"
+        );
+        assert!(
+            should_warn_on_db_size_rising_edge(true, false),
+            "a fresh true→false→true cycle must warn again (e.g. pruning didn't hold)"
+        );
+        assert!(
+            !should_warn_on_db_size_rising_edge(false, false),
+            "never having been over cap must not warn"
+        );
     }
 }

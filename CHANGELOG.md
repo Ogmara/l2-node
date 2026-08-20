@@ -5,6 +5,166 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.108.0] - 2026-08-19
+
+Closes the last open items from the final pre-mainnet audit campaign
+(`docs/audits/l2-node-final-audit-2026-08-16.md`) — W8, W32–W36, plus a
+newly-found W18 residual and a doc-accuracy follow-up. The mainnet gate now
+tracks only live-fleet re-verification, not any further code-level fix.
+
+### Security
+
+- **Removed the confirmed-dead, non-host-bound private-channel sync-proof
+  code path (audit final pre-mainnet W8).** `network::sync::
+  SyncRequestType::PrivateChannelMessages`/`PrivateChannelKeys` and the
+  `verify_private_channel_access` proof check existed in code but were
+  re-confirmed (fresh reachability sweep across every client/SDK repo, not
+  just l2-node) to have zero callers anywhere — nothing ever constructed
+  this request type, so the proof's lack of host-binding (no responder
+  PeerId/network in the signed preimage, making a captured proof replayable
+  to other nodes within its validity window) was real but unreachable.
+  Removed rather than fixed. A separate, independently-discovered dead
+  scaffolding — `messages::types::ContentRequestType`/`ContentRequest`/
+  `PrivateContentRequest`/`PrivateChannelSubscribe` (validated on ingest but
+  with zero apply-arm and zero client ever constructing one) — was removed
+  in the same pass; `MessageType::SyncRequest` (0xF3) now falls through to
+  the existing generic `Raw` catchall, same as the `Ping`/`Pong`/`StateRoot`/
+  `SyncResponse` network types already did.
+
+### Fixed
+
+- **A `ChannelKick`/`Ban`/`Leave` arriving before its channel was known
+  locally silently dropped the P2d key-epoch-floor raise forever (W18
+  residual, found this session).** Mirrors the existing W14 pending-claim
+  pattern for `ChannelDelete`-before-`ChannelCreate`: a new
+  `PENDING_CHANNEL_MEMBER_REMOVALS` CF records the claim (capped at 256 per
+  channel), consumed and replayed the first time the channel is actually
+  created (both the L2 `ChannelCreate` handler and the chain scanner's
+  `ChannelCreated` handler), with its own periodic reaper for claims that
+  never get consumed. New `[channel_member_removal]` config section.
+- **`network.enable_mdns = false` didn't actually disable mDNS** — the
+  behaviour was built unconditionally regardless of the flag, a real
+  privacy/ops surprise on servers (mDNS broadcasts on the local network
+  segment). Now genuinely conditional (`libp2p::swarm::behaviour::toggle::
+  Toggle`).
+- **Dashboard's `rate_limited_total` counter always read 0** even during a
+  real 429 storm — nothing incremented it. Now wired via `GovernorLayer`'s
+  `error_handler` hook.
+- **Two alert types were fully dead** (`KleverDisconnected`: no RPC-health
+  signal existed anywhere; `FailedSignatureSpike`: no dedicated counter
+  existed) **and a third had the identical gap** (`HighRateLimitTriggers`,
+  closed as a natural follow-on once the rate_limited_total fix above made
+  its underlying counter real) — all three now fire for real.
+  `KleverDisconnected` reuses a new shared last-successful-RPC timestamp
+  written by the chain scanner/anchorer/metadata-reconciler/sc_discovery
+  tasks; the other two convert their cumulative counters into a per-minute
+  rate across alert-engine ticks.
+- **`IpfsUnreachable` fired on the very first disconnected reading**,
+  ignoring its own configured `ipfs_disconnect_seconds` grace window
+  entirely. Now genuinely debounced.
+
+### Added
+
+- **`[alerts.ogmara_channel]` now actually works** — previously entirely
+  dead configuration (a code comment literally said "would be added here
+  (Phase 6)"). The node now posts alerts as a self-signed `ChatMessage` into
+  a configured channel it's already a member of, using a dedicated signing
+  identity (env `OGMARA_ALERT_SIGNING_KEY` override, or `signing_key_path`
+  file) separate from both the node's libp2p identity and its anchoring
+  wallet. Refuses to post to an encrypted channel (this dispatcher has no
+  channel key and could never produce valid ciphertext) and disables itself
+  at startup rather than posting under the wrong identity if the loaded
+  key's derived address doesn't match the configured `wallet_address`. The
+  operator must still create the target channel and join this wallet to it
+  out-of-band — there is no node-side automation for that part.
+- **`storage.max_db_size_gb` is now observed, not silently ignored** — the
+  live RocksDB directory size is compared against the configured cap on
+  each metrics sample and logged at `warn!` when exceeded. Deliberately
+  warn-only, not enforcement: this release does not delete channel history
+  to hit a byte target.
+
+### Changed
+
+- **Spec docs corrected** (`docs/specs/01-protocol.md`, `03-l2-node.md`,
+  `05-clients.md`): several sections described a "private channel anchor
+  node" resolution design — pull-based, single authoritative host node per
+  private channel — that was never actually built. What shipped instead
+  (P2/P4) is GossipSub resolution identical to public channels, content
+  always encrypted, keys delivered permissionlessly by any online member.
+  Corrected throughout, including one real functional gap the rewrite
+  surfaced: there is currently no mechanism for a node to backfill a
+  private channel's message HISTORY it missed while offline (live delivery
+  and key delivery both still work) — flagged as an open item for a future
+  session, not fixed here.
+
+### Fixed (post-build audit follow-up)
+
+The CLAUDE.md-mandated Code Audit + Security Audit pass run against the
+above diff found further issues, all fixed in this same release before
+being reported as complete:
+
+- **`ChannelJoin`/`ChannelLeave` had no dedicated rate limit**, falling into
+  the generic `Other` category (100/min) — since `ChannelLeave` has no
+  verified-identity requirement, a single wallet could mint pending
+  member-removal claims (see above) ~3x faster than the new reaper could
+  drain them (Code Audit CRITICAL). New `RateCategory::ChannelMembership`
+  (20/hour) closes the gap.
+- **The pending member-removal claim's retention timestamp was the
+  envelope's own `timestamp` field — attacker-controlled** (Security
+  Audit WARNING). A forged far-future timestamp would let a claim evade the
+  retention reaper forever across arbitrarily many fabricated channel_ids.
+  Now always the node's own clock, read at persist time.
+- **The new claim's row-write and its replay-on-create were not one atomic
+  unit** (Code Audit WARNING): a removal racing the exact moment a channel
+  was created could squeeze a fresh claim into the gap between the create's
+  `CHANNELS` write and its claim-consuming read, orphaning that claim
+  forever (only ever swept un-applied by the reaper). Both steps now run
+  under one `channel_membership_lock` critical section
+  (`Storage::put_channel_and_replay_pending_member_removals`).
+- **`KleverDisconnected` permanently false-positived on any node without
+  `[klever]` configured** (isolated-subnet deployments) — such a node never
+  makes an RPC call at all, so the alert fired at cold start and could never
+  clear, and (once the `ogmara_channel` dispatch above shipped) would have
+  spammed the configured channel forever. Now gated on the same
+  "Klever actually configured" predicate the chain scanner already uses to
+  no-op itself.
+- **Two zeroize gaps in secret-key handling** (Security Audit): the alert
+  signing key's raw file contents sat in a plain, non-zeroizing `String`
+  after being copied into a trimmed `SecretString`; and both the new
+  alert-key loader and the pre-existing anchor-wallet-key loader in
+  `node.rs` skipped their own `bytes.fill(0)` on the wrong-key-length error
+  path (an early `?` return bypassed it). Both fixed — the file read now
+  wraps directly into `SecretString` with no intermediate copy, and the
+  length check now runs before any early return, on both loaders.
+- **`HighRateLimitTriggers` only observed HTTP-layer 429s**, missing the
+  router's own separate, lower rate-limit rejection point (`process_message`
+  Step 6). Same shared counter now increments from both sources.
+- **Three env-var-manipulating tests in `alert_channel.rs` could race each
+  other** under cargo's default multi-threaded test runner (Code Audit).
+  Now serialized by a dedicated test-only mutex.
+- **The `max_db_size_gb` warning re-logged on every metrics tick** for as
+  long as a node stayed over the cap (Code Audit). Now fires only on the
+  false→true rising edge.
+- **The private-channel federation endpoint (`POST /channels/{id}/federate`)
+  had the same claim-orphaning race as the W18 residual above**, found by
+  the independent final-Auditor confirmation pass on this same release: its
+  `CHANNELS` row write for a channel this node had never seen before ran
+  outside `channel_membership_lock`, so a concurrent `ChannelLeave` for the
+  same channel_id could persist a pending claim in the gap and never have it
+  replayed. Now goes through the same
+  `put_channel_and_replay_pending_member_removals` atomic path as the
+  `ChannelCreate` and chain-scanner handlers.
+
+Two lower-severity findings were reviewed and deliberately left as-is
+(documented in code, not fixed): pending-claim replay doesn't re-check
+moderator authorization at replay time (only reachable via `ChannelLeave`
+today, which can only ever target the author's own membership — see
+`storage::schema::cf::PENDING_CHANNEL_MEMBER_REMOVALS`'s doc comment); and
+an attacker who can remotely trip a threshold-based alert can indirectly
+cause a public `ogmara_channel` post, bounded by the existing per-alert-type
+cooldown that already applies uniformly regardless of trigger source (see
+`AlertEngine::fire`'s doc comment).
+
 ## [0.107.0] - 2026-08-19
 
 ### Fixed

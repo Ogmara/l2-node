@@ -29,6 +29,12 @@ pub struct NetworkCounters {
     pub rate_limited_requests: AtomicU64,
     /// Total PoW-required rejections (wallet needs to solve challenge first).
     pub pow_required: AtomicU64,
+    /// Total Ed25519 signature verification failures (audit final
+    /// pre-mainnet W35). A subset of `failed_validations` — isolated so the
+    /// `FailedSignatureSpike` alert can distinguish signature failures
+    /// (usually spoofing/corruption) from the broader rejection bucket
+    /// (rate limits, malformed payloads, policy denials, etc.).
+    pub failed_signature_verifications: AtomicU64,
     /// Recent rejection reasons for dashboard display (last 50).
     pub recent_rejections: Mutex<VecDeque<RecentRejection>>,
 }
@@ -53,6 +59,7 @@ impl NetworkCounters {
             failed_validations: AtomicU64::new(0),
             rate_limited_requests: AtomicU64::new(0),
             pow_required: AtomicU64::new(0),
+            failed_signature_verifications: AtomicU64::new(0),
             recent_rejections: Mutex::new(VecDeque::new()),
         }
     }
@@ -97,6 +104,12 @@ impl NetworkCounters {
         self.pow_required.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Increment the failed-signature-verification counter (audit final
+    /// pre-mainnet W35).
+    pub fn inc_failed_signature_verifications(&self) {
+        self.failed_signature_verifications.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Record a rejection with reason for dashboard display.
     pub fn record_rejection(&self, reason: &str, author: &str) {
         let entry = RecentRejection {
@@ -134,6 +147,7 @@ impl NetworkCounters {
             failed_validations: self.failed_validations.load(Ordering::Relaxed),
             rate_limited_requests: self.rate_limited_requests.load(Ordering::Relaxed),
             pow_required: self.pow_required.load(Ordering::Relaxed),
+            failed_signature_verifications: self.failed_signature_verifications.load(Ordering::Relaxed),
         }
     }
 }
@@ -157,6 +171,7 @@ pub struct CounterSnapshot {
     pub failed_validations: u64,
     pub rate_limited_requests: u64,
     pub pow_required: u64,
+    pub failed_signature_verifications: u64,
 }
 
 impl CounterSnapshot {

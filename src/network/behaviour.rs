@@ -29,8 +29,12 @@ pub struct OgmaraBehaviour {
     pub gossipsub: gossipsub::Behaviour,
     /// Kademlia DHT for peer discovery and content routing.
     pub kademlia: kad::Behaviour<MemoryStore>,
-    /// mDNS for local network peer discovery.
-    pub mdns: libp2p::mdns::tokio::Behaviour,
+    /// mDNS for local network peer discovery. Audit final pre-mainnet W33:
+    /// `Toggle` so `network.enable_mdns = false` actually disables the
+    /// behaviour (previously built unconditionally regardless of the flag —
+    /// a real privacy/ops surprise on servers, since mDNS broadcasts on the
+    /// local network segment).
+    pub mdns: libp2p::swarm::behaviour::toggle::Toggle<libp2p::mdns::tokio::Behaviour>,
     /// Identify for exchanging peer information.
     pub identify: libp2p::identify::Behaviour,
     /// Request-Response for sync protocol.
@@ -167,12 +171,20 @@ pub fn build_swarm(config: &Config, keypair: Keypair) -> Result<Swarm<OgmaraBeha
         kad
     };
 
-    // mDNS (local network discovery)
-    let mdns = libp2p::mdns::tokio::Behaviour::new(
-        libp2p::mdns::Config::default(),
-        peer_id,
-    )
-    .context("creating mDNS behaviour")?;
+    // mDNS (local network discovery) — audit final pre-mainnet W33: only
+    // construct when enabled, so a disabled node neither runs the protocol
+    // nor broadcasts on the local network segment.
+    let mdns: libp2p::swarm::behaviour::toggle::Toggle<libp2p::mdns::tokio::Behaviour> =
+        if config.network.enable_mdns {
+            let behaviour = libp2p::mdns::tokio::Behaviour::new(
+                libp2p::mdns::Config::default(),
+                peer_id,
+            )
+            .context("creating mDNS behaviour")?;
+            Some(behaviour).into()
+        } else {
+            None.into()
+        };
 
     // Identify protocol — protocol_version includes network_id so peers on
     // different networks (testnet vs mainnet) reject each other at handshake.
