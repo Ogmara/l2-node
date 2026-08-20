@@ -5,6 +5,20 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.111.0] - 2026-08-20
+
+### Added
+
+- **Storage tab now shows a disk free/filled gauge.** Previously the only
+  disk visibility on that tab was a raw "disk used bytes" time-series line
+  (no reference to total capacity) and RocksDB's own `db_size_bytes` — an
+  operator had no at-a-glance answer to "how full is this disk." New
+  horizontal bar gauge (color-coded green/yellow/red at 75%/90% thresholds,
+  same convention as the existing CPU/memory cards) shows used/free/total
+  with the node's own data-dir size called out as a fraction of the total.
+  No backend changes — `disk_used_bytes`/`disk_total_bytes` were already in
+  every metrics snapshot, just never rendered as a proportion anywhere.
+
 ## [0.110.0] - 2026-08-20
 
 ### Security

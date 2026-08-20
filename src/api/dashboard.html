@@ -53,6 +53,9 @@ body { font-family: var(--font); background: var(--bg); color: var(--fg); min-he
 .chart-box h3 { font-size: 0.85em; color: var(--fg2); margin-bottom: 8px; }
 .chart { height: 160px; }
 .chart svg { width: 100%; height: 100%; }
+.disk-gauge-bar { height: 28px; border-radius: 6px; background: var(--border); overflow: hidden; position: relative; }
+.disk-gauge-fill { height: 100%; border-radius: 6px 0 0 6px; transition: width 0.4s ease; }
+.disk-gauge-pct { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 0.8em; font-weight: 700; font-family: var(--mono); color: var(--fg); text-shadow: 0 0 4px var(--bg), 0 0 4px var(--bg); }
 table { width: 100%; border-collapse: collapse; font-size: 0.85em; }
 th { text-align: left; padding: 8px; border-bottom: 2px solid var(--border); color: var(--fg2); font-weight: 600; text-transform: uppercase; font-size: 0.75em; letter-spacing: 0.03em; }
 td { padding: 8px; border-bottom: 1px solid var(--border); }
@@ -155,6 +158,11 @@ td { padding: 8px; border-bottom: 1px solid var(--border); }
 
   <!-- STORAGE TAB -->
   <div class="tab" id="tab-storage">
+    <div class="chart-box" style="margin-bottom:16px">
+      <h3>Disk Space</h3>
+      <div id="disk-gauge"></div>
+      <div class="label" id="disk-gauge-label" style="margin-top:8px">--</div>
+    </div>
     <div class="two-col">
       <div>
         <div class="card" style="margin-bottom:16px">
@@ -448,6 +456,25 @@ function lineChart(containerId, datasets, opts) {
   el.innerHTML = svg;
 }
 
+// Renders a horizontal filled-vs-free bar for total OS disk usage (not to be
+// confused with the RocksDB-only `db_size_bytes` metric on this same tab —
+// this is the disk the whole node data_dir lives on). Color follows the
+// same red/yellow/green thresholds already used for CPU/memory.
+function diskGauge(containerId, used, total) {
+  const el = document.getElementById(containerId);
+  if (!el) return;
+  if (!total || total <= 0) {
+    el.innerHTML = '<div class="disk-gauge-bar"><div class="disk-gauge-pct" style="color:var(--fg2)">No data yet</div></div>';
+    return;
+  }
+  const pct = Math.min(100, (used / total) * 100);
+  const color = pct > 90 ? 'var(--red)' : pct > 75 ? 'var(--yellow)' : 'var(--green)';
+  el.innerHTML = `<div class="disk-gauge-bar">`
+    + `<div class="disk-gauge-fill" style="width:${pct.toFixed(1)}%;background:${color}"></div>`
+    + `<div class="disk-gauge-pct">${pct.toFixed(1)}% used</div>`
+    + `</div>`;
+}
+
 // ─── Tab Navigation ─────────────────────────────────────────────────
 document.getElementById('nav').addEventListener('click', (e) => {
   if (e.target.tagName !== 'BUTTON') return;
@@ -606,6 +633,9 @@ function updateDashboard(d) {
     stIpfs.className = 'metric '+(ipfs.connected?'green':'red');
     setText('st-ipfs-detail', fmt(ipfs.pinned_count||0)+' objects, '+fmtBytes(ipfs.repo_size_bytes||0));
     lineChart('chart-disk', [{data: sparkData.disk, color: 'var(--accent2)', label: 'Disk Used'}], {fmtY: fmtBytes});
+    diskGauge('disk-gauge', s.disk_used_bytes||0, s.disk_total_bytes||0);
+    const diskFree = Math.max(0, (s.disk_total_bytes||0) - (s.disk_used_bytes||0));
+    setText('disk-gauge-label', fmtBytes(s.disk_used_bytes||0)+' used / '+fmtBytes(diskFree)+' free / '+fmtBytes(s.disk_total_bytes||0)+' total — node data dir is '+fmtBytes(st.db_size_bytes||0)+' of that');
   }
 }
 
