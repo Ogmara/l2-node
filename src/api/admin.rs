@@ -294,6 +294,7 @@ pub async fn node_registration(
             "contract_address": contract_address,
             "klever_network": state.klever_network,
             "network_node_count": serde_json::Value::Null,
+            "network_active_node_count": serde_json::Value::Null,
             "last_canonical_height": serde_json::Value::Null,
             "quorum_min": 3,
             "anchor_count": serde_json::Value::Null,
@@ -327,9 +328,22 @@ pub async fn node_registration(
     // retained as defensive scaffolding but cannot fire against an
     // SC ≥ 0.4.0. Dashboard State B′ (v0.43.3) is correspondingly
     // unreachable post-upgrade; full removal scheduled for v0.45.0.
-    let (registered_res, count_res, fee_res, canonical_height_res, registered_at_res) = tokio::join!(
+    let (
+        registered_res,
+        count_res,
+        active_count_res,
+        fee_res,
+        canonical_height_res,
+        registered_at_res,
+    ) = tokio::join!(
         crate::chain::sc_views::is_node_registered(http, &klever_node_url, &contract_address, &wallet),
         crate::chain::sc_views::get_node_count(http, &klever_node_url, &contract_address),
+        // v0.109.0 (SC 0.5.0+): active (non-paused) count is the actual
+        // denominator behind the hybrid-quorum escalation threshold — a
+        // registered-but-paused node doesn't count toward it. Surfaced
+        // alongside the paused-inclusive count so the dashboard doesn't
+        // conflate "registered" with "can anchor right now" (spec 12 §2.8).
+        crate::chain::sc_views::get_active_node_count(http, &klever_node_url, &contract_address),
         crate::chain::sc_views::get_node_registration_fee(http, &klever_node_url, &contract_address),
         crate::chain::sc_views::get_latest_canonical_height(http, &klever_node_url, &contract_address),
         crate::chain::sc_views::get_node_registered_at(http, &klever_node_url, &contract_address, &wallet),
@@ -364,6 +378,8 @@ pub async fn node_registration(
     // than misreporting as 0 (which would falsely trigger the
     // bootstrap banner).
     let network_node_count = count_res.ok().map(serde_json::Value::from).unwrap_or(serde_json::Value::Null);
+    // v0.109.0: same null-on-unavailable convention as `network_node_count`.
+    let network_active_node_count = active_count_res.ok().map(serde_json::Value::from).unwrap_or(serde_json::Value::Null);
     let canonical_height_u64 = canonical_height_res.as_ref().ok().copied();
     let last_canonical_height = canonical_height_u64
         .map(serde_json::Value::from)
@@ -448,6 +464,7 @@ pub async fn node_registration(
         // and any SC TX goes to the wrong chain.
         "klever_network": state.klever_network,
         "network_node_count": network_node_count,
+        "network_active_node_count": network_active_node_count,
         "last_canonical_height": last_canonical_height,
         "quorum_min": 3,
         // v0.43.4+: live local stats.

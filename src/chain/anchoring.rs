@@ -257,6 +257,10 @@ impl StateAnchorer {
     ///   - Divergence → bump `divergence_counter`, log warn, drop entry.
     ///   - Not yet canonical (Ok(None)) → keep entry for the next tick.
     ///   - Transport error → keep entry, log debug.
+    ///   - Escalated but not yet finalized (SC 0.7.0, checked via
+    ///     `getEscalatedCanonical`) → keep entry; `getCanonicalAnchor`'s
+    ///     answer for such a height is only a provisional §2.9 tiebreak
+    ///     preview that can still flip, so no verdict is committed on it.
     ///
     /// The divergence counter tracks **consecutive** canonicalized
     /// heights at which our root disagreed — so a single match resets
@@ -288,6 +292,77 @@ impl StateAnchorer {
             .await
             {
                 Ok(Some(canonical)) => {
+                    // SC 0.7.0: `getCanonicalAnchor`'s answer is only
+                    // trustworthy as-is for a NON-escalated height (Phase 1
+                    // base quorum, permanent once reached). For an escalated
+                    // height it may be the §2.9 tiebreak's PROVISIONAL
+                    // preview, which can still be overridden by real
+                    // escalated-quorum agreement on a different root during
+                    // the 24h grace window. Check finality before judging a
+                    // match/divergence on it, rather than committing to a
+                    // (possibly wrong) verdict and dropping the height.
+                    //
+                    // Fail-closed on transport error: if we can't confirm
+                    // whether this height is escalated, do NOT default to
+                    // "not escalated" — that would fall through to judging
+                    // the `canonical` fetched above (potentially a
+                    // provisional preview) directly. Defer instead, exactly
+                    // like the `Err` arm of `get_escalated_canonical` just
+                    // below and like `poll_divergence_resolutions` handles
+                    // the identical call.
+                    let escalated = match crate::chain::sc_views::is_divergence_escalated(
+                        &self.http,
+                        &self.klever.node_url,
+                        &self.klever.contract_address,
+                        sub.block_height,
+                    )
+                    .await
+                    {
+                        Ok(b) => b,
+                        Err(e) => {
+                            debug!(
+                                error = %e,
+                                block_height = sub.block_height,
+                                "isDivergenceEscalated failed; will retry on next divergence-check tick"
+                            );
+                            keep.push_back(sub);
+                            continue;
+                        }
+                    };
+                    let canonical = if escalated {
+                        match crate::chain::sc_views::get_escalated_canonical(
+                            &self.http,
+                            &self.klever.node_url,
+                            &self.klever.contract_address,
+                            sub.block_height,
+                        )
+                        .await
+                        {
+                            Ok(Some(finalized)) => finalized,
+                            Ok(None) => {
+                                // Escalated but not yet finalized — the
+                                // `canonical` we fetched is only a preview.
+                                // Keep waiting rather than judge on it.
+                                debug!(
+                                    block_height = sub.block_height,
+                                    "height is escalated but not yet finalized (grace window/awaiting quorum) — deferring divergence judgment"
+                                );
+                                keep.push_back(sub);
+                                continue;
+                            }
+                            Err(e) => {
+                                debug!(
+                                    error = %e,
+                                    block_height = sub.block_height,
+                                    "getEscalatedCanonical failed; will retry on next divergence-check tick"
+                                );
+                                keep.push_back(sub);
+                                continue;
+                            }
+                        }
+                    } else {
+                        canonical
+                    };
                     if canonical.eq_ignore_ascii_case(&sub.our_root) {
                         // Reset the consecutive-divergence streak; bump
                         // the lifetime canonical counter.
@@ -342,6 +417,20 @@ impl StateAnchorer {
     /// for each newly-resolved entry and removes it from the set.
     /// Skipped silently when no entries are tracked (the common case
     /// in a healthy network).
+    ///
+    /// SC 0.7.0: uses `get_escalated_canonical` (raw read of
+    /// `escalated_canonical`, empty until materialized) rather than
+    /// `get_canonical_anchor`. The latter starts returning the §2.9
+    /// tiebreak's PROVISIONAL preview the instant a height escalates —
+    /// well before the `TIEBREAK_GRACE_PERIOD_SECS` (24h, SC 0.6.0)
+    /// window closes, and that preview can still be overridden by real
+    /// escalated-quorum agreement on a different root during the window.
+    /// Before 0.7.0 this function treated the provisional preview as a
+    /// settled resolution — firing the "resolved" alert and dropping the
+    /// height from tracking — so a later flip to a different canonical
+    /// would go completely unnoticed. Using the finality-only view means
+    /// a height simply stays tracked (silently, correctly) until it is
+    /// genuinely resolved.
     async fn poll_divergence_resolutions(&mut self) {
         if self.divergence_observed.is_empty() {
             return;
@@ -369,11 +458,11 @@ impl StateAnchorer {
             if !escalated {
                 continue;
             }
-            // Escalated. Fetch the (possibly now-resolved) canonical.
-            // `getCanonicalAnchor` returns escalated_canonical if set,
-            // the §2.9 tiebreak winner if not, or `None` if neither
-            // (escalated flag set with no candidates — defensive).
-            let canonical = match crate::chain::sc_views::get_canonical_anchor(
+            // Escalated. Fetch the MATERIALIZED resolution only — `None`
+            // means still provisional (grace window open, no escalated-
+            // quorum agreement yet), so we keep waiting rather than
+            // reporting on an answer that could still change.
+            let canonical = match crate::chain::sc_views::get_escalated_canonical(
                 &self.http,
                 &self.klever.node_url,
                 &self.klever.contract_address,
@@ -382,17 +471,18 @@ impl StateAnchorer {
             .await
             {
                 Ok(Some(c)) => c,
-                Ok(None) => continue, // Still unresolved despite escalation flag — wait.
+                Ok(None) => continue, // Still provisional (grace window open) — wait.
                 Err(e) => {
-                    debug!(error = %e, height, "getCanonicalAnchor failed during resolution poll");
+                    debug!(error = %e, height, "getEscalatedCanonical failed during resolution poll");
                     continue;
                 }
             };
-            // Resolved. Remove from tracking and fire the info alert.
-            // Note: we don't know from views alone whether resolution
-            // was via escalated_quorum (kind=1) or tiebreak (kind=2);
-            // both look identical (escalated_canonical is set). The
-            // alert message keeps to the observability framing.
+            // Genuinely resolved (escalated_canonical materialized on-chain).
+            // Remove from tracking and fire the info alert. Note: we don't
+            // know from views alone whether resolution was via
+            // escalated_quorum (kind=1) or tiebreak (kind=2); both look
+            // identical (escalated_canonical is set). The alert message
+            // keeps to the observability framing.
             self.divergence_observed.remove(&height);
             info!(
                 height,

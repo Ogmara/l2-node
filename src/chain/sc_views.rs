@@ -259,6 +259,32 @@ pub async fn get_node_count(
     Ok(decode_u64_be(&resp.data))
 }
 
+/// Returns the number of registered nodes that are NOT paused (SC 0.5.0+).
+/// This — not [`get_node_count`] — is the denominator behind the hybrid
+/// quorum escalation threshold (`max(4, active/2 + 1)`, spec 12 §2.8): a
+/// paused node cannot anchor, so it does not count toward how many
+/// agreeing anchorers a contested height needs. Surfaced separately from
+/// `network_node_count` in the dashboard so "registered" and "active"
+/// don't get conflated when some nodes are paused.
+pub async fn get_active_node_count(
+    http: &reqwest::Client,
+    klever_node_url: &str,
+    contract_address: &str,
+) -> Result<u64> {
+    let resp = vm_hex_call(
+        http,
+        klever_node_url,
+        contract_address,
+        "getActiveNodeCount",
+        &[],
+    )
+    .await?;
+    if resp.is_require_failure() {
+        return Ok(0);
+    }
+    Ok(decode_u64_be(&resp.data))
+}
+
 /// Returns the registration fee in raw KLV units (1 KLV = 10^6).
 /// Returns `Ok(0)` if the SC fee storage is empty (registration is free).
 pub async fn get_node_registration_fee(
@@ -345,6 +371,52 @@ pub async fn get_canonical_anchor(
     if state_root.len() != 64 {
         anyhow::bail!(
             "getCanonicalAnchor returned unexpected length: got {}, expected 64",
+            state_root.len()
+        );
+    }
+    Ok(Some(state_root))
+}
+
+/// Returns the MATERIALIZED escalated-mode resolution for a height, or
+/// `None` if it has not (yet) been written on-chain.
+///
+/// Distinct from [`get_canonical_anchor`]: for an escalated height,
+/// `get_canonical_anchor` returns the §2.9 tiebreak's PROVISIONAL preview
+/// (computed read-only) the instant escalation triggers — well before the
+/// `TIEBREAK_GRACE_PERIOD_SECS` window closes, and that preview can still
+/// be overridden by genuine escalated-quorum agreement on a DIFFERENT root
+/// during the window. This function raw-reads `escalated_canonical` with
+/// no fallback computation, so `None` here means "still provisional,"
+/// never "not escalated" — check `is_divergence_escalated` first. Once
+/// `Some`, the value is final (write-once on-chain) and always matches
+/// what `get_canonical_anchor` returns for that height from then on.
+///
+/// Added in SC 0.7.0 specifically so the divergence-watcher (below) can
+/// avoid treating a provisional preview as a settled resolution.
+pub async fn get_escalated_canonical(
+    http: &reqwest::Client,
+    klever_node_url: &str,
+    contract_address: &str,
+    block_height: u64,
+) -> Result<Option<String>> {
+    let resp = vm_hex_call(
+        http,
+        klever_node_url,
+        contract_address,
+        "getEscalatedCanonical",
+        &[encode_u64_minimal_hex(block_height)],
+    )
+    .await?;
+    if resp.is_require_failure() || resp.data.is_empty() {
+        return Ok(None);
+    }
+    let ascii =
+        hex::decode(&resp.data).context("hex-decoding getEscalatedCanonical data payload")?;
+    let state_root = String::from_utf8(ascii)
+        .context("getEscalatedCanonical payload is not valid UTF-8")?;
+    if state_root.len() != 64 {
+        anyhow::bail!(
+            "getEscalatedCanonical returned unexpected length: got {}, expected 64",
             state_root.len()
         );
     }
@@ -782,6 +854,91 @@ fn ipv6_is_publicly_routable(ip: &std::net::Ipv6Addr) -> bool {
     true
 }
 
+// ── User + channel registry views (SC 0.6.1) ─────────────────────────
+//
+// These read on-chain records the l2-node ALREADY tracks locally (from
+// `UserRegistered` / `ChannelCreate` gossip events, stored in RocksDB) —
+// so they are not on the node's own hot path; the local copy is faster
+// and doesn't round-trip to Klever RPC. They exist here as the on-chain
+// source-of-truth reads for reconciliation / verification tooling and
+// for SDK consumers who query the chain directly without running a node.
+
+/// Registration timestamp for a registered user, or `0` if not registered.
+pub async fn get_user_registered_at(
+    http: &reqwest::Client,
+    klever_node_url: &str,
+    contract_address: &str,
+    klv_address: &str,
+) -> Result<u64> {
+    let address_hex = encode_address_hex(klv_address)
+        .with_context(|| format!("invalid klv address: {}", klv_address))?;
+    let resp = vm_hex_call(
+        http,
+        klever_node_url,
+        contract_address,
+        "getUserRegisteredAt",
+        &[address_hex],
+    )
+    .await?;
+    if resp.is_require_failure() {
+        return Ok(0);
+    }
+    Ok(decode_u64_be(&resp.data))
+}
+
+/// A channel's on-chain type + creation timestamp.
+pub struct ChannelInfo {
+    /// 0 = Public, 1 = ReadPublic.
+    pub channel_type: u8,
+    pub created_at: u64,
+}
+
+/// Returns a channel's type and creation timestamp, or `None` if the
+/// channel does not exist on-chain.
+pub async fn get_channel_info(
+    http: &reqwest::Client,
+    klever_node_url: &str,
+    contract_address: &str,
+    channel_id: u64,
+) -> Result<Option<ChannelInfo>> {
+    let resp = vm_query_multi(
+        http,
+        klever_node_url,
+        contract_address,
+        "getChannelInfo",
+        &[encode_u64_minimal_hex(channel_id)],
+    )
+    .await?;
+    if resp.is_require_failure() {
+        return Ok(None);
+    }
+    decode_channel_info(&resp.items).map(Some)
+}
+
+/// Decode the `MultiValue2<u8, u64>` payload of `getChannelInfo` into a
+/// [`ChannelInfo`]. Split out from [`get_channel_info`] so the decode logic
+/// is unit-testable without an HTTP round-trip (this crate has no mock-HTTP
+/// harness).
+fn decode_channel_info(items: &[Vec<u8>]) -> Result<ChannelInfo> {
+    // MultiValue2<u8, u64> flattens to exactly 2 return items.
+    if items.len() != 2 {
+        anyhow::bail!(
+            "getChannelInfo returned unexpected item count: {} (expected 2)",
+            items.len()
+        );
+    }
+    let channel_type = match items[0].as_slice() {
+        [] => 0,
+        [b] => *b,
+        _ => anyhow::bail!("getChannelInfo channel_type has unexpected length"),
+    };
+    let created_at = decode_u64_be_bytes(&items[1]);
+    Ok(ChannelInfo {
+        channel_type,
+        created_at,
+    })
+}
+
 // ── Decoding helpers ────────────────────────────────────────────────
 
 /// Decode a u64 from minimal big-endian raw bytes (used by
@@ -868,6 +1025,37 @@ mod tests {
             let encoded = encode_u64_minimal_hex(v);
             assert_eq!(decode_u64_be(&encoded), v, "round-trip for {}", v);
         }
+    }
+
+    // --- getChannelInfo decode (SC 0.6.1) -----------------------------
+
+    #[test]
+    fn channel_info_decodes_type_and_timestamp() {
+        // channel_type=1 (ReadPublic), created_at=1_700_000_000
+        // (0x6553F100 big-endian minimal bytes).
+        let info = decode_channel_info(&[vec![1u8], vec![0x65, 0x53, 0xF1, 0x00]]).unwrap();
+        assert_eq!(info.channel_type, 1);
+        assert_eq!(info.created_at, 1_700_000_000);
+    }
+
+    #[test]
+    fn channel_info_zero_values_decode_as_empty_bytes() {
+        // u8(0) and u64(0) both minimal-encode to zero-length on the wire —
+        // mirrors klever-sc's general zero-value convention.
+        let info = decode_channel_info(&[vec![], vec![]]).unwrap();
+        assert_eq!(info.channel_type, 0);
+        assert_eq!(info.created_at, 0);
+    }
+
+    #[test]
+    fn channel_info_rejects_wrong_item_count() {
+        assert!(decode_channel_info(&[vec![1u8]]).is_err());
+        assert!(decode_channel_info(&[vec![1u8], vec![0u8], vec![0u8]]).is_err());
+    }
+
+    #[test]
+    fn channel_info_rejects_oversized_type_byte() {
+        assert!(decode_channel_info(&[vec![1u8, 2u8], vec![]]).is_err());
     }
 
     // --- Transport classifier (spec 13 §4.5, 0.46.5+) ----------------

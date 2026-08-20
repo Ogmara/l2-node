@@ -5,6 +5,78 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.109.0] - 2026-08-20
+
+Wires the divergence-watcher and dashboard up to the ogmara-contract
+0.7.0 hybrid-quorum surface (new node/user/channel views + the finality
+distinction the 0.6.0 grace window introduced).
+
+### Security
+
+- **Divergence-watcher no longer treats a provisional tiebreak preview as
+  a settled resolution.** Both `check_divergence` (per-submission matcher)
+  and `poll_divergence_resolutions` (re-poll loop) previously judged an
+  escalated height's outcome from `getCanonicalAnchor`, which starts
+  returning the §2.9 tiebreak's PROVISIONAL preview the instant a height
+  escalates — well before the 24h `TIEBREAK_GRACE_PERIOD_SECS` window
+  closes, and that preview can still be overridden by genuine
+  escalated-quorum agreement on a different root during the window.
+  `check_divergence` would commit a match/divergence verdict (bumping
+  counters, dropping the height from tracking) on that preview;
+  `poll_divergence_resolutions` would fire the `anchor_divergence_resolved`
+  info alert and stop tracking. Either way, a later flip to a different
+  canonical root went completely unnoticed. Both now check
+  `getEscalatedCanonical` (SC 0.7.0) first for an escalated height and
+  defer judgment until the resolution is genuinely materialized on-chain.
+  Found while wiring up the grace window this session, not by an external
+  report — no known incident.
+- **Fail-closed on a transient `isDivergenceEscalated` RPC error in
+  `check_divergence`.** The first version of the fix above defaulted to
+  "not escalated" (`.unwrap_or(false)`) when that specific check failed,
+  which — on a genuinely escalated, still-unresolved height — fell through
+  to judging the provisional preview directly, reopening the exact bug the
+  fix was meant to close for that one failure path. Now defers (keeps the
+  submission pending, retries next tick) on error, matching how the
+  adjacent `getEscalatedCanonical` call and `poll_divergence_resolutions`
+  already handled their own RPC failures. Caught by the post-fix audit
+  pass, not shipped to any deploy.
+
+### Added
+
+- `chain::sc_views::get_escalated_canonical` — the SC 0.7.0
+  `getEscalatedCanonical` view client; raw finality read, no preview
+  fallback.
+- `chain::sc_views::get_active_node_count` — the SC 0.5.0+
+  `getActiveNodeCount` view client (registered minus paused; the real
+  denominator behind the hybrid-quorum escalation threshold).
+- `chain::sc_views::get_user_registered_at` / `get_channel_info` — SC
+  0.6.1 `getUserRegisteredAt` / `getChannelInfo` view clients. Not wired
+  into any hot path: the node already tracks this data locally from
+  gossip (faster, no RPC round-trip); these exist as on-chain
+  source-of-truth reads for reconciliation/verification tooling and SDK
+  consumers without a running node.
+- `/admin/node/registration` gains `network_active_node_count` (same
+  null-on-RPC-unavailable convention as `network_node_count`). Dashboard
+  shows it alongside "Registered nodes" as "Active (non-paused)" so an
+  operator doesn't read the registered count as "how many nodes can help
+  reach escalated quorum right now" when some are paused.
+
+### Deferred
+
+- Automatic `resolveTiebreak` invocation remains unimplemented (spec 12
+  §2.9 leaves it to "the l2-node divergence-watcher... or operators/clients
+  manually"). This session closes the finality-detection gap around the
+  existing read-only watcher; adding an automatic resolver is a separate,
+  larger feature (wallet-signed TX construction, gas/cost policy) and a
+  genuine design decision, not a follow-up bug fix.
+
+### Dependencies
+
+- No dependency changes (`Cargo.lock` diff is the version-bump line only).
+  `cargo audit`: 2 vulnerabilities, both the pre-existing, already-deferred
+  `hickory-proto` 0.25.2 DNS-DoS advisories (RUSTSEC-2026-0118/0119) via the
+  `libp2p` 0.56.0 pin — unrelated to this release, tracked separately.
+
 ## [0.108.0] - 2026-08-19
 
 Closes the last open items from the final pre-mainnet audit campaign
