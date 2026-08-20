@@ -1353,6 +1353,24 @@ impl Storage {
         self.exists_cf(cf::FOLLOWS, &key)
     }
 
+    /// Whether a `Followers`-only news post authored by `author` is visible
+    /// to `caller` (audit W37: `NewsPostPayload.visibility` was decoded and
+    /// stored but never checked on any read path — a "followers-only" post
+    /// was actually served to everyone, including the public feed). The
+    /// author always sees their own post; anyone else must be an
+    /// authenticated, currently-following wallet. `None` (unauthenticated /
+    /// unresolvable caller) can never see it — matches the private-channel
+    /// precedent of failing closed rather than open on a missing identity.
+    /// Callers check `payload.visibility == Visibility::Followers` first —
+    /// `Public` posts never call this.
+    pub fn news_followers_post_visible_to(&self, author: &str, caller: Option<&str>) -> bool {
+        match caller {
+            Some(addr) if addr == author => true,
+            Some(addr) => self.is_following(addr, author).unwrap_or(false),
+            None => false,
+        }
+    }
+
     /// Get follower counts for an address: (following_count, follower_count).
     pub fn get_follower_counts(&self, address: &str) -> Result<(u64, u64)> {
         match self.get_cf(cf::FOLLOWER_COUNTS, address.as_bytes())? {
@@ -5116,5 +5134,54 @@ mod store_notification_capped_tests {
                 .unwrap();
         }
         assert_eq!(s.get_notifications(addr, None, 100).unwrap().len(), 10);
+    }
+}
+
+#[cfg(test)]
+mod news_followers_visibility_tests {
+    //! Audit W37: `NewsPostPayload.visibility == Followers` was decoded and
+    //! stored but never checked on any read path. This covers the pure
+    //! predicate; `api::routes` and `network::news_sync` cover the actual
+    //! read-path wiring.
+    use super::*;
+    use tempfile::TempDir;
+
+    fn db() -> (Storage, TempDir) {
+        let dir = TempDir::new().unwrap();
+        (Storage::open(dir.path()).unwrap(), dir)
+    }
+
+    #[test]
+    fn author_always_sees_their_own_post() {
+        let (s, _d) = db();
+        assert!(s.news_followers_post_visible_to("klv1author", Some("klv1author")));
+    }
+
+    #[test]
+    fn unauthenticated_caller_never_sees_it() {
+        let (s, _d) = db();
+        assert!(!s.news_followers_post_visible_to("klv1author", None));
+    }
+
+    #[test]
+    fn non_follower_does_not_see_it() {
+        let (s, _d) = db();
+        assert!(!s.news_followers_post_visible_to("klv1author", Some("klv1stranger")));
+    }
+
+    #[test]
+    fn a_real_follower_sees_it() {
+        let (s, _d) = db();
+        s.apply_follow_edge("klv1fan", "klv1author", true, 1_000).unwrap();
+        assert!(s.news_followers_post_visible_to("klv1author", Some("klv1fan")));
+    }
+
+    #[test]
+    fn unfollowing_revokes_visibility() {
+        let (s, _d) = db();
+        s.apply_follow_edge("klv1fan", "klv1author", true, 1_000).unwrap();
+        assert!(s.news_followers_post_visible_to("klv1author", Some("klv1fan")));
+        s.apply_follow_edge("klv1fan", "klv1author", false, 2_000).unwrap();
+        assert!(!s.news_followers_post_visible_to("klv1author", Some("klv1fan")));
     }
 }

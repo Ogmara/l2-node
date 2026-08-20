@@ -101,22 +101,12 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
         .route("/api/v1/users/{address}", get(routes::get_user))
         .route("/api/v1/users/{address}/followers", get(routes::get_followers))
         .route("/api/v1/users/{address}/following", get(routes::get_following))
-        .route("/api/v1/news", get(routes::list_news))
-        .route("/api/v1/news/{msg_id}", get(routes::get_news_post))
-        .route(
-            "/api/v1/news/{msg_id}/reposts",
-            get(routes::get_news_reposts),
-        )
         // GET and HEAD share the same handler; the handler inspects the
         // method extractor and elides the body for HEAD. RFC 9110 §9.3.2:
         // HEAD must produce the same headers as GET, no body.
         .route(
             "/api/v1/media/{cid}",
             get(routes::get_media).head(routes::get_media),
-        )
-        .route(
-            "/api/v1/users/{address}/posts",
-            get(routes::get_user_posts),
         )
         .route(
             "/api/v1/moderation/reports",
@@ -127,7 +117,8 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
             get(routes::get_user_moderation),
         );
 
-    // Routes that optionally benefit from auth (e.g. filtering private channels)
+    // Routes that optionally benefit from auth (e.g. filtering private channels,
+    // or — W37 — filtering Followers-only news posts to actual followers)
     let optional_auth_routes = Router::new()
         .route("/api/v1/channels", get(routes::list_channels))
         .route("/api/v1/channels/by-slug/{slug}", get(routes::channel_by_slug))
@@ -147,6 +138,16 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
         .route(
             "/api/v1/news/{msg_id}/reactions",
             get(routes::get_news_reactions),
+        )
+        .route(
+            "/api/v1/news/{msg_id}/reposts",
+            get(routes::get_news_reposts),
+        )
+        .route("/api/v1/news", get(routes::list_news))
+        .route("/api/v1/news/{msg_id}", get(routes::get_news_post))
+        .route(
+            "/api/v1/users/{address}/posts",
+            get(routes::get_user_posts),
         )
         .layer(middleware::from_fn(auth::optional_auth_middleware));
 

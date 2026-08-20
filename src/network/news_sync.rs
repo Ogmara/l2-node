@@ -110,6 +110,32 @@ pub fn capped_response() -> NewsSyncResponse {
     }
 }
 
+/// Whether a raw envelope may be re-served to a backfilling peer over this
+/// unauthenticated P2P protocol (audit W37). This responder has no concept
+/// of "requester identity" — unlike the REST `/api/v1/news` endpoints (which
+/// can check `Storage::news_followers_post_visible_to` against an
+/// authenticated caller), a news-sync peer is just another node, not a
+/// wallet. A `Followers`-only `NewsPost` is therefore never backfillable
+/// here; it only ever reaches a fresh/cold-joined node via live gossip
+/// (already-subscribed nodes keep whatever they received that way — this
+/// only affects catch-up for a node that missed the original broadcast).
+/// Anything else (comments, reactions, reposts, or an undecodable payload)
+/// is unaffected — only the post's OWN `visibility` field gates it.
+fn is_backfillable(raw: &[u8]) -> bool {
+    let Ok(envelope) = rmp_serde::from_slice::<crate::messages::envelope::Envelope>(raw) else {
+        return true; // corrupt — not this check's job to hide it
+    };
+    if envelope.msg_type != crate::messages::types::MessageType::NewsPost {
+        return true;
+    }
+    let Ok(payload) =
+        rmp_serde::from_slice::<crate::messages::types::NewsPostPayload>(&envelope.payload)
+    else {
+        return true;
+    };
+    payload.visibility != crate::messages::types::Visibility::Followers
+}
+
 /// Build a response: walk NEWS_FEED newest-first from the cursor, stop at the
 /// window cutoff, re-serve the original signed envelopes from MESSAGES. Caps at
 /// `max_envelopes`. `window_max_age_secs` is the RESPONDER's configured window
@@ -193,7 +219,9 @@ pub fn build_response(
             after_msg_id: msg_id,
         });
         if let Ok(Some(raw)) = storage.get_cf(schema::cf::MESSAGES, &msg_id) {
-            envelopes.push(raw);
+            if is_backfillable(&raw) {
+                envelopes.push(raw);
+            }
         }
     }
 
@@ -264,10 +292,41 @@ fn news_edit_delete_envelopes(storage: &Storage, min_ts: u64) -> Vec<Vec<u8>> {
         let mut msg_id = [0u8; 32];
         msg_id.copy_from_slice(&key[8..40]);
         if let Ok(Some(raw)) = storage.get_cf(schema::cf::MESSAGES, &msg_id) {
-            out.push(raw);
+            if edit_is_backfillable(storage, &raw) {
+                out.push(raw);
+            }
         }
     }
     out
+}
+
+/// Whether a `NewsEdit`/`NewsDelete` envelope may ride along to a
+/// backfilling peer (audit W37 follow-up, found while closing the main
+/// finding). `NewsDelete` never carries content, so it's always safe.
+/// `NewsEdit`'s `EditPayload.content`/`title` carry the post's FULL NEW
+/// plaintext — even though `is_backfillable` above already excludes the
+/// original `Followers`-only `NewsPost` envelope from this same response,
+/// an edit ride-along on that post's `target_id` would otherwise leak its
+/// edited content through this side channel to a peer who never received
+/// the original. Looks up the target post to check its CURRENT visibility
+/// (an edit can't itself change `visibility` — that's immutable per
+/// `channel_encryption_defaults`-style write-time enforcement elsewhere —
+/// so the original post's stored visibility is authoritative).
+fn edit_is_backfillable(storage: &Storage, raw: &[u8]) -> bool {
+    let Ok(envelope) = rmp_serde::from_slice::<crate::messages::envelope::Envelope>(raw) else {
+        return true;
+    };
+    if envelope.msg_type != crate::messages::types::MessageType::NewsEdit {
+        return true;
+    }
+    let Ok(edit) = rmp_serde::from_slice::<crate::messages::types::EditPayload>(&envelope.payload)
+    else {
+        return true;
+    };
+    let Ok(Some(original_raw)) = storage.get_cf(schema::cf::MESSAGES, &edit.target_id) else {
+        return true; // original gone/unknown — nothing more restrictive to check
+    };
+    is_backfillable(&original_raw)
 }
 
 // --- Responder rate limiting (per peer; the feed is global) ---
@@ -483,6 +542,164 @@ mod edit_delete_ride_along_tests {
         assert!(
             contains_type(&resp2.envelopes, MessageType::NewsDelete),
             "delete must ride along on the final page"
+        );
+    }
+}
+
+#[cfg(test)]
+mod w37_followers_visibility_tests {
+    //! Audit W37: news-sync has no requester identity (unlike the REST
+    //! `/api/v1/news` endpoints), so a `Followers`-only post can never be
+    //! backfilled through this protocol — only excluded, not conditionally
+    //! shown. Also covers the edit-payload side channel found while fixing
+    //! this: an edit ride-along on a Followers-only post must not leak its
+    //! new content to a peer who never received the original post.
+    use super::*;
+    use crate::messages::envelope::Envelope;
+    use crate::messages::types::{EditPayload, MessageType, NewsPostPayload, Visibility};
+    use tempfile::TempDir;
+
+    fn contains_type(envelopes: &[Vec<u8>], msg_type: MessageType) -> bool {
+        envelopes.iter().any(|e| {
+            rmp_serde::from_slice::<Envelope>(e)
+                .map(|env| env.msg_type == msg_type)
+                .unwrap_or(false)
+        })
+    }
+
+    fn put_news_post_vis(
+        storage: &Storage,
+        author: &str,
+        msg_id: [u8; 32],
+        ts: u64,
+        visibility: Visibility,
+    ) {
+        let payload = NewsPostPayload {
+            title: "headline".to_string(),
+            content: "body".to_string(),
+            content_rating: Default::default(),
+            tags: vec![],
+            attachments: vec![],
+            visibility,
+        };
+        let env = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::NewsPost,
+            msg_id,
+            author: author.to_string(),
+            timestamp: ts,
+            lamport_ts: 0,
+            payload: rmp_serde::to_vec_named(&payload).unwrap(),
+            signature: vec![],
+            relay_path: vec![],
+        };
+        storage
+            .put_cf(schema::cf::NEWS_FEED, &schema::encode_news_key(ts, &msg_id), &[])
+            .unwrap();
+        storage
+            .put_cf(schema::cf::MESSAGES, &msg_id, &rmp_serde::to_vec_named(&env).unwrap())
+            .unwrap();
+    }
+
+    fn put_news_edit(storage: &Storage, author: &str, target_id: [u8; 32], msg_id: [u8; 32], ts: u64) {
+        let payload = EditPayload {
+            target_id,
+            channel_id: None,
+            content: "leaked new content".to_string(),
+            edited_at: ts,
+            title: Some("leaked new title".to_string()),
+            tags: None,
+            attachments: None,
+            enc_content: None,
+            enc_nonce: None,
+            key_epoch: None,
+        };
+        let env = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::NewsEdit,
+            msg_id,
+            author: author.to_string(),
+            timestamp: ts,
+            lamport_ts: 0,
+            payload: rmp_serde::to_vec_named(&payload).unwrap(),
+            signature: vec![],
+            relay_path: vec![],
+        };
+        storage
+            .put_cf(schema::cf::NEWS_EDIT_DELETE, &schema::encode_news_key(ts, &msg_id), &[])
+            .unwrap();
+        storage
+            .put_cf(schema::cf::MESSAGES, &msg_id, &rmp_serde::to_vec_named(&env).unwrap())
+            .unwrap();
+    }
+
+    #[test]
+    fn followers_only_post_is_never_backfilled() {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let author = "klv1author";
+        let ts = 1_700_000_000_000u64;
+        put_news_post_vis(&storage, author, [1u8; 32], ts, Visibility::Followers);
+
+        let req = NewsSyncRequest { max_age_secs: u64::MAX, cursor: None, overlap_digest: vec![], round: 0 };
+        let resp = build_response(&storage, &req, 10, ts + 1000, u64::MAX);
+        assert!(
+            resp.envelopes.is_empty(),
+            "a Followers-only post must never ride the news-sync backfill response"
+        );
+    }
+
+    #[test]
+    fn public_post_is_still_backfilled() {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let author = "klv1author";
+        let ts = 1_700_000_000_000u64;
+        put_news_post_vis(&storage, author, [1u8; 32], ts, Visibility::Public);
+
+        let req = NewsSyncRequest { max_age_secs: u64::MAX, cursor: None, overlap_digest: vec![], round: 0 };
+        let resp = build_response(&storage, &req, 10, ts + 1000, u64::MAX);
+        assert_eq!(resp.envelopes.len(), 1, "a Public post must still backfill normally");
+    }
+
+    #[test]
+    fn edit_of_a_followers_only_post_does_not_leak_via_ride_along() {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let author = "klv1author";
+        let ts = 1_700_000_000_000u64;
+        let post_id = [1u8; 32];
+        put_news_post_vis(&storage, author, post_id, ts, Visibility::Followers);
+        put_news_edit(&storage, author, post_id, [2u8; 32], ts + 100);
+
+        // cap=1 forces has_more on a first page with only the (excluded)
+        // post row present, but the edit lives in NEWS_EDIT_DELETE and only
+        // rides along on the FINAL page — use a cap large enough that this
+        // one post's absence still yields the final page immediately.
+        let req = NewsSyncRequest { max_age_secs: u64::MAX, cursor: None, overlap_digest: vec![], round: 0 };
+        let resp = build_response(&storage, &req, 10, ts + 1000, u64::MAX);
+        assert!(
+            resp.envelopes.is_empty(),
+            "an edit whose target post is Followers-only must not leak the edited content \
+             via the ride-along side channel, even though the original post is already excluded"
+        );
+    }
+
+    #[test]
+    fn edit_of_a_public_post_still_rides_along() {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let author = "klv1author";
+        let ts = 1_700_000_000_000u64;
+        let post_id = [1u8; 32];
+        put_news_post_vis(&storage, author, post_id, ts, Visibility::Public);
+        put_news_edit(&storage, author, post_id, [2u8; 32], ts + 100);
+
+        let req = NewsSyncRequest { max_age_secs: u64::MAX, cursor: None, overlap_digest: vec![], round: 0 };
+        let resp = build_response(&storage, &req, 10, ts + 1000, u64::MAX);
+        assert!(
+            contains_type(&resp.envelopes, MessageType::NewsEdit),
+            "an edit on a Public post must still ride along normally"
         );
     }
 }

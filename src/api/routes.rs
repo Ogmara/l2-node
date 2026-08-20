@@ -170,6 +170,121 @@ fn envelope_to_json(
     val
 }
 
+/// Whether a news item is visible to `caller` (audit W37 fix). `NewsPost`
+/// checks its own `visibility` field. `NewsComment`/`NewsRepost` carry no
+/// `visibility` of their own but reference a parent/original post by
+/// msg_id — checked recursively against THAT post's visibility (Code Audit
+/// follow-up: the original fix only gated `NewsPost` itself, leaving a
+/// comment's or repost's own content, which can quote/describe a
+/// Followers-only post, fully visible in `list_news` regardless). Anything
+/// else (or an undecodable payload/reference) is never gated. `resolved_author`
+/// must already be the identity-resolved wallet (not the raw
+/// device-delegated `envelope.author`), matching what
+/// `Storage::apply_follow_edge`/`is_following` key on.
+fn news_item_visible(
+    storage: &crate::storage::rocks::Storage,
+    identity: &crate::storage::identity::IdentityResolver,
+    envelope: &crate::messages::envelope::Envelope,
+    resolved_author: &str,
+    caller: Option<&str>,
+) -> bool {
+    use crate::messages::types::MessageType;
+    match envelope.msg_type {
+        MessageType::NewsPost => {
+            news_post_payload_visible(storage, resolved_author, caller, &envelope.payload)
+        }
+        MessageType::NewsComment => {
+            let Ok(payload) = rmp_serde::from_slice::<
+                crate::messages::types::NewsCommentPayload,
+            >(&envelope.payload) else {
+                return true;
+            };
+            news_referenced_post_visible(storage, identity, &payload.post_id, caller)
+        }
+        MessageType::NewsRepost => {
+            let Ok(payload) = rmp_serde::from_slice::<
+                crate::messages::types::NewsRepostPayload,
+            >(&envelope.payload) else {
+                return true;
+            };
+            news_referenced_post_visible(storage, identity, &payload.original_id, caller)
+        }
+        _ => true,
+    }
+}
+
+/// Core `NewsPost` visibility check, shared by `news_item_visible`'s direct
+/// `NewsPost` arm and `news_referenced_post_visible`'s lookup of a
+/// comment/repost's target.
+fn news_post_payload_visible(
+    storage: &crate::storage::rocks::Storage,
+    resolved_author: &str,
+    caller: Option<&str>,
+    payload_bytes: &[u8],
+) -> bool {
+    let Ok(payload) =
+        rmp_serde::from_slice::<crate::messages::types::NewsPostPayload>(payload_bytes)
+    else {
+        return true; // undecodable — not this check's job to hide it
+    };
+    if payload.visibility != crate::messages::types::Visibility::Followers {
+        return true;
+    }
+    storage.news_followers_post_visible_to(resolved_author, caller)
+}
+
+/// Look up `target_id` (a comment's `post_id` or a repost's `original_id`)
+/// and check ITS visibility. A missing/undecodable/non-`NewsPost` target is
+/// treated as visible — not this check's job to hide a dangling reference.
+fn news_referenced_post_visible(
+    storage: &crate::storage::rocks::Storage,
+    identity: &crate::storage::identity::IdentityResolver,
+    target_id: &[u8; 32],
+    caller: Option<&str>,
+) -> bool {
+    let Ok(Some(raw)) = storage.get_cf(cf::MESSAGES, target_id) else {
+        return true;
+    };
+    let Ok(target_env) =
+        rmp_serde::from_slice::<crate::messages::envelope::Envelope>(&raw)
+    else {
+        return true;
+    };
+    if target_env.msg_type != crate::messages::types::MessageType::NewsPost {
+        return true;
+    }
+    let target_author = identity
+        .resolve(&target_env.author)
+        .unwrap_or_else(|_| target_env.author.clone());
+    news_post_payload_visible(storage, &target_author, caller, &target_env.payload)
+}
+
+/// `news_item_visible`, but looks the envelope up by `msg_id` first (Code
+/// Audit follow-up: `get_news_reactions`/`get_news_reposts` take a `msg_id`
+/// directly, not an already-decoded `Envelope`). A genuinely-missing
+/// `msg_id` returns `true` (visible) — existence-checking is each caller's
+/// own pre-existing job; this only ever HIDES a target that both exists AND
+/// fails the same visibility check `list_news`/`get_news_post` apply. Takes
+/// `storage`/`identity` directly (not `&AppState`) so it's unit-testable
+/// without constructing the full app state.
+fn target_news_item_visible(
+    storage: &crate::storage::rocks::Storage,
+    identity: &crate::storage::identity::IdentityResolver,
+    msg_id: &[u8; 32],
+    caller: Option<&str>,
+) -> bool {
+    let Ok(Some(raw)) = storage.get_cf(cf::MESSAGES, msg_id) else {
+        return true;
+    };
+    let Ok(envelope) = rmp_serde::from_slice::<crate::messages::envelope::Envelope>(&raw) else {
+        return true;
+    };
+    let resolved_author = identity
+        .resolve(&envelope.author)
+        .unwrap_or_else(|_| envelope.author.clone());
+    news_item_visible(storage, identity, &envelope, &resolved_author, caller)
+}
+
 /// Apply the latest edit envelope on top of the original message's payload
 /// and return the merged payload as fresh msgpack bytes. Returns `None` on
 /// any decode failure, when the original message is missing, or when the
@@ -2182,11 +2297,19 @@ pub async fn get_enc_keys(
 }
 
 /// GET /api/v1/news
+///
+/// Public feed, but a `Followers`-only post (audit W37) is only included for
+/// an authenticated caller who follows its author (or the author themselves)
+/// — same filter-after-fetch approximation `list_channels` already uses for
+/// private channels (may return fewer than `limit` even when more visible
+/// posts exist further back).
 pub async fn list_news(
     Extension(state): Extension<Arc<AppState>>,
+    auth_user: Option<Extension<AuthUser>>,
     Query(params): Query<PaginationParams>,
 ) -> impl IntoResponse {
     let limit = params.limit.unwrap_or(20).min(100) as usize;
+    let caller = auth_user.as_ref().map(|u| u.address.as_str());
 
     match state
         .storage
@@ -2203,6 +2326,13 @@ pub async fn list_news(
                             crate::messages::envelope::Envelope,
                         >(&envelope_bytes)
                         {
+                            let resolved_author = state
+                                .identity
+                                .resolve(&envelope.author)
+                                .unwrap_or_else(|_| envelope.author.clone());
+                            if !news_item_visible(&state.storage, &state.identity, &envelope, &resolved_author, caller) {
+                                continue;
+                            }
                             let mut post = envelope_to_json(&envelope, &state.identity);
                             if let serde_json::Value::Object(ref mut map) = post {
                                 // Check if this is a comment (msg_type == "NewsComment")
@@ -2237,15 +2367,22 @@ pub async fn list_news(
                                             >(&parent_bytes) {
                                                 let parent_author = state.identity.resolve(&parent_env.author)
                                                     .unwrap_or_else(|_| parent_env.author.clone());
-                                                map.insert("parent_author".into(),
-                                                    serde_json::json!(parent_author));
-                                                // Try to extract parent title
-                                                if let Ok(parent_payload) = rmp_serde::from_slice::<
-                                                    crate::messages::types::NewsPostPayload,
-                                                >(&parent_env.payload) {
-                                                    if !parent_payload.title.is_empty() {
-                                                        map.insert("parent_title".into(),
-                                                            serde_json::json!(parent_payload.title));
+                                                // W37: a comment on a Followers-only post
+                                                // must not leak that post's author/title
+                                                // to a caller who can't see the post
+                                                // itself — the same check applied to
+                                                // the post's own feed entry above.
+                                                if news_item_visible(&state.storage, &state.identity, &parent_env, &parent_author, caller) {
+                                                    map.insert("parent_author".into(),
+                                                        serde_json::json!(parent_author));
+                                                    // Try to extract parent title
+                                                    if let Ok(parent_payload) = rmp_serde::from_slice::<
+                                                        crate::messages::types::NewsPostPayload,
+                                                    >(&parent_env.payload) {
+                                                        if !parent_payload.title.is_empty() {
+                                                            map.insert("parent_title".into(),
+                                                                serde_json::json!(parent_payload.title));
+                                                        }
                                                     }
                                                 }
                                             }
@@ -2277,8 +2414,13 @@ pub async fn list_news(
 }
 
 /// GET /api/v1/news/{msg_id} — single news post with comments.
+///
+/// A `Followers`-only post (audit W37) 404s for anyone who isn't the author
+/// or an authenticated follower — same no-existence-leakage precedent as
+/// `get_channel`'s private-channel handling.
 pub async fn get_news_post(
     Extension(state): Extension<Arc<AppState>>,
+    auth_user: Option<Extension<AuthUser>>,
     Path(msg_id_hex): Path<String>,
 ) -> impl IntoResponse {
     let msg_id = match hex::decode(&msg_id_hex) {
@@ -2304,6 +2446,15 @@ pub async fn get_news_post(
         Ok(env) => env,
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "corrupt envelope").into_response(),
     };
+
+    let resolved_author = state
+        .identity
+        .resolve(&envelope.author)
+        .unwrap_or_else(|_| envelope.author.clone());
+    let caller = auth_user.as_ref().map(|u| u.address.as_str());
+    if !news_item_visible(&state.storage, &state.identity, &envelope, &resolved_author, caller) {
+        return (StatusCode::NOT_FOUND, "post not found").into_response();
+    }
 
     let mut post = envelope_to_json(&envelope, &state.identity);
 
@@ -3381,6 +3532,11 @@ pub async fn unfollow_user(
 
 /// GET /api/v1/news/:msg_id/reactions
 /// Supports optional auth header to include `user_reacted` per spec.
+///
+/// Code Audit follow-up (W37): a `Followers`-only post's reaction counts
+/// were still readable by anyone who already had its `msg_id`, even though
+/// the post itself now 404s. 404s the same way `get_news_post` does if the
+/// target isn't visible to the caller.
 pub async fn get_news_reactions(
     Extension(state): Extension<Arc<AppState>>,
     auth_user: Option<Extension<AuthUser>>,
@@ -3396,6 +3552,10 @@ pub async fn get_news_reactions(
     };
 
     let caller_address = auth_user.map(|a| a.0.address.clone());
+    let caller = caller_address.as_deref();
+    if !target_news_item_visible(&state.storage, &state.identity, &msg_id, caller) {
+        return (StatusCode::NOT_FOUND, "post not found").into_response();
+    }
 
     match state.storage.get_news_reactions(&msg_id) {
         Ok(reactions) => {
@@ -3471,8 +3631,13 @@ pub async fn repost_news(
 }
 
 /// GET /api/v1/news/:msg_id/reposts
+///
+/// Code Audit follow-up (W37): mirrors `get_news_reactions`'s visibility
+/// gate — a `Followers`-only post's reposter list was still readable by
+/// anyone who already had its `msg_id`.
 pub async fn get_news_reposts(
     Extension(state): Extension<Arc<AppState>>,
+    auth_user: Option<Extension<AuthUser>>,
     Path(msg_id_hex): Path<String>,
     Query(params): Query<PaginationParams>,
 ) -> impl IntoResponse {
@@ -3484,6 +3649,11 @@ pub async fn get_news_reposts(
         }
         _ => return (StatusCode::BAD_REQUEST, "invalid msg_id").into_response(),
     };
+
+    let caller = auth_user.as_ref().map(|u| u.address.as_str());
+    if !target_news_item_visible(&state.storage, &state.identity, &msg_id, caller) {
+        return (StatusCode::NOT_FOUND, "post not found").into_response();
+    }
 
     let limit = params.limit.unwrap_or(20).min(100) as usize;
     let prefix = msg_id.to_vec();
@@ -6022,9 +6192,12 @@ fn parse_byte_range(value: &str, total: u64) -> Option<(u64, u64)> {
 ///
 /// Public endpoint. Returns paginated posts in reverse-chronological order,
 /// enriched with reaction counts, comment count, repost count, and
-/// edit/deletion status — mirroring the `list_news` enrichment pattern.
+/// edit/deletion status — mirroring the `list_news` enrichment pattern. A
+/// `Followers`-only post (audit W37) is only included for an authenticated
+/// caller who follows `address` (or is `address` themselves).
 pub async fn get_user_posts(
     Extension(state): Extension<Arc<AppState>>,
+    auth_user: Option<Extension<AuthUser>>,
     Path(address): Path<String>,
     Query(params): Query<PaginationParams>,
 ) -> impl IntoResponse {
@@ -6035,6 +6208,7 @@ pub async fn get_user_posts(
 
     let limit = params.limit.unwrap_or(20).min(100) as usize;
     let page = params.page.unwrap_or(1);
+    let caller = auth_user.as_ref().map(|u| u.address.as_str());
 
     // Resolve to wallet address for consistent lookup
     let resolved = state.identity.resolve(&address).unwrap_or_else(|_| address.clone());
@@ -6073,6 +6247,9 @@ pub async fn get_user_posts(
                     Ok(env) => env,
                     Err(_) => continue,
                 };
+                if !news_item_visible(&state.storage, &state.identity, &envelope, &resolved, caller) {
+                    continue;
+                }
 
                 let mut post = envelope_to_json(&envelope, &state.identity);
                 enrich_message_json(&mut post, &state.storage);
@@ -8179,5 +8356,291 @@ mod gossip_bridge_tests {
             gossip_topic_for_envelope(&env, "testnet"),
             Some(crate::network::gossip::channel_topic("testnet", 42)),
         );
+    }
+}
+
+#[cfg(test)]
+mod w37_news_item_visible_tests {
+    //! Audit W37: `news_item_visible` gates `list_news`/`get_news_post`/
+    //! `get_user_posts`. Only exercises the pure predicate — the actual
+    //! HTTP handlers are covered by the storage-level
+    //! `news_followers_visibility_tests` (rocks.rs) plus the news-sync
+    //! backfill tests (network::news_sync::w37_followers_visibility_tests).
+    use super::news_item_visible;
+    use crate::messages::envelope::Envelope;
+    use crate::storage::schema::cf;
+    use crate::messages::types::{
+        MessageType, NewsCommentPayload, NewsPostPayload, NewsRepostPayload, Visibility,
+    };
+    use crate::storage::identity::IdentityResolver;
+    use crate::storage::rocks::Storage;
+    use tempfile::TempDir;
+
+    fn news_envelope(author: &str, msg_id: [u8; 32], visibility: Visibility) -> Envelope {
+        let payload = NewsPostPayload {
+            title: "headline".to_string(),
+            content: "body".to_string(),
+            content_rating: Default::default(),
+            tags: vec![],
+            attachments: vec![],
+            visibility,
+        };
+        Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::NewsPost,
+            msg_id,
+            author: author.to_string(),
+            timestamp: 1_000,
+            lamport_ts: 0,
+            payload: rmp_serde::to_vec_named(&payload).unwrap(),
+            signature: Vec::new(),
+            relay_path: Vec::new(),
+        }
+    }
+
+    fn comment_envelope(author: &str, post_id: [u8; 32]) -> Envelope {
+        let payload = NewsCommentPayload {
+            post_id,
+            content: "leaked comment content".to_string(),
+            reply_to: None,
+            mentions: vec![],
+            attachments: vec![],
+        };
+        Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::NewsComment,
+            msg_id: [2u8; 32],
+            author: author.to_string(),
+            timestamp: 1_100,
+            lamport_ts: 0,
+            payload: rmp_serde::to_vec_named(&payload).unwrap(),
+            signature: Vec::new(),
+            relay_path: Vec::new(),
+        }
+    }
+
+    fn repost_envelope(author: &str, original_id: [u8; 32], original_author: &str) -> Envelope {
+        let payload = NewsRepostPayload {
+            original_id,
+            original_author: original_author.to_string(),
+            comment: Some("leaked quote-repost content".to_string()),
+        };
+        Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::NewsRepost,
+            msg_id: [3u8; 32],
+            author: author.to_string(),
+            timestamp: 1_200,
+            lamport_ts: 0,
+            payload: rmp_serde::to_vec_named(&payload).unwrap(),
+            signature: Vec::new(),
+            relay_path: Vec::new(),
+        }
+    }
+
+    fn db() -> (Storage, IdentityResolver, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let identity = IdentityResolver::new(storage.clone());
+        (storage, identity, dir)
+    }
+
+    #[test]
+    fn public_post_visible_to_everyone() {
+        let (s, id, _d) = db();
+        let env = news_envelope("klv1author", [1u8; 32], Visibility::Public);
+        assert!(news_item_visible(&s, &id, &env, "klv1author", None));
+        assert!(news_item_visible(&s, &id, &env, "klv1author", Some("klv1stranger")));
+    }
+
+    #[test]
+    fn followers_only_post_hidden_from_stranger_and_anonymous() {
+        let (s, id, _d) = db();
+        let env = news_envelope("klv1author", [1u8; 32], Visibility::Followers);
+        assert!(!news_item_visible(&s, &id, &env, "klv1author", None));
+        assert!(!news_item_visible(&s, &id, &env, "klv1author", Some("klv1stranger")));
+    }
+
+    #[test]
+    fn followers_only_post_visible_to_author_and_follower() {
+        let (s, id, _d) = db();
+        s.apply_follow_edge("klv1fan", "klv1author", true, 500).unwrap();
+        let env = news_envelope("klv1author", [1u8; 32], Visibility::Followers);
+        assert!(news_item_visible(&s, &id, &env, "klv1author", Some("klv1author")));
+        assert!(news_item_visible(&s, &id, &env, "klv1author", Some("klv1fan")));
+    }
+
+    /// Code Audit follow-up (CRITICAL, found post-fix): the original W37 fix
+    /// only gated `NewsPost` itself — a `NewsComment` referencing a
+    /// `Followers`-only post's `post_id` still passed through unfiltered,
+    /// leaking the comment's own content (which can quote/describe the
+    /// hidden post) to anyone. Must now resolve through to the parent's
+    /// visibility.
+    #[test]
+    fn comment_on_a_followers_only_post_is_hidden_from_non_followers() {
+        let (s, id, _d) = db();
+        let post_id = [1u8; 32];
+        let post = news_envelope("klv1author", post_id, Visibility::Followers);
+        s.put_cf(cf::MESSAGES, &post_id, &rmp_serde::to_vec_named(&post).unwrap()).unwrap();
+
+        let comment = comment_envelope("klv1commenter", post_id);
+        assert!(!news_item_visible(&s, &id, &comment, "klv1commenter", None));
+        assert!(!news_item_visible(&s, &id, &comment, "klv1commenter", Some("klv1stranger")));
+    }
+
+    #[test]
+    fn comment_on_a_followers_only_post_is_visible_to_a_follower() {
+        let (s, id, _d) = db();
+        let post_id = [1u8; 32];
+        let post = news_envelope("klv1author", post_id, Visibility::Followers);
+        s.put_cf(cf::MESSAGES, &post_id, &rmp_serde::to_vec_named(&post).unwrap()).unwrap();
+        s.apply_follow_edge("klv1fan", "klv1author", true, 500).unwrap();
+
+        let comment = comment_envelope("klv1fan", post_id);
+        assert!(news_item_visible(&s, &id, &comment, "klv1fan", Some("klv1fan")));
+    }
+
+    #[test]
+    fn comment_on_a_public_post_is_unaffected() {
+        let (s, id, _d) = db();
+        let post_id = [1u8; 32];
+        let post = news_envelope("klv1author", post_id, Visibility::Public);
+        s.put_cf(cf::MESSAGES, &post_id, &rmp_serde::to_vec_named(&post).unwrap()).unwrap();
+
+        let comment = comment_envelope("klv1commenter", post_id);
+        assert!(news_item_visible(&s, &id, &comment, "klv1commenter", None));
+    }
+
+    /// Same leak class as the comment test above, for `NewsRepost`.
+    #[test]
+    fn repost_of_a_followers_only_post_is_hidden_from_non_followers() {
+        let (s, id, _d) = db();
+        let post_id = [1u8; 32];
+        let post = news_envelope("klv1author", post_id, Visibility::Followers);
+        s.put_cf(cf::MESSAGES, &post_id, &rmp_serde::to_vec_named(&post).unwrap()).unwrap();
+
+        let repost = repost_envelope("klv1reposter", post_id, "klv1author");
+        assert!(!news_item_visible(&s, &id, &repost, "klv1reposter", None));
+        assert!(!news_item_visible(&s, &id, &repost, "klv1reposter", Some("klv1stranger")));
+    }
+
+    #[test]
+    fn repost_of_a_public_post_is_unaffected() {
+        let (s, id, _d) = db();
+        let post_id = [1u8; 32];
+        let post = news_envelope("klv1author", post_id, Visibility::Public);
+        s.put_cf(cf::MESSAGES, &post_id, &rmp_serde::to_vec_named(&post).unwrap()).unwrap();
+
+        let repost = repost_envelope("klv1reposter", post_id, "klv1author");
+        assert!(news_item_visible(&s, &id, &repost, "klv1reposter", None));
+    }
+
+    #[test]
+    fn comment_referencing_a_missing_post_is_not_hidden() {
+        // Dangling reference (e.g. the original was pruned) — not this
+        // check's job to hide it; matches the undecodable-payload default.
+        let (s, id, _d) = db();
+        let comment = comment_envelope("klv1commenter", [99u8; 32]);
+        assert!(news_item_visible(&s, &id, &comment, "klv1commenter", None));
+    }
+
+    #[test]
+    fn identity_never_used_directly_matches_router_resolution_convention() {
+        // Sanity check that the identity resolver's own default (unresolved
+        // → returns the input unchanged) composes correctly with the
+        // visibility check when the caller passes an already-resolved
+        // wallet address, matching how every call site resolves
+        // `envelope.author` before calling `news_item_visible`.
+        let (s, id, _d) = db();
+        let resolved = id.resolve("klv1author").unwrap_or_else(|_| "klv1author".to_string());
+        let env = news_envelope("klv1author", [1u8; 32], Visibility::Followers);
+        assert!(!news_item_visible(&s, &id, &env, &resolved, Some("klv1stranger")));
+    }
+}
+
+#[cfg(test)]
+mod w37_target_news_item_visible_tests {
+    //! Final-Auditor follow-up: `target_news_item_visible` gates
+    //! `get_news_reactions`/`get_news_reposts` by `msg_id`, distinct from
+    //! `news_item_visible`'s already-decoded-`Envelope` signature. Covers
+    //! the two cases that must NOT be conflated: a genuinely-missing
+    //! `msg_id` (pre-existing "empty result" behavior, must stay visible)
+    //! vs. an existing-but-hidden target (new 404 behavior, must be
+    //! excluded).
+    use super::target_news_item_visible;
+    use crate::messages::envelope::Envelope;
+    use crate::messages::types::{MessageType, NewsPostPayload, Visibility};
+    use crate::storage::identity::IdentityResolver;
+    use crate::storage::rocks::Storage;
+    use crate::storage::schema::cf;
+    use tempfile::TempDir;
+
+    fn db() -> (Storage, IdentityResolver, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let identity = IdentityResolver::new(storage.clone());
+        (storage, identity, dir)
+    }
+
+    fn store_news_post(storage: &Storage, msg_id: [u8; 32], author: &str, visibility: Visibility) {
+        let payload = NewsPostPayload {
+            title: "headline".to_string(),
+            content: "body".to_string(),
+            content_rating: Default::default(),
+            tags: vec![],
+            attachments: vec![],
+            visibility,
+        };
+        let env = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::NewsPost,
+            msg_id,
+            author: author.to_string(),
+            timestamp: 1_000,
+            lamport_ts: 0,
+            payload: rmp_serde::to_vec_named(&payload).unwrap(),
+            signature: Vec::new(),
+            relay_path: Vec::new(),
+        };
+        storage
+            .put_cf(cf::MESSAGES, &msg_id, &rmp_serde::to_vec_named(&env).unwrap())
+            .unwrap();
+    }
+
+    #[test]
+    fn a_genuinely_missing_msg_id_is_visible() {
+        // Preserves the pre-fix behavior of get_news_reactions/reposts:
+        // an unknown msg_id must NOT 404 here — it falls through to those
+        // endpoints' own existing "empty/zero result" handling, not this
+        // check's job.
+        let (s, id, _d) = db();
+        assert!(target_news_item_visible(&s, &id, &[42u8; 32], None));
+    }
+
+    #[test]
+    fn an_existing_public_post_is_visible() {
+        let (s, id, _d) = db();
+        let msg_id = [1u8; 32];
+        store_news_post(&s, msg_id, "klv1author", Visibility::Public);
+        assert!(target_news_item_visible(&s, &id, &msg_id, None));
+    }
+
+    #[test]
+    fn an_existing_followers_only_post_is_hidden_from_non_followers() {
+        let (s, id, _d) = db();
+        let msg_id = [1u8; 32];
+        store_news_post(&s, msg_id, "klv1author", Visibility::Followers);
+        assert!(!target_news_item_visible(&s, &id, &msg_id, None));
+        assert!(!target_news_item_visible(&s, &id, &msg_id, Some("klv1stranger")));
+    }
+
+    #[test]
+    fn an_existing_followers_only_post_is_visible_to_a_follower() {
+        let (s, id, _d) = db();
+        let msg_id = [1u8; 32];
+        store_news_post(&s, msg_id, "klv1author", Visibility::Followers);
+        s.apply_follow_edge("klv1fan", "klv1author", true, 500).unwrap();
+        assert!(target_news_item_visible(&s, &id, &msg_id, Some("klv1fan")));
+        assert!(target_news_item_visible(&s, &id, &msg_id, Some("klv1author")));
     }
 }

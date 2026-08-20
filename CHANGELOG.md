@@ -5,6 +5,42 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.110.0] - 2026-08-20
+
+### Security
+
+- **`NewsPostPayload.visibility = Followers` was decoded and stored but
+  never enforced on any read path (audit W37)** — a "followers-only" post
+  was actually served to everyone, including the unauthenticated public
+  feed. `GET /api/v1/news`, `GET /api/v1/news/{msg_id}`, and
+  `GET /api/v1/users/{address}/posts` now filter/404 a `Followers`-only
+  post for any caller who isn't the author or an authenticated, currently-
+  following wallet — all 3 moved into the `optional_auth_routes` middleware
+  group so an authenticated caller's identity is available to check. The
+  P2P news-sync backfill responder (no requester-identity concept) simply
+  never backfills a `Followers`-only post to a cold-joining/catch-up node.
+- **Post-fix Code Audit found the first pass only gated the `NewsPost`
+  envelope itself** — a `NewsComment` or `NewsRepost` referencing a hidden
+  post via `post_id`/`original_id` still showed its own content (the
+  comment text, or a quote-repost's comment) unfiltered in `list_news`,
+  leaking information about the hidden post one hop removed. Fixed:
+  `news_item_visible` now resolves a comment/repost's referenced target and
+  checks THAT post's visibility recursively (one lookup deep — a
+  `NewsComment.post_id` only ever references the top-level post, never
+  another comment, so no unbounded chain is possible).
+- **Also found: `GET /api/v1/news/{msg_id}/reactions` and
+  `GET /api/v1/news/{msg_id}/reposts` were never gated at all** — a caller
+  who already had a hidden post's `msg_id` could still see its reaction
+  counts and reposter list. Both now 404 the same way `get_news_post` does
+  (`get_news_reposts` also moved into `optional_auth_routes`, joining
+  `get_news_reactions` which was already there).
+- **Also found while implementing: a `NewsEdit` ride-along in news-sync
+  could leak a hidden post's EDITED content** even though the original
+  post envelope was already excluded — `EditPayload.content`/`title` carry
+  the full new plaintext. Fixed: the edit ride-along now re-checks the
+  original post's visibility via its `target_id` before including it.
+  `NewsDelete` needed no equivalent fix (its payload carries no content).
+
 ## [0.109.0] - 2026-08-20
 
 Wires the divergence-watcher and dashboard up to the ogmara-contract
