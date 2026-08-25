@@ -563,6 +563,19 @@ pub struct BackfillConfig {
     /// caps in `network::news_sync` apply on top of the window.
     #[serde(default = "default_backfill_news_max_age_days")]
     pub news_max_age_days: u64,
+    /// How often, in hours, to re-run the global-news reconciliation once the
+    /// feed is no longer empty (default 6). `0` disables catch-up, restoring
+    /// the pre-0.119.0 behaviour of a single cold-join sync.
+    ///
+    /// This exists because news propagation is otherwise permanently lossy. A
+    /// node only learns about a post via live gossip, and any post it misses
+    /// while restarting, partitioned, or not yet meshed on the news topic used
+    /// to be unrecoverable: the cold-join backfill ran only on a completely
+    /// EMPTY feed, so a node holding a single post would never reconcile again.
+    /// Observed in the field as one node holding 32 posts and its peer 4, with
+    /// no mechanism that could ever close the gap.
+    #[serde(default = "default_backfill_news_catchup_interval_hours")]
+    pub news_catchup_interval_hours: u64,
 }
 
 impl Default for BackfillConfig {
@@ -580,6 +593,8 @@ impl Default for BackfillConfig {
                 default_backfill_max_envelopes_per_response(),
             total_envelopes_cap: default_backfill_total_envelopes_cap(),
             news_max_age_days: default_backfill_news_max_age_days(),
+            news_catchup_interval_hours:
+                default_backfill_news_catchup_interval_hours(),
         }
     }
 }
@@ -589,6 +604,9 @@ fn default_backfill_max_age_days() -> u64 {
 }
 fn default_backfill_news_max_age_days() -> u64 {
     7
+}
+fn default_backfill_news_catchup_interval_hours() -> u64 {
+    6
 }
 fn default_backfill_fanout() -> usize {
     3

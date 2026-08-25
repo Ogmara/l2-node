@@ -5,6 +5,69 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.119.0] - 2026-08-25
+
+Two independent bugs kept the global news feed from working across the mesh.
+Found from a live fleet report: two healthy, peered, same-version nodes held 32
+and 4 news posts respectively, and neither could ever converge.
+
+### Fixed
+
+- **A missed news gossip message was permanent.** `maybe_trigger_news_backfill`
+  ran the global-news reconciliation *only* when `NEWS_FEED` was completely
+  empty, and latched a "never again" flag the moment it was not:
+
+  ```rust
+  if !empty {
+      self.news_backfill_triggered = true; // already have news — never need it
+      return;
+  }
+  ```
+
+  Live gossip is best-effort, so a node that was restarting, briefly
+  partitioned, or not yet meshed on the news topic when a post was broadcast
+  simply never saw it — and holding even a single post disqualified it from
+  ever reconciling. There was no mechanism in the system that could close such
+  a gap, so divergence only ever grew.
+
+  Reconciliation now runs as soon as peers exist (a cold join and a catch-up
+  want the same request) and repeats every `news_catchup_interval_hours`
+  (default 6; `0` restores the old one-shot behaviour). Re-serving is safe: the
+  responder re-sends signed envelopes, the requester re-validates them through
+  the normal routing path, and storing an envelope the node already has is
+  idempotent. A transient storage error no longer counts as a completed sync.
+
+- **The node never pushed news over the WebSocket.** `NotificationEngine::process`
+  had no arm for `NewsPost`, `NewsEdit`, `NewsDelete`, `NewsReaction` or
+  `NewsRepost`, and the `NewsComment` arm only checked mentions. Chat and DMs
+  broadcast to connected clients from this same function, but news never did —
+  so on every client the feed only updated when something forced a REST
+  refetch, which in practice meant navigating away from the feed and back.
+
+  News envelopes now broadcast on both the API-post and gossip-receive paths,
+  so a post made on one node appears live on every node's clients.
+
+### Security
+
+- Live news delivery respects `Visibility::Followers`. A followers-only
+  `NewsPost` is delivered to a targeted `Wallets` audience — the author plus up
+  to 512 followers — never the all-clients `Everyone` audience, mirroring what
+  `Storage::news_followers_post_visible_to` enforces on the REST path (audit
+  W37). Envelopes that reference a post (edit, delete, reaction, comment,
+  repost) inherit the audience of the post they target rather than assuming it
+  is public. Anything whose visibility cannot be determined — an undecodable
+  payload, an unresolvable target, no storage — is dropped rather than
+  broadcast, so a decode failure can never become a disclosure.
+
+### Added
+
+- `[backfill] news_catchup_interval_hours` config key (default 6).
+- Tests: `news_target_id` mapping per news payload type, and a fail-closed test
+  asserting a followers-only post never produces an `Everyone` frame. Each news
+  payload names its parent reference differently — `target_id` on edit, delete
+  and reaction, `post_id` on a comment, `original_id` on a repost — and
+  decoding one with another's struct fails silently, so the mapping is pinned.
+
 ## [0.118.0] - 2026-08-25
 
 Pre-mainnet dependency-security pass. Lockfile-only — no source or behaviour

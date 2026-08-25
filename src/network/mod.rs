@@ -443,7 +443,10 @@ pub struct NetworkService {
     >,
     /// Set once the one-time global-news backfill has been fired this process
     /// lifetime (only fires when NEWS_FEED was empty and peers existed).
-    news_backfill_triggered: bool,
+    /// When the last global-news reconciliation was started, or `None` if none
+    /// has run in this process. Drives both the cold-join sync and the periodic
+    /// catch-up (see `BackfillConfig::news_catchup_interval_hours`).
+    last_news_sync: Option<std::time::Instant>,
     /// DM offline store-and-forward policy (spec 3, l2-node 0.69.0+): persistent
     /// DM-subscription cap + LRU, and the dm-sync backfill window.
     dm_config: crate::config::DmConfig,
@@ -1100,7 +1103,7 @@ impl NetworkService {
             identity_sync_triggered: HashSet::new(),
             news_sync_limits: Arc::new(news_sync::NewsResponderLimits::default()),
             pending_news_sync_requests: HashMap::new(),
-            news_backfill_triggered: false,
+            last_news_sync: None,
             dm_config,
             dm_sync_limits: Arc::new(dm_sync::DmResponderLimits::default()),
             pending_dm_sync_requests: HashMap::new(),
@@ -1667,9 +1670,10 @@ impl NetworkService {
                 }
                 _ = bootstrap_interval.tick() => {
                     self.periodic_bootstrap();
-                    // P-3: one-time global-news backfill. No-op once it has
-                    // fired or the feed is non-empty; retries each tick until
-                    // peers are available.
+                    // P-3: global-news reconciliation. Runs once peers exist,
+                    // then repeats on `news_catchup_interval_hours` so a post
+                    // missed while this node was down or unmeshed is recovered
+                    // rather than lost permanently.
                     self.maybe_trigger_news_backfill();
                 }
                 _ = reconnect_interval.tick() => {
@@ -2741,25 +2745,50 @@ impl NetworkService {
         }
     }
 
-    /// One-time bounded backfill of the GLOBAL news feed (P-3). Fires only when
-    /// NEWS_FEED is empty AND peers exist; pulls the last `news_max_age_days` of
-    /// news from up to FANOUT peers (first non-empty wins). Runs once per
-    /// process lifetime — new posts arrive live via gossip otherwise.
+    /// Bounded reconciliation of the GLOBAL news feed (P-3). Pulls the last
+    /// `news_max_age_days` of news from up to FANOUT peers (first non-empty
+    /// wins), as soon as peers exist, then repeats every
+    /// `news_catchup_interval_hours`.
+    ///
+    /// The repeat is what makes news propagation eventually consistent. Live
+    /// gossip alone is best-effort: a node that is restarting, partitioned, or
+    /// not yet meshed on the news topic simply never sees that broadcast, and
+    /// before 0.119.0 nothing could recover it.
     fn maybe_trigger_news_backfill(&mut self) {
-        if !self.backfill_config.enabled || self.news_backfill_triggered {
+        if !self.backfill_config.enabled {
             return;
         }
-        // Only backfill a genuinely empty feed (fresh / wiped node). A transient
-        // storage error must NOT latch the flag — retry on the next tick.
-        let empty = match self
+        // A transient storage error must NOT count as a completed sync — return
+        // without stamping `last_news_sync` so the next tick retries.
+        if self
             .storage
             .prefix_iter_cf(crate::storage::schema::cf::NEWS_FEED, &[], 1)
+            .is_err()
         {
-            Ok(rows) => rows.is_empty(),
-            Err(_) => return,
+            return;
+        }
+        // Previously this ran ONLY on a completely empty feed, and latched a
+        // "never again" flag the moment the feed was non-empty. That made every
+        // missed gossip message permanent: a node that was restarting, briefly
+        // partitioned, or not yet meshed on the news topic when a post was
+        // broadcast had no way to ever learn about it, because holding even one
+        // post disqualified it from reconciling. Two nodes in the same mesh
+        // drifted to 32 posts vs 4 with nothing able to close the gap.
+        //
+        // Now the first run happens as soon as peers exist (whether or not the
+        // feed is empty — a cold join and a catch-up want the same request), and
+        // subsequent runs repeat on `news_catchup_interval_hours`. Re-serving is
+        // safe: the responder re-sends signed envelopes, the requester re-routes
+        // them through the normal validation path, and storing an envelope the
+        // node already has is idempotent.
+        let due = match self.last_news_sync {
+            None => true,
+            Some(started) => {
+                let hours = self.backfill_config.news_catchup_interval_hours;
+                hours > 0 && started.elapsed() >= Duration::from_secs(hours * 3600)
+            }
         };
-        if !empty {
-            self.news_backfill_triggered = true; // already have news — never need it
+        if !due {
             return;
         }
         let mut candidates: Vec<PeerId> = self.swarm.connected_peers().copied().collect();
@@ -2786,7 +2815,8 @@ impl NetworkService {
         info!(
             fanout = candidates.len(),
             news_max_age_days = self.backfill_config.news_max_age_days,
-            "news-sync: triggering bounded global-news backfill"
+            catchup = self.last_news_sync.is_some(),
+            "news-sync: triggering bounded global-news reconciliation"
         );
         for peer in candidates {
             let id = self
@@ -2799,7 +2829,7 @@ impl NetworkService {
                 NewsSyncPending { peer_id: peer, pages_fetched: 0, consecutive_unproductive_pages: 0 },
             );
         }
-        self.news_backfill_triggered = true;
+        self.last_news_sync = Some(std::time::Instant::now());
     }
 
     /// Handle inbound + outbound news-sync request-response events (P-3).

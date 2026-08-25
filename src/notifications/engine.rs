@@ -50,6 +50,14 @@ pub enum NotificationType {
 /// The notification engine processes messages and generates notifications.
 ///
 /// Thread-safe: can be shared across tasks via `Arc<NotificationEngine>`.
+/// Upper bound on how many followers receive the live WS push for a
+/// `Visibility::Followers` news post. The audience list is materialised into a
+/// single broadcast frame, so an uncapped follower count would let one popular
+/// author build an arbitrarily large one. Followers beyond the cap still see the
+/// post on their next refetch — the same guarantee they had before live news
+/// delivery existed.
+const FOLLOWER_FANOUT_CAP: usize = 512;
+
 pub struct NotificationEngine {
     /// Addresses of locally connected users (for mention matching).
     /// Protected by RwLock for concurrent access from WS handlers
@@ -92,6 +100,15 @@ impl NotificationEngine {
             storage: None,
             max_stored_per_address,
         }
+    }
+
+    /// Storage-less engine for unit tests: exercises the pure audience/routing
+    /// logic without a RocksDB fixture. `storage: None` is also the fail-closed
+    /// path the visibility tests assert on.
+    #[cfg(test)]
+    pub fn new_for_test() -> Self {
+        let (tx, _) = broadcast::channel(16);
+        Self::new(tx, None, None, 0)
     }
 
     /// Set the storage backend for persisting notifications.
@@ -178,6 +195,36 @@ impl NotificationEngine {
                     }
                 }
             }
+            // Real-time delivery for the global news feed. None of the news
+            // types had an arm here before 0.119.0, so the node never pushed a
+            // news envelope over the WS at all: every client (web, desktop and
+            // mobile alike) only picked up a new post when something forced a
+            // REST refetch, which in practice meant navigating away from the
+            // feed and back. Audience/visibility handling lives in
+            // `broadcast_news`.
+            MessageType::NewsPost => {
+                self.broadcast_news(envelope, &[]);
+            }
+            MessageType::NewsEdit | MessageType::NewsDelete | MessageType::NewsRepost => {
+                if let Some(target) = Self::news_target_id(envelope) {
+                    self.broadcast_news(
+                        envelope,
+                        &[("target_msg_id", serde_json::json!(hex::encode(target)))],
+                    );
+                }
+            }
+            MessageType::NewsReaction => {
+                if let Ok(p) = rmp_serde::from_slice::<ReactionPayload>(&envelope.payload) {
+                    self.broadcast_news(
+                        envelope,
+                        &[
+                            ("target_msg_id", serde_json::json!(hex::encode(p.target_id))),
+                            ("emoji", serde_json::json!(p.emoji)),
+                            ("remove", serde_json::json!(p.remove)),
+                        ],
+                    );
+                }
+            }
             MessageType::NewsComment => {
                 if let Ok(payload) =
                     rmp_serde::from_slice::<NewsCommentPayload>(&envelope.payload)
@@ -186,6 +233,13 @@ impl NotificationEngine {
                     let mentions = &payload.mentions[..payload.mentions.len().min(50)];
                     self.check_mentions(envelope, mentions, None, &preview)
                         .await;
+                    self.broadcast_news(
+                        envelope,
+                        &[(
+                            "target_msg_id",
+                            serde_json::json!(hex::encode(payload.post_id)),
+                        )],
+                    );
                 }
             }
             MessageType::DirectMessage => {
@@ -477,6 +531,159 @@ impl NotificationEngine {
                 WsAudience::Wallets(members)
             };
             let _ = self.ws_broadcast.send(Arc::new(WsOutbound { audience, json }));
+        }
+    }
+
+    /// Real-time WS delivery of a global-news envelope.
+    ///
+    /// Runs on BOTH the API-post and gossip-receive paths (see [`Self::process`]),
+    /// so a post made on one node appears live on every node's connected clients.
+    /// Before 0.119.0 no news message type had a `process()` arm at all, so the
+    /// node never pushed news over the WS: web, desktop and mobile alike only
+    /// showed a new post after navigating away from the feed and back, because
+    /// that forced a REST refetch. This is the news counterpart of
+    /// [`Self::broadcast_channel_message`].
+    ///
+    /// PRIVACY: a `NewsPost` marked `Visibility::Followers` must not reach every
+    /// connected client. Those are delivered to the author plus the author's
+    /// followers via a targeted `Wallets` audience, mirroring what
+    /// `Storage::news_followers_post_visible_to` enforces on the REST path
+    /// (audit W37). Anything whose visibility can't be determined — a payload
+    /// that won't decode — is treated as restricted and dropped rather than
+    /// broadcast, so a decode failure can never become a disclosure.
+    fn broadcast_news(&self, envelope: &Envelope, extra: &[(&str, serde_json::Value)]) {
+        use crate::messages::types::{MessageType, NewsPostPayload, Visibility};
+
+        // Only a NewsPost carries a visibility field. Edits, deletes, reactions,
+        // comments and reposts reference a post by id; their audience is that of
+        // the post they target, so resolve it rather than assuming public.
+        let audience = if envelope.msg_type == MessageType::NewsPost {
+            match rmp_serde::from_slice::<NewsPostPayload>(&envelope.payload) {
+                Ok(p) if p.visibility == Visibility::Followers => {
+                    match self.news_followers_audience(&envelope.author) {
+                        Some(a) => a,
+                        None => return,
+                    }
+                }
+                Ok(_) => WsAudience::Everyone,
+                // Undecodable payload — fail closed.
+                Err(_) => return,
+            }
+        } else {
+            match self.news_target_audience(envelope) {
+                Some(a) => a,
+                None => return,
+            }
+        };
+
+        let mut val = match serde_json::to_value(envelope) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        if let serde_json::Value::Object(ref mut map) = val {
+            // msg_id: byte array → hex (matches REST `envelope_to_json`).
+            if let Some(serde_json::Value::Array(bytes)) = map.get("msg_id") {
+                let hex: String = bytes
+                    .iter()
+                    .filter_map(|b| b.as_u64().map(|n| format!("{:02x}", n as u8)))
+                    .collect();
+                map.insert("msg_id".into(), serde_json::Value::String(hex));
+            }
+            // Resolve device key → wallet so the live post's author matches the
+            // REST/optimistic one and the client can dedup its own echo.
+            if let Some(ref storage) = self.storage {
+                if let Ok(Some(wallet)) = storage.resolve_wallet(&envelope.author) {
+                    map.insert("author".into(), serde_json::Value::String(wallet));
+                }
+            }
+            for (k, v) in extra {
+                map.insert((*k).to_string(), v.clone());
+            }
+        }
+        let ws_msg = serde_json::json!({ "type": "message", "envelope": val });
+        if let Ok(json) = serde_json::to_string(&ws_msg) {
+            let _ = self.ws_broadcast.send(Arc::new(WsOutbound { audience, json }));
+        }
+    }
+
+    /// Audience for a `Followers`-only post: the author plus their followers.
+    /// `None` when storage is unavailable or the follower list can't be read —
+    /// callers must drop the frame rather than fall back to `Everyone`.
+    fn news_followers_audience(&self, author: &str) -> Option<WsAudience> {
+        let storage = self.storage.as_ref()?;
+        // The author is addressed by wallet, not by the device key that signed.
+        let author_wallet = storage
+            .resolve_wallet(author)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| author.to_string());
+        // Bounded: an unbounded follower list would build an arbitrarily large
+        // frame. FOLLOWER_FANOUT_CAP followers get the live push; anyone beyond
+        // it still sees the post on their next refetch, which is the same
+        // guarantee they had before this existed.
+        let mut wallets = storage
+            .get_followers(&author_wallet, FOLLOWER_FANOUT_CAP)
+            .ok()?;
+        wallets.push(author_wallet);
+        Some(WsAudience::Wallets(wallets))
+    }
+
+    /// The msg_id of the `NewsPost` a news envelope refers to.
+    ///
+    /// The field name differs per payload — `EditPayload`/`DeletePayload`/
+    /// `ReactionPayload` use `target_id`, `NewsCommentPayload` uses `post_id`,
+    /// and `NewsRepostPayload` uses `original_id` — so this cannot be one
+    /// generic struct. Getting it wrong fails silently (the payload just
+    /// doesn't decode), which is exactly how the reference would go missing.
+    fn news_target_id(envelope: &Envelope) -> Option<[u8; 32]> {
+        use crate::messages::types::{
+            DeletePayload, EditPayload, MessageType, NewsCommentPayload, NewsRepostPayload,
+            ReactionPayload,
+        };
+        match envelope.msg_type {
+            MessageType::NewsEdit => rmp_serde::from_slice::<EditPayload>(&envelope.payload)
+                .ok()
+                .map(|p| p.target_id),
+            MessageType::NewsDelete => rmp_serde::from_slice::<DeletePayload>(&envelope.payload)
+                .ok()
+                .map(|p| p.target_id),
+            MessageType::NewsReaction => {
+                rmp_serde::from_slice::<ReactionPayload>(&envelope.payload)
+                    .ok()
+                    .map(|p| p.target_id)
+            }
+            MessageType::NewsComment => {
+                rmp_serde::from_slice::<NewsCommentPayload>(&envelope.payload)
+                    .ok()
+                    .map(|p| p.post_id)
+            }
+            MessageType::NewsRepost => {
+                rmp_serde::from_slice::<NewsRepostPayload>(&envelope.payload)
+                    .ok()
+                    .map(|p| p.original_id)
+            }
+            _ => None,
+        }
+    }
+
+    /// Audience for a news envelope that targets another post (edit, delete,
+    /// reaction, comment, repost): whatever the targeted post's audience is.
+    /// `None` when the target can't be resolved — fail closed.
+    fn news_target_audience(&self, envelope: &Envelope) -> Option<WsAudience> {
+        use crate::messages::types::{MessageType, NewsPostPayload, Visibility};
+
+        let storage = self.storage.as_ref()?;
+        let target_id = Self::news_target_id(envelope)?;
+        let raw = storage.get_message(&target_id).ok()??;
+        let target_env: Envelope = rmp_serde::from_slice(&raw).ok()?;
+        if target_env.msg_type != MessageType::NewsPost {
+            return None;
+        }
+        let p: NewsPostPayload = rmp_serde::from_slice(&target_env.payload).ok()?;
+        if p.visibility == Visibility::Followers {
+            self.news_followers_audience(&target_env.author)
+        } else {
+            Some(WsAudience::Everyone)
         }
     }
 
@@ -800,5 +1007,156 @@ mod tests {
         assert_eq!(truncate("hello", 10), "hello");
         assert_eq!(truncate("hello world", 8), "hello...");
         assert_eq!(truncate("", 5), "");
+    }
+
+    // --- news_target_id ---
+    //
+    // Every news payload names its reference to the parent post differently:
+    // `target_id` on edit/delete/reaction, `post_id` on a comment, `original_id`
+    // on a repost. Decoding one with another's struct fails silently — the
+    // payload simply doesn't parse and the reference goes missing — so pin each
+    // mapping. Getting this wrong drops the live WS update for that type.
+
+    use crate::messages::envelope::Envelope;
+    use crate::messages::types::{
+        Attachment, ContentRating, DeletePayload, EditPayload, MessageType, NewsCommentPayload,
+        NewsPostPayload, NewsRepostPayload, ReactionPayload, Visibility,
+    };
+
+    const TARGET: [u8; 32] = [7u8; 32];
+
+    fn env(msg_type: MessageType, payload: Vec<u8>) -> Envelope {
+        Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type,
+            msg_id: [0u8; 32],
+            author: "klv1author".into(),
+            timestamp: 1,
+            lamport_ts: 0,
+            payload,
+            signature: vec![0u8; 64],
+            relay_path: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn news_target_id_reads_edit_and_delete_target_id() {
+        let edit = EditPayload {
+            target_id: TARGET,
+            channel_id: None,
+            content: "x".into(),
+            edited_at: 1,
+            title: None,
+            tags: None,
+            attachments: None,
+            enc_content: None,
+            enc_nonce: None,
+            key_epoch: None,
+        };
+        let e = env(MessageType::NewsEdit, rmp_serde::to_vec_named(&edit).unwrap());
+        assert_eq!(NotificationEngine::news_target_id(&e), Some(TARGET));
+
+        let del = DeletePayload { target_id: TARGET, channel_id: None };
+        let e = env(MessageType::NewsDelete, rmp_serde::to_vec_named(&del).unwrap());
+        assert_eq!(NotificationEngine::news_target_id(&e), Some(TARGET));
+    }
+
+    #[test]
+    fn news_target_id_reads_reaction_target_id() {
+        let r = ReactionPayload {
+            target_id: TARGET,
+            channel_id: None,
+            emoji: "👍".into(),
+            remove: false,
+        };
+        let e = env(MessageType::NewsReaction, rmp_serde::to_vec_named(&r).unwrap());
+        assert_eq!(NotificationEngine::news_target_id(&e), Some(TARGET));
+    }
+
+    #[test]
+    fn news_target_id_reads_comment_post_id_not_target_id() {
+        let c = NewsCommentPayload {
+            post_id: TARGET,
+            content: "hi".into(),
+            reply_to: None,
+            mentions: Vec::new(),
+            attachments: Vec::<Attachment>::new(),
+        };
+        let e = env(MessageType::NewsComment, rmp_serde::to_vec_named(&c).unwrap());
+        assert_eq!(NotificationEngine::news_target_id(&e), Some(TARGET));
+    }
+
+    #[test]
+    fn news_target_id_reads_repost_original_id_not_target_id() {
+        let r = NewsRepostPayload {
+            original_id: TARGET,
+            original_author: "klv1orig".into(),
+            comment: None,
+        };
+        let e = env(MessageType::NewsRepost, rmp_serde::to_vec_named(&r).unwrap());
+        assert_eq!(NotificationEngine::news_target_id(&e), Some(TARGET));
+    }
+
+    #[test]
+    fn news_target_id_is_none_for_a_post_or_unrelated_type() {
+        // A NewsPost is the target, it doesn't reference one.
+        let p = NewsPostPayload {
+            title: "t".into(),
+            content: "c".into(),
+            content_rating: ContentRating::General,
+            tags: Vec::new(),
+            attachments: Vec::new(),
+            visibility: Visibility::Public,
+        };
+        let e = env(MessageType::NewsPost, rmp_serde::to_vec_named(&p).unwrap());
+        assert_eq!(NotificationEngine::news_target_id(&e), None);
+
+        let e = env(MessageType::ChatMessage, Vec::new());
+        assert_eq!(NotificationEngine::news_target_id(&e), None);
+    }
+
+    // --- Visibility gating ---
+    //
+    // A Followers-only post must never reach the all-clients `Everyone`
+    // audience. `broadcast_news` resolves that through `news_followers_audience`,
+    // which returns None without storage — and the caller must then DROP the
+    // frame rather than fall back to a broadcast. This pins the fail-closed
+    // direction: with no storage, a Followers post produces no frame at all,
+    // while a Public one still would.
+    #[test]
+    fn followers_only_post_never_broadcasts_to_everyone() {
+        let engine = NotificationEngine::new_for_test();
+
+        let followers = NewsPostPayload {
+            title: "t".into(),
+            content: "c".into(),
+            content_rating: ContentRating::General,
+            tags: Vec::new(),
+            attachments: Vec::new(),
+            visibility: Visibility::Followers,
+        };
+        let e = env(
+            MessageType::NewsPost,
+            rmp_serde::to_vec_named(&followers).unwrap(),
+        );
+        let mut rx = engine.ws_broadcast.subscribe();
+        engine.broadcast_news(&e, &[]);
+        assert!(
+            rx.try_recv().is_err(),
+            "a Followers-only post must not produce a broadcast frame when the \
+             audience cannot be resolved — silence is correct, Everyone is not"
+        );
+
+        let public = NewsPostPayload {
+            visibility: Visibility::Public,
+            ..followers
+        };
+        let e = env(
+            MessageType::NewsPost,
+            rmp_serde::to_vec_named(&public).unwrap(),
+        );
+        engine.broadcast_news(&e, &[]);
+        let frame = rx.try_recv().expect("a Public post must be delivered");
+        assert!(matches!(frame.audience, WsAudience::Everyone));
     }
 }
