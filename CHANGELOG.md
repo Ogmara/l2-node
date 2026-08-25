@@ -5,6 +5,41 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.118.0] - 2026-08-25
+
+Pre-mainnet dependency-security pass. Lockfile-only — no source or behaviour
+changes. All 752 tests pass.
+
+### Security
+
+- **Bumped `anyhow` 1.0.102 → 1.0.104** (RUSTSEC-2026-0190, unsoundness in
+  `Error::downcast_mut()`, memory-corruption category).
+- **Bumped `event-listener` 5.4.1 → 5.4.2** (RUSTSEC-2026-0221, `!Send` tags
+  crossing thread boundaries via `StackSlot`).
+- **Bumped `rand` 0.8.5 → 0.8.8** (RUSTSEC-2026-0097, unsoundness with a custom
+  logger using `rand::rng()`).
+
+  All three are *informational* (unsound) advisories rather than exploitable
+  vulnerabilities; cleared so the remaining audit output is short enough to
+  actually read.
+
+### Known issues (unchanged, still open)
+
+- **`hickory-proto` 0.25.2 — RUSTSEC-2026-0118 / RUSTSEC-2026-0119** remain
+  outstanding, as they have since 2026-06-14. Both are DNS-parsing DoS vectors
+  on the resolver / mDNS peer-discovery path, reached transitively through
+  `libp2p 0.56.0` (`libp2p-dns` + `libp2p-mdns`).
+  - **0118** (NSEC3 unbounded loop on cross-zone responses) has **no upstream
+    fix at any version**.
+  - **0119** (O(n²) name-compression CPU exhaustion) is fixed in
+    `hickory-proto` ≥0.26.1, but `libp2p-mdns 0.48.0` pins `^0.25.2`, so the
+    bump is rejected. Re-verified 2026-08-25: `libp2p 0.56.0` is still the
+    latest release, so there is still no parent to upgrade to.
+
+  Mitigation available today: disabling mDNS (LAN-only discovery) removes the
+  `libp2p-mdns` reach into the affected parser. To be revisited on the first
+  `libp2p` release that adopts `hickory` 0.26.
+
 ## [0.117.0] - 2026-08-25
 
 Governance-dashboard-plan.md Phase 8: Alert Config UI panel. Independent
