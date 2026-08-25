@@ -2531,6 +2531,189 @@ impl Storage {
         Ok(())
     }
 
+    /// Rebuild missing `USERS` rows by replaying stored `ProfileUpdate` envelopes.
+    ///
+    /// `USERS` is a DERIVED index: the authoritative record is the signed
+    /// `ProfileUpdate` envelope in `MESSAGES`. Nothing rebuilt it, so if the index
+    /// was lost — a wipe, a restore from a partial copy, an aborted migration —
+    /// every display name and avatar vanished network-wide with the envelopes
+    /// still sitting on disk. Observed in the field: `/api/v1/users/<addr>`
+    /// returned the empty-profile fallback for every account on every node, while
+    /// clients still showed names from their own local caches.
+    ///
+    /// Replays each author's updates in ascending timestamp order, applying the
+    /// same merge + last-writer-wins semantics as the `ProfileUpdate` arm of
+    /// `MessageRouter` (a later update that sets only `display_name` must not
+    /// erase an earlier `bio`).
+    ///
+    /// Conservative by design: an address that ALREADY has a `USERS` row is left
+    /// untouched, so this can only ever add back what was lost, never overwrite
+    /// live data. Idempotent — guarded by `USERS_REBUILT_FROM_MESSAGES`.
+    pub fn rebuild_users_from_profile_updates(&self) -> Result<()> {
+        use crate::messages::envelope::Envelope;
+        use crate::messages::types::{MessageType, ProfileUpdatePayload};
+        use std::collections::HashMap;
+        use tracing::info;
+
+        if self
+            .get_cf(
+                cf::NODE_STATE,
+                super::schema::state_keys::USERS_REBUILT_FROM_MESSAGES,
+            )?
+            .is_some()
+        {
+            return Ok(());
+        }
+
+        let cf = self
+            .db
+            .cf_handle(cf::MESSAGES)
+            .with_context(|| "column family 'messages' not found")?;
+        let mut iter = self.db.raw_iterator_cf(&cf);
+        iter.seek_to_first();
+
+        // author → updates, collected before applying so they can be ordered.
+        let mut by_author: HashMap<String, Vec<(u64, ProfileUpdatePayload)>> = HashMap::new();
+        while iter.valid() {
+            if let Some(raw) = iter.value() {
+                if let Ok(envelope) = rmp_serde::from_slice::<Envelope>(raw) {
+                    if envelope.msg_type == MessageType::ProfileUpdate {
+                        if let Ok(payload) =
+                            rmp_serde::from_slice::<ProfileUpdatePayload>(&envelope.payload)
+                        {
+                            by_author
+                                .entry(envelope.author.clone())
+                                .or_default()
+                                .push((envelope.timestamp, payload));
+                        }
+                    }
+                }
+            }
+            iter.next();
+        }
+
+        let mut rebuilt = 0u64;
+        for (author, mut updates) in by_author {
+            // Never touch an address that still has a record — this is recovery,
+            // not reconciliation.
+            if self.exists_cf(cf::USERS, author.as_bytes())? {
+                continue;
+            }
+            updates.sort_by_key(|(ts, _)| *ts);
+
+            let mut record = serde_json::json!({
+                "address": author,
+                "public_key": "",
+                "registered_at": 0,
+            });
+            let mut watermark = 0u64;
+            if let serde_json::Value::Object(ref mut map) = record {
+                for (ts, payload) in &updates {
+                    if *ts <= watermark {
+                        continue; // LWW, same as the live path
+                    }
+                    if let Some(name) = &payload.display_name {
+                        map.insert("display_name".into(), serde_json::json!(name));
+                    }
+                    if let Some(avatar) = &payload.avatar_cid {
+                        map.insert("avatar_cid".into(), serde_json::json!(avatar));
+                    }
+                    if let Some(bio) = &payload.bio {
+                        map.insert("bio".into(), serde_json::json!(bio));
+                    }
+                    watermark = *ts;
+                }
+                map.insert("profile_updated_at".into(), serde_json::json!(watermark));
+            }
+
+            // Nothing worth writing if no update carried any field.
+            let has_content = record.get("display_name").is_some()
+                || record.get("avatar_cid").is_some()
+                || record.get("bio").is_some();
+            if !has_content {
+                continue;
+            }
+
+            let bytes = serde_json::to_vec(&record).context("serializing rebuilt user record")?;
+            self.put_cf(cf::USERS, author.as_bytes(), &bytes)?;
+
+            // Restore the @-mention autocomplete index too, or a rebuilt profile
+            // would be invisible to search.
+            if let Some(name) = record.get("display_name").and_then(|v| v.as_str()) {
+                if !name.trim().is_empty() {
+                    let key = super::schema::encode_users_by_name_key(&name.to_lowercase(), &author);
+                    let _ = self.put_cf(cf::USERS_BY_NAME, &key, &[]);
+                }
+            }
+            self.increment_stat(super::schema::state_keys::TOTAL_USERS)?;
+            rebuilt += 1;
+        }
+
+        if rebuilt > 0 {
+            info!(rebuilt, "Rebuilt USERS rows from stored ProfileUpdate envelopes");
+        }
+        self.put_cf(
+            cf::NODE_STATE,
+            super::schema::state_keys::USERS_REBUILT_FROM_MESSAGES,
+            &1u64.to_be_bytes(),
+        )?;
+        Ok(())
+    }
+
+    /// One-time backfill of `NEWS_REACTION_MSGS` from existing `MESSAGES`.
+    ///
+    /// Without this, only reactions made AFTER the upgrade would ever backfill,
+    /// leaving every reaction already on disk unreachable to a syncing peer —
+    /// exactly the divergence the index exists to fix (two nodes holding the
+    /// same post with different reaction counts, with nothing able to converge
+    /// them). Idempotent — guarded by `NEWS_REACTIONS_INDEXED`.
+    pub fn backfill_news_reaction_index(&self) -> Result<()> {
+        use crate::messages::envelope::Envelope;
+        use crate::messages::types::MessageType;
+        use tracing::info;
+
+        if self
+            .get_cf(cf::NODE_STATE, super::schema::state_keys::NEWS_REACTIONS_INDEXED)?
+            .is_some()
+        {
+            return Ok(());
+        }
+
+        let cf = self
+            .db
+            .cf_handle(cf::MESSAGES)
+            .with_context(|| "column family 'messages' not found")?;
+        let mut iter = self.db.raw_iterator_cf(&cf);
+        iter.seek_to_first();
+
+        let mut indexed = 0u64;
+        while iter.valid() {
+            if let Some(raw) = iter.value() {
+                if let Ok(envelope) = rmp_serde::from_slice::<Envelope>(raw) {
+                    if envelope.msg_type == MessageType::NewsReaction {
+                        let key = super::schema::encode_news_key(
+                            envelope.timestamp,
+                            &envelope.msg_id,
+                        );
+                        self.put_cf(cf::NEWS_REACTION_MSGS, &key, &[])?;
+                        indexed += 1;
+                    }
+                }
+            }
+            iter.next();
+        }
+
+        if indexed > 0 {
+            info!(indexed, "Backfilled news reaction index from MESSAGES");
+        }
+        self.put_cf(
+            cf::NODE_STATE,
+            super::schema::state_keys::NEWS_REACTIONS_INDEXED,
+            &1u64.to_be_bytes(),
+        )?;
+        Ok(())
+    }
+
     /// One-time backfill of `CHANNEL_EDIT_DELETE_MSGS`/`DM_EDIT_DELETE_MSGS`/
     /// `NEWS_EDIT_DELETE` from existing `MESSAGES` (audit final pre-mainnet W6:
     /// backfill previously omitted edit/delete markers, so "deleted for
@@ -4747,6 +4930,156 @@ mod backfill_edit_delete_markers_tests {
     /// envelopes that were applied and stored BEFORE the upgrade — this is
     /// what makes the backfill fix retroactive rather than only covering
     /// edits/deletes made going forward.
+    /// The reaction index must be RETROACTIVE. A reaction already applied and
+    /// stored before the upgrade has no `NEWS_REACTION_MSGS` row, and since
+    /// reactions appear in no other index news-sync walks, without the migration
+    /// it would stay permanently unreachable to a syncing peer — which is the
+    /// exact divergence the index exists to fix.
+    #[test]
+    fn backfills_existing_news_reactions_from_messages() {
+        let (s, _d) = db();
+
+        let reaction_id = [9u8; 32];
+        put_message(
+            &s,
+            &Envelope {
+                version: crate::messages::envelope::PROTOCOL_VERSION,
+                msg_type: MessageType::NewsReaction,
+                msg_id: reaction_id,
+                author: "klv1reactor".to_string(),
+                timestamp: 1_700,
+                lamport_ts: 0,
+                payload: rmp_serde::to_vec_named(&crate::messages::types::ReactionPayload {
+                    target_id: [7u8; 32],
+                    channel_id: None,
+                    emoji: "🔥".to_string(),
+                    remove: false,
+                })
+                .unwrap(),
+                signature: vec![],
+                relay_path: vec![],
+            },
+        );
+
+        let key = super::super::schema::encode_news_key(1_700, &reaction_id);
+        assert!(
+            s.get_cf(cf::NEWS_REACTION_MSGS, &key).unwrap().is_none(),
+            "precondition: not indexed yet"
+        );
+
+        s.backfill_news_reaction_index().unwrap();
+        assert!(
+            s.get_cf(cf::NEWS_REACTION_MSGS, &key).unwrap().is_some(),
+            "a pre-existing reaction must be indexed retroactively"
+        );
+
+        // Idempotent, and the sentinel stops a second full scan.
+        s.backfill_news_reaction_index().unwrap();
+        assert!(s.get_cf(cf::NEWS_REACTION_MSGS, &key).unwrap().is_some());
+    }
+
+    /// USERS is derived from ProfileUpdate envelopes and had no rebuild path, so
+    /// losing the index lost every display name and avatar while the signed
+    /// envelopes were still on disk.
+    #[test]
+    fn rebuilds_users_from_profile_updates_preserving_merge_and_lww() {
+        use crate::messages::types::ProfileUpdatePayload;
+        let (s, _d) = db();
+
+        let author = "klv1profile";
+        // Older update sets a bio; newer sets only the name. The merge must keep
+        // BOTH — replaying only the newest would silently drop the bio.
+        for (i, (ts, name, avatar, bio)) in [
+            (100u64, Some("Old Name"), None, Some("my bio")),
+            (200u64, Some("New Name"), Some("cid-avatar"), None),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut msg_id = [0u8; 32];
+            msg_id[0] = 40 + i as u8;
+            put_message(
+                &s,
+                &Envelope {
+                    version: crate::messages::envelope::PROTOCOL_VERSION,
+                    msg_type: MessageType::ProfileUpdate,
+                    msg_id,
+                    author: author.to_string(),
+                    timestamp: ts,
+                    lamport_ts: 0,
+                    payload: rmp_serde::to_vec_named(&ProfileUpdatePayload {
+                        display_name: name.map(String::from),
+                        avatar_cid: avatar.map(String::from),
+                        bio: bio.map(String::from),
+                    })
+                    .unwrap(),
+                    signature: vec![],
+                    relay_path: vec![],
+                },
+            );
+        }
+
+        assert!(
+            s.get_cf(cf::USERS, author.as_bytes()).unwrap().is_none(),
+            "precondition: profile is lost"
+        );
+
+        s.rebuild_users_from_profile_updates().unwrap();
+
+        let raw = s
+            .get_cf(cf::USERS, author.as_bytes())
+            .unwrap()
+            .expect("profile must be rebuilt");
+        let rec: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(rec["display_name"], "New Name", "newest name wins");
+        assert_eq!(rec["avatar_cid"], "cid-avatar");
+        assert_eq!(rec["bio"], "my bio", "an earlier field must survive the merge");
+        assert_eq!(rec["profile_updated_at"], 200, "LWW watermark is the newest ts");
+    }
+
+    /// Recovery must never clobber live data: an address that still has a USERS
+    /// row is left exactly as-is, even if older envelopes exist for it.
+    #[test]
+    fn rebuild_users_leaves_existing_records_untouched() {
+        use crate::messages::types::ProfileUpdatePayload;
+        let (s, _d) = db();
+
+        let author = "klv1existing";
+        let live = serde_json::json!({
+            "address": author,
+            "display_name": "Live Name",
+            "profile_updated_at": 500,
+        });
+        s.put_cf(cf::USERS, author.as_bytes(), &serde_json::to_vec(&live).unwrap())
+            .unwrap();
+
+        put_message(
+            &s,
+            &Envelope {
+                version: crate::messages::envelope::PROTOCOL_VERSION,
+                msg_type: MessageType::ProfileUpdate,
+                msg_id: [60u8; 32],
+                author: author.to_string(),
+                timestamp: 100,
+                lamport_ts: 0,
+                payload: rmp_serde::to_vec_named(&ProfileUpdatePayload {
+                    display_name: Some("Stale Name".into()),
+                    avatar_cid: None,
+                    bio: None,
+                })
+                .unwrap(),
+                signature: vec![],
+                relay_path: vec![],
+            },
+        );
+
+        s.rebuild_users_from_profile_updates().unwrap();
+
+        let raw = s.get_cf(cf::USERS, author.as_bytes()).unwrap().unwrap();
+        let rec: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(rec["display_name"], "Live Name", "must not be overwritten");
+    }
+
     #[test]
     fn backfills_existing_chat_and_dm_deletes_from_messages() {
         let (s, _d) = db();

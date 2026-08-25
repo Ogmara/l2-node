@@ -5,6 +5,59 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.121.0] - 2026-08-25
+
+Closes the two durability gaps left open by 0.119.0/0.120.0. Both are the same
+shape: a derived index that nothing rebuilt, so data on disk became unreachable.
+
+### Fixed
+
+- **Reactions never reached a backfilling peer.** News-sync's backfill walks
+  `NEWS_FEED`, and reactions are the one news type that isn't in it —
+  `NewsComment` and `NewsRepost` are indexed there because they're timeline
+  content, but a reaction isn't. So a reaction propagated by live gossip alone,
+  and one missed while a node was down or unmeshed was lost permanently. Two
+  peered nodes could hold the same post with different counts forever, observed
+  in the field as one node showing two reactions and its peer none.
+
+  Added `NEWS_REACTION_MSGS`, a side index with the same key shape and
+  ride-along treatment `NEWS_EDIT_DELETE` already had. A one-time migration
+  backfills it from existing `MESSAGES`, so reactions that predate the index
+  recover too rather than the fix only applying going forward.
+
+  Visibility is preserved: a reaction on a `Followers`-only post does not ride
+  along. The post itself is already withheld from these responses, so shipping
+  a reaction on it would leak the post's `msg_id` and the reactor's address to
+  a peer that never received it — the same side channel `edit_is_backfillable`
+  closes for edits.
+
+- **A lost `USERS` index took every display name and avatar with it.** `USERS`
+  is derived from signed `ProfileUpdate` envelopes in `MESSAGES`, but nothing
+  ever rebuilt it, so if the index was lost — a wipe, a partial restore, an
+  aborted migration — profiles vanished network-wide while the authoritative
+  envelopes sat untouched on disk. Observed in the field:
+  `/api/v1/users/<addr>` returned the empty-profile fallback for every account
+  on every node, while clients still showed names from their own local caches.
+  No client-side fix could have helped; there was nothing to serve.
+
+  Profiles are now rebuilt at startup by replaying each author's stored
+  `ProfileUpdate` envelopes in timestamp order, with the same merge and
+  last-writer-wins semantics as the live path — a later update that sets only
+  `display_name` must not erase an earlier `bio`. The `USERS_BY_NAME`
+  autocomplete index is restored alongside, or a recovered profile would be
+  invisible to @-mention search.
+
+  Conservative by design: an address that still has a `USERS` row is left
+  untouched, so this can only add back what was lost, never overwrite live data.
+
+### Added
+
+- `NEWS_REACTION_MSGS` column family; `NEWS_REACTIONS_INDEXED` and
+  `USERS_REBUILT_FROM_MESSAGES` migration sentinels.
+- Five tests: retroactive reaction indexing, reaction ride-along on a public
+  post, the followers-only leak guard, profile rebuild preserving merge + LWW,
+  and rebuild leaving existing records untouched.
+
 ## [0.120.0] - 2026-08-25
 
 Follow-up to 0.119.0, from a live report that reactions still only appeared

@@ -305,6 +305,20 @@ pub mod cf {
     /// not originally named in the finding but the same bug). (l2-node
     /// 0.95.0+.)
     pub const NEWS_EDIT_DELETE: &str = "news_edit_delete";
+    /// (!timestamp:8 BE, msg_id:32) → () — same key shape as `NEWS_FEED`, but
+    /// for `NewsReaction` envelopes only.
+    ///
+    /// Reactions are the one news type with no presence in `NEWS_FEED`:
+    /// `NewsComment` and `NewsRepost` are indexed there (they are timeline
+    /// content), while a reaction is not something to show in the feed. But
+    /// news-sync's backfill walks `NEWS_FEED`, so reactions were served to a
+    /// backfilling peer by no mechanism at all — a reaction missed while a node
+    /// was down or unmeshed was lost permanently, and two nodes could hold the
+    /// same post with different reaction counts forever.
+    ///
+    /// Consulted only by news-sync's ride-along, exactly like
+    /// `NEWS_EDIT_DELETE`; never by the feed read path.
+    pub const NEWS_REACTION_MSGS: &str = "news_reaction_msgs";
 
     /// All column family names for database initialization.
     pub const ALL: &[&str] = &[
@@ -369,6 +383,7 @@ pub mod cf {
         CHANNEL_EDIT_DELETE_MSGS,
         DM_EDIT_DELETE_MSGS,
         NEWS_EDIT_DELETE,
+        NEWS_REACTION_MSGS,
         DM_RECIPIENT_MSG_COUNTS,
     ];
 }
@@ -409,6 +424,15 @@ pub mod state_keys {
     /// NEWS_EDIT_DELETE are backfilled from existing MESSAGES (audit final
     /// pre-mainnet W6, l2-node 0.95.0+).
     pub const EDIT_DELETE_MARKERS_INDEXED: &[u8] = b"migration_edit_delete_markers_indexed";
+    /// Sentinel: set to 1 after `NEWS_REACTION_MSGS` is backfilled from existing
+    /// `MESSAGES`, making the reaction ride-along retroactive rather than only
+    /// covering reactions made after the upgrade (l2-node 0.121.0+).
+    pub const NEWS_REACTIONS_INDEXED: &[u8] = b"migration_news_reactions_indexed";
+    /// Sentinel: set to 1 after `USERS` rows are rebuilt from stored
+    /// `ProfileUpdate` envelopes (l2-node 0.121.0+). `USERS` is a derived index
+    /// and nothing rebuilt it, so losing it lost every display name and avatar
+    /// network-wide while the signed envelopes were still on disk.
+    pub const USERS_REBUILT_FROM_MESSAGES: &[u8] = b"migration_users_rebuilt_from_messages";
     /// Sentinel: set to 1 after CHANNEL_MSGS is re-keyed from `lamport_ts` (always
     /// 0 from clients) to the wall-clock `timestamp` — chronological ordering +
     /// working unread fast-skip (l2-node 0.58.0+).

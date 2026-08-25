@@ -685,6 +685,22 @@ impl Node {
             }
         }
 
+        // Backfill NEWS_REACTION_MSGS from MESSAGES (one-time) so reactions that
+        // predate the index also ride along on news-sync backfill. Reactions are
+        // the one news type absent from NEWS_FEED, so before this they reached a
+        // syncing peer by no mechanism at all.
+        if let Err(e) = storage.backfill_news_reaction_index() {
+            warn!(error = %e, "Failed to backfill news reaction index");
+        }
+
+        // Rebuild USERS from stored ProfileUpdate envelopes. USERS is a derived
+        // index with no rebuild path, so losing it lost every display name and
+        // avatar while the signed envelopes were still on disk. Only fills in
+        // addresses that have no record — never overwrites live data.
+        if let Err(e) = storage.rebuild_users_from_profile_updates() {
+            warn!(error = %e, "Failed to rebuild USERS from ProfileUpdate envelopes");
+        }
+
         // Re-key CHANNEL_MSGS from lamport_ts (always 0) to wall-clock timestamp
         // so the channel index is chronological + the unread fast-skip works.
         let channel_msgs_ts_reindexed =

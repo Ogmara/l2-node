@@ -240,6 +240,7 @@ pub fn build_response(
     // requires before an edit/delete can be accepted.
     if !has_more {
         envelopes.extend(news_edit_delete_envelopes(storage, min_ts));
+        envelopes.extend(news_reaction_envelopes(storage, min_ts));
     }
 
     NewsSyncResponse {
@@ -249,6 +250,86 @@ pub fn build_response(
         server_capped: false,
         completeness_root: None,
     }
+}
+
+/// Gather `NewsReaction` envelopes within the window.
+///
+/// Reactions are the one news type that appears in NO index the primary scan
+/// walks: `NewsComment` and `NewsRepost` are written into `NEWS_FEED` (they are
+/// timeline content), but a reaction is not, so before `NEWS_REACTION_MSGS`
+/// existed a reaction reached a backfilling peer by no mechanism whatsoever. A
+/// reaction missed while a node was down or unmeshed was lost permanently, and
+/// two nodes could hold the same post with different counts forever — observed
+/// in the field as one node showing two reactions and its peer none.
+///
+/// Bounded + best-effort, the same tradeoff already accepted for edits/deletes.
+/// Rides along on the last page for the same ordering reason: `toggle_news_reaction`
+/// keys off the target post, so the post wants to be applied first.
+fn news_reaction_envelopes(storage: &Storage, min_ts: u64) -> Vec<Vec<u8>> {
+    const NEWS_REACTION_CAP: usize = 4_000;
+    let rows = match storage.prefix_iter_cf(
+        schema::cf::NEWS_REACTION_MSGS,
+        &[],
+        NEWS_REACTION_CAP.saturating_add(1),
+    ) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    if rows.len() > NEWS_REACTION_CAP {
+        warn!(
+            cap = NEWS_REACTION_CAP,
+            "news-sync: more reaction envelopes than the ride-along cap; \
+             oldest excess reactions were not shipped this session"
+        );
+    }
+    let mut out = Vec::with_capacity(rows.len().min(NEWS_REACTION_CAP));
+    for (key, _) in rows.into_iter().take(NEWS_REACTION_CAP) {
+        // Key shape matches NEWS_FEED: !timestamp:8 ++ msg_id:32.
+        if key.len() < 8 + 32 {
+            continue;
+        }
+        let neg = u64::from_be_bytes(match key[0..8].try_into() {
+            Ok(b) => b,
+            Err(_) => continue,
+        });
+        let ts = !neg;
+        if ts < min_ts {
+            continue;
+        }
+        let mut msg_id = [0u8; 32];
+        msg_id.copy_from_slice(&key[8..40]);
+        if let Ok(Some(raw)) = storage.get_cf(schema::cf::MESSAGES, &msg_id) {
+            if reaction_is_backfillable(storage, &raw) {
+                out.push(raw);
+            }
+        }
+    }
+    out
+}
+
+/// Whether a `NewsReaction` may ride along to a backfilling peer.
+///
+/// A reaction carries no post content, but it does reveal that a given post
+/// EXISTS and who engaged with it. `is_backfillable` already withholds a
+/// `Followers`-only `NewsPost` from this same response, so shipping a reaction
+/// on that post would leak its `msg_id` — and a reactor's address — to a peer
+/// that never received the post. Mirrors `edit_is_backfillable`.
+fn reaction_is_backfillable(storage: &Storage, raw: &[u8]) -> bool {
+    let Ok(envelope) = rmp_serde::from_slice::<crate::messages::envelope::Envelope>(raw) else {
+        return true;
+    };
+    if envelope.msg_type != crate::messages::types::MessageType::NewsReaction {
+        return true;
+    }
+    let Ok(reaction) =
+        rmp_serde::from_slice::<crate::messages::types::ReactionPayload>(&envelope.payload)
+    else {
+        return true;
+    };
+    let Ok(Some(target_raw)) = storage.get_cf(schema::cf::MESSAGES, &reaction.target_id) else {
+        return true; // target gone/unknown — nothing more restrictive to check
+    };
+    is_backfillable(&target_raw)
 }
 
 /// Gather `NewsEdit`/`NewsDelete` envelopes within the window (audit final
@@ -631,6 +712,94 @@ mod w37_followers_visibility_tests {
         storage
             .put_cf(schema::cf::MESSAGES, &msg_id, &rmp_serde::to_vec_named(&env).unwrap())
             .unwrap();
+    }
+
+    fn put_news_reaction(
+        storage: &Storage,
+        reactor: &str,
+        target_id: [u8; 32],
+        msg_id: [u8; 32],
+        ts: u64,
+    ) {
+        let payload = crate::messages::types::ReactionPayload {
+            target_id,
+            channel_id: None,
+            emoji: "🔥".to_string(),
+            remove: false,
+        };
+        let env = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::NewsReaction,
+            msg_id,
+            author: reactor.to_string(),
+            timestamp: ts,
+            lamport_ts: 0,
+            payload: rmp_serde::to_vec_named(&payload).unwrap(),
+            signature: vec![],
+            relay_path: vec![],
+        };
+        storage
+            .put_cf(schema::cf::NEWS_REACTION_MSGS, &schema::encode_news_key(ts, &msg_id), &[])
+            .unwrap();
+        storage
+            .put_cf(schema::cf::MESSAGES, &msg_id, &rmp_serde::to_vec_named(&env).unwrap())
+            .unwrap();
+    }
+
+    /// The whole point of the reaction index: a reaction on a PUBLIC post must
+    /// actually reach a backfilling peer. Reactions live in no index the primary
+    /// NEWS_FEED scan walks, so if the ride-along regresses they silently stop
+    /// propagating and nothing else catches it.
+    #[test]
+    fn reaction_on_a_public_post_rides_along() {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let author = "klv1author";
+        let ts = 1_700_000_000_000u64;
+        let post_id = [1u8; 32];
+        put_news_post_vis(&storage, author, post_id, ts, Visibility::Public);
+        put_news_reaction(&storage, "klv1reactor", post_id, [3u8; 32], ts + 50);
+
+        let req = NewsSyncRequest {
+            max_age_secs: u64::MAX,
+            cursor: None,
+            overlap_digest: vec![],
+            round: 0,
+        };
+        let resp = build_response(&storage, &req, 10, ts + 1000, u64::MAX);
+        assert_eq!(
+            resp.envelopes.len(),
+            2,
+            "the public post AND its reaction must both be served"
+        );
+    }
+
+    /// Mirror of the edit side channel: a reaction reveals that a post exists and
+    /// who engaged with it. Since the Followers-only post itself is withheld from
+    /// this response, shipping a reaction on it would leak the post's msg_id and
+    /// the reactor's address to a peer that never received the post.
+    #[test]
+    fn reaction_on_a_followers_only_post_does_not_leak_via_ride_along() {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let author = "klv1author";
+        let ts = 1_700_000_000_000u64;
+        let post_id = [1u8; 32];
+        put_news_post_vis(&storage, author, post_id, ts, Visibility::Followers);
+        put_news_reaction(&storage, "klv1reactor", post_id, [3u8; 32], ts + 50);
+
+        let req = NewsSyncRequest {
+            max_age_secs: u64::MAX,
+            cursor: None,
+            overlap_digest: vec![],
+            round: 0,
+        };
+        let resp = build_response(&storage, &req, 10, ts + 1000, u64::MAX);
+        assert!(
+            resp.envelopes.is_empty(),
+            "a reaction on a Followers-only post must not leak its existence via the \
+             ride-along, even though the post itself is already excluded"
+        );
     }
 
     #[test]

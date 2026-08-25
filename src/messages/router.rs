@@ -2323,6 +2323,16 @@ impl MessageRouter {
                         resolved_author,
                         payload.remove,
                     )?;
+                    // Side index for news-sync's ride-along. NewsComment and
+                    // NewsRepost land in NEWS_FEED (they are timeline content);
+                    // a reaction is not, so without this it appeared in no index
+                    // that backfill walks and could only ever arrive by live
+                    // gossip — permanently lost if that was missed. Same shape
+                    // and rationale as NEWS_EDIT_DELETE above.
+                    let key =
+                        schema::encode_news_key(envelope.timestamp, &envelope.msg_id);
+                    self.storage
+                        .put_cf(schema::cf::NEWS_REACTION_MSGS, &key, &[])?;
                 }
             }
             MessageType::NewsRepost => {
