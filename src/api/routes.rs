@@ -3496,6 +3496,7 @@ pub async fn follow_user(
     match state.router.process_message(&body) {
         RouteResult::Accepted { raw_bytes, .. } => {
             gossip_if_applicable(&state, &raw_bytes).await;
+            notify_if_applicable(&state, &raw_bytes);
             Json(OkResponse { ok: true }).into_response()
         }
         RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
@@ -3518,6 +3519,7 @@ pub async fn unfollow_user(
     match state.router.process_message(&body) {
         RouteResult::Accepted { raw_bytes, .. } => {
             gossip_if_applicable(&state, &raw_bytes).await;
+            notify_if_applicable(&state, &raw_bytes);
             Json(OkResponse { ok: true }).into_response()
         }
         RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
@@ -3593,6 +3595,7 @@ pub async fn react_to_news(
     match state.router.process_message(&body) {
         RouteResult::Accepted { raw_bytes, .. } => {
             gossip_if_applicable(&state, &raw_bytes).await;
+            notify_if_applicable(&state, &raw_bytes);
             Json(OkResponse { ok: true }).into_response()
         }
         RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
@@ -3613,7 +3616,13 @@ pub async fn repost_news(
     use crate::messages::router::RouteResult;
 
     match state.router.process_message(&body) {
-        RouteResult::Accepted { msg_id, .. } => {
+        RouteResult::Accepted { msg_id, raw_bytes, .. } => {
+            // A repost never federated at all: unlike every other news write this
+            // handler dropped the accepted envelope on the floor instead of
+            // publishing it, so a repost stayed on the node it was made on and
+            // was invisible to the rest of the network.
+            gossip_if_applicable(&state, &raw_bytes).await;
+            notify_if_applicable(&state, &raw_bytes);
             Json(MessageResponse {
                 msg_id: hex::encode(msg_id),
                 delivery: None,
@@ -3943,6 +3952,29 @@ pub async fn get_channel_bans(
 /// `pub(crate)` so `websocket.rs` can reuse it too (audit W26): WS
 /// `Message`/`Dm` frames go through the identical `process_message` +
 /// `Accepted { raw_bytes }` shape but previously never called this.
+/// Feed an accepted envelope to the notification engine, which is what pushes it
+/// to connected WebSocket clients (and raises mention notifications).
+///
+/// The gossip-receive path in `network::mod` already does this for every
+/// envelope that arrives from a peer, but the dedicated REST endpoints did not:
+/// only `post_message` called the engine. So an action taken through one of
+/// those endpoints appeared live on every OTHER node — which received it by
+/// gossip and ran it through the engine — while the node it was performed on
+/// pushed nothing, and its own clients saw the change only after a manual
+/// refetch. Reacting to a news post was the visible case.
+pub(crate) fn notify_if_applicable(state: &AppState, raw_bytes: &[u8]) {
+    let Some(engine) = state.notification_engine.clone() else {
+        return;
+    };
+    let Ok(envelope) = rmp_serde::from_slice::<crate::messages::envelope::Envelope>(raw_bytes)
+    else {
+        return;
+    };
+    tokio::spawn(async move {
+        engine.process(&envelope).await;
+    });
+}
+
 pub(crate) async fn gossip_if_applicable(state: &AppState, raw_bytes: &[u8]) {
     let Ok(envelope) = rmp_serde::from_slice::<crate::messages::envelope::Envelope>(raw_bytes)
     else {
@@ -3969,6 +4001,7 @@ pub async fn add_moderator(
     match state.router.process_message(&body) {
         RouteResult::Accepted { raw_bytes, .. } => {
             gossip_if_applicable(&state, &raw_bytes).await;
+            notify_if_applicable(&state, &raw_bytes);
             Json(OkResponse { ok: true }).into_response()
         }
         RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
@@ -3991,6 +4024,7 @@ pub async fn remove_moderator(
     match state.router.process_message(&body) {
         RouteResult::Accepted { raw_bytes, .. } => {
             gossip_if_applicable(&state, &raw_bytes).await;
+            notify_if_applicable(&state, &raw_bytes);
             Json(OkResponse { ok: true }).into_response()
         }
         RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
@@ -4013,6 +4047,7 @@ pub async fn kick_user(
     match state.router.process_message(&body) {
         RouteResult::Accepted { raw_bytes, .. } => {
             gossip_if_applicable(&state, &raw_bytes).await;
+            notify_if_applicable(&state, &raw_bytes);
             Json(OkResponse { ok: true }).into_response()
         }
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
@@ -4035,6 +4070,7 @@ pub async fn ban_user(
     match state.router.process_message(&body) {
         RouteResult::Accepted { raw_bytes, .. } => {
             gossip_if_applicable(&state, &raw_bytes).await;
+            notify_if_applicable(&state, &raw_bytes);
             Json(OkResponse { ok: true }).into_response()
         }
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
@@ -4057,6 +4093,7 @@ pub async fn unban_user(
     match state.router.process_message(&body) {
         RouteResult::Accepted { raw_bytes, .. } => {
             gossip_if_applicable(&state, &raw_bytes).await;
+            notify_if_applicable(&state, &raw_bytes);
             Json(OkResponse { ok: true }).into_response()
         }
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
@@ -4088,6 +4125,7 @@ pub async fn mute_user(
     match state.router.process_message(&body) {
         RouteResult::Accepted { raw_bytes, .. } => {
             gossip_if_applicable(&state, &raw_bytes).await;
+            notify_if_applicable(&state, &raw_bytes);
             Json(OkResponse { ok: true }).into_response()
         }
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
@@ -4115,6 +4153,7 @@ pub async fn unmute_user(
     match state.router.process_message(&body) {
         RouteResult::Accepted { raw_bytes, .. } => {
             gossip_if_applicable(&state, &raw_bytes).await;
+            notify_if_applicable(&state, &raw_bytes);
             Json(OkResponse { ok: true }).into_response()
         }
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
@@ -4137,6 +4176,7 @@ pub async fn pin_message(
     match state.router.process_message(&body) {
         RouteResult::Accepted { raw_bytes, .. } => {
             gossip_if_applicable(&state, &raw_bytes).await;
+            notify_if_applicable(&state, &raw_bytes);
             Json(OkResponse { ok: true }).into_response()
         }
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
@@ -4159,6 +4199,7 @@ pub async fn unpin_message(
     match state.router.process_message(&body) {
         RouteResult::Accepted { raw_bytes, .. } => {
             gossip_if_applicable(&state, &raw_bytes).await;
+            notify_if_applicable(&state, &raw_bytes);
             Json(OkResponse { ok: true }).into_response()
         }
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
@@ -4181,6 +4222,7 @@ pub async fn invite_user(
     match state.router.process_message(&body) {
         RouteResult::Accepted { raw_bytes, .. } => {
             gossip_if_applicable(&state, &raw_bytes).await;
+            notify_if_applicable(&state, &raw_bytes);
             Json(OkResponse { ok: true }).into_response()
         }
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),

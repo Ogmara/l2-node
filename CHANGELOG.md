@@ -5,6 +5,45 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.120.0] - 2026-08-25
+
+Follow-up to 0.119.0, from a live report that reactions still only appeared
+after a manual refresh. 0.119.0 taught the notification engine to broadcast news
+envelopes, but most write endpoints never call the engine in the first place.
+
+### Fixed
+
+- **Actions taken through a dedicated REST endpoint were never pushed to that
+  node's own clients.** Only `post_message` fed accepted envelopes to the
+  notification engine. The gossip-receive path does it for everything arriving
+  from a peer, so an action appeared live on every OTHER node while the node it
+  was performed on pushed nothing — its clients saw the change only on the next
+  manual refetch. Reacting to a news post was the visible case; the same applied
+  to follow/unfollow and every channel-moderation endpoint (kick, ban, mute,
+  pin, invite, add/remove moderator).
+
+  Added `notify_if_applicable`, the notification counterpart to
+  `gossip_if_applicable`, and called it from all 15 affected handlers.
+
+- **A repost never federated.** `repost_news` dropped the accepted envelope
+  instead of publishing it — no `gossip_if_applicable`, no notification — so a
+  repost stayed on the node it was made on and was invisible to the rest of the
+  network. It now gossips and notifies like every other news write.
+
+### Known issues
+
+- **Reactions, reposts and comments still do not backfill**, so one missed
+  gossip message is permanent for them — the same class of bug 0.119.0 fixed for
+  posts. `news_sync::build_response` walks `NEWS_FEED`, which indexes posts only;
+  `is_news_type` admits the engagement types but nothing ever offers them. This
+  is why a node can hold a post while showing none of its reactions.
+
+  Closing it needs a timestamp-ordered index of engagement envelopes plus a
+  migration to populate it from existing `MESSAGES`, mirroring what
+  `NEWS_EDIT_DELETE` does for edits and deletes. `NEWS_REACTIONS` cannot serve:
+  it is keyed `(msg_id, emoji, author)` and stores the fact of a reaction, not
+  the signed envelope. Deferred rather than rushed — it is a schema addition.
+
 ## [0.119.0] - 2026-08-25
 
 Two independent bugs kept the global news feed from working across the mesh.
