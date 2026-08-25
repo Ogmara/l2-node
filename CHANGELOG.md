@@ -5,6 +5,85 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.117.0] - 2026-08-25
+
+Governance-dashboard-plan.md Phase 8: Alert Config UI panel. Independent
+of the governance work (Phases 0/5-7) — carried forward from the plan's
+original superseded draft, unaffected by the governance-track redesign.
+
+### Added
+
+- **`GET /admin/alerts/config`** (`api/dashboard.rs`) — returns the
+  current `[alerts]` configuration. Serializes `AppState.alerts_config`
+  (a new `AlertsConfig` snapshot field, cloned from `self.config.alerts`
+  at startup) directly rather than hand-building the JSON response —
+  every secret field on the underlying config structs
+  (`telegram.bot_token`, `discord.webhook_url`,
+  `ogmara_channel.signing_key_path`) already carries `#[serde(skip_serializing)]`,
+  so this is compiler-enforced-safe against a future secret field
+  going unredacted, which a hand-rolled reshape would not guarantee.
+  Verified live: `curl | grep` against a real bot-token/webhook-URL
+  confirms neither appears in the response.
+- **`POST /admin/alerts/test`** — dispatches a one-off `[TEST]`-tagged
+  message to every ENABLED channel and reports exactly which
+  succeeded/failed (`{"sent_to": [...], "failed": ["telegram: <reason>", ...]}`).
+  Bypasses the real-alert cooldown map and never writes to
+  `/admin/alerts/history` — a test dispatch is an operator diagnostic
+  action, not a real alert condition (3 new unit tests assert this
+  directly). Routed into the running `AlertEngine` via a new
+  `TestAlertSender`/`TestAlertRequest` channel — the SAME
+  "task owns state, handler asks via oneshot with a shared send+reply
+  timeout budget" idiom `admin::submit_governance_call` uses (this
+  codebase now has 3 independent instances of that pattern:
+  `anchor_trigger`, `governance_submit`, and this one).
+- **`AlertEngine::send_telegram`/`send_discord`/`send_webhook`** now
+  return `Result<(), String>` instead of `()` — needed so
+  `send_test_alert` can report per-channel success/failure; `fire()`'s
+  existing call sites are unaffected (`let _ = ...`).
+- **Dashboard "Alert Configuration" card** (Alerts tab, above Alert
+  History) — enabled/disabled badge, per-dispatcher status row
+  (Telegram/Discord/Webhook/Ogmara-channel), cooldown, and the full
+  threshold table, plus a "Send Test Alert" button showing live
+  sent/failed results. Explicitly notes that credentials are never
+  exposed here and "Send Test Alert" is the way to verify a channel
+  is actually configured correctly, not just enabled (an "enabled"
+  dispatcher with an empty/wrong credential is otherwise
+  indistinguishable from a correctly configured one from this
+  response alone).
+
+### Fixed (same-day Code Audit + Security Audit pass)
+
+- **`self.http`'s `reqwest::Client` had no request timeout** (Code Audit)
+  — a hung/slow third-party endpoint (real or test dispatch) could block
+  `AlertEngine::run()`'s single-threaded `select!` loop for the OS-level
+  TCP timeout, starving the 30s threshold-evaluation tick, real
+  event-driven fires, and graceful shutdown for the same duration, with
+  no signal to the caller (whose own 15s HTTP timeout would already have
+  returned). Now built with a 10s timeout, matching this file's other
+  outbound-HTTP precedent (`AppState.klever_view_http`).
+- **A transient network-level failure could leak a live secret into the
+  dashboard UI** (Security Audit) — `reqwest::Error`'s `Display` impl
+  includes the full request URL on connection-level failures, and
+  Telegram's `bot_token`/Discord's `webhook_url` are embedded directly in
+  that URL. The raw error string flowed unmodified from `send_telegram`/
+  `send_discord`/`send_webhook` into `TestAlertResult.failed`, back over
+  the wire to `POST /admin/alerts/test`'s JSON response. A DNS/connect/TLS
+  blip on "Send Test Alert" would have exposed the token in the browser
+  (DevTools, proxy logs). Replaced with a new `describe_reqwest_error`
+  helper that categorizes the failure (timeout/connect/HTTP status)
+  without ever echoing the URL; the full error still reaches the
+  operator-only log file via the existing `warn!(error = %e, ...)` call,
+  unaffected.
+- **`POST /admin/alerts/test` had no rate limit beyond the generic
+  API-wide governor** (Security Audit) — each call fans out to up to 4
+  real outbound requests against operator-configured third-party targets
+  (Telegram/Discord/webhook/Ogmara-channel), the same "real-world cost
+  beyond generic API load" profile that earned the governance write
+  endpoints their own tighter limiter in the 0.115.0 round, but this
+  endpoint didn't get the same treatment when it shipped. Now behind its
+  own `tower_governor` layer (6/min, burst 3), in addition to the
+  API-wide per-IP limiter.
+
 ## [0.116.0] - 2026-08-25
 
 Governance-dashboard-plan.md Phase 7: the dashboard Governance tab UI —

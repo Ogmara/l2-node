@@ -287,6 +287,19 @@ pub struct AppState {
     pub metrics_history: Arc<RwLock<RingBuffer<MetricsSnapshot>>>,
     /// Shared alert history from the AlertEngine (spec 10-dashboard.md §9).
     pub alert_history: SharedAlertHistory,
+    /// Snapshot of `[alerts]` config, cloned at startup — drives
+    /// `GET /admin/alerts/config` (governance-dashboard-plan.md Phase
+    /// 8). Secret fields (`telegram.bot_token`, `discord.webhook_url`,
+    /// `ogmara_channel.signing_key_path`) are already
+    /// `#[serde(skip_serializing)]` on the underlying config structs,
+    /// so serializing this field directly is safe — no hand-built
+    /// reshaping needed (or permitted: reshaping by hand risks a
+    /// future secret field going unredacted).
+    pub alerts_config: crate::config::AlertsConfig,
+    /// Channel to request a one-off test dispatch from the running
+    /// `AlertEngine` (`POST /admin/alerts/test`). `None` when alerts
+    /// are disabled (`[alerts] enabled = false`, no engine running).
+    pub alert_test_tx: Option<crate::notifications::alerts::TestAlertSender>,
     /// PoW anti-spam manager (None = PoW disabled).
     pub pow: Option<Arc<PowManager>>,
     /// Shared snapshot cache (spec 11-snapshot-sync.md). Populated by the
@@ -552,6 +565,8 @@ impl AppState {
             "testnet".to_string(),                          // network_id — fine for tests
             None,                                           // governance_submit — disabled in tests
             None,                                           // anchor_wallet_address — disabled in tests
+            crate::config::AlertsConfig::default(),         // alerts_config — default in tests
+            None,                                           // alert_test_tx — disabled in tests
         )
     }
 
@@ -607,6 +622,8 @@ impl AppState {
         network_id: String,
         governance_submit: Option<crate::chain::anchoring::GovernanceSubmitSender>,
         anchor_wallet_address: Option<String>,
+        alerts_config: crate::config::AlertsConfig,
+        alert_test_tx: Option<crate::notifications::alerts::TestAlertSender>,
     ) -> Self {
         // moka LRU with size-weighted eviction. `weigher` returns the
         // byte count of each value's body (content-type string is
@@ -715,6 +732,8 @@ impl AppState {
             governance_submit,
             anchor_wallet_address,
             governance_inflight,
+            alerts_config,
+            alert_test_tx,
         }
     }
 

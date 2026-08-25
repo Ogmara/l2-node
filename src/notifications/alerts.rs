@@ -14,6 +14,33 @@ use tracing::{debug, info, warn};
 use crate::config::AlertsConfig;
 use crate::metrics::MetricsSnapshot;
 
+/// Result of a manual `POST /admin/alerts/test` dispatch — which
+/// enabled channels the test message was successfully sent to, and
+/// which failed (with a short reason). Bypasses cooldown and does not
+/// write to `history` — a test dispatch is deliberately invisible to
+/// `/admin/alerts/history` and never throttled by a prior real alert.
+#[derive(Debug, Serialize)]
+pub struct TestAlertResult {
+    pub sent_to: Vec<String>,
+    pub failed: Vec<String>,
+}
+
+/// One `POST /admin/alerts/test` request routed into the running
+/// `AlertEngine` — mirrors the `anchor_trigger`/`GovernanceSubmitRequest`
+/// "task owns state, handler asks via oneshot" idiom already used
+/// elsewhere in this codebase (`chain/anchoring.rs`).
+pub struct TestAlertRequest {
+    pub reply: tokio::sync::oneshot::Sender<TestAlertResult>,
+}
+
+pub type TestAlertSender = mpsc::Sender<TestAlertRequest>;
+
+/// Capacity of the test-alert request channel. Low-volume, operator-
+/// triggered admin action — matches `GovernanceSubmitRequest`'s
+/// capacity-4 precedent, not the much larger event-channel capacity
+/// below.
+const TEST_ALERT_CHANNEL_CAPACITY: usize = 4;
+
 /// Capacity of the cross-task event channel feeding AlertEngine.
 /// Sized to absorb a sustained burst — `AnchorDivergenceResolved`
 /// can fire once per height in a tight window if the SC resolves
@@ -193,6 +220,9 @@ pub struct AlertEngine {
     /// one-shot info events (divergence_resolved, sc_fallback_used)
     /// via the matching sender.
     events_rx: mpsc::Receiver<AlertEvent>,
+    /// Receive end of the test-alert request channel — fed by
+    /// `POST /admin/alerts/test` via the matching `TestAlertSender`.
+    test_rx: mpsc::Receiver<TestAlertRequest>,
     /// `[anchoring] interval_seconds` (audit final pre-mainnet W35) — the
     /// expected anchor cadence, multiplied by `thresholds.anchor_overdue_multiplier`
     /// to get the `AnchorOverdue` firing threshold. `AlertEngine` only holds
@@ -241,13 +271,23 @@ impl AlertEngine {
         mpsc::channel(ALERT_EVENT_CHANNEL_CAPACITY)
     }
 
+    /// Pre-allocate the test-alert request channel, same split-
+    /// construction rationale as [`event_channel`] — the sender goes
+    /// into `AppState` (only when `[alerts] enabled`), the receiver
+    /// into `AlertEngine::new` below.
+    pub fn test_alert_channel() -> (TestAlertSender, mpsc::Receiver<TestAlertRequest>) {
+        mpsc::channel(TEST_ALERT_CHANNEL_CAPACITY)
+    }
+
     /// Construct the engine. `events_rx` must come from a paired call
     /// to [`event_channel`]; the engine consumes events posted on the
-    /// matching sender.
+    /// matching sender. `test_rx` similarly pairs with
+    /// [`test_alert_channel`].
     pub fn new(
         config: AlertsConfig,
         node_id: String,
         events_rx: mpsc::Receiver<AlertEvent>,
+        test_rx: mpsc::Receiver<TestAlertRequest>,
         anchor_interval_seconds: u64,
         channel_dispatcher: Option<crate::notifications::alert_channel::AlertChannelDispatcher>,
         klever_configured: bool,
@@ -255,10 +295,22 @@ impl AlertEngine {
         Self {
             config,
             last_sent: HashMap::new(),
-            http: reqwest::Client::new(),
+            // Code Audit (Phase 8 round): an unconfigured client has no
+            // request timeout, so a hung/slow endpoint (real or test
+            // dispatch) blocks the dispatching `run()` select! arm for
+            // up to the OS-level TCP timeout — starving the OTHER arms
+            // (30s threshold tick, real events_rx fires, shutdown_rx)
+            // for the same duration. 10s matches this file's other
+            // outbound-HTTP timeout precedent (`klever_view_http` in
+            // AppState).
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
             node_id,
             history: Arc::new(RwLock::new(VecDeque::new())),
             events_rx,
+            test_rx,
             anchor_interval_seconds,
             ipfs_disconnected_since: None,
             prev_failed_sig_check: None,
@@ -302,6 +354,10 @@ impl AlertEngine {
                     // alerts so a burst of events still gets
                     // deduplicated within `cooldown.seconds`.
                     self.fire(event.alert_type, &event.details).await;
+                }
+                Some(req) = self.test_rx.recv() => {
+                    let result = self.send_test_alert().await;
+                    let _ = req.reply.send(result);
                 }
                 _ = shutdown_rx.recv() => {
                     debug!("Alert engine shutting down");
@@ -555,13 +611,13 @@ impl AlertEngine {
 
         // Dispatch to configured channels
         if self.config.telegram.enabled {
-            self.send_telegram(&message).await;
+            let _ = self.send_telegram(&message).await;
         }
         if self.config.discord.enabled {
-            self.send_discord(&message).await;
+            let _ = self.send_discord(&message).await;
         }
         if self.config.webhook.enabled {
-            self.send_webhook(&message).await;
+            let _ = self.send_webhook(&message).await;
         }
         // Audit final pre-mainnet W34.
         if let Some(dispatcher) = self.channel_dispatcher.as_ref() {
@@ -570,11 +626,60 @@ impl AlertEngine {
         }
     }
 
-    async fn send_telegram(&self, message: &str) {
+    /// Handles `POST /admin/alerts/test`. Unlike [`fire`], this
+    /// deliberately bypasses the cooldown map and does not touch
+    /// `history` — a test dispatch is a one-off operator action, not a
+    /// real alert condition, and should never suppress (or be
+    /// suppressed by) a genuine alert's cooldown window. Dispatches to
+    /// every ENABLED channel unconditionally (not gated on any
+    /// threshold) and reports exactly which succeeded/failed so the
+    /// dashboard can show real per-channel status rather than a single
+    /// pass/fail bit.
+    async fn send_test_alert(&self) -> TestAlertResult {
+        let message = format!(
+            "[Ogmara Node Alert] [TEST] Test alert dispatch\nNode: {}\nTime: {}",
+            self.node_id,
+            chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
+        );
+        let mut sent_to = Vec::new();
+        let mut failed = Vec::new();
+
+        if self.config.telegram.enabled {
+            match self.send_telegram(&message).await {
+                Ok(()) => sent_to.push("telegram".to_string()),
+                Err(e) => failed.push(format!("telegram: {e}")),
+            }
+        }
+        if self.config.discord.enabled {
+            match self.send_discord(&message).await {
+                Ok(()) => sent_to.push("discord".to_string()),
+                Err(e) => failed.push(format!("discord: {e}")),
+            }
+        }
+        if self.config.webhook.enabled {
+            match self.send_webhook(&message).await {
+                Ok(()) => sent_to.push("webhook".to_string()),
+                Err(e) => failed.push(format!("webhook: {e}")),
+            }
+        }
+        if let Some(dispatcher) = self.channel_dispatcher.as_ref() {
+            if crate::notifications::alert_channel::dispatch_ogmara_channel_alert(dispatcher, &message)
+                .await
+            {
+                sent_to.push("ogmara_channel".to_string());
+            } else {
+                failed.push("ogmara_channel: dispatch failed (see node logs)".to_string());
+            }
+        }
+
+        TestAlertResult { sent_to, failed }
+    }
+
+    async fn send_telegram(&self, message: &str) -> Result<(), String> {
         let token = resolve_env_or_value(&self.config.telegram.bot_token);
         let chat_id = &self.config.telegram.chat_id;
         if token.is_empty() || chat_id.is_empty() {
-            return;
+            return Err("not configured (missing bot_token or chat_id)".to_string());
         }
 
         let url = format!("https://api.telegram.org/bot{}/sendMessage", token);
@@ -585,30 +690,50 @@ impl AlertEngine {
         });
 
         match self.http.post(&url).json(&body).send().await {
-            Ok(resp) if resp.status().is_success() => debug!("Telegram alert sent"),
-            Ok(resp) => warn!(status = %resp.status(), "Telegram alert failed"),
-            Err(e) => warn!(error = %e, "Telegram alert error"),
+            Ok(resp) if resp.status().is_success() => {
+                debug!("Telegram alert sent");
+                Ok(())
+            }
+            Ok(resp) => {
+                let status = resp.status();
+                warn!(status = %status, "Telegram alert failed");
+                Err(format!("HTTP {status}"))
+            }
+            Err(e) => {
+                warn!(error = %e, "Telegram alert error");
+                Err(describe_reqwest_error(&e))
+            }
         }
     }
 
-    async fn send_discord(&self, message: &str) {
+    async fn send_discord(&self, message: &str) -> Result<(), String> {
         let url = resolve_env_or_value(&self.config.discord.webhook_url);
         if url.is_empty() {
-            return;
+            return Err("not configured (missing webhook_url)".to_string());
         }
 
         let body = serde_json::json!({ "content": message });
         match self.http.post(&url).json(&body).send().await {
-            Ok(resp) if resp.status().is_success() => debug!("Discord alert sent"),
-            Ok(resp) => warn!(status = %resp.status(), "Discord alert failed"),
-            Err(e) => warn!(error = %e, "Discord alert error"),
+            Ok(resp) if resp.status().is_success() => {
+                debug!("Discord alert sent");
+                Ok(())
+            }
+            Ok(resp) => {
+                let status = resp.status();
+                warn!(status = %status, "Discord alert failed");
+                Err(format!("HTTP {status}"))
+            }
+            Err(e) => {
+                warn!(error = %e, "Discord alert error");
+                Err(describe_reqwest_error(&e))
+            }
         }
     }
 
-    async fn send_webhook(&self, message: &str) {
+    async fn send_webhook(&self, message: &str) -> Result<(), String> {
         let url = resolve_env_or_value(&self.config.webhook.url);
         if url.is_empty() {
-            return;
+            return Err("not configured (missing url)".to_string());
         }
 
         let body = serde_json::json!({
@@ -619,10 +744,41 @@ impl AlertEngine {
         });
 
         match self.http.post(&url).json(&body).send().await {
-            Ok(resp) if resp.status().is_success() => debug!("Webhook alert sent"),
-            Ok(resp) => warn!(status = %resp.status(), "Webhook alert failed"),
-            Err(e) => warn!(error = %e, "Webhook alert error"),
+            Ok(resp) if resp.status().is_success() => {
+                debug!("Webhook alert sent");
+                Ok(())
+            }
+            Ok(resp) => {
+                let status = resp.status();
+                warn!(status = %status, "Webhook alert failed");
+                Err(format!("HTTP {status}"))
+            }
+            Err(e) => {
+                warn!(error = %e, "Webhook alert error");
+                Err(describe_reqwest_error(&e))
+            }
         }
+    }
+}
+
+/// Security Audit (Phase 8 round): `reqwest::Error`'s `Display`
+/// impl includes the full request URL on connection-level failures
+/// (DNS/connect/TLS) — and Telegram's `bot_token`/Discord's
+/// `webhook_url` are embedded directly IN that URL. `warn!(error = %e,
+/// ...)` above is fine (operator-only log file), but this string also
+/// flows into `TestAlertResult.failed` and back over the wire to
+/// `POST /admin/alerts/test`'s caller — a transient network blip on
+/// "Send Test Alert" would otherwise leak a live secret into the
+/// dashboard UI. Categorize instead of echoing the raw error.
+fn describe_reqwest_error(e: &reqwest::Error) -> String {
+    if e.is_timeout() {
+        "request timed out".to_string()
+    } else if e.is_connect() {
+        "connection failed".to_string()
+    } else if let Some(status) = e.status() {
+        format!("HTTP {status}")
+    } else {
+        "request failed".to_string()
     }
 }
 
@@ -651,10 +807,12 @@ mod tests {
 
     fn engine_with_klever(anchor_interval_seconds: u64, klever_configured: bool) -> AlertEngine {
         let (_tx, rx) = AlertEngine::event_channel();
+        let (_test_tx, test_rx) = AlertEngine::test_alert_channel();
         AlertEngine::new(
             AlertsConfig::default(),
             "test-node".to_string(),
             rx,
+            test_rx,
             anchor_interval_seconds,
             None,
             klever_configured,
@@ -761,5 +919,46 @@ mod tests {
         e.evaluate(&s2).await;
         let (_, last_count) = e.prev_failed_sig_check.expect("must track cumulative count");
         assert_eq!(last_count, 500, "must advance the tracked cumulative count each tick");
+    }
+
+    #[tokio::test]
+    async fn send_test_alert_with_no_channels_enabled_reports_nothing_sent_or_failed() {
+        // All of telegram/discord/webhook/channel_dispatcher default to
+        // disabled/None — send_test_alert must not report a phantom
+        // success or failure for a channel that was never attempted.
+        let e = engine(3600);
+        let result = e.send_test_alert().await;
+        assert!(result.sent_to.is_empty());
+        assert!(result.failed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn send_test_alert_reports_failure_for_an_enabled_but_unconfigured_channel() {
+        // telegram.enabled = true but bot_token/chat_id are empty — the
+        // dispatch attempt must be COUNTED (this is the whole point of a
+        // test-alert endpoint: surfacing "enabled but misconfigured" to
+        // the operator) and land in `failed`, not be silently skipped.
+        let mut e = engine(3600);
+        e.config.telegram.enabled = true;
+        let result = e.send_test_alert().await;
+        assert!(result.sent_to.is_empty());
+        assert_eq!(result.failed.len(), 1);
+        assert!(result.failed[0].starts_with("telegram:"));
+    }
+
+    #[tokio::test]
+    async fn send_test_alert_does_not_touch_cooldown_or_history() {
+        // A test dispatch must be invisible to both the real-alert
+        // cooldown map and /admin/alerts/history — it's an operator
+        // diagnostic action, not a real alert condition.
+        let mut e = engine(3600);
+        e.config.enabled = true;
+        e.send_test_alert().await;
+        assert!(
+            e.last_sent.is_empty(),
+            "send_test_alert must never populate the cooldown map"
+        );
+        let history_len = e.history.read().map(|h| h.len()).unwrap_or(usize::MAX);
+        assert_eq!(history_len, 0, "send_test_alert must never write to history");
     }
 }

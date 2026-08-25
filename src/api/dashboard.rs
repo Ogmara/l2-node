@@ -364,6 +364,78 @@ pub async fn alerts_history(
     Json(serde_json::json!({ "alerts": alerts }))
 }
 
+/// GET /admin/alerts/config — current `[alerts]` configuration
+/// (governance-dashboard-plan.md Phase 8).
+///
+/// Serializes `AlertsConfig` directly rather than hand-building a
+/// JSON object field-by-field: every secret field on the underlying
+/// config structs (`telegram.bot_token`, `discord.webhook_url`,
+/// `ogmara_channel.signing_key_path`) already carries
+/// `#[serde(skip_serializing)]`, so this is compiler-enforced-safe —
+/// a hand-rolled reshape would risk silently including a secret if a
+/// future field is added without the attribute, or silently DROPPING
+/// a legitimately-public field the dashboard needs. `webhook.url` and
+/// `ogmara_channel.{wallet_address,channel_id}` are intentionally NOT
+/// redacted (established policy elsewhere in this codebase — see
+/// `config.rs`'s `WebhookAlertConfig` doc), so they appear as-is.
+pub async fn alerts_config(Extension(state): Extension<Arc<AppState>>) -> impl IntoResponse {
+    Json(state.alerts_config.clone())
+}
+
+/// POST /admin/alerts/test — dispatch a one-off test alert to every
+/// ENABLED channel (governance-dashboard-plan.md Phase 8). Routes
+/// into the running `AlertEngine` via the same
+/// channel+oneshot-reply+shared-timeout-budget idiom as
+/// `admin::submit_governance_call` — see that function's doc comment
+/// for why the deadline must cover both the channel send AND the
+/// reply wait, not just the latter.
+pub async fn alerts_test(Extension(state): Extension<Arc<AppState>>) -> impl IntoResponse {
+    let Some(tx) = &state.alert_test_tx else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "alerts are not enabled on this node" })),
+        )
+            .into_response();
+    };
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    match tokio::time::timeout_at(
+        deadline,
+        tx.send(crate::notifications::alerts::TestAlertRequest { reply: reply_tx }),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "alert engine not running" })),
+            )
+                .into_response();
+        }
+        Err(_) => {
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(serde_json::json!({ "error": "timed out waiting to queue test-alert request (alert engine busy)" })),
+            )
+                .into_response();
+        }
+    }
+    match tokio::time::timeout_at(deadline, reply_rx).await {
+        Ok(Ok(result)) => Json(serde_json::json!({ "sent_to": result.sent_to, "failed": result.failed })).into_response(),
+        Ok(Err(_)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "alert engine dropped reply" })),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            Json(serde_json::json!({ "error": "timed out waiting for alert engine to dispatch test alert" })),
+        )
+            .into_response(),
+    }
+}
+
 /// GET /admin/snapshot/status — current snapshot cache state.
 ///
 /// Returns the most recent successfully built snapshot's metadata so

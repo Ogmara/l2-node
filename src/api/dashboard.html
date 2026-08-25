@@ -231,6 +231,17 @@ td { padding: 8px; border-bottom: 1px solid var(--border); }
 
   <!-- ALERTS TAB -->
   <div class="tab" id="tab-alerts">
+    <!-- Alert Configuration (Phase 8, governance-dashboard-plan.md) -->
+    <div class="card" style="margin-bottom:16px">
+      <h3>Alert Configuration <span id="alerts-enabled-badge" class="badge" style="margin-left:10px;vertical-align:middle">--</span></h3>
+      <div id="alerts-config-body" style="margin-top:8px;color:var(--fg2)">Loading…</div>
+      <div style="margin-top:12px">
+        <button id="alerts-test-btn" onclick="submitTestAlert()" style="background:var(--accent);color:#fff;border:none;padding:6px 16px;border-radius:4px;font-size:0.85em;cursor:pointer;font-weight:600">Send Test Alert</button>
+        <span id="alerts-test-status" style="margin-left:12px;color:var(--fg2)"></span>
+      </div>
+      <div id="alerts-test-result" style="margin-top:8px;font-size:0.9em"></div>
+    </div>
+
     <div class="card" style="margin-bottom:16px">
       <h3>Alert History</h3>
       <table><thead><tr><th>Time</th><th>Severity</th><th>Condition</th><th>Message</th></tr></thead><tbody id="alerts-body"><tr><td colspan="4" style="color:var(--fg2)">Loading...</td></tr></tbody></table>
@@ -626,7 +637,7 @@ document.getElementById('nav').addEventListener('click', (e) => {
     loadHistoryChart('chart-msgs', 'messages_per_minute', 'Msgs/min', 'var(--accent2)');
     loadRejections();
   }
-  if (e.target.dataset.tab === 'alerts') loadAlerts();
+  if (e.target.dataset.tab === 'alerts') { loadAlerts(); loadAlertsConfig(); }
   if (e.target.dataset.tab === 'anchoring') loadAnchoring();
   if (e.target.dataset.tab === 'governance') loadGovernance();
 });
@@ -946,6 +957,88 @@ async function loadAlerts() {
       banner.classList.remove('show');
     }
   } catch(_) {}
+}
+
+// ─── Alert Configuration (Phase 8, governance-dashboard-plan.md) ────
+async function loadAlertsConfig() {
+  const badge = document.getElementById('alerts-enabled-badge');
+  const body = document.getElementById('alerts-config-body');
+  try {
+    const resp = await fetch('/admin/alerts/config');
+    if (!resp.ok) {
+      body.innerHTML = `<span style="color:var(--red)">Failed to load (HTTP ${resp.status}).</span>`;
+      return;
+    }
+    const cfg = await resp.json();
+    badge.textContent = cfg.enabled ? 'enabled' : 'disabled';
+    badge.style.background = cfg.enabled ? 'var(--green)' : 'var(--border)';
+    badge.style.color = cfg.enabled ? '#000' : 'var(--fg2)';
+
+    const row = (name, enabled, extra) => `<tr><td style="color:var(--fg2);width:160px">${esc(name)}</td><td>${enabled ? '<span style="color:var(--green)">enabled</span>' : '<span style="color:var(--fg2)">disabled</span>'}${extra ? ' — ' + extra : ''}</td></tr>`;
+
+    let html = '<table style="width:100%;margin-top:4px">';
+    html += row('Telegram', !!(cfg.telegram && cfg.telegram.enabled));
+    html += row('Discord', !!(cfg.discord && cfg.discord.enabled));
+    html += row('Webhook', !!(cfg.webhook && cfg.webhook.enabled), cfg.webhook && cfg.webhook.url ? esc(cfg.webhook.url) : '');
+    html += row('Ogmara channel', !!(cfg.ogmara_channel && cfg.ogmara_channel.enabled), cfg.ogmara_channel && cfg.ogmara_channel.channel_id ? `channel #${cfg.ogmara_channel.channel_id}` : '');
+    html += `<tr><td style="color:var(--fg2)">Cooldown</td><td>${cfg.cooldown ? fmtTime(cfg.cooldown.seconds) : '--'} between repeated fires of the same condition</td></tr>`;
+    html += '</table>';
+
+    if (cfg.thresholds) {
+      const t = cfg.thresholds;
+      html += '<div class="label" style="margin-top:12px">Thresholds</div>';
+      html += '<table style="width:100%;margin-top:4px;font-size:0.9em">';
+      html += `<tr><td style="color:var(--fg2);width:200px">Min peers</td><td>${t.min_peers}</td></tr>`;
+      html += `<tr><td style="color:var(--fg2)">Klever disconnect</td><td>${fmtTime(t.klever_disconnect_seconds)}</td></tr>`;
+      html += `<tr><td style="color:var(--fg2)">IPFS disconnect</td><td>${fmtTime(t.ipfs_disconnect_seconds)}</td></tr>`;
+      html += `<tr><td style="color:var(--fg2)">Max disk usage</td><td>${t.max_disk_usage_percent}%</td></tr>`;
+      html += `<tr><td style="color:var(--fg2)">Max memory usage</td><td>${t.max_memory_usage_percent}%</td></tr>`;
+      html += `<tr><td style="color:var(--fg2)">Anchor overdue multiplier</td><td>${t.anchor_overdue_multiplier}×</td></tr>`;
+      html += `<tr><td style="color:var(--fg2)">SC sync max lag</td><td>${t.sc_sync_max_lag_blocks} blocks</td></tr>`;
+      html += `<tr><td style="color:var(--fg2)">Rate-limit alert threshold</td><td>${t.rate_limit_alert_per_min}/min</td></tr>`;
+      html += `<tr><td style="color:var(--fg2)">Failed-sig alert threshold</td><td>${t.failed_sig_alert_per_min}/min</td></tr>`;
+      html += `<tr><td style="color:var(--fg2)">Anchor divergence threshold</td><td>${t.anchor_divergence_consecutive} consecutive</td></tr>`;
+      html += '</table>';
+    }
+    html += '<p style="color:var(--fg2);font-size:0.82em;margin-top:10px;line-height:1.4">Credentials (bot tokens, webhook URLs, signing keys) are never exposed here — an "enabled" dispatcher may still be missing a credential. Use <strong>Send Test Alert</strong> below to verify a channel is actually configured correctly, not just enabled.</p>';
+    body.innerHTML = html;
+  } catch (e) {
+    body.innerHTML = `<span style="color:var(--red)">Failed to load: ${esc(e.message || e)}</span>`;
+  }
+}
+
+let alertsTestInFlight = false;
+async function submitTestAlert() {
+  if (alertsTestInFlight) return;
+  alertsTestInFlight = true;
+  const btn = document.getElementById('alerts-test-btn');
+  const statusEl = document.getElementById('alerts-test-status');
+  const resultEl = document.getElementById('alerts-test-result');
+  btn.disabled = true;
+  statusEl.textContent = 'Sending…';
+  resultEl.innerHTML = '';
+  try {
+    const resp = await fetch('/admin/alerts/test', { method: 'POST' });
+    const data = await resp.json();
+    statusEl.textContent = '';
+    if (!resp.ok) {
+      resultEl.innerHTML = `<span style="color:var(--red)">${esc(data.error || ('HTTP ' + resp.status))}</span>`;
+      return;
+    }
+    const sent = data.sent_to || [];
+    const failed = data.failed || [];
+    let html = '';
+    if (sent.length) html += `<div style="color:var(--green)">Sent: ${sent.map(esc).join(', ')}</div>`;
+    if (failed.length) html += `<div style="color:var(--red)">Failed: ${failed.map(esc).join('; ')}</div>`;
+    if (!sent.length && !failed.length) html = '<span style="color:var(--fg2)">No channels are enabled — nothing to test.</span>';
+    resultEl.innerHTML = html;
+  } catch (e) {
+    statusEl.textContent = '';
+    resultEl.innerHTML = `<span style="color:var(--red)">Failed: ${esc(e.message || e)}</span>`;
+  } finally {
+    btn.disabled = false;
+    alertsTestInFlight = false;
+  }
 }
 
 function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }

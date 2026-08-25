@@ -875,6 +875,14 @@ impl Node {
         let (alert_event_tx, alert_event_rx) =
             crate::notifications::alerts::AlertEngine::event_channel();
 
+        // Phase 8 (governance-dashboard-plan.md) — pre-allocate the
+        // test-alert request channel the same way. The sender half
+        // (`Option`-wrapped below, `None` when alerts are disabled)
+        // goes into `AppState` for `POST /admin/alerts/test`; the
+        // receiver is consumed by `AlertEngine::new` further down.
+        let (alert_test_tx, alert_test_rx) =
+            crate::notifications::alerts::AlertEngine::test_alert_channel();
+
         // Start the network service
         let keypair = self.libp2p_keypair()?;
         let mut network = crate::network::NetworkService::new(
@@ -1444,7 +1452,14 @@ impl Node {
         // are disabled we drop `alert_event_rx` here; the matching
         // `anchor_alert_tx`/`sc_alert_tx` handles passed to background
         // tasks were already gated to `None`, so they no-op cleanly.
-        if self.config.alerts.enabled {
+        // Phase 8 — the engine-construction block's value becomes the
+        // `Option<TestAlertSender>` threaded into `AppState`: `Some`
+        // (holding the sender allocated above) when the engine actually
+        // spawns, `None` (with the receiver explicitly dropped) when
+        // alerts are disabled — mirrors the `anchor_trigger_tx`/
+        // `governance_submit_tx` tuple-from-if/else pattern used for
+        // the anchoring task above.
+        let alert_test_tx: Option<crate::notifications::alerts::TestAlertSender> = if self.config.alerts.enabled {
             // Audit final pre-mainnet W34: build the Ogmara-channel alert
             // dispatcher when configured. Every failure mode here degrades
             // gracefully to `None` (alert dispatch just skips this one
@@ -1516,6 +1531,7 @@ impl Node {
                     self.config.alerts.clone(),
                     self.node_id.clone(),
                     alert_event_rx,
+                    alert_test_rx,
                     self.config.anchoring.interval_seconds,
                     channel_dispatcher,
                     klever_configured,
@@ -1527,12 +1543,15 @@ impl Node {
                 alert_engine.run(alert_metrics, alert_shutdown_rx).await;
             });
             info!("Alert engine started");
+            Some(alert_test_tx)
         } else {
-            // Explicit drop of the unused receiver so reviewers don't
-            // wonder why it's unused. Channel sender clones already
+            // Explicit drop of the unused receivers so reviewers don't
+            // wonder why they're unused. Channel sender clones already
             // gated on alerts.enabled => None upstream.
             drop(alert_event_rx);
-        }
+            drop(alert_test_rx);
+            None
+        };
         // Suppress unused-warning on the always-allocated sender until
         // sc_discovery wiring lands later in this method.
         // SC peer-discovery background task (spec 13 §4.3 tier 3,
@@ -1828,6 +1847,12 @@ impl Node {
             // `[anchoring] wallet_key` is configured. `None` when
             // anchoring is disabled.
             anchor_wallet_address,
+            // governance-dashboard-plan.md Phase 8 — snapshot of
+            // `[alerts]` config (drives `GET /admin/alerts/config`) and
+            // the test-alert request sender (`None` when alerts are
+            // disabled).
+            self.config.alerts.clone(),
+            alert_test_tx,
         ));
         // Background sweep: drop zero-counter entries from the per-IP
         // media limiter (v0.41). Without this, the DashMap accumulates

@@ -358,6 +358,8 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
                 .route("/admin/metrics/storage", get(dashboard::metrics_storage))
                 .route("/admin/metrics/rejections", get(dashboard::metrics_rejections))
                 .route("/admin/alerts/history", get(dashboard::alerts_history))
+                .route("/admin/alerts/config", get(dashboard::alerts_config))
+                .merge(alerts_test_routes(&app_state))
                 .route("/admin/snapshot/status", get(dashboard::snapshot_status));
         }
 
@@ -456,6 +458,32 @@ fn governance_write_routes(app_state: &Arc<AppState>) -> Router {
             "/admin/governance/node/execute-proposal",
             post(admin::governance_node_execute_proposal),
         )
+        .layer(GovernorLayer::new(governor_conf).error_handler(|err| err.into()))
+}
+
+/// `POST /admin/alerts/test` fans out to up to 4 real outbound requests
+/// against operator-configured third-party targets (Telegram/Discord/
+/// webhook/Ogmara-channel) per call — the same "real-world cost beyond
+/// generic API load" profile that earned the governance write routes
+/// their own tighter limiter above (Security Audit, Phase 8 round: this
+/// endpoint was initially shipped WITHOUT one, relying only on the
+/// API-wide governor, which would let an admin session generate ~400
+/// req/min against an operator's third-party targets). 6/min with a
+/// burst of 3 comfortably covers "click, notice a config typo, fix,
+/// click again to confirm" without opening up sustained hammering.
+fn alerts_test_routes(app_state: &Arc<AppState>) -> Router {
+    let governor_conf = Arc::new(
+        GovernorConfigBuilder::default()
+            .per_second(10)
+            .burst_size(3)
+            .key_extractor(rate_limit_key::TrustedProxyIpKeyExtractor::new(
+                app_state.trusted_proxies.clone(),
+            ))
+            .finish()
+            .expect("valid governor config"),
+    );
+    Router::new()
+        .route("/admin/alerts/test", post(dashboard::alerts_test))
         .layer(GovernorLayer::new(governor_conf).error_handler(|err| err.into()))
 }
 
