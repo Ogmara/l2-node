@@ -154,6 +154,31 @@ td { padding: 8px; border-bottom: 1px solid var(--border); }
       <h3>Connected Peers <span id="peers-source-summary" style="margin-left:12px;font-size:0.78em;color:var(--fg2);font-weight:normal"></span></h3>
       <table id="peers-table"><thead><tr><th>Node ID</th><th>Agent Version</th><th>Source</th></tr></thead><tbody id="peers-body"></tbody></table>
     </div>
+
+    <!-- v0.112.0 — GossipSub mesh + peer-telemetry wiring (Phase 0 of
+         governance-dashboard-plan.md). Backend endpoints already
+         existed (0.46.6 / 0.48.4); this closes the "no UI" gap. -->
+    <div class="card" style="margin-bottom:16px">
+      <h3>GossipSub Mesh</h3>
+      <div id="mesh-note" style="display:none;margin-bottom:8px;padding:6px 10px;background:var(--bg2);border-left:3px solid var(--yellow);color:var(--fg2);font-size:0.85em"></div>
+      <div class="grid" style="margin-top:4px">
+        <div><div class="label">Total mesh slots</div><div class="metric" id="mesh-total-slots">--</div></div>
+        <div><div class="label">Publish failures</div><div class="metric" id="mesh-pubfail-total">--</div></div>
+      </div>
+      <table><thead><tr><th>Topic</th><th>Mesh Size</th><th>Subscribers</th></tr></thead><tbody id="mesh-topics-body"></tbody></table>
+      <div class="label" id="mesh-pubfail-breakdown" style="margin-top:8px">--</div>
+    </div>
+
+    <div class="card" style="margin-bottom:16px">
+      <h3>Peer Telemetry <span style="margin-left:12px;font-size:0.78em;color:var(--fg2);font-weight:normal">GossipSub scoring: disabled</span></h3>
+      <div id="telemetry-note" style="display:none;margin-bottom:8px;padding:6px 10px;background:var(--bg2);border-left:3px solid var(--yellow);color:var(--fg2);font-size:0.85em"></div>
+      <div class="grid" style="margin-top:4px">
+        <div><div class="label">Total peers</div><div class="metric" id="tel-total-peers">--</div></div>
+        <div><div class="label">Outbound</div><div class="metric" id="tel-outbound-peers">--</div></div>
+        <div><div class="label">Inbound-only</div><div class="metric" id="tel-inbound-only-peers">--</div></div>
+      </div>
+      <table><thead><tr><th>Peer ID</th><th>Outbound Conns</th><th>Inbound Conns</th><th>Mesh Topics</th></tr></thead><tbody id="tel-peers-body"></tbody></table>
+    </div>
   </div>
 
   <!-- STORAGE TAB -->
@@ -487,6 +512,8 @@ document.getElementById('nav').addEventListener('click', (e) => {
     loadPeers();
     loadHistoryChart('chart-peers', 'peers_connected', 'Peers', 'var(--accent2)');
     loadHistoryChart('chart-bw', 'bandwidth_in', 'In', 'var(--green)', fmtRate);
+    loadMeshStats();
+    loadPeerTelemetry();
   }
   if (e.target.dataset.tab === 'storage') {
     loadStorage();
@@ -695,6 +722,59 @@ function renderPeerSource(s) {
   const label = (typeof s === 'string') ? s : 'unknown';
   const c = colors[label] || 'var(--fg2)';
   return `<span style="display:inline-block;padding:1px 8px;border-radius:8px;font-size:0.75em;background:${c};color:#000">${esc(label)}</span>`;
+}
+
+// v0.112.0 — Phase 0 of governance-dashboard-plan.md. Backend endpoints
+// (/admin/network/mesh-stats, /admin/network/peer-telemetry) already
+// existed unused by any UI; this wires them into the Network tab.
+async function loadMeshStats() {
+  try {
+    const resp = await fetch('/admin/network/mesh-stats');
+    const data = await resp.json();
+    setText('mesh-total-slots', fmt(data.total_mesh_slots||0));
+    const pf = data.publish_failures || {};
+    setText('mesh-pubfail-total', fmt(pf.total||0));
+    setText('mesh-pubfail-breakdown',
+      `no peers subscribed: ${fmt(pf.no_peers_subscribed||0)} · all queues full: ${fmt(pf.all_queues_full||0)} · other: ${fmt(pf.other||0)}`);
+    const body = document.getElementById('mesh-topics-body');
+    body.innerHTML = '';
+    const topics = data.topics || [];
+    if (topics.length === 0) {
+      body.innerHTML = '<tr><td colspan="3" style="color:var(--fg2)">No topics subscribed</td></tr>';
+    }
+    for (const t of topics) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td style="font-family:var(--mono);font-size:0.85em">${esc(t.topic||'--')}</td><td>${fmt(t.mesh_size||0)}</td><td>${fmt(t.subscribers||0)}</td>`;
+      body.appendChild(tr);
+    }
+    const noteEl = document.getElementById('mesh-note');
+    if (data.note) { noteEl.textContent = data.note; noteEl.style.display = 'block'; }
+    else { noteEl.style.display = 'none'; }
+  } catch(_) {}
+}
+
+async function loadPeerTelemetry() {
+  try {
+    const resp = await fetch('/admin/network/peer-telemetry');
+    const data = await resp.json();
+    setText('tel-total-peers', fmt(data.total_peers||0));
+    setText('tel-outbound-peers', fmt(data.outbound_peers||0));
+    setText('tel-inbound-only-peers', fmt(data.inbound_only_peers||0));
+    const body = document.getElementById('tel-peers-body');
+    body.innerHTML = '';
+    const peers = data.peers || [];
+    if (peers.length === 0) {
+      body.innerHTML = '<tr><td colspan="4" style="color:var(--fg2)">No peers connected</td></tr>';
+    }
+    for (const p of peers) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td style="font-family:var(--mono);font-size:0.85em">${esc(p.peer_id||'--')}</td><td>${fmt(p.outbound_conns||0)}</td><td>${fmt(p.inbound_conns||0)}</td><td>${fmt(p.mesh_topics||0)}</td>`;
+      body.appendChild(tr);
+    }
+    const noteEl = document.getElementById('telemetry-note');
+    if (data.note) { noteEl.textContent = data.note; noteEl.style.display = 'block'; }
+    else { noteEl.style.display = 'none'; }
+  } catch(_) {}
 }
 
 async function loadStorage() {

@@ -678,6 +678,407 @@ pub async fn get_active_nodes(
     Ok(out)
 }
 
+// ── Governance views (governance-dashboard-plan.md Phase 5) ─────────
+//
+// Two independent tracks on the SC (user-gated `listProposals`/
+// `getProposalTally`/`getUserVote`/`getProposalCount`, and the additive
+// node-gated `listNodeProposals`/`getNodeProposalTally`/`getNodeVote`/
+// `getNodeProposalCount`) share byte-identical wire shapes — same
+// 13-field list-item layout, same 5-field tally, same single-`u8` vote
+// status. DRY design: one private generic decode+fetch helper per
+// shape, `func_name` is the only thing that differs between the two
+// tracks' thin public wrappers below. This halves the decode-logic
+// surface area that could drift or have an undetected bug in one track
+// but not the other. `get_node_count`/`get_active_node_count` (above)
+// are the node-track quorum denominator and need no new code here.
+
+/// One row from `listProposals`/`listNodeProposals` — the flattened
+/// 13-field `MultiValue13` tuple the SC's `query.rs` emits for both
+/// tracks (id, proposer, description, param_key, param_value,
+/// created_at, expires_at, executed, vote_count, oppose_count, quorum,
+/// quorum_met, supermajority_met).
+#[derive(Debug, Clone)]
+pub struct ProposalSummary {
+    pub id: u64,
+    /// bech32 klv1... address, decoded via the same raw-bytes →
+    /// `VerifyingKey` → `pubkey_to_address` path `get_active_nodes` uses.
+    pub proposer: String,
+    /// Attacker-influenced: any registered user/node can set this
+    /// (up to 512 bytes, SC-enforced) via `createProposal`/
+    /// `createNodeProposal`. Not sanitized at this layer by design —
+    /// escape/sanitize at the render layer (dashboard, Phase 7), not here.
+    pub description: String,
+    /// Attacker-influenced — see `description`. Not sanitized here.
+    pub param_key: String,
+    /// Decimal string — the on-chain value is a `BigUint` which may
+    /// exceed u64/u128, so this is never parsed into a fixed-width
+    /// integer here. Phase 6's calldata builder will need the reverse
+    /// (decimal string → bytes) conversion; share `bytes_be_to_decimal_string`
+    /// with it rather than writing a second, untested one.
+    pub param_value: String,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub executed: bool,
+    pub vote_count: u64,
+    pub oppose_count: u64,
+    pub quorum: u64,
+    pub quorum_met: bool,
+    pub supermajority_met: bool,
+}
+
+/// The `MultiValue5<u64, u64, u64, bool, bool>` tally shape shared by
+/// `getProposalTally`/`getNodeProposalTally` — also exactly the trailing
+/// 5 fields of [`ProposalSummary`].
+#[derive(Debug, Clone)]
+pub struct ProposalTally {
+    pub vote_count: u64,
+    pub oppose_count: u64,
+    pub quorum: u64,
+    pub quorum_met: bool,
+    pub supermajority_met: bool,
+}
+
+/// Flattened return-item count per proposal row — the 13-field tuple
+/// both tracks' `listX` views share.
+const PROPOSAL_SUMMARY_ITEM_COUNT: usize = 13;
+
+/// Consumer-side cap on `listProposals`/`listNodeProposals` returned
+/// items — defense in depth against a future SC change or a
+/// hostile/compromised RPC endpoint returning an oversized payload,
+/// same rationale as `get_node_metadata`'s `MAX_RETURNED_ENTRIES`
+/// above. The SC enforces `limit <= LIST_PROPOSALS_MAX_LIMIT` (20)
+/// server-side (`smart-contract/src/governance.rs`); this allows 2x
+/// headroom (40 rows) and rejects larger as a protocol error, BEFORE
+/// building any `ProposalSummary` — `vm_query_multi` itself has no
+/// size bound, so without this check a malicious `klever_node_url`
+/// could force unbounded base64-decode + allocation here.
+const MAX_RETURNED_PROPOSAL_ROWS: usize = 40;
+
+/// klever-sc bool wire encoding on a `/vm/query` multi-value item: empty
+/// = false, non-empty (first byte nonzero) = true. This is the
+/// multi-value counterpart to the `/vm/hex` scalar-bool convention
+/// `is_node_registered`/`is_node_paused` already rely on (`"01"` = true,
+/// empty = false).
+fn decode_bool_bytes(bytes: &[u8]) -> bool {
+    !bytes.is_empty() && bytes[0] != 0
+}
+
+/// 32 raw bytes → bech32 klv1... address. Same two calls
+/// `get_active_nodes` already makes inline (kept as a named helper here
+/// since a governance list response decodes a proposer address in
+/// EVERY row of a page, not just once per call).
+fn decode_address_bytes(func_name: &str, bytes: &[u8]) -> Result<String> {
+    if bytes.len() != 32 {
+        anyhow::bail!(
+            "{} address has wrong length: got {}, expected 32",
+            func_name,
+            bytes.len()
+        );
+    }
+    let mut key = [0u8; 32];
+    key.copy_from_slice(bytes);
+    let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&key)
+        .with_context(|| format!("decoding {} Ed25519 pubkey from raw bytes", func_name))?;
+    crate::crypto::pubkey_to_address(&verifying_key)
+        .with_context(|| format!("encoding {} address as bech32", func_name))
+}
+
+/// Decode one flattened proposal-summary chunk (exactly
+/// [`PROPOSAL_SUMMARY_ITEM_COUNT`] items) into a [`ProposalSummary`].
+/// `func_name` is only used to make error messages point at the right
+/// caller — the decode logic itself is track-agnostic.
+fn decode_proposal_summary(func_name: &str, items: &[Vec<u8>]) -> Result<ProposalSummary> {
+    if items.len() != PROPOSAL_SUMMARY_ITEM_COUNT {
+        anyhow::bail!(
+            "{} returned unexpected item count in one row: {} (expected {})",
+            func_name,
+            items.len(),
+            PROPOSAL_SUMMARY_ITEM_COUNT
+        );
+    }
+    Ok(ProposalSummary {
+        id: decode_u64_be_bytes(&items[0]),
+        proposer: decode_address_bytes(func_name, &items[1])?,
+        description: String::from_utf8(items[2].clone())
+            .with_context(|| format!("{} description is not valid UTF-8", func_name))?,
+        param_key: String::from_utf8(items[3].clone())
+            .with_context(|| format!("{} param_key is not valid UTF-8", func_name))?,
+        param_value: bytes_be_to_decimal_string(&items[4]),
+        created_at: decode_u64_be_bytes(&items[5]),
+        expires_at: decode_u64_be_bytes(&items[6]),
+        executed: decode_bool_bytes(&items[7]),
+        vote_count: decode_u64_be_bytes(&items[8]),
+        oppose_count: decode_u64_be_bytes(&items[9]),
+        quorum: decode_u64_be_bytes(&items[10]),
+        quorum_met: decode_bool_bytes(&items[11]),
+        supermajority_met: decode_bool_bytes(&items[12]),
+    })
+}
+
+/// Decode a 5-item `MultiValue5<u64, u64, u64, bool, bool>` tally.
+fn decode_proposal_tally(func_name: &str, items: &[Vec<u8>]) -> Result<ProposalTally> {
+    if items.len() != 5 {
+        anyhow::bail!(
+            "{} returned unexpected item count: {} (expected 5)",
+            func_name,
+            items.len()
+        );
+    }
+    Ok(ProposalTally {
+        vote_count: decode_u64_be_bytes(&items[0]),
+        oppose_count: decode_u64_be_bytes(&items[1]),
+        quorum: decode_u64_be_bytes(&items[2]),
+        quorum_met: decode_bool_bytes(&items[3]),
+        supermajority_met: decode_bool_bytes(&items[4]),
+    })
+}
+
+/// Shared paginated-list fetch+decode. `func_name` is the only thing
+/// that differs between `listProposals` (user track) and
+/// `listNodeProposals` (node track).
+async fn list_proposals_generic(
+    http: &reqwest::Client,
+    klever_node_url: &str,
+    contract_address: &str,
+    func_name: &str,
+    offset: u32,
+    limit: u32,
+) -> Result<Vec<ProposalSummary>> {
+    let resp = vm_query_multi(
+        http,
+        klever_node_url,
+        contract_address,
+        func_name,
+        &[
+            encode_u64_minimal_hex(offset as u64),
+            encode_u64_minimal_hex(limit as u64),
+        ],
+    )
+    .await?;
+    if resp.is_require_failure() {
+        return Ok(Vec::new());
+    }
+    if resp.items.len() > MAX_RETURNED_PROPOSAL_ROWS * PROPOSAL_SUMMARY_ITEM_COUNT {
+        anyhow::bail!(
+            "{} returned too many items: {} > {} rows worth ({})",
+            func_name,
+            resp.items.len(),
+            MAX_RETURNED_PROPOSAL_ROWS,
+            MAX_RETURNED_PROPOSAL_ROWS * PROPOSAL_SUMMARY_ITEM_COUNT
+        );
+    }
+    if resp.items.len() % PROPOSAL_SUMMARY_ITEM_COUNT != 0 {
+        anyhow::bail!(
+            "{} returned a length not a multiple of {}: {} items",
+            func_name,
+            PROPOSAL_SUMMARY_ITEM_COUNT,
+            resp.items.len()
+        );
+    }
+    resp.items
+        .chunks_exact(PROPOSAL_SUMMARY_ITEM_COUNT)
+        .map(|chunk| decode_proposal_summary(func_name, chunk))
+        .collect()
+}
+
+/// Shared proposal-count fetch+decode (plain scalar u64 via `/vm/hex`,
+/// same pattern as `get_node_count`).
+async fn get_proposal_count_generic(
+    http: &reqwest::Client,
+    klever_node_url: &str,
+    contract_address: &str,
+    func_name: &str,
+) -> Result<u64> {
+    let resp = vm_hex_call(http, klever_node_url, contract_address, func_name, &[]).await?;
+    if resp.is_require_failure() {
+        return Ok(0);
+    }
+    Ok(decode_u64_be(&resp.data))
+}
+
+/// Shared tally fetch+decode. `Ok(None)` for a nonexistent proposal ID
+/// (the SC's `require!(!proposal(id).is_empty(), "Proposal not
+/// found")`) — a benign, expected case, not a transport error.
+async fn get_proposal_tally_generic(
+    http: &reqwest::Client,
+    klever_node_url: &str,
+    contract_address: &str,
+    func_name: &str,
+    proposal_id: u64,
+) -> Result<Option<ProposalTally>> {
+    let resp = vm_query_multi(
+        http,
+        klever_node_url,
+        contract_address,
+        func_name,
+        &[encode_u64_minimal_hex(proposal_id)],
+    )
+    .await?;
+    if resp.is_require_failure() {
+        return Ok(None);
+    }
+    Ok(Some(decode_proposal_tally(func_name, &resp.items)?))
+}
+
+/// Shared vote-status fetch+decode: 0 = has not voted, 1 = support, 2 =
+/// oppose — mirrors the SC's `VOTE_SUPPORT`/`VOTE_OPPOSE` u8 markers
+/// (`governance.rs`), reused as-is by the node track.
+async fn get_vote_status_generic(
+    http: &reqwest::Client,
+    klever_node_url: &str,
+    contract_address: &str,
+    func_name: &str,
+    proposal_id: u64,
+    voter_klv_address: &str,
+) -> Result<u8> {
+    let address_hex = encode_address_hex(voter_klv_address)
+        .with_context(|| format!("invalid klv address: {}", voter_klv_address))?;
+    let resp = vm_hex_call(
+        http,
+        klever_node_url,
+        contract_address,
+        func_name,
+        &[encode_u64_minimal_hex(proposal_id), address_hex],
+    )
+    .await?;
+    if resp.is_require_failure() || resp.data.is_empty() {
+        return Ok(0);
+    }
+    let bytes = hex::decode(&resp.data)
+        .with_context(|| format!("decoding {} u8 return as hex", func_name))?;
+    Ok(bytes.first().copied().unwrap_or(0))
+}
+
+// --- User-track wrappers ---
+
+pub async fn get_proposal_count(
+    http: &reqwest::Client,
+    klever_node_url: &str,
+    contract_address: &str,
+) -> Result<u64> {
+    get_proposal_count_generic(http, klever_node_url, contract_address, "getProposalCount").await
+}
+
+pub async fn list_proposals(
+    http: &reqwest::Client,
+    klever_node_url: &str,
+    contract_address: &str,
+    offset: u32,
+    limit: u32,
+) -> Result<Vec<ProposalSummary>> {
+    list_proposals_generic(
+        http,
+        klever_node_url,
+        contract_address,
+        "listProposals",
+        offset,
+        limit,
+    )
+    .await
+}
+
+pub async fn get_proposal_tally(
+    http: &reqwest::Client,
+    klever_node_url: &str,
+    contract_address: &str,
+    proposal_id: u64,
+) -> Result<Option<ProposalTally>> {
+    get_proposal_tally_generic(
+        http,
+        klever_node_url,
+        contract_address,
+        "getProposalTally",
+        proposal_id,
+    )
+    .await
+}
+
+pub async fn get_user_vote(
+    http: &reqwest::Client,
+    klever_node_url: &str,
+    contract_address: &str,
+    proposal_id: u64,
+    voter_klv_address: &str,
+) -> Result<u8> {
+    get_vote_status_generic(
+        http,
+        klever_node_url,
+        contract_address,
+        "getUserVote",
+        proposal_id,
+        voter_klv_address,
+    )
+    .await
+}
+
+// --- Node-track wrappers (additive) ---
+
+pub async fn get_node_proposal_count(
+    http: &reqwest::Client,
+    klever_node_url: &str,
+    contract_address: &str,
+) -> Result<u64> {
+    get_proposal_count_generic(
+        http,
+        klever_node_url,
+        contract_address,
+        "getNodeProposalCount",
+    )
+    .await
+}
+
+pub async fn list_node_proposals(
+    http: &reqwest::Client,
+    klever_node_url: &str,
+    contract_address: &str,
+    offset: u32,
+    limit: u32,
+) -> Result<Vec<ProposalSummary>> {
+    list_proposals_generic(
+        http,
+        klever_node_url,
+        contract_address,
+        "listNodeProposals",
+        offset,
+        limit,
+    )
+    .await
+}
+
+pub async fn get_node_proposal_tally(
+    http: &reqwest::Client,
+    klever_node_url: &str,
+    contract_address: &str,
+    proposal_id: u64,
+) -> Result<Option<ProposalTally>> {
+    get_proposal_tally_generic(
+        http,
+        klever_node_url,
+        contract_address,
+        "getNodeProposalTally",
+        proposal_id,
+    )
+    .await
+}
+
+pub async fn get_node_vote(
+    http: &reqwest::Client,
+    klever_node_url: &str,
+    contract_address: &str,
+    proposal_id: u64,
+    voter_klv_address: &str,
+) -> Result<u8> {
+    get_vote_status_generic(
+        http,
+        klever_node_url,
+        contract_address,
+        "getNodeVote",
+        proposal_id,
+        voter_klv_address,
+    )
+    .await
+}
+
 // ── Transport classifier (spec 13 §4.5, l2-node 0.46.5+) ────────────
 
 /// Coarse transport tag derived from a multiaddr's protocol stack.
@@ -992,6 +1393,91 @@ fn decode_u128_be(hex_data: &str) -> u128 {
     u128::from_be_bytes(padded)
 }
 
+/// Arbitrary-precision big-endian bytes → decimal string. Used for
+/// governance `param_value` (an on-chain `BigUint` — fees can
+/// legitimately exceed u64/u128, e.g. an owner accidentally proposing a
+/// huge `node_registration_fee`, so this must not silently truncate).
+/// Empty bytes → `"0"`.
+///
+/// Hand-rolled schoolbook base-256→base-10 conversion (no `num-bigint`
+/// dependency — this codebase prefers minimal deps for small,
+/// self-contained utilities like this one) — repeatedly multiplies a
+/// little-endian decimal-digit accumulator by 256 and adds the next
+/// byte, carrying overflow into new digits. O(n²) in byte length, but n
+/// is always tiny here (a handful of bytes for any realistic KLV fee).
+///
+/// Phase 6 (governance-dashboard-plan.md) needs the REVERSE conversion
+/// (decimal string → minimal big-endian bytes, for the create-proposal
+/// calldata builder) — pair a `decimal_string_to_bytes_be` with this
+/// function then and share one round-trip test, rather than writing a
+/// second, independently-tested big-int conversion.
+fn bytes_be_to_decimal_string(bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        return "0".to_string();
+    }
+    // Little-endian decimal digits (digits[0] is the ones place).
+    let mut digits: Vec<u8> = vec![0];
+    for &byte in bytes {
+        let mut carry = byte as u32;
+        for d in digits.iter_mut() {
+            let v = (*d as u32) * 256 + carry;
+            *d = (v % 10) as u8;
+            carry = v / 10;
+        }
+        while carry > 0 {
+            digits.push((carry % 10) as u8);
+            carry /= 10;
+        }
+    }
+    while digits.len() > 1 && *digits.last().unwrap() == 0 {
+        digits.pop();
+    }
+    digits.iter().rev().map(|d| (b'0' + d) as char).collect()
+}
+
+/// Reverse of [`bytes_be_to_decimal_string`] — decimal string → minimal
+/// big-endian bytes (empty for `"0"`). Used by the create-node-proposal
+/// calldata builder (governance-dashboard-plan.md Phase 6, `param_value`
+/// TX arg) so there is exactly one tested BigUint⇄bytes conversion in
+/// this codebase, not two. Validates the input is a plain non-negative
+/// decimal integer (ASCII digits only, no sign, no leading zeros other
+/// than a bare `"0"`) — SC `BigUint` args are always non-negative and a
+/// malformed string here should fail loudly, not silently coerce.
+///
+/// Schoolbook long division by 256 over the decimal-digit
+/// representation (the mirror image of the multiply-accumulate in
+/// `bytes_be_to_decimal_string`) — same O(n²)-in-digit-count
+/// complexity, same "n is always tiny for a realistic fee" rationale.
+pub(crate) fn decimal_string_to_bytes_be(s: &str) -> Result<Vec<u8>> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        anyhow::bail!("not a valid non-negative decimal integer: {:?}", s);
+    }
+    if s.len() > 1 && s.starts_with('0') {
+        anyhow::bail!("decimal integer has a leading zero: {:?}", s);
+    }
+    if s == "0" {
+        return Ok(Vec::new());
+    }
+    // Big-endian (MSB-first) decimal digits, mutated in place by
+    // repeated division.
+    let mut digits: Vec<u8> = s.bytes().map(|b| b - b'0').collect();
+    let mut out_bytes_le: Vec<u8> = Vec::new();
+    while !(digits.len() == 1 && digits[0] == 0) {
+        let mut remainder: u32 = 0;
+        for d in digits.iter_mut() {
+            let cur = remainder * 10 + (*d as u32);
+            *d = (cur / 256) as u8;
+            remainder = cur % 256;
+        }
+        out_bytes_le.push(remainder as u8);
+        while digits.len() > 1 && digits[0] == 0 {
+            digits.remove(0);
+        }
+    }
+    out_bytes_le.reverse();
+    Ok(out_bytes_le)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1247,5 +1733,437 @@ mod tests {
         assert_eq!(TransportKind::Onion.as_str(), "onion");
         assert_eq!(TransportKind::I2p.as_str(), "i2p");
         assert_eq!(TransportKind::Unknown.as_str(), "unknown");
+    }
+
+    // --- Governance decode helpers (governance-dashboard-plan.md Phase 5) ---
+
+    #[test]
+    fn bytes_be_to_decimal_zero_and_small() {
+        assert_eq!(bytes_be_to_decimal_string(&[]), "0");
+        assert_eq!(bytes_be_to_decimal_string(&[0x64]), "100");
+        assert_eq!(bytes_be_to_decimal_string(&[0x01, 0xF4]), "500");
+        assert_eq!(bytes_be_to_decimal_string(&[0xff]), "255");
+    }
+
+    #[test]
+    fn bytes_be_to_decimal_round_trips_u64_values() {
+        // Cross-check against Rust's own u64 formatting for a spread of
+        // values, including the u64::MAX boundary.
+        for v in [0u64, 1, 100, 256, 0xffff, 1_000_000, u64::MAX] {
+            let bytes = v.to_be_bytes();
+            let trimmed: Vec<u8> = {
+                let mut i = 0;
+                while i < bytes.len() - 1 && bytes[i] == 0 {
+                    i += 1;
+                }
+                bytes[i..].to_vec()
+            };
+            assert_eq!(
+                bytes_be_to_decimal_string(&trimmed),
+                v.to_string(),
+                "mismatch for {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn bytes_be_to_decimal_exceeds_u64() {
+        // 2^64 = 18446744073709551616, one more than u64::MAX — exactly
+        // the case a naive u64-based implementation would silently
+        // truncate/corrupt. 9 bytes: 0x01 followed by 8 zero bytes.
+        let bytes = {
+            let mut b = vec![0x01u8];
+            b.extend(std::iter::repeat(0u8).take(8));
+            b
+        };
+        assert_eq!(
+            bytes_be_to_decimal_string(&bytes),
+            "18446744073709551616"
+        );
+    }
+
+    #[test]
+    fn decimal_to_bytes_be_zero_and_small() {
+        assert_eq!(decimal_string_to_bytes_be("0").unwrap(), Vec::<u8>::new());
+        assert_eq!(decimal_string_to_bytes_be("100").unwrap(), vec![0x64]);
+        assert_eq!(decimal_string_to_bytes_be("500").unwrap(), vec![0x01, 0xF4]);
+        assert_eq!(decimal_string_to_bytes_be("255").unwrap(), vec![0xff]);
+    }
+
+    #[test]
+    fn decimal_to_bytes_be_exceeds_u64() {
+        // The exact mirror of `bytes_be_to_decimal_exceeds_u64` — the
+        // same value that would corrupt a naive u64-based implementation.
+        let expected = {
+            let mut b = vec![0x01u8];
+            b.extend(std::iter::repeat(0u8).take(8));
+            b
+        };
+        assert_eq!(
+            decimal_string_to_bytes_be("18446744073709551616").unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn decimal_to_bytes_be_rejects_malformed_input() {
+        assert!(decimal_string_to_bytes_be("").is_err());
+        assert!(decimal_string_to_bytes_be("-1").is_err());
+        assert!(decimal_string_to_bytes_be("1.5").is_err());
+        assert!(decimal_string_to_bytes_be("01").is_err()); // leading zero
+        assert!(decimal_string_to_bytes_be("1a").is_err());
+        assert!(decimal_string_to_bytes_be(" 1").is_err());
+    }
+
+    #[test]
+    fn bytes_decimal_round_trip_is_lossless() {
+        // Share one round-trip test across a spread of magnitudes,
+        // including values requiring more than 8 bytes — proves the
+        // two conversions are genuine inverses, not just independently
+        // "correct-looking."
+        for n in [
+            "0",
+            "1",
+            "100",
+            "255",
+            "256",
+            "18446744073709551615", // u64::MAX
+            "18446744073709551616", // u64::MAX + 1
+            "340282366920938463463374607431768211455", // u128::MAX
+            "340282366920938463463374607431768211456", // u128::MAX + 1
+        ] {
+            let bytes = decimal_string_to_bytes_be(n).unwrap();
+            assert_eq!(bytes_be_to_decimal_string(&bytes), n, "round-trip for {n}");
+        }
+    }
+
+    #[test]
+    fn decode_bool_bytes_wire_convention() {
+        assert!(!decode_bool_bytes(&[]));
+        assert!(!decode_bool_bytes(&[0x00]));
+        assert!(decode_bool_bytes(&[0x01]));
+    }
+
+    #[test]
+    fn proposal_summary_decodes_all_thirteen_fields() {
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x11u8; 32]);
+        let verifying_key = signing_key.verifying_key();
+        let expected_addr = crate::crypto::pubkey_to_address(&verifying_key).unwrap();
+
+        let items: Vec<Vec<u8>> = vec![
+            vec![0x01],                          // id = 1
+            verifying_key.to_bytes().to_vec(),   // proposer
+            b"raise the fee".to_vec(),           // description
+            b"registration_fee".to_vec(),        // param_key
+            vec![0x01, 0xF4],                    // param_value = 500
+            vec![0x03, 0xE8],                    // created_at = 1000
+            vec![0x01, 0x51, 0x80],              // expires_at = 86400
+            vec![],                              // executed = false
+            vec![0x07],                          // vote_count = 7
+            vec![0x02],                          // oppose_count = 2
+            vec![0x0a],                          // quorum = 10
+            vec![],                              // quorum_met = false
+            vec![0x01],                          // supermajority_met = true
+        ];
+        let summary = decode_proposal_summary("listProposals", &items).unwrap();
+        assert_eq!(summary.id, 1);
+        assert_eq!(summary.proposer, expected_addr);
+        assert_eq!(summary.description, "raise the fee");
+        assert_eq!(summary.param_key, "registration_fee");
+        assert_eq!(summary.param_value, "500");
+        assert_eq!(summary.created_at, 1000);
+        assert_eq!(summary.expires_at, 86400);
+        assert!(!summary.executed);
+        assert_eq!(summary.vote_count, 7);
+        assert_eq!(summary.oppose_count, 2);
+        assert_eq!(summary.quorum, 10);
+        assert!(!summary.quorum_met);
+        assert!(summary.supermajority_met);
+    }
+
+    #[test]
+    fn proposal_summary_rejects_wrong_item_count() {
+        assert!(decode_proposal_summary("listProposals", &[vec![0x01]]).is_err());
+        assert!(decode_proposal_summary("listNodeProposals", &[]).is_err());
+    }
+
+    #[test]
+    fn proposal_summary_rejects_malformed_address() {
+        let mut items: Vec<Vec<u8>> = (0..13).map(|_| Vec::new()).collect();
+        items[1] = vec![0u8; 31]; // wrong length, not 32
+        assert!(decode_proposal_summary("listNodeProposals", &items).is_err());
+    }
+
+    #[test]
+    fn proposal_tally_decodes_five_fields() {
+        let items: Vec<Vec<u8>> = vec![
+            vec![0x07], // vote_count = 7
+            vec![0x02], // oppose_count = 2
+            vec![0x0a], // quorum = 10
+            vec![],     // quorum_met = false
+            vec![0x01], // supermajority_met = true
+        ];
+        let tally = decode_proposal_tally("getNodeProposalTally", &items).unwrap();
+        assert_eq!(tally.vote_count, 7);
+        assert_eq!(tally.oppose_count, 2);
+        assert_eq!(tally.quorum, 10);
+        assert!(!tally.quorum_met);
+        assert!(tally.supermajority_met);
+    }
+
+    #[test]
+    fn proposal_tally_rejects_wrong_item_count() {
+        assert!(decode_proposal_tally("getProposalTally", &[vec![0x01]]).is_err());
+    }
+
+    // --- End-to-end wrapper tests against a fake Klever node ---
+    //
+    // Per Phase 5's DoD: pure-decode unit tests above cover the shared
+    // decode logic, but a copy-paste bug that sends the WRONG funcName
+    // string (e.g. `get_node_proposal_count` accidentally calling
+    // `get_proposal_count_generic(..., "getProposalCount")`) would
+    // produce IDENTICAL decode behavior and slip past decode-only
+    // tests entirely. This spins up a tiny in-process fake node
+    // (mirrors `tests/ipfs_client_integration.rs`'s FakeKubo pattern)
+    // that returns TRACK-DISTINGUISHABLE canned data per funcName, so
+    // a wrong funcName manifests as a wrong VALUE, not just a wrong
+    // route.
+
+    use axum::{routing::post, Json, Router};
+    use tokio::net::TcpListener;
+
+    fn b64(bytes: &[u8]) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    async fn vm_query_handler(
+        axum::extract::Json(body): axum::extract::Json<serde_json::Value>,
+    ) -> Json<serde_json::Value> {
+        let func_name = body.get("funcName").and_then(|v| v.as_str()).unwrap_or("");
+        let key_a = ed25519_dalek::SigningKey::from_bytes(&[0x11u8; 32]).verifying_key();
+        let key_b = ed25519_dalek::SigningKey::from_bytes(&[0x22u8; 32]).verifying_key();
+
+        let return_data: Vec<String> = match func_name {
+            "listProposals" => vec![
+                b64(&[0x01]),                          // id = 1
+                b64(&key_a.to_bytes()),                // proposer A
+                b64(b"user track"),                    // description
+                b64(b"registration_fee"),               // param_key
+                b64(&[0x01, 0xF4]),                    // param_value = 500
+                b64(&[0x03, 0xE8]),                    // created_at
+                b64(&[0x01, 0x51, 0x80]),              // expires_at
+                b64(&[]),                              // executed = false
+                b64(&[0x03]),                          // vote_count = 3
+                b64(&[]),                              // oppose_count = 0
+                b64(&[0x0a]),                           // quorum = 10
+                b64(&[]),                              // quorum_met = false
+                b64(&[0x01]),                          // supermajority_met = true
+            ],
+            "listNodeProposals" => vec![
+                b64(&[0x02]),                          // id = 2 (distinct from user track)
+                b64(&key_b.to_bytes()),                // proposer B (distinct)
+                b64(b"node track"),                    // description (distinct)
+                b64(b"node_registration_fee"),          // param_key (distinct)
+                // param_value exceeds u64::MAX — proves the wrapper
+                // path doesn't truncate the way a naive impl would.
+                b64(&[0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
+                b64(&[0x03, 0xE8]),
+                b64(&[0x01, 0x51, 0x80]),
+                b64(&[0x01]),                          // executed = true (distinct)
+                b64(&[0x0b]),                           // vote_count = 11 (distinct)
+                b64(&[0x01]),                           // oppose_count = 1 (distinct)
+                b64(&[0x03]),                           // quorum = 3 (distinct)
+                b64(&[0x01]),                           // quorum_met = true (distinct)
+                b64(&[0x01]),                           // supermajority_met = true
+            ],
+            "getProposalTally" => vec![
+                b64(&[0x03]), // vote_count = 3
+                b64(&[]),     // oppose_count = 0
+                b64(&[0x0a]), // quorum = 10
+                b64(&[]),     // quorum_met = false
+                b64(&[0x01]), // supermajority_met = true
+            ],
+            "getNodeProposalTally" => vec![
+                b64(&[0x0b]), // vote_count = 11 (distinct)
+                b64(&[0x01]), // oppose_count = 1 (distinct)
+                b64(&[0x03]), // quorum = 3 (distinct)
+                b64(&[0x01]), // quorum_met = true (distinct)
+                b64(&[0x01]), // supermajority_met = true
+            ],
+            other => panic!("fake node received unexpected funcName: {other}"),
+        };
+
+        Json(serde_json::json!({
+            "data": { "data": { "returnCode": "Ok", "returnMessage": "", "returnData": return_data } },
+            "error": "",
+        }))
+    }
+
+    async fn vm_hex_handler(
+        axum::extract::Json(body): axum::extract::Json<serde_json::Value>,
+    ) -> Json<serde_json::Value> {
+        let func_name = body.get("funcName").and_then(|v| v.as_str()).unwrap_or("");
+        let hex_data = match func_name {
+            "getProposalCount" => "05",
+            "getNodeProposalCount" => "07", // distinct from user track
+            "getUserVote" => "01",          // VOTE_SUPPORT
+            "getNodeVote" => "02",          // VOTE_OPPOSE (distinct)
+            other => panic!("fake node received unexpected funcName: {other}"),
+        };
+        Json(serde_json::json!({
+            "data": { "data": hex_data },
+            "error": "",
+        }))
+    }
+
+    async fn spawn_fake_klever_node() -> String {
+        let app: Router = Router::new()
+            .route("/vm/query", post(vm_query_handler))
+            .route("/vm/hex", post(vm_hex_handler));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{}", addr)
+    }
+
+    #[tokio::test]
+    async fn governance_wrappers_send_correct_func_names_and_decode_correctly() {
+        let node_url = spawn_fake_klever_node().await;
+        let http = reqwest::Client::new();
+        let contract = "klv1qqqqqqqqqqqqqpgq0000000000000000000000000000000000000000";
+
+        // Counts — distinct values per track prove funcName routing.
+        assert_eq!(
+            get_proposal_count(&http, &node_url, contract).await.unwrap(),
+            5
+        );
+        assert_eq!(
+            get_node_proposal_count(&http, &node_url, contract)
+                .await
+                .unwrap(),
+            7
+        );
+
+        // Vote status — distinct values per track.
+        let owner = crate::crypto::pubkey_to_address(
+            &ed25519_dalek::SigningKey::from_bytes(&[0x11u8; 32]).verifying_key(),
+        )
+        .unwrap();
+        assert_eq!(
+            get_user_vote(&http, &node_url, contract, 1, &owner)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            get_node_vote(&http, &node_url, contract, 1, &owner)
+                .await
+                .unwrap(),
+            2
+        );
+
+        // Tallies — distinct values per track.
+        let user_tally = get_proposal_tally(&http, &node_url, contract, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(user_tally.vote_count, 3);
+        assert_eq!(user_tally.quorum, 10);
+        let node_tally = get_node_proposal_tally(&http, &node_url, contract, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(node_tally.vote_count, 11);
+        assert_eq!(node_tally.quorum, 3);
+
+        // Lists — distinct rows per track, including the >u64::MAX
+        // param_value on the node-track row round-tripping correctly
+        // through the real HTTP + decode path (not just the isolated
+        // decode-function unit test above).
+        let user_rows = list_proposals(&http, &node_url, contract, 0, 20)
+            .await
+            .unwrap();
+        assert_eq!(user_rows.len(), 1);
+        assert_eq!(user_rows[0].id, 1);
+        assert_eq!(user_rows[0].description, "user track");
+        assert_eq!(user_rows[0].param_value, "500");
+        assert!(!user_rows[0].executed);
+
+        let node_rows = list_node_proposals(&http, &node_url, contract, 0, 20)
+            .await
+            .unwrap();
+        assert_eq!(node_rows.len(), 1);
+        assert_eq!(node_rows[0].id, 2);
+        assert_eq!(node_rows[0].description, "node track");
+        assert_eq!(node_rows[0].param_value, "18446744073709551616");
+        assert!(node_rows[0].executed);
+        assert_ne!(node_rows[0].proposer, user_rows[0].proposer);
+    }
+
+    /// Live-network check against the REAL testnet contract (SC 0.8.0,
+    /// upgraded 2026-08-25, governance-dashboard-plan.md Phase 4) — not
+    /// run by default (`cargo test`), only via `cargo test -- --ignored`,
+    /// since it needs network access and depends on live chain state.
+    /// No `#[ignore]`-gated test convention existed elsewhere in this
+    /// codebase before this one; added because it closes the loop
+    /// between Phase 4's manual `curl`-based verification and this
+    /// phase's actual Rust client code — proving the real `reqwest`
+    /// HTTP path decodes the real Klever RPC response shape correctly,
+    /// not just the fake server above. Kept (not deleted after one run)
+    /// as regression coverage for future SC upgrades.
+    #[tokio::test]
+    #[ignore]
+    async fn governance_views_work_against_live_testnet() {
+        let http = reqwest::Client::new();
+        let node_url = "https://node.testnet.klever.org";
+        let contract = "klv1qqqqqqqqqqqqqpgq0ja2j7xwz843ryfsk9vlz6xzsaak590h6pgq7nwr02";
+
+        // As of the Phase 4 upgrade, no proposals exist on either track
+        // yet — this proves the "empty" paths work against a real node,
+        // matching the Phase 4 curl-based verification.
+        assert_eq!(
+            get_proposal_count(&http, node_url, contract).await.unwrap(),
+            0
+        );
+        assert_eq!(
+            get_node_proposal_count(&http, node_url, contract)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(list_proposals(&http, node_url, contract, 0, 20)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(list_node_proposals(&http, node_url, contract, 0, 20)
+            .await
+            .unwrap()
+            .is_empty());
+        // A nonexistent proposal ID must decode as "not found", not error.
+        assert!(get_proposal_tally(&http, node_url, contract, 1)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(get_node_proposal_tally(&http, node_url, contract, 1)
+            .await
+            .unwrap()
+            .is_none());
+        // The testnet SC owner has never voted on anything.
+        let owner = "klv1heatuswg9u9u356snvj20fn9jvcgva8fea5v54uhqadchhaz6pgq26t8jh";
+        assert_eq!(
+            get_user_vote(&http, node_url, contract, 1, owner)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            get_node_vote(&http, node_url, contract, 1, owner)
+                .await
+                .unwrap(),
+            0
+        );
     }
 }

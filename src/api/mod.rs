@@ -322,7 +322,32 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
             // Loopback-only E2E diagnostics (0.68.0): dump a wallet's device
             // enc-key directory + a conversation's wrapped-key envelopes and
             // stored DM messages, to diagnose "can't decrypt" / vanishing DMs.
-            .route("/admin/debug/e2e", get(admin::debug_e2e));
+            .route("/admin/debug/e2e", get(admin::debug_e2e))
+            // governance-dashboard-plan.md Phase 6 — user track is
+            // read-only from this dashboard; node track is full
+            // read+write, signed server-side by the anchoring task's
+            // own wallet (no browser wallet connect step for governance).
+            .route(
+                "/admin/governance/user/proposals",
+                get(admin::governance_user_proposals),
+            )
+            .route(
+                "/admin/governance/user/proposals/{id}",
+                get(admin::governance_user_proposal_by_id),
+            )
+            .route(
+                "/admin/governance/node/proposals",
+                get(admin::governance_node_proposals),
+            )
+            .route(
+                "/admin/governance/node/proposals/{id}",
+                get(admin::governance_node_proposal_by_id),
+            )
+            .route(
+                "/admin/governance/node/wallet-status",
+                get(admin::governance_node_wallet_status),
+            )
+            .merge(governance_write_routes(&app_state));
 
         if config.api.admin.dashboard {
             protected = protected
@@ -394,6 +419,44 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .layer(axum::Extension(app_state))
+}
+
+/// The 3 governance write endpoints (create-proposal/vote/execute) each
+/// broadcast a real, gas-costing on-chain TX signed by the node's own
+/// anchor wallet on success. They already sit behind `admin_auth` and
+/// the API-wide per-IP governor (`config.api.rate_limit_per_ip`,
+/// shared across the whole surface), but that shared budget alone
+/// would let a compromised admin session or a buggy client loop drive
+/// up to the full per-IP allowance in real broadcasts. This gives them
+/// their own, much tighter bucket — steady state 10/min with a burst
+/// of 5 (room for "create a proposal, then cast a couple of votes"
+/// without throttling normal operator use) — layered independently of,
+/// and in addition to, the outer API-wide limiter.
+fn governance_write_routes(app_state: &Arc<AppState>) -> Router {
+    let governor_conf = Arc::new(
+        GovernorConfigBuilder::default()
+            .per_second(6)
+            .burst_size(5)
+            .key_extractor(rate_limit_key::TrustedProxyIpKeyExtractor::new(
+                app_state.trusted_proxies.clone(),
+            ))
+            .finish()
+            .expect("valid governor config"),
+    );
+    Router::new()
+        .route(
+            "/admin/governance/node/create-proposal",
+            post(admin::governance_node_create_proposal),
+        )
+        .route(
+            "/admin/governance/node/vote",
+            post(admin::governance_node_vote),
+        )
+        .route(
+            "/admin/governance/node/execute-proposal",
+            post(admin::governance_node_execute_proposal),
+        )
+        .layer(GovernorLayer::new(governor_conf).error_handler(|err| err.into()))
 }
 
 /// Build CORS layer from configured origins.

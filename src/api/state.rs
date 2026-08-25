@@ -243,6 +243,20 @@ pub struct AppState {
     /// Channel to trigger an immediate state anchor from the admin API.
     /// `None` if anchoring is not enabled.
     pub anchor_trigger: Option<mpsc::Sender<oneshot::Sender<Result<String, String>>>>,
+    /// Channel to submit an arbitrary governance SC-invoke `call_data`
+    /// string for server-side signing by the anchoring task's wallet
+    /// (governance-dashboard-plan.md Phase 6). `None` if anchoring is
+    /// not enabled (no signing key is loaded in that case). See
+    /// `chain::anchoring::GovernanceSubmitRequest`.
+    pub governance_submit: Option<crate::chain::anchoring::GovernanceSubmitSender>,
+    /// The klv1... address that will actually sign governance TXs —
+    /// i.e. the resolved anchor wallet address (env/config
+    /// `wallet_key`, or the node identity key if unset). Distinct from
+    /// `node_address` when a separate anchor `wallet_key` is
+    /// configured; the dashboard must show THIS address as "the wallet
+    /// voting on your behalf," not `node_address`. `None` if anchoring
+    /// is not enabled.
+    pub anchor_wallet_address: Option<String>,
     /// Channel to publish messages to GossipSub via the network layer.
     /// Carries a [`crate::network::GossipPublish`] (topic + bytes +
     /// optional outcome responder, l2-node 0.48.4).
@@ -427,6 +441,19 @@ pub struct AppState {
     /// memory under a flood of distinct nonces — evicted entries are safe
     /// to forget because their signing timestamps have already expired.
     pub auth_nonce_seen: Cache<String, ()>,
+    /// Dedup guard for governance SC-invoke submissions
+    /// (governance-dashboard-plan.md Phase 6 audit follow-up). Key =
+    /// the exact `call_data` string about to be broadcast. An entry's
+    /// presence means "already successfully enqueued to the anchoring
+    /// task, do not enqueue an identical one" — closes the window
+    /// where a client retries `create-proposal`/`vote`/`execute` after
+    /// a `GATEWAY_TIMEOUT` while the original submission is still
+    /// in-flight (or has already broadcast), which would otherwise
+    /// waste real KLV gas on a second broadcast of the same TX intent.
+    /// 60s TTL comfortably outlives `submit_governance_call`'s 30s
+    /// budget; self-expires so a later, genuinely-new action with the
+    /// same encoded arguments isn't blocked forever.
+    pub governance_inflight: Cache<String, ()>,
 }
 
 /// Cached bootstrap-candidates response (spec 13 §4.5).
@@ -523,6 +550,8 @@ impl AppState {
             crate::config::TorConfig::default(),            // tor_config — disabled in tests
             None,                                           // presence_manager — disabled in tests
             "testnet".to_string(),                          // network_id — fine for tests
+            None,                                           // governance_submit — disabled in tests
+            None,                                           // anchor_wallet_address — disabled in tests
         )
     }
 
@@ -576,6 +605,8 @@ impl AppState {
         tor_config: crate::config::TorConfig,
         presence_manager: Option<Arc<crate::network::presence::PresenceManager>>,
         network_id: String,
+        governance_submit: Option<crate::chain::anchoring::GovernanceSubmitSender>,
+        anchor_wallet_address: Option<String>,
     ) -> Self {
         // moka LRU with size-weighted eviction. `weigher` returns the
         // byte count of each value's body (content-type string is
@@ -619,6 +650,15 @@ impl AppState {
                 crate::api::auth::MAX_AUTH_AGE_MS + 2 * crate::api::auth::MAX_AUTH_FUTURE_SKEW_MS,
             ))
             .max_capacity(100_000)
+            .build();
+        // 1,000 entries is generous headroom for how many DISTINCT
+        // governance call_data strings could plausibly be in flight
+        // within any 60s window — this is a duplicate-broadcast guard,
+        // not a general-purpose cache, so realistic occupancy is
+        // single digits.
+        let governance_inflight: Cache<String, ()> = Cache::builder()
+            .time_to_live(std::time::Duration::from_secs(60))
+            .max_capacity(1_000)
             .build();
         Self {
             storage,
@@ -672,6 +712,9 @@ impl AppState {
             presence_manager,
             network_id,
             auth_nonce_seen,
+            governance_submit,
+            anchor_wallet_address,
+            governance_inflight,
         }
     }
 

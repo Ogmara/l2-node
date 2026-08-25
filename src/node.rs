@@ -1241,7 +1241,7 @@ impl Node {
         // broadcast before the rest of the node tears down. None when
         // anchoring is disabled.
         let mut anchor_task: Option<tokio::task::JoinHandle<()>> = None;
-        let anchor_trigger_tx = if self.config.anchoring.enabled {
+        let (anchor_trigger_tx, governance_submit_tx, anchor_wallet_address) = if self.config.anchoring.enabled {
             let anchor_klever = self.config.klever.clone();
             let anchor_config = self.config.anchoring.clone();
             let anchor_storage = self.storage.clone();
@@ -1300,6 +1300,16 @@ impl Node {
                     key
                 }
             };
+            // Governance actions (governance-dashboard-plan.md Phase 6)
+            // are signed with this SAME anchor key, so the address the
+            // dashboard shows as "the wallet voting on your behalf"
+            // must be computed here, before `anchor_key` moves into the
+            // spawned task below — it can legitimately differ from
+            // `self.address()` (the node's own identity key) when a
+            // separate `[anchoring] wallet_key` is configured.
+            let anchor_wallet_address_computed =
+                crate::crypto::pubkey_to_address(&anchor_key.verifying_key())
+                    .context("computing anchor wallet address for governance display")?;
             // Explicit drop is documentation-of-intent — `wallet_key_secret`
             // would naturally scope-exit at the next `}`, but making the
             // zeroize boundary visible at the line a reviewer looks for
@@ -1307,6 +1317,14 @@ impl Node {
             drop(wallet_key_secret);
             let anchor_shutdown_rx = self.shutdown_rx();
             let (trigger_tx, trigger_rx) = tokio::sync::mpsc::channel(1);
+            // Governance-submit channel (Phase 6) — capacity 4, not 1:
+            // unlike the periodic anchor trigger (naturally rate-limited
+            // by "how often does a human click Trigger Anchor"), a
+            // single admin operator may click create/vote/execute in
+            // quick succession across a few open browser tabs.
+            let (gov_tx, gov_rx) = tokio::sync::mpsc::channel::<
+                crate::chain::anchoring::GovernanceSubmitRequest,
+            >(4);
             let anchor_alert_for_task = anchor_alert_tx.clone();
             // Capture the JoinHandle so the main loop can `await` the
             // anchor task on shutdown — when `pause_on_shutdown = true`
@@ -1324,14 +1342,14 @@ impl Node {
                     anchor_alert_for_task,
                     anchor_klever_health,
                 ) {
-                    Ok(mut anchorer) => anchorer.run(anchor_shutdown_rx, trigger_rx).await,
+                    Ok(mut anchorer) => anchorer.run(anchor_shutdown_rx, trigger_rx, gov_rx).await,
                     Err(e) => warn!(error = %e, "Failed to start state anchorer"),
                 }
             });
             anchor_task = Some(handle);
-            Some(trigger_tx)
+            (Some(trigger_tx), Some(gov_tx), Some(anchor_wallet_address_computed))
         } else {
-            None
+            (None, None, None)
         };
 
         // IPFS client (stored for API media endpoints)
@@ -1800,6 +1818,16 @@ impl Node {
             // [network] network_id snapshot — exposed via
             // /api/v1/network/identity (spec 03 §4.1).
             self.config.network_id().to_string(),
+            // governance-dashboard-plan.md Phase 6 — channel to submit
+            // arbitrary governance SC-invoke calldata for server-side
+            // signing by the anchoring task's wallet. `None` when
+            // anchoring is disabled (no signing key loaded).
+            governance_submit_tx,
+            // The klv1... address that will actually sign governance
+            // TXs — distinct from `node_address` when a separate
+            // `[anchoring] wallet_key` is configured. `None` when
+            // anchoring is disabled.
+            anchor_wallet_address,
         ));
         // Background sweep: drop zero-counter entries from the per-IP
         // media limiter (v0.41). Without this, the DashMap accumulates

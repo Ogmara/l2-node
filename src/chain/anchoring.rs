@@ -50,6 +50,29 @@ struct PendingSubmission {
 /// submissions before the oldest get dropped (logged at warn).
 const MAX_PENDING_SUBMISSIONS: usize = 100;
 
+/// One arbitrary-calldata SC-invoke request routed to the anchoring
+/// task for signing with whatever key it resolved at startup (anchor
+/// `[anchoring] wallet_key`, or the node identity key if unset — see
+/// `node.rs`'s anchor-wallet-key loading block). Used by the node-gated
+/// governance REST endpoints (`api::admin`) — the SAME "task owns the
+/// key, ask via channel" idiom as the manual-anchor-trigger channel
+/// (this file, `run()`'s `trigger_rx` param) and `TestAlertSender`
+/// (`notifications::alerts`, governance-dashboard-plan.md Phase 8).
+/// Kept as a SEPARATE channel from the anchor-trigger one rather than
+/// extending that channel's message type: the trigger channel has
+/// fixed "run `perform_anchor` now" semantics and its own working
+/// caller (`admin::trigger_anchor`); folding an arbitrary-calldata
+/// variant into it would force an unrelated endpoint's message type to
+/// grow a discriminant for a feature it has nothing to do with.
+pub struct GovernanceSubmitRequest {
+    pub call_data: String,
+    pub reply: tokio::sync::oneshot::Sender<Result<String, String>>,
+}
+
+/// Channel type governance-write REST handlers hold in `AppState` to
+/// reach the anchoring task's signing key.
+pub type GovernanceSubmitSender = tokio::sync::mpsc::Sender<GovernanceSubmitRequest>;
+
 /// How often the divergence watcher walks `pending_submissions` and
 /// queries `getCanonicalAnchor` for each. 5 minutes is well below
 /// the default 1-hour anchor interval, fast enough that an alert
@@ -154,6 +177,7 @@ impl StateAnchorer {
         mut trigger_rx: tokio::sync::mpsc::Receiver<
             tokio::sync::oneshot::Sender<Result<String, String>>,
         >,
+        mut gov_rx: tokio::sync::mpsc::Receiver<GovernanceSubmitRequest>,
     ) {
         if !self.config.enabled {
             info!("State anchoring disabled");
@@ -205,23 +229,16 @@ impl StateAnchorer {
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    if self.do_anchor_with_backoff(&mut shutdown_rx).await {
+                    if self.do_anchor_with_backoff(&mut shutdown_rx, &mut trigger_rx, &mut gov_rx).await {
                         info!("State anchorer shutting down (during backoff)");
                         break;
                     }
                 }
                 Some(reply_tx) = trigger_rx.recv() => {
-                    info!("Manual anchor trigger received");
-                    let result = self.perform_anchor().await;
-                    match &result {
-                        Ok(tx_hash) => {
-                            self.consecutive_failures = 0;
-                            let _ = reply_tx.send(Ok(tx_hash.clone()));
-                        }
-                        Err(e) => {
-                            let _ = reply_tx.send(Err(e.to_string()));
-                        }
-                    }
+                    self.handle_trigger(reply_tx).await;
+                }
+                Some(req) = gov_rx.recv() => {
+                    self.handle_gov(req).await;
                 }
                 _ = divergence_check.tick() => {
                     self.check_divergence().await;
@@ -601,13 +618,59 @@ impl StateAnchorer {
         }
     }
 
+    /// Handles one manual-anchor-trigger request (`trigger_rx`). Shared
+    /// between `run()`'s main `select!` and `do_anchor_with_backoff`'s
+    /// inner one so a request arriving during backoff is serviced
+    /// identically to one arriving between ticks, not dropped or
+    /// starved.
+    async fn handle_trigger(&mut self, reply_tx: tokio::sync::oneshot::Sender<Result<String, String>>) {
+        info!("Manual anchor trigger received");
+        let result = self.perform_anchor().await;
+        match &result {
+            Ok(tx_hash) => {
+                self.consecutive_failures = 0;
+                let _ = reply_tx.send(Ok(tx_hash.clone()));
+            }
+            Err(e) => {
+                let _ = reply_tx.send(Err(e.to_string()));
+            }
+        }
+    }
+
+    /// Handles one governance SC-invoke submission (`gov_rx`). Shared
+    /// between `run()`'s main `select!` and `do_anchor_with_backoff`'s
+    /// inner one for the same starvation-avoidance reason as
+    /// `handle_trigger`.
+    async fn handle_gov(&mut self, req: GovernanceSubmitRequest) {
+        info!("Governance SC-invoke submission received");
+        // submit_signed_sc_invoke is already &self and already generic
+        // over call_data — no new signing code, just a new caller
+        // (governance-dashboard-plan.md Phase 6).
+        let result = self.submit_signed_sc_invoke(&req.call_data).await
+            .map_err(|e| e.to_string());
+        let _ = req.reply.send(result);
+    }
+
     /// Perform anchor with backoff on failure.
     ///
-    /// Backoff is implemented with a nested `tokio::select!` so shutdown signals
-    /// are still processed promptly during the sleep.
+    /// Backoff is implemented with a nested `tokio::select!` so shutdown
+    /// signals are still processed promptly during the sleep. It ALSO
+    /// keeps servicing `trigger_rx`/`gov_rx` during the (up to 300s)
+    /// sleep — without this, a flaky Klever RPC backing off the anchor
+    /// loop would silently block every manual-anchor and governance
+    /// request behind it, since `run()`'s outer `select!` only resumes
+    /// polling those channels once this call returns (confirmed by a
+    /// Code Audit pass on v0.114.0's governance-channel addition: a
+    /// vote/create-proposal submitted mid-backoff was timing out at the
+    /// caller's 30s HTTP budget even though it was still queued and
+    /// would have succeeded once backoff ended).
     async fn do_anchor_with_backoff(
         &mut self,
         shutdown_rx: &mut tokio::sync::broadcast::Receiver<()>,
+        trigger_rx: &mut tokio::sync::mpsc::Receiver<
+            tokio::sync::oneshot::Sender<Result<String, String>>,
+        >,
+        gov_rx: &mut tokio::sync::mpsc::Receiver<GovernanceSubmitRequest>,
     ) -> bool {
         match self.perform_anchor().await {
             Ok(tx_hash) => {
@@ -629,10 +692,18 @@ impl StateAnchorer {
                     backoff_seconds = backoff_secs,
                     "State anchoring failed"
                 );
-                // Sleep with shutdown awareness
-                tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs(backoff_secs)) => false,
-                    _ = shutdown_rx.recv() => true,
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(backoff_secs);
+                loop {
+                    tokio::select! {
+                        _ = tokio::time::sleep_until(deadline) => return false,
+                        _ = shutdown_rx.recv() => return true,
+                        Some(reply_tx) = trigger_rx.recv() => {
+                            self.handle_trigger(reply_tx).await;
+                        }
+                        Some(req) = gov_rx.recv() => {
+                            self.handle_gov(req).await;
+                        }
+                    }
                 }
             }
         }

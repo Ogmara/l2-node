@@ -5,6 +5,218 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.115.0] - 2026-08-25
+
+Code Audit + Security Audit pass on 0.114.0's governance-dashboard-plan.md
+Phase 6 diff (mandatory pipeline per this org's CLAUDE.md). One real
+correctness/spec-compliance bug and two availability findings came back;
+all fixed here, plus two lower-severity hardening items the user asked
+to weigh in on both of which were judged worth doing given the write
+endpoints broadcast real, gas-costing TXs from the node operator's own
+wallet.
+
+### Fixed
+
+- **`governance_node_create_proposal` validated the wrong track's voting-
+  period bounds** — it checked the USER track's 1-7 day range
+  (86400..=604800s) instead of the NODE track's actual 7-30 day range
+  (604800..=2592000s, `smart-contract` 0.9.0's
+  `node_governance::MIN/MAX_VOTING_PERIOD_SECONDS`). Any node-track
+  proposal with a period the SC would accept (7-30 days minus the old
+  7-day-exact boundary) was rejected client-side with a wrong error
+  message, and periods the SC now REJECTS (1-7 days) were wrongly
+  accepted here and would have failed late, on-chain, instead of with an
+  immediate 400. Caught by cross-checking the Code+Security Audit
+  findings against the actual SC constants — neither audit agent had SC
+  source in scope, so this was found by a follow-up manual check, not
+  the automated pass itself. Extracted into a testable
+  `node_voting_period_in_range` with a dedicated regression test
+  (`node_voting_period_bounds_match_sc_not_user_track`).
+- **Anchor-backoff sleep starved the governance and manual-trigger
+  channels** (Code Audit) — `do_anchor_with_backoff`'s failure-backoff
+  sleep (up to 300s) only raced `shutdown_rx`; since `StateAnchorer::run()`
+  processes one `select!` branch to completion before polling again, a
+  vote/create-proposal/execute submitted while the anchor loop was
+  backing off from a flaky Klever RPC would sit unserviced for the full
+  backoff window, timing out at the caller's 30s HTTP budget even though
+  it was still queued and would have succeeded once backoff ended.
+  `do_anchor_with_backoff` now takes `trigger_rx`/`gov_rx` and services
+  both (via new shared `handle_trigger`/`handle_gov` helpers, also used
+  by the outer loop) inside its own nested `select!` while waiting out
+  the backoff deadline.
+- **`submit_governance_call`'s 30s timeout didn't cover the channel
+  send** (Code Audit + Security Audit, independently) — only the
+  `reply_rx` await was wrapped in `tokio::time::timeout`; with the
+  bounded (capacity 4) channel and each queued request potentially
+  taking ~45s, a 5th concurrent caller could block on `send()` well past
+  the advertised 30s budget before the timer even started. Both awaits
+  now share one `timeout_at` deadline.
+- **No length cap on `param_value` before the O(n²) decimal-to-bytes
+  conversion** (Code Audit + Security Audit, independently) —
+  `CreateNodeProposalRequest.param_value` had no cap before
+  `encode_biguint_calldata_arg` → `sc_views::decimal_string_to_bytes_be`
+  (a repeated-division algorithm, O(n²) in digit count), reachable with
+  up to the global 10MB body limit's worth of digits. Capped at 100
+  characters — far beyond any realistic KLV-denominated governance
+  parameter.
+- **Sequential RPC fan-out in `governance_node_wallet_status`** (Code
+  Audit) — up to `MAX_WALLET_STATUS_IDS` (64) `get_node_vote` calls were
+  awaited one at a time instead of concurrently, worst-case minutes for
+  one dashboard request. Now uses `futures::future::join_all`, matching
+  the `tokio::join!` pattern `governance_list_response` already uses for
+  its own two-call fan-out.
+
+### Added
+
+- **Dedicated, tighter rate limit on the 3 governance write endpoints**
+  (Security Audit note, judged worth fixing given real on-chain spend) —
+  `create-proposal`/`vote`/`execute-proposal` now sit behind their own
+  `tower_governor` layer (10 req/min steady state, burst of 5),
+  independent of and in addition to the API-wide per-IP limiter. Closes
+  the gap where a compromised admin session or buggy client loop could
+  otherwise drive up to the full shared per-IP budget (config-dependent,
+  commonly 100/min) in real, gas-costing broadcasts.
+- **`AppState.governance_inflight`** — a 60s-TTL dedup cache (same moka
+  pattern as the existing `auth_nonce_seen`), keyed by the exact
+  `call_data` string. `submit_governance_call` now rejects
+  (`409 Conflict`) a retry that exactly matches an already-successfully-
+  enqueued submission, closing the wasted-gas window where a client
+  retry after a `GATEWAY_TIMEOUT` could result in a second broadcast of
+  the same TX intent while the first was still in flight (Security Audit
+  note). The guard is released immediately if the enqueue itself fails
+  (so a legitimate retry after a transport error isn't blocked), but
+  deliberately kept in place on a reply-timeout (the original may still
+  be broadcasting).
+
+## [0.114.0] - 2026-08-25
+
+Governance-dashboard-plan.md Phase 6: server-side-signing channel + the
+REST endpoints that actually let an operator read and act on node-track
+governance from the admin dashboard (Phase 7, not yet built, will be
+the first real UI consumer). Targets smart-contract 0.9.0 (node-gated
+governance with anchoring-history-window eligibility hardening — see
+that repo's own CHANGELOG for the full Sybil-resistance design
+history); smart-contract not yet deployed anywhere as of this entry.
+
+### Added
+
+- **`chain::anchoring::GovernanceSubmitRequest`/`GovernanceSubmitSender`**
+  — a second, parallel channel into the `StateAnchorer` task (alongside
+  the existing manual-anchor-trigger channel), so governance writes can
+  be signed by the SAME wallet the node already loads for periodic
+  anchoring, without that signing key ever leaving the one task that
+  owns it. New `select!` arm in `StateAnchorer::run()`; no changes to
+  the existing `submit_signed_sc_invoke` (already generic over
+  call_data) or to the anchor-trigger channel's own semantics.
+- **`AppState.governance_submit`/`AppState.anchor_wallet_address`** —
+  `None` when anchoring isn't enabled (no signing key available).
+  `anchor_wallet_address` is deliberately NOT `node_address` — it's the
+  resolved anchor `wallet_key` (or node identity key if unset), which
+  can legitimately differ; the dashboard must show the wallet that
+  actually signs, not the node's own identity.
+- **8 new admin REST endpoints** (`api/admin.rs`, registered in
+  `api/mod.rs`): `GET /admin/governance/{user,node}/proposals` (shared
+  internal helper, `node_track: bool` is the only difference — same DRY
+  pattern as Phase 5's `sc_views` generic helpers), `GET .../proposals/
+  {id}` (reuses `list_proposals`/`list_node_proposals` with
+  `offset=id-1, limit=1` rather than adding a new `sc_views` function),
+  `GET /admin/governance/node/wallet-status`, and the 3 write endpoints
+  `POST .../node/{create-proposal,vote,execute-proposal}`. Read
+  endpoints call the Phase 5 `sc_views` functions directly; write
+  endpoints build TX calldata server-side and submit via
+  `governance_submit`, returning `{ok, tx_hash}` synchronously (signing
+  +broadcast happens within the request, no client-side signing step at
+  all) — a deliberate departure from the pre-existing `node_metadata`/
+  `node_pause`/`node_resume` endpoints, which still return calldata for
+  browser-wallet signing.
+- **Dedicated TX-calldata encoders** (`api/admin.rs`), separate from
+  `sc_views.rs`'s VIEW-call encoders (different wire rules for zero —
+  view calls encode `0` as `"00"`, TX calldata encodes `0` as EMPTY —
+  confirmed against `klever-sc-codec` 0.19.0 source, see doc comments):
+  `encode_bool_calldata_arg` (pinned by unit test: `false → ""`, never
+  `"00"` — the landmine this whole design note exists to warn about),
+  `encode_u64_calldata_arg`, and `encode_biguint_calldata_arg` (shares
+  `sc_views::decimal_string_to_bytes_be`, new this release, paired with
+  Phase 5's `bytes_be_to_decimal_string` — one tested BigUint⇄bytes
+  conversion used by both the view-decode and calldata-encode
+  directions, not two).
+- **`proposal_status` now distinguishes `closed` from `failed`**: voting
+  ended + tally would pass (quorum and supermajority both met) →
+  `closed` (awaiting someone to click Execute); voting ended + tally
+  would NOT pass → `failed` (never executable — the SC's own `require!`s
+  would reject it). Previously both cases collapsed into `closed`,
+  which didn't tell an operator whether a proposal is actually
+  actionable. `param_key`/`param_value` allow-list cross-referenced in
+  comments against `smart-contract`'s `node_governance.rs`.
+
+### Added
+
+- **`chain::sc_views` gains read-client functions for both governance
+  tracks** — 8 new functions (`get_proposal_count`/`list_proposals`/
+  `get_proposal_tally`/`get_user_vote` for the existing user-gated
+  track, `get_node_proposal_count`/`list_node_proposals`/
+  `get_node_proposal_tally`/`get_node_vote` for the new node-gated
+  track shipped in smart-contract 0.8.0). Not yet wired into any REST
+  endpoint or the dashboard — that's Phases 6-7 of
+  `docs/planning/governance-dashboard-plan.md`. Since the two tracks
+  share byte-identical wire shapes, all 8 functions share 4 private
+  generic fetch+decode helpers (`func_name` is the only thing that
+  differs between a track's pair of wrappers) rather than 8
+  independent implementations.
+- New `bytes_be_to_decimal_string` helper: arbitrary-precision
+  big-endian bytes → decimal string, hand-rolled (no new dependency)
+  since a governance proposal's `param_value` is an on-chain `BigUint`
+  that can legitimately exceed u64/u128. Phase 6's calldata builder
+  will need the reverse conversion — designed to share this function's
+  test coverage rather than adding a second, independently-tested
+  big-int conversion.
+- Test coverage: pure-decode unit tests for the shared 13-field
+  proposal-summary and 5-field tally shapes; an end-to-end test against
+  a fake in-process Klever node (mirrors `tests/ipfs_client_integration
+  .rs`'s `FakeKubo` pattern) proving each of the 8 wrapper functions
+  sends the correct `funcName` — a wrong `funcName` would decode
+  identically to a correct one against a naive fake, so the fake node
+  returns track-distinguishable canned data specifically to catch that
+  class of bug; and a `#[ignore]`-gated live-testnet integration test
+  (`cargo test -- --ignored`) run once against the real testnet 0.8.0
+  contract, confirming the real HTTP/decode path matches actual chain
+  wire format, not just synthetic test data — no `#[ignore]`
+  convention existed in this codebase before this one, added because
+  it closes the loop with Phase 4's manual `curl`-based verification.
+
+### Security
+
+- **`list_proposals_generic` had no cap on RPC response size**, found by
+  the Security Audit pass on this diff. `vm_query_multi` (the shared
+  `/vm/query` transport helper) fully parses and base64-decodes every
+  `returnData` entry before any caller sees it, with no bound of its
+  own; `get_node_metadata` already defends against this for its own
+  view (`MAX_RETURNED_ENTRIES`), but the new `list_proposals_generic`
+  only checked `% 13 == 0`, not a size cap — a malicious/compromised
+  `klever_node_url` RPC could have forced unbounded allocation before
+  that modulo check ever ran. Added `MAX_RETURNED_PROPOSAL_ROWS = 40`
+  (2× headroom over the SC's own `LIST_PROPOSALS_MAX_LIMIT = 20`),
+  matching the existing `get_node_metadata` defense-in-depth
+  convention. Not attacker-reachable by a malicious *proposal
+  creator* — only by a compromised/malicious RPC endpoint, which is
+  outside this l2-node operator's normal trust boundary, but worth
+  closing before Phase 6/7 wire these functions into a REST endpoint.
+
+## [0.112.0] - 2026-08-24
+
+### Added
+
+- **Network tab now surfaces GossipSub mesh state and peer-connection
+  telemetry.** `GET /admin/network/mesh-stats` and `GET /admin/network/
+  peer-telemetry` (shipped 0.46.6 / 0.48.4 for the B4 asymmetric-
+  propagation diagnosis) had no dashboard UI referencing them since the
+  day they landed. Two new cards below "Connected Peers": a "GossipSub
+  Mesh" card (per-topic mesh size/subscriber table + total mesh slots +
+  publish-failure breakdown) and a "Peer Telemetry" card (total/outbound/
+  inbound-only peer counts + per-peer connection-direction table).
+  Pure frontend — no backend changes, both endpoints already existed and
+  are unchanged. Phase 0 of `docs/planning/governance-dashboard-plan.md`.
+
 ## [0.111.0] - 2026-08-20
 
 ### Added

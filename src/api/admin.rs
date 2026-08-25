@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Extension, Query};
+use axum::extract::{Extension, Path, Query};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
@@ -513,8 +513,9 @@ fn format_klv(raw: u128) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_set_metadata_calldata, compute_effective_multiaddrs, extract_host_from_url,
-        format_klv, is_ipv6_non_routable, HostKind,
+        build_set_metadata_calldata, compute_effective_multiaddrs, encode_bool_calldata_arg,
+        encode_biguint_calldata_arg, encode_u64_calldata_arg, extract_host_from_url, format_klv,
+        is_ipv6_non_routable, node_voting_period_in_range, proposal_status, HostKind,
     };
     use crate::config::AnchorMetadataConfig;
     use std::net::{Ipv4Addr, Ipv6Addr};
@@ -810,6 +811,76 @@ mod tests {
             hex::encode("/ip4/1.2.3.4/tcp/2")
         );
         assert_eq!(two, expected);
+    }
+
+    // --- Governance calldata encoders (governance-dashboard-plan.md Phase 6) ---
+
+    #[test]
+    fn bool_calldata_arg_false_is_empty_not_zero() {
+        // THE landmine (see the function's doc comment): false must be
+        // "", never "00" — a stored/encoded bool false top-encodes to
+        // empty bytes in klever-sc-codec, not a zero byte.
+        assert_eq!(encode_bool_calldata_arg(false), "");
+        assert_eq!(encode_bool_calldata_arg(true), "01");
+    }
+
+    #[test]
+    fn u64_calldata_arg_zero_is_empty_not_00() {
+        // Different rule from sc_views.rs's view-call encoder, which
+        // encodes 0 as "00" — TX calldata's 0 is empty bytes.
+        assert_eq!(encode_u64_calldata_arg(0), "");
+        assert_eq!(encode_u64_calldata_arg(1), "01");
+        assert_eq!(encode_u64_calldata_arg(256), "0100");
+        assert_eq!(encode_u64_calldata_arg(0xff), "ff");
+        assert_eq!(encode_u64_calldata_arg(u64::MAX), "ffffffffffffffff");
+    }
+
+    #[test]
+    fn biguint_calldata_arg_encodes_and_rejects() {
+        assert_eq!(encode_biguint_calldata_arg("0").unwrap(), "");
+        assert_eq!(encode_biguint_calldata_arg("500").unwrap(), "01f4");
+        // Exceeds u64::MAX — proves this doesn't route through a
+        // fixed-width integer type anywhere.
+        assert_eq!(
+            encode_biguint_calldata_arg("18446744073709551616").unwrap(),
+            "010000000000000000"
+        );
+        assert!(encode_biguint_calldata_arg("-1").is_err());
+        assert!(encode_biguint_calldata_arg("not a number").is_err());
+    }
+
+    #[test]
+    fn proposal_status_labels() {
+        // executed always wins, regardless of tally.
+        assert_eq!(proposal_status(true, 1000, 2000, false, false), "executed");
+        // still open: quorum/supermajority irrelevant.
+        assert_eq!(proposal_status(false, 2000, 1000, true, true), "open");
+        // voting ended (now >= expires_at) — quorum+supermajority both met -> closed (awaiting execute).
+        assert_eq!(proposal_status(false, 1000, 2000, true, true), "closed");
+        // boundary: now == expires_at is already "ended".
+        assert_eq!(proposal_status(false, 1000, 1000, true, true), "closed");
+        // voting ended, quorum not met -> failed.
+        assert_eq!(proposal_status(false, 1000, 2000, false, true), "failed");
+        // voting ended, quorum met but supermajority not -> failed.
+        assert_eq!(proposal_status(false, 1000, 2000, true, false), "failed");
+        // voting ended, neither met -> failed.
+        assert_eq!(proposal_status(false, 1000, 2000, false, false), "failed");
+    }
+
+    #[test]
+    fn node_voting_period_bounds_match_sc_not_user_track() {
+        // Regression test: an earlier version of this handler validated
+        // against the USER track's bounds (86400..=604800, 1-7 days) by
+        // mistake instead of the NODE track's (604800..=2592000, 7-30
+        // days) — the two tracks have deliberately different limits.
+        assert!(!node_voting_period_in_range(604799)); // just under 7 days
+        assert!(node_voting_period_in_range(604800)); // exactly 7 days (min)
+        assert!(node_voting_period_in_range(2592000)); // exactly 30 days (max)
+        assert!(!node_voting_period_in_range(2592001)); // just over 30 days
+        // Values valid on the USER track but NOT the node track must be
+        // rejected here — this is exactly the bug that shipped.
+        assert!(!node_voting_period_in_range(86400)); // 1 day — user-track min
+        assert!(!node_voting_period_in_range(172800)); // 2 days
     }
 }
 
@@ -1410,6 +1481,634 @@ pub async fn trigger_anchor(
             Json(serde_json::json!({ "error": "anchoring task dropped reply channel" })),
         )
             .into_response(),
+    }
+}
+
+// ─── Governance (governance-dashboard-plan.md Phase 6) ──────────────
+//
+// Two tracks: the existing user-gated one (read-only from this
+// dashboard — see the plan's design rationale) and the new node-gated
+// one (full read+write). Node-track writes are signed SERVER-SIDE by
+// the anchoring task's own wallet (`state.governance_submit`) — there
+// is no "return calldata for the browser to sign" step here, unlike
+// the `node_metadata`/`node_pause`/`node_resume` handlers above. This
+// is a deliberate departure: the operator never connects a browser
+// wallet for governance, they just click a button on an authenticated
+// dashboard session.
+
+/// Current unix time. Used to compute each proposal's `status` label
+/// (open/closed/executed) client-side per the plan's design note —
+/// the SC's list views intentionally don't do this filtering.
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// `open` = not executed, voting still open. `closed` = not executed,
+/// voting ended, AND the tally would pass (quorum + supermajority met)
+/// — awaiting someone to click Execute. `failed` = not executed, voting
+/// ended, and the tally would NOT pass — will never be executable, the
+/// SC's own `require!`s in `executeNodeProposal`/`executeProposal`
+/// would reject it. `executed` = the SC applied the proposal. Quorum/
+/// supermajority are only meaningful once voting has actually ended —
+/// checking them earlier would misreport an `open` proposal that just
+/// hasn't finished accumulating votes yet as `failed`.
+fn proposal_status(
+    executed: bool,
+    expires_at: u64,
+    now: u64,
+    quorum_met: bool,
+    supermajority_met: bool,
+) -> &'static str {
+    if executed {
+        "executed"
+    } else if now < expires_at {
+        "open"
+    } else if quorum_met && supermajority_met {
+        "closed"
+    } else {
+        "failed"
+    }
+}
+
+/// Render one [`crate::chain::sc_views::ProposalSummary`] as the JSON
+/// shape both the list and single-item endpoints share — single
+/// source of truth so the two response shapes can't drift apart.
+fn proposal_summary_json(p: &crate::chain::sc_views::ProposalSummary, now: u64) -> serde_json::Value {
+    serde_json::json!({
+        "id": p.id,
+        "proposer": p.proposer,
+        "description": p.description,
+        "param_key": p.param_key,
+        "param_value": p.param_value,
+        "created_at": p.created_at,
+        "expires_at": p.expires_at,
+        "executed": p.executed,
+        "vote_count": p.vote_count,
+        "oppose_count": p.oppose_count,
+        "quorum": p.quorum,
+        "quorum_met": p.quorum_met,
+        "supermajority_met": p.supermajority_met,
+        "status": proposal_status(p.executed, p.expires_at, now, p.quorum_met, p.supermajority_met),
+    })
+}
+
+#[derive(Deserialize)]
+pub struct GovernanceListQuery {
+    #[serde(default)]
+    pub offset: Option<u32>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+    /// `open` | `closed` | `failed` | `executed` | `all` (default
+    /// `all`) — see [`proposal_status`] for exactly what distinguishes
+    /// `closed` (voting ended, tally would pass, awaiting execute) from
+    /// `failed` (voting ended, tally would NOT pass, never executable).
+    /// Filtered
+    /// AFTER fetching the requested page from the SC — per the plan's
+    /// design note, the SC's list views intentionally don't do this
+    /// filtering, so a filtered response page can be shorter than
+    /// `limit` even when more matching rows exist beyond this page.
+    /// Acceptable for this low-traffic admin surface.
+    #[serde(default)]
+    pub status: Option<String>,
+}
+
+/// Shared list+decode+filter path for `GET .../user/proposals` and
+/// `GET .../node/proposals` — `node_track` is the only thing that
+/// differs between the two callers (same DRY reasoning as Phase 5's
+/// `sc_views` generic helpers).
+async fn governance_list_response(
+    state: &AppState,
+    node_track: bool,
+    offset: u32,
+    limit: u32,
+    status_filter: Option<String>,
+) -> axum::response::Response {
+    let http = &state.klever_view_http;
+    let url = &state.klever_node_url;
+    let addr = &state.contract_address;
+
+    let (count_result, list_result) = if node_track {
+        tokio::join!(
+            crate::chain::sc_views::get_node_proposal_count(http, url, addr),
+            crate::chain::sc_views::list_node_proposals(http, url, addr, offset, limit),
+        )
+    } else {
+        tokio::join!(
+            crate::chain::sc_views::get_proposal_count(http, url, addr),
+            crate::chain::sc_views::list_proposals(http, url, addr, offset, limit),
+        )
+    };
+
+    let rows = match list_result {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!(error = %e, node_track, "governance list-proposals view call failed");
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": "failed to query governance proposals" })),
+            )
+                .into_response();
+        }
+    };
+    // Total count is a courtesy for pagination UI — if the count view
+    // fails independently of the list view (unlikely, same RPC), fall
+    // back to the page length rather than failing the whole request.
+    let total = count_result.unwrap_or(rows.len() as u64);
+
+    let now = now_unix();
+    let proposals: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|p| proposal_summary_json(p, now))
+        .filter(|v| match status_filter.as_deref() {
+            None | Some("all") | Some("") => true,
+            Some(want) => v["status"] == want,
+        })
+        .collect();
+
+    Json(serde_json::json!({ "proposals": proposals, "total": total })).into_response()
+}
+
+/// GET /admin/governance/user/proposals?offset=&limit=&status=
+pub async fn governance_user_proposals(
+    Extension(state): Extension<Arc<AppState>>,
+    Query(params): Query<GovernanceListQuery>,
+) -> impl IntoResponse {
+    governance_list_response(
+        &state,
+        false,
+        params.offset.unwrap_or(0),
+        params.limit.unwrap_or(20).clamp(1, 20),
+        params.status,
+    )
+    .await
+}
+
+/// GET /admin/governance/node/proposals?offset=&limit=&status=
+pub async fn governance_node_proposals(
+    Extension(state): Extension<Arc<AppState>>,
+    Query(params): Query<GovernanceListQuery>,
+) -> impl IntoResponse {
+    governance_list_response(
+        &state,
+        true,
+        params.offset.unwrap_or(0),
+        params.limit.unwrap_or(20).clamp(1, 20),
+        params.status,
+    )
+    .await
+}
+
+/// Shared single-item fetch — reuses the paginated list view with
+/// `offset = id - 1, limit = 1` rather than adding a new `sc_views`
+/// function: the SC's `listProposals`/`listNodeProposals` index
+/// sequentially by ID (`for id in offset+1..=offset+limit`), so this
+/// deterministically returns exactly the row for `id` (or empty if it
+/// doesn't exist) — a low-traffic admin surface, not worth a dedicated
+/// single-proposal view.
+async fn governance_by_id_response(state: &AppState, node_track: bool, id: u64) -> axum::response::Response {
+    if id == 0 || id > u32::MAX as u64 {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "proposal not found" })),
+        )
+            .into_response();
+    }
+    let offset = (id - 1) as u32;
+    let http = &state.klever_view_http;
+    let url = &state.klever_node_url;
+    let addr = &state.contract_address;
+
+    let rows_result = if node_track {
+        crate::chain::sc_views::list_node_proposals(http, url, addr, offset, 1).await
+    } else {
+        crate::chain::sc_views::list_proposals(http, url, addr, offset, 1).await
+    };
+    let rows = match rows_result {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!(error = %e, node_track, id, "governance proposal-by-id view call failed");
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": "failed to query proposal" })),
+            )
+                .into_response();
+        }
+    };
+    let Some(p) = rows.first() else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "proposal not found" })),
+        )
+            .into_response();
+    };
+    Json(proposal_summary_json(p, now_unix())).into_response()
+}
+
+/// GET /admin/governance/user/proposals/{id}
+pub async fn governance_user_proposal_by_id(
+    Extension(state): Extension<Arc<AppState>>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    governance_by_id_response(&state, false, id).await
+}
+
+/// GET /admin/governance/node/proposals/{id}
+pub async fn governance_node_proposal_by_id(
+    Extension(state): Extension<Arc<AppState>>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    governance_by_id_response(&state, true, id).await
+}
+
+#[derive(Deserialize, Default)]
+pub struct WalletStatusQuery {
+    /// Comma-separated proposal IDs to report this wallet's vote on,
+    /// e.g. `1,2,3`. Empty/absent ⇒ `votes: {}`.
+    #[serde(default)]
+    pub proposal_ids: String,
+}
+
+/// GET /admin/governance/node/wallet-status?proposal_ids=1,2,3
+///
+/// The only wallet that matters here is the node's OWN
+/// `state.anchor_wallet_address` — there is no `?address=` param,
+/// unlike the superseded draft's design, because server-side signing
+/// (decision 1) means no other wallet could ever act on this
+/// dashboard's behalf.
+pub async fn governance_node_wallet_status(
+    Extension(state): Extension<Arc<AppState>>,
+    Query(params): Query<WalletStatusQuery>,
+) -> impl IntoResponse {
+    let Some(wallet) = state.anchor_wallet_address.clone() else {
+        return Json(serde_json::json!({
+            "wallet_address": null,
+            "is_registered_node": null,
+            "is_active": null,
+            "votes": {},
+            "error": "anchoring not enabled — no signing wallet available for governance actions",
+        }))
+        .into_response();
+    };
+    let http = &state.klever_view_http;
+    let url = &state.klever_node_url;
+    let addr = &state.contract_address;
+
+    // Reuses the SAME is_node_registered/is_node_paused wrappers
+    // already used for the anchoring-registration/pause-status
+    // handlers above — "is this wallet a registered, active node" is
+    // one concept, not a governance-specific reimplementation. `Err`
+    // (transport failure) degrades to "not active" rather than
+    // failing the whole response — the dashboard shows a disabled
+    // vote button with the RPC error still surfaced via the fields
+    // above being present-but-false, matching this file's existing
+    // "null/false on RPC failure, never a falsely-confident answer to
+    // the wrong side" convention used elsewhere (e.g. `node_metadata`).
+    let is_registered = crate::chain::sc_views::is_node_registered(http, url, addr, &wallet)
+        .await
+        .unwrap_or(false);
+    let is_paused = crate::chain::sc_views::is_node_paused(http, url, addr, &wallet)
+        .await
+        .unwrap_or(false);
+    let is_active = is_registered && !is_paused;
+
+    // Defensive cap mirrors this file's other bounded-input-list
+    // conventions (e.g. `get_node_metadata`'s MAX_RETURNED_ENTRIES) —
+    // an operator's dashboard only ever asks about one visible page
+    // of proposals at a time, so 64 is generous headroom, not a real
+    // limit in practice.
+    const MAX_WALLET_STATUS_IDS: usize = 64;
+    let ids: Vec<u64> = params
+        .proposal_ids
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| s.parse::<u64>().ok())
+        .take(MAX_WALLET_STATUS_IDS)
+        .collect();
+
+    // Fan out concurrently — sequential awaits here would let up to
+    // MAX_WALLET_STATUS_IDS (64) RPC round-trips serialize behind one
+    // another (worst case, at this file's per-call transport timeout,
+    // minutes for one dashboard request).
+    let vote_results = futures::future::join_all(ids.iter().map(|&id| {
+        crate::chain::sc_views::get_node_vote(http, url, addr, id, &wallet)
+    }))
+    .await;
+    let mut votes = serde_json::Map::with_capacity(ids.len());
+    for (id, result) in ids.iter().zip(vote_results) {
+        votes.insert(id.to_string(), serde_json::Value::from(result.unwrap_or(0)));
+    }
+
+    Json(serde_json::json!({
+        "wallet_address": wallet,
+        "is_registered_node": is_registered,
+        "is_active": is_active,
+        "votes": votes,
+    }))
+    .into_response()
+}
+
+/// TX-calldata encoding for a `bool` argument. **Different rule from
+/// any view-call bool encoding** (see the module doc + the plan's
+/// "argument encoding" section): klever-sc-codec top-encodes `true` as
+/// a single `0x01` byte and `false` as EMPTY bytes (verified directly
+/// against `klever-sc-codec` 0.19.0 source,
+/// `impl_for_types/impl_bool.rs`) — the SAME landmine class as the
+/// SC's `VOTE_OPPOSE` u8 marker (a stored `bool false` top-encodes to
+/// empty, which is exactly why votes are stored as u8 there, not
+/// bool). **DO NOT "fix" `false` to `"00"`** — that is wrong and will
+/// desync from what the SC actually decodes, silently breaking "vote
+/// against."
+fn encode_bool_calldata_arg(support: bool) -> &'static str {
+    if support {
+        "01"
+    } else {
+        ""
+    }
+}
+
+/// TX-calldata encoding for a `u64` argument: minimal big-endian
+/// bytes, `0` → EMPTY string. **A DIFFERENT rule from
+/// `sc_views.rs`'s `encode_u64_minimal_hex`**, which encodes `0` as
+/// `"00"` for VIEW-call arguments specifically (`/vm/query`/`/vm/hex`)
+/// — a different RPC context from TX calldata (`/transaction/send`'s
+/// `Data` field, `@`-separated). Do not merge these two encoders.
+fn encode_u64_calldata_arg(v: u64) -> String {
+    if v == 0 {
+        return String::new();
+    }
+    let trimmed = format!("{:016x}", v).trim_start_matches('0').to_string();
+    if trimmed.len() % 2 != 0 {
+        format!("0{trimmed}")
+    } else {
+        trimmed
+    }
+}
+
+/// TX-calldata encoding for a `BigUint` argument, given as a decimal
+/// string (arbitrary precision — a governance fee value can exceed
+/// u64). Parses via the SAME `sc_views::decimal_string_to_bytes_be`
+/// conversion used for the reverse (view-decode) direction in Phase 5
+/// — one tested BigUint⇄bytes conversion in this codebase, not two.
+/// `"0"` correctly round-trips to an empty hex string (minimal-BE
+/// encoding of zero), matching the TX-calldata zero rule.
+fn encode_biguint_calldata_arg(decimal: &str) -> Result<String, String> {
+    crate::chain::sc_views::decimal_string_to_bytes_be(decimal)
+        .map(hex::encode)
+        .map_err(|e| format!("invalid param_value: {e}"))
+}
+
+/// Shared submit path for all 3 node-track write endpoints. Mirrors
+/// `trigger_anchor`'s channel-send/reply-await shape, but ADDS an
+/// explicit timeout — `trigger_anchor`'s own await has none (an
+/// accepted, pre-existing risk on that endpoint, not retroactively
+/// fixed here), but these are user-facing form submissions where an
+/// indefinite hang is a materially worse UX than a clear timeout
+/// error, so the two endpoints are allowed to diverge on this point
+/// deliberately.
+async fn submit_governance_call(state: &AppState, call_data: String) -> Result<String, (StatusCode, String)> {
+    let Some(tx) = &state.governance_submit else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "anchoring not enabled — governance actions require a signing wallet".into(),
+        ));
+    };
+    // Duplicate-broadcast guard (audit follow-up): an entry present
+    // for this EXACT call_data means an identical submission was
+    // already successfully enqueued within the last 60s — reject the
+    // retry rather than risk broadcasting the same TX intent twice.
+    // `entry().or_insert()` is atomic, so two concurrent identical
+    // requests can't both observe "not present" and both proceed.
+    let entry = state
+        .governance_inflight
+        .entry(call_data.clone())
+        .or_insert(())
+        .await;
+    if !entry.is_fresh() {
+        return Err((
+            StatusCode::CONFLICT,
+            "an identical governance submission was already sent — wait before retrying".into(),
+        ));
+    }
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    // Single shared deadline covering BOTH the enqueue and the reply
+    // wait — the channel is bounded (capacity 4, see node.rs) and each
+    // queued request can itself take tens of seconds, so a `send()`
+    // that only starts timing out AFTER it completes would let queued-
+    // up concurrent callers block well past the 30s budget this
+    // function advertises.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    match tokio::time::timeout_at(
+        deadline,
+        tx.send(crate::chain::anchoring::GovernanceSubmitRequest {
+            call_data: call_data.clone(),
+            reply: reply_tx,
+        }),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => {
+            // Enqueue itself failed — this was never actually queued,
+            // so release the guard rather than block a legitimate
+            // immediate retry for 60s.
+            state.governance_inflight.invalidate(&call_data).await;
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "anchoring task not running".into(),
+            ));
+        }
+        Err(_) => {
+            state.governance_inflight.invalidate(&call_data).await;
+            return Err((
+                StatusCode::GATEWAY_TIMEOUT,
+                "timed out waiting to queue governance submission (anchoring task busy)".into(),
+            ));
+        }
+    }
+    // From here on the submission WAS successfully enqueued — the
+    // guard stays in place (TTL-bounded) even on a reply timeout,
+    // since the anchoring task may still broadcast it.
+    match tokio::time::timeout_at(deadline, reply_rx).await {
+        Ok(Ok(Ok(tx_hash))) => Ok(tx_hash),
+        Ok(Ok(Err(e))) => Err((StatusCode::BAD_GATEWAY, e)),
+        Ok(Err(_)) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "anchoring task dropped reply".into(),
+        )),
+        Err(_) => Err((
+            StatusCode::GATEWAY_TIMEOUT,
+            "timed out waiting for anchoring task to sign+broadcast".into(),
+        )),
+    }
+}
+
+/// v1 node-track votable-param set. **KEEP IN SYNC** with
+/// `smart-contract/src/node_governance.rs`'s `valid_keys` — the SC is
+/// the actual enforcement point (a mismatch here just means an
+/// operator sees a late `require!` failure instead of an early 400),
+/// but a stale list here is still a real UX bug worth avoiding.
+const NODE_GOVERNANCE_VALID_PARAM_KEYS: &[&str] = &["node_registration_fee"];
+
+/// Mirrors `smart-contract::node_governance::MIN_VOTING_PERIOD_SECONDS`
+/// / `MAX_VOTING_PERIOD_SECONDS` (604800..=2592000, 7-30 days). Kept in
+/// sync manually like `NODE_GOVERNANCE_VALID_PARAM_KEYS` above — the SC
+/// is the real enforcement point, this just gives an operator an early
+/// 400 instead of a late `require!` failure. **Do not copy the user
+/// track's bounds here** (86400..=604800, 1-7 days, see
+/// `governance.rs`) — an earlier version of this handler did exactly
+/// that by mistake, which would have silently accepted periods the SC
+/// rejects and rejected periods the SC allows.
+fn node_voting_period_in_range(secs: u64) -> bool {
+    const MIN: u64 = 604800;
+    const MAX: u64 = 2592000;
+    (MIN..=MAX).contains(&secs)
+}
+
+#[derive(Deserialize)]
+pub struct CreateNodeProposalRequest {
+    pub description: String,
+    pub param_key: String,
+    /// Decimal string — arbitrary precision, never parsed to a fixed
+    /// integer type before hitting `encode_biguint_calldata_arg`.
+    pub param_value: String,
+    pub voting_period_seconds: u64,
+}
+
+/// POST /admin/governance/node/create-proposal
+pub async fn governance_node_create_proposal(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(body): Json<CreateNodeProposalRequest>,
+) -> impl IntoResponse {
+    if body.description.len() > 512 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "description too long (max 512 bytes)" })),
+        )
+            .into_response();
+    }
+    if !NODE_GOVERNANCE_VALID_PARAM_KEYS.contains(&body.param_key.as_str()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "unsupported parameter key" })),
+        )
+            .into_response();
+    }
+    // `encode_biguint_calldata_arg` → `decimal_string_to_bytes_be` is
+    // O(n^2) in digit count (repeated-division algorithm). 100 digits
+    // is already far beyond any realistic KLV-denominated governance
+    // parameter — this bounds worst-case cost to a few microseconds
+    // while leaving no legitimate value unreachable.
+    if body.param_value.len() > 100 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "param_value too long (max 100 digits)" })),
+        )
+            .into_response();
+    }
+    // Node track's bounds (604800..=2592000, 7-30 days) are WIDER than
+    // the user track's (86400..=604800, 1-7 days, see governance.rs) —
+    // this is `create_node_proposal`, so it must validate against
+    // `node_governance::MIN/MAX_VOTING_PERIOD_SECONDS`, not the user
+    // track's. Mismatching these lets a client submit a period this
+    // handler accepts but `smart-contract`'s SC rejects (any value in
+    // 86400..604800), OR conversely reject periods the SC would have
+    // allowed (604800..2592000) with a wrong client-facing message.
+    if !node_voting_period_in_range(body.voting_period_seconds) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "voting_period_seconds must be between 604800 (7 days) and 2592000 (30 days)"
+            })),
+        )
+            .into_response();
+    }
+    let param_value_hex = match encode_biguint_calldata_arg(&body.param_value) {
+        Ok(h) => h,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": e }))).into_response()
+        }
+    };
+    let call_data = format!(
+        "createNodeProposal@{}@{}@{}@{}",
+        hex::encode(body.description.as_bytes()),
+        hex::encode(body.param_key.as_bytes()),
+        param_value_hex,
+        encode_u64_calldata_arg(body.voting_period_seconds),
+    );
+    match submit_governance_call(&state, call_data).await {
+        Ok(tx_hash) => Json(serde_json::json!({ "ok": true, "tx_hash": tx_hash })).into_response(),
+        Err((status, err)) => (status, Json(serde_json::json!({ "ok": false, "error": err }))).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct NodeVoteRequest {
+    pub proposal_id: u64,
+    pub support: bool,
+}
+
+/// POST /admin/governance/node/vote
+///
+/// `proposal_id` existence is NOT re-checked locally — the SC's own
+/// `require!` already covers it, and the TX cost of a doomed vote is
+/// the operator's own click, not a security issue (mirrors the plan's
+/// explicit reasoning for skipping this pre-check).
+pub async fn governance_node_vote(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(body): Json<NodeVoteRequest>,
+) -> impl IntoResponse {
+    if body.proposal_id == 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "proposal_id must be > 0" })),
+        )
+            .into_response();
+    }
+    let call_data = format!(
+        "nodeVote@{}@{}",
+        encode_u64_calldata_arg(body.proposal_id),
+        encode_bool_calldata_arg(body.support),
+    );
+    match submit_governance_call(&state, call_data).await {
+        Ok(tx_hash) => Json(serde_json::json!({ "ok": true, "tx_hash": tx_hash })).into_response(),
+        Err((status, err)) => (status, Json(serde_json::json!({ "ok": false, "error": err }))).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct ExecuteNodeProposalRequest {
+    pub proposal_id: u64,
+}
+
+/// POST /admin/governance/node/execute-proposal
+///
+/// No client-side "did this proposal really pass" pre-check — the SC
+/// enforces quorum/supermajority/expiry and will just revert if not
+/// met. The dashboard (Phase 7) disables the Execute button client-side
+/// using the already-fetched tally as a UX nicety; this handler mainly
+/// exists to be hit when that button IS enabled.
+pub async fn governance_node_execute_proposal(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(body): Json<ExecuteNodeProposalRequest>,
+) -> impl IntoResponse {
+    if body.proposal_id == 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "proposal_id must be > 0" })),
+        )
+            .into_response();
+    }
+    let call_data = format!(
+        "executeNodeProposal@{}",
+        encode_u64_calldata_arg(body.proposal_id)
+    );
+    match submit_governance_call(&state, call_data).await {
+        Ok(tx_hash) => Json(serde_json::json!({ "ok": true, "tx_hash": tx_hash })).into_response(),
+        Err((status, err)) => (status, Json(serde_json::json!({ "ok": false, "error": err }))).into_response(),
     }
 }
 
