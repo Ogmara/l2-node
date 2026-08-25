@@ -5,6 +5,97 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.116.0] - 2026-08-25
+
+Governance-dashboard-plan.md Phase 7: the dashboard Governance tab UI —
+the first real consumer of the REST endpoints built in Phase 6/0.115.0.
+Targets smart-contract 0.9.0, live on testnet (TX
+`102fae5b3e7774d9b51dd225539e17a204827bd22d8caf5cb0086557859a784e`).
+
+### Added
+
+- **New "Governance" tab in `api/dashboard.html`** — no browser-wallet-
+  connect flow anywhere in it; node-track write actions are signed
+  server-side by the anchoring task's own wallet (Phase 6's design),
+  so every write button is a plain `POST` + JSON body, never
+  `runScInvoke`.
+- **Voting-wallet banner** — `GET .../wallet-status?proposal_ids=` on
+  tab load, renders Active / Registered but Paused / Not Registered /
+  "governance actions unavailable" against `anchor_wallet_address`
+  (not `node_address` — distinct when a separate `[anchoring]
+  wallet_key` is configured).
+- **Node Proposals section** (primary, full read+write) — paginated
+  table (status filter, tally bar, quorum-progress bar reusing the
+  Storage tab's `disk-gauge` inline-SVG convention), row click opens a
+  detail panel with the full description, tally, quorum/supermajority
+  status, Vote For / Vote Against (disabled with a specific reason —
+  already voted for/against, not an active node, anchoring disabled,
+  or voting closed — whichever applies), and an Execute button
+  (enabled only when `!executed && quorum_met && supermajority_met &&
+  status !== 'open'`, mirroring the SC's own gate as a UX nicety, not
+  a security boundary — the SC re-checks and reverts otherwise). A
+  "+ New Proposal" form: description (≤512, server-enforced),
+  parameter (`<select>`, only `node_registration_fee` for v1 — a
+  one-line HTML change to add more later), numeric value, and a
+  7/14/21/30-day voting-period picker matching smart-contract 0.9.0's
+  actual `MIN/MAX_VOTING_PERIOD_SECONDS` (604800/2592000) — NOT the
+  plan doc's original 1/3/7-day picker, which described the node
+  track's PRE-hardening bounds before the Sybil-resistance rework
+  widened it to 7-30 days.
+- **User Proposals section** (secondary, read-only) — same table shape,
+  zero interactive controls, persistent note explaining this dashboard
+  only signs on the node track's behalf.
+- All new write flows show a visible "Submitting…" state — real network
+  latency now (server-side sign + broadcast can take a few seconds),
+  unlike the old client-signed design's instant local wallet prompt.
+
+### Verified
+
+- Extracted the embedded `<script>` block and ran `node --check` —
+  clean syntax.
+- Verified the new tab's HTML div-nesting is balanced (12 open / 12
+  close) via a small script, since `dashboard.html` is `include_str!`-
+  embedded with no Rust-side parsing to catch a malformed tag.
+- Smoke-tested against a throwaway local node instance: `cargo build`
+  clean, dashboard page serves the new tab, `wallet-status` correctly
+  reports `wallet_address: null` when anchoring isn't configured
+  (matches the banner's "unavailable" branch), all 8 governance
+  endpoints reachable and returning the expected JSON shapes.
+- Full functional round-trip (create/vote/execute against a real
+  registered+anchored node) deliberately NOT done in this session —
+  requires real testnet connectivity and an anchored node past the
+  7-day eligibility window; left to the operator against the live
+  fleet per this plan phase's own definition-of-done checklist.
+
+### Fixed (same-day Code Audit pass on the new tab)
+
+- **Pagination "Next" could hide proposals under a status filter** —
+  status filtering happens server-side AFTER paging a fixed-size
+  window, so a filtered page can be shorter than the page size even
+  when more matching rows exist further out; disabling "Next" based on
+  the returned page's length (instead of the server's raw `total`)
+  could strand an operator on page 1 with unseen open/failed/executed
+  proposals beyond it. Now compares `offset + page_size` against
+  `total` for both the Node and User Proposals tables.
+- **No in-flight guard on Vote For / Vote Against / Execute / Submit
+  Proposal** — a double-click could fire two overlapping requests;
+  the server's 60s duplicate-broadcast guard (0.115.0) prevented a
+  second on-chain action but its `409` could still land in the status
+  area AFTER the first call's success message, reading as a false
+  "it failed." All four buttons now disable for the duration of their
+  request and re-enable on error.
+- **Closing the detail panel didn't cancel its pending post-vote/
+  post-execute refresh** — a 4s-delayed re-render fired unconditionally,
+  silently reopening a panel the operator had already dismissed via
+  Close. Now checks the panel is still visible before repopulating it.
+- **Description length check used JS string length (UTF-16 code
+  units) where the server enforces UTF-8 BYTE length** — a non-ASCII
+  description (Cyrillic, CJK, emoji) well under 512 JS characters
+  could still exceed the server's 512-byte cap and be rejected with no
+  client-side warning. Now checks `TextEncoder`-computed byte length;
+  removed the char-counting `maxlength` attribute, which was actively
+  misleading in the same way.
+
 ## [0.115.0] - 2026-08-25
 
 Code Audit + Security Audit pass on 0.114.0's governance-dashboard-plan.md

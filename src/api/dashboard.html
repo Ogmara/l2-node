@@ -110,6 +110,7 @@ td { padding: 8px; border-bottom: 1px solid var(--border); }
   <button data-tab="messages">Messages</button>
   <button data-tab="alerts">Alerts</button>
   <button data-tab="anchoring">Anchoring</button>
+  <button data-tab="governance">Governance</button>
 </div>
 
 <div class="content">
@@ -392,6 +393,108 @@ td { padding: 8px; border-bottom: 1px solid var(--border); }
       </table>
     </div>
   </div>
+
+  <!-- GOVERNANCE TAB (Phase 7, governance-dashboard-plan.md). No
+       browser-wallet-connect flow anywhere in this tab — node-track
+       write actions are signed server-side by the anchoring task's
+       own wallet (smart-contract 0.9.0 + l2-node 0.115.0). -->
+  <div class="tab" id="tab-governance">
+    <div class="card" style="margin-bottom:16px">
+      <h3>Voting wallet</h3>
+      <div id="gov-wallet-banner" style="margin-top:8px;color:var(--fg2)">Loading…</div>
+    </div>
+
+    <!-- Node Proposals — primary, full read+write -->
+    <div class="card" style="margin-bottom:16px">
+      <h3>Node Proposals</h3>
+      <p style="color:var(--fg2);font-size:0.85em;margin-top:4px;line-height:1.4">
+        Voted on by registered, active nodes with a genuine anchoring
+        history (at least 7 days, snapshotted at proposal creation —
+        see the smart contract's node_governance module). Actions here
+        are signed by this node's own anchor wallet — no browser wallet
+        prompt.
+      </p>
+      <div style="margin-top:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <label style="color:var(--fg2);font-size:0.85em">Filter:</label>
+        <select id="gov-node-filter" onchange="govNodeOffset=0;loadNodeProposals()" style="background:var(--bg2);color:var(--fg);border:1px solid var(--border);border-radius:4px;padding:4px 8px;font-size:0.85em">
+          <option value="all">All</option>
+          <option value="open">Open</option>
+          <option value="closed">Closed (awaiting execute)</option>
+          <option value="failed">Failed</option>
+          <option value="executed">Executed</option>
+        </select>
+        <button onclick="showCreateNodeProposalForm()" style="margin-left:auto;background:var(--accent);color:#fff;border:none;padding:6px 14px;border-radius:4px;font-size:0.85em;cursor:pointer">+ New Proposal</button>
+      </div>
+      <table style="margin-top:12px"><thead><tr><th>ID</th><th>Description</th><th>Param</th><th>Tally</th><th>Quorum</th><th>Status</th></tr></thead><tbody id="gov-node-body"><tr><td colspan="6" style="color:var(--fg2)">Loading...</td></tr></tbody></table>
+      <div style="margin-top:10px;display:flex;gap:8px;align-items:center">
+        <button id="gov-node-prev" onclick="govNodePage(-1)" disabled style="background:transparent;border:1px solid var(--border);color:var(--fg2);padding:4px 12px;border-radius:4px;font-size:0.85em;cursor:pointer">‹ Prev</button>
+        <span id="gov-node-page-label" style="color:var(--fg2);font-size:0.85em">--</span>
+        <button id="gov-node-next" onclick="govNodePage(1)" disabled style="background:transparent;border:1px solid var(--border);color:var(--fg2);padding:4px 12px;border-radius:4px;font-size:0.85em;cursor:pointer">Next ›</button>
+      </div>
+    </div>
+
+    <!-- Create Node Proposal form — hidden until "+ New Proposal" -->
+    <div class="card" id="gov-create-card" style="margin-bottom:16px;display:none">
+      <h3>New Node Proposal</h3>
+      <table style="width:100%;margin-top:8px">
+        <tr>
+          <td style="color:var(--fg2);width:160px;vertical-align:top;padding-top:10px">Description</td>
+          <td>
+            <textarea id="gov-create-desc" rows="3" placeholder="What is this proposal for, and why? (max 512 bytes)" style="width:100%;background:var(--bg2);color:var(--fg);border:1px solid var(--border);border-radius:4px;padding:8px;font-family:var(--font);font-size:0.9em;resize:vertical"></textarea>
+          </td>
+        </tr>
+        <tr>
+          <td style="color:var(--fg2)">Parameter</td>
+          <td>
+            <select id="gov-create-param-key" style="background:var(--bg2);color:var(--fg);border:1px solid var(--border);border-radius:4px;padding:6px 8px;font-size:0.9em">
+              <option value="node_registration_fee">node_registration_fee</option>
+            </select>
+          </td>
+        </tr>
+        <tr>
+          <td style="color:var(--fg2)">New value</td>
+          <td><input id="gov-create-param-value" type="text" inputmode="numeric" placeholder="e.g. 150000000 (KLV, 6 decimals)" style="width:100%;max-width:320px;background:var(--bg2);color:var(--fg);border:1px solid var(--border);border-radius:4px;padding:6px 8px;font-size:0.9em;font-family:var(--mono)"></td>
+        </tr>
+        <tr>
+          <td style="color:var(--fg2)">Voting period</td>
+          <td>
+            <select id="gov-create-period" style="background:var(--bg2);color:var(--fg);border:1px solid var(--border);border-radius:4px;padding:6px 8px;font-size:0.9em">
+              <option value="7">7 days (minimum)</option>
+              <option value="14">14 days</option>
+              <option value="21">21 days</option>
+              <option value="30">30 days (maximum)</option>
+            </select>
+          </td>
+        </tr>
+      </table>
+      <div style="margin-top:12px">
+        <button id="gov-create-submit-btn" onclick="submitCreateNodeProposal()" style="background:var(--accent);color:#fff;border:none;padding:6px 16px;border-radius:4px;font-size:0.85em;cursor:pointer;font-weight:600">Submit Proposal</button>
+        <button onclick="hideCreateNodeProposalForm()" style="background:transparent;border:1px solid var(--border);color:var(--fg2);padding:6px 14px;border-radius:4px;font-size:0.85em;margin-left:8px;cursor:pointer">Cancel</button>
+        <span id="gov-create-status" style="margin-left:12px;color:var(--fg2)"></span>
+      </div>
+      <div id="gov-create-error" style="margin-top:8px;color:var(--red)"></div>
+    </div>
+
+    <!-- Proposal detail — hidden until a Node Proposals row is clicked -->
+    <div class="card" id="gov-detail-card" style="margin-bottom:16px;display:none"></div>
+
+    <!-- User Proposals — secondary, read-only -->
+    <div class="card">
+      <h3>User Proposals <span style="margin-left:10px;font-size:0.7em;padding:2px 10px;border-radius:10px;background:var(--border);color:var(--fg2);vertical-align:middle">read-only</span></h3>
+      <p style="color:var(--fg2);font-size:0.85em;margin-top:6px;line-height:1.4">
+        Read-only — governance write actions from this dashboard operate
+        on the node-voting track only. User-track proposals are voted
+        on by individually registered user wallets, which this
+        dashboard does not sign on behalf of.
+      </p>
+      <table style="margin-top:12px"><thead><tr><th>ID</th><th>Description</th><th>Param</th><th>Tally</th><th>Status</th></tr></thead><tbody id="gov-user-body"><tr><td colspan="5" style="color:var(--fg2)">Loading...</td></tr></tbody></table>
+      <div style="margin-top:10px;display:flex;gap:8px;align-items:center">
+        <button id="gov-user-prev" onclick="govUserPage(-1)" disabled style="background:transparent;border:1px solid var(--border);color:var(--fg2);padding:4px 12px;border-radius:4px;font-size:0.85em;cursor:pointer">‹ Prev</button>
+        <span id="gov-user-page-label" style="color:var(--fg2);font-size:0.85em">--</span>
+        <button id="gov-user-next" onclick="govUserPage(1)" disabled style="background:transparent;border:1px solid var(--border);color:var(--fg2);padding:4px 12px;border-radius:4px;font-size:0.85em;cursor:pointer">Next ›</button>
+      </div>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -525,6 +628,7 @@ document.getElementById('nav').addEventListener('click', (e) => {
   }
   if (e.target.dataset.tab === 'alerts') loadAlerts();
   if (e.target.dataset.tab === 'anchoring') loadAnchoring();
+  if (e.target.dataset.tab === 'governance') loadGovernance();
 });
 
 // ─── Theme Toggle ───────────────────────────────────────────────────
@@ -1599,6 +1703,384 @@ async function resumeNodeOnChain() {
     errorEl: document.getElementById('anch-pause-error'),
     postBroadcast: loadAnchoringPause,
   });
+}
+
+// ─── Governance Tab (Phase 7, governance-dashboard-plan.md) ─────────
+// No runScInvoke anywhere here — node-track write endpoints are
+// signed server-side by the anchoring task's own wallet (decision 1
+// of the plan). Every write action is a plain POST + JSON body.
+const GOV_PAGE_SIZE = 10;
+let govNodeOffset = 0;
+let govUserOffset = 0;
+let govNodeProposals = [];
+let govUserProposals = [];
+
+function govStatusBadge(status) {
+  const map = { open: ['var(--blue)', '#fff'], closed: ['var(--yellow)', '#000'], failed: ['var(--red)', '#fff'], executed: ['var(--green)', '#000'] };
+  const [bg, fg] = map[status] || ['var(--border)', 'var(--fg2)'];
+  return `<span class="badge" style="background:${bg};color:${fg}">${esc(status || '?')}</span>`;
+}
+
+function govTallyBar(support, oppose) {
+  const total = (support || 0) + (oppose || 0);
+  const pct = total > 0 ? (support / total) * 100 : 0;
+  return `<div class="disk-gauge-bar" style="height:16px">`
+    + `<div class="disk-gauge-fill" style="width:${pct.toFixed(1)}%;background:var(--green)"></div>`
+    + `</div><div style="font-size:0.75em;color:var(--fg2);margin-top:2px">${support || 0} for / ${oppose || 0} against</div>`;
+}
+
+function govQuorumBar(count, quorum) {
+  const pct = quorum > 0 ? Math.min(100, (count / quorum) * 100) : 0;
+  return `<div class="disk-gauge-bar" style="height:16px"><div class="disk-gauge-fill" style="width:${pct.toFixed(1)}%;background:var(--accent2)"></div></div>`
+    + `<div style="font-size:0.75em;color:var(--fg2);margin-top:2px">${count}/${quorum}</div>`;
+}
+
+function govTruncate(s, n) { return s && s.length > n ? s.slice(0, n) + '…' : (s || ''); }
+
+function loadGovernance() {
+  loadGovernanceWallet();
+  loadNodeProposals();
+  loadUserProposals();
+}
+
+async function loadGovernanceWallet() {
+  const el = document.getElementById('gov-wallet-banner');
+  try {
+    const resp = await fetch('/admin/governance/node/wallet-status?proposal_ids=');
+    const data = await resp.json();
+    if (data.wallet_address === null || data.wallet_address === undefined) {
+      el.innerHTML = `<span style="color:var(--fg2)">Governance actions unavailable — anchoring is not enabled on this node.</span>`;
+    } else if (data.is_active) {
+      el.innerHTML = `Voting as node: <span style="font-family:var(--mono)">${esc(data.wallet_address)}</span> — <span style="color:var(--green)">Active</span>`;
+    } else if (data.is_registered_node) {
+      el.innerHTML = `Voting as node: <span style="font-family:var(--mono)">${esc(data.wallet_address)}</span> — <span style="color:var(--yellow)">Registered but Paused</span>`;
+    } else {
+      el.innerHTML = `Voting as node: <span style="font-family:var(--mono)">${esc(data.wallet_address)}</span> — <span style="color:var(--red)">Not Registered</span>`;
+    }
+  } catch (e) {
+    el.innerHTML = `<span style="color:var(--red)">Failed to load wallet status: ${esc(e.message || e)}</span>`;
+  }
+}
+
+async function loadNodeProposals() {
+  const status = document.getElementById('gov-node-filter').value;
+  const body = document.getElementById('gov-node-body');
+  body.innerHTML = '<tr><td colspan="6" style="color:var(--fg2)">Loading...</td></tr>';
+  try {
+    const q = new URLSearchParams({ offset: govNodeOffset, limit: GOV_PAGE_SIZE, status });
+    const resp = await fetch('/admin/governance/node/proposals?' + q);
+    if (!resp.ok) { body.innerHTML = `<tr><td colspan="6" style="color:var(--red)">Failed to load (HTTP ${resp.status}).</td></tr>`; return; }
+    const data = await resp.json();
+    govNodeProposals = data.proposals || [];
+    if (!govNodeProposals.length) {
+      body.innerHTML = '<tr><td colspan="6" style="color:var(--fg2)">No proposals.</td></tr>';
+    } else {
+      body.innerHTML = govNodeProposals.map(p => `
+        <tr style="cursor:pointer" onclick="openGovDetail(${p.id})">
+          <td>${p.id}</td>
+          <td>${esc(govTruncate(p.description, 60))}</td>
+          <td style="font-family:var(--mono);font-size:0.85em">${esc(p.param_key)} → ${esc(p.param_value)}</td>
+          <td>${govTallyBar(p.vote_count, p.oppose_count)}</td>
+          <td>${govQuorumBar(p.vote_count, p.quorum)}</td>
+          <td>${govStatusBadge(p.status)}</td>
+        </tr>
+      `).join('');
+    }
+    document.getElementById('gov-node-page-label').textContent = `Offset ${govNodeOffset} (total ${data.total ?? '--'})`;
+    document.getElementById('gov-node-prev').disabled = govNodeOffset === 0;
+    // `total` is the RAW (unfiltered) on-chain proposal count — status
+    // filtering happens server-side AFTER paging, so a filtered page
+    // can be shorter than GOV_PAGE_SIZE even when more raw rows (and
+    // thus possibly more matching ones) exist beyond it. Comparing
+    // against `total` instead of this page's length is the only way
+    // to get "Next" right while a status filter is active.
+    document.getElementById('gov-node-next').disabled = (govNodeOffset + GOV_PAGE_SIZE) >= (data.total ?? 0);
+  } catch (e) {
+    body.innerHTML = `<tr><td colspan="6" style="color:var(--red)">Failed to load: ${esc(e.message || e)}</td></tr>`;
+  }
+}
+
+function govNodePage(dir) {
+  govNodeOffset = Math.max(0, govNodeOffset + dir * GOV_PAGE_SIZE);
+  loadNodeProposals();
+}
+
+async function loadUserProposals() {
+  const body = document.getElementById('gov-user-body');
+  body.innerHTML = '<tr><td colspan="5" style="color:var(--fg2)">Loading...</td></tr>';
+  try {
+    const q = new URLSearchParams({ offset: govUserOffset, limit: GOV_PAGE_SIZE, status: 'all' });
+    const resp = await fetch('/admin/governance/user/proposals?' + q);
+    if (!resp.ok) { body.innerHTML = `<tr><td colspan="5" style="color:var(--red)">Failed to load (HTTP ${resp.status}).</td></tr>`; return; }
+    const data = await resp.json();
+    govUserProposals = data.proposals || [];
+    if (!govUserProposals.length) {
+      body.innerHTML = '<tr><td colspan="5" style="color:var(--fg2)">No proposals.</td></tr>';
+    } else {
+      body.innerHTML = govUserProposals.map(p => `
+        <tr>
+          <td>${p.id}</td>
+          <td>${esc(govTruncate(p.description, 60))}</td>
+          <td style="font-family:var(--mono);font-size:0.85em">${esc(p.param_key)} → ${esc(p.param_value)}</td>
+          <td>${govTallyBar(p.vote_count, p.oppose_count)}</td>
+          <td>${govStatusBadge(p.status)}</td>
+        </tr>
+      `).join('');
+    }
+    document.getElementById('gov-user-page-label').textContent = `Offset ${govUserOffset} (total ${data.total ?? '--'})`;
+    document.getElementById('gov-user-prev').disabled = govUserOffset === 0;
+    document.getElementById('gov-user-next').disabled = (govUserOffset + GOV_PAGE_SIZE) >= (data.total ?? 0);
+  } catch (e) {
+    body.innerHTML = `<tr><td colspan="5" style="color:var(--red)">Failed to load: ${esc(e.message || e)}</td></tr>`;
+  }
+}
+
+function govUserPage(dir) {
+  govUserOffset = Math.max(0, govUserOffset + dir * GOV_PAGE_SIZE);
+  loadUserProposals();
+}
+
+// ─── Proposal detail panel ───────────────────────────────────────────
+async function openGovDetail(id) {
+  const card = document.getElementById('gov-detail-card');
+  card.style.display = '';
+  card.innerHTML = `<div style="color:var(--fg2)">Loading proposal #${id}…</div>`;
+  card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  try {
+    const [propResp, walletResp] = await Promise.all([
+      fetch(`/admin/governance/node/proposals/${id}`),
+      fetch(`/admin/governance/node/wallet-status?proposal_ids=${id}`),
+    ]);
+    if (!propResp.ok) { card.innerHTML = `<div style="color:var(--red)">Proposal not found.</div>`; return; }
+    const p = await propResp.json();
+    const wallet = walletResp.ok ? await walletResp.json() : null;
+    renderGovDetail(p, wallet);
+  } catch (e) {
+    card.innerHTML = `<div style="color:var(--red)">Failed to load proposal: ${esc(e.message || e)}</div>`;
+  }
+}
+
+function closeGovDetail() {
+  document.getElementById('gov-detail-card').style.display = 'none';
+}
+
+function renderGovDetail(p, wallet) {
+  const card = document.getElementById('gov-detail-card');
+  const myVote = wallet && wallet.votes ? wallet.votes[String(p.id)] : 0;
+  let voteButtons;
+  if (!wallet || wallet.wallet_address === null || wallet.wallet_address === undefined) {
+    voteButtons = `<span style="color:var(--fg2)">Governance actions unavailable — anchoring is not enabled on this node.</span>`;
+  } else if (!wallet.is_active) {
+    voteButtons = `<span style="color:var(--fg2)">This node is not an active registered node — voting disabled.</span>`;
+  } else if (myVote === 1) {
+    voteButtons = `<span style="color:var(--green)">Already voted: support</span>`;
+  } else if (myVote === 2) {
+    voteButtons = `<span style="color:var(--red)">Already voted: oppose</span>`;
+  } else if (p.status !== 'open') {
+    voteButtons = `<span style="color:var(--fg2)">Voting closed.</span>`;
+  } else {
+    voteButtons = `
+      <button onclick="submitNodeVote(${p.id}, true)" style="background:var(--green);color:#111;border:none;padding:6px 14px;border-radius:4px;font-size:0.85em;cursor:pointer;font-weight:600">Vote For</button>
+      <button onclick="submitNodeVote(${p.id}, false)" style="background:var(--red);color:#fff;border:none;padding:6px 14px;border-radius:4px;font-size:0.85em;cursor:pointer;margin-left:8px;font-weight:600">Vote Against</button>
+    `;
+  }
+  // Mirrors the SC's own gate (quorum_met && supermajority_met &&
+  // now >= expires_at) — client-side UX nicety only; the SC re-checks
+  // all three and will simply revert if this is somehow wrong.
+  const canExecute = !p.executed && p.quorum_met && p.supermajority_met && p.status !== 'open';
+  let executeBtn;
+  if (p.executed) {
+    executeBtn = `<span style="color:var(--green)">Already executed</span>`;
+  } else if (canExecute) {
+    executeBtn = `<button onclick="submitExecuteProposal(${p.id})" style="background:var(--accent);color:#fff;border:none;padding:6px 14px;border-radius:4px;font-size:0.85em;cursor:pointer">Execute</button>`;
+  } else if (p.status === 'open') {
+    executeBtn = `<span style="color:var(--fg2)">Not executable yet — voting still open.</span>`;
+  } else if (p.status === 'failed') {
+    executeBtn = `<span style="color:var(--fg2)">Not executable — proposal failed (quorum or supermajority not met before expiry).</span>`;
+  } else {
+    executeBtn = `<span style="color:var(--fg2)">Not executable yet.</span>`;
+  }
+
+  card.innerHTML = `
+    <div style="display:flex;justify-content:space-between;align-items:flex-start">
+      <h3>Proposal #${p.id} ${govStatusBadge(p.status)}</h3>
+      <button onclick="closeGovDetail()" style="background:transparent;border:1px solid var(--border);color:var(--fg2);padding:2px 10px;border-radius:4px;font-size:0.8em;cursor:pointer">Close</button>
+    </div>
+    <p style="margin-top:8px;line-height:1.5">${esc(p.description)}</p>
+    <table style="width:100%;margin-top:8px;font-size:0.9em">
+      <tr><td style="color:var(--fg2);width:160px">Parameter</td><td style="font-family:var(--mono)">${esc(p.param_key)} → ${esc(p.param_value)}</td></tr>
+      <tr><td style="color:var(--fg2)">Proposer</td><td style="font-family:var(--mono);word-break:break-all">${esc(p.proposer)}</td></tr>
+      <tr><td style="color:var(--fg2)">Created</td><td>${new Date(p.created_at * 1000).toLocaleString()}</td></tr>
+      <tr><td style="color:var(--fg2)">Voting ends</td><td>${new Date(p.expires_at * 1000).toLocaleString()}</td></tr>
+    </table>
+    <div style="margin-top:12px"><div class="label">Tally</div>${govTallyBar(p.vote_count, p.oppose_count)}</div>
+    <div style="margin-top:8px"><div class="label">Quorum (${p.quorum_met ? 'met' : 'not yet met'})</div>${govQuorumBar(p.vote_count, p.quorum)}</div>
+    <div style="margin-top:8px;font-size:0.85em;color:var(--fg2)">Supermajority (2× support vs oppose): ${p.supermajority_met ? 'met' : 'not yet met'}</div>
+    <div style="margin-top:14px">${voteButtons}</div>
+    <div style="margin-top:10px">${executeBtn}</div>
+    <div id="gov-detail-status" style="margin-top:8px;color:var(--fg2)"></div>
+    <div id="gov-detail-error" style="margin-top:4px;color:var(--red)"></div>
+  `;
+}
+
+// Guards the detail panel's Vote For / Vote Against / Execute buttons
+// against a double-click firing two overlapping requests — the server
+// already dedups an EXACT-duplicate submission for 60s (0.115.0's
+// governance_inflight cache), but that's a last-resort backstop, not
+// a substitute for the client not firing the second request at all
+// (and without this, the second call's 409 error text can land in
+// the status area AFTER the first call's success message, reading as
+// a false "it failed" to the operator).
+let govDetailActionInFlight = false;
+
+// Re-opening the detail panel after a vote/execute completes is a
+// convenience (shows the updated tally) — but if the operator already
+// clicked "Close" before the 4s delay elapsed, silently reopening a
+// panel they explicitly dismissed is surprising. Only repopulate it
+// if it's still visible; the proposals table refresh happens either way.
+function govMaybeReopenDetail(id) {
+  if (document.getElementById('gov-detail-card').style.display !== 'none') {
+    openGovDetail(id);
+  }
+  loadNodeProposals();
+}
+
+async function submitNodeVote(id, support) {
+  if (govDetailActionInFlight) return;
+  govDetailActionInFlight = true;
+  const card = document.getElementById('gov-detail-card');
+  const buttons = card.querySelectorAll('button');
+  buttons.forEach(b => b.disabled = true);
+  const statusEl = document.getElementById('gov-detail-status');
+  const errorEl = document.getElementById('gov-detail-error');
+  statusEl.textContent = 'Submitting…';
+  errorEl.textContent = '';
+  try {
+    const resp = await fetch('/admin/governance/node/vote', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ proposal_id: id, support }),
+    });
+    const data = await resp.json();
+    if (!resp.ok || !data.ok) {
+      statusEl.textContent = '';
+      errorEl.textContent = data.error || `Vote failed (HTTP ${resp.status}).`;
+      buttons.forEach(b => b.disabled = false);
+      govDetailActionInFlight = false;
+      return;
+    }
+    statusEl.textContent = `Vote broadcast (tx: ${data.tx_hash.slice(0, 10)}…)`;
+    setTimeout(() => { govDetailActionInFlight = false; govMaybeReopenDetail(id); }, 4000);
+  } catch (e) {
+    statusEl.textContent = '';
+    errorEl.textContent = 'Vote failed: ' + (e.message || e);
+    buttons.forEach(b => b.disabled = false);
+    govDetailActionInFlight = false;
+  }
+}
+
+async function submitExecuteProposal(id) {
+  if (govDetailActionInFlight) return;
+  govDetailActionInFlight = true;
+  const card = document.getElementById('gov-detail-card');
+  const buttons = card.querySelectorAll('button');
+  buttons.forEach(b => b.disabled = true);
+  const statusEl = document.getElementById('gov-detail-status');
+  const errorEl = document.getElementById('gov-detail-error');
+  statusEl.textContent = 'Submitting…';
+  errorEl.textContent = '';
+  try {
+    const resp = await fetch('/admin/governance/node/execute-proposal', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ proposal_id: id }),
+    });
+    const data = await resp.json();
+    if (!resp.ok || !data.ok) {
+      statusEl.textContent = '';
+      errorEl.textContent = data.error || `Execute failed (HTTP ${resp.status}).`;
+      buttons.forEach(b => b.disabled = false);
+      govDetailActionInFlight = false;
+      return;
+    }
+    statusEl.textContent = `Execute broadcast (tx: ${data.tx_hash.slice(0, 10)}…)`;
+    setTimeout(() => { govDetailActionInFlight = false; govMaybeReopenDetail(id); }, 4000);
+  } catch (e) {
+    statusEl.textContent = '';
+    errorEl.textContent = 'Execute failed: ' + (e.message || e);
+    buttons.forEach(b => b.disabled = false);
+    govDetailActionInFlight = false;
+  }
+}
+
+// ─── Create proposal form ────────────────────────────────────────────
+function showCreateNodeProposalForm() {
+  document.getElementById('gov-create-card').style.display = '';
+  document.getElementById('gov-create-card').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+function hideCreateNodeProposalForm() {
+  document.getElementById('gov-create-card').style.display = 'none';
+}
+
+// The server's 512 cap (admin.rs) is `body.description.len() > 512` —
+// a UTF-8 BYTE length, not a JS `.length` (UTF-16 code-unit) count.
+// For non-ASCII text (relevant given this project's 7-language i18n)
+// a string well under 512 JS characters can still exceed 512 bytes —
+// check bytes here so the client's rejection matches the server's.
+function utf8ByteLength(s) { return new TextEncoder().encode(s).length; }
+
+let govCreateActionInFlight = false;
+
+async function submitCreateNodeProposal() {
+  if (govCreateActionInFlight) return;
+  const description = document.getElementById('gov-create-desc').value.trim();
+  const paramKey = document.getElementById('gov-create-param-key').value;
+  const paramValue = document.getElementById('gov-create-param-value').value.trim();
+  const periodDays = parseInt(document.getElementById('gov-create-period').value, 10);
+  const statusEl = document.getElementById('gov-create-status');
+  const errorEl = document.getElementById('gov-create-error');
+  errorEl.textContent = '';
+  if (!description) { errorEl.textContent = 'Description is required.'; return; }
+  if (utf8ByteLength(description) > 512) { errorEl.textContent = 'Description must be 512 bytes or fewer (non-ASCII characters count as multiple bytes).'; return; }
+  // Server re-validates as the real gate (100-digit cap, non-negative
+  // decimal) — this is just an early, friendlier error.
+  if (!/^[0-9]+$/.test(paramValue) || paramValue.length > 100) {
+    errorEl.textContent = 'New value must be a non-negative whole number (no decimals, max 100 digits).';
+    return;
+  }
+  govCreateActionInFlight = true;
+  const submitBtn = document.getElementById('gov-create-submit-btn');
+  submitBtn.disabled = true;
+  statusEl.textContent = 'Submitting…';
+  try {
+    const resp = await fetch('/admin/governance/node/create-proposal', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        description,
+        param_key: paramKey,
+        param_value: paramValue,
+        voting_period_seconds: periodDays * 86400,
+      }),
+    });
+    const data = await resp.json();
+    if (!resp.ok || !data.ok) {
+      statusEl.textContent = '';
+      errorEl.textContent = data.error || `Create failed (HTTP ${resp.status}).`;
+      submitBtn.disabled = false;
+      govCreateActionInFlight = false;
+      return;
+    }
+    statusEl.textContent = `Proposal broadcast (tx: ${data.tx_hash.slice(0, 10)}…). Refreshing list…`;
+    document.getElementById('gov-create-desc').value = '';
+    document.getElementById('gov-create-param-value').value = '';
+    setTimeout(() => { govCreateActionInFlight = false; submitBtn.disabled = false; hideCreateNodeProposalForm(); statusEl.textContent = ''; govNodeOffset = 0; loadNodeProposals(); }, 4000);
+  } catch (e) {
+    statusEl.textContent = '';
+    errorEl.textContent = 'Create failed: ' + (e.message || e);
+    submitBtn.disabled = false;
+    govCreateActionInFlight = false;
+  }
 }
 
 // ─── Auth / Session ─────────────────────────────────────────────────
