@@ -1429,6 +1429,7 @@ impl Node {
             klever_network.clone(),
             self.config.dm.max_stored_messages_per_recipient,
             network_counters.clone(),
+            self.config.api.rate_limits.clone(),
         );
 
         // Start metrics collector (spec 10-dashboard.md §6)

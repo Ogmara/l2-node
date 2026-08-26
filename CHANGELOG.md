@@ -5,6 +5,49 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.122.0] - 2026-08-26
+
+Per-wallet rate limit rework (`docs/planning/l2-node-rate-limit-rework.md`).
+The news-post limit (5/hour) was flagged as unrealistic for real user
+activity; investigation found three defects beyond the number itself.
+
+### Added
+
+- `[api.rate_limits]` in `ogmara.toml`: operator-tunable `NewsPost` budgets
+  (`news_burst_unverified`, `news_burst_registered`, `news_daily_unverified`,
+  `news_daily_registered`). Out-of-range values clamp to a compiled maximum
+  (`MAX_NEWS_*` in `config.rs`) with a `tracing`-style warning rather than
+  aborting startup — enforcement is ingress-only (gossiped/synced messages
+  skip the limiter entirely), so an unclamped value would let one
+  misconfigured or hostile node become an unbounded spam ingress for the
+  whole mesh.
+- News-post limits are now tiered by on-chain registration: unverified
+  wallets get the lower tier, wallets that paid the ~4.4 KLV registration
+  fee get a materially higher one — previously registration bought no
+  extra volume at all, wasting a real anti-sybil signal. Chat messages and
+  reposts are tiered the same way (compiled constants, not configurable).
+
+### Changed
+
+- Rate limiting moved from a single fixed window per category to
+  independent burst + sustained windows (a request is limited if EITHER is
+  exceeded). Fixes the real usability problem: posting several items in a
+  row (breaking story, feed backlog) used to lock a wallet out for the
+  rest of the window even if it posted nothing else all day. Defaults:
+  unverified 5/10min burst + 50/day sustained; registered 20/10min burst +
+  300/day sustained.
+- The rate-limit rejection no longer increments the stored counter — only
+  accepted messages consume budget, so a retry storm against an exhausted
+  window can't inflate the count.
+
+### Fixed
+
+- `cleanup_rate_limits()` now evicts an entry only when BOTH its windows
+  are stale. With a single window this was one threshold check; extending
+  it to two without also extending the eviction condition would have
+  dropped entries whose sustained window was still live, silently
+  resetting that wallet's daily budget early.
+
 ## [0.121.0] - 2026-08-25
 
 Closes the two durability gaps left open by 0.119.0/0.120.0. Both are the same

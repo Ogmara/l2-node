@@ -69,6 +69,9 @@ impl AlertChannelDispatcher {
             klever_network.clone(),
             usize::MAX, // dm_recipient_cap — not applicable, this router never sends DMs
             counters,
+            // Alerts are ChatMessage envelopes (not NewsPost), so this
+            // router never consults the news-post tiering — default is fine.
+            crate::config::RateLimitsConfig::default(),
         );
         Self {
             router,

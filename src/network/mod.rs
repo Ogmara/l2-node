@@ -1051,6 +1051,7 @@ impl NetworkService {
             config.network_id().to_string(),
             dm_config.max_stored_messages_per_recipient,
             counters.clone(),
+            config.api.rate_limits.clone(),
         );
 
         let public_url = config.api.public_url.clone();

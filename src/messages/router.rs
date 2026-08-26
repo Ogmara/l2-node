@@ -31,13 +31,54 @@ use super::envelope::Envelope;
 use super::types::*;
 use super::validation;
 
-/// Per-user, per-category rate limit counters.
+/// Per-user, per-category rate limit counters (dual burst + sustained
+/// windows — rate-limit rework, l2-node 0.122.0). A request is limited if
+/// EITHER window is exceeded. For categories that don't distinguish burst
+/// from sustained, both windows carry the same (max, window_ms) pair
+/// (`RateLimits::flat`), making the pair redundant but behaviorally
+/// identical to the old single-window check.
 struct RateLimitEntry {
-    /// Message count in the current window.
-    count: u32,
-    /// Window start (Unix ms).
-    window_start: u64,
+    burst_count: u32,
+    burst_window_start: u64,
+    sustained_count: u32,
+    sustained_window_start: u64,
 }
+
+/// Resolved (max_count, window_ms) pair for both windows of a rate-limit
+/// check. See `RateCategory::limits`.
+#[derive(Debug, Clone, Copy)]
+struct RateLimits {
+    burst_max: u32,
+    burst_window_ms: u64,
+    sustained_max: u32,
+    sustained_window_ms: u64,
+}
+
+impl RateLimits {
+    /// A category with no burst/sustained distinction — both windows use
+    /// the same (max, window_ms), so the dual check degenerates to the
+    /// original single-window behavior.
+    const fn flat(max: u32, window_ms: u64) -> Self {
+        Self {
+            burst_max: max,
+            burst_window_ms: window_ms,
+            sustained_max: max,
+            sustained_window_ms: window_ms,
+        }
+    }
+}
+
+/// Burst window for `NewsPost` (10 minutes, both tiers).
+const NEWS_BURST_WINDOW_MS: u64 = 10 * 60_000;
+/// Sustained window for `NewsPost` (1 day, both tiers).
+const NEWS_SUSTAINED_WINDOW_MS: u64 = 86_400_000;
+
+/// TTL for the cached on-chain-registration lookup used by the rate
+/// limiter (`is_registered_cached`). Registration is a rare, monotonic
+/// transition (a wallet never un-registers), so a short TTL is enough to
+/// take the storage read off the hot path without meaningfully delaying a
+/// wallet's tier upgrade after it registers.
+const REGISTRATION_CACHE_TTL_MS: u64 = 60_000;
 
 /// Result of checking whether `address` is the creator of `channel_id`, distinguishing
 /// "not the creator" from "the channel doesn't exist locally yet" (audit final
@@ -67,20 +108,45 @@ enum RateCategory {
 }
 
 impl RateCategory {
-    /// (max_count, window_ms) per category.
-    fn limits(self) -> (u32, u64) {
+    /// Resolved rate limits for this category, tiered by on-chain
+    /// registration where the rate-limit rework plan calls for it (news
+    /// posts, chat messages, reposts — spec §2 Change A). `NewsPost` also
+    /// gets the dual burst/sustained treatment (Change B) using the
+    /// operator-configured, ceiling-clamped values from `ogmara.toml`
+    /// (Change C); every other category stays a compiled flat constant.
+    fn limits(self, registered: bool, rate_limits_config: &crate::config::RateLimitsConfig) -> RateLimits {
         match self {
-            Self::ChatMessages => (30, 60_000),
-            Self::NewsPost => (5, 3_600_000),
-            Self::Reaction => (60, 60_000),
-            Self::Repost => (10, 3_600_000),
-            Self::ChannelAdmin => (30, 3_600_000),
-            Self::ModeratorChange => (10, 86_400_000),
-            Self::ChannelInvite => (20, 3_600_000),
-            Self::PinUnpin => (20, 3_600_000),
+            Self::ChatMessages => {
+                RateLimits::flat(if registered { 60 } else { 30 }, 60_000)
+            }
+            Self::NewsPost => {
+                if registered {
+                    RateLimits {
+                        burst_max: rate_limits_config.news_burst_registered,
+                        burst_window_ms: NEWS_BURST_WINDOW_MS,
+                        sustained_max: rate_limits_config.news_daily_registered,
+                        sustained_window_ms: NEWS_SUSTAINED_WINDOW_MS,
+                    }
+                } else {
+                    RateLimits {
+                        burst_max: rate_limits_config.news_burst_unverified,
+                        burst_window_ms: NEWS_BURST_WINDOW_MS,
+                        sustained_max: rate_limits_config.news_daily_unverified,
+                        sustained_window_ms: NEWS_SUSTAINED_WINDOW_MS,
+                    }
+                }
+            }
+            Self::Reaction => RateLimits::flat(60, 60_000),
+            Self::Repost => {
+                RateLimits::flat(if registered { 30 } else { 10 }, 3_600_000)
+            }
+            Self::ChannelAdmin => RateLimits::flat(30, 3_600_000),
+            Self::ModeratorChange => RateLimits::flat(10, 86_400_000),
+            Self::ChannelInvite => RateLimits::flat(20, 3_600_000),
+            Self::PinUnpin => RateLimits::flat(20, 3_600_000),
             // Legit clients publish a 4 s-debounced last-write-wins vault; 10/min is
             // generous for that while bounding the 2 MB-per-write storage churn.
-            Self::KeyVault => (10, 60_000),
+            Self::KeyVault => RateLimits::flat(10, 60_000),
             // Audit final pre-mainnet W15: device (re)binding is a rare, manual user
             // action (setting up a new device, occasional key rotation) — not a
             // high-frequency pattern, unlike this previously fell into `Other`'s
@@ -90,7 +156,7 @@ impl RateCategory {
             // immediately superseded/revoked). 10/hour is generous for a user
             // configuring several devices in one sitting while cutting the abuse
             // ceiling ~600x (144,000/day → 240/day).
-            Self::DeviceEnc => (10, 3_600_000),
+            Self::DeviceEnc => RateLimits::flat(10, 3_600_000),
             // Audit final pre-mainnet Code Audit CRITICAL #1: ChannelLeave has no
             // `requires_verified_identity()` gate and previously fell into `Other`'s
             // 100/min, letting a single wallet mint up to 144,000/day
@@ -100,8 +166,8 @@ impl RateCategory {
             // node.rs). Real join/leave activity is bursty-but-rare per wallet; 20/hour
             // is generous headroom while capping worst-case growth at 480/day/wallet,
             // well under the reaper's throughput.
-            Self::ChannelMembership => (20, 3_600_000),
-            Self::Other => (100, 60_000),
+            Self::ChannelMembership => RateLimits::flat(20, 3_600_000),
+            Self::Other => RateLimits::flat(100, 60_000),
         }
     }
 
@@ -194,6 +260,17 @@ pub struct MessageRouter {
     identity: IdentityResolver,
     /// Per-user, per-category rate limit counters: "(address:category)" → entry.
     rate_limits: DashMap<String, RateLimitEntry>,
+    /// Operator-configured, ceiling-clamped `NewsPost` budgets
+    /// (`api.rate_limits` in `ogmara.toml`, rate-limit rework l2-node
+    /// 0.122.0). Other categories stay compiled constants — see
+    /// `RateCategory::limits`.
+    rate_limits_config: crate::config::RateLimitsConfig,
+    /// Short-TTL cache of the on-chain-registration tiering lookup
+    /// (`is_registered_cached`): "address" → (is_registered, cached_at_ms).
+    /// Takes the USERS-CF read off the hot path for every rate-limited
+    /// message — registration is rare and monotonic, so a 60s staleness
+    /// window is harmless (see `REGISTRATION_CACHE_TTL_MS`).
+    registration_cache: DashMap<String, (bool, u64)>,
     /// PoW anti-spam manager (None = PoW disabled).
     pow: Option<Arc<crate::pow::PowManager>>,
     /// This node's Klever network ("testnet"/"mainnet", from `config.network_id()`).
@@ -263,6 +340,7 @@ pub enum RouteResult {
 }
 
 impl MessageRouter {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         storage: Storage,
         identity: IdentityResolver,
@@ -270,11 +348,14 @@ impl MessageRouter {
         network: String,
         dm_recipient_cap: usize,
         counters: Arc<crate::metrics::counters::NetworkCounters>,
+        rate_limits_config: crate::config::RateLimitsConfig,
     ) -> Self {
         Self {
             storage,
             identity,
             rate_limits: DashMap::new(),
+            rate_limits_config,
+            registration_cache: DashMap::new(),
             pow,
             network,
             dm_recipient_cap,
@@ -404,26 +485,9 @@ impl MessageRouter {
         // on-chain registration for advanced features.
         if envelope.msg_type != MessageType::DeviceDelegation
             && envelope.msg_type.requires_verified_identity()
+            && !self.is_registered(&resolved_author)
         {
-            match self.storage.get_cf(
-                crate::storage::schema::cf::USERS,
-                resolved_author.as_bytes(),
-            ) {
-                Ok(Some(data)) => {
-                    // User exists — check if on-chain registered (registered_at > 0
-                    // means the chain scanner wrote this, not just a ProfileUpdate).
-                    let is_verified = serde_json::from_slice::<serde_json::Value>(&data)
-                        .ok()
-                        .and_then(|v| v.get("registered_at")?.as_u64())
-                        .map_or(false, |ts| ts > 0);
-                    if !is_verified {
-                        return RouteResult::Rejected(REGISTRATION_REQUIRED_REASON.into());
-                    }
-                }
-                _ => {
-                    return RouteResult::Rejected(REGISTRATION_REQUIRED_REASON.into());
-                }
-            }
+            return RouteResult::Rejected(REGISTRATION_REQUIRED_REASON.into());
         }
 
         // Step 4e: Proof-of-Work gate for unknown wallets.
@@ -471,7 +535,8 @@ impl MessageRouter {
         // Step 6: Rate limit by wallet address — skipped for synced messages
         if !is_sync && envelope.msg_type.requires_registration() {
             let category = RateCategory::from_msg_type(envelope.msg_type);
-            if self.is_rate_limited(&resolved_author, category, now_ms) {
+            let registered = self.is_registered_cached(&resolved_author, now_ms);
+            if self.is_rate_limited(&resolved_author, category, registered, now_ms) {
                 // Code Audit NOTE #6: `HighRateLimitTriggers` (W35) only
                 // observed HTTP-layer 429s (`GovernorLayer::error_handler`,
                 // W36) — this router-level, per-wallet-per-category limit is
@@ -933,40 +998,106 @@ impl MessageRouter {
     }
 
     /// Check if a user is rate-limited for a specific action category.
-    fn is_rate_limited(&self, author: &str, category: RateCategory, now_ms: u64) -> bool {
-        let (max_count, window_ms) = category.limits();
+    /// Applies both the burst and sustained windows (rate-limit rework,
+    /// l2-node 0.122.0) — a request is limited if EITHER window is already
+    /// at its cap. Does NOT increment the counters on a rejection, so a
+    /// retry storm against an exhausted budget cannot inflate the stored
+    /// count — only accepted messages consume budget.
+    fn is_rate_limited(
+        &self,
+        author: &str,
+        category: RateCategory,
+        registered: bool,
+        now_ms: u64,
+    ) -> bool {
+        let limits = category.limits(registered, &self.rate_limits_config);
         let key = format!("{}:{:?}", author, category);
 
-        let mut entry = self
-            .rate_limits
-            .entry(key)
-            .or_insert(RateLimitEntry {
-                count: 0,
-                window_start: now_ms,
-            });
+        let mut entry = self.rate_limits.entry(key).or_insert(RateLimitEntry {
+            burst_count: 0,
+            burst_window_start: now_ms,
+            sustained_count: 0,
+            sustained_window_start: now_ms,
+        });
 
-        // Reset window if expired
-        if now_ms.saturating_sub(entry.window_start) > window_ms {
-            entry.count = 0;
-            entry.window_start = now_ms;
+        // Reset each window independently if expired.
+        if now_ms.saturating_sub(entry.burst_window_start) > limits.burst_window_ms {
+            entry.burst_count = 0;
+            entry.burst_window_start = now_ms;
+        }
+        if now_ms.saturating_sub(entry.sustained_window_start) > limits.sustained_window_ms {
+            entry.sustained_count = 0;
+            entry.sustained_window_start = now_ms;
         }
 
-        entry.count = entry.count.saturating_add(1);
-        entry.count > max_count
+        if entry.burst_count >= limits.burst_max || entry.sustained_count >= limits.sustained_max {
+            return true;
+        }
+
+        entry.burst_count += 1;
+        entry.sustained_count += 1;
+        false
     }
 
-    /// Evict expired rate limit entries to prevent unbounded memory growth.
-    /// Should be called periodically (e.g., every few minutes).
+    /// Whether `author` (a wallet address) is on-chain registered
+    /// (`registered_at > 0` in the USERS record, written by the chain
+    /// scanner — not by a mere `ProfileUpdate`). Uncached direct storage
+    /// read — used by permission gates (step 4d, the `NewsEdit`
+    /// defense-in-depth check) where a stale "not yet registered" result
+    /// would incorrectly reject a message the wallet is now entitled to
+    /// send. For the rate-limiter's hot path, use `is_registered_cached`
+    /// instead.
+    fn is_registered(&self, author: &str) -> bool {
+        self.storage
+            .get_cf(crate::storage::schema::cf::USERS, author.as_bytes())
+            .ok()
+            .flatten()
+            .and_then(|data| serde_json::from_slice::<serde_json::Value>(&data).ok())
+            .and_then(|v| v.get("registered_at")?.as_u64())
+            .map_or(false, |ts| ts > 0)
+    }
+
+    /// Cached wrapper around `is_registered`, for the rate-limiter's tiering
+    /// lookup (Step 6 runs on every rate-limited message, unlike step 4d's
+    /// gate which only runs for the smaller set of `requires_verified_identity`
+    /// types). See `REGISTRATION_CACHE_TTL_MS`.
+    fn is_registered_cached(&self, author: &str, now_ms: u64) -> bool {
+        if let Some(entry) = self.registration_cache.get(author) {
+            let (registered, cached_at) = *entry;
+            if now_ms.saturating_sub(cached_at) < REGISTRATION_CACHE_TTL_MS {
+                return registered;
+            }
+        }
+        let registered = self.is_registered(author);
+        self.registration_cache
+            .insert(author.to_string(), (registered, now_ms));
+        registered
+    }
+
+    /// Evict expired rate limit / registration cache entries to prevent
+    /// unbounded memory growth. Should be called periodically (e.g., every
+    /// few minutes).
+    ///
+    /// Retains a `RateLimitEntry` while EITHER of its two windows is still
+    /// live — with a single window this was a one-line threshold, but
+    /// checking only one of the two independently-resetting windows here
+    /// would evict (and silently reset) a budget whose OTHER window is
+    /// still meaningfully populated (rate-limit rework, l2-node 0.122.0).
     pub fn cleanup_rate_limits(&self) {
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
 
-        // Use the largest window (86_400_000ms = 1 day) as the eviction threshold
+        // Largest window across all categories/tiers (NewsPost and
+        // ModeratorChange sustained windows are both 1 day).
+        const MAX_WINDOW_MS: u64 = 86_400_000;
         self.rate_limits.retain(|_, entry| {
-            now_ms.saturating_sub(entry.window_start) < 86_400_000
+            now_ms.saturating_sub(entry.burst_window_start) < MAX_WINDOW_MS
+                || now_ms.saturating_sub(entry.sustained_window_start) < MAX_WINDOW_MS
         });
+        self.registration_cache
+            .retain(|_, (_, cached_at)| now_ms.saturating_sub(*cached_at) < MAX_WINDOW_MS);
     }
 
     /// Validate the payload based on message type.
@@ -1621,18 +1752,8 @@ impl MessageRouter {
 
         // 6. For NewsEdit: defense-in-depth check (Step 4d already gates this,
         // but verify on-chain registration here too for edit-specific flow).
-        if envelope.msg_type == MessageType::NewsEdit {
-            let is_verified = self
-                .storage
-                .get_cf(schema::cf::USERS, resolved_author.as_bytes())
-                .ok()
-                .flatten()
-                .and_then(|data| serde_json::from_slice::<serde_json::Value>(&data).ok())
-                .and_then(|v| v.get("registered_at")?.as_u64())
-                .map_or(false, |ts| ts > 0);
-            if !is_verified {
-                return Err("news edits require on-chain registration".into());
-            }
+        if envelope.msg_type == MessageType::NewsEdit && !self.is_registered(resolved_author) {
+            return Err("news edits require on-chain registration".into());
         }
 
         Ok(())
@@ -3609,7 +3730,7 @@ mod enc_supersede_tests {
         let storage = Storage::open(dir.path()).unwrap();
         let identity = IdentityResolver::new(storage.clone());
         (
-            MessageRouter::new(storage, identity, None, "testnet".to_string(), usize::MAX, std::sync::Arc::new(crate::metrics::counters::NetworkCounters::new())),
+            MessageRouter::new(storage, identity, None, "testnet".to_string(), usize::MAX, std::sync::Arc::new(crate::metrics::counters::NetworkCounters::new()), crate::config::RateLimitsConfig::default()),
             dir,
         )
     }
@@ -3743,7 +3864,7 @@ mod enc_supersede_tests {
         let storage = Storage::open(dir.path()).unwrap();
         let identity = IdentityResolver::new(storage.clone());
         (
-            MessageRouter::new(storage, identity, None, "mainnet".to_string(), usize::MAX, std::sync::Arc::new(crate::metrics::counters::NetworkCounters::new())),
+            MessageRouter::new(storage, identity, None, "mainnet".to_string(), usize::MAX, std::sync::Arc::new(crate::metrics::counters::NetworkCounters::new()), crate::config::RateLimitsConfig::default()),
             dir,
         )
     }
@@ -3881,7 +4002,7 @@ mod cross_node_ban_kick_tests {
         let storage = Storage::open(dir.path()).unwrap();
         let identity = IdentityResolver::new(storage.clone());
         (
-            MessageRouter::new(storage, identity, None, "testnet".to_string(), usize::MAX, std::sync::Arc::new(crate::metrics::counters::NetworkCounters::new())),
+            MessageRouter::new(storage, identity, None, "testnet".to_string(), usize::MAX, std::sync::Arc::new(crate::metrics::counters::NetworkCounters::new()), crate::config::RateLimitsConfig::default()),
             dir,
         )
     }
@@ -4078,7 +4199,7 @@ mod channel_delete_before_create_tests {
         let storage = Storage::open(dir.path()).unwrap();
         let identity = IdentityResolver::new(storage.clone());
         (
-            MessageRouter::new(storage, identity, None, "testnet".to_string(), usize::MAX, std::sync::Arc::new(crate::metrics::counters::NetworkCounters::new())),
+            MessageRouter::new(storage, identity, None, "testnet".to_string(), usize::MAX, std::sync::Arc::new(crate::metrics::counters::NetworkCounters::new()), crate::config::RateLimitsConfig::default()),
             dir,
         )
     }
@@ -4315,7 +4436,7 @@ mod dm_reaction_tests {
         let storage = Storage::open(dir.path()).unwrap();
         let identity = IdentityResolver::new(storage.clone());
         (
-            MessageRouter::new(storage, identity, None, "testnet".to_string(), usize::MAX, std::sync::Arc::new(crate::metrics::counters::NetworkCounters::new())),
+            MessageRouter::new(storage, identity, None, "testnet".to_string(), usize::MAX, std::sync::Arc::new(crate::metrics::counters::NetworkCounters::new()), crate::config::RateLimitsConfig::default()),
             dir,
         )
     }
@@ -4560,7 +4681,7 @@ mod channel_mute_unmute_tests {
         let storage = Storage::open(dir.path()).unwrap();
         let identity = IdentityResolver::new(storage.clone());
         (
-            MessageRouter::new(storage, identity, None, "testnet".to_string(), usize::MAX, std::sync::Arc::new(crate::metrics::counters::NetworkCounters::new())),
+            MessageRouter::new(storage, identity, None, "testnet".to_string(), usize::MAX, std::sync::Arc::new(crate::metrics::counters::NetworkCounters::new()), crate::config::RateLimitsConfig::default()),
             dir,
         )
     }
@@ -4808,7 +4929,7 @@ mod edit_delete_index_tests {
         let storage = Storage::open(dir.path()).unwrap();
         let identity = IdentityResolver::new(storage.clone());
         (
-            MessageRouter::new(storage, identity, None, "testnet".to_string(), usize::MAX, std::sync::Arc::new(crate::metrics::counters::NetworkCounters::new())),
+            MessageRouter::new(storage, identity, None, "testnet".to_string(), usize::MAX, std::sync::Arc::new(crate::metrics::counters::NetworkCounters::new()), crate::config::RateLimitsConfig::default()),
             dir,
         )
     }
@@ -5160,7 +5281,7 @@ mod dm_recipient_cap_tests {
         let storage = Storage::open(dir.path()).unwrap();
         let identity = IdentityResolver::new(storage.clone());
         (
-            MessageRouter::new(storage, identity, None, "testnet".to_string(), cap, std::sync::Arc::new(crate::metrics::counters::NetworkCounters::new())),
+            MessageRouter::new(storage, identity, None, "testnet".to_string(), cap, std::sync::Arc::new(crate::metrics::counters::NetworkCounters::new()), crate::config::RateLimitsConfig::default()),
             dir,
         )
     }
@@ -5350,6 +5471,7 @@ mod rate_limit_counter_tests {
                 "testnet".to_string(),
                 usize::MAX,
                 counters.clone(),
+                crate::config::RateLimitsConfig::default(),
             ),
             dir,
             counters,
@@ -5416,6 +5538,180 @@ mod rate_limit_counter_tests {
             counters.snapshot().rate_limited_requests >= 1,
             "the router's own rate-limit rejection must increment the shared counter, \
              not just the HTTP-layer 429 path (Code Audit NOTE #6)"
+        );
+    }
+
+    fn router_with_rate_limits(
+        cfg: crate::config::RateLimitsConfig,
+    ) -> (MessageRouter, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let identity = IdentityResolver::new(storage.clone());
+        let counters = std::sync::Arc::new(crate::metrics::counters::NetworkCounters::new());
+        (
+            MessageRouter::new(
+                storage,
+                identity,
+                None,
+                "testnet".to_string(),
+                usize::MAX,
+                counters,
+                cfg,
+            ),
+            dir,
+        )
+    }
+
+    /// Rate-limit rework (l2-node 0.122.0): a burst of `burst_max` NewsPost
+    /// calls is allowed back-to-back, and the very next one is blocked.
+    #[test]
+    fn news_post_burst_allowed_then_blocked() {
+        let cfg = crate::config::RateLimitsConfig {
+            news_burst_unverified: 5,
+            news_daily_unverified: 50,
+            ..Default::default()
+        };
+        let (r, _dir) = router_with_rate_limits(cfg);
+        let author = "klv1burst";
+        let base = now_ms();
+
+        for i in 0..5 {
+            assert!(
+                !r.is_rate_limited(author, RateCategory::NewsPost, false, base + i),
+                "post {} within the burst allowance must be accepted",
+                i
+            );
+        }
+        assert!(
+            r.is_rate_limited(author, RateCategory::NewsPost, false, base + 5),
+            "the 6th post within the burst window must be rate limited"
+        );
+    }
+
+    /// The sustained (daily) cap blocks even while the burst window still
+    /// has room — the two checks are independent, not "burst OR sustained
+    /// whichever is larger" (rate-limit rework §2 Change B).
+    #[test]
+    fn news_post_sustained_cap_blocks_despite_burst_room() {
+        let cfg = crate::config::RateLimitsConfig {
+            news_burst_unverified: 100, // effectively unlimited for this test
+            news_daily_unverified: 3,
+            ..Default::default()
+        };
+        let (r, _dir) = router_with_rate_limits(cfg);
+        let author = "klv1sustained";
+        let base = now_ms();
+
+        for i in 0..3 {
+            assert!(
+                !r.is_rate_limited(author, RateCategory::NewsPost, false, base + i),
+                "post {} within the daily cap must be accepted",
+                i
+            );
+        }
+        assert!(
+            r.is_rate_limited(author, RateCategory::NewsPost, false, base + 3),
+            "the 4th post must be rejected by the sustained cap even though \
+             the burst window (100/10min) still has room"
+        );
+    }
+
+    /// Once the burst window elapses, its counter resets independently of
+    /// the sustained counter, which keeps accumulating across the rollover.
+    #[test]
+    fn news_post_burst_window_rollover_resets_only_burst_counter() {
+        let cfg = crate::config::RateLimitsConfig {
+            news_burst_unverified: 2,
+            news_daily_unverified: 100,
+            ..Default::default()
+        };
+        let (r, _dir) = router_with_rate_limits(cfg);
+        let author = "klv1rollover";
+        let base = now_ms();
+
+        assert!(!r.is_rate_limited(author, RateCategory::NewsPost, false, base));
+        assert!(!r.is_rate_limited(author, RateCategory::NewsPost, false, base + 1));
+        assert!(
+            r.is_rate_limited(author, RateCategory::NewsPost, false, base + 2),
+            "3rd post inside the same 10-min burst window must be blocked"
+        );
+
+        // Advance past the 10-minute burst window (NEWS_BURST_WINDOW_MS).
+        let after_rollover = base + NEWS_BURST_WINDOW_MS + 1;
+        assert!(
+            !r.is_rate_limited(author, RateCategory::NewsPost, false, after_rollover),
+            "a new burst window must allow posts again after rollover"
+        );
+    }
+
+    /// Change A: a registered (on-chain verified) wallet gets a materially
+    /// higher NewsPost budget than an unverified one, for the same category
+    /// and the same instant.
+    #[test]
+    fn news_post_registered_tier_gets_higher_budget() {
+        let (r, _dir, _counters) = router();
+        let unverified = "klv1unverified";
+        let registered = "klv1registered";
+        let base = now_ms();
+
+        // Default config: unverified burst = 5, registered burst = 20.
+        for i in 0..5 {
+            assert!(!r.is_rate_limited(unverified, RateCategory::NewsPost, false, base + i));
+        }
+        assert!(
+            r.is_rate_limited(unverified, RateCategory::NewsPost, false, base + 5),
+            "unverified wallet must be capped at the lower burst tier"
+        );
+
+        for i in 0..20 {
+            assert!(
+                !r.is_rate_limited(registered, RateCategory::NewsPost, true, base + i),
+                "registered post {} must be within the higher burst tier",
+                i
+            );
+        }
+        assert!(
+            r.is_rate_limited(registered, RateCategory::NewsPost, true, base + 20),
+            "registered wallet's 21st post must still hit its (higher) burst cap"
+        );
+    }
+
+    /// `cleanup_rate_limits` must retain an entry while EITHER window is
+    /// still live — evicting on the burst window alone would silently
+    /// reset a sustained-window budget that's still meaningfully populated
+    /// (the exact regression the rate-limit rework plan calls out as the
+    /// easiest place to introduce a bug, §2 Change B). Insert the entry
+    /// directly rather than driving it through `is_rate_limited`, so the
+    /// burst window is unambiguously stale (2 days old, in real wall-clock
+    /// terms) while the sustained window is fresh — `cleanup_rate_limits`
+    /// itself reads real `SystemTime::now()`, so the test data must too.
+    #[test]
+    fn cleanup_retains_entry_with_live_sustained_window_after_burst_expires() {
+        let (r, _dir, _counters) = router();
+        let author = "klv1cleanup";
+        let real_now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let two_days_ago = real_now.saturating_sub(2 * 86_400_000);
+
+        let key = format!("{}:{:?}", author, RateCategory::NewsPost);
+        r.rate_limits.insert(
+            key.clone(),
+            RateLimitEntry {
+                burst_count: 5,
+                burst_window_start: two_days_ago,
+                sustained_count: 40,
+                sustained_window_start: real_now,
+            },
+        );
+
+        r.cleanup_rate_limits();
+
+        assert!(
+            r.rate_limits.contains_key(&key),
+            "cleanup must NOT evict an entry whose sustained window is still \
+             live (now) just because its burst window is stale (2 days old)"
         );
     }
 }

@@ -1038,6 +1038,9 @@ pub struct ApiConfig {
     /// Admin API configuration.
     #[serde(default)]
     pub admin: AdminConfig,
+    /// Per-wallet message rate limits (news posts, l2-node 0.122.0+).
+    #[serde(default)]
+    pub rate_limits: RateLimitsConfig,
 }
 
 impl Default for ApiConfig {
@@ -1051,8 +1054,79 @@ impl Default for ApiConfig {
             trusted_proxies: Vec::new(),
             pow: PowConfig::default(),
             admin: AdminConfig::default(),
+            rate_limits: RateLimitsConfig::default(),
         }
     }
+}
+
+/// Compiled hard ceilings for `RateLimitsConfig` fields, enforced by
+/// `Config::validate()`. Enforcement of the underlying rate limits is
+/// ingress-only (`messages/router.rs` step 6 skips gossiped/synced
+/// messages entirely — see `docs/planning/l2-node-rate-limit-rework.md`
+/// §1.5), so the network's effective limit is already whatever the most
+/// permissive reachable node allows. Without a compiled ceiling, a
+/// misconfigured or hostile node's config value alone would determine the
+/// mesh-wide spam ceiling. Set at ~10x the shipped defaults: generous
+/// headroom for an operator tuning a busy community, still bounded. Lives
+/// here (not in `messages::router`) because the `lib` target (integration
+/// tests) compiles `config` but not `messages`.
+pub const MAX_NEWS_BURST_UNVERIFIED: u32 = 50;
+pub const MAX_NEWS_BURST_REGISTERED: u32 = 100;
+pub const MAX_NEWS_DAILY_UNVERIFIED: u32 = 500;
+pub const MAX_NEWS_DAILY_REGISTERED: u32 = 2_000;
+
+/// Per-wallet message rate limits (l2-node 0.122.0+, rate-limit rework).
+///
+/// Covers the `NewsPost` category's dual burst/sustained budget, tiered by
+/// on-chain registration (`docs/planning/l2-node-rate-limit-rework.md`).
+/// Other rate-limited categories (chat, reactions, channel admin, ...) are
+/// NOT configurable here — see `RateCategory::limits` in
+/// `messages/router.rs` — because enforcement is ingress-only (§1.5 of the
+/// plan): a gossiped/synced message skips the limiter entirely, so any
+/// configurable value MUST be clamped to a compiled hard ceiling
+/// (`MAX_NEWS_*`, defined above) or a single misconfigured/hostile
+/// node becomes an unbounded spam ingress for the whole mesh. Out-of-range
+/// values are clamped with an `eprintln!` warning at config-load (validation
+/// runs before the tracing subscriber is initialized), not rejected —
+/// a node stuck in a crash loop over a rate limit is worse than a clamped one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateLimitsConfig {
+    /// News posts allowed per 10-minute burst window, unverified wallets.
+    #[serde(default = "default_news_burst_unverified")]
+    pub news_burst_unverified: u32,
+    /// News posts allowed per 10-minute burst window, on-chain registered wallets.
+    #[serde(default = "default_news_burst_registered")]
+    pub news_burst_registered: u32,
+    /// News posts allowed per rolling day, unverified wallets.
+    #[serde(default = "default_news_daily_unverified")]
+    pub news_daily_unverified: u32,
+    /// News posts allowed per rolling day, on-chain registered wallets.
+    #[serde(default = "default_news_daily_registered")]
+    pub news_daily_registered: u32,
+}
+
+impl Default for RateLimitsConfig {
+    fn default() -> Self {
+        Self {
+            news_burst_unverified: default_news_burst_unverified(),
+            news_burst_registered: default_news_burst_registered(),
+            news_daily_unverified: default_news_daily_unverified(),
+            news_daily_registered: default_news_daily_registered(),
+        }
+    }
+}
+
+fn default_news_burst_unverified() -> u32 {
+    5
+}
+fn default_news_burst_registered() -> u32 {
+    20
+}
+fn default_news_daily_unverified() -> u32 {
+    50
+}
+fn default_news_daily_registered() -> u32 {
+    300
 }
 
 /// Proof-of-Work anti-spam configuration.
@@ -2411,6 +2485,51 @@ impl Config {
             );
             self.api.pow.difficulty = MAX_POW_DIFFICULTY;
         }
+        // Rate-limit rework (l2-node 0.122.0): news-post budgets are
+        // operator-configurable but enforcement is ingress-only (a
+        // gossiped/synced message skips the limiter — see
+        // `messages/router.rs` step 6), so the network's effective limit is
+        // already whatever the most permissive reachable node allows. A
+        // config value above the compiled ceiling would turn one
+        // misconfigured or hostile node into an unbounded spam ingress for
+        // the whole mesh. SOFT clamp + warn, matching the PoW-difficulty
+        // clamp above — a node stuck in a crash loop over a rate limit is
+        // worse than a clamped one.
+        macro_rules! clamp_rate_limit {
+            ($field:ident, $max:expr, $label:literal) => {
+                if self.api.rate_limits.$field > $max {
+                    eprintln!(
+                        "[config] api.rate_limits.{} ({}) exceeds the compiled maximum \
+                         ({}) for {}; clamping.",
+                        stringify!($field),
+                        self.api.rate_limits.$field,
+                        $max,
+                        $label,
+                    );
+                    self.api.rate_limits.$field = $max;
+                }
+            };
+        }
+        clamp_rate_limit!(
+            news_burst_unverified,
+            MAX_NEWS_BURST_UNVERIFIED,
+            "unverified news-post bursts"
+        );
+        clamp_rate_limit!(
+            news_burst_registered,
+            MAX_NEWS_BURST_REGISTERED,
+            "registered news-post bursts"
+        );
+        clamp_rate_limit!(
+            news_daily_unverified,
+            MAX_NEWS_DAILY_UNVERIFIED,
+            "unverified daily news posts"
+        );
+        clamp_rate_limit!(
+            news_daily_registered,
+            MAX_NEWS_DAILY_REGISTERED,
+            "registered daily news posts"
+        );
         // Trusted-proxy CIDRs (v0.42). Parse-validate each entry at
         // load time; HARD reject on first malformed entry. Silently
         // dropping a bad CIDR would flip the security model: an
@@ -2653,6 +2772,22 @@ enabled = true
 dashboard = true
 admin_wallets = []
 session_ttl_hours = 24
+
+[api.rate_limits]
+# Per-wallet news-post budgets (l2-node 0.122.0+, rate-limit rework). Two
+# windows apply together: a short burst allowance so posting several items
+# in a row (breaking story, feed backlog) doesn't lock you out, and a daily
+# sustained cap that bounds total volume. Registered = on-chain verified
+# wallet (paid the registration fee, a real anti-sybil signal); unverified
+# wallets get the lower tier. Values are clamped to a compiled maximum (see
+# MAX_NEWS_* in config.rs) — enforcement is ingress-only, so an
+# unbounded value here would make this node an unbounded spam source for
+# the whole mesh once its posts propagate. Other rate-limited categories
+# (chat, reactions, channel admin, ...) are not configurable.
+news_burst_unverified = 5   # per 10 min
+news_burst_registered = 20  # per 10 min
+news_daily_unverified = 50  # per day
+news_daily_registered = 300 # per day
 
 [storage]
 engine = "rocksdb"
@@ -3376,6 +3511,36 @@ mod tests {
         assert!(format!("{:?}", err).contains("trusted_proxies"));
     }
 
+    // --- Rate-limit rework (l2-node 0.122.0) ------------------------
+
+    #[test]
+    fn validate_clamps_rate_limits_above_compiled_ceiling_instead_of_rejecting() {
+        let mut c = baseline_config();
+        c.api.rate_limits.news_burst_unverified = MAX_NEWS_BURST_UNVERIFIED + 1000;
+        c.api.rate_limits.news_burst_registered = MAX_NEWS_BURST_REGISTERED + 1000;
+        c.api.rate_limits.news_daily_unverified = MAX_NEWS_DAILY_UNVERIFIED + 1000;
+        c.api.rate_limits.news_daily_registered = MAX_NEWS_DAILY_REGISTERED + 1000;
+
+        c.validate()
+            .expect("an out-of-range rate limit must clamp, never abort startup");
+
+        assert_eq!(c.api.rate_limits.news_burst_unverified, MAX_NEWS_BURST_UNVERIFIED);
+        assert_eq!(c.api.rate_limits.news_burst_registered, MAX_NEWS_BURST_REGISTERED);
+        assert_eq!(c.api.rate_limits.news_daily_unverified, MAX_NEWS_DAILY_UNVERIFIED);
+        assert_eq!(c.api.rate_limits.news_daily_registered, MAX_NEWS_DAILY_REGISTERED);
+    }
+
+    #[test]
+    fn validate_leaves_in_range_rate_limits_untouched() {
+        let mut c = baseline_config();
+        c.api.rate_limits = RateLimitsConfig::default();
+        c.validate().unwrap();
+        assert_eq!(c.api.rate_limits.news_burst_unverified, 5);
+        assert_eq!(c.api.rate_limits.news_burst_registered, 20);
+        assert_eq!(c.api.rate_limits.news_daily_unverified, 50);
+        assert_eq!(c.api.rate_limits.news_daily_registered, 300);
+    }
+
     #[test]
     fn validate_rejects_oversized_prefix() {
         let mut c = baseline_config();
@@ -3499,6 +3664,7 @@ mod tests {
             "[api]",
             "[api.pow]",
             "[api.admin]",
+            "[api.rate_limits]",
             "[storage]",
             "[cache]",
             "[dm]",
