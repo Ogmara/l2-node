@@ -529,6 +529,72 @@ fn enrich_message_json(msg: &mut serde_json::Value, storage: &crate::storage::ro
     }
 }
 
+/// Enrich a `NewsRepost` item with a preview of the original post it
+/// references — the repost's own payload only carries `original_id` /
+/// `original_author` / an optional quote `comment`, none of which is a
+/// title or body, so without this a repost card has nothing to render but
+/// its header and action row (empty-looking, no link back to what was
+/// reposted). Mirrors the `NewsComment` "parent context" enrichment in
+/// `list_news` below. A missing, undecodable, deleted, or no-longer-visible
+/// original degrades to `original_available: false` rather than leaking
+/// content the caller shouldn't see or panicking on a dangling reference.
+fn enrich_repost_json(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    envelope: &crate::messages::envelope::Envelope,
+    state: &AppState,
+    caller: Option<&str>,
+) {
+    let Ok(payload) = rmp_serde::from_slice::<crate::messages::types::NewsRepostPayload>(&envelope.payload) else {
+        return;
+    };
+    map.insert("original_id".into(), serde_json::json!(hex::encode(payload.original_id)));
+    if let Some(comment) = &payload.comment {
+        map.insert("repost_comment".into(), serde_json::json!(comment));
+    }
+
+    let Ok(Some(orig_bytes)) = state.storage.get_message(&payload.original_id) else {
+        map.insert("original_available".into(), serde_json::json!(false));
+        return;
+    };
+    let Ok(orig_env) = rmp_serde::from_slice::<crate::messages::envelope::Envelope>(&orig_bytes) else {
+        map.insert("original_available".into(), serde_json::json!(false));
+        return;
+    };
+    let orig_author = state
+        .identity
+        .resolve(&orig_env.author)
+        .unwrap_or_else(|_| orig_env.author.clone());
+    if !news_item_visible(&state.storage, &state.identity, &orig_env, &orig_author, caller) {
+        map.insert("original_available".into(), serde_json::json!(false));
+        return;
+    }
+
+    map.insert("original_available".into(), serde_json::json!(true));
+    map.insert("original_author".into(), serde_json::json!(orig_author));
+    if state.storage.is_deleted(&payload.original_id).unwrap_or(false) {
+        map.insert("original_deleted".into(), serde_json::json!(true));
+        return;
+    }
+    if let Ok(orig_payload) =
+        rmp_serde::from_slice::<crate::messages::types::NewsPostPayload>(&orig_env.payload)
+    {
+        if !orig_payload.title.is_empty() {
+            map.insert("original_title".into(), serde_json::json!(orig_payload.title));
+        }
+        map.insert("original_content".into(), serde_json::json!(orig_payload.content));
+        if let Some(att) = orig_payload.attachments.first() {
+            map.insert(
+                "original_attachment".into(),
+                serde_json::json!({
+                    "cid": att.cid,
+                    "mime_type": att.mime_type,
+                    "thumbnail_cid": att.thumbnail_cid,
+                }),
+            );
+        }
+    }
+}
+
 // --- Query parameters ---
 
 #[derive(Debug, Deserialize)]
@@ -2340,6 +2406,10 @@ pub async fn list_news(
                                     .and_then(|v| v.as_str())
                                     .map(|s| s == "NewsComment")
                                     .unwrap_or(false);
+                                let is_repost = map.get("msg_type")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s == "NewsRepost")
+                                    .unwrap_or(false);
 
                                 // Enrich all feed items with engagement counts
                                 let reactions = state.storage.get_news_reactions(&msg_id).unwrap_or_default();
@@ -2388,6 +2458,10 @@ pub async fn list_news(
                                             }
                                         }
                                     }
+                                }
+
+                                if is_repost {
+                                    enrich_repost_json(map, &envelope, &state, caller);
                                 }
                             }
                             enrich_message_json(&mut post, &state.storage);
@@ -2474,6 +2548,14 @@ pub async fn get_news_post(
             "comment_count".into(),
             serde_json::json!(state.storage.get_comment_count(&msg_id).unwrap_or(0)),
         );
+
+        let is_repost = map.get("msg_type")
+            .and_then(|v| v.as_str())
+            .map(|s| s == "NewsRepost")
+            .unwrap_or(false);
+        if is_repost {
+            enrich_repost_json(map, &envelope, &state, caller);
+        }
     }
     enrich_message_json(&mut post, &state.storage);
 
@@ -3716,6 +3798,15 @@ pub async fn list_bookmarks(
                     >(&envelope_bytes)
                     {
                         let mut bm = envelope_to_json(&envelope, &state.identity);
+                        if let serde_json::Value::Object(ref mut map) = bm {
+                            let is_repost = map.get("msg_type")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s == "NewsRepost")
+                                .unwrap_or(false);
+                            if is_repost {
+                                enrich_repost_json(map, &envelope, &state, Some(auth_user.address.as_str()));
+                            }
+                        }
                         enrich_message_json(&mut bm, &state.storage);
                         bookmarks.push(bm);
                     }
@@ -6311,6 +6402,14 @@ pub async fn get_user_posts(
                         "comment_count".into(),
                         serde_json::json!(state.storage.get_comment_count(&msg_id).unwrap_or(0)),
                     );
+
+                    let is_repost = map.get("msg_type")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s == "NewsRepost")
+                        .unwrap_or(false);
+                    if is_repost {
+                        enrich_repost_json(map, &envelope, &state, caller);
+                    }
                 }
                 posts.push(post);
             }

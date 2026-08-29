@@ -5,7 +5,34 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.122.0] - 2026-08-26
+## [0.122.1] - 2026-08-28
+
+### Fixed
+
+- **Reposts rendered as empty cards in every client (web, desktop, mobile).**
+  `list_news`, `get_news_post`, `get_user_posts`, and `list_bookmarks` all
+  serialized a `NewsRepost` item as its raw envelope — `msg_type`,
+  `author`, `payload` — with no enrichment. The payload itself only carries
+  `{original_id, original_author, comment}`: no title, no body. Clients
+  decode `payload` expecting a `NewsPost` shape (`title`/`content`), so a
+  repost card had nothing to show but its header and action row.
+  `NewsComment` gets an equivalent "parent context" enrichment
+  (`parent_post_id`/`parent_author`/`parent_title`) in `list_news`; reposts
+  had no counterpart anywhere, including in the two endpoints
+  (`get_news_post`, `get_user_posts`) that never got the comment enrichment
+  either.
+
+  Added `enrich_repost_json` (`src/api/routes.rs`), wired into all four
+  endpoints: resolves the reposted post and adds `original_id`,
+  `original_author`, `original_title`, `original_content`,
+  `original_attachment` (first attachment, for a thumbnail), and the
+  repost's own optional quote-comment as `repost_comment`. A deleted,
+  unresolvable, or not-visible-to-the-caller original degrades to
+  `original_available: false` (reuses `news_item_visible`'s existing
+  Followers-only gating) rather than leaking content or 500ing on a
+  dangling reference.
+
+
 
 Per-wallet rate limit rework (`docs/planning/l2-node-rate-limit-rework.md`).
 The news-post limit (5/hour) was flagged as unrealistic for real user
