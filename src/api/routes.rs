@@ -6353,12 +6353,27 @@ pub async fn get_user_posts(
 
     // Skip entries for pagination (page-based offset)
     let skip = ((page.saturating_sub(1)) as usize) * limit;
-    let fetch_limit = skip + limit;
 
-    match state.storage.prefix_iter_cf(cf::NEWS_BY_AUTHOR, &prefix, fetch_limit) {
+    // `total` must reflect every visible post the author has, not just the
+    // requested page. Deletion is a marker in a separate CF (DELETION_MARKERS)
+    // rather than a removal from MESSAGES or NEWS_BY_AUTHOR — per spec, a
+    // deleted post still counts and still appears in the page, just as a
+    // `{ deleted: true }` placeholder (`enrich_message_json` blanks the
+    // payload) — so deleted posts are *supposed* to be included here, same as
+    // the page below. The one real exclusion is Followers-only posts hidden
+    // from a non-follower caller (`news_item_visible`), which does require a
+    // decode to evaluate. So: walk the full prefix (capped like the
+    // codebase's other full-author scans, e.g. the AllUserContent deletion
+    // `PAGE = 10_000`), resolving+decoding every entry to know if it's really
+    // visible, but only pay the expensive per-post enrichment (reactions/
+    // repost/comment counts) for the entries that land in the requested page.
+    const TOTAL_SCAN_CAP: usize = 10_000;
+
+    match state.storage.prefix_iter_cf(cf::NEWS_BY_AUTHOR, &prefix, TOTAL_SCAN_CAP) {
         Ok(entries) => {
             let mut posts = Vec::with_capacity(limit);
-            for (key, _) in entries.into_iter().skip(skip) {
+            let mut visible_count: usize = 0;
+            for (key, _) in entries.into_iter() {
                 // Key layout: author_bytes + 0xFF + !timestamp(8) + msg_id(32)
                 if key.len() < prefix.len() + 8 + 32 {
                     continue;
@@ -6369,7 +6384,9 @@ pub async fn get_user_posts(
                     Err(_) => continue,
                 };
 
-                // Fetch envelope
+                // Fetch envelope — missing means a genuinely absent/corrupt
+                // entry, not a deletion (deletions are markers, handled below
+                // via enrich_message_json, and still count/display).
                 let envelope_bytes = match state.storage.get_message(&msg_id) {
                     Ok(Some(bytes)) => bytes,
                     _ => continue,
@@ -6381,6 +6398,12 @@ pub async fn get_user_posts(
                     Err(_) => continue,
                 };
                 if !news_item_visible(&state.storage, &state.identity, &envelope, &resolved, caller) {
+                    continue;
+                }
+
+                let index = visible_count;
+                visible_count += 1;
+                if index < skip || index >= skip + limit {
                     continue;
                 }
 
@@ -6414,10 +6437,9 @@ pub async fn get_user_posts(
                 posts.push(post);
             }
 
-            let total = posts.len();
             Json(serde_json::json!({
                 "posts": posts,
-                "total": total,
+                "total": visible_count,
                 "page": page,
             }))
             .into_response()

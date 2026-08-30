@@ -5,6 +5,27 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.122.2] - 2026-08-30
+
+### Fixed
+
+- **`GET /api/v1/users/{address}/posts` returned `"total"` equal to
+  `posts.len()` of the fetched, `limit`-capped page** — never the author's
+  real post count. A user with more posts than the caller's `limit` (mobile
+  defaults to 20, web/desktop to 50) always saw the profile "Posts" stat
+  stuck at exactly that cap, worse on mobile since its default limit is
+  lower. Reported as: mobile profile showing "20 Posts" for an address web/
+  desktop showed "50 Posts" for — both were wrong, just capped at different
+  ceilings. Fixed `get_user_posts` to compute the real `total` from a full
+  scan of the author's `NEWS_BY_AUTHOR` prefix (capped at 10,000, matching
+  the codebase's other full-author-scan ceilings), independent of the
+  requested page — the expensive per-post enrichment (reactions/repost/
+  comment counts) still only runs for the entries actually being returned.
+  As a side effect, pagination is now also correctly windowed on the
+  *visible* post index rather than the raw CF row index, so a deleted or
+  filtered-out entry sitting inside a page range can no longer shrink that
+  page below the requested `limit`.
+
 ## [0.122.1] - 2026-08-28
 
 ### Fixed
