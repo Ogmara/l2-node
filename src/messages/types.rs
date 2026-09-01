@@ -696,6 +696,18 @@ pub struct SettingsSyncPayload {
     pub nonce: [u8; 12],
     /// Encryption key epoch.
     pub key_epoch: u64,
+    /// Client-asserted "content last-edited at" (ms epoch), cleartext.
+    ///
+    /// The blob itself is opaque to the node, so this is the only ordering key
+    /// the node has for last-writer-wins when the same wallet's blob arrives
+    /// from two devices (via `POST /api/v1/messages` on one node and the
+    /// `topic_profile` gossip relay on another). It is the max `updatedAt` the
+    /// client tracks across its synced objects — NOT the envelope build time —
+    /// so a device re-uploading an OLD copy to seed a fresh node cannot clobber
+    /// newer content elsewhere. `0` (an older client that doesn't send it) means
+    /// "fall back to the envelope timestamp".
+    #[serde(default)]
+    pub updated_at: u64,
 }
 
 /// Wallet-encrypted E2E key-recovery vault (protocol §2.5 / E2E plan D4 / P3).
@@ -716,6 +728,11 @@ pub struct KeyVaultSyncPayload {
     /// Vault payload format version (currently 1) — lets clients evolve the
     /// inner keyring schema without a new message type.
     pub format_version: u8,
+    /// Client-asserted write time (ms epoch), cleartext — the LWW ordering key
+    /// for the same-wallet blob arriving from two devices / via gossip relay.
+    /// `0` (older client) means "fall back to the envelope timestamp".
+    #[serde(default)]
+    pub updated_at: u64,
 }
 
 // --- Social Payloads (Follow/Unfollow) ---

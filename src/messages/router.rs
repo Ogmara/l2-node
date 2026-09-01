@@ -3048,11 +3048,23 @@ impl MessageRouter {
                         "nonce": payload.nonce,
                         "key_epoch": payload.key_epoch,
                     });
-                    self.storage.store_settings(
+                    // LWW key: the client's cleartext content timestamp, or the
+                    // signed envelope time for an older client that omits it.
+                    // This blob is gossiped on `topic_profile`, so the SAME
+                    // envelope is applied again on every peer node — the LWW
+                    // guard makes that idempotent and stops an out-of-order
+                    // relay (or a stale re-seed of a fresh node) rolling it back.
+                    let ts = if payload.updated_at > 0 {
+                        payload.updated_at
+                    } else {
+                        envelope.timestamp
+                    };
+                    let applied = self.storage.store_settings(
                         resolved_author,
                         json.to_string().as_bytes(),
+                        ts,
                     )?;
-                    debug!(author = %resolved_author, "Settings synced");
+                    debug!(author = %resolved_author, applied, ts, "Settings synced");
                 }
             }
             MessageType::KeyVaultSync => {
@@ -3060,7 +3072,8 @@ impl MessageRouter {
                 // vault. Opaque to the node; persisted as JSON so the owner can
                 // retrieve {encrypted_vault, nonce, format_version} for restore.
                 // Last-write-wins per wallet — only the verified signer can write
-                // their own record (auth is the envelope signature).
+                // their own record (auth is the envelope signature). Gossiped on
+                // `topic_profile` so a fresh device restores it from ANY node.
                 if let Ok(payload) =
                     rmp_serde::from_slice::<KeyVaultSyncPayload>(&envelope.payload)
                 {
@@ -3069,11 +3082,17 @@ impl MessageRouter {
                         "nonce": payload.nonce,
                         "format_version": payload.format_version,
                     });
-                    self.storage.store_key_vault(
+                    let ts = if payload.updated_at > 0 {
+                        payload.updated_at
+                    } else {
+                        envelope.timestamp
+                    };
+                    let applied = self.storage.store_key_vault(
                         resolved_author,
                         json.to_string().as_bytes(),
+                        ts,
                     )?;
-                    debug!(author = %resolved_author, "Key vault synced");
+                    debug!(author = %resolved_author, applied, ts, "Key vault synced");
                 }
             }
             MessageType::DeviceEncBinding => {

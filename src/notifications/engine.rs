@@ -14,7 +14,7 @@ use tracing::{debug, warn};
 use crate::messages::envelope::Envelope;
 use crate::messages::types::{
     ChatMessagePayload, DeletePayload, DirectMessagePayload, EditPayload, MessageType,
-    NewsCommentPayload, ReactionPayload,
+    NewsCommentPayload, ReactionPayload, SettingsSyncPayload,
 };
 use crate::api::state::{WsAudience, WsOutbound};
 use crate::storage::rocks::Storage;
@@ -300,14 +300,29 @@ impl NotificationEngine {
             MessageType::SettingsSync => {
                 // Nudge the wallet's OTHER connected sessions to re-pull
                 // `GET /api/v1/settings` and re-apply their synced objects
-                // (`channelOrg`, `hiddenDms`, `topicGroups`). SettingsSync is
-                // NOT gossiped, so this only runs on the home node's API-post
-                // path — which is exactly where the wallet's other devices are
-                // connected. Without it a second device only picks the change
-                // up on its next login (the "one-shot sync = permanent
+                // (`channelOrg`, `hiddenDms`, `topicGroups`). Runs on BOTH the
+                // home node's API-post path AND the `topic_profile` gossip
+                // receive path (0.125.0 — SettingsSync now replicates), so a
+                // device on a DIFFERENT node than the writer is nudged too, not
+                // just on its next login (the "one-shot sync = permanent
                 // divergence" failure mode). Spec 3 §4.3.
+                //
+                // Skip the nudge when this copy is not actually newer than what
+                // this node already holds — an out-of-order gossip relay of an
+                // already-superseded blob shouldn't wake every local session.
                 let wallet = self.resolve_member_wallet(&envelope.author);
-                self.broadcast_settings_changed(&wallet);
+                let incoming_ts = rmp_serde::from_slice::<SettingsSyncPayload>(&envelope.payload)
+                    .ok()
+                    .map(|p| if p.updated_at > 0 { p.updated_at } else { envelope.timestamp })
+                    .unwrap_or(envelope.timestamp);
+                let stored_ts = self
+                    .storage
+                    .as_ref()
+                    .and_then(|s| s.get_settings_ts(&wallet).ok())
+                    .unwrap_or(0);
+                if incoming_ts >= stored_ts {
+                    self.broadcast_settings_changed(&wallet);
+                }
             }
             _ => {}
         }

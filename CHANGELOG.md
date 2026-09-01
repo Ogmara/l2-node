@@ -5,6 +5,48 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.125.0] - 2026-09-01
+
+### Added
+
+- **Cross-node replication for the per-wallet settings blob and E2E
+  key-recovery vault.** `SettingsSync` (0x33) and `KeyVaultSync` (0x38) now
+  gossip on the `topic_profile` topic (alongside `ProfileUpdate` / `Follow` /
+  `Unfollow`), so a wallet's `channelOrg` / `hiddenDms` / `topicGroups` and its
+  key vault exist on **every** node — not just the one that received the
+  upload. Before this they fell through to `gossip_topic_for_envelope`'s
+  `_ => None`, so a second device connected to a different node than the writer
+  silently saw *different* settings, and a fresh device could not restore its
+  key vault unless it happened to hit the original node. Both blobs are opaque
+  to the node (E2E-encrypted / wallet-sealed), so relaying them leaks nothing.
+- `SettingsSyncPayload` / `KeyVaultSyncPayload` gain a cleartext `updated_at`
+  (ms epoch, `#[serde(default)]`) — the client's own "content last-edited at".
+  It is the last-writer-wins ordering key the node uses when the same wallet's
+  blob arrives twice (API post + gossip relay) or from two devices. Using the
+  client content timestamp rather than the envelope build time means a device
+  re-uploading an **older** copy to seed a fresh node can never roll back newer
+  content that reached another node first. Older clients omit it → the node
+  falls back to the signed envelope timestamp.
+
+### Changed
+
+- `store_settings` / `store_key_vault` are now LWW: a write whose timestamp is
+  strictly older than the stored one is dropped (returns `false`). The stored
+  value gains an internal wrapper `{"_sv":1,"ts":…,"blob":…}`; `get_settings` /
+  `get_key_vault` strip it, and a pre-0.125.0 unwrapped row passes through and
+  is upgraded by the first timestamped write. No CF/schema change.
+- The `settings_changed` WebSocket nudge now also fires on the gossip-receive
+  path (a device on a different node than the writer converges without waiting
+  for its next login), and is suppressed when the received copy is not newer
+  than what the node already holds.
+
+### Security
+
+- `cargo audit` unchanged from 0.124.0 — **no dependencies added or bumped**.
+  The two `hickory-proto` advisories (RUSTSEC-2026-0118 / -0119) remain,
+  reachable only via the `libp2p 0.56.0` DNS transport pin; no patched release
+  is reachable under that pin, tracked for the next libp2p upgrade.
+
 ## [0.124.0] - 2026-09-01
 
 ### Added

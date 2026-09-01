@@ -70,6 +70,34 @@ fn stat_counter_merge(
     Some(total.to_be_bytes().to_vec())
 }
 
+/// Wrap an opaque per-wallet blob (`settings_sync` / `key_vault`) with the node's
+/// LWW ordering timestamp: `{"_sv":1,"ts":<ts>,"blob":<inner>}`. `inner` is the
+/// exact JSON the API returns, so unwrapping is a field read.
+fn wrap_synced(inner: &[u8], ts: u64) -> Vec<u8> {
+    let blob: serde_json::Value =
+        serde_json::from_slice(inner).unwrap_or_else(|_| serde_json::Value::Null);
+    serde_json::json!({ "_sv": 1, "ts": ts, "blob": blob })
+        .to_string()
+        .into_bytes()
+}
+
+/// Inverse of [`wrap_synced`]. Returns `(inner_blob_bytes, ts)`. A value that is
+/// not a wrapper (a row written by a pre-LWW node) passes through unchanged with
+/// `ts = 0`, so the first timestamped write always supersedes it.
+fn unwrap_synced(raw: &[u8]) -> (Vec<u8>, u64) {
+    match serde_json::from_slice::<serde_json::Value>(raw) {
+        Ok(v) if v.get("_sv").and_then(|x| x.as_u64()) == Some(1) => {
+            let ts = v.get("ts").and_then(|x| x.as_u64()).unwrap_or(0);
+            let inner = v
+                .get("blob")
+                .map(|b| b.to_string().into_bytes())
+                .unwrap_or_else(|| raw.to_vec());
+            (inner, ts)
+        }
+        _ => (raw.to_vec(), 0),
+    }
+}
+
 /// Outcome of a first-write-wins channel-key-envelope store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyEnvelopeStore {
@@ -3357,31 +3385,87 @@ impl Storage {
 
     // --- Settings Sync ---
 
-    /// Store encrypted settings blob for a user.
+    /// Store encrypted settings blob for a user, last-writer-wins by `ts`.
     ///
-    /// The blob is opaque to the node — encryption/decryption happens client-side.
-    pub fn store_settings(&self, wallet_address: &str, data: &[u8]) -> Result<()> {
-        self.put_cf(cf::SETTINGS_SYNC, wallet_address.as_bytes(), data)
+    /// The blob is opaque to the node (encryption/decryption is client-side), so
+    /// `ts` — the client's cleartext "content last-edited at" — is the only
+    /// ordering key the node has when the same wallet's blob arrives from two
+    /// devices: once via `POST /api/v1/messages` on the home node, again via the
+    /// `topic_profile` gossip relay on every other node. A write whose `ts` is
+    /// strictly older than what is already stored is dropped, so a device
+    /// re-uploading an old copy to seed a fresh node can never roll back newer
+    /// content that reached this node first. Returns `true` if the write was
+    /// applied, `false` if it was dropped as stale.
+    pub fn store_settings(&self, wallet_address: &str, data: &[u8], ts: u64) -> Result<bool> {
+        self.store_synced_lww(cf::SETTINGS_SYNC, wallet_address, data, ts)
     }
 
-    /// Get encrypted settings blob for a user.
+    /// Get encrypted settings blob for a user (the inner client blob, with the
+    /// node's LWW wrapper stripped; legacy unwrapped values pass through).
     pub fn get_settings(&self, wallet_address: &str) -> Result<Option<Vec<u8>>> {
-        self.get_cf(cf::SETTINGS_SYNC, wallet_address.as_bytes())
+        Ok(self
+            .get_cf(cf::SETTINGS_SYNC, wallet_address.as_bytes())?
+            .map(|raw| unwrap_synced(&raw).0))
+    }
+
+    /// The stored LWW timestamp for a user's settings blob (`0` if none / legacy).
+    pub fn get_settings_ts(&self, wallet_address: &str) -> Result<u64> {
+        Ok(self
+            .get_cf(cf::SETTINGS_SYNC, wallet_address.as_bytes())?
+            .map(|raw| unwrap_synced(&raw).1)
+            .unwrap_or(0))
     }
 
     // --- Key-Recovery Vault (E2E P3) ---
 
-    /// Store the encrypted E2E key-recovery vault for a user.
+    /// Store the encrypted E2E key-recovery vault for a user, LWW by `ts`.
     ///
-    /// The blob is opaque to the node — sealed under a wallet-derived backup key the
-    /// node never holds. Last-write-wins; one record per wallet.
-    pub fn store_key_vault(&self, wallet_address: &str, data: &[u8]) -> Result<()> {
-        self.put_cf(cf::KEY_VAULT, wallet_address.as_bytes(), data)
+    /// Same rationale as [`store_settings`]: the blob is opaque, so the client's
+    /// cleartext write time orders concurrent copies from multiple devices and
+    /// the `topic_profile` gossip relay. Returns `true` if applied.
+    pub fn store_key_vault(&self, wallet_address: &str, data: &[u8], ts: u64) -> Result<bool> {
+        self.store_synced_lww(cf::KEY_VAULT, wallet_address, data, ts)
     }
 
-    /// Get the encrypted E2E key-recovery vault for a user.
+    /// Get the encrypted E2E key-recovery vault for a user (inner blob).
     pub fn get_key_vault(&self, wallet_address: &str) -> Result<Option<Vec<u8>>> {
-        self.get_cf(cf::KEY_VAULT, wallet_address.as_bytes())
+        Ok(self
+            .get_cf(cf::KEY_VAULT, wallet_address.as_bytes())?
+            .map(|raw| unwrap_synced(&raw).0))
+    }
+
+    /// The stored LWW timestamp for a user's key-vault blob (`0` if none / legacy).
+    pub fn get_key_vault_ts(&self, wallet_address: &str) -> Result<u64> {
+        Ok(self
+            .get_cf(cf::KEY_VAULT, wallet_address.as_bytes())?
+            .map(|raw| unwrap_synced(&raw).1)
+            .unwrap_or(0))
+    }
+
+    /// Shared LWW read-modify-write for the two per-wallet opaque blobs
+    /// (`settings_sync`, `key_vault`). Stores `{"_sv":1,"ts":<ts>,"blob":<inner>}`;
+    /// drops a write whose `ts` is strictly older than the stored one.
+    ///
+    /// The read-then-write is not transactional. The gossip-relay path runs on
+    /// the single-threaded swarm loop, so the only race is two `POST
+    /// /api/v1/messages` for the *same wallet* landing on the *same node* within
+    /// the RMW window (microseconds) — one human, two devices, near-simultaneous.
+    /// The worst outcome is the older of the two racing writes persisting, i.e.
+    /// exactly the pre-0.125.0 blind-`put` semantics; the client's own
+    /// `updatedAt` LWW on apply is the backstop. A per-wallet lock would close it
+    /// but is not worth the contention for a setting a user changes by hand.
+    fn store_synced_lww(&self, cf: &str, wallet_address: &str, inner: &[u8], ts: u64) -> Result<bool> {
+        if let Some(existing) = self.get_cf(cf, wallet_address.as_bytes())? {
+            let (_, existing_ts) = unwrap_synced(&existing);
+            // Legacy unwrapped rows report existing_ts = 0, so the first
+            // timestamped write always upgrades them.
+            if existing_ts > ts {
+                return Ok(false);
+            }
+        }
+        let wrapped = wrap_synced(inner, ts);
+        self.put_cf(cf, wallet_address.as_bytes(), &wrapped)?;
+        Ok(true)
     }
 
     /// Delete a user's encrypted key-recovery vault + settings blob (account
@@ -5601,5 +5685,76 @@ mod news_followers_visibility_tests {
         assert!(s.news_followers_post_visible_to("klv1author", Some("klv1fan")));
         s.apply_follow_edge("klv1fan", "klv1author", false, 2_000).unwrap();
         assert!(!s.news_followers_post_visible_to("klv1author", Some("klv1fan")));
+    }
+}
+
+#[cfg(test)]
+mod synced_blob_lww_tests {
+    //! 0.125.0: `settings_sync` / `key_vault` are now gossiped, so the same
+    //! wallet's blob is applied on every node — once from the API post, again
+    //! from every `topic_profile` relay, possibly out of order. `store_settings`
+    //! / `store_key_vault` are LWW by the client's cleartext `ts`.
+    use super::*;
+    use tempfile::TempDir;
+
+    fn db() -> (Storage, TempDir) {
+        let dir = TempDir::new().unwrap();
+        (Storage::open(dir.path()).unwrap(), dir)
+    }
+
+    fn blob(tag: &str) -> Vec<u8> {
+        serde_json::json!({ "encrypted_settings": tag, "nonce": [], "key_epoch": 0 })
+            .to_string()
+            .into_bytes()
+    }
+
+    #[test]
+    fn newer_ts_wins_older_ts_is_dropped_and_get_returns_inner_blob() {
+        let (s, _d) = db();
+        let w = "klv1wallet";
+
+        assert!(s.store_settings(w, &blob("v2"), 200).unwrap());
+        assert_eq!(s.get_settings_ts(w).unwrap(), 200);
+        // get_settings strips the LWW wrapper — the client sees exactly what it stored.
+        assert_eq!(s.get_settings(w).unwrap().unwrap(), blob("v2"));
+
+        // An out-of-order relay of an older copy is dropped, content unchanged.
+        assert!(!s.store_settings(w, &blob("v1"), 100).unwrap());
+        assert_eq!(s.get_settings(w).unwrap().unwrap(), blob("v2"));
+        assert_eq!(s.get_settings_ts(w).unwrap(), 200);
+
+        // A strictly newer copy replaces it.
+        assert!(s.store_settings(w, &blob("v3"), 300).unwrap());
+        assert_eq!(s.get_settings(w).unwrap().unwrap(), blob("v3"));
+
+        // Equal ts (a re-broadcast of the same envelope) is idempotent — applied,
+        // same content.
+        assert!(s.store_settings(w, &blob("v3"), 300).unwrap());
+        assert_eq!(s.get_settings(w).unwrap().unwrap(), blob("v3"));
+    }
+
+    #[test]
+    fn legacy_unwrapped_row_is_upgraded_by_the_first_timestamped_write() {
+        let (s, _d) = db();
+        let w = "klv1legacy";
+        // Simulate a row written by a pre-0.125.0 node (no LWW wrapper).
+        s.put_cf(cf::SETTINGS_SYNC, w.as_bytes(), &blob("legacy")).unwrap();
+        assert_eq!(s.get_settings_ts(w).unwrap(), 0);
+        assert_eq!(s.get_settings(w).unwrap().unwrap(), blob("legacy"));
+
+        // First timestamped write supersedes it (0 is never > ts).
+        assert!(s.store_settings(w, &blob("new"), 1).unwrap());
+        assert_eq!(s.get_settings(w).unwrap().unwrap(), blob("new"));
+        assert_eq!(s.get_settings_ts(w).unwrap(), 1);
+    }
+
+    #[test]
+    fn key_vault_uses_the_same_lww_path() {
+        let (s, _d) = db();
+        let w = "klv1kv";
+        assert!(s.store_key_vault(w, &blob("kv2"), 20).unwrap());
+        assert!(!s.store_key_vault(w, &blob("kv1"), 10).unwrap());
+        assert_eq!(s.get_key_vault(w).unwrap().unwrap(), blob("kv2"));
+        assert_eq!(s.get_key_vault_ts(w).unwrap(), 20);
     }
 }

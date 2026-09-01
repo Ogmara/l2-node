@@ -1770,6 +1770,22 @@ pub(crate) fn gossip_topic_for_envelope(
         // the apply arm only ever deletes `resolved_author`'s OWN content, so
         // a relayed request can't be used to delete someone else's data.
         MessageType::DeletionRequest => Some(gossip::topic_network(network_id)),
+        // SettingsSync / KeyVaultSync MUST gossip so a wallet's cross-device
+        // settings blob and E2E key-recovery vault exist on EVERY node, not just
+        // the one that received the upload. Before this, a second device on a
+        // different node than the one that wrote never saw the settings (and a
+        // fresh device could not restore its key vault) — "connected to another
+        // node" silently meant "different settings". Both blobs are opaque to
+        // the node (E2E-encrypted / wallet-sealed), so relaying them leaks
+        // nothing; the apply arm is per-wallet last-writer-wins by the client's
+        // cleartext `updated_at`, keyed off `resolved_author` (the verified
+        // signer, never the payload), so a relayed/replayed copy can only ever
+        // affect the SENDER's own record and can't roll newer content back.
+        // Rides `topic_profile` alongside ProfileUpdate / Follow / Unfollow —
+        // the same per-wallet-user-state channel every node already subscribes.
+        MessageType::SettingsSync | MessageType::KeyVaultSync => {
+            Some(gossip::topic_profile(network_id))
+        }
         _ => None,
     }
 }
@@ -8955,6 +8971,46 @@ mod gossip_bridge_tests {
         assert_eq!(
             gossip_topic_for_envelope(&env, "testnet"),
             Some(crate::network::gossip::channel_topic("testnet", 42)),
+        );
+    }
+
+    #[test]
+    fn settings_sync_and_key_vault_sync_gossip_on_profile_topic() {
+        // 0.125.0: both per-wallet opaque blobs now replicate across the mesh
+        // (rides `topic_profile` with ProfileUpdate/Follow/Unfollow) so a device
+        // on a different node than the writer still sees the same settings and
+        // can restore its key vault from any node. Before this they fell through
+        // to `_ => None` — stored only on the node that received the upload.
+        use crate::messages::types::{KeyVaultSyncPayload, SettingsSyncPayload};
+
+        let settings = SettingsSyncPayload {
+            encrypted_settings: vec![1, 2, 3],
+            nonce: [0u8; 12],
+            key_epoch: 0,
+            updated_at: 123,
+        };
+        let env = envelope(
+            MessageType::SettingsSync,
+            rmp_serde::to_vec_named(&settings).unwrap(),
+        );
+        assert_eq!(
+            gossip_topic_for_envelope(&env, "testnet"),
+            Some(crate::network::gossip::topic_profile("testnet")),
+        );
+
+        let vault = KeyVaultSyncPayload {
+            encrypted_vault: vec![4, 5, 6],
+            nonce: [0u8; 24],
+            format_version: 1,
+            updated_at: 456,
+        };
+        let env = envelope(
+            MessageType::KeyVaultSync,
+            rmp_serde::to_vec_named(&vault).unwrap(),
+        );
+        assert_eq!(
+            gossip_topic_for_envelope(&env, "testnet"),
+            Some(crate::network::gossip::topic_profile("testnet")),
         );
     }
 }
