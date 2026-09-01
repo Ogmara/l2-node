@@ -298,7 +298,7 @@ fn validate_version(v: &str) -> Result<(), PresenceError> {
 /// [`PresenceError::UnsupportedPeerIdHash`]; Ogmara nodes always use
 /// Ed25519 keys (see [`crate::node::Node::libp2p_keypair`]) so this
 /// only rejects spoofed records that target a non-Ogmara key type.
-fn extract_ed25519_public_key(
+pub(crate) fn extract_ed25519_public_key(
     peer_id: &PeerId,
 ) -> Result<libp2p::identity::PublicKey, PresenceError> {
     // `PeerId::as_ref` returns `&multihash::Multihash<64>`. libp2p

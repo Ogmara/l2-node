@@ -1,5 +1,60 @@
 //! Small shared utilities.
 
+/// Maximum length (bytes) of a canonical normalized tag.
+pub const MAX_TAG_LEN: usize = 64;
+
+/// Canonical normalized form of a news hashtag (protocol §3.5).
+///
+/// Procedure: trim ASCII whitespace → lowercase → strip a single leading
+/// `#` → trim again → require `^[a-z0-9-]{1,64}$` (bytes). Returns `None`
+/// when the input has no canonical representation: empty, longer than
+/// [`MAX_TAG_LEN`], or containing any character outside `[a-z0-9-]` after
+/// the steps above.
+///
+/// The L2 node indexes (`news_by_tag`), routes (`/news/tag/{tag}`), filters
+/// (`GET /api/v1/news?tag=` / `?tags=`) and counts (Hot Topics, spec 3 §3.9)
+/// tags in this form only. The `@ogmara/sdk` `normalizeHashtag()` helper MUST
+/// produce byte-identical output for identical input — a follow/filter that
+/// normalizes differently silently matches nothing.
+pub fn normalize_tag(raw: &str) -> Option<String> {
+    let lowered = raw.trim().to_lowercase();
+    let stripped = lowered.strip_prefix('#').unwrap_or(&lowered).trim();
+    if stripped.is_empty() || stripped.len() > MAX_TAG_LEN {
+        return None;
+    }
+    if !stripped
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    {
+        return None;
+    }
+    Some(stripped.to_string())
+}
+
+/// Normalize each tag in `raw`, drop the ones with no canonical form, and
+/// de-duplicate while preserving first-seen order. Used for the `?tags=`
+/// OR-set feed filter and for digesting a `NewsPost`'s tag list.
+pub fn normalize_tags_dedup(raw: impl IntoIterator<Item = impl AsRef<str>>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for t in raw {
+        if let Some(n) = normalize_tag(t.as_ref()) {
+            if !out.contains(&n) {
+                out.push(n);
+            }
+        }
+    }
+    out
+}
+
+/// Current wall-clock time in milliseconds since the Unix epoch. Saturates
+/// to 0 if the clock is somehow before the epoch.
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Truncate a string to at most `max` bytes, never splitting a multibyte
 /// UTF-8 character.
 ///
@@ -23,7 +78,37 @@ pub fn truncate_str(s: &str, max: usize) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::truncate_str;
+    use super::{normalize_tag, normalize_tags_dedup, truncate_str};
+
+    #[test]
+    fn normalize_tag_canonical_cases() {
+        assert_eq!(normalize_tag("klever").as_deref(), Some("klever"));
+        assert_eq!(normalize_tag("Klever").as_deref(), Some("klever"));
+        assert_eq!(normalize_tag("#Klever").as_deref(), Some("klever"));
+        assert_eq!(normalize_tag("  #Klever  ").as_deref(), Some("klever"));
+        assert_eq!(normalize_tag("# klever").as_deref(), Some("klever"));
+        assert_eq!(normalize_tag("web-3").as_deref(), Some("web-3"));
+        assert_eq!(normalize_tag("ONCHAIN2026").as_deref(), Some("onchain2026"));
+    }
+
+    #[test]
+    fn normalize_tag_rejects_non_canonical() {
+        assert_eq!(normalize_tag(""), None);
+        assert_eq!(normalize_tag("   "), None);
+        assert_eq!(normalize_tag("#"), None);
+        assert_eq!(normalize_tag("tag with spaces"), None);
+        assert_eq!(normalize_tag("under_score"), None);
+        assert_eq!(normalize_tag("emoji🔥"), None);
+        assert_eq!(normalize_tag("Кириллица"), None);
+        assert_eq!(normalize_tag(&"a".repeat(65)), None);
+        assert_eq!(normalize_tag(&"a".repeat(64)).map(|s| s.len()), Some(64));
+    }
+
+    #[test]
+    fn normalize_tags_dedup_drops_and_dedupes_preserving_order() {
+        let got = normalize_tags_dedup(["#Klever", "klever", "bad tag", "DeFi", "defi", "web-3"]);
+        assert_eq!(got, vec!["klever", "defi", "web-3"]);
+    }
 
     #[test]
     fn truncate_ascii() {

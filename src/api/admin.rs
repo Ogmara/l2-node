@@ -181,7 +181,8 @@ pub async fn storage_stats(
         "status": "ok",
         "column_families": [
             "messages", "channel_msgs", "dm_messages", "dm_conversations",
-            "news_feed", "news_by_tag", "news_by_author", "users",
+            "news_feed", "news_by_tag", "news_by_author",
+            "hot_topics_local", "hot_topics_merged", "users",
             "channels", "delegations", "state_anchors", "peer_directory",
             "content_cache", "node_state"
         ],

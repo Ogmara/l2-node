@@ -610,6 +610,16 @@ pub struct PaginationParams {
     /// (news/personal feeds only). If both `before` and `after` are supplied,
     /// `after` wins — same precedence as `MessageParams`.
     pub after: Option<String>,
+    /// `GET /api/v1/news` only (l2-node 0.124.0+): restrict the feed to posts
+    /// carrying this hashtag. Normalized to canonical form (protocol §3.5)
+    /// before lookup. Ignored by every other paginated handler.
+    #[serde(default)]
+    pub tag: Option<String>,
+    /// `GET /api/v1/news` only: comma-separated hashtags — the feed is the
+    /// union of posts carrying ANY of them (each normalized, blanks/dupes
+    /// dropped, capped at 50). Wins over `tag` if both are given.
+    #[serde(default)]
+    pub tags: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2371,6 +2381,225 @@ pub async fn get_enc_keys(
     }
 }
 
+/// Load, visibility-check (audit W37) and engagement-enrich a single news
+/// feed entry by `msg_id`. Returns `None` when the message is missing,
+/// undecodable, or not visible to `caller`.
+///
+/// Extracted so the global feed (`list_news` over `NEWS_FEED`) and the
+/// tag-filtered feed (`tag_filtered_news_ids` over `NEWS_BY_TAG`) share one
+/// enrichment path and cannot drift — the `users/{address}/posts` `total`
+/// bug shape.
+fn enrich_news_msg_id(
+    msg_id: &[u8; 32],
+    state: &AppState,
+    caller: Option<&str>,
+) -> Option<serde_json::Value> {
+    let envelope_bytes = state.storage.get_message(msg_id).ok()??;
+    let envelope =
+        rmp_serde::from_slice::<crate::messages::envelope::Envelope>(&envelope_bytes).ok()?;
+    let resolved_author = state
+        .identity
+        .resolve(&envelope.author)
+        .unwrap_or_else(|_| envelope.author.clone());
+    if !news_item_visible(&state.storage, &state.identity, &envelope, &resolved_author, caller) {
+        return None;
+    }
+    let mut post = envelope_to_json(&envelope, &state.identity);
+    if let serde_json::Value::Object(ref mut map) = post {
+        let is_comment = map
+            .get("msg_type")
+            .and_then(|v| v.as_str())
+            .map(|s| s == "NewsComment")
+            .unwrap_or(false);
+        let is_repost = map
+            .get("msg_type")
+            .and_then(|v| v.as_str())
+            .map(|s| s == "NewsRepost")
+            .unwrap_or(false);
+
+        let reactions = state.storage.get_news_reactions(msg_id).unwrap_or_default();
+        let reaction_counts: serde_json::Map<String, serde_json::Value> = reactions
+            .into_iter()
+            .map(|(e, c)| (e, serde_json::json!(c)))
+            .collect();
+        map.insert("reaction_counts".into(), serde_json::json!(reaction_counts));
+        map.insert(
+            "repost_count".into(),
+            serde_json::json!(state.storage.get_repost_count(msg_id).unwrap_or(0)),
+        );
+        map.insert(
+            "comment_count".into(),
+            serde_json::json!(state.storage.get_comment_count(msg_id).unwrap_or(0)),
+        );
+
+        if is_comment {
+            if let Ok(payload) = rmp_serde::from_slice::<
+                crate::messages::types::NewsCommentPayload,
+            >(&envelope.payload)
+            {
+                map.insert(
+                    "parent_post_id".into(),
+                    serde_json::json!(hex::encode(payload.post_id)),
+                );
+                if let Ok(Some(parent_bytes)) = state.storage.get_message(&payload.post_id) {
+                    if let Ok(parent_env) = rmp_serde::from_slice::<
+                        crate::messages::envelope::Envelope,
+                    >(&parent_bytes)
+                    {
+                        let parent_author = state
+                            .identity
+                            .resolve(&parent_env.author)
+                            .unwrap_or_else(|_| parent_env.author.clone());
+                        if news_item_visible(
+                            &state.storage,
+                            &state.identity,
+                            &parent_env,
+                            &parent_author,
+                            caller,
+                        ) {
+                            map.insert(
+                                "parent_author".into(),
+                                serde_json::json!(parent_author),
+                            );
+                            if let Ok(parent_payload) = rmp_serde::from_slice::<
+                                crate::messages::types::NewsPostPayload,
+                            >(&parent_env.payload)
+                            {
+                                if !parent_payload.title.is_empty() {
+                                    map.insert(
+                                        "parent_title".into(),
+                                        serde_json::json!(parent_payload.title),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if is_repost {
+            enrich_repost_json(map, &envelope, state, caller);
+        }
+    }
+    enrich_message_json(&mut post, &state.storage);
+    Some(post)
+}
+
+/// Resolve `?tag=` / `?tags=` into an ordered, de-duplicated `Vec<[u8; 32]>`
+/// of news `msg_id`s (newest-first) plus a conservative `has_more`, by
+/// scanning the `NEWS_BY_TAG` index rather than the global `NEWS_FEED`.
+///
+/// `tags` is an OR-set: a post carrying any of the tags is included, counted
+/// once. Cursor (`before` = older, `after` = newer) is honoured as a
+/// `(timestamp, msg_id)` threshold, resolved the same anti-oracle way as the
+/// global feed (an unknown / invisible cursor falls back to the newest
+/// page). `has_more` is true when any single-tag sub-scan filled `limit`, or
+/// the merged candidate set (pre-truncation) exceeded it — measured before
+/// the visibility filter in `enrich_news_msg_id`, matching the global feed.
+fn tag_filtered_news_ids(
+    state: &AppState,
+    tags: &[String],
+    params: &PaginationParams,
+    limit: usize,
+    caller: Option<&str>,
+) -> Result<(Vec<[u8; 32]>, bool), anyhow::Error> {
+    use crate::storage::schema;
+
+    // Resolve a hex msg_id cursor to (timestamp, msg_id). None => newest page.
+    // Same visibility gate as the global feed's `cursor_seek`: an invisible or
+    // unknown cursor is indistinguishable, so it can't be used as an
+    // existence/timestamp oracle for a Followers-only post.
+    let resolve_cursor = |hex_id: &str| -> Option<(u64, [u8; 32])> {
+        let msg_id: [u8; 32] = hex::decode(hex_id).ok()?.try_into().ok()?;
+        let env_bytes = state.storage.get_message(&msg_id).ok()??;
+        let env =
+            rmp_serde::from_slice::<crate::messages::envelope::Envelope>(&env_bytes).ok()?;
+        let feed_key = schema::encode_news_key(env.timestamp, &msg_id);
+        if !state.storage.exists_cf(cf::NEWS_FEED, &feed_key).unwrap_or(false) {
+            return None;
+        }
+        let resolved_author = state
+            .identity
+            .resolve(&env.author)
+            .unwrap_or_else(|_| env.author.clone());
+        if !news_item_visible(&state.storage, &state.identity, &env, &resolved_author, caller) {
+            return None;
+        }
+        Some((env.timestamp, msg_id))
+    };
+
+    // "newer" (after) vs "older" (before) vs newest page.
+    enum Dir {
+        Newest,
+        Older(u64, [u8; 32]),
+        Newer(u64, [u8; 32]),
+    }
+    let dir = if let Some(a) = &params.after {
+        match resolve_cursor(a) {
+            Some((ts, id)) => Dir::Newer(ts, id),
+            None => Dir::Newest,
+        }
+    } else if let Some(b) = &params.before {
+        match resolve_cursor(b) {
+            Some((ts, id)) => Dir::Older(ts, id),
+            None => Dir::Newest,
+        }
+    } else {
+        Dir::Newest
+    };
+
+    let mut any_subscan_full = false;
+    // Dedup by msg_id, remembering the post timestamp for the merge sort.
+    let mut seen: std::collections::HashMap<[u8; 32], u64> = std::collections::HashMap::new();
+
+    for tag in tags {
+        let prefix = schema::news_by_tag_prefix(tag);
+        let rows = match &dir {
+            Dir::Newest => state.storage.prefix_iter_cf(cf::NEWS_BY_TAG, &prefix, limit)?,
+            Dir::Older(ts, id) => {
+                let start = schema::encode_news_by_tag_key(tag, *ts, id);
+                state
+                    .storage
+                    .prefix_iter_cf_after(cf::NEWS_BY_TAG, &start, &prefix, limit)?
+            }
+            Dir::Newer(ts, id) => {
+                let start = schema::encode_news_by_tag_key(tag, *ts, id);
+                state
+                    .storage
+                    .reverse_iter_cf_before(cf::NEWS_BY_TAG, &start, &prefix, limit)?
+            }
+        };
+        if rows.len() == limit {
+            any_subscan_full = true;
+        }
+        for (key, _) in rows {
+            if let Some((post_ts, mid)) = schema::decode_news_by_tag_key(&key) {
+                seen.entry(mid).or_insert(post_ts);
+            }
+        }
+    }
+
+    let mut merged: Vec<([u8; 32], u64)> = seen.into_iter().collect();
+    // Newest-first; msg_id as a stable tie-break.
+    merged.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    // For the "newer" page we want the entries CLOSEST to the cursor (the
+    // oldest of the newer set), matching the global feed's
+    // reverse_iter_cf_before semantics — take from the tail, then flip.
+    let has_more = any_subscan_full || merged.len() > limit;
+    let ordered: Vec<[u8; 32]> = if matches!(dir, Dir::Newer(..)) {
+        let mut tail: Vec<[u8; 32]> =
+            merged.iter().rev().take(limit).map(|(id, _)| *id).collect();
+        tail.reverse();
+        tail
+    } else {
+        merged.into_iter().take(limit).map(|(id, _)| id).collect()
+    };
+
+    Ok((ordered, has_more))
+}
+
 /// GET /api/v1/news
 ///
 /// Public feed, but a `Followers`-only post (audit W37) is only included for
@@ -2395,6 +2624,58 @@ pub async fn list_news(
 ) -> impl IntoResponse {
     let limit = params.limit.unwrap_or(20).min(100) as usize;
     let caller = auth_user.as_ref().map(|u| u.address.as_str());
+
+    // --- Tag filter (l2-node 0.124.0+). `?tags=` (OR-set, cap 50) wins over
+    // `?tag=`. Every tag is normalized to canonical form (protocol §3.5)
+    // before lookup, so `?tag=Klever` matches indexed `klever`. When a filter
+    // is present the feed is scanned from `NEWS_BY_TAG` instead of
+    // `NEWS_FEED`; everything else (cursor, has_more, W37 visibility,
+    // enrichment) is identical because both paths share `enrich_news_msg_id`.
+    let tag_filter: Vec<String> = if let Some(raw) = params.tags.as_deref() {
+        crate::util::normalize_tags_dedup(raw.split(','))
+            .into_iter()
+            .take(50)
+            .collect()
+    } else if let Some(raw) = params.tag.as_deref() {
+        crate::util::normalize_tag(raw).into_iter().collect()
+    } else {
+        Vec::new()
+    };
+    let tag_requested = params.tags.is_some() || params.tag.is_some();
+
+    if tag_requested {
+        // A tag filter that normalizes to nothing (all entries invalid) is an
+        // explicit empty result — NOT a silent fall-through to the global feed.
+        if tag_filter.is_empty() {
+            return Json(serde_json::json!({
+                "posts": [],
+                "total": 0,
+                "page": params.page.unwrap_or(1),
+                "has_more": false,
+            }))
+            .into_response();
+        }
+        return match tag_filtered_news_ids(&state, &tag_filter, &params, limit, caller) {
+            Ok((ordered_ids, has_more)) => {
+                let posts: Vec<serde_json::Value> = ordered_ids
+                    .iter()
+                    .filter_map(|id| enrich_news_msg_id(id, &state, caller))
+                    .collect();
+                let total = posts.len();
+                Json(serde_json::json!({
+                    "posts": posts,
+                    "total": total,
+                    "page": params.page.unwrap_or(1),
+                    "has_more": has_more,
+                }))
+                .into_response()
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "Storage error in list_news tag filter");
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
+            }
+        };
+    }
 
     // Resolve a hex `msg_id` cursor to its `NEWS_FEED` key. `None` => not a
     // valid/known/visible post => fall back to the newest page.
@@ -2466,86 +2747,8 @@ pub async fn list_news(
                 // Key: (!timestamp:8, msg_id:32)
                 if key.len() >= 40 {
                     let msg_id: [u8; 32] = key[8..40].try_into().unwrap_or([0u8; 32]);
-                    if let Ok(Some(envelope_bytes)) = state.storage.get_message(&msg_id) {
-                        if let Ok(envelope) = rmp_serde::from_slice::<
-                            crate::messages::envelope::Envelope,
-                        >(&envelope_bytes)
-                        {
-                            let resolved_author = state
-                                .identity
-                                .resolve(&envelope.author)
-                                .unwrap_or_else(|_| envelope.author.clone());
-                            if !news_item_visible(&state.storage, &state.identity, &envelope, &resolved_author, caller) {
-                                continue;
-                            }
-                            let mut post = envelope_to_json(&envelope, &state.identity);
-                            if let serde_json::Value::Object(ref mut map) = post {
-                                // Check if this is a comment (msg_type == "NewsComment")
-                                let is_comment = map.get("msg_type")
-                                    .and_then(|v| v.as_str())
-                                    .map(|s| s == "NewsComment")
-                                    .unwrap_or(false);
-                                let is_repost = map.get("msg_type")
-                                    .and_then(|v| v.as_str())
-                                    .map(|s| s == "NewsRepost")
-                                    .unwrap_or(false);
-
-                                // Enrich all feed items with engagement counts
-                                let reactions = state.storage.get_news_reactions(&msg_id).unwrap_or_default();
-                                let reaction_counts: serde_json::Map<String, serde_json::Value> = reactions
-                                    .into_iter()
-                                    .map(|(e, c)| (e, serde_json::json!(c)))
-                                    .collect();
-                                map.insert("reaction_counts".into(), serde_json::json!(reaction_counts));
-                                map.insert("repost_count".into(),
-                                    serde_json::json!(state.storage.get_repost_count(&msg_id).unwrap_or(0)));
-                                map.insert("comment_count".into(),
-                                    serde_json::json!(state.storage.get_comment_count(&msg_id).unwrap_or(0)));
-
-                                if is_comment {
-                                    // Enrich with parent post context
-                                    if let Ok(payload) = rmp_serde::from_slice::<
-                                        crate::messages::types::NewsCommentPayload,
-                                    >(&envelope.payload) {
-                                        map.insert("parent_post_id".into(),
-                                            serde_json::json!(hex::encode(payload.post_id)));
-                                        // Fetch parent post for author + title preview
-                                        if let Ok(Some(parent_bytes)) = state.storage.get_message(&payload.post_id) {
-                                            if let Ok(parent_env) = rmp_serde::from_slice::<
-                                                crate::messages::envelope::Envelope,
-                                            >(&parent_bytes) {
-                                                let parent_author = state.identity.resolve(&parent_env.author)
-                                                    .unwrap_or_else(|_| parent_env.author.clone());
-                                                // W37: a comment on a Followers-only post
-                                                // must not leak that post's author/title
-                                                // to a caller who can't see the post
-                                                // itself — the same check applied to
-                                                // the post's own feed entry above.
-                                                if news_item_visible(&state.storage, &state.identity, &parent_env, &parent_author, caller) {
-                                                    map.insert("parent_author".into(),
-                                                        serde_json::json!(parent_author));
-                                                    // Try to extract parent title
-                                                    if let Ok(parent_payload) = rmp_serde::from_slice::<
-                                                        crate::messages::types::NewsPostPayload,
-                                                    >(&parent_env.payload) {
-                                                        if !parent_payload.title.is_empty() {
-                                                            map.insert("parent_title".into(),
-                                                                serde_json::json!(parent_payload.title));
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-
-                                if is_repost {
-                                    enrich_repost_json(map, &envelope, &state, caller);
-                                }
-                            }
-                            enrich_message_json(&mut post, &state.storage);
-                            posts.push(post);
-                        }
+                    if let Some(post) = enrich_news_msg_id(&msg_id, &state, caller) {
+                        posts.push(post);
                     }
                 }
             }
@@ -2565,6 +2768,57 @@ pub async fn list_news(
             }
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct HotTopicsParams {
+    /// Only `"24h"` is supported in this version; any other value → 400.
+    pub window: Option<String>,
+    pub limit: Option<u32>,
+}
+
+/// GET /api/v1/news/hot-topics — trending news hashtags over a rolling 24h
+/// window, aggregated network-wide from peer digests (spec 3 §3.9).
+///
+/// `{ "scope": "network" | "local", "topics": [ { "hashtag", "count" } ] }`,
+/// sorted by count desc (ties by hashtag asc). `count` is a network-wide
+/// distinct-`NewsPost` estimate (HyperLogLog, ~±2%) after the median trim.
+/// Served from a `[hot_topics] cache_ttl_secs` server-side cache.
+pub async fn hot_topics(
+    Extension(state): Extension<Arc<AppState>>,
+    Query(params): Query<HotTopicsParams>,
+) -> impl IntoResponse {
+    if let Some(w) = params.window.as_deref() {
+        if w != "24h" {
+            return (
+                StatusCode::BAD_REQUEST,
+                "window: only \"24h\" is supported",
+            )
+                .into_response();
+        }
+    }
+    let Some(agg) = state.hot_topics.as_ref() else {
+        // Storage-less test state / subsystem never constructed.
+        return Json(serde_json::json!({ "scope": "local", "topics": [] }))
+            .into_response();
+    };
+    let cfg = agg.config();
+    if !cfg.enabled {
+        return Json(serde_json::json!({ "scope": "local", "topics": [] }))
+            .into_response();
+    }
+    let limit = params
+        .limit
+        .map(|l| l as usize)
+        .unwrap_or(cfg.limit_default)
+        .min(cfg.limit_cap.min(100))
+        .max(1);
+    let res = agg.query(limit, crate::network::hot_topics::now_ms());
+    Json(serde_json::json!({
+        "scope": res.scope.as_str(),
+        "topics": res.topics,
+    }))
+    .into_response()
 }
 
 /// GET /api/v1/news/{msg_id} — single news post with comments.

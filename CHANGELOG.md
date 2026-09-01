@@ -5,6 +5,87 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.124.0] - 2026-09-01
+
+### Added
+
+- **News feed hashtag filter.** `GET /api/v1/news` now honours `?tag=<t>`
+  (single tag) and `?tags=t1,t2,...` (OR-set, deduped by `msg_id`, capped at
+  50). Every tag is normalized to canonical form (protocol §3.5 — trim →
+  lowercase → strip a leading `#` → `^[a-z0-9-]{1,64}$`) before lookup, so
+  `?tag=Klever` matches indexed `klever`. Backed by the `news_by_tag` index;
+  cursor (`before`/`after`), `has_more` and the audit-W37 follower-visibility
+  filter behave exactly as for the unfiltered feed — the two paths share one
+  enrichment helper so they cannot drift. `GET /api/v1/feed` does **not**
+  accept tag params. The `?tag=` parameter had been accepted-and-ignored
+  since the feed's inception; it is now wired.
+- **`GET /api/v1/news/hot-topics`** — trending news hashtags over a rolling
+  24h window with usage counts. `{ "scope": "network" | "local", "topics":
+  [ { "hashtag", "count" } ] }`, sorted by count desc (ties by hashtag asc),
+  served from a `[hot_topics] cache_ttl_secs` (default 60s) server-side cache.
+  `count` is a network-wide **distinct-`NewsPost`** estimate.
+- **Hot Topics mesh aggregation (spec 3 §3.9).** Each node keeps, per
+  `(tag, bucket_hour)`, a small hand-rolled dense HyperLogLog sketch
+  (`src/hll.rs`, p=12, no new dependency — reuses `zstd`) of the distinct
+  `NewsPost` `msg_id`s it has indexed (`hot_topics_local` CF). On a timer
+  (`[hot_topics] publish_interval_secs`, default 600, first send jittered) it
+  publishes a signed `HotTopicsDigest` (protocol tag `0xE1`,
+  `MessageType::HotTopicsDigest`) on the `/network` gossip topic. Receiving
+  nodes validate (cost-ordered pipeline modelled on presence-record
+  validation: size guard → decode → PeerId/denylist/source-match → rate-limit
+  peek → skew → network/window match → signature → rate-limit commit →
+  sender-identity gate) and fold accepted digests into `hot_topics_merged` by
+  HLL **union**, so a post gossiped to every node is counted once. Abuse
+  resistance: SC-registered / presence-`both` sender gate (falls back to
+  meshed-peer-only when no Klever RPC is configured), per-node contribution
+  clamp, query-time median trim, and a minimum-contributors gate before a tag
+  is reported as `scope: "network"`. A fresh / partitioned / mesh-disabled
+  node serves its own local counts with `scope: "local"` and never blocks.
+- **`settings_changed` WebSocket event.** When a wallet's cross-device
+  settings blob (`SettingsSync` / `0x33`) is overwritten by any of its
+  devices, the node now pushes a payload-free `{ "type": "settings_changed" }`
+  to that wallet's other authenticated WS sessions, so a second device
+  re-pulls `GET /api/v1/settings` immediately instead of only on its next
+  login (the "one-shot sync = permanent divergence" failure mode). The blob
+  stays E2E-encrypted — the node still can't read it.
+- Two new node-local column families: `hot_topics_local` and
+  `hot_topics_merged`. Both are derived aggregates **excluded from the
+  snapshot `DOMAIN_CFS`** (a poisoned snapshot must not be able to forge
+  trending data; both rebuild cheaply from `news_feed` + inbound digests) and
+  hourly-evicted past `window_hours + eviction_slack_hours`. On first start
+  after upgrade, `hot_topics_local` is rebuilt from the last window of
+  `news_feed` if empty.
+- `[hot_topics]` config section (26 keys) with startup validation: hard
+  rejects for values that would hot-spin a loop or make the endpoint
+  degenerate (`sketch_precision != 12`, `cache_ttl_secs = 0`,
+  `inbound_rate_limit_secs = 0`, …), soft clamps for a too-wide window or a
+  too-fast publish cadence.
+- `util::normalize_tag` / `normalize_tags_dedup` — the canonical tag
+  normalization, in the `lib.rs` surface as the SDK-parity reference for
+  `@ogmara/sdk`'s `normalizeHashtag()`.
+
+### Changed
+
+- `MessageRouter` indexes `news_by_tag` in canonical normalized form
+  (previously the raw client string). A tag-changing `NewsEdit` now re-indexes
+  `news_by_tag` for the original post so the feed filter stays correct; Hot
+  Topics sketches are deliberately not touched on edit/delete (approximate
+  rolling counter; decrement-on-delete is a probe vector).
+- `/admin/storage/stats` lists the two new column families.
+
+### Security
+
+- Hot Topics digest ingestion is rate-limited per libp2p `PeerId`
+  (`[hot_topics] inbound_rate_limit_secs`, default 300s, sharing the presence
+  rate-limiter shape) and gated on a `digest_max_envelope_bytes` (512 KiB)
+  pre-decode size check; the HLL wire form's zstd decode is hard-bounded to
+  4096 output bytes so it cannot be a decompression bomb.
+- Dependency scan: `cargo audit` reports the same 2 `hickory-proto`
+  advisories (RUSTSEC-2026-0118 / -0119) reachable only through the
+  `libp2p 0.56` `dns` feature — unchanged by this release, no fixed version
+  reachable under the current `libp2p` pin (RUSTSEC-2026-0118 has no fix at
+  any version). No new dependencies were added.
+
 ## [0.123.0] - 2026-09-01
 
 ### Added

@@ -68,6 +68,9 @@ pub struct Config {
     /// l2-node 0.108.0+).
     #[serde(default)]
     pub channel_member_removal: ChannelMemberRemovalConfig,
+    /// Trending-news-hashtag aggregation (spec 3 §3.9, l2-node 0.124.0+).
+    #[serde(default)]
+    pub hot_topics: HotTopicsConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -887,6 +890,224 @@ fn default_channel_member_removal_pending_retention_hours() -> u64 {
     24
 }
 fn default_channel_member_removal_reap_interval_secs() -> u64 {
+    3600
+}
+
+/// Trending-news-hashtag aggregation (spec 3 §3.9, protocol §3.15). Feeds
+/// `GET /api/v1/news/hot-topics`. Counts are network-wide distinct-post
+/// estimates folded from peer `HotTopicsDigest` gossip (0xE1) by HLL union;
+/// abuse resistance is a sender-identity gate + per-node contribution clamp +
+/// query-time median trim + minimum-contributors gate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HotTopicsConfig {
+    /// Master switch for the whole subsystem (ingest sketches, endpoint,
+    /// digests). Default true.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Exchange `HotTopicsDigest` gossip with peers for a network-wide count.
+    /// `false` → serve this node's own local counts only, `scope` always
+    /// `"local"`. Default true.
+    #[serde(default = "default_true")]
+    pub mesh_enabled: bool,
+    /// Rolling window width in hours. Only 24 is meaningful in this version;
+    /// validation clamps to `1..=168` and rejects 0. Default 24.
+    #[serde(default = "default_hot_topics_window_hours")]
+    pub window_hours: u64,
+    /// Default `limit` for the endpoint when the caller doesn't specify one.
+    #[serde(default = "default_hot_topics_limit_default")]
+    pub limit_default: usize,
+    /// Operator ceiling on the endpoint's `limit`. Hard-capped at 100
+    /// regardless of config. Default 50.
+    #[serde(default = "default_hot_topics_limit_cap")]
+    pub limit_cap: usize,
+    /// Server-side TTL (seconds) for the computed hot-topics result. Rejects
+    /// 0. Default 60.
+    #[serde(default = "default_hot_topics_cache_ttl_secs")]
+    pub cache_ttl_secs: u64,
+    /// A tag must reach this many distinct posts (in the merged view, or in
+    /// this node's own local view) to appear at all. `>= 1`. Default 2.
+    #[serde(default = "default_hot_topics_min_count")]
+    pub min_count: u64,
+    /// Per-bucket cap on DISTINCT tracked tags. Once hit, a NEW tag for that
+    /// bucket is not tracked (existing tags still count). Rejects 0; warns
+    /// above 65536. Default 4096.
+    #[serde(default = "default_hot_topics_max_tracked_tags_per_bucket")]
+    pub max_tracked_tags_per_bucket: usize,
+    /// Extra hours a bucket is kept past `window_hours` before hourly
+    /// eviction. Default 2.
+    #[serde(default = "default_hot_topics_eviction_slack_hours")]
+    pub eviction_slack_hours: u64,
+    /// Outbound digest cadence (seconds). Clamped to `120..=3600`. Default
+    /// 600 (matches `NodeAnnouncement`).
+    #[serde(default = "default_hot_topics_publish_interval_secs")]
+    pub publish_interval_secs: u64,
+    /// Random `0..=publish_jitter_secs` added to the FIRST post-boot digest
+    /// publish to avoid a restart thundering herd. Default 60.
+    #[serde(default = "default_hot_topics_publish_jitter_secs")]
+    pub publish_jitter_secs: u64,
+    /// Max buckets carried in one outbound digest (current hour + a few
+    /// recent). Default 3.
+    #[serde(default = "default_hot_topics_max_buckets_per_digest")]
+    pub max_buckets_per_digest: usize,
+    /// Max tags per bucket in one digest — sender self-caps, receiver rejects
+    /// a digest that exceeds it. Default 48.
+    #[serde(default = "default_hot_topics_max_tags_per_digest")]
+    pub max_tags_per_digest: usize,
+    /// HLL precision. Fixed at 12 in this version — validation rejects any
+    /// other value. Default 12.
+    #[serde(default = "default_hot_topics_sketch_precision")]
+    pub sketch_precision: u8,
+    /// Per-tag serialized-sketch wire cap (the dense zstd form is ~4 KiB
+    /// worst case). Default 8192.
+    #[serde(default = "default_hot_topics_max_sketch_bytes")]
+    pub max_sketch_bytes: usize,
+    /// Whole-digest-envelope size guard, checked BEFORE msgpack decode.
+    /// Default 524288 (512 KiB).
+    #[serde(default = "default_hot_topics_digest_max_envelope_bytes")]
+    pub digest_max_envelope_bytes: usize,
+    /// Max distinct peers whose contribution is tracked per `(tag, bucket)`.
+    /// Default 64.
+    #[serde(default = "default_hot_topics_digest_max_peers")]
+    pub digest_max_peers: usize,
+    /// Minimum gap (seconds) between ACCEPTED inbound digests per PeerId —
+    /// shares the presence rate-limiter type. Default 300.
+    #[serde(default = "default_hot_topics_inbound_rate_limit_secs")]
+    pub inbound_rate_limit_secs: u64,
+    /// Per-node contribution clamp: an incoming `approx` above this still
+    /// unions but WARNs; above `2×` it drops that tag from the digest.
+    /// Default 5000.
+    #[serde(default = "default_hot_topics_max_node_tag_contribution")]
+    pub max_node_tag_contribution: u32,
+    /// Query-time cap: reported count `<= trim_multiplier × median(contributor
+    /// approx)`. Default 3.
+    #[serde(default = "default_hot_topics_trim_multiplier")]
+    pub trim_multiplier: u32,
+    /// A tag is reported as `scope:"network"` only with at least this many
+    /// contributors. Default 2.
+    #[serde(default = "default_hot_topics_min_contributors")]
+    pub min_contributors: u16,
+    /// Below this contributor count the trim falls back to
+    /// `local_cardinality × local_only_multiplier` instead of the median.
+    /// Default 3.
+    #[serde(default = "default_hot_topics_min_contributors_for_trim")]
+    pub min_contributors_for_trim: u16,
+    /// Fallback trim multiplier vs this node's own local cardinality when
+    /// there are too few contributors for a median. Default 4.
+    #[serde(default = "default_hot_topics_local_only_multiplier")]
+    pub local_only_multiplier: u32,
+    /// Only fold digests from SC-registered / presence-`both` senders. If
+    /// true but no `[klever]` RPC is configured, the node WARNs at startup
+    /// and falls back to meshed-peer-only acceptance (never hard-fails).
+    /// Default true.
+    #[serde(default = "default_true")]
+    pub require_sc_registered_sender: bool,
+    /// TTL (seconds) of the cached SC `getActiveNodes` set used by the
+    /// sender-identity gate. Default 3600.
+    #[serde(default = "default_hot_topics_active_set_refresh_secs")]
+    pub active_set_refresh_secs: u64,
+    /// PeerIds whose digests are never accepted (in addition to
+    /// `[network.presence] denylist`). Default empty.
+    #[serde(default)]
+    pub digest_denylist: Vec<String>,
+}
+
+impl Default for HotTopicsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            mesh_enabled: true,
+            window_hours: default_hot_topics_window_hours(),
+            limit_default: default_hot_topics_limit_default(),
+            limit_cap: default_hot_topics_limit_cap(),
+            cache_ttl_secs: default_hot_topics_cache_ttl_secs(),
+            min_count: default_hot_topics_min_count(),
+            max_tracked_tags_per_bucket: default_hot_topics_max_tracked_tags_per_bucket(),
+            eviction_slack_hours: default_hot_topics_eviction_slack_hours(),
+            publish_interval_secs: default_hot_topics_publish_interval_secs(),
+            publish_jitter_secs: default_hot_topics_publish_jitter_secs(),
+            max_buckets_per_digest: default_hot_topics_max_buckets_per_digest(),
+            max_tags_per_digest: default_hot_topics_max_tags_per_digest(),
+            sketch_precision: default_hot_topics_sketch_precision(),
+            max_sketch_bytes: default_hot_topics_max_sketch_bytes(),
+            digest_max_envelope_bytes: default_hot_topics_digest_max_envelope_bytes(),
+            digest_max_peers: default_hot_topics_digest_max_peers(),
+            inbound_rate_limit_secs: default_hot_topics_inbound_rate_limit_secs(),
+            max_node_tag_contribution: default_hot_topics_max_node_tag_contribution(),
+            trim_multiplier: default_hot_topics_trim_multiplier(),
+            min_contributors: default_hot_topics_min_contributors(),
+            min_contributors_for_trim: default_hot_topics_min_contributors_for_trim(),
+            local_only_multiplier: default_hot_topics_local_only_multiplier(),
+            require_sc_registered_sender: true,
+            active_set_refresh_secs: default_hot_topics_active_set_refresh_secs(),
+            digest_denylist: Vec::new(),
+        }
+    }
+}
+
+fn default_hot_topics_window_hours() -> u64 {
+    24
+}
+fn default_hot_topics_limit_default() -> usize {
+    20
+}
+fn default_hot_topics_limit_cap() -> usize {
+    50
+}
+fn default_hot_topics_cache_ttl_secs() -> u64 {
+    60
+}
+fn default_hot_topics_min_count() -> u64 {
+    2
+}
+fn default_hot_topics_max_tracked_tags_per_bucket() -> usize {
+    4096
+}
+fn default_hot_topics_eviction_slack_hours() -> u64 {
+    2
+}
+fn default_hot_topics_publish_interval_secs() -> u64 {
+    600
+}
+fn default_hot_topics_publish_jitter_secs() -> u64 {
+    60
+}
+fn default_hot_topics_max_buckets_per_digest() -> usize {
+    3
+}
+fn default_hot_topics_max_tags_per_digest() -> usize {
+    48
+}
+fn default_hot_topics_sketch_precision() -> u8 {
+    12
+}
+fn default_hot_topics_max_sketch_bytes() -> usize {
+    8192
+}
+fn default_hot_topics_digest_max_envelope_bytes() -> usize {
+    524_288
+}
+fn default_hot_topics_digest_max_peers() -> usize {
+    64
+}
+fn default_hot_topics_inbound_rate_limit_secs() -> u64 {
+    300
+}
+fn default_hot_topics_max_node_tag_contribution() -> u32 {
+    5000
+}
+fn default_hot_topics_trim_multiplier() -> u32 {
+    3
+}
+fn default_hot_topics_min_contributors() -> u16 {
+    2
+}
+fn default_hot_topics_min_contributors_for_trim() -> u16 {
+    3
+}
+fn default_hot_topics_local_only_multiplier() -> u32 {
+    4
+}
+fn default_hot_topics_active_set_refresh_secs() -> u64 {
     3600
 }
 
@@ -2543,6 +2764,118 @@ impl Config {
                 format!("api.trusted_proxies[{}] = {:?}", idx, entry)
             })?;
         }
+
+        // Hot Topics aggregation (spec 3 §3.9, l2-node 0.124.0+). Only
+        // gated when `enabled` — an operator who leaves the block at its
+        // defaults never trips these. Zero values that would hot-spin a
+        // loop or make the endpoint degenerate are HARD rejects; a
+        // too-wide window or a too-fast publish cadence is a SOFT clamp
+        // (a node crash-looping over a trending-widget knob is worse).
+        if self.hot_topics.enabled {
+            let ht = &mut self.hot_topics;
+            if ht.sketch_precision != 12 {
+                anyhow::bail!(
+                    "hot_topics.sketch_precision = {} is unsupported — this version \
+                     only implements p = 12 (the on-wire sketch format is fixed). \
+                     Remove the override or set it to 12.",
+                    ht.sketch_precision
+                );
+            }
+            if ht.window_hours == 0 {
+                anyhow::bail!("hot_topics.window_hours must be > 0 (default 24)");
+            }
+            if ht.window_hours > 168 {
+                eprintln!(
+                    "[config] hot_topics.window_hours ({}) exceeds the 168h (7d) \
+                     maximum; clamping.",
+                    ht.window_hours
+                );
+                ht.window_hours = 168;
+            }
+            if ht.cache_ttl_secs == 0 {
+                anyhow::bail!(
+                    "hot_topics.cache_ttl_secs must be > 0 (zero recomputes the \
+                     result on every request; default 60)"
+                );
+            }
+            if ht.min_count == 0 {
+                anyhow::bail!("hot_topics.min_count must be >= 1 (default 2)");
+            }
+            if ht.max_tracked_tags_per_bucket == 0 {
+                anyhow::bail!(
+                    "hot_topics.max_tracked_tags_per_bucket must be > 0 (default 4096)"
+                );
+            }
+            if ht.max_tracked_tags_per_bucket > 65_536 {
+                eprintln!(
+                    "[config] hot_topics.max_tracked_tags_per_bucket ({}) is very \
+                     large — write amplification from tag-spam is bounded only by \
+                     this value.",
+                    ht.max_tracked_tags_per_bucket
+                );
+            }
+            if ht.publish_interval_secs < 120 {
+                eprintln!(
+                    "[config] hot_topics.publish_interval_secs ({}) is below the 120s \
+                     floor; clamping (a faster cadence just floods the /network topic).",
+                    ht.publish_interval_secs
+                );
+                ht.publish_interval_secs = 120;
+            }
+            if ht.publish_interval_secs > 3600 {
+                eprintln!(
+                    "[config] hot_topics.publish_interval_secs ({}) exceeds the 3600s \
+                     ceiling; clamping.",
+                    ht.publish_interval_secs
+                );
+                ht.publish_interval_secs = 3600;
+            }
+            if ht.inbound_rate_limit_secs == 0 {
+                anyhow::bail!(
+                    "hot_topics.inbound_rate_limit_secs must be > 0 (zero accepts an \
+                     unbounded digest rate per peer; default 300)"
+                );
+            }
+            if ht.max_buckets_per_digest == 0 || ht.max_tags_per_digest == 0 {
+                anyhow::bail!(
+                    "hot_topics.max_buckets_per_digest and max_tags_per_digest must \
+                     both be > 0 (defaults 3 and 48)"
+                );
+            }
+            if ht.digest_max_envelope_bytes < 4096 {
+                anyhow::bail!(
+                    "hot_topics.digest_max_envelope_bytes = {} is too small — a single \
+                     sketch alone can approach 4 KiB (default 524288)",
+                    ht.digest_max_envelope_bytes
+                );
+            }
+            if ht.trim_multiplier == 0 {
+                anyhow::bail!("hot_topics.trim_multiplier must be >= 1 (default 3)");
+            }
+            if ht.limit_cap == 0 || ht.limit_default == 0 {
+                anyhow::bail!(
+                    "hot_topics.limit_cap and limit_default must both be > 0 \
+                     (defaults 50 and 20)"
+                );
+            }
+            for (idx, entry) in ht.digest_denylist.iter().enumerate() {
+                if entry.trim().is_empty() {
+                    anyhow::bail!(
+                        "hot_topics.digest_denylist[{}] is empty — remove it or \
+                         replace with a valid libp2p PeerId (base58)",
+                        idx
+                    );
+                }
+                entry.parse::<libp2p::PeerId>().with_context(|| {
+                    format!(
+                        "hot_topics.digest_denylist[{}] = {:?} must be a valid libp2p \
+                         PeerId (base58, e.g. \"12D3KooW...\")",
+                        idx, entry
+                    )
+                })?;
+            }
+        }
+
         Ok(())
     }
 

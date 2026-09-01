@@ -946,6 +946,11 @@ impl Node {
         // serve the cache; the manager's background sweep runs as a
         // separate task below.
         let presence_manager_handle = network.presence_manager();
+        // Spec 3 §3.9 — shared Hot Topics aggregator handle. Cloned into
+        // AppState (endpoint reads) and used below to spawn the hourly
+        // eviction sweep, the one-shot startup bootstrap, and (when Klever is
+        // wired) the periodic trusted-node refresh.
+        let hot_topics_agg = network.hot_topics();
         info!(
             peer_id = %network_peer_id,
             "Network service started"
@@ -959,6 +964,124 @@ impl Node {
             spawn_supervised("presence_sweep", async move {
                 sweep_mgr.run_sweep(sweep_shutdown_rx).await;
             });
+        }
+
+        // Hot Topics maintenance (spec 3 §3.9, l2-node 0.124.0+).
+        if self.config.hot_topics.enabled {
+            // (a) One-shot bootstrap: rebuild the local per-(tag,hour)
+            // sketches from the last window of NEWS_FEED if HOT_TOPICS_LOCAL
+            // is empty (the upgrade path).
+            {
+                let boot_agg = hot_topics_agg.clone();
+                spawn_supervised("hot_topics_bootstrap", async move {
+                    let n = tokio::task::spawn_blocking(move || {
+                        boot_agg.bootstrap_local_from_news_feed(
+                            crate::network::hot_topics::now_ms(),
+                        )
+                    })
+                    .await;
+                    match n {
+                        Ok(Ok(0)) => {}
+                        Ok(Ok(scanned)) => {
+                            info!(scanned, "hot-topics: rebuilt local sketches from NEWS_FEED")
+                        }
+                        Ok(Err(e)) => warn!(error = %e, "hot-topics bootstrap failed"),
+                        Err(e) => warn!(error = %e, "hot-topics bootstrap task join failed"),
+                    }
+                });
+            }
+
+            // (b) Hourly eviction of buckets older than the window + slack,
+            // from both HOT_TOPICS_LOCAL and HOT_TOPICS_MERGED.
+            {
+                let evict_agg = hot_topics_agg.clone();
+                let mut evict_shutdown_rx = self.shutdown_rx();
+                spawn_supervised("hot_topics_evict", async move {
+                    let mut iv = tokio::time::interval(std::time::Duration::from_secs(3600));
+                    iv.tick().await;
+                    loop {
+                        tokio::select! {
+                            _ = iv.tick() => {
+                                let a = evict_agg.clone();
+                                match tokio::task::spawn_blocking(move || {
+                                    a.evict_stale(crate::network::hot_topics::now_ms())
+                                }).await {
+                                    Ok(Ok(n)) if n > 0 => debug!(removed = n, "hot-topics: evicted stale buckets"),
+                                    Ok(Ok(_)) => {}
+                                    Ok(Err(e)) => warn!(error = %e, "hot-topics eviction failed"),
+                                    Err(e) => warn!(error = %e, "hot-topics eviction task join failed"),
+                                }
+                            }
+                            _ = evict_shutdown_rx.recv() => break,
+                        }
+                    }
+                });
+            }
+
+            // (c) Trusted-node refresh: the digest sender-identity gate folds
+            // digests only from SC-registered nodes. Poll `getActiveNodes`
+            // when Klever + mesh + the gate are all configured; otherwise the
+            // aggregator falls back to meshed-peer-only acceptance.
+            let klever_ready = !self.config.klever.node_url.is_empty()
+                && !self.config.klever.contract_address.is_empty();
+            if self.config.hot_topics.mesh_enabled
+                && self.config.hot_topics.require_sc_registered_sender
+                && klever_ready
+            {
+                let tr_agg = hot_topics_agg.clone();
+                let tr_url = self.config.klever.node_url.clone();
+                let tr_contract = self.config.klever.contract_address.clone();
+                let tr_every = std::time::Duration::from_secs(
+                    self.config.hot_topics.active_set_refresh_secs.max(60),
+                );
+                let mut tr_shutdown_rx = self.shutdown_rx();
+                spawn_supervised("hot_topics_trusted_refresh", async move {
+                    let http = reqwest::Client::builder()
+                        .timeout(std::time::Duration::from_secs(20))
+                        .build()
+                        .unwrap_or_default();
+                    let mut iv = tokio::time::interval(tr_every);
+                    // Fire the first refresh ~15s in, once RPC is likely up.
+                    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                    loop {
+                        let mut set = std::collections::HashSet::new();
+                        let mut offset = 0u32;
+                        loop {
+                            match crate::chain::sc_views::get_active_nodes(
+                                &http, &tr_url, &tr_contract, offset, 64,
+                            )
+                            .await
+                            {
+                                Ok(page) => {
+                                    if page.is_empty() {
+                                        break;
+                                    }
+                                    let got = page.len() as u32;
+                                    for n in page {
+                                        set.insert(n.address);
+                                    }
+                                    if got < 64 || offset >= 64 * 32 {
+                                        break;
+                                    }
+                                    offset += got;
+                                }
+                                Err(e) => {
+                                    debug!(error = %e, "hot-topics: getActiveNodes refresh failed");
+                                    break;
+                                }
+                            }
+                        }
+                        if !set.is_empty() {
+                            debug!(nodes = set.len(), "hot-topics: refreshed trusted node set");
+                            tr_agg.set_trusted_nodes(set);
+                        }
+                        tokio::select! {
+                            _ = iv.tick() => {}
+                            _ = tr_shutdown_rx.recv() => break,
+                        }
+                    }
+                });
+            }
         }
 
         // Channel for chain scanner → network layer topic subscriptions. Cloned for
@@ -1430,7 +1553,8 @@ impl Node {
             self.config.dm.max_stored_messages_per_recipient,
             network_counters.clone(),
             self.config.api.rate_limits.clone(),
-        );
+        )
+        .with_hot_topics_config(self.config.hot_topics.clone());
 
         // Start metrics collector (spec 10-dashboard.md §6)
         let node_address = self.address().unwrap_or_default();
@@ -1870,6 +1994,10 @@ impl Node {
             // disabled).
             self.config.alerts.clone(),
             alert_test_tx,
+            // Spec 3 §3.9 — Hot Topics mesh aggregator, shared with the
+            // network task so `GET /api/v1/news/hot-topics` reads the same
+            // merged view inbound digests are folded into.
+            Some(hot_topics_agg.clone()),
         ));
         // Background sweep: drop zero-counter entries from the per-IP
         // media limiter (v0.41). Without this, the DashMap accumulates

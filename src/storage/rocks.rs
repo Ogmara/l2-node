@@ -262,6 +262,12 @@ impl Storage {
                     // klv1 bech32 addresses with 32-byte Ed25519 keys are 62 characters
                     cf_opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(62));
                 }
+                if *name == cf::HOT_TOPICS_LOCAL || *name == cf::HOT_TOPICS_MERGED {
+                    // Key: (bucket_hour:8 BE, tag) — prefix by the bucket hour so
+                    // per-bucket scans (digest build, eviction, query fold) stay
+                    // in one SST prefix range.
+                    cf_opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(8));
+                }
                 if *name == cf::NODE_STATE {
                     // Audit final pre-mainnet W19b: lock-free counter accumulation
                     // for the `stat_*`/`TOTAL_*` keys (see `stat_counter_merge`'s

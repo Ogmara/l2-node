@@ -299,6 +299,13 @@ pub struct MessageRouter {
     /// `failed_signature_verifications` on a Step 4b rejection, feeding the
     /// `FailedSignatureSpike` alert.
     counters: Arc<crate::metrics::counters::NetworkCounters>,
+    /// Trending-hashtag aggregation policy (spec 3 §3.9). Consulted in
+    /// `update_indexes` when a `NewsPost` is stored: gates whether the
+    /// per-`(tag, hour)` HyperLogLog sketch in `HOT_TOPICS_LOCAL` is
+    /// updated, and caps distinct tracked tags per bucket. Defaults to
+    /// `HotTopicsConfig::default()`; production overrides via
+    /// `with_hot_topics_config`.
+    hot_topics_config: crate::config::HotTopicsConfig,
 }
 
 /// Rejection reason for step 4d (tiered identity). Shared with
@@ -361,7 +368,19 @@ impl MessageRouter {
             dm_recipient_cap,
             dm_recipient_cap_lock: std::sync::Mutex::new(()),
             counters,
+            hot_topics_config: crate::config::HotTopicsConfig::default(),
         }
+    }
+
+    /// Override the trending-hashtag aggregation policy (production wiring —
+    /// tests keep the default). Builder-style so `new`'s already-long
+    /// signature doesn't grow another argument.
+    pub fn with_hot_topics_config(
+        mut self,
+        cfg: crate::config::HotTopicsConfig,
+    ) -> Self {
+        self.hot_topics_config = cfg;
+        self
     }
 
     /// Process a raw message through the full pipeline.
@@ -2027,6 +2046,43 @@ impl MessageRouter {
         Some(payload.channel_id)
     }
 
+    /// Add one `NewsPost` `msg_id` to this node's local HyperLogLog sketch
+    /// for `(tag, bucket_hour)` in `HOT_TOPICS_LOCAL` (spec 3 §3.9).
+    ///
+    /// Honors `max_tracked_tags_per_bucket`: once a bucket already tracks
+    /// that many distinct tags, a brand-new tag is dropped (tags already
+    /// present keep counting) — this bounds write amplification from
+    /// tag-spam. Read-modify-write: `NewsPost` ingest is low-rate, so no
+    /// RocksDB merge operator is warranted.
+    fn hot_topics_sketch_insert(
+        &self,
+        bucket_hour: u64,
+        tag: &str,
+        msg_id: &[u8; 32],
+    ) -> Result<()> {
+        let key = schema::encode_hot_topics_key(bucket_hour, tag);
+        let existing = self.storage.get_cf(schema::cf::HOT_TOPICS_LOCAL, &key)?;
+        if existing.is_none() {
+            let cap = self.hot_topics_config.max_tracked_tags_per_bucket;
+            let tracked = self.storage.count_prefix_cf(
+                schema::cf::HOT_TOPICS_LOCAL,
+                &bucket_hour.to_be_bytes(),
+                cap.saturating_add(1),
+            )?;
+            if tracked as usize >= cap {
+                return Ok(());
+            }
+        }
+        let mut hll = existing
+            .as_deref()
+            .and_then(crate::hll::Hll::from_bytes)
+            .unwrap_or_default();
+        hll.insert(msg_id);
+        self.storage
+            .put_cf(schema::cf::HOT_TOPICS_LOCAL, &key, &hll.to_bytes())?;
+        Ok(())
+    }
+
     /// Update storage indexes based on message type.
     fn update_indexes(&self, envelope: &Envelope, resolved_author: &str) -> Result<()> {
         // P-1 (identity-sync): index a user's signed identity envelopes
@@ -2188,11 +2244,27 @@ impl MessageRouter {
                 self.storage
                     .put_cf(schema::cf::NEWS_BY_AUTHOR, &author_key, &[])?;
 
-                // Index by tags
+                // Index by tags (canonical normalized form — protocol §3.5) and
+                // feed the per-(tag, hour) Hot Topics HyperLogLog sketch.
                 if let Ok(payload) =
                     rmp_serde::from_slice::<NewsPostPayload>(&envelope.payload)
                 {
-                    for tag in &payload.tags {
+                    let norm = crate::util::normalize_tags_dedup(&payload.tags);
+                    let bucket_hour =
+                        envelope.timestamp / schema::HOT_TOPICS_BUCKET_MS;
+                    let ht = &self.hot_topics_config;
+                    // Only sketch a post whose bucket is (or could still be) in
+                    // the rolling window — a very old backfilled post shouldn't
+                    // resurrect a long-evicted bucket.
+                    let sketch_this_bucket = ht.enabled && {
+                        let now_hour = crate::util::now_ms()
+                            / schema::HOT_TOPICS_BUCKET_MS;
+                        let lo = now_hour.saturating_sub(
+                            ht.window_hours + ht.eviction_slack_hours,
+                        );
+                        bucket_hour >= lo && bucket_hour <= now_hour + 1
+                    };
+                    for tag in &norm {
                         let tag_key = schema::encode_news_by_tag_key(
                             tag,
                             envelope.timestamp,
@@ -2200,6 +2272,13 @@ impl MessageRouter {
                         );
                         self.storage
                             .put_cf(schema::cf::NEWS_BY_TAG, &tag_key, &[])?;
+                        if sketch_this_bucket {
+                            self.hot_topics_sketch_insert(
+                                bucket_hour,
+                                tag,
+                                &envelope.msg_id,
+                            )?;
+                        }
                     }
                 }
             }
@@ -2878,6 +2957,62 @@ impl MessageRouter {
                         schema::encode_news_key(envelope.timestamp, &envelope.msg_id);
                     self.storage
                         .put_cf(schema::cf::NEWS_EDIT_DELETE, &key, &[])?;
+
+                    // If the edit overlays a new `tags` set, re-index
+                    // `NEWS_BY_TAG` for the ORIGINAL post so the `?tag=` /
+                    // `?tags=` feed filter stays correct (the read-time
+                    // projection already swaps the displayed tags; the index
+                    // is separate). Hot Topics sketches are intentionally NOT
+                    // touched — they are an approximate rolling counter and
+                    // decrement-on-edit is a probe vector (spec 3 §3.9).
+                    if let Some(new_tags) = &payload.tags {
+                        if let Ok(Some(orig_raw)) = self
+                            .storage
+                            .get_cf(schema::cf::MESSAGES, &payload.target_id)
+                        {
+                            if let Ok(orig_env) =
+                                rmp_serde::from_slice::<Envelope>(&orig_raw)
+                            {
+                                if orig_env.msg_type == MessageType::NewsPost {
+                                    let old: std::collections::HashSet<String> =
+                                        rmp_serde::from_slice::<NewsPostPayload>(
+                                            &orig_env.payload,
+                                        )
+                                        .map(|p| {
+                                            crate::util::normalize_tags_dedup(&p.tags)
+                                                .into_iter()
+                                                .collect()
+                                        })
+                                        .unwrap_or_default();
+                                    let new: std::collections::HashSet<String> =
+                                        crate::util::normalize_tags_dedup(new_tags)
+                                            .into_iter()
+                                            .collect();
+                                    for gone in old.difference(&new) {
+                                        let k = schema::encode_news_by_tag_key(
+                                            gone,
+                                            orig_env.timestamp,
+                                            &payload.target_id,
+                                        );
+                                        self.storage
+                                            .delete_cf(schema::cf::NEWS_BY_TAG, &k)?;
+                                    }
+                                    for added in new.difference(&old) {
+                                        let k = schema::encode_news_by_tag_key(
+                                            added,
+                                            orig_env.timestamp,
+                                            &payload.target_id,
+                                        );
+                                        self.storage.put_cf(
+                                            schema::cf::NEWS_BY_TAG,
+                                            &k,
+                                            &[],
+                                        )?;
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
             MessageType::NewsDelete => {
@@ -5713,5 +5848,118 @@ mod rate_limit_counter_tests {
             "cleanup must NOT evict an entry whose sustained window is still \
              live (now) just because its burst window is stale (2 days old)"
         );
+    }
+}
+#[cfg(test)]
+mod hot_topics_ingest_tests {
+    //! Spec 3 §3.9 — the ingest side of Hot Topics: a `NewsPost` must index
+    //! its tags in `NEWS_BY_TAG` in canonical normalized form (protocol §3.5)
+    //! and feed the per-`(tag, hour)` sketch in `HOT_TOPICS_LOCAL`.
+    use super::*;
+    use tempfile::TempDir;
+
+    fn router() -> (MessageRouter, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let identity = IdentityResolver::new(storage.clone());
+        (
+            MessageRouter::new(
+                storage,
+                identity,
+                None,
+                "testnet".to_string(),
+                usize::MAX,
+                std::sync::Arc::new(crate::metrics::counters::NetworkCounters::new()),
+                crate::config::RateLimitsConfig::default(),
+            )
+            .with_hot_topics_config(crate::config::HotTopicsConfig::default()),
+            dir,
+        )
+    }
+
+    fn news_envelope(author: &str, msg_id: [u8; 32], ts: u64, tags: &[&str]) -> Envelope {
+        let payload = NewsPostPayload {
+            title: "t".into(),
+            content: "c".into(),
+            content_rating: Default::default(),
+            tags: tags.iter().map(|s| s.to_string()).collect(),
+            attachments: vec![],
+            visibility: Default::default(),
+        };
+        Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::NewsPost,
+            msg_id,
+            author: author.to_string(),
+            timestamp: ts,
+            lamport_ts: 0,
+            payload: rmp_serde::to_vec_named(&payload).unwrap(),
+            signature: vec![],
+            relay_path: vec![],
+        }
+    }
+
+    #[test]
+    fn news_post_indexes_normalized_tags_and_feeds_the_sketch() {
+        let (r, _d) = router();
+        let ts = crate::util::now_ms();
+        let msg_id = [7u8; 32];
+        // Mixed-case, hashed, and one un-normalizable tag.
+        let env = news_envelope("klv1a", msg_id, ts, &["#Klever", "DeFi", "bad tag"]);
+        r.storage
+            .put_cf(schema::cf::MESSAGES, &msg_id, &rmp_serde::to_vec_named(&env).unwrap())
+            .unwrap();
+        r.update_indexes(&env, "klv1a").unwrap();
+
+        // NEWS_BY_TAG holds the canonical form only.
+        assert!(r
+            .storage
+            .prefix_iter_cf(schema::cf::NEWS_BY_TAG, &schema::news_by_tag_prefix("klever"), 4)
+            .unwrap()
+            .len()
+            == 1);
+        assert!(r
+            .storage
+            .prefix_iter_cf(schema::cf::NEWS_BY_TAG, &schema::news_by_tag_prefix("defi"), 4)
+            .unwrap()
+            .len()
+            == 1);
+        // The raw "Klever" / "bad tag" never entered the index.
+        assert!(r
+            .storage
+            .prefix_iter_cf(schema::cf::NEWS_BY_TAG, &schema::news_by_tag_prefix("Klever"), 4)
+            .unwrap()
+            .is_empty());
+
+        // HOT_TOPICS_LOCAL has a sketch for (bucket, klever) estimating 1.
+        let bucket = ts / schema::HOT_TOPICS_BUCKET_MS;
+        let raw = r
+            .storage
+            .get_cf(schema::cf::HOT_TOPICS_LOCAL, &schema::encode_hot_topics_key(bucket, "klever"))
+            .unwrap()
+            .expect("sketch present");
+        let hll = crate::hll::Hll::from_bytes(&raw).expect("decodes");
+        assert_eq!(hll.estimate_u32(), 1);
+    }
+
+    #[test]
+    fn max_tracked_tags_per_bucket_drops_new_tags_once_full() {
+        let (mut r, _d) = router();
+        r.hot_topics_config.max_tracked_tags_per_bucket = 2;
+        let ts = crate::util::now_ms();
+        let bucket = ts / schema::HOT_TOPICS_BUCKET_MS;
+        for (i, tag) in ["a", "b", "c"].iter().enumerate() {
+            let msg_id = [i as u8; 32];
+            let env = news_envelope("klv1a", msg_id, ts, &[tag]);
+            r.storage
+                .put_cf(schema::cf::MESSAGES, &msg_id, &rmp_serde::to_vec_named(&env).unwrap())
+                .unwrap();
+            r.update_indexes(&env, "klv1a").unwrap();
+        }
+        let tracked = r
+            .storage
+            .count_prefix_cf(schema::cf::HOT_TOPICS_LOCAL, &bucket.to_be_bytes(), 10)
+            .unwrap();
+        assert_eq!(tracked, 2, "third distinct tag must be dropped at the cap");
     }
 }

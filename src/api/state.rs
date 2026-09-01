@@ -300,6 +300,11 @@ pub struct AppState {
     /// `AlertEngine` (`POST /admin/alerts/test`). `None` when alerts
     /// are disabled (`[alerts] enabled = false`, no engine running).
     pub alert_test_tx: Option<crate::notifications::alerts::TestAlertSender>,
+    /// Hot Topics mesh aggregator (spec 3 §3.9, l2-node 0.124.0+). Shared
+    /// with `NetworkService` — `GET /api/v1/news/hot-topics` reads the merged
+    /// view the network task folds inbound digests into. `None` only in the
+    /// storage-less test constructor.
+    pub hot_topics: Option<Arc<crate::network::hot_topics::HotTopicsAggregator>>,
     /// PoW anti-spam manager (None = PoW disabled).
     pub pow: Option<Arc<PowManager>>,
     /// Shared snapshot cache (spec 11-snapshot-sync.md). Populated by the
@@ -567,6 +572,7 @@ impl AppState {
             None,                                           // anchor_wallet_address — disabled in tests
             crate::config::AlertsConfig::default(),         // alerts_config — default in tests
             None,                                           // alert_test_tx — disabled in tests
+            None,                                           // hot_topics — storage-less test state
         )
     }
 
@@ -624,6 +630,7 @@ impl AppState {
         anchor_wallet_address: Option<String>,
         alerts_config: crate::config::AlertsConfig,
         alert_test_tx: Option<crate::notifications::alerts::TestAlertSender>,
+        hot_topics: Option<Arc<crate::network::hot_topics::HotTopicsAggregator>>,
     ) -> Self {
         // moka LRU with size-weighted eviction. `weigher` returns the
         // byte count of each value's body (content-type string is
@@ -734,6 +741,7 @@ impl AppState {
             governance_inflight,
             alerts_config,
             alert_test_tx,
+            hot_topics,
         }
     }
 

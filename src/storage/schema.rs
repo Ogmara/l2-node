@@ -32,6 +32,21 @@ pub mod cf {
     pub const NEWS_BY_TAG: &str = "news_by_tag";
     /// (author, timestamp, msg_id) → () — author's posts
     pub const NEWS_BY_AUTHOR: &str = "news_by_author";
+    /// (bucket_hour:u64 BE, tag) → serialized `Hll` — this node's own
+    /// HyperLogLog sketch of the distinct `NewsPost` msg_ids it has indexed
+    /// for `(tag, hour)`. Source for this node's outbound `HotTopicsDigest`
+    /// (0xE1, protocol §3.15). `tag` is canonical normalized form
+    /// (`util::normalize_tag`). NODE-LOCAL derived aggregate — EXCLUDED from
+    /// snapshot `DOMAIN_CFS` (a poisoned snapshot must not forge trending
+    /// data; cheap to rebuild from `NEWS_FEED`). Hourly-evicted past
+    /// `[hot_topics] window_hours + eviction_slack_hours`.
+    pub const HOT_TOPICS_LOCAL: &str = "hot_topics_local";
+    /// (bucket_hour:u64 BE, tag) → JSON(`HotTopicsMerged`) — union of
+    /// `HOT_TOPICS_LOCAL` and every accepted peer digest, plus a bounded ring
+    /// of contributor cardinality estimates (drives the query-time median
+    /// trim). Served by `GET /api/v1/news/hot-topics`. NODE-LOCAL — EXCLUDED
+    /// from snapshot `DOMAIN_CFS`. Same eviction as `HOT_TOPICS_LOCAL`.
+    pub const HOT_TOPICS_MERGED: &str = "hot_topics_merged";
     /// klever_address → UserProfile (serialized)
     pub const USERS: &str = "users";
     /// (display_name_lower, 0x00, klever_address) → () — case-insensitive
@@ -331,6 +346,8 @@ pub mod cf {
         NEWS_FEED,
         NEWS_BY_TAG,
         NEWS_BY_AUTHOR,
+        HOT_TOPICS_LOCAL,
+        HOT_TOPICS_MERGED,
         USERS,
         USERS_BY_NAME,
         CHANNELS,
@@ -669,6 +686,10 @@ pub fn encode_news_key(timestamp: u64, msg_id: &[u8; 32]) -> Vec<u8> {
 }
 
 /// Encode a news-by-tag index key: (tag, timestamp, msg_id).
+///
+/// `tag` MUST already be in canonical normalized form (`util::normalize_tag`,
+/// protocol §3.5) — the index only ever stores and is only ever queried on
+/// that form.
 pub fn encode_news_by_tag_key(tag: &str, timestamp: u64, msg_id: &[u8; 32]) -> Vec<u8> {
     let tag_bytes = tag.as_bytes();
     let mut key = Vec::with_capacity(2 + tag_bytes.len() + 8 + 32);
@@ -679,6 +700,62 @@ pub fn encode_news_by_tag_key(tag: &str, timestamp: u64, msg_id: &[u8; 32]) -> V
     key.extend_from_slice(msg_id);
     key
 }
+
+/// The `NEWS_BY_TAG` key prefix that selects every entry for one canonical
+/// tag: `(u16 len, tag_bytes)`. Iterating this prefix yields the tag's posts
+/// newest-first (the timestamp is stored inverted).
+pub fn news_by_tag_prefix(tag: &str) -> Vec<u8> {
+    let tag_bytes = tag.as_bytes();
+    let mut p = Vec::with_capacity(2 + tag_bytes.len());
+    p.extend_from_slice(&(tag_bytes.len() as u16).to_be_bytes());
+    p.extend_from_slice(tag_bytes);
+    p
+}
+
+/// Decode `(timestamp, msg_id)` from a `NEWS_BY_TAG` key. Returns `None` if
+/// the key is too short for the recorded tag length + 8 + 32 tail.
+pub fn decode_news_by_tag_key(key: &[u8]) -> Option<(u64, [u8; 32])> {
+    if key.len() < 2 {
+        return None;
+    }
+    let tag_len = u16::from_be_bytes([key[0], key[1]]) as usize;
+    let ts_at = 2 + tag_len;
+    let id_at = ts_at + 8;
+    if key.len() < id_at + 32 {
+        return None;
+    }
+    let inv_ts = u64::from_be_bytes(key[ts_at..ts_at + 8].try_into().ok()?);
+    let msg_id: [u8; 32] = key[id_at..id_at + 32].try_into().ok()?;
+    Some((!inv_ts, msg_id))
+}
+
+/// Encode a `HOT_TOPICS_LOCAL` / `HOT_TOPICS_MERGED` key: `bucket_hour:u64 BE
+/// ++ tag_bytes`. Non-inverted BE hour so a range over `[lo_hour, hi_hour]`
+/// is a contiguous scan and stale-bucket eviction is a bounded forward walk.
+/// `tag` MUST be canonical normalized form (`util::normalize_tag`).
+pub fn encode_hot_topics_key(bucket_hour: u64, tag: &str) -> Vec<u8> {
+    let tag_bytes = tag.as_bytes();
+    let mut key = Vec::with_capacity(8 + tag_bytes.len());
+    key.extend_from_slice(&bucket_hour.to_be_bytes());
+    key.extend_from_slice(tag_bytes);
+    key
+}
+
+/// Decode `(bucket_hour, tag)` from a hot-topics key. `None` if the key is
+/// shorter than the 8-byte hour prefix or the tag bytes aren't UTF-8.
+pub fn decode_hot_topics_key(key: &[u8]) -> Option<(u64, &str)> {
+    if key.len() < 8 {
+        return None;
+    }
+    let bucket_hour = u64::from_be_bytes(key[0..8].try_into().ok()?);
+    let tag = std::str::from_utf8(&key[8..]).ok()?;
+    Some((bucket_hour, tag))
+}
+
+/// Milliseconds per rolling-window bucket (1 hour). A `NewsPost`'s
+/// `bucket_hour` is `envelope.timestamp / HOT_TOPICS_BUCKET_MS`, derived from
+/// the post's own signed timestamp so every node buckets it identically.
+pub const HOT_TOPICS_BUCKET_MS: u64 = 3_600_000;
 
 /// Encode a news-by-author index key: (author_address, timestamp, msg_id).
 pub fn encode_news_by_author_key(author: &str, timestamp: u64, msg_id: &[u8; 32]) -> Vec<u8> {

@@ -297,6 +297,18 @@ impl NotificationEngine {
                     self.broadcast_channel_deleted(p.channel_id);
                 }
             }
+            MessageType::SettingsSync => {
+                // Nudge the wallet's OTHER connected sessions to re-pull
+                // `GET /api/v1/settings` and re-apply their synced objects
+                // (`channelOrg`, `hiddenDms`, `topicGroups`). SettingsSync is
+                // NOT gossiped, so this only runs on the home node's API-post
+                // path — which is exactly where the wallet's other devices are
+                // connected. Without it a second device only picks the change
+                // up on its next login (the "one-shot sync = permanent
+                // divergence" failure mode). Spec 3 §4.3.
+                let wallet = self.resolve_member_wallet(&envelope.author);
+                self.broadcast_settings_changed(&wallet);
+            }
             _ => {}
         }
     }
@@ -377,6 +389,24 @@ impl NotificationEngine {
         if let Ok(json) = serde_json::to_string(&ws_msg) {
             let _ = self.ws_broadcast.send(Arc::new(WsOutbound {
                 audience: WsAudience::Wallets(members),
+                json,
+            }));
+        }
+    }
+
+    /// Notify a wallet's authenticated WebSocket sessions that its cross-device
+    /// settings blob was overwritten (`SettingsSync` / 0x33). Payload-free — the
+    /// blob is E2E-encrypted and the node can't read it; the client reacts by
+    /// re-fetching `GET /api/v1/settings` and re-applying its synced objects
+    /// under their normal last-writer-wins merge. Targeted to `Wallets([wallet])`
+    /// — the WS layer delivers to every session authenticated as that wallet,
+    /// including (harmlessly) the one that just wrote, which dedups on its own
+    /// `updatedAt`. Spec 3 §4.3.
+    fn broadcast_settings_changed(&self, wallet: &str) {
+        let ws_msg = serde_json::json!({ "type": "settings_changed" });
+        if let Ok(json) = serde_json::to_string(&ws_msg) {
+            let _ = self.ws_broadcast.send(Arc::new(WsOutbound {
+                audience: WsAudience::Wallets(vec![wallet.to_string()]),
                 json,
             }));
         }

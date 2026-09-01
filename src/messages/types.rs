@@ -76,6 +76,11 @@ pub enum MessageType {
 
     // Network
     NodeAnnouncement = 0xE0,
+    /// Node-to-node rolling trending-hashtag digest (spec 3 §3.9, protocol
+    /// §3.15). Envelope-framed, node-libp2p-key-signed, published on the
+    /// `/network` topic. Handled entirely by the network layer's
+    /// `hot_topics` aggregator — never enters the message router pipeline.
+    HotTopicsDigest = 0xE1,
     Ping = 0xF0,
     Pong = 0xF1,
     StateRoot = 0xF2,
@@ -131,6 +136,7 @@ impl MessageType {
             0x60 => Some(Self::PrivateChannelKeyDistribution),
             0x61 => Some(Self::ChannelKeyEnvelope),
             0xE0 => Some(Self::NodeAnnouncement),
+            0xE1 => Some(Self::HotTopicsDigest),
             0xF0 => Some(Self::Ping),
             0xF1 => Some(Self::Pong),
             0xF2 => Some(Self::StateRoot),

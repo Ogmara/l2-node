@@ -5,6 +5,7 @@
 
 mod config;
 mod crypto;
+mod hll;
 mod messages;
 mod node;
 mod pow;

@@ -144,6 +144,10 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
             get(routes::get_news_reposts),
         )
         .route("/api/v1/news", get(routes::list_news))
+        // MUST precede the `{msg_id}` route so "hot-topics" is not captured as
+        // a msg_id (spec 3 §4.1). axum 0.8's matchit prioritizes the static
+        // segment regardless of order, but keep them adjacent and ordered.
+        .route("/api/v1/news/hot-topics", get(routes::hot_topics))
         .route("/api/v1/news/{msg_id}", get(routes::get_news_post))
         .route(
             "/api/v1/users/{address}/posts",
@@ -505,5 +509,29 @@ fn build_cors(origins: &[String]) -> CorsLayer {
             .allow_origin(AllowOrigin::list(parsed))
             .allow_methods(Any)
             .allow_headers(Any)
+    }
+}
+
+#[cfg(test)]
+mod route_shape_tests {
+    //! Guards the `/api/v1/news/hot-topics` vs `/api/v1/news/{msg_id}`
+    //! ordering (spec 3 §4.1): axum 0.8's matchit gives the static segment
+    //! precedence over the param, so both may coexist. If a future axum bump
+    //! ever changes that, this panics at router-build time.
+    use axum::routing::get;
+    use axum::Router;
+
+    async fn dummy() -> &'static str {
+        "ok"
+    }
+
+    #[test]
+    fn static_news_subpath_coexists_with_msg_id_param() {
+        let _r: Router = Router::new()
+            .route("/api/v1/news", get(dummy))
+            .route("/api/v1/news/hot-topics", get(dummy))
+            .route("/api/v1/news/{msg_id}", get(dummy))
+            .route("/api/v1/news/{msg_id}/reactions", get(dummy));
+        // Building the Router is enough — matchit validates on insert.
     }
 }

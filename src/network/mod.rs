@@ -10,6 +10,7 @@
 pub mod behaviour;
 pub mod dm_sync;
 pub mod gossip;
+pub mod hot_topics;
 pub mod mesh_stats;
 pub mod presence;
 pub mod identity_sync;
@@ -487,6 +488,18 @@ pub struct NetworkService {
     /// handler can dispatch on it without re-hashing each time. `None`
     /// iff `presence_manager` is `None`.
     presence_topic_hash: Option<libp2p::gossipsub::TopicHash>,
+    /// Hot Topics mesh aggregator (spec 3 §3.9, l2-node 0.124.0+). Always
+    /// present; a no-op when `[hot_topics] enabled = false`. Shared (`Arc`)
+    /// with the REST layer so `GET /api/v1/news/hot-topics` reads the same
+    /// merged view this service folds inbound digests into.
+    hot_topics: Arc<hot_topics::HotTopicsAggregator>,
+    /// Hash of the `/network` topic — used to route inbound `HotTopicsDigest`
+    /// gossip to the aggregator before the generic envelope router.
+    network_topic_hash: libp2p::gossipsub::TopicHash,
+    /// libp2p keypair clone, kept for signing outbound Hot Topics digests
+    /// (protocol §3.15 — digests are signed with the node's libp2p key,
+    /// verified via the key embedded in `peer_id`).
+    hot_topics_keypair: libp2p::identity::Keypair,
     /// True once the self-broadcast has fired on mesh stabilization
     /// (≥ 3 connected peers — spec 13 §10.5). One-shot per process so
     /// the steady-state interval handles all subsequent broadcasts.
@@ -833,6 +846,8 @@ impl NetworkService {
         // handle to sign outbound records. libp2p `Keypair` is cheap
         // to clone (internally `Arc`-backed for Ed25519).
         let keypair_for_presence = keypair.clone();
+        // Same, for signing outbound Hot Topics digests (spec 3 §3.15).
+        let hot_topics_keypair = keypair.clone();
         let mut swarm = behaviour::build_swarm(config, keypair)
             .context("building libp2p swarm")?;
 
@@ -1052,9 +1067,21 @@ impl NetworkService {
             dm_config.max_stored_messages_per_recipient,
             counters.clone(),
             config.api.rate_limits.clone(),
-        );
+        )
+        .with_hot_topics_config(config.hot_topics.clone());
 
         let public_url = config.api.public_url.clone();
+
+        // Hot Topics aggregator (spec 3 §3.9). Constructed unconditionally —
+        // the config's `enabled` flag makes every method a cheap no-op when
+        // off — and shared with the REST layer via `hot_topics()`.
+        let hot_topics = Arc::new(hot_topics::HotTopicsAggregator::new(
+            storage.clone(),
+            config.hot_topics.clone(),
+            config.network_id().to_string(),
+        ));
+        let network_topic_hash =
+            gossip::topic_hash(&gossip::topic_network(config.network_id()));
 
         let snapshot_serve_enabled = config.snapshot.serve_enabled;
         // Clamp to [1, 4096] — config can't disable the semaphore entirely
@@ -1113,6 +1140,9 @@ impl NetworkService {
             local_dm_users_seen: HashMap::new(),
             presence_manager,
             presence_topic_hash,
+            hot_topics,
+            network_topic_hash,
+            hot_topics_keypair,
             presence_initial_broadcast_done: false,
             presence_validation_tx,
             presence_validation_rx,
@@ -1164,6 +1194,13 @@ impl NetworkService {
     /// `node.rs` to wire the manager into `AppState` for the
     /// `/api/v1/network/presence*` REST handlers. `None` when
     /// `[network.presence] enabled = false`.
+    /// Shared handle to the Hot Topics aggregator (spec 3 §3.9). Cloned into
+    /// `AppState` so `GET /api/v1/news/hot-topics` serves the same merged
+    /// view this service maintains.
+    pub fn hot_topics(&self) -> Arc<hot_topics::HotTopicsAggregator> {
+        self.hot_topics.clone()
+    }
+
     pub fn presence_manager(&self) -> Option<Arc<presence::PresenceManager>> {
         self.presence_manager.clone()
     }
@@ -1598,6 +1635,22 @@ impl NetworkService {
             tokio::time::interval(Duration::from_secs(self.dm_config.reap_interval_secs.max(1)));
         dm_reap_interval.tick().await; // skip immediate tick
 
+        // Hot Topics digest publish cadence (spec 3 §3.9). First publish is
+        // jittered `0..=publish_jitter_secs` past one full interval to avoid a
+        // fleet-wide thundering herd after a coordinated restart. The arm is a
+        // no-op when `[hot_topics] enabled`/`mesh_enabled` is false.
+        let ht_cfg = self.hot_topics.config().clone();
+        let ht_period = Duration::from_secs(ht_cfg.publish_interval_secs.max(1));
+        let ht_jitter = if ht_cfg.publish_jitter_secs > 0 {
+            Duration::from_secs(rand::random::<u64>() % (ht_cfg.publish_jitter_secs + 1))
+        } else {
+            Duration::ZERO
+        };
+        let mut hot_topics_interval = tokio::time::interval_at(
+            tokio::time::Instant::now() + ht_period + ht_jitter,
+            ht_period,
+        );
+
         loop {
             tokio::select! {
                 event = self.swarm.select_next_some() => {
@@ -1668,6 +1721,10 @@ impl NetworkService {
                 }
                 _ = announce_interval.tick() => {
                     self.publish_node_announcement();
+                }
+                _ = hot_topics_interval.tick() => {
+                    self.publish_hot_topics_digest();
+                    self.hot_topics.prune_rate_limiter();
                 }
                 _ = bootstrap_interval.tick() => {
                     self.periodic_bootstrap();
@@ -1746,6 +1803,7 @@ impl NetworkService {
                     .as_ref()
                     .map(|h| *h == message.topic)
                     .unwrap_or(false);
+                let on_network_topic = message.topic == self.network_topic_hash;
                 if on_presence_topic {
                     // The presence handler reports validation outcome
                     // back through `presence_validation_tx` once the
@@ -1755,6 +1813,52 @@ impl NetworkService {
                         message_id,
                         message.data,
                     );
+                } else if on_network_topic
+                    && hot_topics::HotTopicsAggregator::looks_like_digest(
+                        &message.data,
+                        self.hot_topics.config().digest_max_envelope_bytes,
+                    )
+                {
+                    // Hot Topics digest (0xE1, spec 3 §3.9). Validated + folded
+                    // synchronously here — one Ed25519 verify, cheap enough for
+                    // a message that arrives at most every few minutes per peer
+                    // — then a matching validation result so relay proceeds.
+                    let outcome = self.hot_topics.handle_inbound(
+                        propagation_source,
+                        &message.data,
+                        hot_topics::now_ms(),
+                    );
+                    let acceptance = match &outcome {
+                        hot_topics::InboundOutcome::Accepted => {
+                            self.adjust_gossip_app_score(
+                                propagation_source,
+                                VALID_MESSAGE_SCORE_RECOVERY,
+                            );
+                            libp2p::gossipsub::MessageAcceptance::Accept
+                        }
+                        hot_topics::InboundOutcome::Invalid(reason) => {
+                            debug!(reason = %reason, "hot-topics digest invalid — rejecting");
+                            self.counters.inc_failed_validations();
+                            self.adjust_gossip_app_score(
+                                propagation_source,
+                                -INVALID_MESSAGE_SCORE_PENALTY,
+                            );
+                            libp2p::gossipsub::MessageAcceptance::Reject
+                        }
+                        hot_topics::InboundOutcome::Ignored(reason) => {
+                            debug!(reason = %reason, "hot-topics digest not folded — ignoring");
+                            libp2p::gossipsub::MessageAcceptance::Ignore
+                        }
+                    };
+                    let _ = self
+                        .swarm
+                        .behaviour_mut()
+                        .gossipsub
+                        .report_message_validation_result(
+                            &message_id,
+                            &propagation_source,
+                            acceptance,
+                        );
                 } else if !self.check_gossip_rate_limit(propagation_source) {
                     // Audit final pre-mainnet W10: per-peer rate limit,
                     // checked BEFORE `handle_gossip_message` so a flooding
@@ -4402,6 +4506,36 @@ impl NetworkService {
                 // (application data) is where the alert matters.
                 self.publish_failure_counters.record(&e);
                 debug!(error = %e, "Failed to publish NodeAnnouncement (no peers yet?)");
+            }
+        }
+    }
+
+    /// Publish this node's Hot Topics digest on the `/network` topic (spec 3
+    /// §3.9). A no-op when `[hot_topics] enabled`/`mesh_enabled` is false or
+    /// this node has nothing to report for the recent buckets.
+    fn publish_hot_topics_digest(&mut self) {
+        let node_address =
+            crate::crypto::pubkey_to_address(&self.signing_key.verifying_key())
+                .unwrap_or_default();
+        let Some(bytes) = self.hot_topics.build_and_sign_digest(
+            &self.hot_topics_keypair,
+            &node_address,
+            hot_topics::now_ms(),
+        ) else {
+            return;
+        };
+        let bytes_len = bytes.len() as u64;
+        let topic = libp2p::gossipsub::IdentTopic::new(gossip::topic_network(
+            self.topics.network_id(),
+        ));
+        match self.swarm.behaviour_mut().gossipsub.publish(topic, bytes) {
+            Ok(_) => {
+                self.counters.add_bytes_out(bytes_len);
+                debug!(bytes = bytes_len, "Published HotTopicsDigest");
+            }
+            Err(e) => {
+                self.publish_failure_counters.record(&e);
+                debug!(error = %e, "Failed to publish HotTopicsDigest (no peers yet?)");
             }
         }
     }
