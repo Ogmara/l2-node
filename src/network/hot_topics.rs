@@ -202,6 +202,13 @@ pub struct HotTopicsAggregator {
     /// Serializes `compute_query` so concurrent cache misses don't each run
     /// the full window scan (single-flight).
     compute_lock: Mutex<()>,
+    /// Serializes `fold` — the digest fold now runs on a `spawn_blocking`
+    /// thread (off the swarm loop), so without this two peers' digests for
+    /// the same `(bucket, tag)` could race the `HOT_TOPICS_MERGED`
+    /// read-modify-write and one would clobber the other's contributor /
+    /// sketch. Each fold is a handful of RocksDB point ops, and inbound
+    /// digests are already per-PeerId rate-limited, so contention is low.
+    fold_lock: Mutex<()>,
 }
 
 impl HotTopicsAggregator {
@@ -214,6 +221,7 @@ impl HotTopicsAggregator {
             trusted_peers: RwLock::new(HashSet::new()),
             result_cache: Mutex::new(None),
             compute_lock: Mutex::new(()),
+            fold_lock: Mutex::new(()),
         }
     }
 
@@ -437,6 +445,9 @@ impl HotTopicsAggregator {
     /// sender's PeerId, so re-folds from the same peer refresh rather than
     /// inflate (Code+Security Audit C1).
     pub fn fold(&self, vd: ValidatedDigest) {
+        // Serialize the read-modify-write against other concurrent folds
+        // (this runs on a blocking thread, not the single swarm loop).
+        let _guard = self.fold_lock.lock();
         let mut folded = 0usize;
         for b in &vd.buckets {
             for t in &b.tags {
@@ -662,8 +673,10 @@ impl HotTopicsAggregator {
             let (count, contributors) = match merged_acc.get(tag) {
                 Some((hll, contribs)) => {
                     let raw = hll.estimate_u32() as u64;
-                    // Distinct non-local contributors — the gate + trim input.
-                    let n_distinct = contribs.len() as u16;
+                    // Distinct contributors — the gate + trim input. Saturate
+                    // rather than wrap if a (misconfigured) map ever exceeds
+                    // u16 (Auditor N3).
+                    let n_distinct = contribs.len().min(u16::MAX as usize) as u16;
                     let mut approxes: Vec<u64> = contribs
                         .iter()
                         .filter(|(k, _)| k.as_str() != LOCAL_CONTRIBUTOR_KEY)
@@ -1144,6 +1157,34 @@ mod tests {
         let (receiver, _d) = agg(HotTopicsConfig::default()); // trusted set empty
         let d = deliver(&receiver, kp.public().to_peer_id(), &bytes, now);
         assert!(matches!(d, InboundDecision::Ignore(_)), "{d:?}");
+    }
+
+    #[test]
+    fn merged_cf_enforces_the_per_bucket_tag_cap() {
+        // Auditor W3/W7 follow-up: the distinct-tag cap must hold on the
+        // MERGED CF, not only on LOCAL ingest.
+        let mut cfg = HotTopicsConfig::default();
+        cfg.max_tracked_tags_per_bucket = 2;
+        let now = 12_000 * HOT_TOPICS_BUCKET_MS + 1;
+        let cur = now / HOT_TOPICS_BUCKET_MS;
+        let (receiver, _d) = agg(cfg);
+
+        let (sender, _sd) = agg(HotTopicsConfig::default());
+        for tag in ["a", "b", "c", "d"] {
+            put_local(&sender, cur, tag, &[1, 2, 3]);
+        }
+        let kp = libp2p::identity::Keypair::generate_ed25519();
+        let src = kp.public().to_peer_id();
+        trust(&receiver, src);
+        let bytes = sender.build_and_sign_digest(&kp, "klv1n", now).unwrap();
+        if let InboundDecision::Fold(vd) = receiver.classify_and_validate(src, &bytes, now) {
+            receiver.fold(*vd);
+        }
+        let tracked = receiver
+            .storage
+            .count_prefix_cf(schema::cf::HOT_TOPICS_MERGED, &cur.to_be_bytes(), 100)
+            .unwrap();
+        assert_eq!(tracked, 2, "merged CF must cap distinct tags per bucket");
     }
 
     #[test]

@@ -2854,6 +2854,24 @@ impl Config {
                      both be > 0 (defaults 3 and 48)"
                 );
             }
+            // Upper clamps — `build_and_sign_digest` runs on the swarm event
+            // loop, so a grossly oversized value would stall it each publish
+            // interval (Auditor N2). Operator-self-harm only; receivers reject
+            // oversized digests via their own caps.
+            if ht.max_buckets_per_digest > 24 {
+                eprintln!(
+                    "[config] hot_topics.max_buckets_per_digest ({}) exceeds 24; clamping.",
+                    ht.max_buckets_per_digest
+                );
+                ht.max_buckets_per_digest = 24;
+            }
+            if ht.max_tags_per_digest > 512 {
+                eprintln!(
+                    "[config] hot_topics.max_tags_per_digest ({}) exceeds 512; clamping.",
+                    ht.max_tags_per_digest
+                );
+                ht.max_tags_per_digest = 512;
+            }
             if ht.digest_max_envelope_bytes < 4096 {
                 anyhow::bail!(
                     "hot_topics.digest_max_envelope_bytes = {} is too small — a single \

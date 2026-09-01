@@ -32,15 +32,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   publishes a signed `HotTopicsDigest` (protocol tag `0xE1`,
   `MessageType::HotTopicsDigest`) on the `/network` gossip topic. Receiving
   nodes validate (cost-ordered pipeline modelled on presence-record
-  validation: size guard → decode → PeerId/denylist/source-match → rate-limit
-  peek → skew → network/window match → signature → rate-limit commit →
-  sender-identity gate) and fold accepted digests into `hot_topics_merged` by
-  HLL **union**, so a post gossiped to every node is counted once. Abuse
-  resistance: SC-registered / presence-`both` sender gate (falls back to
-  meshed-peer-only when no Klever RPC is configured), per-node contribution
-  clamp, query-time median trim, and a minimum-contributors gate before a tag
-  is reported as `scope: "network"`. A fresh / partitioned / mesh-disabled
-  node serves its own local counts with `scope: "local"` and never blocks.
+  validation: size guard → decode → PeerId/denylist/source-match →
+  check-and-arm rate limit → skew → network/window match → shape caps →
+  signature → sender-identity gate) and fold accepted digests into
+  `hot_topics_merged` — off the swarm event loop, on a `spawn_blocking`
+  thread, serialized by a `fold_lock` so two peers' digests for the same
+  `(bucket, tag)` can't lose-update the read-modify-write — by HLL **union**,
+  so a post gossiped to every node is counted once. Abuse resistance: the
+  sender-identity gate folds a digest only if its `peer_id` is in the set of
+  PeerIds resolved from SC-registered active nodes' on-chain published
+  multiaddrs — with no such set (no Klever RPC, or no published multiaddrs)
+  the node folds nothing and serves its own local view; there is **no
+  accept-all fallback**. Then a per-node contribution clamp, a query-time
+  median trim over distinct contributors, and a minimum-distinct-contributors
+  gate before a tag is reported as `scope: "network"`. A fresh / partitioned
+  / mesh-disabled node serves its own local counts with `scope: "local"` and
+  never blocks.
 - **`settings_changed` WebSocket event.** When a wallet's cross-device
   settings blob (`SettingsSync` / `0x33`) is overwritten by any of its
   devices, the node now pushes a payload-free `{ "type": "settings_changed" }`
@@ -72,6 +79,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Topics sketches are deliberately not touched on edit/delete (approximate
   rolling counter; decrement-on-delete is a probe vector).
 - `/admin/storage/stats` lists the two new column families.
+
+### Fixed
+
+- **Concurrent-fold lost update** (final Auditor pass). Moving the digest
+  fold to a `spawn_blocking` thread opened a race: two trusted peers' digests
+  for the same `(bucket, tag)` could each read-modify-write `hot_topics_merged`
+  and one would silently drop the other's sketch union and contributor entry.
+  Now serialized by a `fold_lock` held for the whole fold; each fold is a
+  handful of RocksDB point ops so contention is negligible.
 
 ### Security
 
