@@ -22,8 +22,13 @@ pub const MAX_TAG_LEN: usize = 64;
 /// produce identical output — a follow/filter that normalizes differently
 /// silently matches nothing.
 pub fn normalize_tag(raw: &str) -> Option<String> {
-    let trimmed = raw.trim();
-    let stripped = trimmed.strip_prefix('#').unwrap_or(trimmed).trim();
+    // ASCII whitespace only — Rust's `str::trim` strips the full Unicode
+    // `White_Space` set and JS `String.prototype.trim` strips a different set
+    // again (NEL, ZWNBSP, …); trimming exactly `[ \t\n\r\x0b\x0c]` keeps the
+    // node and the SDK byte-identical (Spec Compliance finding 5).
+    let ws = |c: char| matches!(c, ' ' | '\t' | '\n' | '\r' | '\u{0b}' | '\u{0c}');
+    let trimmed = raw.trim_matches(ws);
+    let stripped = trimmed.strip_prefix('#').unwrap_or(trimmed).trim_matches(ws);
     if stripped.is_empty() || stripped.len() > MAX_TAG_LEN {
         return None;
     }

@@ -995,10 +995,13 @@ pub struct HotTopicsConfig {
     /// there are too few contributors for a median. Default 4.
     #[serde(default = "default_hot_topics_local_only_multiplier")]
     pub local_only_multiplier: u32,
-    /// Only fold digests from SC-registered / presence-`both` senders. If
-    /// true but no `[klever]` RPC is configured, the node WARNs at startup
-    /// and falls back to meshed-peer-only acceptance (never hard-fails).
-    /// Default true.
+    /// Fold digests only from nodes whose libp2p PeerId is in the trusted set
+    /// — the PeerIds resolved from SC `getActiveNodes` nodes' on-chain
+    /// published multiaddrs (`/p2p/<peer_id>`). The digest's self-asserted
+    /// `node_address` is never consulted. If true but no `[klever]` RPC is
+    /// configured, or the active nodes publish no multiaddrs, the node has no
+    /// trusted set and folds **nothing** (it still serves its own local
+    /// view). There is no accept-all fallback. Default true.
     #[serde(default = "default_true")]
     pub require_sc_registered_sender: bool,
     /// TTL (seconds) of the cached SC `getActiveNodes` set used by the
