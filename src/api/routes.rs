@@ -601,6 +601,15 @@ fn enrich_repost_json(
 pub struct PaginationParams {
     pub page: Option<u32>,
     pub limit: Option<u32>,
+    /// Hex-encoded `msg_id` cursor: return items strictly OLDER than this one
+    /// (news/personal feeds only — other paginated handlers ignore it). The
+    /// personal feed also still accepts a bare integer here as the legacy
+    /// wall-clock-timestamp cursor.
+    pub before: Option<String>,
+    /// Hex-encoded `msg_id` cursor: return items strictly NEWER than this one
+    /// (news/personal feeds only). If both `before` and `after` are supplied,
+    /// `after` wins — same precedence as `MessageParams`.
+    pub after: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2369,6 +2378,16 @@ pub async fn get_enc_keys(
 /// — same filter-after-fetch approximation `list_channels` already uses for
 /// private channels (may return fewer than `limit` even when more visible
 /// posts exist further back).
+///
+/// Pagination is cursor-based (l2-node 0.123.0+): `?before=<hex msg_id>`
+/// returns the page of posts strictly OLDER than that post, `?after=<hex
+/// msg_id>` the page strictly NEWER. `NEWS_FEED` is keyed by `!timestamp`
+/// (newest-first), so "older" walks forward from the cursor and "newer" walks
+/// backward — mirroring `get_channel_messages`. An unresolvable cursor falls
+/// back to the newest page (same as the channel handler). The response carries
+/// `has_more` (true when the raw index scan filled `limit`, i.e. before the
+/// W37 visibility filter — so it can be conservatively true on the final page
+/// if that page was all filtered out).
 pub async fn list_news(
     Extension(state): Extension<Arc<AppState>>,
     auth_user: Option<Extension<AuthUser>>,
@@ -2377,11 +2396,71 @@ pub async fn list_news(
     let limit = params.limit.unwrap_or(20).min(100) as usize;
     let caller = auth_user.as_ref().map(|u| u.address.as_str());
 
-    match state
-        .storage
-        .prefix_iter_cf(cf::NEWS_FEED, &[], limit)
-    {
-        Ok(entries) => {
+    // Resolve a hex `msg_id` cursor to its `NEWS_FEED` key. `None` => not a
+    // valid/known/visible post => fall back to the newest page.
+    //
+    // The visibility gate here is load-bearing, not just tidiness: without it a
+    // caller who holds the `msg_id` of a `Followers`-only post they can't see
+    // (audit W37) could hand it in as `before=`/`after=` and, by observing
+    // whether pagination "took", confirm the post exists and bracket its
+    // timestamp between two visible posts — an oracle the row-level filter
+    // below doesn't close because it never runs for a cursor. Returning `None`
+    // for an invisible cursor makes it byte-for-byte indistinguishable from an
+    // unknown one. Mirrors `get_channel_messages`'s cross-channel cursor guard.
+    let cursor_seek = |hex_id: &str| -> Option<Vec<u8>> {
+        let msg_id: [u8; 32] = hex::decode(hex_id).ok()?.try_into().ok()?;
+        let env_bytes = state.storage.get_message(&msg_id).ok()??;
+        let env =
+            rmp_serde::from_slice::<crate::messages::envelope::Envelope>(&env_bytes).ok()?;
+        let key = crate::storage::schema::encode_news_key(env.timestamp, &msg_id);
+        if !state.storage.exists_cf(cf::NEWS_FEED, &key).unwrap_or(false) {
+            return None;
+        }
+        let resolved_author = state
+            .identity
+            .resolve(&env.author)
+            .unwrap_or_else(|_| env.author.clone());
+        if !news_item_visible(&state.storage, &state.identity, &env, &resolved_author, caller) {
+            return None;
+        }
+        Some(key)
+    };
+
+    // `reverse_order` tracks whether the iterator returned newest-last (the
+    // `after` / newer-page case) and needs flipping to the newest-first order
+    // the response always uses.
+    let (entries_result, reverse_order) = if let Some(after_hex) = &params.after {
+        match cursor_seek(after_hex) {
+            Some(seek) => (
+                state
+                    .storage
+                    .reverse_iter_cf_before(cf::NEWS_FEED, &seek, &[], limit),
+                true,
+            ),
+            None => (state.storage.prefix_iter_cf(cf::NEWS_FEED, &[], limit), false),
+        }
+    } else if let Some(before_hex) = &params.before {
+        match cursor_seek(before_hex) {
+            Some(seek) => (
+                state
+                    .storage
+                    .prefix_iter_cf_after(cf::NEWS_FEED, &seek, &[], limit),
+                false,
+            ),
+            None => (state.storage.prefix_iter_cf(cf::NEWS_FEED, &[], limit), false),
+        }
+    } else {
+        (state.storage.prefix_iter_cf(cf::NEWS_FEED, &[], limit), false)
+    };
+
+    match entries_result {
+        Ok(mut entries) => {
+            if reverse_order {
+                entries.reverse();
+            }
+            // `has_more` is measured on the raw index scan, before the W37
+            // visibility filter below can drop entries.
+            let has_more = entries.len() == limit;
             let mut posts = Vec::with_capacity(entries.len());
             for (key, _) in &entries {
                 // Key: (!timestamp:8, msg_id:32)
@@ -2475,6 +2554,7 @@ pub async fn list_news(
                 "posts": posts,
                 "total": total,
                 "page": params.page.unwrap_or(1),
+                "has_more": has_more,
             }))
             .into_response()
         }
@@ -4324,13 +4404,23 @@ pub async fn invite_user(
     }
 }
 
-/// GET /api/v1/feed — personal news feed (posts from followed users)
+/// GET /api/v1/feed — personal news feed (posts from followed users).
+///
+/// Cursor pagination (l2-node 0.123.0+): `?before=<hex msg_id>` / `?after=<hex
+/// msg_id>` page OLDER / NEWER than that post, merged across every followed
+/// author by `(timestamp, msg_id)`. `after` wins if both are given. An
+/// unresolvable cursor falls back to the newest page. (Releases before 0.123.0
+/// accepted a `before=<timestamp>` query but silently ignored it, so there is
+/// no prior behaviour to preserve.)
 pub async fn personal_feed(
     Extension(state): Extension<Arc<AppState>>,
     Extension(auth_user): Extension<AuthUser>,
     Query(params): Query<PaginationParams>,
 ) -> impl IntoResponse {
     let limit = params.limit.unwrap_or(20).min(100) as usize;
+    // One extra row per author so `has_more` stays correct even when a single
+    // prolific author fills the merged page on its own.
+    let scan = limit + 1;
 
     // Cap following fan-out to 200 to prevent O(N*M) DDoS (audit W1/W6)
     let following = match state.storage.get_following(&auth_user.address, 200) {
@@ -4346,24 +4436,88 @@ pub async fn personal_feed(
             "posts": [],
             "total": 0,
             "page": params.page.unwrap_or(1),
+            "has_more": false,
         }))
         .into_response();
     }
 
-    // Collect posts from each followed user
-    let mut all_posts: Vec<(u64, Vec<u8>)> = Vec::new();
+    // Resolve a hex `msg_id` cursor to `(timestamp, msg_id)` for merge
+    // comparison and per-author seek-key construction. Gated on visibility
+    // (same reasoning as `list_news`'s `cursor_seek`): a cursor pointing at a
+    // post the caller can't see resolves to `None` → newest-page fallback,
+    // indistinguishable from an unknown id.
+    let caller_addr = auth_user.address.as_str();
+    let resolve_cursor = |hex_id: &str| -> Option<(u64, [u8; 32])> {
+        let msg_id: [u8; 32] = hex::decode(hex_id).ok()?.try_into().ok()?;
+        let env_bytes = state.storage.get_message(&msg_id).ok()??;
+        let env =
+            rmp_serde::from_slice::<crate::messages::envelope::Envelope>(&env_bytes).ok()?;
+        let resolved_author = state
+            .identity
+            .resolve(&env.author)
+            .unwrap_or_else(|_| env.author.clone());
+        if !news_item_visible(
+            &state.storage,
+            &state.identity,
+            &env,
+            &resolved_author,
+            Some(caller_addr),
+        ) {
+            return None;
+        }
+        Some((env.timestamp, msg_id))
+    };
+    // `Some((cursor, true))` => want NEWER than cursor; `after` beats `before`.
+    let cursor: Option<((u64, [u8; 32]), bool)> = params
+        .after
+        .as_deref()
+        .and_then(|h| resolve_cursor(h).map(|c| (c, true)))
+        .or_else(|| {
+            params
+                .before
+                .as_deref()
+                .and_then(|h| resolve_cursor(h).map(|c| (c, false)))
+        });
+
+    // Collect (timestamp, msg_id, env_bytes) from each followed user. With a
+    // cursor, use a per-author SEEKED scan so deep pagination stays exact
+    // instead of always re-reading each author's newest page.
+    let mut all_posts: Vec<(u64, [u8; 32], Vec<u8>)> = Vec::new();
     for author in &following {
         let mut author_prefix = Vec::with_capacity(author.len() + 1);
         author_prefix.extend_from_slice(author.as_bytes());
         author_prefix.push(0xFF);
+        let suffix_start = author.len() + 1;
 
-        if let Ok(entries) = state.storage.prefix_iter_cf(
-            crate::storage::schema::cf::NEWS_BY_AUTHOR,
-            &author_prefix,
-            limit,
-        ) {
+        let entries = match &cursor {
+            Some(((cts, cid), is_after)) => {
+                let seek =
+                    crate::storage::schema::encode_news_by_author_key(author, *cts, cid);
+                if *is_after {
+                    state.storage.reverse_iter_cf_before(
+                        crate::storage::schema::cf::NEWS_BY_AUTHOR,
+                        &seek,
+                        &author_prefix,
+                        scan,
+                    )
+                } else {
+                    state.storage.prefix_iter_cf_after(
+                        crate::storage::schema::cf::NEWS_BY_AUTHOR,
+                        &seek,
+                        &author_prefix,
+                        scan,
+                    )
+                }
+            }
+            None => state.storage.prefix_iter_cf(
+                crate::storage::schema::cf::NEWS_BY_AUTHOR,
+                &author_prefix,
+                scan,
+            ),
+        };
+
+        if let Ok(entries) = entries {
             for (key, _) in entries {
-                let suffix_start = author.len() + 1;
                 if key.len() >= suffix_start + 40 {
                     let msg_id: [u8; 32] =
                         key[suffix_start + 8..suffix_start + 40].try_into().unwrap_or([0u8; 32]);
@@ -4371,20 +4525,34 @@ pub async fn personal_feed(
                         key[suffix_start..suffix_start + 8].try_into().unwrap_or([0u8; 8]);
                     let timestamp = !u64::from_be_bytes(neg_ts);
                     if let Ok(Some(env_bytes)) = state.storage.get_message(&msg_id) {
-                        all_posts.push((timestamp, env_bytes));
+                        all_posts.push((timestamp, msg_id, env_bytes));
                     }
                 }
             }
         }
     }
 
-    // Sort newest first, apply limit
-    all_posts.sort_by(|a, b| b.0.cmp(&a.0));
+    // For an `after` (newer) page we want the `limit` entries CLOSEST to the
+    // cursor — the oldest of the newer set — so sort ascending, take `limit`,
+    // then flip back to the newest-first order the response always uses.
+    let want_closest_newer = matches!(&cursor, Some((_, true)));
+    if want_closest_newer {
+        all_posts.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    } else {
+        all_posts.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    }
+    // De-dup defensively (an author can't appear twice in `following`, but the
+    // seeked scans overlapping at the cursor boundary shouldn't double-count).
+    all_posts.dedup_by(|a, b| a.1 == b.1);
+    let has_more = all_posts.len() > limit;
     all_posts.truncate(limit);
+    if want_closest_newer {
+        all_posts.reverse();
+    }
 
     let posts: Vec<serde_json::Value> = all_posts
         .iter()
-        .filter_map(|(_, bytes)| {
+        .filter_map(|(_, _, bytes)| {
             rmp_serde::from_slice::<crate::messages::envelope::Envelope>(bytes)
                 .ok()
                 .map(|env| {
@@ -4399,6 +4567,7 @@ pub async fn personal_feed(
         "posts": posts,
         "total": posts.len(),
         "page": params.page.unwrap_or(1),
+        "has_more": has_more,
     }))
     .into_response()
 }

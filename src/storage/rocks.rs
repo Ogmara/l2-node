@@ -4903,6 +4903,85 @@ mod message_pagination_tests {
 }
 
 #[cfg(test)]
+mod news_feed_pagination_tests {
+    //! `list_news` / `personal_feed` cursor pagination (l2-node 0.123.0+).
+    //! `NEWS_FEED` keys are `encode_news_key` = `!timestamp ‖ msg_id`, so
+    //! ascending key order is newest-first: "older than cursor" walks FORWARD
+    //! (`prefix_iter_cf_after`) and "newer than cursor" walks BACKWARD
+    //! (`reverse_iter_cf_before`, then the handler reverses to newest-first).
+    use super::*;
+    use crate::storage::schema::encode_news_key;
+    use tempfile::TempDir;
+
+    fn db() -> (Storage, TempDir) {
+        let dir = TempDir::new().unwrap();
+        (Storage::open(dir.path()).unwrap(), dir)
+    }
+
+    /// Seed `count` news-feed entries with strictly increasing timestamps
+    /// `base_ts..base_ts+count` (so index `i` is older than index `i+1`);
+    /// returns their keys in seed order.
+    fn seed_news(s: &Storage, base_ts: u64, count: u64) -> Vec<Vec<u8>> {
+        let mut keys = Vec::with_capacity(count as usize);
+        for i in 0..count {
+            let mut msg_id = [0u8; 32];
+            msg_id[24..].copy_from_slice(&i.to_be_bytes());
+            let key = encode_news_key(base_ts + i, &msg_id);
+            s.put_cf(cf::NEWS_FEED, &key, b"").unwrap();
+            keys.push(key);
+        }
+        keys
+    }
+
+    #[test]
+    fn no_cursor_returns_newest_page() {
+        let (s, _d) = db();
+        let k = seed_news(&s, 1_000, 10);
+        let page = s.prefix_iter_cf(cf::NEWS_FEED, &[], 4).unwrap();
+        let got: Vec<Vec<u8>> = page.into_iter().map(|(key, _)| key).collect();
+        // Newest-first: seeded indices 9, 8, 7, 6.
+        assert_eq!(got, vec![k[9].clone(), k[8].clone(), k[7].clone(), k[6].clone()]);
+    }
+
+    #[test]
+    fn before_cursor_returns_the_older_page_no_overlap() {
+        let (s, _d) = db();
+        let k = seed_news(&s, 2_000, 10);
+        // Cursor = index 6; the handler does NOT reverse the `before` result.
+        let older = s.prefix_iter_cf_after(cf::NEWS_FEED, &k[6], &[], 4).unwrap();
+        let got: Vec<Vec<u8>> = older.into_iter().map(|(key, _)| key).collect();
+        // Strictly older than 6, newest-first: 5, 4, 3, 2. Cursor 6 excluded.
+        assert_eq!(got, vec![k[5].clone(), k[4].clone(), k[3].clone(), k[2].clone()]);
+        assert!(!got.contains(&k[6]));
+    }
+
+    #[test]
+    fn after_cursor_returns_the_newer_page_no_overlap() {
+        let (s, _d) = db();
+        let k = seed_news(&s, 3_000, 10);
+        // Cursor = index 3; handler reverses this result to newest-first.
+        let mut newer = s.reverse_iter_cf_before(cf::NEWS_FEED, &k[3], &[], 4).unwrap();
+        newer.reverse();
+        let got: Vec<Vec<u8>> = newer.into_iter().map(|(key, _)| key).collect();
+        // Strictly newer than 3, newest-first: 7, 6, 5, 4. Cursor 3 excluded.
+        assert_eq!(got, vec![k[7].clone(), k[6].clone(), k[5].clone(), k[4].clone()]);
+        assert!(!got.contains(&k[3]));
+    }
+
+    #[test]
+    fn cursor_at_end_of_history_yields_short_page() {
+        let (s, _d) = db();
+        let k = seed_news(&s, 4_000, 5);
+        // Nothing older than the oldest post.
+        let older = s.prefix_iter_cf_after(cf::NEWS_FEED, &k[0], &[], 4).unwrap();
+        assert!(older.is_empty());
+        // Only one post newer than index 3.
+        let newer = s.reverse_iter_cf_before(cf::NEWS_FEED, &k[3], &[], 4).unwrap();
+        assert_eq!(newer.len(), 1);
+    }
+}
+
+#[cfg(test)]
 mod backfill_edit_delete_markers_tests {
     use super::*;
     use crate::messages::envelope::Envelope;

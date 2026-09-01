@@ -5,6 +5,48 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.123.0] - 2026-09-01
+
+### Added
+
+- **Cursor pagination for the news feeds.** `GET /api/v1/news` and
+  `GET /api/v1/feed` now accept `?before=<hex msg_id>` (page of posts strictly
+  older than that post) and `?after=<hex msg_id>` (page strictly newer),
+  matching the cursor model `GET /api/v1/channels/{id}/messages` already uses.
+  `after` wins if both are given; an unresolvable cursor falls back to the
+  newest page. Both responses gain a `has_more` boolean (measured on the raw
+  index scan, before the audit-W37 visibility filter, so it can be
+  conservatively `true` on the final page). This is the backend half of the
+  client News Feed rework — infinite scroll through history plus a
+  resume-at-last-position feed that the fixed 20-post page could not support.
+- `personal_feed` now does a per-followed-author *seeked* index scan when a
+  cursor is present (via `NEWS_BY_AUTHOR` keys), so deep "load older" stays
+  exact instead of re-reading each author's newest page every request.
+
+### Changed
+
+- `GET /api/v1/feed` previously accepted a `before=<timestamp>` query but
+  silently ignored it; a numeric `before` now simply fails to resolve as a
+  msg_id and yields the newest page. `page` on both news endpoints remains
+  accepted and echoed but has never paginated and still does not.
+
+### Security
+
+- The `before`/`after` cursor on `GET /api/v1/news` and `GET /api/v1/feed` is
+  **visibility-gated**: resolving a cursor that points at a `Followers`-only post
+  the caller cannot see returns the newest-page fallback, byte-for-byte
+  indistinguishable from an unknown `msg_id`. Without this, a caller holding
+  such a post's `msg_id` could hand it in as a cursor and, by observing whether
+  pagination took effect, confirm the post exists and bracket its timestamp —
+  the row-level W37 filter never runs for a cursor. Mirrors the cross-channel
+  cursor guard in `get_channel_messages`.
+- No dependency changes in this release. `cargo audit` still reports the two
+  `hickory-proto` advisories (RUSTSEC-2026-0118 / -0119) reachable only through
+  the `libp2p 0.56.0` transitive pin — unchanged, still upstream-blocked until
+  libp2p ships a release that bumps `hickory-*` (tracked since the 2026-08-25
+  dependency pass). Not shipped-code-reachable in a way we can trigger: the node
+  does not resolve untrusted DNS via hickory on the request path.
+
 ## [0.122.2] - 2026-08-30
 
 ### Fixed
