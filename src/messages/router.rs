@@ -2253,17 +2253,23 @@ impl MessageRouter {
                     let bucket_hour =
                         envelope.timestamp / schema::HOT_TOPICS_BUCKET_MS;
                     let ht = &self.hot_topics_config;
-                    // Only sketch a post whose bucket is (or could still be) in
-                    // the rolling window — a very old backfilled post shouldn't
-                    // resurrect a long-evicted bucket.
-                    let sketch_this_bucket = ht.enabled && {
-                        let now_hour = crate::util::now_ms()
-                            / schema::HOT_TOPICS_BUCKET_MS;
-                        let lo = now_hour.saturating_sub(
-                            ht.window_hours + ht.eviction_slack_hours,
-                        );
-                        bucket_hour >= lo && bucket_hour <= now_hour + 1
-                    };
+                    // Only sketch a PUBLIC post whose bucket is (or could still
+                    // be) in the rolling window. Public-only (Security Audit
+                    // N1): `GET /api/v1/news/hot-topics` is unauthenticated, so
+                    // counting `Followers`-only posts would make the hourly
+                    // per-tag count a weak existence/volume oracle for hidden
+                    // posts. The `news_by_tag` index still gets every tag — the
+                    // feed filter re-applies the W37 visibility gate on read.
+                    let sketch_this_bucket = ht.enabled
+                        && payload.visibility == crate::messages::types::Visibility::Public
+                        && {
+                            let now_hour = crate::util::now_ms()
+                                / schema::HOT_TOPICS_BUCKET_MS;
+                            let lo = now_hour.saturating_sub(
+                                ht.window_hours + ht.eviction_slack_hours,
+                            );
+                            bucket_hour >= lo && bucket_hour <= now_hour + 1
+                        };
                     for tag in &norm {
                         let tag_key = schema::encode_news_by_tag_key(
                             tag,

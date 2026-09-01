@@ -41,7 +41,7 @@ pub mod cf {
     /// data; cheap to rebuild from `NEWS_FEED`). Hourly-evicted past
     /// `[hot_topics] window_hours + eviction_slack_hours`.
     pub const HOT_TOPICS_LOCAL: &str = "hot_topics_local";
-    /// (bucket_hour:u64 BE, tag) → JSON(`HotTopicsMerged`) — union of
+    /// (bucket_hour:u64 BE, tag) → msgpack(`HotTopicsMerged`) — union of
     /// `HOT_TOPICS_LOCAL` and every accepted peer digest, plus a bounded ring
     /// of contributor cardinality estimates (drives the query-time median
     /// trim). Served by `GET /api/v1/news/hot-topics`. NODE-LOCAL — EXCLUDED

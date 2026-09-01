@@ -2813,7 +2813,21 @@ pub async fn hot_topics(
         .unwrap_or(cfg.limit_default)
         .min(cfg.limit_cap.min(100))
         .max(1);
-    let res = agg.query(limit, crate::network::hot_topics::now_ms());
+    // The query does a bounded-but-real RocksDB window scan + HLL merges;
+    // keep it off the async reactor (Code+Security Audit W2). `query` is
+    // itself single-flighted, so concurrent misses don't stack.
+    let agg = agg.clone();
+    let res = match tokio::task::spawn_blocking(move || {
+        agg.query(limit, crate::network::hot_topics::now_ms())
+    })
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error = %e, "hot-topics query task join failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response();
+        }
+    };
     Json(serde_json::json!({
         "scope": res.scope.as_str(),
         "topics": res.topics,

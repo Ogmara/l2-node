@@ -2792,6 +2792,15 @@ impl Config {
                 );
                 ht.window_hours = 168;
             }
+            if ht.eviction_slack_hours > 168 {
+                eprintln!(
+                    "[config] hot_topics.eviction_slack_hours ({}) is very large; \
+                     clamping to 168 (window_hours + slack must stay well under \
+                     u64 to avoid overflow in the bucket math).",
+                    ht.eviction_slack_hours
+                );
+                ht.eviction_slack_hours = 168;
+            }
             if ht.cache_ttl_secs == 0 {
                 anyhow::bail!(
                     "hot_topics.cache_ttl_secs must be > 0 (zero recomputes the \
@@ -2848,6 +2857,65 @@ impl Config {
                      sketch alone can approach 4 KiB (default 524288)",
                     ht.digest_max_envelope_bytes
                 );
+            }
+            if ht.publish_jitter_secs > 3600 {
+                eprintln!(
+                    "[config] hot_topics.publish_jitter_secs ({}) exceeds 3600; \
+                     clamping (also guards the `% (jitter + 1)` in the publish \
+                     timer against overflow).",
+                    ht.publish_jitter_secs
+                );
+                ht.publish_jitter_secs = 3600;
+            }
+            if ht.digest_max_envelope_bytes > 8 * 1024 * 1024 {
+                eprintln!(
+                    "[config] hot_topics.digest_max_envelope_bytes ({}) exceeds the \
+                     8 MiB ceiling; clamping (this gates a pre-decode allocation).",
+                    ht.digest_max_envelope_bytes
+                );
+                ht.digest_max_envelope_bytes = 8 * 1024 * 1024;
+            }
+            if ht.max_sketch_bytes == 0 {
+                anyhow::bail!(
+                    "hot_topics.max_sketch_bytes must be > 0 (zero rejects every \
+                     peer sketch, silently disabling the mesh; default 8192)"
+                );
+            }
+            if ht.digest_max_peers == 0 || ht.digest_max_peers > u16::MAX as usize {
+                anyhow::bail!(
+                    "hot_topics.digest_max_peers must be 1..={} (default 64) — it \
+                     caps the distinct-contributor map per (tag, bucket)",
+                    u16::MAX
+                );
+            }
+            if ht.min_contributors == 0 {
+                anyhow::bail!(
+                    "hot_topics.min_contributors must be >= 1 (0 marks every tag \
+                     network-scope; default 2)"
+                );
+            }
+            if ht.min_contributors_for_trim == 0 {
+                anyhow::bail!(
+                    "hot_topics.min_contributors_for_trim must be >= 1 (default 3)"
+                );
+            }
+            if ht.local_only_multiplier == 0 {
+                anyhow::bail!(
+                    "hot_topics.local_only_multiplier must be >= 1 (default 4)"
+                );
+            }
+            if ht.max_node_tag_contribution == 0 {
+                anyhow::bail!(
+                    "hot_topics.max_node_tag_contribution must be >= 1 (default 5000)"
+                );
+            }
+            if ht.active_set_refresh_secs < 60 {
+                eprintln!(
+                    "[config] hot_topics.active_set_refresh_secs ({}) is below 60; \
+                     clamping (avoids hammering the SC RPC).",
+                    ht.active_set_refresh_secs
+                );
+                ht.active_set_refresh_secs = 60;
             }
             if ht.trim_multiplier == 0 {
                 anyhow::bail!("hot_topics.trim_multiplier must be >= 1 (default 3)");

@@ -18,7 +18,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, RwLock};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 use anyhow::Result;
 use libp2p::PeerId;
@@ -98,27 +98,21 @@ pub struct HotTopicsMerged {
     /// Union of this node's local sketch and every accepted peer sketch for
     /// `(tag, bucket)`. `Hll::to_bytes()` form.
     pub merged_hll: Vec<u8>,
-    /// Distinct contributing nodes folded so far (capped at
-    /// `digest_max_peers`). `1` means "local only".
-    pub contributor_count: u16,
-    /// Ring of the most recent contributor cardinality estimates (`approx`
-    /// values, plus this node's local estimate). Drives the median trim.
-    pub approx_ring: Vec<u32>,
+    /// **Distinct** contributors, `contributor_key → latest cardinality
+    /// estimate`. Keyed by the sender's libp2p PeerId (base58); the local
+    /// node's own contribution is keyed `"@local"`. Bounded at
+    /// `digest_max_peers` — a re-fold from a peer already present REFRESHES
+    /// its value and re-unions its sketch but never grows the map. This is
+    /// what makes `min_contributors` a real distinct-node gate and the
+    /// median trim a real cross-node median (Code+Security Audit C1).
+    #[serde(default)]
+    pub contributors: std::collections::BTreeMap<String, u32>,
     /// Wall-clock ms of the last update (diagnostics / eviction sanity).
     pub updated_at: u64,
 }
 
-const APPROX_RING_MAX: usize = 32;
-
-impl HotTopicsMerged {
-    fn push_approx(&mut self, v: u32) {
-        self.approx_ring.push(v);
-        if self.approx_ring.len() > APPROX_RING_MAX {
-            let drop = self.approx_ring.len() - APPROX_RING_MAX;
-            self.approx_ring.drain(0..drop);
-        }
-    }
-}
+/// Contributor key for this node's own local sketch.
+pub const LOCAL_CONTRIBUTOR_KEY: &str = "@local";
 
 // --- Endpoint result ---
 
@@ -154,17 +148,31 @@ pub struct HotTopicsResult {
     pub topics: Vec<HotTopic>,
 }
 
-/// Outcome of folding an inbound digest — maps to a gossip
-/// `MessageAcceptance` at the call site.
-#[derive(Debug, PartialEq, Eq)]
-pub enum InboundOutcome {
-    /// Folded (or a harmless duplicate/refresh) — safe to re-propagate.
-    Accepted,
+/// A digest that has passed every synchronous validation gate and is ready to
+/// be folded into `HOT_TOPICS_MERGED`. The fold itself (RocksDB read-modify-
+/// write per `(bucket, tag)`) is done off the swarm event loop.
+#[derive(Debug)]
+pub struct ValidatedDigest {
+    /// base58 libp2p PeerId of the sender — the contributor key in
+    /// `HotTopicsMerged::contributors`.
+    peer_key: String,
+    buckets: Vec<DigestBucket>,
+    now_ms: u64,
+}
+
+/// Outcome of classifying + validating a `/network`-topic message.
+#[derive(Debug)]
+pub enum InboundDecision {
+    /// Not a Hot Topics digest — the caller falls through to the generic
+    /// envelope router (e.g. a `NodeAnnouncement`).
+    NotADigest,
+    /// Validated — report `Accept` and fold [`ValidatedDigest`] off-loop.
+    Fold(Box<ValidatedDigest>),
     /// Structurally/cryptographically invalid — reject + penalize the relay.
-    Invalid(String),
+    Reject(String),
     /// Well-formed but not folded (untrusted sender, rate-limited, out of
     /// window). Ignore, do not penalize.
-    Ignored(String),
+    Ignore(String),
 }
 
 // --- Aggregator ---
@@ -177,13 +185,23 @@ pub struct HotTopicsAggregator {
     storage: Storage,
     config: HotTopicsConfig,
     network_id: String,
-    /// PeerId → last accepted digest `Instant`.
+    /// PeerId → last accepted-OR-rejected digest `Instant` (a bad digest also
+    /// arms the limiter, so a peer flooding malformed digests is throttled
+    /// after the first).
     rate: Mutex<HashMap<PeerId, Instant>>,
-    /// Node addresses (`klv1…`) whose digests may be folded — SC-registered
-    /// ∪ presence-`both`. Refreshed by `NetworkService`.
-    trusted_nodes: RwLock<HashSet<String>>,
+    /// libp2p **PeerIds** whose digests may be folded — the sender-identity
+    /// gate (Code+Security Audit C1). Populated from the SC `getActiveNodes`
+    /// set cross-referenced with each node's on-chain published multiaddrs
+    /// (`/p2p/<peer_id>`), so a digest's `peer_id` — which is already bound to
+    /// the signature and matched against the gossip propagation source — is
+    /// what decides trust, NOT the self-asserted `node_address` string.
+    /// Refreshed by `NetworkService`/`node.rs`.
+    trusted_peers: RwLock<HashSet<PeerId>>,
     /// `(computed_at, result)` — TTL `config.cache_ttl_secs`.
     result_cache: Mutex<Option<(Instant, HotTopicsResult)>>,
+    /// Serializes `compute_query` so concurrent cache misses don't each run
+    /// the full window scan (single-flight).
+    compute_lock: Mutex<()>,
 }
 
 impl HotTopicsAggregator {
@@ -193,8 +211,9 @@ impl HotTopicsAggregator {
             config,
             network_id: network_id.into(),
             rate: Mutex::new(HashMap::new()),
-            trusted_nodes: RwLock::new(HashSet::new()),
+            trusted_peers: RwLock::new(HashSet::new()),
             result_cache: Mutex::new(None),
+            compute_lock: Mutex::new(()),
         }
     }
 
@@ -202,24 +221,21 @@ impl HotTopicsAggregator {
         &self.config
     }
 
-    /// Replace the trusted-node set (SC-registered ∪ presence-`both`).
-    pub fn set_trusted_nodes(&self, set: HashSet<String>) {
-        if let Ok(mut g) = self.trusted_nodes.write() {
+    /// Replace the trusted-PeerId set (SC-registered active nodes whose
+    /// on-chain multiaddrs we could resolve to a PeerId). Called only after a
+    /// clean, complete `getActiveNodes` pagination.
+    pub fn set_trusted_peers(&self, set: HashSet<PeerId>) {
+        if let Ok(mut g) = self.trusted_peers.write() {
             *g = set;
         }
     }
 
-    fn trusted_nodes_empty(&self) -> bool {
-        self.trusted_nodes.read().map(|g| g.is_empty()).unwrap_or(true)
+    fn have_trusted_peers(&self) -> bool {
+        self.trusted_peers.read().map(|g| !g.is_empty()).unwrap_or(false)
     }
 
-    fn is_trusted_node(&self, addr: &str) -> bool {
-        !addr.is_empty()
-            && self
-                .trusted_nodes
-                .read()
-                .map(|g| g.contains(addr))
-                .unwrap_or(false)
+    fn is_trusted_peer(&self, peer: &PeerId) -> bool {
+        self.trusted_peers.read().map(|g| g.contains(peer)).unwrap_or(false)
     }
 
     fn current_bucket(now_ms: u64) -> u64 {
@@ -257,11 +273,11 @@ impl HotTopicsAggregator {
                 .ok()?;
             let mut tags: Vec<DigestTag> = Vec::new();
             for (key, val) in rows {
-                let Some((_, tag)) = schema::decode_hot_topics_key(&key) else { continue };
-                let Some(hll) = Hll::from_bytes(&val) else { continue };
-                if hll.to_bytes().len() > self.config.max_sketch_bytes {
+                if val.len() > self.config.max_sketch_bytes {
                     continue;
                 }
+                let Some((_, tag)) = schema::decode_hot_topics_key(&key) else { continue };
+                let Some(hll) = Hll::from_bytes(&val) else { continue };
                 tags.push(DigestTag {
                     tag: tag.to_string(),
                     approx: hll.estimate_u32(),
@@ -297,110 +313,132 @@ impl HotTopicsAggregator {
 
     // --- Inbound ---
 
-    /// Try to decode `bytes` as a Hot Topics digest. Cheap classifier for the
-    /// `/network` topic reader — a `NodeAnnouncement` envelope has none of the
-    /// required fields and fails here.
-    pub fn looks_like_digest(bytes: &[u8], max_envelope_bytes: usize) -> bool {
-        if bytes.len() > max_envelope_bytes {
-            return false;
-        }
-        match rmp_serde::from_slice::<HotTopicsDigest>(bytes) {
-            Ok(d) => d.signed.msg_type == HOT_TOPICS_DIGEST_TAG,
-            Err(_) => false,
+    /// Cheap first-look classifier for a `/network`-topic message: is the first
+    /// byte a MessagePack `fixmap`/`map16`/`map32` marker? Both a
+    /// `NodeAnnouncement` envelope and a digest are maps, so this only rejects
+    /// obviously-non-map frames without a full decode; the real distinction is
+    /// made by [`classify_and_validate`] which tries the strict digest decode.
+    fn is_mapish(bytes: &[u8]) -> bool {
+        match bytes.first() {
+            Some(&b) => (0x80..=0x8f).contains(&b) || b == 0xde || b == 0xdf,
+            None => false,
         }
     }
 
-    /// Validate an inbound digest and, if accepted, fold it into
-    /// `HOT_TOPICS_MERGED`. The cost-ordered pipeline mirrors
+    /// Classify + fully validate a `/network`-topic message. Everything here is
+    /// synchronous and cheap enough for the swarm event loop; the actual fold
+    /// (RocksDB read-modify-write per `(bucket, tag)`) is returned to the
+    /// caller as a [`ValidatedDigest`] to run off-loop. Cost-ordered like
     /// `presence::validate_record`.
-    pub fn handle_inbound(
+    pub fn classify_and_validate(
         &self,
         propagation_source: PeerId,
         bytes: &[u8],
         now_ms: u64,
-    ) -> InboundOutcome {
-        if !self.config.enabled || !self.config.mesh_enabled {
-            return InboundOutcome::Ignored("mesh disabled".into());
+    ) -> InboundDecision {
+        // 0. Size guard (pre-decode) + cheap shape pre-check.
+        if bytes.len() > self.config.digest_max_envelope_bytes || !Self::is_mapish(bytes) {
+            return InboundDecision::NotADigest;
         }
-        // 1. Envelope-size guard (pre-decode).
-        if bytes.len() > self.config.digest_max_envelope_bytes {
-            return InboundOutcome::Invalid(format!(
-                "digest {} bytes exceeds {}",
-                bytes.len(),
-                self.config.digest_max_envelope_bytes
-            ));
-        }
-        // 2. Decode.
+        // 1. Strict decode — a NodeAnnouncement envelope lacks the required
+        //    fields and lands here as NotADigest (caller falls through).
         let digest: HotTopicsDigest = match rmp_serde::from_slice(bytes) {
             Ok(d) => d,
-            Err(e) => return InboundOutcome::Invalid(format!("decode: {e}")),
+            Err(_) => return InboundDecision::NotADigest,
         };
         let s = &digest.signed;
         if s.msg_type != HOT_TOPICS_DIGEST_TAG {
-            return InboundOutcome::Invalid("wrong msg_type".into());
+            return InboundDecision::NotADigest;
         }
-        // 3. PeerId parse + denylist + propagation-source match.
+        // From here it IS a digest — decide accept/reject/ignore.
+        if !self.config.enabled || !self.config.mesh_enabled {
+            return InboundDecision::Ignore("mesh disabled".into());
+        }
+        // 2. PeerId parse + denylist + propagation-source match.
         let claimed: PeerId = match s.peer_id.parse() {
             Ok(p) => p,
-            Err(e) => return InboundOutcome::Invalid(format!("bad peer_id: {e}")),
+            Err(e) => return InboundDecision::Reject(format!("bad peer_id: {e}")),
         };
         if self.config.digest_denylist.iter().any(|d| d == &s.peer_id) {
-            return InboundOutcome::Ignored("denylisted".into());
+            return InboundDecision::Ignore("denylisted".into());
         }
         if claimed != propagation_source {
-            return InboundOutcome::Invalid("peer_id != propagation source".into());
+            return InboundDecision::Reject("peer_id != propagation source".into());
         }
-        // 4. Rate-limit PEEK (non-mutating, cheap).
-        if !self.rate_peek(&claimed, now_ms) {
-            return InboundOutcome::Ignored("rate limited".into());
+        // 3. Rate limit — check AND arm in one step, BEFORE the expensive
+        //    signature verify, so a peer flooding digests (valid or not) pays
+        //    one verify then is throttled for `inbound_rate_limit_secs`.
+        if !self.rate_check_and_commit(&claimed) {
+            return InboundDecision::Ignore("rate limited".into());
         }
-        // 5. Timestamp skew.
+        // 4. Timestamp skew.
         let now_s = unix_secs(now_ms);
         if s.timestamp <= now_s.saturating_sub(DIGEST_PAST_SKEW_SECS)
             || s.timestamp >= now_s.saturating_add(DIGEST_FUTURE_SKEW_SECS)
         {
-            return InboundOutcome::Invalid("timestamp skew".into());
+            return InboundDecision::Reject("timestamp skew".into());
         }
-        // 6. network_id.
+        // 5. network_id.
         if s.network_id != self.network_id {
-            return InboundOutcome::Invalid("network_id mismatch".into());
+            return InboundDecision::Reject("network_id mismatch".into());
         }
-        // 7. window_hours.
+        // 6. window_hours.
         if s.window_hours != self.config.window_hours {
-            return InboundOutcome::Ignored("window_hours mismatch".into());
+            return InboundDecision::Ignore("window_hours mismatch".into());
         }
-        // 8. Shape caps.
+        // 7. Shape caps.
         if s.buckets.len() > self.config.max_buckets_per_digest {
-            return InboundOutcome::Invalid("too many buckets".into());
+            return InboundDecision::Reject("too many buckets".into());
         }
         if s.buckets.iter().any(|b| b.tags.len() > self.config.max_tags_per_digest) {
-            return InboundOutcome::Invalid("too many tags in a bucket".into());
+            return InboundDecision::Reject("too many tags in a bucket".into());
         }
-        // 9. Signature (Ed25519 over to_vec_named(signed)).
+        // 8. Signature (Ed25519 over to_vec_named(signed)).
         if let Err(e) = verify_digest_sig(&digest) {
-            return InboundOutcome::Invalid(format!("bad signature: {e}"));
+            return InboundDecision::Reject(format!("bad signature: {e}"));
         }
-        // 10. Rate-limit COMMIT.
-        if !self.rate_commit(&claimed, now_ms) {
-            return InboundOutcome::Ignored("rate limited".into());
+        // 9. Sender-identity gate — the digest's `peer_id` (bound to the
+        //    signature AND matched to the gossip source) MUST be a
+        //    SC-registered active node's PeerId. `node_address` is advisory
+        //    only. When we have no trusted set at all (Klever RPC not
+        //    configured, or the SC nodes publish no multiaddrs) we cannot
+        //    verify anyone → do NOT fold; this node still serves its own
+        //    local view (Code+Security Audit C1).
+        if self.config.require_sc_registered_sender {
+            if !self.have_trusted_peers() {
+                return InboundDecision::Ignore("no trusted-peer set — folding disabled".into());
+            }
+            if !self.is_trusted_peer(&claimed) {
+                return InboundDecision::Ignore("sender is not an SC-registered active node".into());
+            }
         }
-        // 11. Sender-identity gate.
-        let trusted = self.is_trusted_node(&s.node_address)
-            || (self.config.require_sc_registered_sender && self.trusted_nodes_empty());
-        //          ^ no Klever RPC configured / set not yet populated → fall
-        //            back to "meshed peer" acceptance (we only get here for a
-        //            gossip-mesh delivery whose peer_id matched the source).
-        if self.config.require_sc_registered_sender && !trusted {
-            return InboundOutcome::Ignored("sender not a known active node".into());
-        }
-        // 12. Fold each (bucket, tag).
+        // 10. Keep only in-window buckets; the caller folds off-loop.
         let lo = self.window_lo_bucket(now_ms);
         let hi = Self::current_bucket(now_ms) + 1;
+        let peer_key = s.peer_id.clone();
+        let buckets: Vec<DigestBucket> = digest
+            .signed
+            .buckets
+            .into_iter()
+            .filter(|b| b.bucket_hour >= lo && b.bucket_hour <= hi)
+            .collect();
+        if buckets.is_empty() {
+            return InboundDecision::Ignore("no in-window buckets".into());
+        }
+        InboundDecision::Fold(Box::new(ValidatedDigest {
+            peer_key,
+            buckets,
+            now_ms,
+        }))
+    }
+
+    /// Fold a fully-validated digest into `HOT_TOPICS_MERGED`. Runs off the
+    /// swarm event loop (`spawn_blocking`). Contributor identity is the
+    /// sender's PeerId, so re-folds from the same peer refresh rather than
+    /// inflate (Code+Security Audit C1).
+    pub fn fold(&self, vd: ValidatedDigest) {
         let mut folded = 0usize;
-        for b in &s.buckets {
-            if b.bucket_hour < lo || b.bucket_hour > hi {
-                continue;
-            }
+        for b in &vd.buckets {
             for t in &b.tags {
                 if crate::util::normalize_tag(&t.tag).as_deref() != Some(t.tag.as_str()) {
                     continue; // non-canonical tag in a digest — skip
@@ -409,50 +447,77 @@ impl HotTopicsAggregator {
                     continue;
                 }
                 let Some(incoming) = Hll::from_bytes(&t.hll) else { continue };
-                // Per-node contribution clamp.
-                if t.approx > self.config.max_node_tag_contribution.saturating_mul(2) {
-                    warn!(peer = %claimed, tag = %t.tag, approx = t.approx, "hot-topics: dropping wildly-inflated tag from digest");
+                // Bound BOTH the self-reported estimate AND the sketch's own
+                // estimate — a sender can pass a small `approx` alongside a
+                // saturated sketch (Code W6 / Security C2).
+                let est = incoming.estimate_u32().max(t.approx);
+                if est > self.config.max_node_tag_contribution.saturating_mul(2) {
+                    warn!(peer = %vd.peer_key, tag = %t.tag, est, "hot-topics: dropping wildly-inflated tag from digest");
                     continue;
                 }
-                if t.approx > self.config.max_node_tag_contribution {
-                    warn!(peer = %claimed, tag = %t.tag, approx = t.approx, "hot-topics: peer contribution above clamp (folding anyway)");
+                if est > self.config.max_node_tag_contribution {
+                    warn!(peer = %vd.peer_key, tag = %t.tag, est, "hot-topics: peer contribution above clamp (folding anyway)");
                 }
-                if let Err(e) = self.fold_one(b.bucket_hour, &t.tag, &incoming, t.approx, now_ms) {
+                let clamped = est.min(self.config.max_node_tag_contribution);
+                if let Err(e) =
+                    self.fold_one(b.bucket_hour, &t.tag, &incoming, &vd.peer_key, clamped, vd.now_ms)
+                {
                     debug!(error = %e, "hot-topics: fold failed");
                 }
                 folded += 1;
             }
         }
-        debug!(peer = %claimed, folded, "hot-topics: digest folded");
-        self.invalidate_cache();
-        InboundOutcome::Accepted
+        debug!(peer = %vd.peer_key, folded, "hot-topics: digest folded");
+        // Note: the result cache is NOT invalidated here — a <= cache_ttl_secs
+        // stale trending list is fine, and invalidating on every fold makes a
+        // busy mesh recompute the full window scan on every request (Code W2 /
+        // Security W2).
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn fold_one(
         &self,
         bucket_hour: u64,
         tag: &str,
         incoming: &Hll,
+        peer_key: &str,
         approx: u32,
         now_ms: u64,
     ) -> Result<()> {
         let key = schema::encode_hot_topics_key(bucket_hour, tag);
-        let mut merged: HotTopicsMerged = self
-            .storage
-            .get_cf(schema::cf::HOT_TOPICS_MERGED, &key)?
+        let existing = self.storage.get_cf(schema::cf::HOT_TOPICS_MERGED, &key)?;
+
+        // Per-bucket distinct-tag cap on the MERGED CF too, not just LOCAL
+        // (Code+Security Audit W3/W7): a fresh tag is dropped once the bucket
+        // is full; tags already tracked keep folding.
+        if existing.is_none() {
+            let tracked = self.storage.count_prefix_cf(
+                schema::cf::HOT_TOPICS_MERGED,
+                &bucket_hour.to_be_bytes(),
+                self.config.max_tracked_tags_per_bucket.saturating_add(1),
+            )?;
+            if tracked as usize >= self.config.max_tracked_tags_per_bucket {
+                return Ok(());
+            }
+        }
+
+        let mut merged: HotTopicsMerged = existing
             .and_then(|b| rmp_serde::from_slice(&b).ok())
             .unwrap_or_default();
 
         // Seed from local on first touch so the merged view is never behind
-        // this node's own ingest.
+        // this node's own ingest — recorded as the `@local` contributor.
         let mut acc = if merged.merged_hll.is_empty() {
             let local = self
                 .storage
                 .get_cf(schema::cf::HOT_TOPICS_LOCAL, &key)?
                 .and_then(|b| Hll::from_bytes(&b))
                 .unwrap_or_default();
-            merged.contributor_count = 1;
-            merged.push_approx(local.estimate_u32());
+            if !local.is_empty() {
+                merged
+                    .contributors
+                    .insert(LOCAL_CONTRIBUTOR_KEY.to_string(), local.estimate_u32());
+            }
             local
         } else {
             Hll::from_bytes(&merged.merged_hll).unwrap_or_default()
@@ -460,11 +525,14 @@ impl HotTopicsAggregator {
 
         acc.merge(incoming);
         merged.merged_hll = acc.to_bytes();
-        merged.contributor_count = merged
-            .contributor_count
-            .saturating_add(1)
-            .min(self.config.digest_max_peers as u16);
-        merged.push_approx(approx);
+        // Record/refresh this contributor. Bounded at digest_max_peers — a new
+        // peer beyond the cap is dropped (its sketch is still unioned above, so
+        // it can't be undone, but it doesn't grow the distinct-contributor
+        // count / median input).
+        let cap = self.config.digest_max_peers.max(1);
+        if merged.contributors.contains_key(peer_key) || merged.contributors.len() < cap {
+            merged.contributors.insert(peer_key.to_string(), approx);
+        }
         merged.updated_at = now_ms;
 
         let bytes = rmp_serde::to_vec_named(&merged)?;
@@ -473,18 +541,11 @@ impl HotTopicsAggregator {
         Ok(())
     }
 
-    fn rate_peek(&self, peer: &PeerId, now_ms: u64) -> bool {
-        let gap = std::time::Duration::from_secs(self.config.inbound_rate_limit_secs);
-        let _ = now_ms;
-        match self.rate.lock() {
-            Ok(g) => g.get(peer).map(|prev| prev.elapsed() >= gap).unwrap_or(true),
-            Err(_) => true,
-        }
-    }
-
-    fn rate_commit(&self, peer: &PeerId, now_ms: u64) -> bool {
-        let _ = now_ms;
-        let gap = std::time::Duration::from_secs(self.config.inbound_rate_limit_secs);
+    /// Check the per-PeerId rate limit and, on success, arm it. A digest that
+    /// later turns out invalid still consumed this slot, so a peer flooding
+    /// malformed digests is throttled after the first.
+    fn rate_check_and_commit(&self, peer: &PeerId) -> bool {
+        let gap = std::time::Duration::from_secs(self.config.inbound_rate_limit_secs.max(1));
         let Ok(mut g) = self.rate.lock() else { return true };
         if let Some(prev) = g.get(peer) {
             if prev.elapsed() < gap {
@@ -506,23 +567,28 @@ impl HotTopicsAggregator {
         }
     }
 
-    fn invalidate_cache(&self) {
-        if let Ok(mut g) = self.result_cache.lock() {
-            *g = None;
-        }
-    }
-
     // --- Query ---
 
     /// Compute (or serve from the TTL cache) the top-N trending tags.
+    /// Single-flight: concurrent cache misses serialize on `compute_lock` so
+    /// only one full window scan runs at a time.
     pub fn query(&self, limit: usize, now_ms: u64) -> HotTopicsResult {
+        let ttl = std::time::Duration::from_secs(self.config.cache_ttl_secs.max(1));
+        let fresh = |g: &Option<(Instant, HotTopicsResult)>| {
+            g.as_ref().filter(|(at, _)| at.elapsed() < ttl).map(|(_, r)| r.clone())
+        };
         if let Ok(g) = self.result_cache.lock() {
-            if let Some((at, res)) = g.as_ref() {
-                if at.elapsed() < std::time::Duration::from_secs(self.config.cache_ttl_secs) {
-                    let mut r = res.clone();
-                    r.topics.truncate(limit);
-                    return r;
-                }
+            if let Some(mut r) = fresh(&g) {
+                r.topics.truncate(limit);
+                return r;
+            }
+        }
+        let _flight = self.compute_lock.lock();
+        // Another waiter may have populated the cache while we blocked.
+        if let Ok(g) = self.result_cache.lock() {
+            if let Some(mut r) = fresh(&g) {
+                r.topics.truncate(limit);
+                return r;
             }
         }
         let res = self.compute_query(now_ms);
@@ -537,16 +603,21 @@ impl HotTopicsAggregator {
     fn compute_query(&self, now_ms: u64) -> HotTopicsResult {
         let cur = Self::current_bucket(now_ms);
         let lo = cur.saturating_sub(self.config.window_hours.saturating_sub(1));
+        // Per-bucket scan cap: distinct tags per bucket are bounded by
+        // max_tracked_tags_per_bucket on both write paths, so this is a
+        // safety ceiling, not the expected size.
+        let scan_cap = self.config.max_tracked_tags_per_bucket.saturating_mul(2).max(1024);
 
-        // tag -> (window-union HLL, best contributor_count, approx ring merged)
-        let mut merged_acc: HashMap<String, (Hll, u16, Vec<u32>)> = HashMap::new();
+        // tag -> (window-union HLL, contributor_key -> max approx)
+        let mut merged_acc: HashMap<String, (Hll, std::collections::BTreeMap<String, u32>)> =
+            HashMap::new();
         let mut local_acc: HashMap<String, Hll> = HashMap::new();
 
         for bh in lo..=cur {
             let prefix = bh.to_be_bytes();
             if let Ok(rows) =
                 self.storage
-                    .prefix_iter_cf(schema::cf::HOT_TOPICS_MERGED, &prefix, 100_000)
+                    .prefix_iter_cf(schema::cf::HOT_TOPICS_MERGED, &prefix, scan_cap)
             {
                 for (key, val) in rows {
                     let Some((_, tag)) = schema::decode_hot_topics_key(&key) else { continue };
@@ -554,15 +625,17 @@ impl HotTopicsAggregator {
                     let Some(hll) = Hll::from_bytes(&m.merged_hll) else { continue };
                     let e = merged_acc
                         .entry(tag.to_string())
-                        .or_insert_with(|| (Hll::new(), 0, Vec::new()));
+                        .or_insert_with(|| (Hll::new(), std::collections::BTreeMap::new()));
                     e.0.merge(&hll);
-                    e.1 = e.1.max(m.contributor_count);
-                    e.2.extend(m.approx_ring);
+                    for (k, v) in m.contributors {
+                        let slot = e.1.entry(k).or_insert(0);
+                        *slot = (*slot).max(v);
+                    }
                 }
             }
             if let Ok(rows) =
                 self.storage
-                    .prefix_iter_cf(schema::cf::HOT_TOPICS_LOCAL, &prefix, 100_000)
+                    .prefix_iter_cf(schema::cf::HOT_TOPICS_LOCAL, &prefix, scan_cap)
             {
                 for (key, val) in rows {
                     let Some((_, tag)) = schema::decode_hot_topics_key(&key) else { continue };
@@ -587,26 +660,29 @@ impl HotTopicsAggregator {
         for tag in all_tags {
             let local_est = local_acc.get(tag).map(|h| h.estimate_u32()).unwrap_or(0) as u64;
             let (count, contributors) = match merged_acc.get(tag) {
-                Some((hll, contributors, ring)) => {
+                Some((hll, contribs)) => {
                     let raw = hll.estimate_u32() as u64;
-                    // Median trim.
-                    let trimmed = if *contributors >= self.config.min_contributors_for_trim
-                        && !ring.is_empty()
-                    {
-                        let mut r = ring.clone();
-                        r.sort_unstable();
-                        let median = r[r.len() / 2] as u64;
+                    // Distinct non-local contributors — the gate + trim input.
+                    let n_distinct = contribs.len() as u16;
+                    let mut approxes: Vec<u64> = contribs
+                        .iter()
+                        .filter(|(k, _)| k.as_str() != LOCAL_CONTRIBUTOR_KEY)
+                        .map(|(_, v)| *v as u64)
+                        .collect();
+                    approxes.sort_unstable();
+                    let trimmed = if approxes.len() as u16 >= self.config.min_contributors_for_trim {
+                        let median = approxes[approxes.len() / 2];
                         raw.min(median.saturating_mul(self.config.trim_multiplier as u64))
                     } else {
-                        // Too few contributors for a stable median → bound by
+                        // Too few distinct peers for a stable median → bound by
                         // local cardinality × multiplier.
                         raw.min(
                             local_est.saturating_mul(self.config.local_only_multiplier as u64),
                         )
                     };
-                    (trimmed.max(local_est), *contributors)
+                    (trimmed.max(local_est), n_distinct)
                 }
-                None => (local_est, 1),
+                None => (local_est, if local_est > 0 { 1 } else { 0 }),
             };
 
             if count < self.config.min_count {
@@ -681,65 +757,122 @@ impl HotTopicsAggregator {
         Ok(removed)
     }
 
-    /// On first start after upgrade: if `HOT_TOPICS_LOCAL` is empty but
-    /// `NEWS_FEED` is not, rebuild the local sketches from the last
-    /// `window_hours` of posts. Returns the number of posts scanned.
+    /// `NODE_STATE` key: set once the first-start bootstrap has run so a
+    /// low-traffic node whose buckets all legitimately evict doesn't re-scan
+    /// the whole feed on every boot (Code+Security Audit W8).
+    const BOOTSTRAP_DONE_KEY: &'static [u8] = b"hot_topics_bootstrapped";
+
+    /// On first start after upgrade: if we've never bootstrapped and
+    /// `HOT_TOPICS_LOCAL` is empty, rebuild the local sketches from the last
+    /// `window_hours` of PUBLIC news posts, then persist the done-marker.
+    /// Streams `NEWS_FEED` in bounded batches and flushes per bucket so a
+    /// huge history never buffers all sketches at once. Returns the number of
+    /// posts scanned.
     pub fn bootstrap_local_from_news_feed(&self, now_ms: u64) -> Result<u64> {
         if !self.config.enabled {
+            return Ok(0);
+        }
+        if self
+            .storage
+            .get_cf(schema::cf::NODE_STATE, Self::BOOTSTRAP_DONE_KEY)?
+            .is_some()
+        {
             return Ok(0);
         }
         let already = self
             .storage
             .prefix_iter_cf(schema::cf::HOT_TOPICS_LOCAL, &[], 1)?;
         if !already.is_empty() {
+            // Sketches already exist (a running 0.124.0 node) — just mark done.
+            self.storage
+                .put_cf(schema::cf::NODE_STATE, Self::BOOTSTRAP_DONE_KEY, &[1])?;
             return Ok(0);
         }
         let lo_bucket = Self::current_bucket(now_ms)
             .saturating_sub(self.config.window_hours + self.config.eviction_slack_hours);
-        let lo_ms = lo_bucket * HOT_TOPICS_BUCKET_MS;
+        let lo_ms = lo_bucket.saturating_mul(HOT_TOPICS_BUCKET_MS);
+        let tag_cap = self.config.max_tracked_tags_per_bucket;
 
-        // NEWS_FEED is keyed by `!timestamp` (newest first). Walk from the
-        // head until we pass out of the window.
+        // NEWS_FEED is keyed by `!timestamp` (newest first). Walk from the head
+        // in batches; every post in a batch is in the same or an earlier hour
+        // than the previous, so once we cross `lo_ms` we're done.
         let mut scanned = 0u64;
-        let mut sketches: HashMap<Vec<u8>, Hll> = HashMap::new();
-        let rows = self
-            .storage
-            .prefix_iter_cf(schema::cf::NEWS_FEED, &[], 200_000)?;
-        for (key, _) in rows {
-            if key.len() < 40 {
-                continue;
+        // Only the CURRENT bucket's sketches are held in memory; flushed when
+        // the scan moves to an older bucket.
+        let mut cur_bucket: Option<u64> = None;
+        let mut cur_sketches: HashMap<String, Hll> = HashMap::new();
+        let flush = |bh: u64, sk: &mut HashMap<String, Hll>, storage: &Storage| -> Result<()> {
+            for (tag, hll) in sk.drain() {
+                storage.put_cf(
+                    schema::cf::HOT_TOPICS_LOCAL,
+                    &schema::encode_hot_topics_key(bh, &tag),
+                    &hll.to_bytes(),
+                )?;
             }
-            let inv_ts = u64::from_be_bytes(key[0..8].try_into().unwrap_or([0; 8]));
-            let ts = !inv_ts;
-            if ts < lo_ms {
+            Ok(())
+        };
+
+        let mut start: Vec<u8> = Vec::new();
+        'scan: loop {
+            let batch = if start.is_empty() {
+                self.storage.prefix_iter_cf(schema::cf::NEWS_FEED, &[], 4096)?
+            } else {
+                self.storage
+                    .prefix_iter_cf_after(schema::cf::NEWS_FEED, &start, &[], 4096)?
+            };
+            if batch.is_empty() {
                 break;
             }
-            let msg_id: [u8; 32] = key[8..40].try_into().unwrap_or([0u8; 32]);
-            let Ok(Some(env_bytes)) = self.storage.get_message(&msg_id) else { continue };
-            let Ok(env) =
-                rmp_serde::from_slice::<crate::messages::envelope::Envelope>(&env_bytes)
-            else {
-                continue;
-            };
-            if env.msg_type != crate::messages::types::MessageType::NewsPost {
-                continue;
+            for (key, _) in &batch {
+                start = key.clone();
+                if key.len() < 40 {
+                    continue;
+                }
+                let inv_ts = u64::from_be_bytes(key[0..8].try_into().unwrap_or([0; 8]));
+                let ts = !inv_ts;
+                if ts < lo_ms {
+                    break 'scan;
+                }
+                let msg_id: [u8; 32] = key[8..40].try_into().unwrap_or([0u8; 32]);
+                let Ok(Some(env_bytes)) = self.storage.get_message(&msg_id) else { continue };
+                let Ok(env) =
+                    rmp_serde::from_slice::<crate::messages::envelope::Envelope>(&env_bytes)
+                else {
+                    continue;
+                };
+                if env.msg_type != crate::messages::types::MessageType::NewsPost {
+                    continue;
+                }
+                let Ok(payload) = rmp_serde::from_slice::<
+                    crate::messages::types::NewsPostPayload,
+                >(&env.payload) else {
+                    continue;
+                };
+                // Public-only, mirroring the ingest path (Security Audit N1).
+                if payload.visibility != crate::messages::types::Visibility::Public {
+                    continue;
+                }
+                let bh = env.timestamp / HOT_TOPICS_BUCKET_MS;
+                if cur_bucket != Some(bh) {
+                    if let Some(prev) = cur_bucket {
+                        flush(prev, &mut cur_sketches, &self.storage)?;
+                    }
+                    cur_bucket = Some(bh);
+                }
+                for tag in crate::util::normalize_tags_dedup(&payload.tags) {
+                    if !cur_sketches.contains_key(&tag) && cur_sketches.len() >= tag_cap {
+                        continue; // per-bucket distinct-tag cap
+                    }
+                    cur_sketches.entry(tag).or_default().insert(&msg_id);
+                }
+                scanned += 1;
             }
-            let Ok(payload) = rmp_serde::from_slice::<crate::messages::types::NewsPostPayload>(
-                &env.payload,
-            ) else {
-                continue;
-            };
-            let bh = env.timestamp / HOT_TOPICS_BUCKET_MS;
-            for tag in crate::util::normalize_tags_dedup(&payload.tags) {
-                let k = schema::encode_hot_topics_key(bh, &tag);
-                sketches.entry(k).or_default().insert(&msg_id);
-            }
-            scanned += 1;
         }
-        for (k, hll) in sketches {
-            self.storage
-                .put_cf(schema::cf::HOT_TOPICS_LOCAL, &k, &hll.to_bytes())?;
+        if let Some(bh) = cur_bucket {
+            flush(bh, &mut cur_sketches, &self.storage)?;
         }
+        self.storage
+            .put_cf(schema::cf::NODE_STATE, Self::BOOTSTRAP_DONE_KEY, &[1])?;
         Ok(scanned)
     }
 }
@@ -765,13 +898,9 @@ fn unix_secs(now_ms: u64) -> u64 {
     now_ms / 1000
 }
 
-/// Convenience: current wall-clock ms (falls back to 0 pre-epoch).
-pub fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
+/// Current wall-clock ms since the epoch — re-exported from `util` so callers
+/// in the network layer don't reach across modules for it.
+pub use crate::util::now_ms;
 
 #[cfg(test)]
 mod tests {
@@ -870,30 +999,58 @@ mod tests {
         assert!(merged_left.is_empty(), "stale merged row must be evicted");
     }
 
+    /// Deliver a digest to `receiver` as the network layer would: classify +
+    /// validate, and on `Fold` also run the fold. Returns the decision.
+    fn deliver(
+        receiver: &HotTopicsAggregator,
+        src: PeerId,
+        bytes: &[u8],
+        now: u64,
+    ) -> InboundDecision {
+        let d = receiver.classify_and_validate(src, bytes, now);
+        if let InboundDecision::Fold(vd) = d {
+            let vd = *vd;
+            let key = vd.peer_key.clone();
+            receiver.fold(vd);
+            return InboundDecision::Fold(Box::new(ValidatedDigest {
+                peer_key: key,
+                buckets: vec![],
+                now_ms: now,
+            }));
+        }
+        d
+    }
+
+    fn trust(receiver: &HotTopicsAggregator, peer: PeerId) {
+        let mut cur: HashSet<PeerId> = receiver
+            .trusted_peers
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        cur.insert(peer);
+        receiver.set_trusted_peers(cur);
+    }
+
     #[test]
-    fn digest_roundtrip_build_then_fold_five_nodes_counts_union_once() {
-        // Five nodes each ingest the SAME 100 posts under #klever. A merged
-        // estimate must be ~100, not ~500 — the whole point of the design.
+    fn digest_fold_from_five_nodes_counts_the_union_once() {
+        // Five nodes each ingest the SAME 100 posts under #klever. The merged
+        // estimate must be ~100, not ~500 — the whole point of the design —
+        // and each distinct peer counts once toward the contributor gate.
         let now = 2_000 * HOT_TOPICS_BUCKET_MS + 1;
         let cur = now / HOT_TOPICS_BUCKET_MS;
-
         let (receiver, _d) = agg(HotTopicsConfig::default());
-        // receiver trusts everyone for the test
-        let mut trusted = HashSet::new();
 
         for node in 0..5u64 {
             let (sender, _sd) = agg(HotTopicsConfig::default());
             put_local(&sender, cur, "klever", &(0..100).collect::<Vec<_>>());
             let kp = libp2p::identity::Keypair::generate_ed25519();
-            let addr = format!("klv1node{node}");
-            trusted.insert(addr.clone());
-            let bytes = sender
-                .build_and_sign_digest(&kp, &addr, now)
-                .expect("digest");
-            receiver.set_trusted_nodes(trusted.clone());
             let src = kp.public().to_peer_id();
-            let out = receiver.handle_inbound(src, &bytes, now + node); // +node so rate limiter differs
-            assert_eq!(out, InboundOutcome::Accepted, "node {node}");
+            trust(&receiver, src);
+            let bytes = sender
+                .build_and_sign_digest(&kp, &format!("klv1node{node}"), now)
+                .expect("digest");
+            let d = deliver(&receiver, src, &bytes, now + node);
+            assert!(matches!(d, InboundDecision::Fold(_)), "node {node}: {d:?}");
         }
 
         let res = receiver.query(10, now);
@@ -907,7 +1064,59 @@ mod tests {
     }
 
     #[test]
-    fn untrusted_sender_is_ignored_not_folded() {
+    fn one_peer_resending_does_not_inflate_the_contributor_count() {
+        // Code+Security Audit C1: the SAME peer folding its digest repeatedly
+        // must stay ONE contributor, so a lone node can't reach the
+        // min_contributors_for_trim (3) regime by itself.
+        let mut cfg = HotTopicsConfig::default();
+        cfg.min_contributors_for_trim = 3;
+        cfg.local_only_multiplier = 4;
+        let now = 9_000 * HOT_TOPICS_BUCKET_MS + 1;
+        let cur = now / HOT_TOPICS_BUCKET_MS;
+        let (receiver, _d) = agg(cfg);
+        // receiver has NO local posts for #forge → local_est is 0.
+        let (sender, _sd) = agg(HotTopicsConfig::default());
+        put_local(&sender, cur, "forge", &(0..5000).collect::<Vec<_>>());
+        let kp = libp2p::identity::Keypair::generate_ed25519();
+        let src = kp.public().to_peer_id();
+        trust(&receiver, src);
+
+        // Fold the same peer's digest three times (bypassing the rate limiter
+        // by folding the ValidatedDigest directly).
+        for _ in 0..3 {
+            let bytes = sender.build_and_sign_digest(&kp, "klv1lonewolf", now).unwrap();
+            if let InboundDecision::Fold(vd) =
+                receiver.classify_and_validate(src, &bytes, now)
+            {
+                receiver.fold(*vd);
+            }
+            // clear the rate slot so the next classify passes
+            receiver.rate.lock().unwrap().clear();
+        }
+
+        let key = schema::encode_hot_topics_key(cur, "forge");
+        let m: HotTopicsMerged = rmp_serde::from_slice(
+            &receiver
+                .storage
+                .get_cf(schema::cf::HOT_TOPICS_MERGED, &key)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(m.contributors.len(), 1, "one distinct peer, not three folds");
+
+        // With <3 distinct peers and local_est 0, the trim bounds count to
+        // local_est * multiplier = 0 → the forged tag is filtered by min_count.
+        let res = receiver.query(10, now);
+        assert!(
+            res.topics.iter().all(|t| t.hashtag != "forge"),
+            "a lone peer forged a network-scope tag: {:?}",
+            res.topics
+        );
+    }
+
+    #[test]
+    fn untrusted_peer_is_ignored_not_folded() {
         let now = 3_000 * HOT_TOPICS_BUCKET_MS + 1;
         let cur = now / HOT_TOPICS_BUCKET_MS;
         let (sender, _sd) = agg(HotTopicsConfig::default());
@@ -916,29 +1125,48 @@ mod tests {
         let bytes = sender.build_and_sign_digest(&kp, "klv1rogue", now).unwrap();
 
         let (receiver, _d) = agg(HotTopicsConfig::default());
-        // trusted set explicitly populated but WITHOUT the rogue → not empty,
-        // so the mesh fallback does not apply.
-        receiver.set_trusted_nodes(HashSet::from(["klv1someoneelse".to_string()]));
-        let out = receiver.handle_inbound(kp.public().to_peer_id(), &bytes, now);
-        assert!(matches!(out, InboundOutcome::Ignored(_)), "{out:?}");
+        // Non-empty trusted set, but WITHOUT the sender's PeerId.
+        trust(&receiver, libp2p::identity::Keypair::generate_ed25519().public().to_peer_id());
+        let d = deliver(&receiver, kp.public().to_peer_id(), &bytes, now);
+        assert!(matches!(d, InboundDecision::Ignore(_)), "{d:?}");
     }
 
     #[test]
-    fn tampered_signature_is_invalid() {
+    fn no_trusted_set_means_fold_nothing() {
+        // Security Audit C1: with no trusted-peer set (Klever RPC absent) the
+        // gate must NOT accept-all — it folds nothing.
+        let now = 8_000 * HOT_TOPICS_BUCKET_MS + 1;
+        let cur = now / HOT_TOPICS_BUCKET_MS;
+        let (sender, _sd) = agg(HotTopicsConfig::default());
+        put_local(&sender, cur, "klever", &(0..50).collect::<Vec<_>>());
+        let kp = libp2p::identity::Keypair::generate_ed25519();
+        let bytes = sender.build_and_sign_digest(&kp, "klv1x", now).unwrap();
+        let (receiver, _d) = agg(HotTopicsConfig::default()); // trusted set empty
+        let d = deliver(&receiver, kp.public().to_peer_id(), &bytes, now);
+        assert!(matches!(d, InboundDecision::Ignore(_)), "{d:?}");
+    }
+
+    #[test]
+    fn tampered_signature_is_rejected() {
         let now = 4_000 * HOT_TOPICS_BUCKET_MS + 1;
         let cur = now / HOT_TOPICS_BUCKET_MS;
         let (sender, _sd) = agg(HotTopicsConfig::default());
         put_local(&sender, cur, "klever", &[1, 2, 3, 4, 5]);
         let kp = libp2p::identity::Keypair::generate_ed25519();
-        let mut bytes = sender.build_and_sign_digest(&kp, "klv1x", now).unwrap();
-        *bytes.last_mut().unwrap() ^= 0xFF;
+        let bytes = sender.build_and_sign_digest(&kp, "klv1x", now).unwrap();
+        // Decode, corrupt a signature byte, re-encode — structure stays valid
+        // so this exercises the signature check, not the decode path.
+        let mut digest: HotTopicsDigest = rmp_serde::from_slice(&bytes).unwrap();
+        digest.signature[10] ^= 0xFF;
+        let bytes = rmp_serde::to_vec_named(&digest).unwrap();
         let (receiver, _d) = agg(HotTopicsConfig::default());
-        let out = receiver.handle_inbound(kp.public().to_peer_id(), &bytes, now);
-        assert!(matches!(out, InboundOutcome::Invalid(_)), "{out:?}");
+        trust(&receiver, kp.public().to_peer_id());
+        let d = receiver.classify_and_validate(kp.public().to_peer_id(), &bytes, now);
+        assert!(matches!(d, InboundDecision::Reject(_)), "{d:?}");
     }
 
     #[test]
-    fn wrong_network_is_invalid() {
+    fn wrong_network_is_rejected() {
         let now = 5_000 * HOT_TOPICS_BUCKET_MS + 1;
         let cur = now / HOT_TOPICS_BUCKET_MS;
         let (sender, _sd) = agg(HotTopicsConfig::default());
@@ -950,8 +1178,23 @@ mod tests {
         let storage = Storage::open(dir.path()).unwrap();
         let receiver =
             HotTopicsAggregator::new(storage, HotTopicsConfig::default(), "mainnet");
-        let out = receiver.handle_inbound(kp.public().to_peer_id(), &bytes, now);
-        assert!(matches!(out, InboundOutcome::Invalid(_)), "{out:?}");
+        let d = receiver.classify_and_validate(kp.public().to_peer_id(), &bytes, now);
+        assert!(matches!(d, InboundDecision::Reject(_)), "{d:?}");
+    }
+
+    #[test]
+    fn spoofed_propagation_source_is_rejected() {
+        let now = 10_500 * HOT_TOPICS_BUCKET_MS + 1;
+        let cur = now / HOT_TOPICS_BUCKET_MS;
+        let (sender, _sd) = agg(HotTopicsConfig::default());
+        put_local(&sender, cur, "klever", &[1, 2, 3]);
+        let kp = libp2p::identity::Keypair::generate_ed25519();
+        let bytes = sender.build_and_sign_digest(&kp, "klv1x", now).unwrap();
+        let (receiver, _d) = agg(HotTopicsConfig::default());
+        // Deliver claiming a DIFFERENT peer as the propagation source.
+        let other = libp2p::identity::Keypair::generate_ed25519().public().to_peer_id();
+        let d = receiver.classify_and_validate(other, &bytes, now);
+        assert!(matches!(d, InboundDecision::Reject(_)), "{d:?}");
     }
 
     #[test]
@@ -961,18 +1204,35 @@ mod tests {
         let (sender, _sd) = agg(HotTopicsConfig::default());
         put_local(&sender, cur, "klever", &(0..20).collect::<Vec<_>>());
         let kp = libp2p::identity::Keypair::generate_ed25519();
-        let addr = "klv1n";
+        let src = kp.public().to_peer_id();
         let (receiver, _d) = agg(HotTopicsConfig::default());
-        receiver.set_trusted_nodes(HashSet::from([addr.to_string()]));
-        let b1 = sender.build_and_sign_digest(&kp, addr, now).unwrap();
-        let b2 = sender.build_and_sign_digest(&kp, addr, now + 1).unwrap();
-        assert_eq!(
-            receiver.handle_inbound(kp.public().to_peer_id(), &b1, now),
-            InboundOutcome::Accepted
-        );
+        trust(&receiver, src);
+        let b1 = sender.build_and_sign_digest(&kp, "klv1n", now).unwrap();
+        let b2 = sender.build_and_sign_digest(&kp, "klv1n", now + 1).unwrap();
         assert!(matches!(
-            receiver.handle_inbound(kp.public().to_peer_id(), &b2, now + 1),
-            InboundOutcome::Ignored(_)
+            receiver.classify_and_validate(src, &b1, now),
+            InboundDecision::Fold(_)
+        ));
+        assert!(matches!(
+            receiver.classify_and_validate(src, &b2, now + 1),
+            InboundDecision::Ignore(_)
+        ));
+    }
+
+    #[test]
+    fn a_non_digest_network_message_is_not_a_digest() {
+        let (receiver, _d) = agg(HotTopicsConfig::default());
+        let src = libp2p::identity::Keypair::generate_ed25519().public().to_peer_id();
+        // A msgpack map that is not a digest (no required fields).
+        let bytes = rmp_serde::to_vec_named(&serde_json::json!({ "node_id": "x" })).unwrap();
+        assert!(matches!(
+            receiver.classify_and_validate(src, &bytes, 1_000),
+            InboundDecision::NotADigest
+        ));
+        // Garbage.
+        assert!(matches!(
+            receiver.classify_and_validate(src, &[1, 2, 3], 1_000),
+            InboundDecision::NotADigest
         ));
     }
 

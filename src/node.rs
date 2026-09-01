@@ -1018,10 +1018,14 @@ impl Node {
                 });
             }
 
-            // (c) Trusted-node refresh: the digest sender-identity gate folds
-            // digests only from SC-registered nodes. Poll `getActiveNodes`
-            // when Klever + mesh + the gate are all configured; otherwise the
-            // aggregator falls back to meshed-peer-only acceptance.
+            // (c) Trusted-PEER refresh (Code+Security Audit C1). The digest
+            // sender-identity gate folds only digests whose libp2p `peer_id`
+            // (bound to the signature + matched to the gossip source) belongs
+            // to an SC-registered active node. We derive that PeerId set from
+            // `getActiveNodes` × each node's on-chain published multiaddrs
+            // (`/p2p/<peer_id>`). Runs only when Klever + mesh + the gate are
+            // all configured; otherwise the aggregator has no trusted set and
+            // folds nothing (serving its own local view).
             let klever_ready = !self.config.klever.node_url.is_empty()
                 && !self.config.klever.contract_address.is_empty();
             if self.config.hot_topics.mesh_enabled
@@ -1036,6 +1040,7 @@ impl Node {
                 );
                 let mut tr_shutdown_rx = self.shutdown_rx();
                 spawn_supervised("hot_topics_trusted_refresh", async move {
+                    use std::str::FromStr;
                     let http = reqwest::Client::builder()
                         .timeout(std::time::Duration::from_secs(20))
                         .build()
@@ -1044,8 +1049,10 @@ impl Node {
                     // Fire the first refresh ~15s in, once RPC is likely up.
                     tokio::time::sleep(std::time::Duration::from_secs(15)).await;
                     loop {
-                        let mut set = std::collections::HashSet::new();
+                        // 1. Full, clean pagination of getActiveNodes.
+                        let mut addrs: Vec<String> = Vec::new();
                         let mut offset = 0u32;
+                        let mut clean = true;
                         loop {
                             match crate::chain::sc_views::get_active_nodes(
                                 &http, &tr_url, &tr_contract, offset, 64,
@@ -1053,12 +1060,9 @@ impl Node {
                             .await
                             {
                                 Ok(page) => {
-                                    if page.is_empty() {
-                                        break;
-                                    }
                                     let got = page.len() as u32;
                                     for n in page {
-                                        set.insert(n.address);
+                                        addrs.push(n.address);
                                     }
                                     if got < 64 || offset >= 64 * 32 {
                                         break;
@@ -1066,14 +1070,53 @@ impl Node {
                                     offset += got;
                                 }
                                 Err(e) => {
-                                    debug!(error = %e, "hot-topics: getActiveNodes refresh failed");
+                                    // A mid-pagination failure must NOT install
+                                    // a partial set (Code Audit W4) — skip this
+                                    // round entirely.
+                                    debug!(error = %e, "hot-topics: getActiveNodes refresh failed; keeping the previous trusted set");
+                                    clean = false;
                                     break;
                                 }
                             }
                         }
-                        if !set.is_empty() {
-                            debug!(nodes = set.len(), "hot-topics: refreshed trusted node set");
-                            tr_agg.set_trusted_nodes(set);
+                        // 2. Resolve each node's published multiaddrs → PeerId.
+                        let mut peers: std::collections::HashSet<libp2p::PeerId> =
+                            std::collections::HashSet::new();
+                        if clean {
+                            for a in &addrs {
+                                match crate::chain::sc_views::get_node_metadata(
+                                    &http, &tr_url, &tr_contract, a,
+                                )
+                                .await
+                                {
+                                    Ok(mas) => {
+                                        for ma in mas {
+                                            if let Ok(m) = libp2p::Multiaddr::from_str(&ma) {
+                                                for proto in m.iter() {
+                                                    if let libp2p::multiaddr::Protocol::P2p(pid) =
+                                                        proto
+                                                    {
+                                                        peers.insert(pid);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        debug!(node = %a, error = %e, "hot-topics: getNodeMetadata failed; skipping this round");
+                                        clean = false;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if clean {
+                            debug!(
+                                nodes = addrs.len(),
+                                peers = peers.len(),
+                                "hot-topics: refreshed trusted-peer set"
+                            );
+                            tr_agg.set_trusted_peers(peers);
                         }
                         tokio::select! {
                             _ = iv.tick() => {}

@@ -76,10 +76,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 
 - Hot Topics digest ingestion is rate-limited per libp2p `PeerId`
-  (`[hot_topics] inbound_rate_limit_secs`, default 300s, sharing the presence
-  rate-limiter shape) and gated on a `digest_max_envelope_bytes` (512 KiB)
-  pre-decode size check; the HLL wire form's zstd decode is hard-bounded to
-  4096 output bytes so it cannot be a decompression bomb.
+  (`[hot_topics] inbound_rate_limit_secs`, default 300s) — armed on every
+  digest, valid or malformed, and after the shared W10 per-peer gossip flood
+  limit — and gated on a `digest_max_envelope_bytes` (512 KiB) pre-decode
+  size check; the HLL wire form's zstd decode is hard-bounded to 4096 output
+  bytes so it cannot be a decompression bomb.
+- **Sender-identity gate is PeerId-bound** (code + security audit of the
+  initial implementation). A digest is folded only if its libp2p `peer_id` —
+  which is bound to the signature AND matched against the gossip propagation
+  source — is in the set of PeerIds resolved from SC-registered active nodes'
+  on-chain published multiaddrs. The self-asserted `node_address` string is
+  advisory and never used for trust. When no trusted set can be built (no
+  Klever RPC, or the active nodes publish no multiaddrs) the node folds
+  nothing and serves its own local view — there is no accept-all fallback.
+- **Contributor accounting is per distinct PeerId**, not per fold-event
+  (audit critical). `hot_topics_merged.contributors` maps each contributor's
+  PeerId to its latest estimate; a peer re-sending its digest refreshes its
+  entry and re-unions its sketch but cannot grow the distinct-contributor
+  count or the median-trim input. A lone node can no longer walk itself into
+  the `min_contributors` / `min_contributors_for_trim` regimes.
+- The fold's contribution bound now uses `max(incoming sketch estimate,
+  self-reported approx)`, so a sender cannot pass a small `approx` beside a
+  saturated sketch; `max_tracked_tags_per_bucket` is enforced on the merged
+  view too; Hot Topics counts **public** posts only (`Followers`-only posts
+  are not in the unauthenticated aggregate); `normalize_tag` uses ASCII-only
+  casefold so no non-ASCII codepoint folds into `[a-z]` and aliases a tag.
+- The inbound fold and the `hot-topics` query both run under
+  `spawn_blocking` (off the swarm event loop / async reactor); the query is
+  single-flighted and its cache is no longer invalidated on every fold.
+- `[hot_topics]` validation now also rejects/clamps `max_sketch_bytes = 0`,
+  `digest_max_peers` outside `1..=65535`, `min_contributors = 0`,
+  `min_contributors_for_trim = 0`, `local_only_multiplier = 0`,
+  `max_node_tag_contribution = 0`, an oversized `publish_jitter_secs` /
+  `digest_max_envelope_bytes` / `eviction_slack_hours`, and a too-low
+  `active_set_refresh_secs`.
 - Dependency scan: `cargo audit` reports the same 2 `hickory-proto`
   advisories (RUSTSEC-2026-0118 / -0119) reachable only through the
   `libp2p 0.56` `dns` feature — unchanged by this release, no fixed version

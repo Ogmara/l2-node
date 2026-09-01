@@ -5,30 +5,38 @@ pub const MAX_TAG_LEN: usize = 64;
 
 /// Canonical normalized form of a news hashtag (protocol §3.5).
 ///
-/// Procedure: trim ASCII whitespace → lowercase → strip a single leading
-/// `#` → trim again → require `^[a-z0-9-]{1,64}$` (bytes). Returns `None`
+/// Procedure: trim ASCII whitespace → strip a single leading `#` → trim
+/// again → **ASCII** lowercase → require `^[a-z0-9-]{1,64}$`. Returns `None`
 /// when the input has no canonical representation: empty, longer than
-/// [`MAX_TAG_LEN`], or containing any character outside `[a-z0-9-]` after
-/// the steps above.
+/// [`MAX_TAG_LEN`], or containing any character outside `[a-z0-9-]`.
+///
+/// ASCII-only casefold is deliberate: full-Unicode `to_lowercase()` folds a
+/// few non-ASCII codepoints *into* `[a-z]` (U+212A KELVIN SIGN → `k`,
+/// U+017F LATIN SMALL LETTER LONG S → `s`), which would let distinct inputs
+/// alias to one tag and make the "byte-identical to the JS SDK" contract
+/// fragile across future Unicode data (Security Audit N3).
 ///
 /// The L2 node indexes (`news_by_tag`), routes (`/news/tag/{tag}`), filters
 /// (`GET /api/v1/news?tag=` / `?tags=`) and counts (Hot Topics, spec 3 §3.9)
 /// tags in this form only. The `@ogmara/sdk` `normalizeHashtag()` helper MUST
-/// produce byte-identical output for identical input — a follow/filter that
-/// normalizes differently silently matches nothing.
+/// produce identical output — a follow/filter that normalizes differently
+/// silently matches nothing.
 pub fn normalize_tag(raw: &str) -> Option<String> {
-    let lowered = raw.trim().to_lowercase();
-    let stripped = lowered.strip_prefix('#').unwrap_or(&lowered).trim();
+    let trimmed = raw.trim();
+    let stripped = trimmed.strip_prefix('#').unwrap_or(trimmed).trim();
     if stripped.is_empty() || stripped.len() > MAX_TAG_LEN {
         return None;
     }
-    if !stripped
-        .bytes()
-        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-    {
-        return None;
+    let mut out = String::with_capacity(stripped.len());
+    for b in stripped.bytes() {
+        let c = b.to_ascii_lowercase();
+        if c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-' {
+            out.push(c as char);
+        } else {
+            return None;
+        }
     }
-    Some(stripped.to_string())
+    Some(out)
 }
 
 /// Normalize each tag in `raw`, drop the ones with no canonical form, and

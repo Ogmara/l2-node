@@ -1642,7 +1642,11 @@ impl NetworkService {
         let ht_cfg = self.hot_topics.config().clone();
         let ht_period = Duration::from_secs(ht_cfg.publish_interval_secs.max(1));
         let ht_jitter = if ht_cfg.publish_jitter_secs > 0 {
-            Duration::from_secs(rand::random::<u64>() % (ht_cfg.publish_jitter_secs + 1))
+            // `publish_jitter_secs` is config-clamped to <= 3600, so `+ 1`
+            // cannot overflow and the modulus is never 0.
+            Duration::from_secs(
+                rand::random::<u64>() % ht_cfg.publish_jitter_secs.saturating_add(1),
+            )
         } else {
             Duration::ZERO
         };
@@ -1813,61 +1817,12 @@ impl NetworkService {
                         message_id,
                         message.data,
                     );
-                } else if on_network_topic
-                    && hot_topics::HotTopicsAggregator::looks_like_digest(
-                        &message.data,
-                        self.hot_topics.config().digest_max_envelope_bytes,
-                    )
-                {
-                    // Hot Topics digest (0xE1, spec 3 §3.9). Validated + folded
-                    // synchronously here — one Ed25519 verify, cheap enough for
-                    // a message that arrives at most every few minutes per peer
-                    // — then a matching validation result so relay proceeds.
-                    let outcome = self.hot_topics.handle_inbound(
-                        propagation_source,
-                        &message.data,
-                        hot_topics::now_ms(),
-                    );
-                    let acceptance = match &outcome {
-                        hot_topics::InboundOutcome::Accepted => {
-                            self.adjust_gossip_app_score(
-                                propagation_source,
-                                VALID_MESSAGE_SCORE_RECOVERY,
-                            );
-                            libp2p::gossipsub::MessageAcceptance::Accept
-                        }
-                        hot_topics::InboundOutcome::Invalid(reason) => {
-                            debug!(reason = %reason, "hot-topics digest invalid — rejecting");
-                            self.counters.inc_failed_validations();
-                            self.adjust_gossip_app_score(
-                                propagation_source,
-                                -INVALID_MESSAGE_SCORE_PENALTY,
-                            );
-                            libp2p::gossipsub::MessageAcceptance::Reject
-                        }
-                        hot_topics::InboundOutcome::Ignored(reason) => {
-                            debug!(reason = %reason, "hot-topics digest not folded — ignoring");
-                            libp2p::gossipsub::MessageAcceptance::Ignore
-                        }
-                    };
-                    let _ = self
-                        .swarm
-                        .behaviour_mut()
-                        .gossipsub
-                        .report_message_validation_result(
-                            &message_id,
-                            &propagation_source,
-                            acceptance,
-                        );
                 } else if !self.check_gossip_rate_limit(propagation_source) {
                     // Audit final pre-mainnet W10: per-peer rate limit,
-                    // checked BEFORE `handle_gossip_message` so a flooding
-                    // peer's messages are dropped without paying the
-                    // Keccak/Ed25519/storage cost of `process_message`.
-                    // `Ignore`, not `Reject` — a burst alone isn't proof of
-                    // malice (the dedicated P5 scoring path below handles
-                    // actual invalidity), and this avoids stacking an extra
-                    // gossipsub-side penalty on top of it.
+                    // checked BEFORE any per-message work (the envelope router
+                    // OR the Hot Topics digest path — Security Audit W1) so a
+                    // flooding peer's messages are dropped without paying the
+                    // decode/verify/storage cost. `Ignore`, not `Reject`.
                     let _ = self
                         .swarm
                         .behaviour_mut()
@@ -1878,22 +1833,71 @@ impl NetworkService {
                             libp2p::gossipsub::MessageAcceptance::Ignore,
                         );
                 } else {
-                    // Spec 13 §10.3 + v0.48.0: gossipsub is configured with
-                    // `.validate_messages()`, so EVERY received message must
-                    // produce a validation result or relay stalls. The router
-                    // now distinguishes structurally-INVALID envelopes (→
-                    // Reject + peer penalty) from valid-but-unaccepted ones (→
-                    // Ignore) — audit 2026-06-07 W6.
-                    let acceptance = self.handle_gossip_message(propagation_source, &message.data);
-                    let _ = self
-                        .swarm
-                        .behaviour_mut()
-                        .gossipsub
-                        .report_message_validation_result(
-                            &message_id,
-                            &propagation_source,
-                            acceptance,
-                        );
+                    // Hot Topics digest (0xE1, spec 3 §3.9) on the /network
+                    // topic: cheap validation runs here, the RocksDB fold is
+                    // done off the swarm loop (Code+Security Audit W1).
+                    // `NotADigest` (e.g. a NodeAnnouncement) falls through to
+                    // the generic envelope router.
+                    let mut handled = false;
+                    if on_network_topic {
+                        let acc = match self.hot_topics.classify_and_validate(
+                            propagation_source,
+                            &message.data,
+                            hot_topics::now_ms(),
+                        ) {
+                            hot_topics::InboundDecision::NotADigest => None,
+                            hot_topics::InboundDecision::Fold(vd) => {
+                                self.adjust_gossip_app_score(
+                                    propagation_source,
+                                    VALID_MESSAGE_SCORE_RECOVERY,
+                                );
+                                let agg = self.hot_topics.clone();
+                                tokio::task::spawn_blocking(move || agg.fold(*vd));
+                                Some(libp2p::gossipsub::MessageAcceptance::Accept)
+                            }
+                            hot_topics::InboundDecision::Reject(reason) => {
+                                debug!(reason = %reason, "hot-topics digest invalid — rejecting");
+                                self.counters.inc_failed_validations();
+                                self.adjust_gossip_app_score(
+                                    propagation_source,
+                                    -INVALID_MESSAGE_SCORE_PENALTY,
+                                );
+                                Some(libp2p::gossipsub::MessageAcceptance::Reject)
+                            }
+                            hot_topics::InboundDecision::Ignore(reason) => {
+                                debug!(reason = %reason, "hot-topics digest not folded — ignoring");
+                                Some(libp2p::gossipsub::MessageAcceptance::Ignore)
+                            }
+                        };
+                        if let Some(acc) = acc {
+                            let _ = self
+                                .swarm
+                                .behaviour_mut()
+                                .gossipsub
+                                .report_message_validation_result(
+                                    &message_id,
+                                    &propagation_source,
+                                    acc,
+                                );
+                            handled = true;
+                        }
+                    }
+                    if !handled {
+                        // Spec 13 §10.3 + v0.48.0: gossipsub is configured with
+                        // `.validate_messages()`, so EVERY received message must
+                        // produce a validation result or relay stalls.
+                        let acceptance =
+                            self.handle_gossip_message(propagation_source, &message.data);
+                        let _ = self
+                            .swarm
+                            .behaviour_mut()
+                            .gossipsub
+                            .report_message_validation_result(
+                                &message_id,
+                                &propagation_source,
+                                acceptance,
+                            );
+                    }
                 }
             }
 
