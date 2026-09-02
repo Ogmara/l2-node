@@ -1178,6 +1178,12 @@ async function loadAnchoring() {
   loadEarnings();
 }
 
+// Set while a claim result is on screen, so a background refresh cannot erase
+// the tx hash before the operator has read it. Declared BEFORE `loadEarnings`,
+// which reads it: a `let` is in the temporal dead zone until its declaration
+// executes, so a later declaration would make the first refresh throw.
+let earnStatusSticky = false;
+
 // v0.126.0 — operator revenue from user registrations (SC 0.10.0).
 async function loadEarnings() {
   const mine = document.getElementById('earn-mine');

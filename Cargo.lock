@@ -2686,7 +2686,7 @@ dependencies = [
 
 [[package]]
 name = "ogmara-node"
-version = "0.126.1"
+version = "0.126.2"
 dependencies = [
  "aes-gcm",
  "anyhow",

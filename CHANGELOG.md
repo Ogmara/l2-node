@@ -5,6 +5,35 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.126.2] - 2026-09-02
+
+### Fixed
+
+- **Dashboard earnings card broke entirely** with "Could not load earnings:
+  earnStatusSticky is not defined". The 0.126.1 edit that moved the split
+  fetch also deleted the `let earnStatusSticky = false;` declaration, leaving
+  four assignments to a name that no longer existed. Every refresh threw a
+  `ReferenceError` and the card rendered `--` across the board. The
+  declaration is restored, and now sits BEFORE `loadEarnings` rather than
+  after it — a `let` is in the temporal dead zone until its declaration
+  executes, so a later one would fail the same way.
+
+### Added
+
+- Two regression guards over `dashboard.html`'s inline script, both written
+  against bugs that actually shipped:
+  - `no_assignment_to_an_undeclared_variable` — catches assignment to a name
+    that was never declared. This class is invisible to a syntax check
+    (`node --check` passed on the broken file); it only surfaces at runtime in
+    a browser, which nothing in this suite exercises.
+  - `dashboard_never_fetches_the_public_api` — the dashboard must stay inside
+    `/admin/*`. A public-API fetch returns a correct 200 when queried directly
+    but fails silently from the dashboard behind an admin-scoped reverse
+    proxy, which is exactly how the 0.126.0 bug hid.
+
+  Both were verified by reintroducing the original defect and confirming the
+  test fails, rather than assumed to work.
+
 ## [0.126.1] - 2026-09-02
 
 ### Fixed

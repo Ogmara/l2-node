@@ -503,3 +503,125 @@ pub async fn snapshot_status(
 /// Vanilla HTML/CSS/JS, inline SVG charts, no external dependencies.
 /// Dark theme default with light theme toggle.
 const DASHBOARD_HTML: &str = include_str!("dashboard.html");
+
+#[cfg(test)]
+mod dashboard_js_tests {
+    use super::DASHBOARD_HTML;
+    use std::collections::HashSet;
+
+    /// Everything between the inline `<script>` tags.
+    fn script_body() -> String {
+        let mut out = String::new();
+        let mut rest = DASHBOARD_HTML;
+        while let Some(open) = rest.find("<script") {
+            let after = &rest[open..];
+            let Some(gt) = after.find('>') else { break };
+            let body_start = open + gt + 1;
+            let Some(close) = rest[body_start..].find("</script>") else { break };
+            out.push_str(&rest[body_start..body_start + close]);
+            out.push('\n');
+            rest = &rest[body_start + close..];
+        }
+        out
+    }
+
+    /// Names bound by a `let` / `const` / `var` / `function` declaration.
+    fn declared_names(js: &str) -> HashSet<String> {
+        let mut names = HashSet::new();
+        for kw in ["let ", "const ", "var ", "function "] {
+            let mut from = 0usize;
+            while let Some(i) = js[from..].find(kw) {
+                let at = from + i;
+                // Must start a token, not sit inside a longer identifier.
+                let prev_ok = at == 0
+                    || !js[..at]
+                        .chars()
+                        .next_back()
+                        .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '$');
+                let ident: String = js[at + kw.len()..]
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')
+                    .collect();
+                if prev_ok && !ident.is_empty() {
+                    names.insert(ident);
+                }
+                from = at + kw.len();
+            }
+        }
+        names
+    }
+
+    /// Catches assignment to a name that was never declared.
+    ///
+    /// This exists because of a real 0.126.1 regression: an edit deleted
+    /// `let earnStatusSticky = false;` while leaving four assignments to it
+    /// behind. `node --check` reported the file as valid — a missing
+    /// declaration is a RUNTIME `ReferenceError`, not a syntax error — so the
+    /// dashboard shipped and every earnings refresh died with "earnStatusSticky
+    /// is not defined", blanking the card. Only a browser (or an executing
+    /// harness) would have caught it, and neither runs in this test suite.
+    ///
+    /// Deliberately narrow to avoid false positives: it only inspects
+    /// statement-leading `name = ...` assignments, so property writes
+    /// (`el.textContent = x`), declarations, and comparisons are all ignored.
+    #[test]
+    fn no_assignment_to_an_undeclared_variable() {
+        let js = script_body();
+        assert!(!js.is_empty(), "dashboard.html should contain inline script");
+        let declared = declared_names(&js);
+        // Assigned via a `for (x of ...)`/`catch (e)` binding or the DOM globals.
+        let known_globals: HashSet<&str> = ["window", "document", "location"].into_iter().collect();
+
+        let mut offenders = Vec::new();
+        for (lineno, raw) in js.lines().enumerate() {
+            let line = raw.trim();
+            if line.starts_with("//") || line.starts_with('*') || line.starts_with("/*") {
+                continue;
+            }
+            // `name = ...` but not `==`, `===`, `>=`, `<=`, `!=`, `+=`, etc.
+            let Some(eq) = line.find('=') else { continue };
+            if eq == 0 || eq + 1 >= line.len() {
+                continue;
+            }
+            let before = &line[..eq];
+            let after_ch = line.as_bytes()[eq + 1];
+            let prev_ch = line.as_bytes()[eq - 1];
+            if after_ch == b'=' || matches!(prev_ch, b'=' | b'!' | b'<' | b'>' | b'+' | b'-' | b'*' | b'/' | b'&' | b'|') {
+                continue;
+            }
+            let name = before.trim();
+            if name.is_empty()
+                || !name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+                || name.chars().next().is_some_and(|c| c.is_ascii_digit())
+            {
+                continue;
+            }
+            if !declared.contains(name) && !known_globals.contains(name) {
+                offenders.push(format!("line {}: `{}`", lineno + 1, name));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "assignment to undeclared variable(s) in dashboard.html — a runtime \
+             ReferenceError that no syntax check catches:\n  {}",
+            offenders.join("\n  ")
+        );
+    }
+
+    /// The dashboard must stay inside the `/admin/*` namespace.
+    ///
+    /// Also a real 0.126.0 regression: the earnings card fetched the public
+    /// `/api/v1/registration/info`, which returned a correct 200 when queried
+    /// directly but silently failed from the dashboard on a deployment whose
+    /// reverse proxy scopes only `/admin` to the node. Every other fetch in
+    /// this file targets `/admin/*`, and that is load-bearing.
+    #[test]
+    fn dashboard_never_fetches_the_public_api() {
+        let js = script_body();
+        assert!(
+            !js.contains("fetch('/api/") && !js.contains("fetch(\"/api/"),
+            "dashboard.html must fetch only /admin/* — a public-API fetch fails \
+             silently behind an admin-scoped reverse proxy"
+        );
+    }
+}
