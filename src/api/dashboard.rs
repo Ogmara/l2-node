@@ -608,6 +608,48 @@ mod dashboard_js_tests {
         );
     }
 
+    /// `callValue` must be a JSON number, never a string.
+    ///
+    /// The Klever node refuses a string at JSON decode ("cannot unmarshal
+    /// string into Go struct field SmartContractRequest.callValue of type
+    /// int64"), verified against live testnet on both signing paths. A
+    /// long-standing comment in `dashboard.html` asserted the opposite, and
+    /// `registerNodeOnChain` followed it — so node registration returned a 400
+    /// for any non-zero `node_registration_fee`, which has defaulted to 100 KLV
+    /// since SC 0.5.0. It went unnoticed because an empty `{}` IS correct when
+    /// no value is attached, so the path worked while the fee was zero.
+    #[test]
+    fn call_value_is_never_a_string() {
+        let js = script_body();
+        let mut offenders = Vec::new();
+        for (i, line) in js.lines().enumerate() {
+            let trimmed = line.trim();
+            // Skip comments — this file documents the very shape it forbids.
+            if !line.contains("KLV:")
+                || trimmed.starts_with("//")
+                || trimmed.starts_with('*')
+                || trimmed.starts_with("/*")
+            {
+                continue;
+            }
+            // A string amount is the bug: `KLV: "..."`, `KLV: x.toString()`,
+            // or `KLV: String(x)`.
+            let after = line.split("KLV:").nth(1).unwrap_or("").trim_start();
+            if after.starts_with('"')
+                || after.starts_with('\'')
+                || after.starts_with("String(")
+                || after.split(&[',', '}'][..]).next().is_some_and(|v| v.contains(".toString()"))
+            {
+                offenders.push(format!("line {}: {}", i + 1, line.trim()));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "callValue amounts must be JSON numbers — the Klever node rejects              strings at JSON decode:\n  {}",
+            offenders.join("\n  ")
+        );
+    }
+
     /// The dashboard must stay inside the `/admin/*` namespace.
     ///
     /// Also a real 0.126.0 regression: the earnings card fetched the public

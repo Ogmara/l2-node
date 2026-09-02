@@ -1684,11 +1684,21 @@ async function registerNodeOnChain() {
   // each shaped as {type: 63, payload: {...}}, with call data as a
   // SEPARATE second argument of base64-encoded "functionName@hexArg1@…"
   // strings. The contract.type must be 63 (TransactionType.SmartContract,
-  // NOT the prior wrong value 7), payload.scType 0 = InvokeContract,
-  // and callValue uses STRING amounts ({ KLV: "100000000" }) or empty
-  // {} when no value is attached. Getting any of these wrong manifests
-  // as a 400 from /transaction/send.
-  const callValue = feeRaw > 0 ? { KLV: feeRaw.toString() } : {};
+  // NOT the prior wrong value 7) and payload.scType 0 = InvokeContract.
+  //
+  // callValue MUST be a JSON NUMBER, not a string. This comment previously
+  // asserted the opposite — that strings were required — which was wrong and
+  // meant registerNode failed with a 400 for any non-zero
+  // `node_registration_fee` (100 KLV by default since SC 0.5.0). Verified
+  // against the live testnet node on both signing paths: `{ KLV: "100000000" }`
+  // is refused at JSON decode with "cannot unmarshal string into Go struct
+  // field SmartContractRequest.callValue of type int64", while
+  // `{ KLV: 100000000 }` is accepted. An empty `{}` is still correct when no
+  // value is attached, and is why this went unnoticed while the fee was 0.
+  //
+  // `Number()` is exact here: the raw amount would have to exceed 2^53
+  // (~9 billion KLV) to lose precision, and JSON has no other numeric form.
+  const callValue = feeRaw > 0 ? { KLV: feeRaw } : {};
   const callData = 'registerNode'; // no args
 
   let tx;

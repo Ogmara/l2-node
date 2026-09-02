@@ -5,6 +5,30 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.126.4] - 2026-09-02
+
+### Fixed
+
+- **Node registration from the dashboard was broken for any non-zero
+  `node_registration_fee`** — which is 100 KLV by default since SC 0.5.0.
+  `registerNodeOnChain` sent `callValue: { KLV: "100000000" }`, a STRING, on
+  the authority of a long-standing comment in this file asserting strings were
+  required. The Klever node refuses a string at JSON decode ("cannot unmarshal
+  string into Go struct field SmartContractRequest.callValue of type int64"),
+  so the call returned a 400 before reaching the contract. Verified against
+  live testnet on both the extension and direct-RPC signing paths: the number
+  form is accepted, the string form is not.
+
+  It went unnoticed because an empty `{}` **is** correct when no value is
+  attached, so the path worked for as long as the fee was zero. The misleading
+  comment is corrected in place rather than deleted, since it is exactly what
+  produced the bug.
+
+### Added
+
+- `call_value_is_never_a_string` guard over the dashboard script. Verified by
+  reintroducing the original `.toString()` and confirming the test fails.
+
 ## [0.126.3] - 2026-09-02
 
 ### Fixed
