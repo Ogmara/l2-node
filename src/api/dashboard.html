@@ -1202,41 +1202,26 @@ async function loadEarnings() {
       // never unexplained.
       status.textContent = d.claimable ? '' : (d.reason || '');
     }
+    // Share per verification, from the SAME admin response — the dashboard
+    // deliberately never reaches into the public /api/v1 namespace.
+    // `registration_fee_raw` is a decimal STRING of raw units; compare as a
+    // string, since a Number() round-trip loses precision on large values.
+    if (d.registration_fee_raw == null || d.node_fee_share_bps == null) {
+      share.textContent = '--';
+    } else if (String(d.registration_fee_raw) === '0') {
+      share.textContent = 'fee is 0 (free)';
+    } else {
+      share.textContent =
+        (Number(d.node_fee_share_bps) / 100) + '% of ' + d.registration_fee_klv + ' KLV';
+    }
   } catch (e) {
     mine.textContent = '--';
     net.textContent = '--';
+    share.textContent = '--';
     btn.disabled = true;
     status.textContent = 'Could not load earnings: ' + (e.message || e);
   }
-  // The split lives on the public registration endpoint, which is cached —
-  // cheap to call and keeps this card self-contained.
-  try {
-    const r = await fetch('/api/v1/registration/info');
-    if (r.ok) {
-      const info = await r.json();
-      const bps = Number(info.node_fee_share_bps || 0);
-      const fee = info.registration_fee_klv;
-      // `registration_fee` is a decimal STRING of raw units and may be null
-      // when the node has no contract configured. Compare as a string — a
-      // Number() round-trip would lose precision on large values.
-      if (info.contract_configured === false || info.registration_fee == null) {
-        share.textContent = 'no contract configured';
-      } else if (String(info.registration_fee) === '0') {
-        share.textContent = 'fee is 0 (free)';
-      } else {
-        share.textContent = (bps / 100) + '% of ' + fee + ' KLV';
-      }
-    } else {
-      share.textContent = '--';
-    }
-  } catch (_) {
-    share.textContent = '--';
-  }
 }
-
-// Set while a claim result is on screen, so a background refresh cannot
-// erase the tx hash before the operator has read it.
-let earnStatusSticky = false;
 
 async function claimEarnings() {
   const btn = document.getElementById('earn-claim-btn');

@@ -2140,9 +2140,18 @@ pub async fn node_earnings(Extension(state): Extension<Arc<AppState>>) -> impl I
     }
 
     let http = &state.klever_view_http;
-    let (mine_res, total_res) = tokio::join!(
+    // The fee and share are fetched HERE rather than letting the dashboard
+    // call the public `/api/v1/registration/info`. Every other dashboard fetch
+    // targets `/admin/*`, and that is load-bearing: an operator may serve the
+    // admin surface through a reverse proxy that scopes only `/admin` to the
+    // node, in which case a cross-namespace fetch silently fails and the card
+    // renders "--" with no error. Keeping the dashboard inside one namespace
+    // removes that whole class of deployment-dependent breakage.
+    let (mine_res, total_res, fee_res, bps_res) = tokio::join!(
         crate::chain::sc_views::get_node_earnings(http, &klever_node_url, &contract_address, &wallet),
         crate::chain::sc_views::get_total_unclaimed_node_earnings(http, &klever_node_url, &contract_address),
+        crate::chain::sc_views::get_registration_fee(http, &klever_node_url, &contract_address),
+        crate::chain::sc_views::get_node_fee_share_bps(http, &klever_node_url, &contract_address),
     );
 
     // On an RPC error report null rather than 0 — "we could not read it" and
@@ -2171,6 +2180,10 @@ pub async fn node_earnings(Extension(state): Extension<Arc<AppState>>) -> impl I
         "unclaimed_klv": unclaimed.map(format_klv),
         "network_unclaimed_raw": total_res.as_ref().ok().map(|v| v.to_string()),
         "network_unclaimed_klv": total_res.as_ref().ok().map(|v| format_klv(*v)),
+        // Null on RPC failure, never 0 — same reasoning as the balances above.
+        "registration_fee_raw": fee_res.as_ref().ok().map(|v| v.to_string()),
+        "registration_fee_klv": fee_res.as_ref().ok().map(|v| format_klv(*v)),
+        "node_fee_share_bps": bps_res.as_ref().ok(),
     }))
     .into_response()
 }

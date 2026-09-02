@@ -5,6 +5,24 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.126.1] - 2026-09-02
+
+### Fixed
+
+- **Dashboard "Your share per verification" always rendered `--`.** The
+  earnings card fetched the split from the public
+  `GET /api/v1/registration/info`, but every other one of the dashboard's 25
+  fetches targets `/admin/*` — and that turns out to be load-bearing: an
+  operator serving the admin surface through a reverse proxy that scopes only
+  `/admin` to the node gets a silent failure on any cross-namespace call.
+  Confirmed live on the fleet: the endpoint itself returned a correct 200
+  while the dashboard still showed `--`.
+  `GET /admin/node/earnings` now returns `registration_fee_raw`,
+  `registration_fee_klv` and `node_fee_share_bps` alongside the balances, and
+  the card reads everything from that one response. The dashboard no longer
+  fetches the public API at all. Both new fields follow the same null-not-zero
+  convention as the balances.
+
 ## [0.126.0] - 2026-09-02
 
 Node-side support for the user registration fee and operator revenue sharing
