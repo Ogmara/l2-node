@@ -79,6 +79,11 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
         .route("/api/v1/health", get(routes::health))
         .route("/api/v1/network/stats", get(routes::network_stats))
         .route("/api/v1/network/nodes", get(routes::network_nodes))
+        // v0.126.0 (SC 0.10.0) — everything a client needs to build a
+        // `register` transaction: the live fee, the node/treasury split, and
+        // this node's operator address to credit. Public (a client needs it
+        // BEFORE it has an identity), 60-second cache.
+        .route("/api/v1/registration/info", get(routes::registration_info))
         // v0.45.0 — spec 13 §4.5: SC-derived bootstrap discovery for
         // SDK clients and new nodes. Public, 5-min cache.
         .route(
@@ -313,6 +318,11 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
             .route("/admin/node/metadata", get(admin::node_metadata))
             .route("/admin/node/pause-status", get(admin::node_pause_status))
             .route("/admin/node/pause", post(admin::node_pause))
+            // v0.126.0 (SC 0.10.0) — operator revenue from user
+            // registrations: read the accrued balance, and claim it.
+            // Read-only; the write half lives in `governance_write_routes`
+            // because it broadcasts a real, fee-costing transaction.
+            .route("/admin/node/earnings", get(admin::node_earnings))
             .route("/admin/node/resume", post(admin::node_resume))
             // v0.46.6 — spec 10 §9.2 B4 instrumentation. Per-topic
             // mesh size + subscriber count + cumulative publish-
@@ -461,6 +471,15 @@ fn governance_write_routes(app_state: &Arc<AppState>) -> Router {
         .route(
             "/admin/governance/node/execute-proposal",
             post(admin::governance_node_execute_proposal),
+        )
+        // v0.126.0 — not a governance action, but it broadcasts a real TX from
+        // the anchor wallet, which is exactly what this bucket exists for. The
+        // 60s duplicate-broadcast guard already bounds it in practice, but
+        // that is incidental (it falls out of the calldata being constant) and
+        // would evaporate the moment the call took an argument.
+        .route(
+            "/admin/node/claim-earnings",
+            post(admin::node_claim_earnings),
         )
         .layer(GovernorLayer::new(governor_conf).error_handler(|err| err.into()))
 }

@@ -306,6 +306,107 @@ pub async fn get_node_registration_fee(
     Ok(decode_u128_be(&resp.data))
 }
 
+/// Returns the USER registration fee in raw KLV units (1 KLV = 10^6).
+///
+/// `Ok(0)` means registration is currently free — which is the state of an
+/// already-deployed contract until its owner switches the fee on, so it is
+/// the expected reading, not an error. Clients MUST read this before
+/// building a `register` transaction: the fee is node-governance controlled
+/// and changes without any client release.
+///
+/// Added in SC 0.10.0. An older contract has no such endpoint, so the call
+/// fails `require` and this returns `Ok(0)` — the same value as "free",
+/// which is the correct fallback in both cases.
+pub async fn get_registration_fee(
+    http: &reqwest::Client,
+    klever_node_url: &str,
+    contract_address: &str,
+) -> Result<u128> {
+    let resp = vm_hex_call(
+        http,
+        klever_node_url,
+        contract_address,
+        "getRegistrationFee",
+        &[],
+    )
+    .await?;
+    if resp.is_require_failure() {
+        return Ok(0);
+    }
+    Ok(decode_u128_be(&resp.data))
+}
+
+/// Returns the share of each user registration fee routed to the referring
+/// node, in basis points (10_000 = 100%). `Ok(0)` = the whole fee goes to
+/// the protocol treasury. Added in SC 0.10.0; capped on-chain at 8000.
+pub async fn get_node_fee_share_bps(
+    http: &reqwest::Client,
+    klever_node_url: &str,
+    contract_address: &str,
+) -> Result<u64> {
+    let resp = vm_hex_call(
+        http,
+        klever_node_url,
+        contract_address,
+        "getNodeFeeShareBps",
+        &[],
+    )
+    .await?;
+    if resp.is_require_failure() {
+        return Ok(0);
+    }
+    Ok(decode_u64_be(&resp.data))
+}
+
+/// Returns the unclaimed KLV `klv_address` has accrued from users who
+/// registered through its node. Claimed with the `claimNodeEarnings`
+/// endpoint. `Ok(0)` for a non-node address or one with nothing owed.
+///
+/// Decoded as `u128`, not `u64`: this accumulates without bound until
+/// claimed, so it must not silently truncate.
+pub async fn get_node_earnings(
+    http: &reqwest::Client,
+    klever_node_url: &str,
+    contract_address: &str,
+    klv_address: &str,
+) -> Result<u128> {
+    let address_hex = encode_address_hex(klv_address)
+        .with_context(|| format!("invalid klv address: {}", klv_address))?;
+    let resp = vm_hex_call(
+        http,
+        klever_node_url,
+        contract_address,
+        "getNodeEarnings",
+        &[address_hex],
+    )
+    .await?;
+    if resp.is_require_failure() {
+        return Ok(0);
+    }
+    Ok(decode_u128_be(&resp.data))
+}
+
+/// Returns the total unclaimed node earnings across every operator — the
+/// contract's outstanding liability to node operators. Added in SC 0.10.0.
+pub async fn get_total_unclaimed_node_earnings(
+    http: &reqwest::Client,
+    klever_node_url: &str,
+    contract_address: &str,
+) -> Result<u128> {
+    let resp = vm_hex_call(
+        http,
+        klever_node_url,
+        contract_address,
+        "getTotalUnclaimedNodeEarnings",
+        &[],
+    )
+    .await?;
+    if resp.is_require_failure() {
+        return Ok(0);
+    }
+    Ok(decode_u128_be(&resp.data))
+}
+
 /// Returns the unix-second timestamp at which `address` registered as
 /// a node, or `0` if not registered (or registered via legacy allowlist
 /// which doesn't track a timestamp).

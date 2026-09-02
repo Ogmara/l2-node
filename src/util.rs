@@ -157,3 +157,39 @@ mod tests {
         assert_eq!(truncate_str(s, 2), "ab");
     }
 }
+
+/// Format a raw KLV amount (6 decimals) as a human-readable string.
+///
+/// `100_000_000` -> `"100"`, `50_500_000` -> `"50.5"`, `0` -> `"0"`.
+/// Trailing zeros in the fractional part are trimmed, so the output is
+/// display-ready without further formatting.
+///
+/// Shared by the admin dashboard and the public `registration/info`
+/// endpoint so the two can never render the same amount differently.
+pub fn format_klv_amount(raw: u128) -> String {
+    if raw == 0 {
+        return "0".to_string();
+    }
+    let whole = raw / 1_000_000;
+    let frac = raw % 1_000_000;
+    if frac == 0 {
+        return whole.to_string();
+    }
+    let frac_str = format!("{:06}", frac);
+    format!("{}.{}", whole, frac_str.trim_end_matches('0'))
+}
+
+#[cfg(test)]
+mod klv_format_tests {
+    use super::format_klv_amount;
+
+    #[test]
+    fn formats_whole_fractional_and_zero() {
+        assert_eq!(format_klv_amount(0), "0");
+        assert_eq!(format_klv_amount(100_000_000), "100");
+        assert_eq!(format_klv_amount(50_500_000), "50.5");
+        assert_eq!(format_klv_amount(1), "0.000001");
+        // Trailing zeros trimmed, but a leading zero in the fraction kept.
+        assert_eq!(format_klv_amount(1_010_000), "1.01");
+    }
+}

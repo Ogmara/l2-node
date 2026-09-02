@@ -497,18 +497,11 @@ pub async fn node_registration(
 /// Uses up to 6 fractional digits, trimming trailing zeros and the
 /// decimal point when integer-valued. `100_000_000` → `"100"`,
 /// `100_500_000` → `"100.5"`, `0` → `"0"`.
+/// Thin alias over the shared formatter in `util`, which the public
+/// `registration/info` endpoint also uses — one implementation, so the
+/// dashboard and the API can never disagree about how an amount renders.
 fn format_klv(raw: u128) -> String {
-    if raw == 0 {
-        return "0".to_string();
-    }
-    let whole = raw / 1_000_000;
-    let frac = raw % 1_000_000;
-    if frac == 0 {
-        return whole.to_string();
-    }
-    let frac_str = format!("{:06}", frac);
-    let trimmed = frac_str.trim_end_matches('0');
-    format!("{}.{}", whole, trimmed)
+    crate::util::format_klv_amount(raw)
 }
 
 #[cfg(test)]
@@ -1870,7 +1863,13 @@ fn encode_biguint_calldata_arg(decimal: &str) -> Result<String, String> {
 /// indefinite hang is a materially worse UX than a clear timeout
 /// error, so the two endpoints are allowed to diverge on this point
 /// deliberately.
-async fn submit_governance_call(state: &AppState, call_data: String) -> Result<String, (StatusCode, String)> {
+/// Sign and broadcast an arbitrary SC call from this node's ANCHOR wallet.
+///
+/// Named `submit_governance_call` until v0.126.0; renamed because
+/// `claimNodeEarnings` is not a governance action. The duplicate-broadcast
+/// guard below is keyed on the exact `call_data`, which matters more for
+/// no-argument calls — see `node_claim_earnings`.
+async fn submit_signed_call(state: &AppState, call_data: String) -> Result<String, (StatusCode, String)> {
     let Some(tx) = &state.governance_submit else {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1952,7 +1951,26 @@ async fn submit_governance_call(state: &AppState, call_data: String) -> Result<S
 /// the actual enforcement point (a mismatch here just means an
 /// operator sees a late `require!` failure instead of an early 400),
 /// but a stale list here is still a real UX bug worth avoiding.
-const NODE_GOVERNANCE_VALID_PARAM_KEYS: &[&str] = &["node_registration_fee"];
+/// Mirrors the contract's node-track `valid_keys` in
+/// `smart-contract/src/node_governance.rs`. **These two lists must be updated
+/// together** — nothing in either repo's build or audit pipeline catches the
+/// drift, and a stale list here rejects a valid proposal with a 400 before it
+/// ever reaches the chain. Asserted by `node_governance_param_keys_match_sc`
+/// below.
+const NODE_GOVERNANCE_VALID_PARAM_KEYS: &[&str] = &[
+    "node_registration_fee",
+    // Added in SC 0.10.0: user registration economics moved to the node track.
+    "registration_fee",
+    "node_fee_share_bps",
+];
+
+/// Upper bounds mirroring the contract's hard caps
+/// (`registry::MAX_REGISTRATION_FEE`, `registry::MAX_NODE_FEE_SHARE_BPS`).
+/// Checked here purely so the operator gets an immediate, readable 400 rather
+/// than a `require!` failure after signing and broadcasting — the CONTRACT is
+/// the authority, and it re-checks at both proposal creation and execution.
+const MAX_REGISTRATION_FEE_RAW: u128 = 10_000_000_000;
+const MAX_NODE_FEE_SHARE_BPS: u128 = 8_000;
 
 /// Mirrors `smart-contract::node_governance::MIN_VOTING_PERIOD_SECONDS`
 /// / `MAX_VOTING_PERIOD_SECONDS` (604800..=2592000, 7-30 days). Kept in
@@ -1979,6 +1997,265 @@ pub struct CreateNodeProposalRequest {
     pub voting_period_seconds: u64,
 }
 
+/// Advisory bounds check mirroring the contract's caps for the node-track
+/// parameters that have them. Returns `Some(message)` when the value is out
+/// of range and `None` when it is acceptable.
+///
+/// `node_registration_fee` is deliberately absent: it is uncapped on chain.
+///
+/// A value that does not parse as `u128` is treated as OUT OF BOUNDS for any
+/// capped key, not waved through. `decimal_string_to_bytes_be` is
+/// arbitrary-precision and happily encodes a 60-digit decimal, so "let the
+/// calldata encoder reject it" is false for exactly the values this check
+/// exists to catch — they would be signed and broadcast at real gas cost only
+/// to hit the contract's `require!`. Non-numeric input still falls through to
+/// the encoder, which reports it better than a bounds message would.
+fn node_param_value_out_of_bounds(key: &str, value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    let has_cap = matches!(key, "registration_fee" | "node_fee_share_bps");
+    let parsed: u128 = match trimmed.parse() {
+        Ok(v) => v,
+        // All-digits but too large for u128 — far beyond any cap.
+        Err(_) if has_cap && !trimmed.is_empty() && trimmed.bytes().all(|b| b.is_ascii_digit()) => {
+            return Some(format!("{} value is far above the contract maximum", key));
+        }
+        Err(_) => return None,
+    };
+    match key {
+        "registration_fee" if parsed > MAX_REGISTRATION_FEE_RAW => Some(format!(
+            "registration_fee exceeds the contract maximum of {} raw KLV ({} KLV)",
+            MAX_REGISTRATION_FEE_RAW,
+            crate::util::format_klv_amount(MAX_REGISTRATION_FEE_RAW)
+        )),
+        "node_fee_share_bps" if parsed > MAX_NODE_FEE_SHARE_BPS => Some(format!(
+            "node_fee_share_bps exceeds the contract maximum of {} ({}%)",
+            MAX_NODE_FEE_SHARE_BPS,
+            MAX_NODE_FEE_SHARE_BPS / 100
+        )),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod node_governance_param_tests {
+    use super::*;
+
+    /// Pins this crate's allowlist against the CONTRACT's node-track
+    /// `valid_keys`. Cross-repo drift is invisible to both repos' build and
+    /// audit pipelines, and a stale list here silently rejects valid
+    /// proposals — so assert the expected set explicitly. If the contract
+    /// gains a votable key, this test must be updated in the same change.
+    #[test]
+    fn node_governance_param_keys_match_sc() {
+        assert_eq!(
+            NODE_GOVERNANCE_VALID_PARAM_KEYS,
+            &[
+                "node_registration_fee",
+                "registration_fee",
+                "node_fee_share_bps"
+            ],
+            "allowlist drifted from smart-contract/src/node_governance.rs valid_keys"
+        );
+    }
+
+    #[test]
+    fn bounds_check_matches_contract_caps() {
+        // At the cap is fine; one over is not.
+        assert!(node_param_value_out_of_bounds("registration_fee", "10000000000").is_none());
+        assert!(node_param_value_out_of_bounds("registration_fee", "10000000001").is_some());
+        assert!(node_param_value_out_of_bounds("node_fee_share_bps", "8000").is_none());
+        assert!(node_param_value_out_of_bounds("node_fee_share_bps", "8001").is_some());
+        // Uncapped on chain — must not be rejected here.
+        assert!(
+            node_param_value_out_of_bounds("node_registration_fee", "999999999999").is_none()
+        );
+        // Non-numeric falls through to the calldata encoder's own error.
+        assert!(node_param_value_out_of_bounds("registration_fee", "abc").is_none());
+        // All-digits but beyond u128 must be REJECTED, not waved through:
+        // `decimal_string_to_bytes_be` is arbitrary-precision and would
+        // happily encode this, so it would otherwise be signed and broadcast
+        // at real gas cost only to hit the contract's `require!`.
+        let huge = "9".repeat(60);
+        assert!(node_param_value_out_of_bounds("registration_fee", &huge).is_some());
+        assert!(node_param_value_out_of_bounds("node_fee_share_bps", &huge).is_some());
+        // But an uncapped key still passes — the contract has no bound there.
+        assert!(node_param_value_out_of_bounds("node_registration_fee", &huge).is_none());
+    }
+
+    /// The anchoring-disabled branch must report `null` balances, not `0`.
+    /// "not applicable" and "earned nothing" render identically otherwise,
+    /// and a concrete 0 beside "anchoring is not enabled" is actively wrong.
+    #[test]
+    fn earnings_disabled_branch_reports_null_not_zero() {
+        let p = earnings_disabled_payload();
+        assert!(p["unclaimed_raw"].is_null(), "unclaimed_raw must be null");
+        assert!(p["unclaimed_klv"].is_null(), "unclaimed_klv must be null");
+        assert!(p["wallet"].is_null());
+        assert_eq!(p["claimable"], serde_json::json!(false));
+        // The reason must be present and non-empty, so a disabled Claim
+        // button is never unexplained in the dashboard.
+        assert!(p["reason"].as_str().is_some_and(|r| !r.is_empty()));
+        // Explicitly NOT the numeric zero these fields could plausibly carry.
+        assert_ne!(p["unclaimed_raw"], serde_json::json!("0"));
+        assert_ne!(p["unclaimed_klv"], serde_json::json!("0"));
+    }
+}
+
+/// The `node_earnings` response for a node with anchoring disabled.
+///
+/// Extracted so the null-vs-zero contract can be asserted directly rather than
+/// by scraping source text: balances here are `null`, NOT `0`. The truthful
+/// answer is "not applicable" — this node has no wallet that could ever earn —
+/// and a concrete `0` sitting next to "anchoring is not enabled" reads as
+/// "you have earned nothing", which is a different and misleading claim. The
+/// dashboard renders `null` as "--".
+fn earnings_disabled_payload() -> serde_json::Value {
+    serde_json::json!({
+        "wallet": serde_json::Value::Null,
+        "claimable": false,
+        "reason": "anchoring is not enabled — this node has no signing wallet to earn or claim with",
+        "unclaimed_raw": serde_json::Value::Null,
+        "unclaimed_klv": serde_json::Value::Null,
+    })
+}
+
+/// GET /admin/node/earnings
+///
+/// This operator's unclaimed share of user registration fees (SC 0.10.0),
+/// plus the network-wide total for context.
+///
+/// Returns HTTP 200 with `claimable: false` and a `reason` when anchoring is
+/// disabled, rather than an error status: the dashboard should EXPLAIN the
+/// state, not render a failure. Mirrors `node_pause_status`, which reports a
+/// null status the same way.
+pub async fn node_earnings(Extension(state): Extension<Arc<AppState>>) -> impl IntoResponse {
+    let klever_node_url = state.klever_node_url.clone();
+    let contract_address = state.contract_address.clone();
+    // The ANCHOR wallet is what signs `registerNode`, so it is the address the
+    // contract credits — NOT `node_address`.
+    let wallet = state.anchor_wallet_address.clone().unwrap_or_default();
+
+    if klever_node_url.is_empty() || contract_address.is_empty() || wallet.is_empty() {
+        return Json(earnings_disabled_payload()).into_response();
+    }
+
+    let http = &state.klever_view_http;
+    let (mine_res, total_res) = tokio::join!(
+        crate::chain::sc_views::get_node_earnings(http, &klever_node_url, &contract_address, &wallet),
+        crate::chain::sc_views::get_total_unclaimed_node_earnings(http, &klever_node_url, &contract_address),
+    );
+
+    // On an RPC error report null rather than 0 — "we could not read it" and
+    // "you have earned nothing" must not look identical to the operator.
+    let (unclaimed, claimable, reason) = match mine_res {
+        Ok(v) if v > 0 => (Some(v), true, serde_json::Value::Null),
+        Ok(v) => (
+            Some(v),
+            false,
+            serde_json::Value::from("nothing to claim yet"),
+        ),
+        Err(e) => (
+            None,
+            false,
+            serde_json::Value::from(format!("could not read earnings from the contract: {}", e)),
+        ),
+    };
+
+    Json(serde_json::json!({
+        "wallet": wallet,
+        "klever_network": state.klever_network,
+        "contract_address": contract_address,
+        "claimable": claimable,
+        "reason": reason,
+        "unclaimed_raw": unclaimed.map(|v| v.to_string()),
+        "unclaimed_klv": unclaimed.map(format_klv),
+        "network_unclaimed_raw": total_res.as_ref().ok().map(|v| v.to_string()),
+        "network_unclaimed_klv": total_res.as_ref().ok().map(|v| format_klv(*v)),
+    }))
+    .into_response()
+}
+
+/// POST /admin/node/claim-earnings
+///
+/// Claims this operator's accrued registration-fee share. Takes no body —
+/// `claimNodeEarnings` takes no SC arguments and pays only its caller, so
+/// there is nothing to parameterise and nothing to authorise beyond holding
+/// the anchor wallet key.
+///
+/// **One claim per 60 seconds.** `submit_signed_call`'s duplicate-broadcast
+/// guard is keyed on the exact `call_data`. Every other signed call varies by
+/// argument (`proposal_id`, vote direction), so the guard only ever catches
+/// genuine double-submits — but `claimNodeEarnings` has NO arguments, so its
+/// calldata is a constant for the life of the node and the guard therefore
+/// rate-limits legitimate repeat claims too. That is acceptable (a second
+/// claim inside the window would hit "No earnings to claim" anyway), but it
+/// is surfaced with a specific message below rather than the generic
+/// governance wording, so nobody debugs it as a mystery 409.
+pub async fn node_claim_earnings(
+    Extension(state): Extension<Arc<AppState>>,
+) -> impl IntoResponse {
+    // Check the balance BEFORE broadcasting. `claimNodeEarnings` reverts with
+    // "No earnings to claim" on a zero balance, and a reverted TX still costs
+    // the anchor wallet its fee — the same wallet that funds anchoring. The
+    // dashboard disables the button, but that is client-side only, so anything
+    // that reaches this endpoint (a stale tab, a script, a CSRF-triggered POST
+    // from a page the operator has open on the node host) could otherwise burn
+    // fee on a guaranteed-revert call. `getNodeEarnings` is a free view.
+    let wallet = state.anchor_wallet_address.clone().unwrap_or_default();
+    if !wallet.is_empty()
+        && !state.klever_node_url.is_empty()
+        && !state.contract_address.is_empty()
+    {
+        if let Ok(0) = crate::chain::sc_views::get_node_earnings(
+            &state.klever_view_http,
+            &state.klever_node_url,
+            &state.contract_address,
+            &wallet,
+        )
+        .await
+        {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": "nothing to claim — no earnings have accrued to this node yet",
+                })),
+            )
+                .into_response();
+        }
+        // An RPC error here is deliberately NOT fatal: the contract is the
+        // authority on the balance, and refusing to claim because a view call
+        // failed would be worse than letting the operator try.
+    }
+
+    match submit_signed_call(&state, "claimNodeEarnings".to_string()).await {
+        Ok(tx_hash) => Json(serde_json::json!({ "ok": true, "tx_hash": tx_hash })).into_response(),
+        Err((StatusCode::CONFLICT, _)) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "a claim was just submitted — wait a minute before retrying",
+            })),
+        )
+            .into_response(),
+        // `submit_signed_call`'s message is worded for governance actions;
+        // an operator clicking Claim should not be told about proposals.
+        Err((StatusCode::SERVICE_UNAVAILABLE, _)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "anchoring is not enabled — this node has no signing wallet to claim with",
+            })),
+        )
+            .into_response(),
+        Err((status, err)) => (
+            status,
+            Json(serde_json::json!({ "ok": false, "error": err })),
+        )
+            .into_response(),
+    }
+}
+
 /// POST /admin/governance/node/create-proposal
 pub async fn governance_node_create_proposal(
     Extension(state): Extension<Arc<AppState>>,
@@ -1995,6 +2272,17 @@ pub async fn governance_node_create_proposal(
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": "unsupported parameter key" })),
+        )
+            .into_response();
+    }
+    // Early bounds check so an out-of-range value fails HERE with a readable
+    // message, instead of after the operator has signed and broadcast and the
+    // contract's `require!` rejects it. Advisory only — the contract enforces
+    // the real caps at both creation and execution.
+    if let Some(err) = node_param_value_out_of_bounds(&body.param_key, &body.param_value) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": err })),
         )
             .into_response();
     }
@@ -2040,7 +2328,7 @@ pub async fn governance_node_create_proposal(
         param_value_hex,
         encode_u64_calldata_arg(body.voting_period_seconds),
     );
-    match submit_governance_call(&state, call_data).await {
+    match submit_signed_call(&state, call_data).await {
         Ok(tx_hash) => Json(serde_json::json!({ "ok": true, "tx_hash": tx_hash })).into_response(),
         Err((status, err)) => (status, Json(serde_json::json!({ "ok": false, "error": err }))).into_response(),
     }
@@ -2074,7 +2362,7 @@ pub async fn governance_node_vote(
         encode_u64_calldata_arg(body.proposal_id),
         encode_bool_calldata_arg(body.support),
     );
-    match submit_governance_call(&state, call_data).await {
+    match submit_signed_call(&state, call_data).await {
         Ok(tx_hash) => Json(serde_json::json!({ "ok": true, "tx_hash": tx_hash })).into_response(),
         Err((status, err)) => (status, Json(serde_json::json!({ "ok": false, "error": err }))).into_response(),
     }
@@ -2107,7 +2395,7 @@ pub async fn governance_node_execute_proposal(
         "executeNodeProposal@{}",
         encode_u64_calldata_arg(body.proposal_id)
     );
-    match submit_governance_call(&state, call_data).await {
+    match submit_signed_call(&state, call_data).await {
         Ok(tx_hash) => Json(serde_json::json!({ "ok": true, "tx_hash": tx_hash })).into_response(),
         Err((status, err)) => (status, Json(serde_json::json!({ "ok": false, "error": err }))).into_response(),
     }

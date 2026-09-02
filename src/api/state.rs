@@ -395,6 +395,18 @@ pub struct AppState {
     /// the rest re-check the cache after acquiring and skip the
     /// fan-out if a sibling refresh populated it in the meantime.
     pub bootstrap_candidates_refresh: Arc<tokio::sync::Mutex<()>>,
+    /// Cached `registration/info` payload (v0.126.0). 60-second TTL.
+    ///
+    /// The endpoint exists so a client can read the live registration fee
+    /// before building its transaction, which means it is polled on a user-
+    /// facing path. Without a cache every page load would fan out to the
+    /// Klever RPC; the cache turns unbounded client polling into at most one
+    /// SC round-trip per minute. Same RwLock + single-flight shape as
+    /// `bootstrap_candidates_cache` above, for the same reasons.
+    pub registration_info_cache:
+        Arc<tokio::sync::RwLock<Option<CachedRegistrationInfo>>>,
+    /// Single-flight gate for `registration/info` regeneration.
+    pub registration_info_refresh: Arc<tokio::sync::Mutex<()>>,
     /// Snapshot of `[network.discovery] max_peer_staleness_days`,
     /// converted to seconds. Used by the bootstrap-candidates handler
     /// to filter out registry entries whose last anchor is too old to
@@ -468,10 +480,23 @@ pub struct AppState {
     /// a `GATEWAY_TIMEOUT` while the original submission is still
     /// in-flight (or has already broadcast), which would otherwise
     /// waste real KLV gas on a second broadcast of the same TX intent.
-    /// 60s TTL comfortably outlives `submit_governance_call`'s 30s
+    /// 60s TTL comfortably outlives `submit_signed_call`'s 30s
     /// budget; self-expires so a later, genuinely-new action with the
     /// same encoded arguments isn't blocked forever.
     pub governance_inflight: Cache<String, ()>,
+}
+
+/// Cached `registration/info` body + age tracking (v0.126.0).
+#[derive(Clone)]
+pub struct CachedRegistrationInfo {
+    /// Already-rendered response body, cloned on each cache hit.
+    pub payload: serde_json::Value,
+    /// `Instant` at generation — used for TTL comparison.
+    pub generated_at: Instant,
+    /// Whether this entry records a FAILED refresh. Negative entries are
+    /// held under a shorter TTL so the node recovers quickly once the RPC
+    /// comes back, and are never served as if authoritative.
+    pub is_negative: bool,
 }
 
 /// Cached bootstrap-candidates response (spec 13 §4.5).
@@ -725,6 +750,8 @@ impl AppState {
             anchor_wallet_key_configured,
             bootstrap_candidates_cache: Arc::new(tokio::sync::RwLock::new(None)),
             bootstrap_candidates_refresh: Arc::new(tokio::sync::Mutex::new(())),
+            registration_info_cache: Arc::new(tokio::sync::RwLock::new(None)),
+            registration_info_refresh: Arc::new(tokio::sync::Mutex::new(())),
             max_peer_staleness_secs,
             bootstrap_nodes,
             sc_discovery_enabled,

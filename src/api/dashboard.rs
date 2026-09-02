@@ -386,7 +386,7 @@ pub async fn alerts_config(Extension(state): Extension<Arc<AppState>>) -> impl I
 /// ENABLED channel (governance-dashboard-plan.md Phase 8). Routes
 /// into the running `AlertEngine` via the same
 /// channel+oneshot-reply+shared-timeout-budget idiom as
-/// `admin::submit_governance_call` — see that function's doc comment
+/// `admin::submit_signed_call` — see that function's doc comment
 /// for why the deadline must cover both the channel send AND the
 /// reply wait, not just the latter.
 pub async fn alerts_test(Extension(state): Extension<Arc<AppState>>) -> impl IntoResponse {

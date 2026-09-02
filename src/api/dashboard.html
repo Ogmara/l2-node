@@ -297,6 +297,31 @@ td { padding: 8px; border-bottom: 1px solid var(--border); }
       </table>
     </div>
 
+    <!-- v0.126.0 (SC 0.10.0) — operator revenue from user registrations. -->
+    <div class="card" style="margin-bottom:16px">
+      <h3 style="cursor:pointer;user-select:none" onclick="toggleEarningsInfo()">
+        <span id="earnings-info-arrow">&#9660;</span> Your earnings
+      </h3>
+      <div id="earnings-info-body">
+        <p style="color:var(--fg);line-height:1.5;margin-top:8px">
+          When a user verifies their wallet on-chain through <strong>your</strong>
+          node, a share of the registration fee is credited to your anchorer
+          wallet. It accrues on-chain and you can claim it at any time —
+          including after unregistering your node. Nothing expires.
+        </p>
+      </div>
+      <div class="grid" style="margin-top:12px">
+        <div><div class="label">Unclaimed</div><div class="metric" id="earn-mine">--</div></div>
+        <div><div class="label">Network-wide unclaimed</div><div class="metric" id="earn-network">--</div></div>
+        <div><div class="label">Your share per verification</div><div class="metric" id="earn-share">--</div></div>
+      </div>
+      <div style="margin-top:12px">
+        <button id="earn-claim-btn" onclick="claimEarnings()" disabled
+                style="padding:8px 16px;font-size:0.9em;cursor:pointer">Claim earnings</button>
+        <span id="earn-claim-status" style="margin-left:10px;color:var(--fg2)"></span>
+      </div>
+    </div>
+
     <!-- Action area — content swapped via JS based on state -->
     <div class="card" id="anch-action">
       <div style="color:var(--fg2)">Loading registration status…</div>
@@ -457,9 +482,12 @@ td { padding: 8px; border-bottom: 1px solid var(--border); }
         <tr>
           <td style="color:var(--fg2)">Parameter</td>
           <td>
-            <select id="gov-create-param-key" style="background:var(--bg2);color:var(--fg);border:1px solid var(--border);border-radius:4px;padding:6px 8px;font-size:0.9em">
+            <select id="gov-create-param-key" onchange="updateGovParamHint()" style="background:var(--bg2);color:var(--fg);border:1px solid var(--border);border-radius:4px;padding:6px 8px;font-size:0.9em">
               <option value="node_registration_fee">node_registration_fee</option>
+              <option value="registration_fee">registration_fee</option>
+              <option value="node_fee_share_bps">node_fee_share_bps</option>
             </select>
+            <div id="gov-param-hint" style="color:var(--fg2);font-size:0.8em;margin-top:4px"></div>
           </td>
         </tr>
         <tr>
@@ -1147,6 +1175,122 @@ async function loadAnchoring() {
   // RPCs against different SC views, no need to serialize.
   loadAnchoringMetadata();
   loadAnchoringPause();
+  loadEarnings();
+}
+
+// v0.126.0 — operator revenue from user registrations (SC 0.10.0).
+async function loadEarnings() {
+  const mine = document.getElementById('earn-mine');
+  const net = document.getElementById('earn-network');
+  const share = document.getElementById('earn-share');
+  const btn = document.getElementById('earn-claim-btn');
+  const status = document.getElementById('earn-claim-status');
+  try {
+    const resp = await fetch('/admin/node/earnings');
+    const d = await resp.json();
+    // `unclaimed_klv` is null when the contract could not be read — that is
+    // NOT the same as zero, so show it differently.
+    mine.textContent = d.unclaimed_klv == null ? '--' : d.unclaimed_klv + ' KLV';
+    net.textContent =
+      d.network_unclaimed_klv == null ? '--' : d.network_unclaimed_klv + ' KLV';
+    btn.disabled = !d.claimable;
+    // Never clobber a claim confirmation this function did not write — the
+    // tx hash is the operator's only record of what was submitted, and the
+    // balance does not drop until the tx is actually included.
+    if (!earnStatusSticky) {
+      // Always show the reason when not claimable, so a disabled button is
+      // never unexplained.
+      status.textContent = d.claimable ? '' : (d.reason || '');
+    }
+  } catch (e) {
+    mine.textContent = '--';
+    net.textContent = '--';
+    btn.disabled = true;
+    status.textContent = 'Could not load earnings: ' + (e.message || e);
+  }
+  // The split lives on the public registration endpoint, which is cached —
+  // cheap to call and keeps this card self-contained.
+  try {
+    const r = await fetch('/api/v1/registration/info');
+    if (r.ok) {
+      const info = await r.json();
+      const bps = Number(info.node_fee_share_bps || 0);
+      const fee = info.registration_fee_klv;
+      // `registration_fee` is a decimal STRING of raw units and may be null
+      // when the node has no contract configured. Compare as a string — a
+      // Number() round-trip would lose precision on large values.
+      if (info.contract_configured === false || info.registration_fee == null) {
+        share.textContent = 'no contract configured';
+      } else if (String(info.registration_fee) === '0') {
+        share.textContent = 'fee is 0 (free)';
+      } else {
+        share.textContent = (bps / 100) + '% of ' + fee + ' KLV';
+      }
+    } else {
+      share.textContent = '--';
+    }
+  } catch (_) {
+    share.textContent = '--';
+  }
+}
+
+// Set while a claim result is on screen, so a background refresh cannot
+// erase the tx hash before the operator has read it.
+let earnStatusSticky = false;
+
+async function claimEarnings() {
+  const btn = document.getElementById('earn-claim-btn');
+  const status = document.getElementById('earn-claim-status');
+  btn.disabled = true;
+  earnStatusSticky = false;
+  status.textContent = 'Submitting…';
+  try {
+    const resp = await fetch('/admin/node/claim-earnings', { method: 'POST' });
+    const d = await resp.json();
+    if (d.ok) {
+      status.textContent = 'Claimed — tx ' + String(d.tx_hash).slice(0, 16) + '…';
+      earnStatusSticky = true;
+      // The balance does not drop until the tx is INCLUDED, so refreshing
+      // immediately would just re-read the old value. Same 5-6s delay the
+      // other broadcast paths on this tab use.
+      setTimeout(loadEarnings, 6000);
+    } else {
+      status.textContent = d.error || 'Claim failed.';
+      earnStatusSticky = true;
+      btn.disabled = false;
+    }
+  } catch (e) {
+    status.textContent = 'Claim failed: ' + (e.message || e);
+    earnStatusSticky = true;
+    btn.disabled = false;
+  }
+}
+
+function toggleEarningsInfo() {
+  const body = document.getElementById('earnings-info-body');
+  const arrow = document.getElementById('earnings-info-arrow');
+  if (body.style.display === 'none') {
+    body.style.display = '';
+    arrow.textContent = '\u25BC';
+  } else {
+    body.style.display = 'none';
+    arrow.textContent = '\u25B6';
+  }
+}
+
+// Hint for the governance parameter picker — the contract enforces these
+// caps, so surface them before the operator signs.
+function updateGovParamHint() {
+  const key = document.getElementById('gov-create-param-key').value;
+  const hint = document.getElementById('gov-param-hint');
+  if (!hint) return;
+  if (key === 'registration_fee') {
+    hint.textContent = 'User verification fee, raw KLV (6 decimals). Max 10000000000 (10,000 KLV).';
+  } else if (key === 'node_fee_share_bps') {
+    hint.textContent = 'Share routed to the referring node, in basis points. Max 8000 (80%).';
+  } else {
+    hint.textContent = 'Node registration fee, raw KLV (6 decimals). No on-chain cap.';
+  }
 }
 
 // v0.45.0 — load + render the on-chain metadata section.
@@ -1834,6 +1978,9 @@ function loadGovernance() {
   loadGovernanceWallet();
   loadNodeProposals();
   loadUserProposals();
+  // The picker's hint is otherwise empty until the operator touches the
+  // dropdown, so the default selection would show no cap guidance at all.
+  updateGovParamHint();
 }
 
 async function loadGovernanceWallet() {

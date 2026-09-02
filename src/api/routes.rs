@@ -666,6 +666,14 @@ pub struct HealthResponse {
     /// Klever network name ("testnet" / "mainnet"). The other half of the
     /// auth binding — a signature is valid only for this network + node_id.
     pub network: String,
+    // NOTE: the node operator's Klever wallet is deliberately NOT exposed
+    // here. It lives on `GET /api/v1/registration/info` as `operator_address`,
+    // which is the endpoint a client actually calls before registering.
+    // `/health` is polled continuously by load balancers, uptime monitors and
+    // status pages, so putting a funded wallet address on it would scatter it
+    // through third-party logs that have no use for it — and for a node with
+    // anchoring enabled but not yet registered on-chain, it would disclose an
+    // address↔endpoint link that does not otherwise exist.
 }
 
 #[derive(Serialize)]
@@ -740,6 +748,224 @@ pub async fn health(Extension(state): Extension<Arc<AppState>>) -> Json<HealthRe
         node_id: state.node_id.clone(),
         network: state.klever_network.clone(),
     })
+}
+
+/// GET /api/v1/registration/info
+///
+/// Everything a client needs to build a `register` transaction: the live fee,
+/// the split, and which address to credit. One call instead of making every
+/// client hand-roll SC queries.
+///
+/// Public and unauthenticated — none of it is secret, and a client needs it
+/// BEFORE it has an identity to authenticate with. Backed by a 60-second
+/// cache so client polling cannot amplify into Klever RPC load.
+///
+/// `registration_fee` of 0 means registration is currently free, which is the
+/// state of a deployed contract until its owner switches the fee on. A client
+/// must still read this rather than assuming: the fee is governance-controlled
+/// and changes with no client release.
+pub async fn registration_info(
+    Extension(state): Extension<Arc<AppState>>,
+) -> impl IntoResponse {
+    // Positive TTL. Registration parameters change only by governance vote, so
+    // a minute-old answer is authoritative in practice.
+    const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+    // Shorter negative TTL so the node recovers quickly once the RPC returns.
+    // Without this, a failing upstream is never cached and every request pays
+    // the full RPC timeout while holding the single-flight lock — turning an
+    // outage into a serialized queue on a PUBLIC endpoint. Same guard, same
+    // reason, as `network_bootstrap_candidates` below.
+    const NEGATIVE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(15);
+    // Outer bound on a refresh, so a pathological RPC cannot pin the
+    // single-flight lock for the full per-request timeout budget.
+    const REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    // Advertise the REMAINING freshness, not the full TTL. Emitting a flat
+    // max-age on a cache hit that is already 59s old would let a downstream
+    // cache hold it another 60s, doubling real client-visible staleness.
+    fn header_for(age: std::time::Duration, ttl: std::time::Duration) -> String {
+        let remaining = ttl.saturating_sub(age).as_secs();
+        format!("public, max-age={}", remaining)
+    }
+
+    let contract = state.contract_address.clone();
+    let url = state.klever_node_url.clone();
+
+    // No contract configured on this node. Answered BEFORE the single-flight
+    // lock: it needs no RPC, so serializing these requests would be waste.
+    //
+    // The fee is reported as `null`, NOT `"0"`. A client that pins its own
+    // `contract_address` (which clients are required to do) may well be
+    // talking to a contract that DOES charge a fee, so answering "0" here
+    // would be read as "free" and produce a zero-value transaction that is
+    // rejected on chain. `null` + `contract_configured: false` says the only
+    // true thing: this node cannot tell you.
+    if url.is_empty() || contract.is_empty() {
+        let payload = serde_json::json!({
+            "registration_fee": serde_json::Value::Null,
+            "registration_fee_klv": serde_json::Value::Null,
+            "node_fee_share_bps": serde_json::Value::Null,
+            "operator_address": serde_json::Value::Null,
+            "contract_address": serde_json::Value::Null,
+            "network": state.klever_network,
+            "contract_configured": false,
+        });
+        return (
+            [(header::CACHE_CONTROL, header_for(
+                std::time::Duration::ZERO, CACHE_TTL))],
+            Json(payload),
+        )
+            .into_response();
+    }
+
+    // Fast path: cache hit under a read lock, so concurrent readers never
+    // serialize behind each other.
+    {
+        let read = state.registration_info_cache.read().await;
+        if let Some(cached) = read.as_ref() {
+            let age = cached.generated_at.elapsed();
+            let ttl = if cached.is_negative { NEGATIVE_CACHE_TTL } else { CACHE_TTL };
+            if age < ttl {
+                let status = if cached.is_negative {
+                    StatusCode::SERVICE_UNAVAILABLE
+                } else {
+                    StatusCode::OK
+                };
+                return (
+                    status,
+                    [(header::CACHE_CONTROL, header_for(age, ttl))],
+                    Json(cached.payload.clone()),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    // Single-flight: only one refresher runs the SC calls; the rest re-check
+    // the cache after acquiring and reuse whatever it produced.
+    let _guard = state.registration_info_refresh.lock().await;
+    let stale = {
+        let read = state.registration_info_cache.read().await;
+        if let Some(cached) = read.as_ref() {
+            let age = cached.generated_at.elapsed();
+            let ttl = if cached.is_negative { NEGATIVE_CACHE_TTL } else { CACHE_TTL };
+            if age < ttl {
+                let status = if cached.is_negative {
+                    StatusCode::SERVICE_UNAVAILABLE
+                } else {
+                    StatusCode::OK
+                };
+                return (
+                    status,
+                    [(header::CACHE_CONTROL, header_for(age, ttl))],
+                    Json(cached.payload.clone()),
+                )
+                    .into_response();
+            }
+        }
+        // Keep the last GOOD payload around — if the refresh below fails we
+        // would rather serve a slightly stale but correct answer than 503 a
+        // working registration flow over a transient RPC blip.
+        read.as_ref()
+            .filter(|c| !c.is_negative)
+            .map(|c| c.payload.clone())
+    };
+
+    let http = &state.klever_view_http;
+    let refresh = async {
+        tokio::join!(
+            crate::chain::sc_views::get_registration_fee(http, &url, &contract),
+            crate::chain::sc_views::get_node_fee_share_bps(http, &url, &contract),
+        )
+    };
+
+    let joined = tokio::time::timeout(REFRESH_TIMEOUT, refresh).await;
+
+    // Both readers already map a contract-level `require` failure (including
+    // an endpoint an older contract lacks) to 0. A TRANSPORT error is
+    // different and must NOT be served as "registration is free" — a client
+    // would then build a zero-value transaction and have it rejected on chain.
+    let (fee, bps) = match joined {
+        Ok((Ok(f), Ok(b))) => (f, b),
+        Ok((Err(_), _)) | Ok((_, Err(_))) | Err(_) => {
+            // Prefer a stale-but-real answer over an error. Registration
+            // parameters change only by governance vote, so a slightly old
+            // value is authoritative in practice and far better than 503-ing
+            // a working registration flow over a transient blip.
+            if let Some(payload) = stale {
+                // Re-stamp the entry. Without this the cached value stays
+                // permanently past its TTL, so EVERY subsequent request
+                // re-acquires the single-flight lock and pays another full
+                // refresh attempt — precisely the serialized-queue pathology
+                // the negative cache exists to prevent, just on the stale
+                // branch instead of the cold one. Held for the negative TTL:
+                // long enough to stop the stampede, short enough to pick the
+                // real value back up quickly once the RPC recovers.
+                {
+                    let mut write = state.registration_info_cache.write().await;
+                    *write = Some(crate::api::state::CachedRegistrationInfo {
+                        payload: payload.clone(),
+                        generated_at: std::time::Instant::now(),
+                        // NOT negative: this payload is real data, and must
+                        // keep being served with 200 rather than 503.
+                        is_negative: false,
+                    });
+                }
+                return (
+                    [(header::CACHE_CONTROL, header_for(
+                        std::time::Duration::ZERO, NEGATIVE_CACHE_TTL))],
+                    Json(payload),
+                )
+                    .into_response();
+            }
+            // Nothing usable cached — negative-cache the failure so a
+            // continuing outage costs one RPC attempt per NEGATIVE_CACHE_TTL
+            // rather than one per request.
+            let payload = serde_json::json!({
+                "error": "could not read registration parameters from the contract",
+            });
+            {
+                let mut write = state.registration_info_cache.write().await;
+                *write = Some(crate::api::state::CachedRegistrationInfo {
+                    payload: payload.clone(),
+                    generated_at: std::time::Instant::now(),
+                    is_negative: true,
+                });
+            }
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(header::CACHE_CONTROL, header_for(
+                    std::time::Duration::ZERO, NEGATIVE_CACHE_TTL))],
+                Json(payload),
+            )
+                .into_response();
+        }
+    };
+
+    let payload = serde_json::json!({
+        "registration_fee": fee.to_string(),
+        "registration_fee_klv": crate::util::format_klv_amount(fee),
+        "node_fee_share_bps": bps,
+        "operator_address": state.anchor_wallet_address,
+        "contract_address": contract,
+        "network": state.klever_network,
+        "contract_configured": true,
+    });
+
+    {
+        let mut write = state.registration_info_cache.write().await;
+        *write = Some(crate::api::state::CachedRegistrationInfo {
+            payload: payload.clone(),
+            generated_at: std::time::Instant::now(),
+            is_negative: false,
+        });
+    }
+
+    (
+        [(header::CACHE_CONTROL, header_for(std::time::Duration::ZERO, CACHE_TTL))],
+        Json(payload),
+    )
+        .into_response()
 }
 
 /// GET /api/v1/network/stats

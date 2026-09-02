@@ -5,6 +5,118 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.126.0] - 2026-09-02
+
+Node-side support for the user registration fee and operator revenue sharing
+introduced in smart-contract 0.10.0. Operators can now see and claim the share
+of registration fees earned from users who verified through their node.
+
+### Added
+
+- **`GET /api/v1/registration/info`** (public) — everything a client needs to
+  build a `register` transaction: `registration_fee` (raw and formatted),
+  `node_fee_share_bps`, the `operator_address` to credit, `contract_address`,
+  `network`, and `contract_configured`. Public because a client needs it
+  BEFORE it has an identity to authenticate with.
+  - 60-second positive cache with single-flight refresh, a **15-second
+    negative cache**, a **10-second refresh timeout**, and stale-while-error.
+    Without the negative cache and timeout, an RPC outage would leave every
+    request paying the full RPC timeout while holding the single-flight lock
+    — turning an upstream failure into a serialized queue on a public,
+    unauthenticated endpoint.
+  - `Cache-Control` advertises the REMAINING freshness, not a flat TTL, so a
+    hit served at 59s of age cannot be held downstream for another 60.
+  - A transport error returns 503 rather than reporting the fee as 0 — a
+    client must never be told "free" when the truth is "unknown", or it would
+    build a zero-value transaction and have it rejected on chain. A
+    slightly-stale cached answer is preferred over a 503 where one exists.
+  - When the node has no contract configured, every fee field is `null` and
+    `contract_configured` is `false` — **not** `"0"`. A client pinning its own
+    contract may well face a contract that DOES charge, so answering "0" would
+    be read as "free" and produce a zero-value transaction rejected on chain.
+    `null` says the only true thing: this node cannot tell you.
+  - **Clients MUST pin `contract_address` from their own configuration** and
+    treat only `operator_address` / `node_fee_share_bps` as node-supplied. A
+    malicious operator could otherwise serve their own contract address and
+    redirect the fee.
+  - Field types are deliberately asymmetric and easy to get wrong:
+    `registration_fee` is a decimal **string** of raw units (parse with
+    `BigInt`, never `Number`), `node_fee_share_bps` is a **number**, and
+    `operator_address` / all fee fields may be **null**.
+- **`GET /admin/node/earnings`** — this operator's unclaimed balance plus the
+  network-wide total. Returns HTTP 200 with `claimable: false` and a `reason`
+  when anchoring is disabled, rather than an error: the dashboard should
+  explain the state, not render a failure. Both an RPC error and a disabled
+  anchorer report `null`, not `0` — "could not read" / "not applicable" and
+  "earned nothing" must not look identical.
+- **`POST /admin/node/claim-earnings`** — signs `claimNodeEarnings` from the
+  anchor wallet. Server-side signing is safe here specifically because the
+  contract pays the caller and only the caller, so this grants the dashboard
+  no authority it does not already hold. It **checks the balance first** and
+  returns 409 instead of broadcasting when nothing has accrued: a claim on a
+  zero balance reverts on chain but still costs the anchor wallet its fee, and
+  the anchor wallet is what funds anchoring. Rate-limited with the other
+  transaction-broadcasting routes (6/s, burst 5), not merely by the API-wide
+  limiter.
+- **Anchoring-tab "Your earnings" card** — unclaimed balance, network-wide
+  total, the current share per verification, and a Claim button that is
+  disabled with a specific reason whenever it cannot be used.
+- `registration_fee` and `node_fee_share_bps` added to the node-governance
+  parameter picker, with the contract's caps shown as an inline hint.
+- Four SC view readers in `chain/sc_views.rs`: `get_registration_fee`,
+  `get_node_fee_share_bps`, `get_node_earnings`,
+  `get_total_unclaimed_node_earnings`. Balances decode as `u128`, not `u64` —
+  earnings accumulate unbounded until claimed and must not silently truncate.
+
+### Changed
+
+- `NODE_GOVERNANCE_VALID_PARAM_KEYS` now mirrors the contract's three-key
+  node-track set. **This was blocking:** until now the dashboard rejected the
+  two new governance keys with a 400 before they could reach the chain. It
+  failed closed, so nothing was corrupted — the feature was simply
+  unreachable. A unit test now pins the list, because cross-repo drift is
+  invisible to both repos' build and audit pipelines.
+- Node-governance proposal creation bounds-checks `registration_fee` and
+  `node_fee_share_bps` against the contract's caps, so an out-of-range value
+  fails immediately with a readable message instead of after the operator has
+  signed and broadcast. Advisory only — the contract remains the authority and
+  re-checks at both creation and execution. An all-digits value too large for
+  `u128` is treated as out of bounds rather than passed through: the calldata
+  encoder is arbitrary-precision and would happily encode a 60-digit number,
+  so it would otherwise be broadcast at real cost only to hit the contract's
+  `require!`.
+- The node operator's wallet address is deliberately **not** exposed on
+  `GET /api/v1/health`. It lives only on `registration/info`, the endpoint a
+  client actually calls before registering. `/health` is polled continuously
+  by load balancers and uptime monitors, which would scatter a funded wallet
+  address through third-party logs — and for a node with anchoring enabled but
+  not yet registered on-chain it would disclose an address-to-endpoint link
+  that does not otherwise exist.
+- `submit_governance_call` renamed to `submit_signed_call`; it now signs a
+  non-governance call (`claimNodeEarnings`) and the old name was a misnomer.
+- `format_klv` moved to `util::format_klv_amount` and shared, so the dashboard
+  and the public API can never render the same amount differently.
+
+### Notes
+
+- **`claimNodeEarnings` is limited to one claim per 60 seconds.** The
+  duplicate-broadcast guard is keyed on exact call data; every other signed
+  call varies by argument, but this one takes none, so its calldata is
+  constant for the life of the node. Harmless — a second claim inside the
+  window would hit "No earnings to claim" anyway — but it is surfaced with a
+  specific message rather than the generic governance wording, so it is not
+  mistaken for a bug.
+
+### Security
+
+- `cargo audit`: the same 2 pre-existing `hickory-proto 0.25.2` advisories
+  (RUSTSEC-2026-0118, -0119), reached transitively through `libp2p 0.56.0`.
+  **Re-verified against upstream this pass rather than assumed:** libp2p
+  0.56.0 is still the latest release, `libp2p-mdns 0.48.0` still pins
+  `hickory-proto ^0.25.2` so 0.26.1 is unreachable, and -0118 has no fix at
+  any version. Not deferred by choice — genuinely blocked upstream, and
+  unaffected by this change.
+
 ## [0.125.0] - 2026-09-01
 
 ### Added
