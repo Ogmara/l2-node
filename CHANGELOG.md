@@ -5,6 +5,39 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.126.5] - 2026-09-02
+
+Audit-pass follow-ups for 0.126.1–0.126.4, which shipped without one.
+
+### Fixed
+
+- **The dashboard guards added in 0.126.2 were giving false assurance.**
+  `declared_names` scanned raw text including comments, and the words `for `,
+  `catch ` and `function ` occur constantly in English prose there ("for the
+  operator", "catch a failure") — so the scan ran away over the following code
+  and marked every identifier in it as declared, silently disabling the check.
+  It also captured only the FIRST declarator, so real declarations like
+  `let min = Infinity, max = -Infinity;` went unseen — a latent false positive
+  that would have failed the build on a cosmetic reformat.
+  Now: comments and string contents are stripped first, declarator lists are
+  split on depth-0 commas, destructuring patterns are harvested, and
+  `function`/`catch`/`for` regions are bounded by their parentheses. Verified
+  in BOTH directions — it catches the original deleted-declaration regression
+  and stays quiet on the reformat that previously would have broken the build.
+- `dashboard_never_fetches_the_public_api` missed template-literal fetches,
+  which are already the house style in that file, so the exact regression
+  could recur as `` fetch(`/api/…`) ``.
+- **The `catch` branch of `loadEarnings` erased the claim confirmation it was
+  written to protect.** A post-claim refresh hitting a transient failure
+  replaced the tx hash — the operator's only record of what was submitted —
+  with an error string. It now respects `earnStatusSticky`, as the success
+  path already did.
+- **`GET /admin/node/earnings` hid the fee and share from any node without an
+  anchor wallet.** They are network-wide governance parameters that need no
+  wallet to read, so the operator most likely to ask "what would I earn if I
+  enabled anchoring?" was the one who could not see the answer. Regression
+  from 0.126.1, which moved the values off the public endpoint.
+
 ## [0.126.4] - 2026-09-02
 
 ### Fixed

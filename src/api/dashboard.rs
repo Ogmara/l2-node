@@ -525,29 +525,169 @@ mod dashboard_js_tests {
         out
     }
 
+    /// Strip `//` and `/* */` comments, preserving line structure.
+    ///
+    /// Essential, not cosmetic: the declaration scanner keys off the words
+    /// `for `, `catch `, `function ` and `let `, all of which occur constantly
+    /// in ENGLISH PROSE in this file's comments ("for the operator", "catch a
+    /// failure"). Scanning them made the analyser run away over the following
+    /// code and mark every identifier in it as declared, silently disabling
+    /// the check. It also means commenting out a declaration no longer counts
+    /// as declaring it.
+    ///
+    /// String contents are tracked so a `//` inside a URL literal is not
+    /// mistaken for a comment.
+    fn strip_comments(js: &str) -> String {
+        let mut out = String::with_capacity(js.len());
+        let mut chars = js.chars().peekable();
+        let mut quote: Option<char> = None;
+        let mut escaped = false;
+        while let Some(c) = chars.next() {
+            if let Some(q) = quote {
+                out.push(c);
+                if escaped { escaped = false; }
+                else if c == '\\' { escaped = true; }
+                else if c == q { quote = None; }
+                continue;
+            }
+            match c {
+                '\'' | '"' | '`' => { quote = Some(c); out.push(c); }
+                '/' if chars.peek() == Some(&'/') => {
+                    for n in chars.by_ref() {
+                        if n == '\n' { out.push('\n'); break; }
+                    }
+                }
+                '/' if chars.peek() == Some(&'*') => {
+                    chars.next();
+                    let mut prev = '\0';
+                    for n in chars.by_ref() {
+                        if n == '\n' { out.push('\n'); }
+                        if prev == '*' && n == '/' { break; }
+                        prev = n;
+                    }
+                }
+                _ => out.push(c),
+            }
+        }
+        out
+    }
+
     /// Names bound by a `let` / `const` / `var` / `function` declaration.
+    ///
+    /// Captures EVERY declarator, not just the first: `let a = 1, b = 2;` and
+    /// destructuring (`const { x, y } = o`, `const [p, q] = arr`) all bind
+    /// names that later assignments legitimately target. An earlier version
+    /// took only the first identifier, which left real declarations such as
+    /// `let min = Infinity, max = -Infinity;` unseen — a latent false positive
+    /// that would have failed the build on a purely cosmetic reformat.
+    ///
+    /// Also collects function/arrow parameters and `catch (e)` bindings, since
+    /// all of those are assignable.
     fn declared_names(js: &str) -> HashSet<String> {
         let mut names = HashSet::new();
-        for kw in ["let ", "const ", "var ", "function "] {
+        let bytes = js.as_bytes();
+        let is_ident = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
+
+        let push_idents = |seg: &str, names: &mut HashSet<String>| {
+            let mut cur = String::new();
+            for c in seg.chars() {
+                if is_ident(c) {
+                    cur.push(c);
+                } else if !cur.is_empty() && !cur.starts_with(|d: char| d.is_ascii_digit()) {
+                    names.insert(std::mem::take(&mut cur));
+                } else {
+                    cur.clear();
+                }
+            }
+            if !cur.is_empty() && !cur.starts_with(|d: char| d.is_ascii_digit()) {
+                names.insert(cur);
+            }
+        };
+
+        // Declaration keywords whose binding region is a plain declarator
+        // list, and `catch`/`for`, whose bindings live inside parentheses.
+        for kw in ["let ", "const ", "var ", "function ", "catch ", "for "] {
+            // `function`, `catch` and `for` bind only a name and/or a
+            // parenthesised list — their region must END at the closing paren.
+            // Letting `function` run to the next `;` would swallow the whole
+            // body and mark every identifier in it as declared, silently
+            // defeating the check.
+            let paren_scoped = kw == "catch " || kw == "for " || kw == "function ";
             let mut from = 0usize;
             while let Some(i) = js[from..].find(kw) {
                 let at = from + i;
-                // Must start a token, not sit inside a longer identifier.
-                let prev_ok = at == 0
-                    || !js[..at]
-                        .chars()
-                        .next_back()
-                        .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '$');
-                let ident: String = js[at + kw.len()..]
-                    .chars()
-                    .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')
-                    .collect();
-                if prev_ok && !ident.is_empty() {
-                    names.insert(ident);
+                let prev_ok = at == 0 || !js[..at].chars().next_back().is_some_and(is_ident);
+                if prev_ok {
+                    let rest = &js[at + kw.len()..];
+                    // Hard cap so a malformed or unusual construct can never let
+                    // the scan run away and swallow unrelated code — which would
+                    // silently mark real undeclared names as declared and defeat
+                    // the whole check.
+                    // Char-safe cap: slicing at a raw byte index would panic
+                    // mid-codepoint (this file contains box-drawing comments).
+                    let cap = rest
+                        .char_indices()
+                        .nth(300)
+                        .map(|(bi, _)| bi)
+                        .unwrap_or(rest.len());
+                    let window = &rest[..cap];
+                    let mut depth = 0i32;
+                    let mut end = window.len();
+                    for (bi, ch) in window.char_indices() {
+                        match ch {
+                            '(' | '[' | '{' => depth += 1,
+                            ')' | ']' | '}' => {
+                                depth -= 1;
+                                // catch/for bindings end with their paren.
+                                if depth <= 0 && paren_scoped { end = bi; break; }
+                            }
+                            // A declarator list ends at the statement end. We do
+                            // NOT stop at the first `=`: that would drop every
+                            // later declarator in `let a = 1, b = 2;`, leaving
+                            // real declarations unseen — the exact false
+                            // positive that would fail the build on a reformat.
+                            ';' if depth == 0 && !paren_scoped => { end = bi; break; }
+                            _ => {}
+                        }
+                    }
+                    let region = &window[..end];
+                    // Split on depth-0 commas into declarators, then take each
+                    // one's binding side (before its own `=`). Handles
+                    // `let a = 1, b = 2` and `const { x, y } = o` alike.
+                    let mut depth2 = 0i32;
+                    let mut seg_start = 0usize;
+                    let mut segments: Vec<&str> = Vec::new();
+                    for (bi, ch) in region.char_indices() {
+                        match ch {
+                            '(' | '[' | '{' => depth2 += 1,
+                            ')' | ']' | '}' => depth2 -= 1,
+                            ',' if depth2 == 0 => {
+                                segments.push(&region[seg_start..bi]);
+                                seg_start = bi + 1;
+                            }
+                            _ => {}
+                        }
+                    }
+                    segments.push(&region[seg_start..]);
+                    for seg in segments {
+                        let mut d3 = 0i32;
+                        let mut cut = seg.len();
+                        for (bi, ch) in seg.char_indices() {
+                            match ch {
+                                '(' | '[' | '{' => d3 += 1,
+                                ')' | ']' | '}' => d3 -= 1,
+                                '=' if d3 == 0 => { cut = bi; break; }
+                                _ => {}
+                            }
+                        }
+                        push_idents(&seg[..cut], &mut names);
+                    }
+
                 }
                 from = at + kw.len();
             }
         }
+        let _ = bytes;
         names
     }
 
@@ -566,7 +706,7 @@ mod dashboard_js_tests {
     /// (`el.textContent = x`), declarations, and comparisons are all ignored.
     #[test]
     fn no_assignment_to_an_undeclared_variable() {
-        let js = script_body();
+        let js = strip_comments(&script_body());
         assert!(!js.is_empty(), "dashboard.html should contain inline script");
         let declared = declared_names(&js);
         // Assigned via a `for (x of ...)`/`catch (e)` binding or the DOM globals.
@@ -620,16 +760,12 @@ mod dashboard_js_tests {
     /// no value is attached, so the path worked while the fee was zero.
     #[test]
     fn call_value_is_never_a_string() {
-        let js = script_body();
+        let js = strip_comments(&script_body());
         let mut offenders = Vec::new();
         for (i, line) in js.lines().enumerate() {
-            let trimmed = line.trim();
-            // Skip comments — this file documents the very shape it forbids.
-            if !line.contains("KLV:")
-                || trimmed.starts_with("//")
-                || trimmed.starts_with('*')
-                || trimmed.starts_with("/*")
-            {
+            // Comments are already stripped, so this file can document the
+            // very shape it forbids without tripping its own guard.
+            if !line.contains("KLV:") {
                 continue;
             }
             // A string amount is the bug: `KLV: "..."`, `KLV: x.toString()`,
@@ -659,9 +795,13 @@ mod dashboard_js_tests {
     /// this file targets `/admin/*`, and that is load-bearing.
     #[test]
     fn dashboard_never_fetches_the_public_api() {
-        let js = script_body();
+        let js = strip_comments(&script_body());
         assert!(
-            !js.contains("fetch('/api/") && !js.contains("fetch(\"/api/"),
+            !js.contains("fetch('/api/")
+                && !js.contains("fetch(\"/api/")
+                // Template-literal fetches are already the house style in this
+                // file, so the exact regression can recur in that form.
+                && !js.contains("fetch(`/api/"),
             "dashboard.html must fetch only /admin/* — a public-API fetch fails \
              silently behind an admin-scoped reverse proxy"
         );

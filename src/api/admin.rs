@@ -2135,6 +2135,30 @@ pub async fn node_earnings(Extension(state): Extension<Arc<AppState>>) -> impl I
     // contract credits — NOT `node_address`.
     let wallet = state.anchor_wallet_address.clone().unwrap_or_default();
 
+    // The fee and share are network-wide governance parameters that need no
+    // anchor wallet to read, so fetch them even when this node cannot earn.
+    // Otherwise the operator most likely to ask "what would I earn if I
+    // enabled anchoring?" is the one operator who cannot see the answer.
+    if wallet.is_empty() && !klever_node_url.is_empty() && !contract_address.is_empty() {
+        let http = &state.klever_view_http;
+        let (fee_res, bps_res) = tokio::join!(
+            crate::chain::sc_views::get_registration_fee(http, &klever_node_url, &contract_address),
+            crate::chain::sc_views::get_node_fee_share_bps(http, &klever_node_url, &contract_address),
+        );
+        let mut payload = earnings_disabled_payload();
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert(
+                "registration_fee_raw".into(),
+                fee_res.as_ref().ok().map(|v| v.to_string()).into(),
+            );
+            obj.insert(
+                "registration_fee_klv".into(),
+                fee_res.as_ref().ok().map(|v| format_klv(*v)).into(),
+            );
+            obj.insert("node_fee_share_bps".into(), bps_res.as_ref().ok().copied().into());
+        }
+        return Json(payload).into_response();
+    }
     if klever_node_url.is_empty() || contract_address.is_empty() || wallet.is_empty() {
         return Json(earnings_disabled_payload()).into_response();
     }

@@ -1234,7 +1234,13 @@ async function loadEarnings() {
     share.textContent = '--';
     shareSub.textContent = '';
     btn.disabled = true;
-    status.textContent = 'Could not load earnings: ' + (e.message || e);
+    // Respect the sticky flag here too. A post-claim refresh that hits a
+    // transient failure would otherwise replace the tx hash — the operator's
+    // only record of what was submitted — with an error string, which is
+    // exactly what the flag exists to prevent.
+    if (!earnStatusSticky) {
+      status.textContent = 'Could not load earnings: ' + (e.message || e);
+    }
   }
 }
 
