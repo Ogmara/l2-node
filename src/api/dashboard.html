@@ -313,7 +313,7 @@ td { padding: 8px; border-bottom: 1px solid var(--border); }
       <div class="grid" style="margin-top:12px">
         <div><div class="label">Unclaimed</div><div class="metric" id="earn-mine">--</div></div>
         <div><div class="label">Network-wide unclaimed</div><div class="metric" id="earn-network">--</div></div>
-        <div><div class="label">Your share per verification</div><div class="metric" id="earn-share">--</div></div>
+        <div><div class="label">Your share per verification</div><div class="metric" id="earn-share">--</div><div class="label" id="earn-share-sub"></div></div>
       </div>
       <div style="margin-top:12px">
         <button id="earn-claim-btn" onclick="claimEarnings()" disabled
@@ -1189,6 +1189,7 @@ async function loadEarnings() {
   const mine = document.getElementById('earn-mine');
   const net = document.getElementById('earn-network');
   const share = document.getElementById('earn-share');
+  const shareSub = document.getElementById('earn-share-sub');
   const btn = document.getElementById('earn-claim-btn');
   const status = document.getElementById('earn-claim-status');
   try {
@@ -1212,18 +1213,26 @@ async function loadEarnings() {
     // deliberately never reaches into the public /api/v1 namespace.
     // `registration_fee_raw` is a decimal STRING of raw units; compare as a
     // string, since a Number() round-trip loses precision on large values.
+    //
+    // `.metric` is a 1.8em mono display style built for short values like
+    // "0 KLV", so the metric carries only a short token and any qualifier goes
+    // in the muted sub-line — a sentence in `.metric` renders enormous and
+    // wraps.
     if (d.registration_fee_raw == null || d.node_fee_share_bps == null) {
       share.textContent = '--';
+      shareSub.textContent = '';
     } else if (String(d.registration_fee_raw) === '0') {
-      share.textContent = 'fee is 0 (free)';
+      share.textContent = 'Free';
+      shareSub.textContent = 'no registration fee set yet';
     } else {
-      share.textContent =
-        (Number(d.node_fee_share_bps) / 100) + '% of ' + d.registration_fee_klv + ' KLV';
+      share.textContent = (Number(d.node_fee_share_bps) / 100) + '%';
+      shareSub.textContent = 'of ' + d.registration_fee_klv + ' KLV';
     }
   } catch (e) {
     mine.textContent = '--';
     net.textContent = '--';
     share.textContent = '--';
+    shareSub.textContent = '';
     btn.disabled = true;
     status.textContent = 'Could not load earnings: ' + (e.message || e);
   }

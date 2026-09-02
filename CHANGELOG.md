@@ -5,6 +5,18 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.126.3] - 2026-09-02
+
+### Fixed
+
+- **"Your share per verification" rendered as an oversized wrapped sentence.**
+  `.metric` is a 1.8em bold mono display style meant for short values like
+  "0 KLV"; putting "fee is 0 (free)" through it produced enormous text
+  spilling onto two lines. The metric now carries a short token and any
+  qualifier moves to a muted sub-line, matching the other two metrics in the
+  card: **Free** / "no registration fee set yet" when the fee is 0, and
+  **50%** / "of 100 KLV" once one is set.
+
 ## [0.126.2] - 2026-09-02
 
 ### Fixed
