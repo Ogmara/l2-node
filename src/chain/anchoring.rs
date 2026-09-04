@@ -824,7 +824,11 @@ impl StateAnchorer {
             .with_context(|| format!("/transaction/send returned non-JSON (HTTP {}): {}", send_status, crate::util::truncate_str(&send_text, 500)))?;
         if send_status.is_server_error() {
             let err_msg = send_body.get("error").and_then(|e| e.as_str()).unwrap_or("server error");
-            return Err(anyhow::anyhow!("TX send HTTP {}: {}", send_status, err_msg));
+            return Err(anyhow::anyhow!(
+                "TX send HTTP {}: {}",
+                send_status,
+                crate::util::truncate_str(err_msg, 500)
+            ));
         }
         debug!(response = %send_body, "TX send response");
 
@@ -836,9 +840,30 @@ impl StateAnchorer {
                     .get("error")
                     .and_then(|e| e.as_str())
                     .unwrap_or("unknown error");
-                anyhow::anyhow!("TX build failed: {}", err_msg)
+                anyhow::anyhow!("TX build failed: {}", crate::util::truncate_str(err_msg, 500))
             })?
             .clone();
+
+        // `/transaction/send` SIMULATES the SC invoke while building the raw
+        // TX. A panicked or `require!`-reverted simulation still returns
+        // `data.result`, but WITHOUT the `KAppFee`/`BandwidthFee` estimate —
+        // and signing + broadcasting that fee-less TX gets it rejected with a
+        // misleading `invalid transaction fees: (0/..) (0/..)` that buries
+        // the real cause. `simulation_error` classifies the response by
+        // whether that fee estimate is present; surface the real error here
+        // instead of broadcasting a doomed TX.
+        match simulation_error(&send_body) {
+            SimulationOutcome::Ok => {}
+            SimulationOutcome::Benign(err) => {
+                warn!(error = %err, "TX send reported a benign error alongside a built TX; proceeding");
+            }
+            SimulationOutcome::Failed(err) => {
+                return Err(anyhow::anyhow!(
+                    "TX simulation failed in /transaction/send (not broadcast): {}",
+                    err
+                ));
+            }
+        }
 
         // Decode TX to get the canonical hash to sign.
         let decode_resp = self
@@ -859,7 +884,12 @@ impl StateAnchorer {
         let tx_hash_hex = decode_json
             .pointer("/data/tx/hash")
             .and_then(|h| h.as_str())
-            .ok_or_else(|| anyhow::anyhow!("no hash in /transaction/decode response: {}", decode_text))?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no hash in /transaction/decode response: {}",
+                    crate::util::truncate_str(&decode_text, 500)
+                )
+            })?
             .to_string();
 
         debug!(tx_hash = %tx_hash_hex, "TX hash decoded");
@@ -1051,9 +1081,190 @@ fn encode_u32_hex(v: u32) -> String {
     }
 }
 
+/// Classification of the top-level `error` field on a `/transaction/send`
+/// response that also carried a built `data.result`.
+#[derive(Debug, PartialEq, Eq)]
+enum SimulationOutcome {
+    /// No error, or an empty one — proceed to decode/sign/broadcast.
+    Ok,
+    /// A known-benign error that does not invalidate the built TX; proceed
+    /// but log it.
+    Benign(String),
+    /// A real simulation failure (VM panic, `require!` revert, validation
+    /// error). The built TX has no fees and must not be broadcast.
+    Failed(String),
+}
+
+/// Inspect a `/transaction/send` body and decide whether the built TX is
+/// safe to sign and broadcast.
+///
+/// The Klever node SIMULATES the SC invoke while building the raw TX, and on
+/// a failed simulation it still returns `data.result` (so the caller cannot
+/// rely on that field's absence). The signal that actually matters for the
+/// broadcast is the **fee estimate**: a completed build carries a non-zero
+/// flat `KAppFee` plus a size-based `BandwidthFee` on the `RawData`
+/// envelope; a panicked or `require!`-reverted simulation omits both (and
+/// sets `code: "bad_request"`, `ResultCode` non-zero). Broadcasting a
+/// fee-less TX is exactly what earns the misleading
+/// `invalid transaction fees: (0/..) (0/..)` rejection — so a missing fee
+/// estimate is the fatal condition, NOT the presence of an `error` string.
+/// Keying on the fee estimate means an unrecognised-but-harmless `error`
+/// alongside an otherwise valid, fee-bearing TX does not stall the anchor
+/// loop (audit W1, 2026-09-03).
+///
+/// `nil address in GetExistingAccount` is whitelisted outright: it is
+/// emitted for a sender with no on-chain history yet, the built TX is still
+/// valid, and it is treated as benign even if this particular build did not
+/// carry a fee estimate (see the Klever TX API notes / memory).
+fn simulation_error(send_body: &Value) -> SimulationOutcome {
+    let err = send_body.get("error").and_then(|e| e.as_str()).unwrap_or("");
+    let msg = || crate::util::truncate_str(err, 500).to_string();
+
+    if err.contains("nil address in GetExistingAccount") {
+        return SimulationOutcome::Benign(msg());
+    }
+
+    let raw = send_body.pointer("/data/result/RawData");
+    let fee = |name: &str| -> u64 {
+        raw.and_then(|r| r.get(name))
+            .and_then(|v| {
+                v.as_u64()
+                    .or_else(|| v.as_f64().map(|f| f as u64))
+                    .or_else(|| v.as_str()?.parse().ok())
+            })
+            .unwrap_or(0)
+    };
+
+    if fee("KAppFee") > 0 && fee("BandwidthFee") > 0 {
+        // Built and fee-bearing: broadcastable. An empty `error` is the
+        // clean path; a non-empty one is the historical "RawData present,
+        // proceed despite the error" case — logged, not fatal.
+        if err.is_empty() {
+            SimulationOutcome::Ok
+        } else {
+            SimulationOutcome::Benign(msg())
+        }
+    } else if !err.is_empty() {
+        SimulationOutcome::Failed(msg())
+    } else {
+        // No fee estimate and no error string — a malformed/failed build
+        // that would still be rejected at broadcast. Surface the `code`
+        // (a short server token; truncated defensively all the same).
+        let code = send_body
+            .get("code")
+            .and_then(|c| c.as_str())
+            .unwrap_or("unknown");
+        SimulationOutcome::Failed(format!(
+            "transaction/send produced no fee estimate (code: {})",
+            crate::util::truncate_str(code, 100)
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Real `/transaction/send` `data.result` for a build whose simulation
+    // SUCCEEDED — captured from testnet (pauseNode invoke). Carries the fee
+    // estimate that marks the TX broadcastable.
+    fn fee_bearing_result() -> serde_json::Value {
+        serde_json::json!({
+            "RawData": {
+                "Nonce": 802,
+                "Sender": "wyY1ryh8gUX/HzziZPQajR7U9NcA+ajSLf1c/ba4llY=",
+                "Data": ["cGF1c2VOb2RlQDcwNzI2ZjYyNjU="],
+                "KAppFee": 2000000i64,
+                "BandwidthFee": 5991913i64,
+                "Version": 1,
+                "ChainID": "MTA5",
+            },
+            "GasLimit": 400000000i64,
+        })
+    }
+
+    #[test]
+    fn simulation_error_classifies_send_responses() {
+        // Clean build: fee estimate present, no error.
+        let ok = serde_json::json!({
+            "data": { "result": fee_bearing_result(), "txHash": "b691f9" },
+            "error": "",
+            "code": "successful",
+        });
+        assert_eq!(simulation_error(&ok), SimulationOutcome::Ok);
+
+        // Missing `error` key entirely, fee estimate present → still Ok.
+        let no_err_key = serde_json::json!({
+            "data": { "result": fee_bearing_result() },
+        });
+        assert_eq!(simulation_error(&no_err_key), SimulationOutcome::Ok);
+
+        // Benign: brand-new sender. Whitelisted regardless of fee estimate.
+        let benign = serde_json::json!({
+            "data": { "result": {} },
+            "error": "nil address in GetExistingAccount",
+        });
+        assert_eq!(
+            simulation_error(&benign),
+            SimulationOutcome::Benign("nil address in GetExistingAccount".to_string()),
+        );
+
+        // Unrecognised, non-empty error BUT the build still produced a fee
+        // estimate → proceed (Benign), do not stall the anchor loop (W1).
+        let odd_but_fee_bearing = serde_json::json!({
+            "data": { "result": fee_bearing_result() },
+            "error": "some future non-fatal warning",
+        });
+        assert_eq!(
+            simulation_error(&odd_but_fee_bearing),
+            SimulationOutcome::Benign("some future non-fatal warning".to_string()),
+        );
+
+        // Real failure: the exact body a governance createNodeProposal against
+        // a fail-allocator contract returned on testnet — no fee fields,
+        // ResultCode 57, code "bad_request".
+        let panicked = serde_json::json!({
+            "data": { "result": { "RawData": {}, "ResultCode": 57 }, "txHash": "" },
+            "error": "validation error: invalid argument: VMUserError - (panic occurred)",
+            "code": "bad_request",
+        });
+        match simulation_error(&panicked) {
+            SimulationOutcome::Failed(msg) => assert!(msg.contains("panic occurred"), "{msg}"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+
+        // No fee estimate and no error string → Failed, surfacing the code.
+        let no_fees_no_err = serde_json::json!({
+            "data": { "result": { "RawData": {} } },
+            "code": "bad_request",
+        });
+        match simulation_error(&no_fees_no_err) {
+            SimulationOutcome::Failed(msg) => assert!(msg.contains("bad_request"), "{msg}"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+
+        // Fees serialised as strings are still recognised.
+        let string_fees = serde_json::json!({
+            "data": { "result": { "RawData": { "KAppFee": "2000000", "BandwidthFee": "394" } } },
+            "error": "nonsense",
+        });
+        assert_eq!(
+            simulation_error(&string_fees),
+            SimulationOutcome::Benign("nonsense".to_string()),
+        );
+
+        // A pathologically long error is truncated before it reaches a log
+        // line or the admin HTTP response (N1).
+        let long = "x".repeat(4000);
+        let huge_err = serde_json::json!({
+            "data": { "result": { "RawData": {} } },
+            "error": long,
+        });
+        match simulation_error(&huge_err) {
+            SimulationOutcome::Failed(msg) => assert!(msg.len() <= 500, "len {}", msg.len()),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
 
     #[test]
     fn test_encode_u64_hex() {

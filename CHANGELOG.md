@@ -5,6 +5,31 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.126.6] - 2026-09-03
+
+### Fixed
+
+- **A failed SC-invoke simulation is now surfaced instead of being
+  broadcast as a doomed transaction.** `/transaction/send` simulates the
+  contract call while building the raw TX; a panicked or `require!`-reverted
+  simulation still returns `data.result`, but *without* the
+  `KAppFee`/`BandwidthFee` estimate. `submit_signed_sc_invoke` only checked
+  that `data.result` existed, so it signed and broadcast the fee-less TX
+  anyway — and the broadcast was rejected with a misleading
+  `invalid transaction fees: (0/..) (0/..)` that hid the real cause. This is
+  what a node operator saw creating a governance proposal from the dashboard
+  against a smart contract that panics on the call; the dashboard now shows
+  the contract's actual error, and the doomed TX is never broadcast.
+
+  The classifier (`simulation_error`) keys on the **fee estimate**, not the
+  error text: a build that still produced a non-zero `KAppFee` +
+  `BandwidthFee` is broadcastable and an unrecognised non-fatal `error`
+  string on it does not stall the anchor loop; a build missing that estimate
+  is fatal regardless of wording. `nil address in GetExistingAccount` (a
+  brand-new sender) stays whitelisted outright. The surfaced error string is
+  truncated to 500 bytes before it reaches a log line or the admin HTTP
+  response.
+
 ## [0.126.5] - 2026-09-02
 
 Audit-pass follow-ups for 0.126.1–0.126.4, which shipped without one.
