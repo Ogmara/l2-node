@@ -2529,11 +2529,25 @@ fn build_search_result(state: &Arc<AppState>, address: &str) -> Option<serde_jso
         .and_then(|v| v.as_u64())
         .map(|ts| ts > 0)
         .unwrap_or(false);
+    // `is_bot` / `bot_handle` are part of the projection because this endpoint
+    // feeds the `@`-mention popover, which renders the Bot badge (spec 6 §6.2).
+    // This response is an explicit field list, NOT a passthrough of the users
+    // record — a field omitted here is simply unavailable to that UI.
+    //
+    // The two signals stay orthogonal and must never be merged into one glyph:
+    // `verified` means "paid to register on-chain"; `is_bot` means "this account
+    // says it is automated", which is free, self-declared and cosmetic. The badge
+    // is shown for EVERY self-declared bot, verified or not — an unverified bot
+    // is precisely the one a user most needs labelled.
+    let is_bot = user.get("is_bot").and_then(|v| v.as_bool()).unwrap_or(false);
+    let bot_handle = user.get("bot_handle").and_then(|v| v.as_str()).map(String::from);
     Some(serde_json::json!({
         "address": address,
         "display_name": display_name,
         "avatar_cid": avatar_cid,
         "verified": verified,
+        "is_bot": is_bot,
+        "bot_handle": bot_handle,
     }))
 }
 
@@ -3250,6 +3264,7 @@ pub async fn post_message(
             msg_id,
             raw_bytes,
             msg_type: _,
+            bot_commands_changed,
         } => {
             state.counters.inc_messages_stored();
 
@@ -3316,8 +3331,15 @@ pub async fn post_message(
                 // Feed to notification engine for mention detection
                 if let Some(ref engine) = state.notification_engine {
                     let engine = engine.clone();
+                    // Only fires when the router's content comparison saw a REAL
+                    // descriptor change — a no-op republish (every bot restart)
+                    // reaches here as `None`.
+                    let bot_wallet = bot_commands_changed.clone();
                     tokio::spawn(async move {
                         engine.process(&envelope).await;
+                        if let Some(wallet) = bot_wallet {
+                            engine.broadcast_bot_commands_changed(&wallet).await;
+                        }
                     });
                 }
             }
@@ -3452,7 +3474,26 @@ pub async fn update_profile(
     use crate::messages::router::RouteResult;
 
     match state.router.process_message(&body) {
-        RouteResult::Accepted { raw_bytes, .. } => {
+        RouteResult::Accepted {
+            raw_bytes,
+            bot_commands_changed,
+            ..
+        } => {
+            // A descriptor change submitted HERE must notify this node's own
+            // clients. Gossip does not loop a publish back to its origin, so
+            // without this the one node a bot publishes through is the only node
+            // that never tells its users — precisely inverted from what you want,
+            // since those are the bot's own users. (Every other node gets it via
+            // the gossip receive path in `network/mod.rs`.)
+            if let Some(wallet) = bot_commands_changed {
+                if let Some(ref engine) = state.notification_engine {
+                    let engine = engine.clone();
+                    tokio::spawn(async move {
+                        engine.broadcast_bot_commands_changed(&wallet).await;
+                    });
+                }
+            }
+
             // Publish to GossipSub so other nodes learn the new display_name.
             // Without this the ProfileUpdate was only ever stored locally on
             // the node it was submitted to — other nodes (which discover the
@@ -4520,6 +4561,181 @@ pub async fn get_channel_members(
             (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
         }
     }
+}
+
+/// GET /api/v1/channels/:channel_id/bots
+///
+/// Every member of the channel whose `users` record carries `is_bot = true`,
+/// with the command list clients render in the `/`-autocomplete (spec 6 §6.1.2).
+///
+/// Access reuses `require_channel_access` exactly as `/members` and `/pins` do:
+/// a non-member of a private channel gets 404, so the endpoint leaks no
+/// existence. Public channels stay unauthenticated.
+pub async fn get_channel_bots(
+    Extension(state): Extension<Arc<AppState>>,
+    auth_user: Option<Extension<AuthUser>>,
+    Path(channel_id): Path<u64>,
+) -> impl IntoResponse {
+    let caller = auth_user.as_ref().map(|u| u.address.as_str());
+    if let Err(resp) = require_channel_access(&state, channel_id, caller) {
+        return resp;
+    }
+
+    let cfg = &state.bots_config;
+    let ttl = std::time::Duration::from_secs(cfg.channel_bots_cache_ttl_secs);
+
+    // The cache holds only WHICH members are bots. Commands, ban and mute state
+    // are re-read on every request, so a descriptor change or a mute is visible
+    // immediately and nothing needs invalidating for them. What the cache saves
+    // is the expensive part: the up-to-5000-row CHANNEL_MEMBERS scan. Only a
+    // membership change evicts an entry. See `NotificationEngine`'s field docs.
+    //
+    // With no engine wired (tests) every call rescans — correct, just uncached.
+    let cached = match state.notification_engine {
+        Some(ref engine) => engine.channel_bots_cached(channel_id, ttl).await,
+        None => None,
+    };
+
+    // `scan_capped` travels WITH the cached list. It describes the scan that
+    // produced the list, so recomputing it as `false` on a cache hit would report
+    // a truncated channel as complete for the whole TTL.
+    let scan_capped;
+    let bot_addresses: std::sync::Arc<Vec<String>> = match cached {
+        Some((capped, list)) => {
+            scan_capped = capped;
+            list
+        }
+        None => {
+            let entries = match state.storage.prefix_iter_cf(
+                cf::CHANNEL_MEMBERS,
+                &channel_id.to_be_bytes(),
+                cfg.channel_bots_max_members_scanned,
+            ) {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::error!(error = %e, "Storage error in get_channel_bots");
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
+                        .into_response();
+                }
+            };
+            scan_capped = entries.len() >= cfg.channel_bots_max_members_scanned;
+
+            let mut found = Vec::new();
+            for (key, _) in entries {
+                if key.len() <= 8 {
+                    continue;
+                }
+                // Borrow first; only allocate for the members that are bots.
+                let Ok(addr) = std::str::from_utf8(&key[8..]) else {
+                    continue;
+                };
+                let Ok(Some(raw)) = state.storage.get_cf(cf::USERS, addr.as_bytes()) else {
+                    continue;
+                };
+                let Ok(rec) = serde_json::from_slice::<serde_json::Value>(&raw) else {
+                    continue;
+                };
+                if rec.get("is_bot").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    found.push(addr.to_string());
+                }
+            }
+            let found = std::sync::Arc::new(found);
+            if let Some(ref engine) = state.notification_engine {
+                engine
+                    .channel_bots_store(
+                        channel_id,
+                        scan_capped,
+                        std::sync::Arc::clone(&found),
+                        cfg.channel_bots_cache_max_entries,
+                    )
+                    .await;
+            }
+            found
+        }
+    };
+
+    // Project from the CURRENT user records, and re-apply moderation on every
+    // read so a mute, unmute, ban or unban takes effect at once.
+    let mut bots: Vec<serde_json::Value> = Vec::new();
+    for address in bot_addresses.iter() {
+        // A bot banned or muted in THIS channel disappears from THIS channel's
+        // picker, network-wide. Its descriptor and its commands elsewhere are
+        // untouched — moderation is channel-scoped (spec 7 §5.3).
+        //
+        // `is_channel_banned`, not a bare `exists_cf`: a CHANNEL_BANS row
+        // outlives its `duration_secs`, so an existence check would keep a
+        // temp-banned bot out of the picker permanently even though it is free
+        // to post again. This mirrors `is_channel_muted` below.
+        //
+        // Both FAIL CLOSED: a storage error hides the bot rather than showing a
+        // possibly-banned one. A moderation filter must not default to permit.
+        match state.storage.is_channel_banned(channel_id, address) {
+            Ok(false) => {}
+            Ok(true) => continue,
+            Err(e) => {
+                tracing::warn!(error = %e, %address, "ban lookup failed; omitting bot");
+                continue;
+            }
+        }
+        match state.storage.is_channel_muted(channel_id, address) {
+            Ok(false) => {}
+            Ok(true) => continue,
+            Err(e) => {
+                tracing::warn!(error = %e, %address, "mute lookup failed; omitting bot");
+                continue;
+            }
+        }
+
+        let Ok(Some(raw)) = state.storage.get_cf(cf::USERS, address.as_bytes()) else {
+            continue;
+        };
+        let Ok(rec) = serde_json::from_slice::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        // Re-checked: a wallet may have un-declared since the list was cached.
+        if !rec.get("is_bot").and_then(|v| v.as_bool()).unwrap_or(false) {
+            continue;
+        }
+        bots.push(serde_json::json!({
+            "address": address,
+            "display_name": rec.get("display_name").cloned().unwrap_or(serde_json::Value::Null),
+            "avatar_cid": rec.get("avatar_cid").cloned().unwrap_or(serde_json::Value::Null),
+            "verified": rec.get("registered_at").and_then(|v| v.as_u64()).unwrap_or(0) > 0,
+            "bot_handle": rec.get("bot_handle").cloned().unwrap_or(serde_json::Value::Null),
+            "commands": rec.get("bot_commands").cloned().unwrap_or(serde_json::json!([])),
+        }));
+    }
+
+    // SORT BEFORE TRUNCATING. Capping during the scan would make the surviving
+    // set depend on CHANNEL_MEMBERS key order — i.e. on bech32 address bytes — so
+    // an attacker could grind an address that sorts early, guarantee inclusion,
+    // and push legitimate bots out of the picker entirely before declaring their
+    // handle. That is the same squatter's ladder the ordering rule rejects, just
+    // reached through truncation instead of ranking. The candidate set is already
+    // bounded by the scan cap, so sorting first costs nothing new.
+    bots.sort_by(|a, b| {
+        let av = a.get("verified").and_then(|v| v.as_bool()).unwrap_or(false);
+        let bv = b.get("verified").and_then(|v| v.as_bool()).unwrap_or(false);
+        bv.cmp(&av).then_with(|| {
+            a.get("address")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .cmp(b.get("address").and_then(|v| v.as_str()).unwrap_or(""))
+        })
+    });
+    let result_capped = bots.len() > cfg.channel_bots_max_returned;
+    bots.truncate(cfg.channel_bots_max_returned);
+
+    // `total` is the number of entries in THIS response — not a channel-wide bot
+    // count. Stated explicitly because `/members` computes its `total` the same
+    // page-local way and that has been mistaken for a global count before.
+    Json(serde_json::json!({
+        "bots": &bots,
+        "total": bots.len(),
+        "scan_capped": scan_capped,
+        "result_capped": result_capped,
+    }))
+    .into_response()
 }
 
 /// GET /api/v1/channels/:channel_id/pins

@@ -385,6 +385,31 @@ max_total_bytes = 2147483648             # 2 GiB hard cap on snapshot size
 # at startup whenever this is true.
 experimental_skip_anchor_verify = false
 
+[bots]
+# Bot command discovery (spec 3 §4.1), behind
+# GET /api/v1/channels/{channel_id}/bots — the source for the "/" command
+# autocomplete in the clients. A bot is an ordinary wallet that self-declares
+# `is_bot` in its profile; nothing here grants a bot any capability.
+#
+# How long a channel's resolved bot MEMBERSHIP is cached, in seconds. Only the
+# address list is cached — commands, bans and mutes are re-read on every
+# request, so a bot editing its commands (or being muted) takes effect at once
+# regardless of this value. Raising it only widens the window in which a
+# newly-JOINED bot is missing from the picker.
+channel_bots_cache_ttl_secs = 60
+# Hard ceiling on the CHANNEL_MEMBERS scan behind that endpoint. This is the
+# endpoint's DoS bound: past it the handler stops and reports
+# `scan_capped: true` rather than returning a partial list as if complete.
+# Lower it on a node serving very large channels. Rejected at load if 0, and
+# capped at 100000.
+channel_bots_max_members_scanned = 5000
+# Max bots in one response. Bounds the OUTPUT, which the scan cap does not —
+# a small channel can still be almost entirely bots. Clients render at most
+# 20 rows regardless.
+channel_bots_max_returned = 50
+# Max channels held in the discovery cache.
+channel_bots_cache_max_entries = 1000
+
 [metrics]
 enabled = true
 system_interval_seconds = 10

@@ -2036,6 +2036,8 @@ impl Node {
             // the test-alert request sender (`None` when alerts are
             // disabled).
             self.config.alerts.clone(),
+            // Spec 3 §4.1 — bounds for GET /api/v1/channels/{id}/bots.
+            self.config.bots.clone(),
             alert_test_tx,
             // Spec 3 §3.9 — Hot Topics mesh aggregator, shared with the
             // network task so `GET /api/v1/news/hot-topics` reads the same

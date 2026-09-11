@@ -21,6 +21,27 @@ pub const MAX_NEWS_TAGS: usize = 10;
 pub const MAX_DISPLAY_NAME: usize = 64;
 /// Maximum bio length (256 chars).
 pub const MAX_BIO: usize = 256;
+/// Max commands a bot may advertise (spec 01 §3.11).
+pub const MAX_BOT_COMMANDS: usize = 32;
+/// Max bytes of a bot command name.
+pub const MAX_BOT_COMMAND_NAME: usize = 32;
+/// Max bytes of a bot command description.
+pub const MAX_BOT_COMMAND_DESC: usize = 128;
+/// Max bytes of a bot command's argument hint.
+pub const MAX_BOT_ARGS_HINT: usize = 64;
+/// Bot handle length bounds (inclusive).
+pub const MIN_BOT_HANDLE: usize = 3;
+/// Max bytes of a bot handle.
+pub const MAX_BOT_HANDLE: usize = 32;
+/// Hard ceiling on a `ProfileUpdate` envelope payload, checked on the RAW BYTES
+/// **before** deserialization on every ingestion path (spec 01 §3.11).
+///
+/// `ProfileUpdatePayload` gained a variable-length array (`bot.commands`), and
+/// without a pre-deserialization bound the only ceiling is the transport's own —
+/// 10 MiB on the HTTP path (`DefaultBodyLimit`) and 256 KiB on the wire. Bounding
+/// the value itself rather than only its effects is the l2-node 0.97.0 / W16
+/// lesson applied before it bites. A worst-case legitimate descriptor is ~7.2 KB.
+pub const MAX_PROFILE_PAYLOAD_BYTES: usize = 16 * 1024;
 /// Maximum channel slug length (64 chars).
 pub const MAX_SLUG: usize = 64;
 /// Maximum channel description length (256 chars).
@@ -262,6 +283,110 @@ pub fn validate_profile_update(p: &ProfileUpdatePayload) -> Result<(), Validatio
     if let Some(ref bio) = p.bio {
         if bio.len() > MAX_BIO {
             return Err(ValidationError("bio too long".into()));
+        }
+    }
+    if let Some(ref bot) = p.bot {
+        validate_bot_descriptor(bot)?;
+    }
+    Ok(())
+}
+
+/// Reject a codepoint that would let a descriptor string tamper with how a
+/// client renders the command picker.
+///
+/// This is a **control- and bidi-codepoint rejection, NOT an ASCII allowlist**.
+/// Command descriptions are user-authored prose and MUST keep the full Unicode
+/// range so a Chinese or Japanese bot author's text renders correctly; narrowing
+/// this to ASCII is the plausible mis-implementation and would silently break
+/// them. Only characters that are invisible or that reorder surrounding text are
+/// refused. Clients additionally `stripBidi()` at render time, because the node
+/// serving them may predate this check.
+fn is_forbidden_descriptor_char(c: char) -> bool {
+    matches!(c,
+        '\u{0}'..='\u{1F}'          // C0 controls
+        | '\u{7F}'                   // DEL
+        | '\u{80}'..='\u{9F}'       // C1 controls
+        | '\u{61C}'                  // ARABIC LETTER MARK (bidi)
+        | '\u{200B}'                 // ZERO WIDTH SPACE
+        | '\u{200E}' | '\u{200F}'  // LTR / RTL MARK
+        | '\u{2028}' | '\u{2029}'  // line / paragraph separator
+        | '\u{202A}'..='\u{202E}'   // bidi embedding / override
+        | '\u{2060}'..='\u{2064}'   // word joiner, invisible operators
+        | '\u{2066}'..='\u{2069}'   // bidi isolates
+        | '\u{FEFF}'                 // ZWNBSP / BOM
+        | '\u{FFF9}'..='\u{FFFB}'   // interlinear annotation
+        | '\u{E0000}'..='\u{E007F}' // TAG characters — the standard carrier for
+                                     // invisible text smuggled into a rendered string
+    )
+    // DELIBERATELY NOT rejected, despite sitting inside the U+200B..U+200F block
+    // a naive range would sweep up:
+    //   U+200C ZERO WIDTH NON-JOINER — REQUIRED for correct Persian/Farsi and
+    //     Indic orthography.
+    //   U+200D ZERO WIDTH JOINER — REQUIRED for emoji ZWJ sequences; without it
+    //     "👩‍💻" and "👨‍👩‍👧" cannot be written at all.
+    // Rejecting these would be a silent functional break for exactly the users
+    // the "not an ASCII allowlist" rule exists to protect. They are formatting
+    // characters, not reordering ones: neither can change the visual order of
+    // surrounding text, which is the attack this function defends against.
+}
+
+/// Validate a self-declared bot descriptor (spec 01 §3.11).
+///
+/// Every violation rejects the WHOLE envelope — a node must never silently
+/// truncate a descriptor, because a truncated command list is indistinguishable
+/// to a client from the bot having advertised exactly that.
+pub fn validate_bot_descriptor(b: &BotDescriptor) -> Result<(), ValidationError> {
+    if let Some(ref handle) = b.handle {
+        if handle.len() < MIN_BOT_HANDLE || handle.len() > MAX_BOT_HANDLE {
+            return Err(ValidationError("bot handle length out of range".into()));
+        }
+        if !handle.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Err(ValidationError(
+                "bot handle must match ^[A-Za-z0-9_]+$".into(),
+            ));
+        }
+    }
+
+    if let Some(ref commands) = b.commands {
+        if commands.len() > MAX_BOT_COMMANDS {
+            return Err(ValidationError("too many bot commands".into()));
+        }
+        for cmd in commands {
+            if cmd.name.is_empty() || cmd.name.len() > MAX_BOT_COMMAND_NAME {
+                return Err(ValidationError("bot command name length out of range".into()));
+            }
+            // Lowercase on the wire. Consumers match case-insensitively, but a
+            // bot cannot DECLARE `/Dom`, which removes the `/Dom` vs `/dom`
+            // confusion surface and keeps dedup and collision detection trivial.
+            if !cmd
+                .name
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+            {
+                return Err(ValidationError(
+                    "bot command name must match ^[a-z0-9_]+$".into(),
+                ));
+            }
+            if cmd.description.is_empty() || cmd.description.len() > MAX_BOT_COMMAND_DESC {
+                return Err(ValidationError(
+                    "bot command description length out of range".into(),
+                ));
+            }
+            if cmd.description.chars().any(is_forbidden_descriptor_char) {
+                return Err(ValidationError(
+                    "bot command description contains a control or bidi codepoint".into(),
+                ));
+            }
+            if let Some(ref hint) = cmd.args_hint {
+                if hint.len() > MAX_BOT_ARGS_HINT {
+                    return Err(ValidationError("bot command args_hint too long".into()));
+                }
+                if hint.chars().any(is_forbidden_descriptor_char) {
+                    return Err(ValidationError(
+                        "bot command args_hint contains a control or bidi codepoint".into(),
+                    ));
+                }
+            }
         }
     }
     Ok(())
@@ -1467,5 +1592,257 @@ mod tests {
         let mut p = encrypted_chat();
         p.mentions = vec!["klv1x".into(); MAX_MENTIONS + 1];
         assert!(validate_chat_message(&p).is_err());
+    }
+}
+
+// --- Bot descriptor (spec 01 §3.11) ---
+
+#[cfg(test)]
+mod bot_descriptor_tests {
+    use super::*;
+    use crate::messages::types::{deserialize_payload, MessageType};
+
+    fn cmd(name: &str, desc: &str) -> BotCommand {
+        BotCommand {
+            name: name.into(),
+            description: desc.into(),
+            args_hint: None,
+        }
+    }
+
+    fn descriptor(commands: Vec<BotCommand>) -> BotDescriptor {
+        BotDescriptor {
+            is_bot: true,
+            handle: Some("CoinTrendz".into()),
+            commands: Some(commands),
+        }
+    }
+
+    #[test]
+    fn accepts_a_well_formed_descriptor() {
+        assert!(validate_bot_descriptor(&descriptor(vec![cmd("c", "Chart for a symbol")])).is_ok());
+    }
+
+    #[test]
+    fn command_count_boundary() {
+        let at_cap = descriptor(vec![cmd("c", "d"); MAX_BOT_COMMANDS]);
+        assert!(validate_bot_descriptor(&at_cap).is_ok(), "exactly at cap must pass");
+        let over = descriptor(vec![cmd("c", "d"); MAX_BOT_COMMANDS + 1]);
+        assert!(validate_bot_descriptor(&over).is_err(), "one over cap must fail");
+    }
+
+    #[test]
+    fn field_length_boundaries() {
+        assert!(validate_bot_descriptor(&descriptor(vec![cmd(
+            &"a".repeat(MAX_BOT_COMMAND_NAME),
+            "d"
+        )]))
+        .is_ok());
+        assert!(validate_bot_descriptor(&descriptor(vec![cmd(
+            &"a".repeat(MAX_BOT_COMMAND_NAME + 1),
+            "d"
+        )]))
+        .is_err());
+        assert!(validate_bot_descriptor(&descriptor(vec![cmd(
+            "c",
+            &"d".repeat(MAX_BOT_COMMAND_DESC)
+        )]))
+        .is_ok());
+        assert!(validate_bot_descriptor(&descriptor(vec![cmd(
+            "c",
+            &"d".repeat(MAX_BOT_COMMAND_DESC + 1)
+        )]))
+        .is_err());
+    }
+
+    #[test]
+    fn empty_name_or_description_is_rejected() {
+        assert!(validate_bot_descriptor(&descriptor(vec![cmd("", "d")])).is_err());
+        assert!(validate_bot_descriptor(&descriptor(vec![cmd("c", "")])).is_err());
+    }
+
+    #[test]
+    fn command_names_are_lowercase_only_on_the_wire() {
+        // A bot cannot DECLARE `/Dom`; consumers match case-insensitively, which
+        // is what keeps `/Dom` vs `/dom` from being two different commands.
+        assert!(validate_bot_descriptor(&descriptor(vec![cmd("Dom", "d")])).is_err());
+        assert!(validate_bot_descriptor(&descriptor(vec![cmd("dom", "d")])).is_ok());
+        assert!(validate_bot_descriptor(&descriptor(vec![cmd("do_m2", "d")])).is_ok());
+        assert!(validate_bot_descriptor(&descriptor(vec![cmd("do-m", "d")])).is_err());
+        assert!(validate_bot_descriptor(&descriptor(vec![cmd("/dom", "d")])).is_err());
+    }
+
+    #[test]
+    fn descriptions_keep_full_unicode() {
+        // THE regression test for this feature. The charset rule is a control-
+        // and bidi-codepoint REJECTION, not an ASCII allowlist; narrowing it to
+        // ASCII is the plausible mis-implementation and would silently break
+        // every CJK, Cyrillic or emoji description.
+        for desc in ["图表查询", "チャートを表示", "График по символу", "Chart 📈"] {
+            assert!(
+                validate_bot_descriptor(&descriptor(vec![cmd("c", desc)])).is_ok(),
+                "must accept non-ASCII description: {desc}"
+            );
+        }
+    }
+
+    #[test]
+    fn zwj_and_zwnj_survive() {
+        // These sit inside the U+200B..U+200F block a naive range sweeps up, and
+        // rejecting them silently breaks emoji ZWJ sequences and Persian/Indic
+        // orthography — the exact functional break the "not an ASCII allowlist"
+        // rule exists to prevent. A single-codepoint emoji test does NOT catch it.
+        for ok in [
+            "Run as 👩\u{200D}💻",      // ZWJ emoji sequence
+            "👨\u{200D}👩\u{200D}👧",  // multi-ZWJ family sequence
+            "می\u{200C}خواهم",          // Persian ZWNJ
+        ] {
+            assert!(
+                validate_bot_descriptor(&descriptor(vec![cmd("c", ok)])).is_ok(),
+                "must accept {ok:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_control_and_bidi_codepoints() {
+        for bad in [
+            "a\u{0}b",       // NUL
+            "a\nb",          // C0
+            "a\u{7F}b",      // DEL
+            "a\u{85}b",      // C1
+            "a\u{200B}b",    // zero-width space
+            "a\u{202E}b",    // right-to-left override
+            "a\u{2066}b",    // bidi isolate
+            "a\u{2028}b",    // line separator
+            "a\u{61C}b",     // Arabic letter mark (bidi)
+            "a\u{FEFF}b",    // ZWNBSP / BOM
+            "a\u{2060}b",    // word joiner
+            "a\u{FFF9}b",    // interlinear annotation anchor
+            "a\u{E0041}b",   // TAG character — invisible text smuggling
+        ] {
+            assert!(
+                validate_bot_descriptor(&descriptor(vec![cmd("c", bad)])).is_err(),
+                "must reject {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn args_hint_is_bounded_and_sanitized() {
+        let mut d = descriptor(vec![cmd("c", "d")]);
+        if let Some(ref mut cmds) = d.commands {
+            cmds[0].args_hint = Some("a".repeat(MAX_BOT_ARGS_HINT));
+        }
+        assert!(validate_bot_descriptor(&d).is_ok());
+        if let Some(ref mut cmds) = d.commands {
+            cmds[0].args_hint = Some("a".repeat(MAX_BOT_ARGS_HINT + 1));
+        }
+        assert!(validate_bot_descriptor(&d).is_err());
+        if let Some(ref mut cmds) = d.commands {
+            cmds[0].args_hint = Some("a\u{202E}b".into());
+        }
+        assert!(validate_bot_descriptor(&d).is_err());
+    }
+
+    #[test]
+    fn handle_is_ascii_and_length_bounded() {
+        let mut d = descriptor(vec![]);
+        d.handle = Some("ab".into()); // below MIN_BOT_HANDLE
+        assert!(validate_bot_descriptor(&d).is_err());
+        d.handle = Some("abc".into());
+        assert!(validate_bot_descriptor(&d).is_ok());
+        d.handle = Some("a".repeat(MAX_BOT_HANDLE));
+        assert!(validate_bot_descriptor(&d).is_ok());
+        d.handle = Some("a".repeat(MAX_BOT_HANDLE + 1));
+        assert!(validate_bot_descriptor(&d).is_err());
+        // ASCII-only is what removes homograph impersonation from the handle
+        // namespace clients disambiguate on (`/cmd@handle`).
+        d.handle = Some("Соin".into()); // Cyrillic С
+        assert!(validate_bot_descriptor(&d).is_err());
+        d.handle = Some("bad-handle".into());
+        assert!(validate_bot_descriptor(&d).is_err());
+    }
+
+    #[test]
+    fn commands_none_and_empty_are_different_requests() {
+        // `None` = leave the stored list alone; `Some([])` = clear it. Both are
+        // valid; collapsing them would make "clear my commands" impossible.
+        let mut d = descriptor(vec![]);
+        d.commands = None;
+        assert!(validate_bot_descriptor(&d).is_ok());
+        d.commands = Some(vec![]);
+        assert!(validate_bot_descriptor(&d).is_ok());
+    }
+
+    #[test]
+    fn profile_payload_size_is_checked_before_deserialization() {
+        // The per-field caps run only AFTER a successful decode, which is too
+        // late — `bot.commands` is variable-length, so the raw bytes need their
+        // own ceiling on every ingestion path.
+        let oversized = vec![0u8; MAX_PROFILE_PAYLOAD_BYTES + 1];
+        let err = deserialize_payload(MessageType::ProfileUpdate, &oversized)
+            .expect_err("oversized ProfileUpdate payload must be refused");
+        assert!(
+            err.to_string().contains("too large"),
+            "expected a size refusal, got: {err}"
+        );
+    }
+
+    #[test]
+    fn profile_update_round_trips_as_a_named_msgpack_map() {
+        // `to_vec_named` (map encoding), not `to_vec` (array) — a JS client reads
+        // `.field`, and the array form silently breaks every such read.
+        let payload = ProfileUpdatePayload {
+            display_name: Some("Chart Bot".into()),
+            avatar_cid: None,
+            bio: None,
+            bot: Some(descriptor(vec![cmd("c", "Chart for a symbol")])),
+        };
+        let bytes = rmp_serde::to_vec_named(&payload).unwrap();
+        assert!(
+            bytes[0] & 0xF0 == 0x80 || bytes[0] == 0xDE || bytes[0] == 0xDF,
+            "payload must encode as a msgpack MAP, got first byte {:#04x}",
+            bytes[0]
+        );
+        let decoded = match deserialize_payload(MessageType::ProfileUpdate, &bytes).unwrap() {
+            crate::messages::types::DeserializedPayload::ProfileUpdate(p) => p,
+            other => panic!("wrong variant: {other:?}"),
+        };
+        assert_eq!(decoded.bot, payload.bot);
+        assert!(validate_profile_update(&decoded).is_ok());
+    }
+
+    #[test]
+    fn a_profile_update_without_bot_still_decodes() {
+        // Wire-compat: a client that predates bots omits the field entirely.
+        #[derive(serde::Serialize)]
+        struct OldPayload {
+            display_name: Option<String>,
+            avatar_cid: Option<String>,
+            bio: Option<String>,
+        }
+        let bytes = rmp_serde::to_vec_named(&OldPayload {
+            display_name: Some("Alice".into()),
+            avatar_cid: None,
+            bio: None,
+        })
+        .unwrap();
+        let decoded = match deserialize_payload(MessageType::ProfileUpdate, &bytes).unwrap() {
+            crate::messages::types::DeserializedPayload::ProfileUpdate(p) => p,
+            other => panic!("wrong variant: {other:?}"),
+        };
+        assert!(decoded.bot.is_none(), "absent bot must mean UNCHANGED, not cleared");
+    }
+
+    #[test]
+    fn oversized_descriptor_is_rejected_through_validate_profile_update() {
+        let p = ProfileUpdatePayload {
+            display_name: None,
+            avatar_cid: None,
+            bio: None,
+            bot: Some(descriptor(vec![cmd("c", "d"); MAX_BOT_COMMANDS + 1])),
+        };
+        assert!(validate_profile_update(&p).is_err());
     }
 }

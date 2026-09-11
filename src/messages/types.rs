@@ -58,6 +58,12 @@ pub enum MessageType {
     DeviceEncBinding = 0x36,
     DeviceEncRevoke = 0x37,
     KeyVaultSync = 0x38,
+    // 0x39 = BotDescriptor — RESERVED, deliberately NOT a variant and NOT routed.
+    // A bot's identity + command list ship inside ProfileUpdate (0x30) as
+    // `ProfileUpdatePayload.bot`; see spec 01 §3.11 and `BotDescriptor` below.
+    // Take this number only if per-channel or per-language command scopes ever
+    // outgrow the profile record. Kept as a comment rather than an unroutable
+    // variant so nobody wires it by accident.
 
     // Moderation
     Report = 0x40,
@@ -625,6 +631,52 @@ pub struct ProfileUpdatePayload {
     pub avatar_cid: Option<String>,
     /// Max 256 UTF-8 chars.
     pub bio: Option<String>,
+    /// Self-declared bot identity + advertised command list (spec 01 §3.11).
+    ///
+    /// Trailing position + `#[serde(default)]` keeps msgpack wire-compat: a
+    /// ProfileUpdate from a client that predates bots still decodes.
+    ///
+    /// `None` means "unchanged" — never "clear". Clearing is explicit, via
+    /// `is_bot: false`.
+    #[serde(default)]
+    pub bot: Option<BotDescriptor>,
+}
+
+/// A wallet's self-declared bot identity (spec 01 §3.11).
+///
+/// This is a **hint for clients, never an authorization**: anyone may set it and
+/// no node grants any capability on the strength of it. It rides inside
+/// `ProfileUpdate` (0x30) rather than carrying its own message type so that it
+/// inherits profile-topic gossip, the `profile_updated_at` LWW watermark, and
+/// identity-sync backfill unchanged. `MessageType::BotDescriptor` (0x39) is
+/// reserved for the day per-channel or per-language command scopes outgrow this.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BotDescriptor {
+    /// When `false`, the stored descriptor is cleared entirely.
+    pub is_bot: bool,
+    /// Display convenience for `/cmd@handle` disambiguation — NOT identity, NOT
+    /// unique, NOT enforced. ASCII-only by construction, which removes homograph
+    /// impersonation from the namespace clients disambiguate on.
+    #[serde(default)]
+    pub handle: Option<String>,
+    /// Advertised commands. `None` leaves the stored list unchanged; an empty
+    /// `Vec` clears it.
+    #[serde(default)]
+    pub commands: Option<Vec<BotCommand>>,
+}
+
+/// One advertised bot command (spec 01 §3.11).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BotCommand {
+    /// Lowercase on the wire (`^[a-z0-9_]+$`), no leading `/`. Consumers match
+    /// case-insensitively — mobile keyboards autocapitalise an empty composer.
+    pub name: String,
+    /// Human-readable, full Unicode (CJK included). Only control and
+    /// bidirectional codepoints are rejected — this is NOT an ASCII allowlist.
+    pub description: String,
+    /// e.g. `"<symbol> [days]"`.
+    #[serde(default)]
+    pub args_hint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -972,7 +1024,30 @@ pub fn deserialize_payload(
         MessageType::NewsRepost => Ok(DeserializedPayload::NewsRepost(rmp_serde::from_slice(payload_bytes)?)),
         MessageType::NewsPost => Ok(DeserializedPayload::NewsPost(rmp_serde::from_slice(payload_bytes)?)),
         MessageType::NewsComment => Ok(DeserializedPayload::NewsComment(rmp_serde::from_slice(payload_bytes)?)),
-        MessageType::ProfileUpdate => Ok(DeserializedPayload::ProfileUpdate(rmp_serde::from_slice(payload_bytes)?)),
+        MessageType::ProfileUpdate => {
+            // Bound the RAW BYTES before deserializing (spec 01 §3.11).
+            //
+            // `ProfileUpdatePayload` carries a variable-length array
+            // (`bot.commands`); without this the only ceiling on what reaches
+            // the msgpack decoder is the transport's — 10 MiB via
+            // `DefaultBodyLimit` on the HTTP path, 256 KiB on the wire. The
+            // per-field caps in `validate_profile_update` run only AFTER a
+            // successful decode, which is too late to matter.
+            //
+            // This sits in `deserialize_payload` rather than at each call site
+            // deliberately: it is the single choke point every ingestion path
+            // (gossip, identity-sync, `PUT /api/v1/profile`,
+            // `POST /api/v1/messages`) funnels through, so no path can acquire
+            // the gap back by being added later.
+            if payload_bytes.len() > crate::messages::validation::MAX_PROFILE_PAYLOAD_BYTES {
+                return Err(rmp_serde::decode::Error::Uncategorized(format!(
+                    "ProfileUpdate payload too large: {} bytes (max {})",
+                    payload_bytes.len(),
+                    crate::messages::validation::MAX_PROFILE_PAYLOAD_BYTES
+                )));
+            }
+            Ok(DeserializedPayload::ProfileUpdate(rmp_serde::from_slice(payload_bytes)?))
+        }
         MessageType::DeviceDelegation => Ok(DeserializedPayload::DeviceDelegation(rmp_serde::from_slice(payload_bytes)?)),
         MessageType::DeviceRevocation => Ok(DeserializedPayload::DeviceRevocation(rmp_serde::from_slice(payload_bytes)?)),
         MessageType::SettingsSync => Ok(DeserializedPayload::SettingsSync(rmp_serde::from_slice(payload_bytes)?)),

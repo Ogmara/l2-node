@@ -104,6 +104,7 @@ enum RateCategory {
     KeyVault,          // 10 per minute (E2E vault — debounced LWW republish)
     DeviceEnc,         // 10 per hour (audit final pre-mainnet W15)
     ChannelMembership, // 20 per hour (join/leave — audit final pre-mainnet Code Audit CRITICAL #1)
+    ProfileUpdate,     // 20/hour unverified, 60/hour registered (spec 01 §6.1)
     Other,             // fallback: 100 per minute
 }
 
@@ -144,6 +145,19 @@ impl RateCategory {
             Self::ModeratorChange => RateLimits::flat(10, 86_400_000),
             Self::ChannelInvite => RateLimits::flat(20, 3_600_000),
             Self::PinUnpin => RateLimits::flat(20, 3_600_000),
+            // Split out of `Other` (100/min) in 0.127.0. A ProfileUpdate can now
+            // carry a bot descriptor, whose arrival broadcasts
+            // `bot_commands_changed` to every connected client — and bots
+            // republish their descriptor on EVERY start (spec 01 §3.11), so a
+            // crash-looping bot at 100/min would flood the profile topic and fan
+            // that out network-wide. Deliberately NO bot exemption: a descriptor
+            // is metadata, not service, and no legitimate bot rewrites its
+            // command list more than a few times an hour. A bot needing a higher
+            // MESSAGE allowance gets it from the registered tier on ChatMessages,
+            // not from here.
+            Self::ProfileUpdate => {
+                RateLimits::flat(if registered { 60 } else { 20 }, 3_600_000)
+            }
             // Legit clients publish a 4 s-debounced last-write-wins vault; 10/min is
             // generous for that while bounding the 2 MB-per-write storage churn.
             Self::KeyVault => RateLimits::flat(10, 60_000),
@@ -189,6 +203,7 @@ impl RateCategory {
             | MessageType::PrivateChannelKeyDistribution => Self::ModeratorChange,
             MessageType::ChannelInvite => Self::ChannelInvite,
             MessageType::ChannelPinMessage | MessageType::ChannelUnpinMessage => Self::PinUnpin,
+            MessageType::ProfileUpdate => Self::ProfileUpdate,
             MessageType::KeyVaultSync => Self::KeyVault,
             MessageType::DeviceEncBinding | MessageType::DeviceEncRevoke => Self::DeviceEnc,
             MessageType::ChannelJoin | MessageType::ChannelLeave => Self::ChannelMembership,
@@ -325,6 +340,19 @@ pub enum RouteResult {
         msg_type: MessageType,
         /// Raw envelope bytes for downstream processing (notifications, etc.).
         raw_bytes: Vec<u8>,
+        /// `Some(wallet)` when this envelope actually changed that wallet's bot
+        /// descriptor, so the caller should emit `bot_commands_changed` and drop
+        /// the affected discovery-cache entries (spec 3 §4.3).
+        ///
+        /// Carried out of the router rather than recomputed downstream because
+        /// the comparison needs the PRE-merge record, which no longer exists by
+        /// the time notifications run. Always `None` from
+        /// `process_synced_message` — enforced by an explicit `!is_sync` gate at
+        /// the construction site, NOT merely by sync's callers ignoring it —
+        /// which is how identity-sync, a path that bypasses rate limiting by
+        /// design, is prevented from triggering a broadcast storm during
+        /// backfill that no rate limit could bound.
+        bot_commands_changed: Option<String>,
     },
     /// Message is a duplicate (already stored).
     Duplicate,
@@ -640,9 +668,13 @@ impl MessageRouter {
         }
 
         // Step 8b: Update indexes using resolved wallet address
-        if let Err(e) = self.update_indexes(&envelope, &resolved_author) {
-            warn!(error = %e, "Failed to update indexes (message still stored)");
-        }
+        let bot_changed = match self.update_indexes(&envelope, &resolved_author) {
+            Ok(changed) => changed,
+            Err(e) => {
+                warn!(error = %e, "Failed to update indexes (message still stored)");
+                false
+            }
+        };
 
         // After first successful message from a basic (non-registered) wallet,
         // mark them as known so future PoW checks are skipped (persists across restarts).
@@ -670,6 +702,18 @@ impl MessageRouter {
             msg_id: envelope.msg_id,
             msg_type: envelope.msg_type,
             raw_bytes: raw_bytes.to_vec(),
+            // `&& !is_sync` is load-bearing, not belt-and-braces. Identity-sync
+            // calls this same function via `process_synced_message`, so without
+            // the gate a backfill of N ProfileUpdates would emit N broadcasts —
+            // and the sync path deliberately bypasses rate limiting, so the
+            // ProfileUpdate category could not bound them. The sync call sites
+            // happen to discard the result today, which makes this invariant
+            // true by accident; the gate makes it true by construction.
+            bot_commands_changed: if bot_changed && !is_sync {
+                Some(resolved_author.clone())
+            } else {
+                None
+            },
         }
     }
 
@@ -2084,7 +2128,15 @@ impl MessageRouter {
     }
 
     /// Update storage indexes based on message type.
-    fn update_indexes(&self, envelope: &Envelope, resolved_author: &str) -> Result<()> {
+    /// Returns `true` when this envelope actually CHANGED the author's bot
+    /// descriptor (spec 01 §3.11) — the caller uses it to decide whether to emit
+    /// `bot_commands_changed`. It is a content comparison, not a "did we store
+    /// something" flag: bots republish their descriptor on every start, and a
+    /// restart always carries a fresh timestamp, so the LWW watermark alone
+    /// would let every restart through to a network-wide broadcast.
+    fn update_indexes(&self, envelope: &Envelope, resolved_author: &str) -> Result<bool> {
+        // Set by the ProfileUpdate arm; see the doc comment above.
+        let mut bot_changed = false;
         // P-1 (identity-sync): index a user's signed identity envelopes
         // (delegation/revocation/profile/follow/unfollow) under their wallet so
         // the per-wallet identity-sync responder can re-serve them to a node the
@@ -2331,7 +2383,7 @@ impl MessageRouter {
                             channel_id = payload.channel_id,
                             "ChannelCreate for tombstoned channel — ignoring (deleted)"
                         );
-                        return Ok(());
+                        return Ok(false);
                     }
                     if let Ok(Some(existing)) = self.storage.get_cf(schema::cf::CHANNELS, &key) {
                         // Channel already exists — typically the chain scanner's
@@ -3274,7 +3326,7 @@ impl MessageRouter {
                                 incoming_ts = envelope.timestamp,
                                 "DeviceDelegation older-or-equal to revocation tombstone — rejected"
                             );
-                            return Ok(());
+                            return Ok(false);
                         }
                     }
 
@@ -3306,7 +3358,7 @@ impl MessageRouter {
                                 incoming_ts = envelope.timestamp,
                                 "DeviceDelegation older or equal — no-op"
                             );
-                            return Ok(());
+                            return Ok(false);
                         }
                     }
 
@@ -3335,7 +3387,7 @@ impl MessageRouter {
                             cap = MAX_DEVICES_PER_WALLET,
                             "DeviceDelegation arrival exceeded per-wallet device cap; dropping"
                         );
-                        return Ok(());
+                        return Ok(false);
                     }
 
                     let claim = crate::storage::rocks::DeviceClaim {
@@ -3643,7 +3695,7 @@ impl MessageRouter {
                             incoming = envelope.timestamp,
                             "ProfileUpdate older-or-equal — no-op (LWW)"
                         );
-                        return Ok(());
+                        return Ok(false);
                     }
 
                     // Capture old display_name BEFORE merge so we can clean up the
@@ -3652,6 +3704,19 @@ impl MessageRouter {
                         .get("display_name")
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string());
+
+                    // Snapshot the bot descriptor BEFORE the merge so we can tell a
+                    // real change from a no-op republish. Deliberately EXCLUDES
+                    // `bot_updated_at`, which moves on every republish and would make
+                    // every comparison report a change.
+                    let bot_snapshot = |r: &serde_json::Value| {
+                        (
+                            r.get("is_bot").and_then(|v| v.as_bool()).unwrap_or(false),
+                            r.get("bot_handle").cloned().unwrap_or(serde_json::Value::Null),
+                            r.get("bot_commands").cloned().unwrap_or(serde_json::Value::Null),
+                        )
+                    };
+                    let old_bot = bot_snapshot(&record);
 
                     // Merge profile fields
                     if let serde_json::Value::Object(ref mut map) = record {
@@ -3664,12 +3729,50 @@ impl MessageRouter {
                         if let Some(bio) = &payload.bio {
                             map.insert("bio".into(), serde_json::json!(bio));
                         }
+                        // Bot descriptor (spec 01 §3.11). Absent `bot` means
+                        // UNCHANGED — never "clear" — so a plain display-name edit
+                        // from an ordinary client cannot wipe a bot's command list.
+                        if let Some(bot) = &payload.bot {
+                            if !bot.is_bot {
+                                // `is_bot: false` is the explicit un-declare: it
+                                // clears the whole descriptor, not just the flag.
+                                map.insert("is_bot".into(), serde_json::json!(false));
+                                map.insert("bot_handle".into(), serde_json::Value::Null);
+                                map.insert("bot_commands".into(), serde_json::json!([]));
+                            } else {
+                                map.insert("is_bot".into(), serde_json::json!(true));
+                                // `handle: None` leaves an existing handle alone.
+                                if let Some(h) = &bot.handle {
+                                    map.insert("bot_handle".into(), serde_json::json!(h));
+                                }
+                                // `commands: None` leaves the stored list alone;
+                                // `Some([])` clears it. These are different requests
+                                // and must not collapse into one.
+                                if let Some(cmds) = &bot.commands {
+                                    map.insert("bot_commands".into(), serde_json::json!(cmds));
+                                }
+                            }
+                            // Informational only. The authoritative anti-replay
+                            // watermark stays `profile_updated_at` above — a second
+                            // LWW key on the same record is how you get two truths.
+                            map.insert(
+                                "bot_updated_at".into(),
+                                serde_json::json!(envelope.timestamp),
+                            );
+                        }
                         // Record the LWW watermark for the next apply.
                         map.insert(
                             "profile_updated_at".into(),
                             serde_json::json!(envelope.timestamp),
                         );
                     }
+
+                    // Content comparison gates the BROADCAST; the LWW check above
+                    // gates the REPLAY. Both are required: a bot restart produces a
+                    // fresh timestamp (so LWW passes) carrying an identical
+                    // descriptor (so this suppresses), which is what makes
+                    // republish-on-start free.
+                    bot_changed = payload.bot.is_some() && bot_snapshot(&record) != old_bot;
 
                     let bytes = serde_json::to_vec(&record)
                         .context("serializing user record")?;
@@ -3794,14 +3897,14 @@ impl MessageRouter {
                             author = %envelope.author,
                             "NodeAnnouncement node_id mismatch — rejecting"
                         );
-                        return Ok(());
+                        return Ok(false);
                     }
 
                     // Validate payload bounds
                     if payload.channels.len() > 10_000 {
                         warn!(node_id = %payload.node_id, count = payload.channels.len(),
                             "NodeAnnouncement channels list too large — rejecting");
-                        return Ok(());
+                        return Ok(false);
                     }
                     if let Some(ref ep) = payload.api_endpoint {
                         if ep.len() > 256
@@ -3809,7 +3912,7 @@ impl MessageRouter {
                         {
                             warn!(node_id = %payload.node_id,
                                 "NodeAnnouncement invalid api_endpoint — rejecting");
-                            return Ok(());
+                            return Ok(false);
                         }
                     }
 
@@ -3825,7 +3928,7 @@ impl MessageRouter {
                         )?.is_none() {
                             debug!(node_id = %payload.node_id,
                                 "Peer directory at capacity, ignoring new node");
-                            return Ok(());
+                            return Ok(false);
                         }
                     }
 
@@ -3876,7 +3979,7 @@ impl MessageRouter {
             _ => {}
         }
 
-        Ok(())
+        Ok(bot_changed)
     }
 }
 
@@ -5986,5 +6089,203 @@ mod hot_topics_ingest_tests {
             .count_prefix_cf(schema::cf::HOT_TOPICS_LOCAL, &bucket.to_be_bytes(), 10)
             .unwrap();
         assert_eq!(tracked, 2, "third distinct tag must be dropped at the cap");
+    }
+}
+
+// --- Bot descriptor: broadcast signalling (spec 01 §3.11, spec 03 §4.3) ---
+
+#[cfg(test)]
+mod bot_broadcast_signal_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn router() -> (MessageRouter, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let identity = IdentityResolver::new(storage.clone());
+        (
+            MessageRouter::new(
+                storage,
+                identity,
+                None,
+                "testnet".to_string(),
+                usize::MAX,
+                std::sync::Arc::new(crate::metrics::counters::NetworkCounters::new()),
+                crate::config::RateLimitsConfig::default(),
+            ),
+            dir,
+        )
+    }
+
+    fn now_ms() -> u64 {
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
+    }
+
+    /// A fully signed ProfileUpdate carrying (or clearing) a bot descriptor.
+    fn signed_profile_update(
+        sk: &ed25519_dalek::SigningKey,
+        author: &str,
+        bot: Option<BotDescriptor>,
+        timestamp: u64,
+    ) -> Vec<u8> {
+        let payload = ProfileUpdatePayload {
+            display_name: Some("Chart Bot".into()),
+            avatar_cid: None,
+            bio: None,
+            bot,
+        };
+        let payload_bytes = rmp_serde::to_vec_named(&payload).unwrap();
+        let author_pubkey: [u8; 32] = sk.verifying_key().to_bytes();
+        let msg_id = crypto::compute_msg_id("testnet", &author_pubkey, &payload_bytes, timestamp);
+        let signature = signing::sign_ogmara_message(
+            sk,
+            "testnet",
+            crate::messages::envelope::PROTOCOL_VERSION,
+            MessageType::ProfileUpdate as u8,
+            &msg_id,
+            timestamp,
+            &payload_bytes,
+        );
+        let envelope = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::ProfileUpdate,
+            msg_id,
+            author: author.to_string(),
+            timestamp,
+            lamport_ts: 0,
+            payload: payload_bytes,
+            signature: signature.to_bytes().to_vec(),
+            relay_path: vec![],
+        };
+        rmp_serde::to_vec_named(&envelope).unwrap()
+    }
+
+    fn descriptor(desc: &str) -> BotDescriptor {
+        BotDescriptor {
+            is_bot: true,
+            handle: Some("CoinTrendz".into()),
+            commands: Some(vec![BotCommand {
+                name: "c".into(),
+                description: desc.into(),
+                args_hint: None,
+            }]),
+        }
+    }
+
+    fn signal(r: &MessageRouter, raw: &[u8]) -> Option<String> {
+        match r.process_message(raw) {
+            RouteResult::Accepted { bot_commands_changed, .. } => bot_commands_changed,
+            other => panic!("expected Accepted, got {other:?}"),
+        }
+    }
+
+    fn sync_signal(r: &MessageRouter, raw: &[u8]) -> Option<String> {
+        match r.process_synced_message(raw) {
+            RouteResult::Accepted { bot_commands_changed, .. } => bot_commands_changed,
+            other => panic!("expected Accepted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_first_descriptor_signals_a_change() {
+        let (r, _d) = router();
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let author = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        let raw = signed_profile_update(&sk, &author, Some(descriptor("Chart")), now_ms());
+        assert_eq!(signal(&r, &raw), Some(author));
+    }
+
+    #[test]
+    fn an_identical_republish_does_not_signal() {
+        // THE republish-on-start guarantee (spec 01 §3.11): a bot resends its
+        // descriptor on every start, and the restart carries a FRESH timestamp —
+        // so the LWW watermark alone would let every restart through to a
+        // network-wide broadcast. Only the content comparison suppresses it.
+        let (r, _d) = router();
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[10u8; 32]);
+        let author = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        let t = now_ms();
+        assert_eq!(
+            signal(&r, &signed_profile_update(&sk, &author, Some(descriptor("Chart")), t)),
+            Some(author.clone())
+        );
+        // Same descriptor, strictly newer timestamp — passes LWW, must not signal.
+        assert_eq!(
+            signal(&r, &signed_profile_update(&sk, &author, Some(descriptor("Chart")), t + 1000)),
+            None,
+            "an identical republish must not trigger a broadcast"
+        );
+        // A real edit does signal.
+        assert_eq!(
+            signal(&r, &signed_profile_update(&sk, &author, Some(descriptor("Chart v2")), t + 2000)),
+            Some(author)
+        );
+    }
+
+    #[test]
+    fn a_profile_edit_without_a_descriptor_never_signals() {
+        let (r, _d) = router();
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[11u8; 32]);
+        let author = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        let t = now_ms();
+        let _ = signal(&r, &signed_profile_update(&sk, &author, Some(descriptor("Chart")), t));
+        assert_eq!(
+            signal(&r, &signed_profile_update(&sk, &author, None, t + 1000)),
+            None,
+            "an ordinary display-name edit must not signal, and must not clear the descriptor"
+        );
+        // ...and the descriptor survived that edit.
+        let rec: serde_json::Value = serde_json::from_slice(
+            &r.storage.get_cf(schema::cf::USERS, author.as_bytes()).unwrap().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(rec["is_bot"], serde_json::json!(true));
+        assert_eq!(rec["bot_commands"][0]["name"], serde_json::json!("c"));
+    }
+
+    #[test]
+    fn identity_sync_never_signals() {
+        // LOAD-BEARING (spec 03 §4.3): identity-sync deliberately bypasses rate
+        // limiting, so if it could signal, a backfill of N profile updates would
+        // emit N network-wide broadcasts that no rate limit could bound. The
+        // gate is at the construction site, NOT at sync's call sites — this test
+        // exists because relying on callers to discard the value made the
+        // invariant true only by accident.
+        let (r, _d) = router();
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[12u8; 32]);
+        let author = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        let raw = signed_profile_update(&sk, &author, Some(descriptor("Chart")), now_ms());
+        assert_eq!(
+            sync_signal(&r, &raw),
+            None,
+            "process_synced_message must never signal a descriptor change"
+        );
+        // The descriptor IS still applied — only the broadcast is suppressed.
+        let rec: serde_json::Value = serde_json::from_slice(
+            &r.storage.get_cf(schema::cf::USERS, author.as_bytes()).unwrap().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(rec["is_bot"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn un_declaring_clears_the_descriptor_and_signals() {
+        let (r, _d) = router();
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[13u8; 32]);
+        let author = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        let t = now_ms();
+        let _ = signal(&r, &signed_profile_update(&sk, &author, Some(descriptor("Chart")), t));
+        let cleared = BotDescriptor { is_bot: false, handle: None, commands: None };
+        assert_eq!(
+            signal(&r, &signed_profile_update(&sk, &author, Some(cleared), t + 1000)),
+            Some(author.clone())
+        );
+        let rec: serde_json::Value = serde_json::from_slice(
+            &r.storage.get_cf(schema::cf::USERS, author.as_bytes()).unwrap().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(rec["is_bot"], serde_json::json!(false));
+        assert_eq!(rec["bot_handle"], serde_json::Value::Null);
+        assert_eq!(rec["bot_commands"], serde_json::json!([]));
     }
 }

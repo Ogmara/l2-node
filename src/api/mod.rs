@@ -141,6 +141,10 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
             get(routes::get_channel_pins),
         )
         .route(
+            "/api/v1/channels/{channel_id}/bots",
+            get(routes::get_channel_bots),
+        )
+        .route(
             "/api/v1/news/{msg_id}/reactions",
             get(routes::get_news_reactions),
         )

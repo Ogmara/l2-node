@@ -37,6 +37,9 @@ pub struct Config {
     pub alerts: AlertsConfig,
     #[serde(default)]
     pub metrics: MetricsConfig,
+    /// Bot command discovery (spec 3 §4.1, l2-node 0.127.0).
+    #[serde(default)]
+    pub bots: BotsConfig,
     /// Cross-node media fallback policy (spec 3 §media-fetch, l2-node
     /// 0.46.7+). Separate from `[ipfs]` because the concerns are
     /// distinct: `[ipfs]` is local-Kubo connection + handler resource
@@ -1865,6 +1868,63 @@ pub struct OgmaraChannelAlertConfig {
     pub signing_key_path: String,
 }
 
+/// Bot command discovery for `GET /api/v1/channels/{channel_id}/bots`
+/// (spec 3 §4.1, l2-node 0.127.0).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BotsConfig {
+    /// Staleness ceiling on a channel's resolved bot list, in seconds.
+    ///
+    /// Not a refresh interval — the entry is also evicted early on a membership
+    /// change for that channel. A bot editing its commands, or being muted or
+    /// banned, needs NO invalidation — only the address list is cached, and
+    /// commands and moderation state are re-read on every request. Raising this
+    /// therefore only widens the window in which a newly-JOINED bot is missing.
+    #[serde(default = "default_bots_cache_ttl")]
+    pub channel_bots_cache_ttl_secs: u64,
+    /// Hard ceiling on the CHANNEL_MEMBERS scan behind the endpoint. Past it the
+    /// handler stops and reports `scan_capped`, rather than returning a partial
+    /// list as though it were complete.
+    #[serde(default = "default_bots_max_scanned")]
+    pub channel_bots_max_members_scanned: usize,
+    /// Hard ceiling on how many bots one response may carry.
+    ///
+    /// NOT redundant with the scan cap: that bounds the INPUT, this bounds the
+    /// OUTPUT. A channel well under the scan ceiling can still be almost
+    /// entirely bots, and an uncapped response is
+    /// `bots x 32 commands x ~224 B` — tens of MB on a path the composer hits on
+    /// every channel open.
+    #[serde(default = "default_bots_max_returned")]
+    pub channel_bots_max_returned: usize,
+    /// Max channels held in the discovery cache. Bounds the cache itself; each
+    /// entry is a list of bot addresses, not a rendered response.
+    #[serde(default = "default_bots_cache_max_entries")]
+    pub channel_bots_cache_max_entries: usize,
+}
+
+fn default_bots_cache_ttl() -> u64 {
+    60
+}
+fn default_bots_max_scanned() -> usize {
+    5000
+}
+fn default_bots_max_returned() -> usize {
+    50
+}
+fn default_bots_cache_max_entries() -> usize {
+    1000
+}
+
+impl Default for BotsConfig {
+    fn default() -> Self {
+        Self {
+            channel_bots_cache_ttl_secs: default_bots_cache_ttl(),
+            channel_bots_max_members_scanned: default_bots_max_scanned(),
+            channel_bots_max_returned: default_bots_max_returned(),
+            channel_bots_cache_max_entries: default_bots_cache_max_entries(),
+        }
+    }
+}
+
 /// Metrics collection configuration (spec 10-dashboard.md §10.3).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetricsConfig {
@@ -2283,6 +2343,30 @@ impl Config {
             anyhow::bail!(
                 "network.sc_discovery.max_candidates must be > 0 (default is 5)"
             );
+        }
+        // Spec 3 §4.1 — bot discovery bounds. Zeros here fail SILENTLY rather
+        // than loudly: a zero scan cap makes the endpoint return an empty list
+        // forever while reporting `scan_capped: true`, and a zero TTL keeps the
+        // cache's full memory cost at a 0% hit rate. The scan cap also carries a
+        // hard ceiling because it IS the endpoint's DoS bound — an operator who
+        // raises it to "unlimited" removes the protection the design relies on.
+        if self.bots.channel_bots_max_members_scanned == 0 {
+            anyhow::bail!("bots.channel_bots_max_members_scanned must be > 0 (default is 5000)");
+        }
+        if self.bots.channel_bots_max_members_scanned > 100_000 {
+            anyhow::bail!(
+                "bots.channel_bots_max_members_scanned must be <= 100000 (default is 5000) — \
+                 it is the scan bound on an endpoint clients hit on every channel open"
+            );
+        }
+        if self.bots.channel_bots_max_returned == 0 {
+            anyhow::bail!("bots.channel_bots_max_returned must be > 0 (default is 50)");
+        }
+        if self.bots.channel_bots_cache_ttl_secs == 0 {
+            anyhow::bail!("bots.channel_bots_cache_ttl_secs must be > 0 (default is 60)");
+        }
+        if self.bots.channel_bots_cache_max_entries == 0 {
+            anyhow::bail!("bots.channel_bots_cache_max_entries must be > 0 (default is 1000)");
         }
         // Spec 3 §media-fetch (l2-node 0.46.7+) — media peer-fallback
         // tunables. Zero values would either deadlock (fanout=0 fans
@@ -3357,6 +3441,31 @@ max_total_bytes = 2147483648             # 2 GiB hard cap on snapshot size
 # at startup whenever this is true.
 experimental_skip_anchor_verify = false
 
+[bots]
+# Bot command discovery (spec 3 §4.1), behind
+# GET /api/v1/channels/{channel_id}/bots — the source for the "/" command
+# autocomplete in the clients. A bot is an ordinary wallet that self-declares
+# `is_bot` in its profile; nothing here grants a bot any capability.
+#
+# How long a channel's resolved bot MEMBERSHIP is cached, in seconds. Only the
+# address list is cached — commands, bans and mutes are re-read on every
+# request, so a bot editing its commands (or being muted) takes effect at once
+# regardless of this value. Raising it only widens the window in which a
+# newly-JOINED bot is missing from the picker.
+channel_bots_cache_ttl_secs = 60
+# Hard ceiling on the CHANNEL_MEMBERS scan behind that endpoint. This is the
+# endpoint's DoS bound: past it the handler stops and reports
+# `scan_capped: true` rather than returning a partial list as if complete.
+# Lower it on a node serving very large channels. Rejected at load if 0, and
+# capped at 100000.
+channel_bots_max_members_scanned = 5000
+# Max bots in one response. Bounds the OUTPUT, which the scan cap does not —
+# a small channel can still be almost entirely bots. Clients render at most
+# 20 rows regardless.
+channel_bots_max_returned = 50
+# Max channels held in the discovery cache.
+channel_bots_cache_max_entries = 1000
+
 [metrics]
 enabled = true
 system_interval_seconds = 10
@@ -4098,6 +4207,7 @@ mod tests {
             "[anchoring]",
             "[anchoring.metadata]",
             "[snapshot]",
+            "[bots]",
             "[metrics]",
             "[alerts]",
             "[alerts.cooldown]",

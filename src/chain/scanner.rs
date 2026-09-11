@@ -459,13 +459,33 @@ impl ChainScanner {
                 public_key,
                 timestamp,
             } => {
-                // Merge with existing record to preserve profile data (display_name, avatar, bio).
+                // Merge with existing record to preserve profile data.
                 // The chain scanner may re-process blocks, so this must be idempotent.
+                //
+                // Merge FIELD-WISE into the raw JSON, never through the typed
+                // `UserRecord`. The `users` row is a free-form JSON document owned
+                // jointly by this scanner and the message router
+                // (`messages/router.rs`, ProfileUpdate arm), and `UserRecord` is a
+                // CLOSED struct listing only six keys — round-tripping through it
+                // silently deletes every key it does not declare. That previously
+                // dropped `profile_updated_at`, which is the P-2 anti-replay
+                // watermark: with it gone, `prev_profile_ts` reads back as 0 and a
+                // stale ProfileUpdate served over identity-sync (which skips the
+                // clock-drift check) applies cleanly — exactly the backfill
+                // downgrade the watermark exists to prevent. It now also carries a
+                // wallet's bot descriptor (spec 01 §3.11).
+                //
+                // Do NOT "fix" this by adding fields to `UserRecord`; that repairs
+                // today and breaks again the next time the router learns a key.
                 if let Some(existing) = self.storage.get_cf(cf::USERS, address.as_bytes())? {
-                    // Record exists — only update registration fields, preserve profile
-                    let mut record: UserRecord = serde_json::from_slice(&existing)?;
-                    record.public_key = public_key;
-                    record.registered_at = timestamp;
+                    let record = merge_user_fields(
+                        &existing,
+                        &address,
+                        &[
+                            ("public_key", serde_json::json!(public_key)),
+                            ("registered_at", serde_json::json!(timestamp)),
+                        ],
+                    );
                     let bytes = serde_json::to_vec(&record)?;
                     self.storage
                         .put_cf(cf::USERS, address.as_bytes(), &bytes)?;
@@ -495,8 +515,13 @@ impl ChainScanner {
                 public_key,
             } => {
                 if let Some(existing) = self.storage.get_cf(cf::USERS, address.as_bytes())? {
-                    let mut record: UserRecord = serde_json::from_slice(&existing)?;
-                    record.public_key = public_key;
+                    // Same helper as the UserRegistered arm — see its doc comment
+                    // for why this must not go through `UserRecord`.
+                    let record = merge_user_fields(
+                        &existing,
+                        &address,
+                        &[("public_key", serde_json::json!(public_key))],
+                    );
                     let bytes = serde_json::to_vec(&record)?;
                     self.storage
                         .put_cf(cf::USERS, address.as_bytes(), &bytes)?;
@@ -968,4 +993,120 @@ pub fn gc_snapshot_rollback_if_ready(
     // Clear the marker keys so we don't repeat the work.
     let _ = storage.delete_cf(cf::NODE_STATE, state_keys::SNAPSHOT_ROLLBACK_DIR);
     let _ = storage.delete_cf(cf::NODE_STATE, state_keys::SNAPSHOT_APPLIED_AT_HEIGHT);
+}
+
+/// Merge `updates` into an existing `users` row, preserving every key the
+/// caller does not explicitly set.
+///
+/// The `users` row is a free-form JSON document written by TWO owners: this
+/// chain scanner (`registered_at`, `public_key`) and the message router
+/// (`display_name`, `avatar_cid`, `bio`, `profile_updated_at`, and the bot
+/// descriptor — spec 01 §3.11). Neither owner may round-trip it through a
+/// closed typed struct: serde drops undeclared keys on re-serialize, so doing
+/// that silently deletes the other owner's fields.
+///
+/// That is not hypothetical. `UserRegistered` and `PublicKeyUpdated` previously
+/// went through `UserRecord`, whose six fields do not include
+/// `profile_updated_at` — **the P-2 anti-replay watermark**. Every on-chain
+/// registration, and every block re-scan, erased it. With the watermark gone
+/// `prev_profile_ts` reads back as `0`, the LWW guard passes for any timestamp,
+/// and a stale ProfileUpdate served over identity-sync (which deliberately skips
+/// the clock-drift check) applies cleanly — exactly the backfill downgrade the
+/// watermark exists to prevent.
+///
+/// Do NOT "fix" a future occurrence by adding fields to `UserRecord`. That
+/// repairs today and breaks again the next time the router learns a key.
+fn merge_user_fields(
+    existing: &[u8],
+    address: &str,
+    updates: &[(&str, serde_json::Value)],
+) -> serde_json::Value {
+    // Parse failure yields `Null` rather than `{}` deliberately: an empty object
+    // IS an object, so falling back to `{}` would skip the repair branch below
+    // and silently drop `address` from a row rebuilt out of unparseable bytes.
+    let mut record: serde_json::Value =
+        serde_json::from_slice(existing).unwrap_or(serde_json::Value::Null);
+    if !record.is_object() {
+        // Unparseable, or valid JSON that is not an object (an array, a bare
+        // string): start a fresh row rather than writing the malformed value
+        // back and losing the update entirely.
+        record = serde_json::json!({ "address": address });
+    }
+    if let serde_json::Value::Object(ref mut map) = record {
+        for (k, v) in updates {
+            map.insert((*k).to_string(), v.clone());
+        }
+    }
+    record
+}
+
+#[cfg(test)]
+mod user_record_merge_tests {
+    use super::*;
+
+    #[test]
+    fn preserves_every_router_owned_key() {
+        // REGRESSION: the scanner used to deserialize into `UserRecord` (six
+        // fields) and re-serialize, silently deleting everything else — including
+        // `profile_updated_at`, the anti-replay watermark, and the bot descriptor.
+        let existing = serde_json::json!({
+            "address": "klv1abc",
+            "public_key": "old",
+            "registered_at": 0,
+            "display_name": "Chart Bot",
+            "bio": "hi",
+            "profile_updated_at": 1234567890u64,
+            "is_bot": true,
+            "bot_handle": "CoinTrendz",
+            "bot_commands": [{"name": "c", "description": "Chart"}],
+            "bot_updated_at": 1234567890u64,
+        })
+        .to_string();
+
+        let merged = merge_user_fields(
+            existing.as_bytes(),
+            "klv1abc",
+            &[
+                ("public_key", serde_json::json!("new")),
+                ("registered_at", serde_json::json!(999u64)),
+            ],
+        );
+
+        // The on-chain fields were updated...
+        assert_eq!(merged["public_key"], serde_json::json!("new"));
+        assert_eq!(merged["registered_at"], serde_json::json!(999u64));
+        // ...and every router-owned key survived.
+        assert_eq!(merged["profile_updated_at"], serde_json::json!(1234567890u64));
+        assert_eq!(merged["display_name"], serde_json::json!("Chart Bot"));
+        assert_eq!(merged["bio"], serde_json::json!("hi"));
+        assert_eq!(merged["is_bot"], serde_json::json!(true));
+        assert_eq!(merged["bot_handle"], serde_json::json!("CoinTrendz"));
+        assert_eq!(merged["bot_commands"][0]["name"], serde_json::json!("c"));
+        assert_eq!(merged["bot_updated_at"], serde_json::json!(1234567890u64));
+    }
+
+    #[test]
+    fn unknown_future_keys_survive_too() {
+        // The point is the GENERAL property, not a list of today's field names:
+        // a key this code has never heard of must still round-trip.
+        let existing = serde_json::json!({ "address": "klv1x", "some_future_field": 42 }).to_string();
+        let merged = merge_user_fields(
+            existing.as_bytes(),
+            "klv1x",
+            &[("public_key", serde_json::json!("pk"))],
+        );
+        assert_eq!(merged["some_future_field"], serde_json::json!(42));
+        assert_eq!(merged["public_key"], serde_json::json!("pk"));
+    }
+
+    #[test]
+    fn a_malformed_row_does_not_swallow_the_update() {
+        // Both arms behave identically here — the earlier inline versions did not.
+        for bad in [b"not json".as_slice(), b"[1,2,3]".as_slice(), b"".as_slice()] {
+            let merged =
+                merge_user_fields(bad, "klv1y", &[("public_key", serde_json::json!("pk"))]);
+            assert_eq!(merged["public_key"], serde_json::json!("pk"));
+            assert_eq!(merged["address"], serde_json::json!("klv1y"));
+        }
+    }
 }

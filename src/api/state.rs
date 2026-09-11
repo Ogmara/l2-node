@@ -296,6 +296,8 @@ pub struct AppState {
     /// reshaping needed (or permitted: reshaping by hand risks a
     /// future secret field going unredacted).
     pub alerts_config: crate::config::AlertsConfig,
+    /// Bot command discovery bounds (spec 3 §4.1, l2-node 0.127.0).
+    pub bots_config: crate::config::BotsConfig,
     /// Channel to request a one-off test dispatch from the running
     /// `AlertEngine` (`POST /admin/alerts/test`). `None` when alerts
     /// are disabled (`[alerts] enabled = false`, no engine running).
@@ -596,6 +598,7 @@ impl AppState {
             None,                                           // governance_submit — disabled in tests
             None,                                           // anchor_wallet_address — disabled in tests
             crate::config::AlertsConfig::default(),         // alerts_config — default in tests
+            crate::config::BotsConfig::default(),           // bots_config — default in tests
             None,                                           // alert_test_tx — disabled in tests
             None,                                           // hot_topics — storage-less test state
         )
@@ -654,6 +657,7 @@ impl AppState {
         governance_submit: Option<crate::chain::anchoring::GovernanceSubmitSender>,
         anchor_wallet_address: Option<String>,
         alerts_config: crate::config::AlertsConfig,
+        bots_config: crate::config::BotsConfig,
         alert_test_tx: Option<crate::notifications::alerts::TestAlertSender>,
         hot_topics: Option<Arc<crate::network::hot_topics::HotTopicsAggregator>>,
     ) -> Self {
@@ -767,6 +771,7 @@ impl AppState {
             anchor_wallet_address,
             governance_inflight,
             alerts_config,
+            bots_config,
             alert_test_tx,
             hot_topics,
         }

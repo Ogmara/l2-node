@@ -3,9 +3,9 @@
 //! Parses the `mentions` field in chat messages, matches against locally
 //! connected users, and delivers notifications via WebSocket and push gateway.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tokio::sync::{broadcast, RwLock};
@@ -79,7 +79,58 @@ pub struct NotificationEngine {
     /// `Storage::store_notification_capped`'s doc comment for the full
     /// rationale. `0` = unlimited.
     max_stored_per_address: u64,
+    /// Per-wallet coalescing for `bot_commands_changed` (spec 3 §4.3):
+    /// `wallet -> last broadcast instant`.
+    ///
+    /// SIZE-BOUNDED at [`BOT_COALESCE_MAX_ENTRIES`] and pruned on insert — an
+    /// unbounded per-address map is a memory-exhaustion vector, and this one is
+    /// keyed by attacker-suppliable input.
+    bot_broadcast_seen: Arc<RwLock<HashMap<String, Instant>>>,
+    /// Which members of a channel are bots, for
+    /// `GET /api/v1/channels/{channel_id}/bots` (spec 3 §4.1):
+    /// `channel_id -> (computed_at, bot addresses)`.
+    ///
+    /// Caches only the ADDRESS LIST, never the rendered response. That choice
+    /// does most of the work in this feature's cost model:
+    ///
+    /// - **Memory.** A rendered response is up to 50 bots x 32 commands x ~224 B;
+    ///   held as `serde_json::Value` that is ~1 MB per channel, so a 1000-entry
+    ///   cache would be ~1 GB of RSS. An address list is ~50 x 62 B, so the same
+    ///   cache is a few MB.
+    /// - **Freshness.** Commands are re-read from `USERS` on every request, so a
+    ///   descriptor change is visible IMMEDIATELY without invalidating anything.
+    ///   That is why a descriptor change does not flush this cache: it does not
+    ///   need to, and a global flush would be a remotely-triggerable off-switch
+    ///   for the only defense this endpoint has.
+    /// - **Moderation.** Ban and mute are re-applied on every read, so a mute or
+    ///   an unban takes effect at once rather than after the TTL.
+    ///
+    /// What it still saves is the expensive part: the up-to-5000-row
+    /// `CHANNEL_MEMBERS` scan. Only a MEMBERSHIP change invalidates an entry, and
+    /// that trigger is already keyed by channel.
+    ///
+    /// Lives on the engine rather than on `AppState` because invalidation must
+    /// happen on BOTH ingestion paths — the API post path holds `AppState`, but
+    /// the gossip receive path does not, and the engine is the one component
+    /// both already share. Node-local derived state: never persisted, and so
+    /// excluded from snapshot `DOMAIN_CFS` by construction.
+    /// `channel_id -> (computed_at, scan_was_capped, bot addresses)`.
+    ///
+    /// `scan_was_capped` rides WITH the entry: it is a property of the scan that
+    /// produced this list, so serving the list without it would report a
+    /// truncated channel as complete for the whole TTL — the one thing the flag
+    /// exists to prevent.
+    channel_bots_cache: Arc<RwLock<HashMap<u64, (Instant, bool, Arc<Vec<String>>)>>>,
 }
+
+/// Minimum gap between two `bot_commands_changed` broadcasts for the SAME
+/// wallet. The descriptor is public and the event carries no payload, so the
+/// cost of a broadcast is fan-out, not disclosure — this bounds the fan-out.
+const BOT_COALESCE_WINDOW: Duration = Duration::from_secs(10);
+/// Hard cap on the coalescing map. On overflow the least-recently-broadcast
+/// entries are dropped; losing one only means the next broadcast for that
+/// wallet is not coalesced, which is safe.
+const BOT_COALESCE_MAX_ENTRIES: usize = 10_000;
 
 impl NotificationEngine {
     pub fn new(
@@ -99,6 +150,8 @@ impl NotificationEngine {
                 .unwrap_or_default(),
             storage: None,
             max_stored_per_address,
+            bot_broadcast_seen: Arc::new(RwLock::new(HashMap::new())),
+            channel_bots_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -270,6 +323,11 @@ impl NotificationEngine {
                     } else {
                         "leave"
                     };
+                    // Membership decides who appears in this channel's bot list,
+                    // so a join/leave invalidates it. Unlike a descriptor change
+                    // this trigger IS keyed by channel, so it can be a point
+                    // eviction rather than a full flush.
+                    self.channel_bots_invalidate(p.channel_id).await;
                     self.broadcast_channel_membership_change(p.channel_id, action, &member);
                 }
             }
@@ -285,6 +343,10 @@ impl NotificationEngine {
                     } else {
                         "ban"
                     };
+                    // A kicked or banned bot must drop out of this channel's
+                    // picker immediately — the endpoint filters banned/muted bots,
+                    // but a cached response predates the ban.
+                    self.channel_bots_invalidate(p.channel_id).await;
                     self.broadcast_channel_membership_change(p.channel_id, action, &p.target_user);
                 }
             }
@@ -404,6 +466,109 @@ impl NotificationEngine {
         if let Ok(json) = serde_json::to_string(&ws_msg) {
             let _ = self.ws_broadcast.send(Arc::new(WsOutbound {
                 audience: WsAudience::Wallets(members),
+                json,
+            }));
+        }
+    }
+
+    /// Read a channel's cached bot addresses, if present and within `ttl`.
+    pub async fn channel_bots_cached(
+        &self,
+        channel_id: u64,
+        ttl: Duration,
+    ) -> Option<(bool, Arc<Vec<String>>)> {
+        let cache = self.channel_bots_cache.read().await;
+        cache
+            .get(&channel_id)
+            .filter(|(at, _, _)| at.elapsed() < ttl)
+            .map(|(_, capped, v)| (*capped, Arc::clone(v)))
+    }
+
+    /// Store a channel's bot addresses, evicting the oldest entries if the cache
+    /// is at `max_entries`.
+    pub async fn channel_bots_store(
+        &self,
+        channel_id: u64,
+        scan_capped: bool,
+        value: Arc<Vec<String>>,
+        max_entries: usize,
+    ) {
+        let mut cache = self.channel_bots_cache.write().await;
+        if cache.len() >= max_entries && !cache.contains_key(&channel_id) {
+            // Drop the oldest half rather than one entry, so a hot node does not
+            // pay an eviction scan on every single insert once it is full.
+            let mut by_age: Vec<(u64, Instant)> =
+                cache.iter().map(|(k, (at, _, _))| (*k, *at)).collect();
+            by_age.sort_by_key(|(_, at)| *at);
+            for (k, _) in by_age.into_iter().take(max_entries / 2 + 1) {
+                cache.remove(&k);
+            }
+        }
+        cache.insert(channel_id, (Instant::now(), scan_capped, value));
+    }
+
+    /// Drop one channel's cached bot list — used when that channel's membership
+    /// changes, which is a trigger already keyed by channel.
+    pub async fn channel_bots_invalidate(&self, channel_id: u64) {
+        self.channel_bots_cache.write().await.remove(&channel_id);
+    }
+
+    /// Tell every connected client that `wallet`'s bot descriptor changed, so
+    /// clients viewing a channel that bot is in re-fetch
+    /// `GET /api/v1/channels/{channel_id}/bots` and refresh their `/`-picker.
+    ///
+    /// Audience is `Everyone`, deliberately: the descriptor is public, and
+    /// `WsAudience` has no "all authenticated sessions" variant — do not add one
+    /// for this.
+    ///
+    /// The caller is responsible for only invoking this when the descriptor
+    /// ACTUALLY changed (the router's content comparison) and never from
+    /// identity-sync. This method adds the second half of that defense:
+    /// per-wallet coalescing, so a wallet that legitimately edits its commands
+    /// in a burst still only wakes every client once per window.
+    pub async fn broadcast_bot_commands_changed(&self, wallet: &str) {
+        // NOTE: this deliberately does NOT touch `channel_bots_cache`.
+        //
+        // An earlier revision flushed the whole cache here, on the reasoning that
+        // there is no wallet -> channels reverse index so selective eviction is
+        // not computable. That was true but the wrong conclusion: a global flush
+        // reachable from any wallet on any node — the trigger arrives over gossip
+        // — is a remotely-triggerable off-switch for the only thing standing in
+        // front of an unauthenticated 5000-row scan, and coalescing bounds client
+        // fan-out without bounding the flush at all.
+        //
+        // The cache now holds only the channel's bot ADDRESSES; commands are
+        // re-read from `USERS` on every request. So a descriptor change is
+        // already visible immediately and there is nothing stale to evict.
+        {
+            let now = Instant::now();
+            let mut seen = self.bot_broadcast_seen.write().await;
+            if let Some(last) = seen.get(wallet) {
+                if now.duration_since(*last) < BOT_COALESCE_WINDOW {
+                    return;
+                }
+            }
+            // Prune before inserting so the map cannot grow past its cap.
+            if seen.len() >= BOT_COALESCE_MAX_ENTRIES && !seen.contains_key(wallet) {
+                let cutoff = now.checked_sub(BOT_COALESCE_WINDOW).unwrap_or(now);
+                seen.retain(|_, t| *t > cutoff);
+                // Still full even after dropping everything stale: refuse to
+                // grow. Skipping the bookkeeping (not the broadcast) degrades
+                // coalescing, never correctness.
+                if seen.len() >= BOT_COALESCE_MAX_ENTRIES {
+                    seen.clear();
+                }
+            }
+            seen.insert(wallet.to_string(), now);
+        }
+
+        let ws_msg = serde_json::json!({
+            "type": "bot_commands_changed",
+            "address": wallet,
+        });
+        if let Ok(json) = serde_json::to_string(&ws_msg) {
+            let _ = self.ws_broadcast.send(Arc::new(WsOutbound {
+                audience: WsAudience::Everyone,
                 json,
             }));
         }
@@ -1203,5 +1368,102 @@ mod tests {
         engine.broadcast_news(&e, &[]);
         let frame = rx.try_recv().expect("a Public post must be delivered");
         assert!(matches!(frame.audience, WsAudience::Everyone));
+    }
+}
+
+// --- channel bot discovery cache (spec 3 §4.1) ---
+
+#[cfg(test)]
+mod channel_bots_cache_tests {
+    use super::*;
+
+    fn addrs(n: usize) -> Arc<Vec<String>> {
+        Arc::new((0..n).map(|i| format!("klv1bot{i}")).collect())
+    }
+
+    #[tokio::test]
+    async fn scan_capped_survives_a_cache_hit() {
+        // REGRESSION: the cache originally stored only the address list, so
+        // `scan_capped` was recomputed as `false` on every hit — meaning a
+        // channel whose member scan WAS truncated reported itself complete for
+        // the whole TTL. The flag describes the scan that produced the list, so
+        // it has to travel with it.
+        let e = NotificationEngine::new_for_test();
+        e.channel_bots_store(42, true, addrs(3), 10).await;
+        let (capped, list) = e
+            .channel_bots_cached(42, Duration::from_secs(60))
+            .await
+            .expect("entry should be cached");
+        assert!(capped, "scan_capped must survive a cache hit");
+        assert_eq!(list.len(), 3);
+
+        e.channel_bots_store(7, false, addrs(1), 10).await;
+        let (capped, _) = e
+            .channel_bots_cached(7, Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert!(!capped, "an uncapped scan must not report capped");
+    }
+
+    #[tokio::test]
+    async fn entry_expires_with_ttl() {
+        let e = NotificationEngine::new_for_test();
+        e.channel_bots_store(1, false, addrs(1), 10).await;
+        assert!(e.channel_bots_cached(1, Duration::from_secs(60)).await.is_some());
+        // A zero TTL makes every entry already stale.
+        assert!(e.channel_bots_cached(1, Duration::ZERO).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn membership_invalidation_drops_only_that_channel() {
+        let e = NotificationEngine::new_for_test();
+        e.channel_bots_store(1, false, addrs(1), 10).await;
+        e.channel_bots_store(2, false, addrs(1), 10).await;
+        e.channel_bots_invalidate(1).await;
+        assert!(e.channel_bots_cached(1, Duration::from_secs(60)).await.is_none());
+        assert!(e.channel_bots_cached(2, Duration::from_secs(60)).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_descriptor_change_does_NOT_flush_the_cache() {
+        // Deliberate: the cache holds addresses, not commands, so a descriptor
+        // change needs no eviction — and a flush reachable over gossip from any
+        // wallet on any node would be a remotely-triggerable off-switch for the
+        // endpoint's only DoS bound. If someone reintroduces the flush, this
+        // fails.
+        let e = NotificationEngine::new_for_test();
+        e.channel_bots_store(1, false, addrs(2), 10).await;
+        e.broadcast_bot_commands_changed("klv1somebot").await;
+        assert!(
+            e.channel_bots_cached(1, Duration::from_secs(60)).await.is_some(),
+            "a descriptor change must not evict channel bot lists"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_stays_bounded_at_max_entries() {
+        let e = NotificationEngine::new_for_test();
+        for ch in 0..50u64 {
+            e.channel_bots_store(ch, false, addrs(1), 8).await;
+        }
+        let len = e.channel_bots_cache.read().await.len();
+        assert!(len <= 8, "cache grew past max_entries: {len}");
+    }
+
+    #[tokio::test]
+    async fn coalescing_suppresses_a_second_broadcast_in_the_window() {
+        let e = NotificationEngine::new_for_test();
+        let mut rx = e.ws_broadcast.subscribe();
+        e.broadcast_bot_commands_changed("klv1a").await;
+        e.broadcast_bot_commands_changed("klv1a").await;
+        let first = rx.try_recv().expect("first broadcast should be sent");
+        assert!(first.json.contains("bot_commands_changed"));
+        assert!(
+            rx.try_recv().is_err(),
+            "second broadcast for the same wallet within the window must be suppressed"
+        );
+        // A different wallet is not coalesced against the first.
+        e.broadcast_bot_commands_changed("klv1b").await;
+        assert!(rx.try_recv().is_ok(), "a different wallet must still broadcast");
     }
 }

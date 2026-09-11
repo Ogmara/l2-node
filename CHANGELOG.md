@@ -5,6 +5,156 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.127.0] - 2026-09-11
+
+### Added
+
+- **Bot self-declaration and the `/`-command picker's server half**
+  (spec 01 §3.11, spec 03 §4.1/§4.3). A wallet can declare itself automated
+  and advertise the commands it answers to; clients use this to render a
+  Telegram-style autocomplete when a user types `/` in a channel composer.
+  - `ProfileUpdatePayload.bot` carries a `BotDescriptor { is_bot, handle,
+    commands }`. It rides inside `ProfileUpdate` (0x30) rather than a new
+    message type, so it inherits profile-topic gossip, the existing
+    `profile_updated_at` LWW watermark and identity-sync backfill unchanged —
+    no new gossip path, no new anti-replay rule, no new identity-sync scope
+    bit. `0x39` is reserved (as a comment, not a variant) for the day
+    per-channel or per-language command scopes outgrow the profile record.
+  - Descriptor fields flatten into the `users` record as `is_bot`,
+    `bot_handle`, `bot_commands`, `bot_updated_at`. **No new column family.**
+    `bot_updated_at` is informational — the authoritative watermark stays
+    `profile_updated_at`, because a second LWW key on one record is how you
+    get two truths.
+  - `GET /api/v1/channels/{channel_id}/bots` returns the channel's bots and
+    their commands. Reuses `require_channel_access` exactly as `/members` and
+    `/pins` do, so a non-member of a private channel gets 404 with no
+    existence leak. Bots banned or muted in that channel are filtered out, so
+    moderation removes their commands from that channel's picker network-wide
+    without a bot-specific moderation primitive.
+  - New WebSocket event `bot_commands_changed` so an open picker refreshes
+    live. Emitted from the gossip receive path and from all three local submit
+    paths (`POST /api/v1/messages`, `PUT /api/v1/profile`, WS) — gossip does not
+    loop a publish back to its origin, so without the local paths the one node a
+    bot publishes through would be the only node that never told its own users.
+  - `GET /api/v1/users/search` now projects `is_bot` and `bot_handle`. That
+    response is an explicit field list rather than a passthrough, so without
+    this the Bot badge on `@`-mention rows would have been unimplementable.
+  - New `[bots]` config section: `channel_bots_cache_ttl_secs` (60),
+    `channel_bots_max_members_scanned` (5000), `channel_bots_max_returned`
+    (50), `channel_bots_cache_max_entries` (1000) — documented in
+    `ogmara.example.toml` and bound-checked at load, since a zero scan cap would
+    silently serve an empty list forever and an unbounded one would remove the
+    endpoint's only DoS ceiling.
+  - The discovery cache holds a channel's bot **addresses**, never the rendered
+    response. Commands, bans and mutes are re-read per request, so a descriptor
+    edit or a mute takes effect immediately and nothing needs invalidating for
+    them; only a membership change evicts an entry. This keeps the cache at a
+    few MB rather than ~1 GB (1000 channels x 50 bots x 32 commands held as
+    `serde_json::Value`), and removes the need for a global flush — which, being
+    reachable from any wallet on any node via gossip, would have been a
+    remotely-triggerable off-switch for the endpoint's only protection.
+- **`ProfileUpdate` has its own rate-limit category** — 20/hour unverified,
+  60/hour registered, replacing the generic `Other` bucket (100/min). No bot
+  exemption: a descriptor is metadata, not service. This closes a gap
+  spec 01 §6.1 and spec 07 §2.2 had both already flagged as follow-up work.
+
+### Fixed
+
+- **The chain scanner no longer wipes profile fields it does not know about.**
+  `UserRegistered` and `PublicKeyUpdated` round-tripped the `users` row through
+  the typed `UserRecord` struct, which declares six keys and silently drops
+  every other key on re-serialize. The row is free-form JSON written jointly by
+  the scanner and the message router, so this deleted `profile_updated_at` —
+  **the P-2 anti-replay watermark**. With it gone, `prev_profile_ts` read back
+  as `0` and the LWW guard passed for any timestamp, so a stale ProfileUpdate
+  served over identity-sync (which deliberately skips the clock-drift check)
+  applied cleanly: exactly the backfill downgrade the watermark exists to
+  prevent. **This was pre-existing**, reachable on every on-chain registration
+  and on any block re-scan; 0.127.0 is what made it matter, since the
+  downgradable payload is now a command list rendered in a list users click.
+  Both arms now merge field-wise into the raw JSON, as the router does. Adding
+  the missing fields to `UserRecord` was deliberately *not* the fix — that
+  repairs today and breaks again the next time the router learns a key.
+- **Profile rebuild-from-envelopes restores bot descriptors.**
+  `rebuild_users_from_profile_updates` (the disaster-recovery path) replayed
+  only `display_name`/`avatar_cid`/`bio`, so it would have restored every bot as
+  a non-bot with its commands gone, and its "did any update carry content?" gate
+  ignored bot fields entirely — a wallet whose only profile content was a
+  descriptor was skipped outright. It also decoded payloads without the size
+  ceiling, at boot, into an unbounded in-memory map; envelopes written by older
+  nodes or restored from a foreign copy carry no guarantee of having passed the
+  live check.
+
+### Security
+
+- **`ProfileUpdate` payloads are now bounded before deserialization**
+  (`MAX_PROFILE_PAYLOAD_BYTES`, 16 KiB). The per-field caps in
+  `validate_profile_update` run only *after* `rmp_serde::from_slice`, and the
+  sole ceiling on bytes reaching that decoder was the transport's own — 10 MiB
+  via `DefaultBodyLimit` on the HTTP path. Adding a variable-length array
+  (`bot.commands`) to this payload would have turned a latent gap into a live
+  one. The check sits inside `deserialize_payload`, the single choke point
+  every ingestion path (gossip, identity-sync, `PUT /api/v1/profile`,
+  `POST /api/v1/messages`) funnels through, so no path can reacquire the gap
+  by being added later.
+- **Bot descriptor strings reject control and bidirectional codepoints** — C0,
+  DEL, C1, `U+061C`, zero-width space, LTR/RTL marks, line/paragraph separators,
+  bidi embeddings/overrides/isolates, word joiner and invisible operators,
+  `U+FEFF`, interlinear annotation, and the `U+E0000`-`U+E007F` **tag
+  characters** that are the standard carrier for invisible text smuggled into a
+  rendered string. A command description renders inside a list the user is about
+  to click, so an override character could reorder what they think they are
+  selecting.
+
+  This is deliberately a *rejection* and **not** an ASCII allowlist —
+  descriptions are user-authored prose and keep the full Unicode range.
+  `U+200C` ZWNJ and `U+200D` ZWJ are explicitly **permitted** despite sitting
+  inside the `U+200B`-`U+200F` block a naive range would sweep up: ZWJ is
+  required for emoji ZWJ sequences and ZWNJ for correct Persian and Indic
+  orthography. Neither can reorder surrounding text, so neither is part of the
+  attack this defends against, and rejecting them would have been a silent
+  functional break for exactly the users the rule exists to protect. Regression
+  tests cover CJK, Cyrillic, emoji, ZWJ sequences and Persian ZWNJ.
+- **`bot_commands_changed` is never emitted from identity-sync.** The sync
+  path bypasses rate limiting by design, so a backfill of N profile updates
+  would have produced N unbounded broadcasts that the new `ProfileUpdate`
+  category could not bound. Enforced by an explicit `!is_sync` gate at the
+  construction site, not merely by sync's callers discarding the value.
+- **The broadcast is suppressed when the descriptor did not actually change.**
+  Bots republish their descriptor on every start, and a restart always carries
+  a fresh timestamp — so the LWW watermark alone would let every restart
+  through to a network-wide broadcast. The content comparison happens in the
+  router, where the pre-merge record still exists. Per-wallet coalescing (10 s)
+  backs it up, from a map bounded at 10,000 entries.
+- **Both the member scan and the response are bounded, separately.** The scan
+  cap bounds the input; `channel_bots_max_returned` bounds the output. A
+  channel well under the scan ceiling can still be almost entirely bots, and
+  this response sits on a composer keystroke path.
+- **The response is sorted BEFORE it is truncated.** Capping during the scan
+  would have made the surviving set depend on `CHANNEL_MEMBERS` key order — i.e.
+  on raw bech32 address bytes — so an attacker could grind an address that sorts
+  early, guarantee inclusion, and push legitimate bots out of a channel's picker
+  before declaring their handle. That is the same squatter's ladder the ordering
+  rule rejects, reached through truncation instead of ranking.
+- **Ban filtering respects expiry and fails closed.** The discovery endpoint uses
+  `is_channel_banned` (which honours `duration_secs`) rather than a bare row
+  existence check, so a temp-banned bot is not invisible in the picker forever
+  after its ban lapses. Both the ban and mute lookups omit the bot on a storage
+  error rather than treating the error as "not banned" — a moderation filter must
+  not default to permit.
+
+### Notes
+
+- Bot identity is deliberately **off-chain** and **self-declared**: `is_bot` is
+  a hint for clients, never an authorization, and no node grants a capability
+  on the strength of it. See spec 02 for why paying to record the same
+  unverified claim buys nothing.
+- A bot invited into a **private** channel can decrypt every message in it —
+  private channels are force-encrypted with a *symmetric* epoch key, so there
+  is no key that opens one message and not the rest. This is disclosed at
+  invite time by the clients rather than prevented here; the node change adds
+  no new exposure.
+
 ## [0.126.6] - 2026-09-03
 
 ### Fixed

@@ -2611,7 +2611,15 @@ impl Storage {
         while iter.valid() {
             if let Some(raw) = iter.value() {
                 if let Ok(envelope) = rmp_serde::from_slice::<Envelope>(raw) {
-                    if envelope.msg_type == MessageType::ProfileUpdate {
+                    // Size-gate before decoding, mirroring `deserialize_payload`.
+                    // These envelopes were written by an earlier node version or
+                    // restored from a foreign copy, so they carry no guarantee of
+                    // having passed the live check — and this runs at BOOT, where
+                    // an unbounded allocation stops the node starting.
+                    if envelope.msg_type == MessageType::ProfileUpdate
+                        && envelope.payload.len()
+                            <= crate::messages::validation::MAX_PROFILE_PAYLOAD_BYTES
+                    {
                         if let Ok(payload) =
                             rmp_serde::from_slice::<ProfileUpdatePayload>(&envelope.payload)
                         {
@@ -2655,15 +2663,38 @@ impl Storage {
                     if let Some(bio) = &payload.bio {
                         map.insert("bio".into(), serde_json::json!(bio));
                     }
+                    // Bot descriptor (spec 01 §3.11) — MUST mirror the live merge
+                    // in `messages/router.rs`. This is the disaster-recovery path;
+                    // omitting it here restores every bot as a non-bot, with its
+                    // command list silently gone.
+                    if let Some(bot) = &payload.bot {
+                        if !bot.is_bot {
+                            map.insert("is_bot".into(), serde_json::json!(false));
+                            map.insert("bot_handle".into(), serde_json::Value::Null);
+                            map.insert("bot_commands".into(), serde_json::json!([]));
+                        } else {
+                            map.insert("is_bot".into(), serde_json::json!(true));
+                            if let Some(h) = &bot.handle {
+                                map.insert("bot_handle".into(), serde_json::json!(h));
+                            }
+                            if let Some(cmds) = &bot.commands {
+                                map.insert("bot_commands".into(), serde_json::json!(cmds));
+                            }
+                        }
+                        map.insert("bot_updated_at".into(), serde_json::json!(*ts));
+                    }
                     watermark = *ts;
                 }
                 map.insert("profile_updated_at".into(), serde_json::json!(watermark));
             }
 
-            // Nothing worth writing if no update carried any field.
+            // Nothing worth writing if no update carried any field. `is_bot` counts:
+            // a wallet whose only profile content is a bot descriptor would
+            // otherwise be skipped entirely by the rebuild.
             let has_content = record.get("display_name").is_some()
                 || record.get("avatar_cid").is_some()
-                || record.get("bio").is_some();
+                || record.get("bio").is_some()
+                || record.get("is_bot").is_some();
             if !has_content {
                 continue;
             }
@@ -5180,6 +5211,7 @@ mod backfill_edit_delete_markers_tests {
                         display_name: name.map(String::from),
                         avatar_cid: avatar.map(String::from),
                         bio: bio.map(String::from),
+                        bot: None,
                     })
                     .unwrap(),
                     signature: vec![],
@@ -5235,6 +5267,7 @@ mod backfill_edit_delete_markers_tests {
                     display_name: Some("Stale Name".into()),
                     avatar_cid: None,
                     bio: None,
+                    bot: None,
                 })
                 .unwrap(),
                 signature: vec![],

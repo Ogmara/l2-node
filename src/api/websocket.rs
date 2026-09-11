@@ -287,7 +287,27 @@ async fn handle_ws_client_message(
                 let result = state.router.process_message(&bytes);
                 debug!(result = ?result, "WS message processed");
                 // Feed accepted messages to notification engine for mention detection
-                if let crate::messages::router::RouteResult::Accepted { raw_bytes, .. } = result {
+                if let crate::messages::router::RouteResult::Accepted {
+                    raw_bytes,
+                    bot_commands_changed,
+                    ..
+                } = result
+                {
+                    // Same reason as the REST submit path: gossip does not loop
+                    // back to the publisher, so without this the node a bot
+                    // submits through is the only one that never tells its own
+                    // clients. The `Dm` arm below does the same — do NOT assume
+                    // a `Dm` frame can only carry a DirectMessage: dispatch is on
+                    // the client-supplied `envelope.msg_type`, and nothing binds
+                    // the frame variant to it.
+                    if let Some(wallet) = bot_commands_changed {
+                        if let Some(ref engine) = state.notification_engine {
+                            let engine = engine.clone();
+                            tokio::spawn(async move {
+                                engine.broadcast_bot_commands_changed(&wallet).await;
+                            });
+                        }
+                    }
                     // Audit W26: chat/news/etc sent over WS were stored +
                     // locally notified but never gossip-published, unlike
                     // the identical envelope sent via POST /api/v1/messages
@@ -310,8 +330,26 @@ async fn handle_ws_client_message(
                 debug!(result = ?result, "WS DM processed");
                 // Audit W26: same gap as Message above — a DM sent over WS
                 // reached only the sender's own node.
-                if let crate::messages::router::RouteResult::Accepted { raw_bytes, .. } = result {
+                if let crate::messages::router::RouteResult::Accepted {
+                    raw_bytes,
+                    bot_commands_changed,
+                    ..
+                } = result
+                {
                     super::routes::gossip_if_applicable(state, &raw_bytes).await;
+                    // Handled here too, because the frame variant does not
+                    // constrain `msg_type`: a client can submit a ProfileUpdate
+                    // through `Dm` and the router will accept it. Relying on "a
+                    // DM can't carry a descriptor" would be trusting a property
+                    // nothing enforces.
+                    if let Some(wallet) = bot_commands_changed {
+                        if let Some(ref engine) = state.notification_engine {
+                            let engine = engine.clone();
+                            tokio::spawn(async move {
+                                engine.broadcast_bot_commands_changed(&wallet).await;
+                            });
+                        }
+                    }
                 }
             }
         }

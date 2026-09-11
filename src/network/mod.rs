@@ -4834,6 +4834,7 @@ impl NetworkService {
                 msg_id,
                 msg_type,
                 raw_bytes,
+                bot_commands_changed,
             } => {
                 debug!(
                     msg_id = %hex::encode(msg_id),
@@ -4847,9 +4848,18 @@ impl NetworkService {
                 // Feed to notification engine for mention detection (fire-and-forget)
                 if let Some(ref engine) = self.notification_engine {
                     let engine = engine.clone();
+                    // Live gossip only. The sync paths call
+                    // `process_synced_message`, which never yields this field —
+                    // identity-sync bypasses rate limiting by design, so
+                    // broadcasting from it would be an unbounded fan-out during
+                    // backfill that the ProfileUpdate rate limit cannot bound.
+                    let bot_wallet = bot_commands_changed.clone();
                     tokio::spawn(async move {
                         if let Ok(envelope) = rmp_serde::from_slice::<Envelope>(&raw_bytes) {
                             engine.process(&envelope).await;
+                        }
+                        if let Some(wallet) = bot_wallet {
+                            engine.broadcast_bot_commands_changed(&wallet).await;
                         }
                     });
                 }
