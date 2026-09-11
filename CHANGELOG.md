@@ -5,6 +5,29 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.127.1] - 2026-09-11
+
+**Tests only — no behaviour change.** The 0.127.0 image remains current; the
+fleet does not need a redeploy for this.
+
+### Added
+
+- **A cross-repo wire-compatibility test for `sdk-rust`'s positional encoding.**
+  `sdk-rust` builds envelopes with `rmp_serde::to_vec` — the POSITIONAL array
+  form — while `sdk-js` sends msgpack maps. The node has to decode both, and the
+  array form makes `ProfileUpdatePayload`'s field order load-bearing in a way
+  nothing else enforces: a reorder on either side would silently land a bio in
+  the avatar CID rather than failing. The test pins the exact array shapes
+  `sdk-rust` emits, including that a 2-element `BotCommand` from an older SDK
+  (which skipped a `None` `args_hint`) still decodes via the trailing
+  `#[serde(default)]`.
+- **A regression test for an explicit `bot: nil`.** `sdk-js` emits every profile
+  field with `?? null`, so an ordinary display-name edit sends the `bot` key
+  PRESENT and nil — a different serde path from the key being absent, which was
+  the only case previously covered. If that decoded to anything but `None`,
+  every unrelated profile edit from any client would wipe that wallet's
+  published command list.
+
 ## [0.127.0] - 2026-09-11
 
 ### Added

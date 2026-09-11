@@ -1836,6 +1836,115 @@ mod bot_descriptor_tests {
     }
 
     #[test]
+    fn an_explicit_null_bot_means_unchanged_not_cleared() {
+        // THE case that actually happens in production, and it is NOT the same
+        // serde path as an absent key. `sdk-js`'s `profileUpdatePayload` emits
+        // every field with `?? null`, so an ordinary display-name edit sends
+        // `bot: nil` (msgpack 0xc0) with the KEY PRESENT.
+        //
+        // If that deserialized to anything but `None`, every unrelated profile
+        // edit from any client would wipe that wallet's published command list.
+        // The sibling test covers the key being absent; this covers present-null.
+        #[derive(serde::Serialize)]
+        struct SdkShape {
+            display_name: Option<String>,
+            avatar_cid: Option<String>,
+            bio: Option<String>,
+            bot: Option<BotDescriptor>,
+        }
+        let bytes = rmp_serde::to_vec_named(&SdkShape {
+            display_name: Some("Alice".into()),
+            avatar_cid: None,
+            bio: None,
+            bot: None,
+        })
+        .unwrap();
+        // Sanity: the key really is present and nil, not omitted. msgpack nil is
+        // 0xC0, and `to_vec_named` writes the key as a str before it.
+        assert!(
+            bytes.windows(4).any(|w| w == b"\x03bot") || bytes.windows(3).any(|w| w == b"bot"),
+            "fixture must actually contain the `bot` key"
+        );
+        assert!(
+            bytes.contains(&0xC0),
+            "fixture must send bot as an explicit msgpack nil (0xC0)"
+        );
+
+        let decoded = match deserialize_payload(MessageType::ProfileUpdate, &bytes).unwrap() {
+            crate::messages::types::DeserializedPayload::ProfileUpdate(p) => p,
+            other => panic!("wrong variant: {other:?}"),
+        };
+        assert!(
+            decoded.bot.is_none(),
+            "an explicit null bot must mean UNCHANGED — anything else wipes command lists"
+        );
+    }
+
+    #[test]
+    fn decodes_a_positional_array_descriptor_from_sdk_rust() {
+        // sdk-rust's `build_envelope` uses `rmp_serde::to_vec` — the POSITIONAL
+        // array encoding — while sdk-js sends msgpack MAPS. The node must decode
+        // both, and the array form makes FIELD ORDER load-bearing: a mismatch
+        // silently lands a bio in the avatar CID.
+        //
+        // Pins the array shapes sdk-rust actually emits, so a reorder or an
+        // added field on either side fails here rather than corrupting profiles.
+        // A 2-element BotCommand (older sdk-rust, which skipped a None
+        // args_hint) must still decode via the trailing `#[serde(default)]`.
+        use rmp_serde::to_vec as to_vec_positional;
+
+        #[derive(serde::Serialize)]
+        struct CmdThree<'a>(&'a str, &'a str, Option<&'a str>);
+        #[derive(serde::Serialize)]
+        struct CmdTwo<'a>(&'a str, &'a str);
+        #[derive(serde::Serialize)]
+        struct Desc<'a, C: serde::Serialize>(bool, Option<&'a str>, Option<Vec<C>>);
+        #[derive(serde::Serialize)]
+        struct Profile<'a, C: serde::Serialize>(
+            Option<&'a str>,
+            Option<&'a str>,
+            Option<&'a str>,
+            Option<Desc<'a, C>>,
+        );
+
+        // Current sdk-rust: 3-slot command, args_hint always present.
+        let bytes = to_vec_positional(&Profile(
+            Some("Chart Bot"),
+            None,
+            None,
+            Some(Desc(true, Some("CoinTrendz"), Some(vec![CmdThree("c", "Chart", None)]))),
+        ))
+        .unwrap();
+        let decoded = match deserialize_payload(MessageType::ProfileUpdate, &bytes).unwrap() {
+            crate::messages::types::DeserializedPayload::ProfileUpdate(p) => p,
+            other => panic!("wrong variant: {other:?}"),
+        };
+        assert_eq!(decoded.display_name.as_deref(), Some("Chart Bot"));
+        let bot = decoded.bot.expect("descriptor must decode");
+        assert!(bot.is_bot);
+        assert_eq!(bot.handle.as_deref(), Some("CoinTrendz"));
+        let cmds = bot.commands.expect("commands must decode");
+        assert_eq!(cmds[0].name, "c");
+        assert_eq!(cmds[0].description, "Chart");
+        assert_eq!(cmds[0].args_hint, None);
+
+        // Older sdk-rust: 2-slot command (args_hint skipped) must still decode.
+        let bytes = to_vec_positional(&Profile(
+            None,
+            None,
+            None,
+            Some(Desc(true, None, Some(vec![CmdTwo("c", "Chart")]))),
+        ))
+        .unwrap();
+        let decoded = match deserialize_payload(MessageType::ProfileUpdate, &bytes).unwrap() {
+            crate::messages::types::DeserializedPayload::ProfileUpdate(p) => p,
+            other => panic!("wrong variant: {other:?}"),
+        };
+        let cmds = decoded.bot.unwrap().commands.unwrap();
+        assert_eq!(cmds[0].args_hint, None, "a skipped trailing field must default");
+    }
+
+    #[test]
     fn oversized_descriptor_is_rejected_through_validate_profile_update() {
         let p = ProfileUpdatePayload {
             display_name: None,
