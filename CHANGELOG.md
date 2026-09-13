@@ -5,6 +5,28 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.129.0] - 2026-09-13
+
+Found during the security/code audit of ogmara-bot's channel-invite auto-join
+feature (which consumes 0.128.0's `channel_invite` notification): the
+untyped `GET /api/v1/notifications` page can silently starve a low-volume
+type behind a high-volume one, with no visible sign anything was dropped.
+
+### Added
+
+- **`GET /api/v1/notifications` gains an optional `?type=` filter.**
+  Without it, every notification type shares one `limit`-sized page,
+  newest-first — for a wallet where one type is rare (an invite) and another
+  is frequent (a mention, which fires on every command invocation for an
+  answering bot), the rare type can be pushed out of the page entirely with
+  no error and a page that still looks complete. `Storage::get_notifications`
+  now widens its internal scan window (independent of the output `limit`,
+  capped at 2000 rows) whenever a type filter is given, since the key layout
+  has no type component — filtering happens after decoding each candidate
+  row, so most scanned rows won't match and the scan has to look further
+  than the output limit to find enough that do. sdk-js 0.59.0 exposes this
+  as a third `getNotifications(since, limit, type)` argument.
+
 ## [0.128.0] - 2026-09-13
 
 ### Added

@@ -3588,21 +3588,41 @@ impl Storage {
         self.store_notification(target_address, notification_id, timestamp, notification)
     }
 
-    /// Get notifications for a user, optionally filtered by a since timestamp.
+    /// Get notifications for a user, optionally filtered by a since timestamp
+    /// and/or a notification type (e.g. `"channel_invite"`).
     ///
     /// Returns notifications in reverse-chronological order (newest first).
     /// If `since` is provided, only notifications newer than that timestamp are returned.
+    ///
+    /// Without a type filter, `limit` bounds both how many ROWS are scanned
+    /// and how many are returned — every scanned row passes through (bar the
+    /// `since` cut), so the two amounts coincide. WITH a type filter that
+    /// stops being true: a wallet's feed mixes every type together, and a
+    /// low-volume type (an invite) can sit behind many higher-volume ones (a
+    /// mention fires on every command invocation), so scanning only `limit`
+    /// rows could return fewer than `limit` matches — or none — even when
+    /// plenty exist further back. The scan window widens independently of
+    /// the output limit in that case, capped so a type filter cannot turn a
+    /// small, cheap request into an unbounded scan.
     pub fn get_notifications(
         &self,
         address: &str,
         since: Option<u64>,
         limit: usize,
+        notification_type: Option<&str>,
     ) -> Result<Vec<serde_json::Value>> {
         let mut prefix = Vec::with_capacity(address.len() + 1);
         prefix.extend_from_slice(address.as_bytes());
         prefix.push(0xFF);
 
-        let entries = self.prefix_iter_cf(cf::NOTIFICATIONS, &prefix, limit)?;
+        const MAX_TYPE_FILTER_SCAN: usize = 2000;
+        let scan_limit = if notification_type.is_some() {
+            limit.saturating_mul(20).min(MAX_TYPE_FILTER_SCAN)
+        } else {
+            limit
+        };
+
+        let entries = self.prefix_iter_cf(cf::NOTIFICATIONS, &prefix, scan_limit)?;
         Ok(entries
             .into_iter()
             .filter_map(|(key, value)| {
@@ -3621,8 +3641,15 @@ impl Storage {
                     }
                 }
 
-                serde_json::from_slice(&value).ok()
+                let parsed: serde_json::Value = serde_json::from_slice(&value).ok()?;
+                if let Some(want_type) = notification_type {
+                    if parsed.get("type").and_then(|v| v.as_str()) != Some(want_type) {
+                        return None;
+                    }
+                }
+                Some(parsed)
             })
+            .take(limit)
             .collect())
     }
 
@@ -5619,7 +5646,7 @@ mod store_notification_capped_tests {
         s.store_notification_capped(addr, &[5; 32], 1005, &n(5), 5)
             .unwrap();
 
-        let stored = s.get_notifications(addr, None, 100).unwrap();
+        let stored = s.get_notifications(addr, None, 100, None).unwrap();
         assert_eq!(stored.len(), 5, "count must stay at cap, not grow to 6");
         let survivors: Vec<u64> = stored.iter().map(|v| v["n"].as_u64().unwrap()).collect();
         assert!(
@@ -5640,7 +5667,7 @@ mod store_notification_capped_tests {
             s.store_notification_capped(addr, &[i; 32], 1000 + i as u64, &n(i), 10)
                 .unwrap();
         }
-        let stored = s.get_notifications(addr, None, 100).unwrap();
+        let stored = s.get_notifications(addr, None, 100, None).unwrap();
         assert_eq!(stored.len(), 3, "under cap — nothing should be evicted");
     }
 
@@ -5656,8 +5683,8 @@ mod store_notification_capped_tests {
         // the CF-wide total is now over what a single address's cap is.
         s.store_notification_capped("klv1bob", &[9; 32], 2000, &n(9), 3)
             .unwrap();
-        assert_eq!(s.get_notifications("klv1alice", None, 100).unwrap().len(), 3);
-        assert_eq!(s.get_notifications("klv1bob", None, 100).unwrap().len(), 1);
+        assert_eq!(s.get_notifications("klv1alice", None, 100, None).unwrap().len(), 3);
+        assert_eq!(s.get_notifications("klv1bob", None, 100, None).unwrap().len(), 1);
     }
 
     #[test]
@@ -5668,7 +5695,60 @@ mod store_notification_capped_tests {
             s.store_notification_capped(addr, &[i; 32], 1000 + i as u64, &n(i), 0)
                 .unwrap();
         }
-        assert_eq!(s.get_notifications(addr, None, 100).unwrap().len(), 10);
+        assert_eq!(s.get_notifications(addr, None, 100, None).unwrap().len(), 10);
+    }
+
+    fn typed(t: &str, i: u8) -> serde_json::Value {
+        serde_json::json!({"type": t, "n": i})
+    }
+
+    #[test]
+    fn a_type_filter_finds_a_match_buried_behind_more_recent_non_matching_rows() {
+        // REGRESSION GUARD. Without widening the scan, `limit` rows are read
+        // and THEN filtered — so a low-volume type sitting behind more than
+        // `limit` higher-volume rows (a mention fires on every command
+        // invocation; an invite is rare) would come back empty even though a
+        // match exists. Store 60 "mention" rows newer than one
+        // "channel_invite", then ask for channel_invite with limit=10 — a
+        // scan capped AT the limit would never reach the invite at all.
+        let (s, _d) = db();
+        let addr = "klv1busybot";
+        s.store_notification_capped(addr, &[0; 32], 1000, &typed("channel_invite", 0), 0)
+            .unwrap();
+        for i in 1..=60u8 {
+            s.store_notification_capped(addr, &[i; 32], 1000 + i as u64, &typed("mention", i), 0)
+                .unwrap();
+        }
+        let found = s
+            .get_notifications(addr, None, 10, Some("channel_invite"))
+            .unwrap();
+        assert_eq!(found.len(), 1, "the one invite must still be found behind 60 newer mentions");
+        assert_eq!(found[0]["type"], "channel_invite");
+    }
+
+    #[test]
+    fn a_type_filter_still_respects_the_output_limit() {
+        let (s, _d) = db();
+        let addr = "klv1busybot2";
+        for i in 0..5u8 {
+            s.store_notification_capped(addr, &[i; 32], 1000 + i as u64, &typed("channel_invite", i), 0)
+                .unwrap();
+        }
+        let found = s
+            .get_notifications(addr, None, 2, Some("channel_invite"))
+            .unwrap();
+        assert_eq!(found.len(), 2, "limit must still cap the OUTPUT, not just the scan");
+    }
+
+    #[test]
+    fn no_type_filter_behaves_exactly_as_before() {
+        let (s, _d) = db();
+        let addr = "klv1mixed";
+        s.store_notification_capped(addr, &[0; 32], 1000, &typed("channel_invite", 0), 0)
+            .unwrap();
+        s.store_notification_capped(addr, &[1; 32], 1001, &typed("mention", 1), 0)
+            .unwrap();
+        assert_eq!(s.get_notifications(addr, None, 100, None).unwrap().len(), 2);
     }
 }
 

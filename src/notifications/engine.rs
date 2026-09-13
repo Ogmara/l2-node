@@ -1462,7 +1462,7 @@ mod tests {
             .storage
             .as_ref()
             .unwrap()
-            .get_notifications("klv1invitee", None, 50)
+            .get_notifications("klv1invitee", None, 50, None)
             .unwrap();
         assert_eq!(stored.len(), 1, "the invite must be persisted regardless of connection state");
         assert_eq!(stored[0]["type"], "channel_invite");
@@ -1474,7 +1474,7 @@ mod tests {
             .storage
             .as_ref()
             .unwrap()
-            .get_notifications("klv1author", None, 50)
+            .get_notifications("klv1author", None, 50, None)
             .unwrap()
             .is_empty());
     }
@@ -1560,7 +1560,7 @@ mod tests {
             .storage
             .as_ref()
             .unwrap()
-            .get_notifications("klv1invitee", None, 50)
+            .get_notifications("klv1invitee", None, 50, None)
             .unwrap();
         assert_eq!(stored.len(), 1);
     }

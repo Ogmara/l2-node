@@ -635,6 +635,13 @@ pub struct MessageParams {
 pub struct NotificationParams {
     pub since: Option<u64>,
     pub limit: Option<u32>,
+    /// Filter to one notification type (e.g. `channel_invite`). Optional —
+    /// without it, the endpoint mixes every type together, which starves a
+    /// low-volume type (an invite) out of a busy wallet's page when
+    /// higher-volume types (mentions in particular — every command
+    /// invocation is also a mention) fill it first.
+    #[serde(rename = "type")]
+    pub notification_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -7358,7 +7365,12 @@ pub async fn get_notifications(
     let limit = params.limit.unwrap_or(50).min(200) as usize;
     let since = params.since;
 
-    match state.storage.get_notifications(&auth_user.address, since, limit) {
+    match state.storage.get_notifications(
+        &auth_user.address,
+        since,
+        limit,
+        params.notification_type.as_deref(),
+    ) {
         Ok(notifications) => {
             let total = notifications.len();
             Json(serde_json::json!({
