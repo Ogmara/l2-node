@@ -5,6 +5,16 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.129.1] - 2026-09-13
+
+Tests only — no behavior change. 0.129.0's `type` query filter was verified
+by unit-testing `NotificationParams` directly in Rust, which never exercises
+`#[serde(rename = "type")]` against the actual URL-encoded query string
+`axum::extract::Query` parses on the wire (it uses `serde_urlencoded`, not
+`serde_json`). Added `serde_urlencoded` as a dev-dependency and two tests
+that deserialize a real `?since=100&limit=50&type=channel_invite` string,
+closing the one boundary the existing tests couldn't reach.
+
 ## [0.129.0] - 2026-09-13
 
 Found during the security/code audit of ogmara-bot's channel-invite auto-join

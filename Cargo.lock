@@ -2686,7 +2686,7 @@ dependencies = [
 
 [[package]]
 name = "ogmara-node"
-version = "0.129.0"
+version = "0.129.1"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2714,6 +2714,7 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "sha2",
  "sha3",
  "sysinfo 0.34.2",

@@ -1,6 +1,6 @@
 [package]
 name = "ogmara-node"
-version = "0.129.0"
+version = "0.129.1"
 edition = "2021"
 authors = ["Ogmara Contributors"]
 license = "MIT"
@@ -95,3 +95,4 @@ httpdate = "1.0"             # RFC 7231 HTTP-date parsing for If-Range / Last-Mo
 [dev-dependencies]
 tokio = { version = "1.50", features = ["test-util", "macros"] }
 tempfile = "3"
+serde_urlencoded = "0.7"

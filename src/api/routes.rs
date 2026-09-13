@@ -644,6 +644,33 @@ pub struct NotificationParams {
     pub notification_type: Option<String>,
 }
 
+#[cfg(test)]
+mod notification_params_tests {
+    //! `axum::extract::Query` deserializes via `serde_urlencoded` under the
+    //! hood, not `serde_json` — this pins that the `#[serde(rename = "type")]`
+    //! actually round-trips through THAT deserializer for a real `?type=...`
+    //! query string, the one thing a unit test against the field directly
+    //! (constructing a `NotificationParams` in Rust) could never catch, since
+    //! it would never exercise the rename attribute or the URL-encoded form
+    //! at all.
+    use super::NotificationParams;
+
+    #[test]
+    fn type_param_deserializes_from_the_wire_query_string() {
+        let params: NotificationParams =
+            serde_urlencoded::from_str("since=100&limit=50&type=channel_invite").unwrap();
+        assert_eq!(params.since, Some(100));
+        assert_eq!(params.limit, Some(50));
+        assert_eq!(params.notification_type.as_deref(), Some("channel_invite"));
+    }
+
+    #[test]
+    fn type_param_is_optional() {
+        let params: NotificationParams = serde_urlencoded::from_str("since=100").unwrap();
+        assert_eq!(params.notification_type, None);
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ModerationReportParams {
     pub target: String,
