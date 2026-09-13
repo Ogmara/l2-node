@@ -5,6 +5,42 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.128.0] - 2026-09-13
+
+### Added
+
+- **A `channel_invite` notification type.** `MessageType::ChannelInvite` now
+  generates a notification addressed to the invited wallet, alongside its
+  existing `CHANNEL_INVITES` storage record. Closes a gap that affected every
+  client, not just bots: nobody was ever told they'd been invited to a
+  channel — the record existed but nothing surfaced it. Unlike `mention`,
+  which only reaches a wallet connected via WebSocket at the moment the
+  message arrives (`local_users`-gated — fine for a mention, since the
+  recipient is normally already reading the channel), `channel_invite` is
+  unconditionally persisted so the invited wallet can discover it later via
+  `GET /api/v1/notifications?since=...` after being offline at invite time.
+  This matters most for a channel-answering bot, which is typically only
+  intermittently running and needs to notice an invite on its next startup or
+  poll, not only if it happens to be connected at the exact moment someone
+  invites it. Rate-limited to 20/hour per sender (the existing `ChannelInvite`
+  category), so unconditional persistence adds no new storage/DoS surface.
+  See spec 03 §3.7.
+
+### Security
+
+- **A private-channel invite no longer broadcasts to every connected
+  client.** The existing all-clients WS fan-out (`deliver()`) only redacted
+  the message *preview* for a non-public channel, which is correct for a
+  mention (the channel is already visible to whoever is in it) but was wrong
+  for the new `channel_invite` type: it would have leaked "wallet X was just
+  invited to private channel Y" — `channel_id`, `channel_name`, and the
+  inviter's address — to every connected client, not only the invitee. Caught
+  in review before this shipped anywhere. Fixed by skipping the Everyone
+  broadcast entirely for a non-public channel's invite; the invitee still
+  gets it in full via the persisted, per-recipient `GET
+  /api/v1/notifications`. The per-recipient push-gateway delivery is
+  unaffected (it was never broadcast).
+
 ## [0.127.1] - 2026-09-11
 
 **Tests only — no behaviour change.** The 0.127.0 image remains current; the

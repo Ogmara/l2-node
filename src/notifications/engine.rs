@@ -13,8 +13,8 @@ use tracing::{debug, warn};
 
 use crate::messages::envelope::Envelope;
 use crate::messages::types::{
-    ChatMessagePayload, DeletePayload, DirectMessagePayload, EditPayload, MessageType,
-    NewsCommentPayload, ReactionPayload, SettingsSyncPayload,
+    ChannelInvitePayload, ChatMessagePayload, DeletePayload, DirectMessagePayload, EditPayload,
+    MessageType, NewsCommentPayload, ReactionPayload, SettingsSyncPayload,
 };
 use crate::api::state::{WsAudience, WsOutbound};
 use crate::storage::rocks::Storage;
@@ -45,6 +45,10 @@ pub enum NotificationType {
     Mention,
     Reply,
     Dm,
+    /// Someone (channel creator or moderator) invited this wallet to a
+    /// channel. The only notification type NOT gated on the recipient being
+    /// currently connected — see the `ChannelInvite` arm in `process()`.
+    ChannelInvite,
 }
 
 /// The notification engine processes messages and generates notifications.
@@ -310,6 +314,33 @@ impl NotificationEngine {
                 // they appear live (they also propagate via gossip + storage, but
                 // without this only show on the recipient's next poll/reload).
                 self.broadcast_dm_update(envelope);
+            }
+            MessageType::ChannelInvite => {
+                if let Ok(payload) =
+                    rmp_serde::from_slice::<ChannelInvitePayload>(&envelope.payload)
+                {
+                    let notification = Notification {
+                        notification_type: NotificationType::ChannelInvite,
+                        msg_id: hex::encode(envelope.msg_id),
+                        author: envelope.author.clone(),
+                        channel_id: Some(payload.channel_id),
+                        channel_name: self.lookup_channel_name(payload.channel_id),
+                        preview: String::new(),
+                        timestamp: envelope.timestamp,
+                    };
+                    // Deliberately NOT gated on `local_users` (unlike
+                    // check_mentions): the whole point is that the invited
+                    // wallet discovers this LATER, via GET
+                    // /api/v1/notifications, after being offline at invite
+                    // time — a bot in particular is typically only
+                    // intermittently running. Gating on "connected right now"
+                    // would silently drop exactly the case this exists for.
+                    // Rate-limited to 20/hour (RateLimits::flat(20, ...) for
+                    // ChannelInvite), so unconditional persistence here adds
+                    // no meaningful storage/DoS surface.
+                    self.deliver(&payload.target_user, &envelope.msg_id, notification)
+                        .await;
+                }
             }
             MessageType::ChannelJoin | MessageType::ChannelLeave => {
                 #[derive(serde::Deserialize)]
@@ -1105,26 +1136,42 @@ impl NotificationEngine {
         // GET /api/v1/notifications). Public-channel previews are world-readable.
         // (Follow-up: per-recipient WS delivery would also hide the mention
         // metadata — author/channel — not just the preview.)
-        let broadcast_notification = match notification.channel_id {
-            Some(cid) if !self.channel_is_public(cid) => {
-                let mut redacted = notification.clone();
-                redacted.preview = String::new();
-                redacted
+        //
+        // A ChannelInvite to a non-public channel skips this broadcast
+        // entirely rather than redacting just the preview, unlike a mention:
+        // preview-only redaction still leaves channel_id/channel_name/author
+        // in the Everyone-audience frame, which for a mention just says "an
+        // already-visible channel had activity" but for an invite says "wallet
+        // X was just invited to private channel Y" — a fact about someone
+        // else's private-channel membership with no legitimate audience
+        // beyond the invitee, who already gets it in full via the persisted,
+        // per-recipient GET /api/v1/notifications path above. This only skips
+        // the ALL-CLIENTS broadcast below — the per-recipient push-gateway
+        // delivery further down still fires, since that one is not public.
+        let suppress_broadcast = matches!(notification.notification_type, NotificationType::ChannelInvite)
+            && notification.channel_id.is_some_and(|cid| !self.channel_is_public(cid));
+        if !suppress_broadcast {
+            let broadcast_notification = match notification.channel_id {
+                Some(cid) if !self.channel_is_public(cid) => {
+                    let mut redacted = notification.clone();
+                    redacted.preview = String::new();
+                    redacted
+                }
+                _ => notification.clone(),
+            };
+            let ws_msg = serde_json::json!({
+                "type": "notification",
+                "mention": broadcast_notification,
+            });
+            if let Ok(json) = serde_json::to_string(&ws_msg) {
+                // Mention notifications keep the legacy all-clients fan-out (clients
+                // filter to the mentioned wallet; private-channel previews are
+                // redacted above). See the follow-up note re: per-recipient delivery.
+                let _ = self.ws_broadcast.send(Arc::new(WsOutbound {
+                    audience: WsAudience::Everyone,
+                    json,
+                }));
             }
-            _ => notification.clone(),
-        };
-        let ws_msg = serde_json::json!({
-            "type": "notification",
-            "mention": broadcast_notification,
-        });
-        if let Ok(json) = serde_json::to_string(&ws_msg) {
-            // Mention notifications keep the legacy all-clients fan-out (clients
-            // filter to the mentioned wallet; private-channel previews are
-            // redacted above). See the follow-up note re: per-recipient delivery.
-            let _ = self.ws_broadcast.send(Arc::new(WsOutbound {
-                audience: WsAudience::Everyone,
-                json,
-            }));
         }
 
         // Push gateway (if configured)
@@ -1150,6 +1197,7 @@ impl NotificationEngine {
             NotificationType::Mention => "mention",
             NotificationType::Reply => "reply",
             NotificationType::Dm => "dm",
+            NotificationType::ChannelInvite => "channel_invite",
         };
 
         let body = serde_json::json!({
@@ -1192,6 +1240,7 @@ fn notification_type_str(nt: &NotificationType) -> &'static str {
         NotificationType::Mention => "mention",
         NotificationType::Reply => "reply",
         NotificationType::Dm => "dm",
+        NotificationType::ChannelInvite => "channel_invite",
     }
 }
 
@@ -1368,6 +1417,152 @@ mod tests {
         engine.broadcast_news(&e, &[]);
         let frame = rx.try_recv().expect("a Public post must be delivered");
         assert!(matches!(frame.audience, WsAudience::Everyone));
+    }
+
+    // --- ChannelInvite notification ---
+
+    use crate::messages::types::ChannelInvitePayload;
+    use tempfile::TempDir;
+
+    fn engine_with_storage() -> (NotificationEngine, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let mut engine = NotificationEngine::new_for_test();
+        engine.set_storage(storage);
+        (engine, dir)
+    }
+
+    #[tokio::test]
+    async fn channel_invite_is_persisted_even_when_the_invitee_is_offline() {
+        // REGRESSION GUARD. `check_mentions` only delivers to an address
+        // present in `local_users` — populated solely by a live WS connection
+        // (api/websocket.rs) — because a mention that arrives while you're
+        // reading the channel anyway doesn't need durable delivery. An invite
+        // is the opposite case: the whole point is that the invitee (very
+        // often a bot, which is only intermittently running) discovers it
+        // LATER by polling GET /api/v1/notifications. Gating this on
+        // `local_users` the same way mentions are gated would silently drop
+        // every invite sent while the invitee happens to be offline — which
+        // is the normal case, not the exception.
+        let (engine, _dir) = engine_with_storage();
+        // Deliberately NOT calling engine.add_local_user() — the invitee is
+        // offline for this whole test.
+        let payload = ChannelInvitePayload {
+            channel_id: 42,
+            target_user: "klv1invitee".into(),
+            anchor_node: None,
+        };
+        let e = env(
+            MessageType::ChannelInvite,
+            rmp_serde::to_vec_named(&payload).unwrap(),
+        );
+        engine.process(&e).await;
+
+        let stored = engine
+            .storage
+            .as_ref()
+            .unwrap()
+            .get_notifications("klv1invitee", None, 50)
+            .unwrap();
+        assert_eq!(stored.len(), 1, "the invite must be persisted regardless of connection state");
+        assert_eq!(stored[0]["type"], "channel_invite");
+        assert_eq!(stored[0]["channel_id"], "42");
+        assert_eq!(stored[0]["from"], "klv1author");
+
+        // Nobody else's notifications are touched.
+        assert!(engine
+            .storage
+            .as_ref()
+            .unwrap()
+            .get_notifications("klv1author", None, 50)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn channel_invite_broadcasts_over_ws_for_a_public_channel() {
+        // The bot's own WS subscription is one path it could react to an
+        // invite in real time through (in addition to polling on reconnect),
+        // so the broadcast side must fire too, not just storage — but only
+        // when the channel is public, since a public channel's existence is
+        // not itself sensitive information.
+        let (engine, _dir) = engine_with_storage();
+        engine
+            .storage
+            .as_ref()
+            .unwrap()
+            .put_cf(
+                cf::CHANNELS,
+                &7u64.to_be_bytes(),
+                &serde_json::to_vec(&serde_json::json!({"channel_type": 0, "name": "Public Chan"}))
+                    .unwrap(),
+            )
+            .unwrap();
+        let mut rx = engine.ws_broadcast.subscribe();
+        let payload = ChannelInvitePayload {
+            channel_id: 7,
+            target_user: "klv1invitee".into(),
+            anchor_node: None,
+        };
+        let e = env(
+            MessageType::ChannelInvite,
+            rmp_serde::to_vec_named(&payload).unwrap(),
+        );
+        engine.process(&e).await;
+
+        let frame = rx.try_recv().expect("an invite to a PUBLIC channel must produce a WS frame");
+        assert!(matches!(frame.audience, WsAudience::Everyone));
+        assert!(frame.json.contains("channel_invite"));
+    }
+
+    #[tokio::test]
+    async fn channel_invite_never_broadcasts_over_ws_for_a_private_channel() {
+        // REGRESSION GUARD. Unlike a mention (where redacting just the
+        // preview is enough, since the channel itself is already visible to
+        // whoever is in it), an invite's channel_id/channel_name/author would
+        // otherwise leak "wallet X was just invited to private channel Y" to
+        // every connected client, not only the invitee — a fact about
+        // someone else's private-channel membership with no legitimate
+        // audience beyond the invitee. The invitee still gets it in full via
+        // the persisted, per-recipient GET /api/v1/notifications path
+        // (proven by the sibling offline-delivery test), so this test only
+        // has to prove the PUBLIC, all-clients broadcast is suppressed.
+        let (engine, _dir) = engine_with_storage();
+        engine
+            .storage
+            .as_ref()
+            .unwrap()
+            .put_cf(
+                cf::CHANNELS,
+                &9u64.to_be_bytes(),
+                &serde_json::to_vec(&serde_json::json!({"channel_type": 2, "name": "Secret Chan"}))
+                    .unwrap(),
+            )
+            .unwrap();
+        let mut rx = engine.ws_broadcast.subscribe();
+        let payload = ChannelInvitePayload {
+            channel_id: 9,
+            target_user: "klv1invitee".into(),
+            anchor_node: None,
+        };
+        let e = env(
+            MessageType::ChannelInvite,
+            rmp_serde::to_vec_named(&payload).unwrap(),
+        );
+        engine.process(&e).await;
+
+        assert!(
+            rx.try_recv().is_err(),
+            "an invite to a PRIVATE channel must never broadcast to Everyone"
+        );
+        // Still persisted for the invitee's own private, authenticated poll.
+        let stored = engine
+            .storage
+            .as_ref()
+            .unwrap()
+            .get_notifications("klv1invitee", None, 50)
+            .unwrap();
+        assert_eq!(stored.len(), 1);
     }
 }
 
