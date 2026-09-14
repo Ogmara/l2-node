@@ -5,6 +5,39 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.129.2] - 2026-09-14
+
+### Security
+
+- **`rustls` 0.23.37 → 0.23.45**, fixing RUSTSEC-2026-0285 (TLS 1.3
+  handshake messages incorrectly accepted across encryption level
+  boundaries, medium severity), disclosed the same day it was found here.
+  Transitive dependency (via `reqwest`); a clean patch-level bump within
+  the already-pinned 0.23.x line, no code changes needed. The other two
+  flagged advisories (hickory-proto, via the pinned libp2p 0.56.0) remain
+  the same already-deferred, upstream-blocked pair as before.
+
+### Added
+
+- **Test coverage for the public-channel two-phase creation merge**
+  (`src/messages/router.rs`, `channel_create_encryption_merge_tests`).
+  Investigated a live report that a channel's `encryption_enabled` field
+  was missing from its stored metadata despite the channel being
+  genuinely v2-encrypted (its messages carried `enc_content`, and other
+  clients decrypted them fine) — the suspected mechanism was a race
+  between the chain scanner's bare-skeleton channel record (written on
+  seeing the on-chain create event, before any L2 fields exist) and the
+  creator's later L2 `ChannelCreate` envelope, which is supposed to merge
+  `encryption_enabled` in via `or_insert`. Reproducing both orderings of
+  that race in a controlled test did NOT reveal a bug — the merge logic
+  held correctly in both directions. Recorded here as a dead end (so it
+  isn't re-investigated from scratch) along with the test coverage the
+  investigation produced, which is real regression value either way. The
+  root cause of the original report turned out to be unrelated: ogmara-bot
+  has no channel-key handling at all, so it can never read a genuinely
+  encrypted channel regardless of what its metadata says (see ogmara-bot's
+  own changelog).
+
 ## [0.129.1] - 2026-09-13
 
 Tests only — no behavior change. 0.129.0's `type` query filter was verified

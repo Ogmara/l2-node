@@ -4690,6 +4690,183 @@ mod channel_delete_before_create_tests {
 }
 
 #[cfg(test)]
+mod channel_create_encryption_merge_tests {
+    //! Reproduces a live bug report (2026-09-14): a public channel created via
+    //! desktop's two-phase flow (on-chain SC tx first, L2 ChannelCreate
+    //! envelope published only after chain confirmation) ended up with NO
+    //! `encryption_enabled` field at all in its stored CHANNELS record, even
+    //! though the creating client sent `encryptionEnabled: true` and its own
+    //! messages into the channel were genuinely v2-encrypted (`enc_content`
+    //! present). Consequence: any OTHER reader of the channel record —
+    //! ogmara-bot's `describeChannel`, or another wallet's client, which uses
+    //! this SAME field to decide `encrypt-on-send` (desktop
+    //! `ChatView.tsx:507`) — would treat the channel as legacy-plaintext and
+    //! could itself send an UNENCRYPTED message into it.
+    //!
+    //! The suspected mechanism: the chain scanner can create a bare
+    //! `ChannelRecord` skeleton (no `encryption_enabled` key at all) for the
+    //! channel BEFORE the creator's L2 `ChannelCreate` envelope arrives and
+    //! merges in the real encryption flags via `obj.entry("encryption_enabled")
+    //! .or_insert(...)` (router.rs ~2419-2426) — but that merge only runs when
+    //! `is_creator` (comparing the skeleton's stored `creator` against the
+    //! envelope's `resolved_author`) is true.
+    use super::*;
+    use tempfile::TempDir;
+
+    fn router() -> (MessageRouter, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let identity = IdentityResolver::new(storage.clone());
+        (
+            MessageRouter::new(storage, identity, None, "testnet".to_string(), usize::MAX, std::sync::Arc::new(crate::metrics::counters::NetworkCounters::new()), crate::config::RateLimitsConfig::default()),
+            dir,
+        )
+    }
+
+    fn register_user(r: &MessageRouter, address: &str, registered_at: u64) {
+        let rec = serde_json::json!({ "address": address, "registered_at": registered_at });
+        r.storage.put_cf(schema::cf::USERS, address.as_bytes(), rec.to_string().as_bytes()).unwrap();
+    }
+
+    /// Mirrors the chain scanner's "first time we've seen this channel" write
+    /// (scanner.rs ~599-612): the plain `ChannelRecord` struct, which has no
+    /// `encryption_enabled` field to serialize in the first place.
+    fn make_chain_scanner_skeleton(r: &MessageRouter, channel_id: u64, creator: &str) {
+        let record = crate::chain::types::ChannelRecord {
+            channel_id,
+            slug: "testtest123".to_string(),
+            creator: creator.to_string(),
+            channel_type: 0,
+            created_at: 1_000,
+            display_name: None,
+            description: None,
+            member_count: 0,
+        };
+        r.storage
+            .put_cf(schema::cf::CHANNELS, &channel_id.to_be_bytes(), &serde_json::to_vec(&record).unwrap())
+            .unwrap();
+    }
+
+    fn signed_public_create_envelope(
+        sk: &ed25519_dalek::SigningKey,
+        author: &str,
+        channel_id: u64,
+        timestamp: u64,
+    ) -> Vec<u8> {
+        let payload = ChannelCreatePayload {
+            channel_id,
+            slug: "testtest123".to_string(),
+            channel_type: ChannelType::Public,
+            display_name: None,
+            description: None,
+            content_rating: Default::default(),
+            moderation: ModerationPolicy { admins: vec![], rules: None },
+            // What desktop actually sends (ChannelCreateView.tsx: `encryptionEnabled: true`).
+            encryption_enabled: Some(true),
+            history_visibility: None,
+        };
+        let payload_bytes = rmp_serde::to_vec_named(&payload).unwrap();
+        let author_pubkey: [u8; 32] = sk.verifying_key().to_bytes();
+        let msg_id = crypto::compute_msg_id("testnet", &author_pubkey, &payload_bytes, timestamp);
+        let signature = signing::sign_ogmara_message(
+            sk, "testnet", crate::messages::envelope::PROTOCOL_VERSION,
+            MessageType::ChannelCreate as u8, &msg_id, timestamp, &payload_bytes,
+        );
+        let envelope = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::ChannelCreate,
+            msg_id,
+            author: author.to_string(),
+            timestamp,
+            lamport_ts: 0,
+            payload: payload_bytes,
+            signature: signature.to_bytes().to_vec(),
+            relay_path: vec![],
+        };
+        rmp_serde::to_vec_named(&envelope).unwrap()
+    }
+
+    fn now_ms() -> u64 {
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
+    }
+
+    #[test]
+    fn skeleton_then_real_create_by_the_SAME_creator_merges_encryption_enabled() {
+        let (r, _d) = router();
+        let sk = crypto::generate_keypair();
+        let creator = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        register_user(&r, &creator, 1_000);
+        let cid = 5001u64;
+
+        // Chain scanner sees the on-chain event FIRST (plausible: the client
+        // waits for on-chain confirmation before publishing the L2 envelope,
+        // so the scanner has a head start).
+        make_chain_scanner_skeleton(&r, cid, &creator);
+        assert!(
+            !r.storage.get_cf(schema::cf::CHANNELS, &cid.to_be_bytes()).unwrap().unwrap()
+                .windows(19).any(|w| w == b"encryption_enabled"),
+            "sanity check: the bare skeleton must not already have the key"
+        );
+
+        let raw = signed_public_create_envelope(&sk, &creator, cid, now_ms());
+        let result = r.process_message(&raw);
+        assert!(matches!(result, RouteResult::Accepted { .. }), "got {:?}", result);
+
+        let stored = r.storage.get_cf(schema::cf::CHANNELS, &cid.to_be_bytes()).unwrap().unwrap();
+        let meta: serde_json::Value = serde_json::from_slice(&stored).unwrap();
+        assert_eq!(
+            meta.get("encryption_enabled"), Some(&serde_json::json!(true)),
+            "the creator's own ChannelCreate must merge encryption_enabled into a pre-existing \
+             chain-scanner skeleton, not leave it permanently unset. Full stored record: {meta}"
+        );
+    }
+
+    #[test]
+    fn real_create_arriving_FIRST_then_a_late_chain_scan_does_not_clobber_encryption_enabled() {
+        // The reverse ordering: the L2 envelope wins the race and creates the
+        // full record correctly; a LATER chain-scan of the same on-chain
+        // event must not downgrade it back to unencrypted.
+        let (r, _d) = router();
+        let sk = crypto::generate_keypair();
+        let creator = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        register_user(&r, &creator, 1_000);
+        let cid = 5002u64;
+
+        let raw = signed_public_create_envelope(&sk, &creator, cid, now_ms());
+        assert!(matches!(r.process_message(&raw), RouteResult::Accepted { .. }));
+        let before = r.storage.get_cf(schema::cf::CHANNELS, &cid.to_be_bytes()).unwrap().unwrap();
+        let before: serde_json::Value = serde_json::from_slice(&before).unwrap();
+        assert_eq!(before.get("encryption_enabled"), Some(&serde_json::json!(true)));
+
+        // Simulate the chain scanner's "already exists" merge branch directly
+        // (scanner.rs ~569-589): it overwrites channel_id/slug/creator/
+        // channel_type/created_at unconditionally and only `or_insert`s
+        // display_name/description/member_count — it must never touch
+        // encryption_enabled at all, in either direction.
+        let existing = r.storage.get_cf(schema::cf::CHANNELS, &cid.to_be_bytes()).unwrap().unwrap();
+        let mut meta: serde_json::Value = serde_json::from_slice(&existing).unwrap();
+        if let Some(obj) = meta.as_object_mut() {
+            obj.insert("channel_id".into(), serde_json::json!(cid));
+            obj.insert("slug".into(), serde_json::json!("testtest123"));
+            obj.insert("creator".into(), serde_json::json!(creator));
+            obj.insert("channel_type".into(), serde_json::json!(0u8));
+            obj.insert("created_at".into(), serde_json::json!(1_000u64));
+            obj.entry("display_name").or_insert(serde_json::Value::Null);
+            obj.entry("description").or_insert(serde_json::Value::Null);
+            obj.entry("member_count").or_insert(serde_json::json!(0));
+        }
+        r.storage.put_cf(schema::cf::CHANNELS, &cid.to_be_bytes(), &serde_json::to_vec(&meta).unwrap()).unwrap();
+
+        let after = r.storage.get_cf(schema::cf::CHANNELS, &cid.to_be_bytes()).unwrap().unwrap();
+        let after: serde_json::Value = serde_json::from_slice(&after).unwrap();
+        assert_eq!(
+            after.get("encryption_enabled"), Some(&serde_json::json!(true)),
+            "a later chain-scan merge must not clobber an already-correct encryption_enabled"
+        );
+    }
+}
+
+#[cfg(test)]
 mod dm_reaction_tests {
     use super::*;
     use tempfile::TempDir;
