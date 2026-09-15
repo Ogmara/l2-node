@@ -1830,6 +1830,13 @@ struct ChannelIdExtract {
     channel_id: Option<u64>,
 }
 
+/// Minimal extractor to route a `ChannelInvite` (0x1B) to the INVITEE's
+/// dm_topic rather than the channel topic — see that gossip arm's comment.
+#[derive(serde::Deserialize)]
+struct ChannelInviteTargetExtract {
+    target_user: String,
+}
+
 #[derive(serde::Deserialize)]
 struct RecipientExtract {
     recipient: String,
@@ -1866,19 +1873,20 @@ pub(crate) fn gossip_topic_for_envelope(
         // node (federation) — not just the host. authorize_channel_action gates
         // them to mods on every ingest path, so a relayed kick/ban can't be forged.
         | MessageType::ChannelKick | MessageType::ChannelBan
-        // AddModerator/RemoveModerator/Unban/Invite (audit final pre-mainnet
-        // W25): these had NO bridge arm at all, so moderator grants, unbans,
-        // and invites stayed host-node-local — a mod added on one node wasn't
-        // recognized as a mod on any other, an unbanned user stayed banned
-        // everywhere else, an invite only worked against the host. All four
-        // are re-authorized independently on every ingest node
+        // AddModerator/RemoveModerator/Unban (audit final pre-mainnet W25):
+        // these had NO bridge arm at all, so moderator grants and unbans
+        // stayed host-node-local — a mod added on one node wasn't recognized
+        // as a mod on any other, an unbanned user stayed banned everywhere
+        // else. Both are re-authorized independently on every ingest node
         // (`authorize_channel_action`: creator-only for AddModerator/
-        // RemoveModerator, mod-with-can_ban for Unban, creator-or-mod for
-        // Invite) and idempotent under duplicate relay (keyed put/delete on
-        // (channel_id, target_user), so a re-delivery overwrites with the
-        // same value or no-ops).
+        // RemoveModerator, mod-with-can_ban for Unban) and idempotent under
+        // duplicate relay (keyed put/delete on (channel_id, target_user), so
+        // a re-delivery overwrites with the same value or no-ops).
+        // (ChannelInvite moved to its own arm below, routed to the
+        // INVITEE's dm_topic rather than the channel topic — see that arm's
+        // comment.)
         | MessageType::ChannelAddModerator | MessageType::ChannelRemoveModerator
-        | MessageType::ChannelUnban | MessageType::ChannelInvite
+        | MessageType::ChannelUnban
         // ChannelMute/ChannelUnmute (audit W30): ChannelMute had NO bridge
         // arm at all, so a mute never propagated off the host node via ANY
         // path (there's no dedicated mute REST endpoint — it went through
@@ -1965,6 +1973,23 @@ pub(crate) fn gossip_topic_for_envelope(
             // can't decode, which previously dropped DMs from gossip too.
             let p: RecipientExtract = rmp_serde::from_slice(&envelope.payload).ok()?;
             Some(gossip::dm_topic(network_id, &p.recipient))
+        }
+        // ChannelInvite goes to the INVITEE's dm_topic, not the channel
+        // topic (cross-node private-channel invite fix): its only real
+        // consumer is the one invited wallet, wherever their home node is —
+        // routing it to `channel_topic` meant a node had to ALREADY be
+        // subscribed (i.e. have already federated the channel) to ever see
+        // it, which is never true for a brand-new private channel a node
+        // has never heard of. `dm_topic` is the existing "reach a wallet
+        // regardless of prior state" mechanism (every node subscribes to it
+        // for any wallet that has authenticated there — `register_local_dm_user`)
+        // and needs no new infrastructure. `authorize_channel_action`'s
+        // `ChannelInvite` arm now defers (rather than hard-rejects) when the
+        // channel is unknown locally, mirroring `ChannelDelete`'s
+        // `channel_creator_check` precedent — see that arm's comment.
+        MessageType::ChannelInvite => {
+            let p: ChannelInviteTargetExtract = rmp_serde::from_slice(&envelope.payload).ok()?;
+            Some(gossip::dm_topic(network_id, &p.target_user))
         }
         MessageType::DirectMessageEdit | MessageType::DirectMessageDelete
         | MessageType::DirectMessageReaction => {
@@ -9327,13 +9352,14 @@ mod gossip_bridge_tests {
     }
 
     #[test]
-    fn moderator_unban_and_invite_gossip_on_channel_topic() {
+    fn moderator_and_unban_gossip_on_channel_topic() {
         // Regression (audit final pre-mainnet W25): AddModerator (0x14),
-        // RemoveModerator (0x15), Unban (0x18), and Invite (0x1B) had NO
-        // bridge arm at all (unlike Kick/Ban/Pin/Unpin/Update in the same
-        // match block), so mod grants, unbans, and invites stayed
-        // host-node-local — which node a client happened to call decided
-        // whether the action was network-wide.
+        // RemoveModerator (0x15), and Unban (0x18) had NO bridge arm at all
+        // (unlike Kick/Ban/Pin/Unpin/Update in the same match block), so mod
+        // grants and unbans stayed host-node-local — which node a client
+        // happened to call decided whether the action was network-wide.
+        // (Invite/0x1B moved to its own dm_topic test below — see
+        // `channel_invite_gossips_on_invitee_dm_topic`.)
         let add_mod = ChannelAddModeratorPayload {
             channel_id: 42,
             target_user: "klv1target".to_string(),
@@ -9378,15 +9404,24 @@ mod gossip_bridge_tests {
             Some(crate::network::gossip::channel_topic("testnet", 42)),
         );
 
+    }
+
+    #[test]
+    fn channel_invite_gossips_on_invitee_dm_topic() {
+        // Cross-node private-channel invite fix: routing Invite to the
+        // channel topic meant a node had to already be SUBSCRIBED (i.e.
+        // have already federated the channel) to ever see it — never true
+        // for a brand-new private channel. dm_topic reaches the invited
+        // wallet's home node regardless of whether it knows the channel.
         let invite = ChannelInvitePayload {
             channel_id: 42,
             target_user: "klv1target".to_string(),
-            anchor_node: None,
+            anchor_node: Some("https://host.example".to_string()),
         };
         let env = envelope(MessageType::ChannelInvite, rmp_serde::to_vec_named(&invite).unwrap());
         assert_eq!(
             gossip_topic_for_envelope(&env, "testnet"),
-            Some(crate::network::gossip::channel_topic("testnet", 42)),
+            Some(crate::network::gossip::dm_topic("testnet", "klv1target")),
         );
     }
 

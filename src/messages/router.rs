@@ -1644,13 +1644,35 @@ impl MessageRouter {
                 }
                 Ok(())
             }
-            // Creator + any moderator
+            // Creator + any moderator. A channel this node has never seen
+            // locally (out-of-order gossip, or — the common case now that
+            // ChannelInvite routes to the invitee's dm_topic — a brand-new
+            // private channel this node has never federated at all) is
+            // deliberately let through here rather than rejected, mirroring
+            // `ChannelDelete`'s `channel_creator_check` precedent: neither
+            // creator nor moderator status can be checked until the channel
+            // actually exists locally, and the cross-node notification
+            // delivery this exists for needs the message ACCEPTED
+            // regardless. This does NOT by itself grant anything — deferring
+            // authorization here is safe ONLY because `update_indexes`'s
+            // `ChannelInvite` apply step separately re-verifies creator/mod
+            // status before ever writing the `CHANNEL_INVITES` record
+            // `ChannelJoin` later trusts as invitation proof (security
+            // audit, CRITICAL, 2026-09-15 — the first version of this fix
+            // let an Unknown-channel invite write that record unverified,
+            // which let any wallet self-grant "invited" status on any
+            // private channel, including inviting itself, by targeting a
+            // node that hadn't federated it yet). See that apply step's
+            // comment for the full reasoning.
             MessageType::ChannelInvite => {
                 let channel_id = self
                     .extract_channel_id(envelope)
                     .ok_or("missing or invalid channel_id")?;
-                if self.is_channel_creator(channel_id, resolved_author)? {
-                    return Ok(());
+                match self.channel_creator_check(channel_id, resolved_author)? {
+                    ChannelCreatorCheck::IsCreator | ChannelCreatorCheck::Unknown => {
+                        return Ok(());
+                    }
+                    ChannelCreatorCheck::NotCreator => {}
                 }
                 if self.storage.is_channel_moderator(channel_id, resolved_author)
                     .unwrap_or(false)
@@ -2760,21 +2782,58 @@ impl MessageRouter {
                 if let Ok(payload) =
                     rmp_serde::from_slice::<ChannelInvitePayload>(&envelope.payload)
                 {
-                    let key = schema::encode_channel_invite_key(
-                        payload.channel_id,
-                        &payload.target_user,
-                    );
-                    let record = serde_json::json!({
-                        "invited_by": resolved_author,
-                        "timestamp": envelope.timestamp,
-                    });
-                    let record_bytes = serde_json::to_vec(&record)
-                        .context("serializing invite record")?;
-                    self.storage.put_cf(
-                        schema::cf::CHANNEL_INVITES,
-                        &key,
-                        &record_bytes,
-                    )?;
+                    // Re-verify fresh here rather than trusting the earlier
+                    // authorize_channel_action pass (security audit, CRITICAL,
+                    // 2026-09-15): that check now defers (Ok) on a channel
+                    // this node has never seen locally, so a NotCreator
+                    // author would never even reach this apply step for a
+                    // KNOWN channel — but for an UNKNOWN one, "deferred"
+                    // does not mean "verified", and this CHANNEL_INVITES
+                    // record is later trusted by `ChannelJoin` as bare PROOF
+                    // of a real invite (the `invite_links_disabled` gate).
+                    // Writing it on unverifiable say-so would let any wallet
+                    // self-grant "invited" status on any private channel it
+                    // can merely name the id of — including inviting itself
+                    // — just by targeting a node that hasn't federated that
+                    // channel yet, which is the default state of most of the
+                    // network for most private channels. The cross-node
+                    // notification delivery this session's fix exists for
+                    // does NOT depend on this record at all (see `process()`
+                    // in notifications/engine.rs, an independent mechanism),
+                    // so skipping the write for an unverifiable invite costs
+                    // nothing there — it only means a channel with
+                    // `invite_links_disabled: true` needs a genuine
+                    // re-invite once the invitee's node has federated and
+                    // can verify the inviter for real, same as it would
+                    // with no cross-node delivery at all.
+                    let verified = match self
+                        .channel_creator_check(payload.channel_id, resolved_author)
+                    {
+                        Ok(ChannelCreatorCheck::IsCreator) => true,
+                        Ok(ChannelCreatorCheck::Unknown)
+                        | Ok(ChannelCreatorCheck::NotCreator)
+                        | Err(_) => self
+                            .storage
+                            .is_channel_moderator(payload.channel_id, resolved_author)
+                            .unwrap_or(false),
+                    };
+                    if verified {
+                        let key = schema::encode_channel_invite_key(
+                            payload.channel_id,
+                            &payload.target_user,
+                        );
+                        let record = serde_json::json!({
+                            "invited_by": resolved_author,
+                            "timestamp": envelope.timestamp,
+                        });
+                        let record_bytes = serde_json::to_vec(&record)
+                            .context("serializing invite record")?;
+                        self.storage.put_cf(
+                            schema::cf::CHANNEL_INVITES,
+                            &key,
+                            &record_bytes,
+                        )?;
+                    }
                 }
             }
             MessageType::ChannelUpdate => {
@@ -4520,6 +4579,45 @@ mod channel_delete_before_create_tests {
         rmp_serde::to_vec_named(&envelope).unwrap()
     }
 
+    fn signed_invite_envelope(
+        sk: &ed25519_dalek::SigningKey,
+        author: &str,
+        channel_id: u64,
+        target_user: &str,
+        timestamp: u64,
+    ) -> Vec<u8> {
+        let payload = ChannelInvitePayload {
+            channel_id,
+            target_user: target_user.to_string(),
+            anchor_node: Some("https://host.example".to_string()),
+        };
+        let payload_bytes = rmp_serde::to_vec_named(&payload).unwrap();
+        let author_pubkey: [u8; 32] = sk.verifying_key().to_bytes();
+        let msg_id =
+            crypto::compute_msg_id("testnet", &author_pubkey, &payload_bytes, timestamp);
+        let signature = signing::sign_ogmara_message(
+            sk,
+            "testnet",
+            crate::messages::envelope::PROTOCOL_VERSION,
+            MessageType::ChannelInvite as u8,
+            &msg_id,
+            timestamp,
+            &payload_bytes,
+        );
+        let envelope = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::ChannelInvite,
+            msg_id,
+            author: author.to_string(),
+            timestamp,
+            lamport_ts: 0,
+            payload: payload_bytes,
+            signature: signature.to_bytes().to_vec(),
+            relay_path: vec![],
+        };
+        rmp_serde::to_vec_named(&envelope).unwrap()
+    }
+
     fn signed_create_envelope(
         sk: &ed25519_dalek::SigningKey,
         author: &str,
@@ -4590,6 +4688,104 @@ mod channel_delete_before_create_tests {
             r.storage.exists_cf(schema::cf::DELETED_CHANNELS, &cid.to_be_bytes()).unwrap_or(false) == false,
             "must not tombstone a channel it has never seen"
         );
+    }
+
+    #[test]
+    fn invite_for_unknown_channel_is_accepted_not_rejected() {
+        // Cross-node private-channel invite fix: a node that has never
+        // federated the target channel can't verify creator/moderator
+        // status locally, so authorization must defer (mirroring
+        // `channel_creator_check`'s existing ChannelDelete precedent)
+        // rather than hard-reject — otherwise a relayed ChannelInvite on
+        // the invitee's dm_topic would never produce a notification on any
+        // node except the one that already knows the channel, which is
+        // exactly the bug this fix closes.
+        let (r, _d) = router();
+        let sk = crypto::generate_keypair();
+        let inviter = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        register_user(&r, &inviter, 1_000);
+        let cid = 4244u64;
+
+        let raw = signed_invite_envelope(&sk, &inviter, cid, "klv1target", now_ms());
+        match r.process_message(&raw) {
+            RouteResult::Accepted { .. } => {}
+            other => panic!("expected Accepted (deferred, not rejected), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn invite_for_unknown_channel_never_grants_a_trusted_channel_invites_record() {
+        // REGRESSION GUARD, CRITICAL (security audit, 2026-09-15). The
+        // deferred-Unknown authorization above must NOT, by itself, let an
+        // unverifiable invite write the CHANNEL_INVITES record ChannelJoin
+        // trusts as bare proof of a real invite — otherwise ANY wallet could
+        // self-grant "invited" status on ANY private channel (including
+        // inviting itself) just by targeting a node that hasn't federated
+        // that channel yet, bypassing invite_links_disabled entirely. The
+        // message is Accepted (so the notification still gets delivered —
+        // that's the actual fix), but no CHANNEL_INVITES row may exist for
+        // an unknown channel's invite.
+        let (r, _d) = router();
+        let attacker_sk = crypto::generate_keypair();
+        let attacker = crypto::pubkey_to_address(&attacker_sk.verifying_key()).unwrap();
+        register_user(&r, &attacker, 1_000);
+        let cid = 4246u64;
+
+        // Self-invite: the worst-case variant from the finding.
+        let raw = signed_invite_envelope(&attacker_sk, &attacker, cid, &attacker, now_ms());
+        assert!(matches!(r.process_message(&raw), RouteResult::Accepted { .. }));
+
+        let key = schema::encode_channel_invite_key(cid, &attacker);
+        assert!(
+            r.storage.get_cf(schema::cf::CHANNEL_INVITES, &key).unwrap().is_none(),
+            "an invite for a channel this node has never seen must NOT be trusted as a real grant"
+        );
+    }
+
+    #[test]
+    fn invite_for_a_known_channel_by_the_real_creator_still_grants_the_record() {
+        // The fix above must not also break the legitimate, KNOWN-channel
+        // case: a real creator's invite still writes CHANNEL_INVITES.
+        let (r, _d) = router();
+        let creator_sk = crypto::generate_keypair();
+        let creator = crypto::pubkey_to_address(&creator_sk.verifying_key()).unwrap();
+        register_user(&r, &creator, 1_000);
+        let cid = 4247u64;
+        let create_raw = signed_create_envelope(&creator_sk, &creator, cid, "test-channel", now_ms());
+        assert!(matches!(r.process_message(&create_raw), RouteResult::Accepted { .. }));
+
+        let raw = signed_invite_envelope(&creator_sk, &creator, cid, "klv1target", now_ms() + 1);
+        assert!(matches!(r.process_message(&raw), RouteResult::Accepted { .. }));
+
+        let key = schema::encode_channel_invite_key(cid, "klv1target");
+        assert!(
+            r.storage.get_cf(schema::cf::CHANNEL_INVITES, &key).unwrap().is_some(),
+            "a real creator's invite for a known channel must still grant the record"
+        );
+    }
+
+    #[test]
+    fn invite_for_a_known_channel_by_a_non_creator_non_moderator_is_rejected() {
+        // The Unknown-defers change must not weaken the KNOWN-channel case:
+        // a channel this node DOES have a record for still requires the
+        // author to be its creator or a moderator.
+        let (r, _d) = router();
+        let creator_sk = crypto::generate_keypair();
+        let creator = crypto::pubkey_to_address(&creator_sk.verifying_key()).unwrap();
+        register_user(&r, &creator, 1_000);
+        let cid = 4245u64;
+        let create_raw = signed_create_envelope(&creator_sk, &creator, cid, "test-channel", now_ms());
+        assert!(matches!(r.process_message(&create_raw), RouteResult::Accepted { .. }));
+
+        let outsider_sk = crypto::generate_keypair();
+        let outsider = crypto::pubkey_to_address(&outsider_sk.verifying_key()).unwrap();
+        register_user(&r, &outsider, 1_000);
+        let invite_raw =
+            signed_invite_envelope(&outsider_sk, &outsider, cid, "klv1target", now_ms() + 1);
+        match r.process_message(&invite_raw) {
+            RouteResult::Rejected(_) => {}
+            other => panic!("expected Rejected (not creator/moderator), got {:?}", other),
+        }
     }
 
     #[test]

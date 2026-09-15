@@ -5,6 +5,63 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.130.0] - 2026-09-15
+
+Cross-node private-channel invite delivery. Private channels are host-node-
+scoped — a channel only exists on its creator's ("anchor") node until
+another node federates (replicates) it. `ChannelInvite` never reached a
+node that hadn't already federated the target channel: it gossiped on the
+channel's own topic, which a node only subscribes to after federating —
+and even if it somehow arrived, authorization hard-rejected it because it
+required a local channel record to verify the inviter. Found live: a bot
+invited to a brand-new private channel on a node its own home node had
+never heard of never saw the invite at all.
+
+### Added
+
+- **`ChannelInvite` now gossips on the invitee's `dm_topic`, not the
+  channel's topic.** `dm_topic` is a per-wallet topic every node already
+  subscribes to for any wallet that has authenticated there — the actual
+  "reach a wallet wherever they are" mechanism this message needed, not
+  the channel-topic subscription that requires prior federation.
+- **Authorization now defers, rather than hard-rejects, when the target
+  channel is unknown locally** (`channel_creator_check`, mirroring the
+  existing `ChannelDelete` precedent) — the message is accepted so the
+  invitee's node receives and can notify on it, since neither creator nor
+  moderator status can be verified until the channel actually exists
+  locally.
+- **`ChannelInvitePayload.anchor_node`** (present on the wire since this
+  field was added, never previously populated or surfaced) now flows
+  through: the inviting client sets it to its own node's URL, and it's
+  now included in the `channel_invite` notification (`GET
+  /api/v1/notifications`) so the invitee's client can `POST
+  /api/v1/channels/{id}/federate` before joining — the same step the
+  existing click-through invite link already triggers, just reachable
+  from a notification instead of a URL fragment.
+
+### Security
+
+- **Closed a critical access-control bypass introduced by the
+  authorization-deferral change above, before it ever shipped** (found in
+  this session's own security audit, fixed same session, re-audited
+  clean): the apply step that writes the `CHANNEL_INVITES` record —
+  which `ChannelJoin` later trusts as bare proof of a real invite,
+  gating the `invite_links_disabled` flag — ran unconditionally whenever
+  authorization passed. Once authorization could defer on an unknown
+  channel, this meant ANY wallet could send itself a `ChannelInvite` for
+  ANY private channel_id, including one with invites explicitly disabled,
+  targeting a node that simply hadn't federated that channel yet (the
+  default state for most of the network), and get a permanently-trusted
+  "invited" grant recorded with zero real authorization. Fixed by having
+  the apply step re-verify creator/moderator status independently, fresh,
+  before ever writing the record — writing nothing for an unverifiable
+  invite (the cross-node notification delivery above does not depend on
+  this record at all, so nothing about the actual fix is lost). A
+  channel with `invite_links_disabled: true` now requires a genuine
+  re-invite once the invitee's node has actually federated and can
+  verify the inviter for real; the far more common default
+  (`invite_links_disabled: false`) is unaffected either way.
+
 ## [0.129.2] - 2026-09-14
 
 ### Security

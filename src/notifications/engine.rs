@@ -37,6 +37,10 @@ pub struct Notification {
     pub preview: String,
     /// Timestamp of the triggering message.
     pub timestamp: u64,
+    /// Anchor node API endpoint (`channel_invite` only) — tells the
+    /// recipient's client where a private channel it doesn't know locally
+    /// is hosted, so it can `federate_channel` before joining.
+    pub anchor_node: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -327,6 +331,7 @@ impl NotificationEngine {
                         channel_name: self.lookup_channel_name(payload.channel_id),
                         preview: String::new(),
                         timestamp: envelope.timestamp,
+                        anchor_node: payload.anchor_node.clone(),
                     };
                     // Deliberately NOT gated on `local_users` (unlike
                     // check_mentions): the whole point is that the invited
@@ -1063,6 +1068,7 @@ impl NotificationEngine {
                     channel_name: channel_name.clone(),
                     preview: preview.to_string(),
                     timestamp: envelope.timestamp,
+                    anchor_node: None,
                 };
 
                 self.deliver(mentioned_address, &envelope.msg_id, notification)
@@ -1116,6 +1122,7 @@ impl NotificationEngine {
                 "channel_name": notification.channel_name,
                 "preview": notification.preview,
                 "timestamp": notification.timestamp,
+                "anchor_node": notification.anchor_node,
             });
             if let Err(e) = storage.store_notification_capped(
                 target_address,
