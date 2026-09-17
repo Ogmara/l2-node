@@ -5,6 +5,69 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.130.1] - 2026-09-17
+
+Chain-scanner retry write amplification. Investigated why darkw0rld's
+RocksDB data directory had grown to 2.4GB despite only ~500 messages/posts
+and 873 real anchors: the directory was almost entirely uncompressed WAL
+(write-ahead log) segments, not compacted/compressed SST tables (SST total
+was 12MB). A RocksDB flush during the investigation showed a single
+column family (`state_anchors`) collapsing 196,857 memtable entries down to
+a 165KB SST on flush — consistent with a small number of real keys being
+written many times over, not real data volume.
+
+Root cause: the chain scanner's cursor only persists after an entire
+catch-up batch (2,000 blocks, up to 50 API pages) succeeds. A transient
+failure partway through a batch (rate limit, HTTP/JSON error — routine on
+a node that "always falls behind and resyncs") discarded the batch's
+progress, and the next tick retried the whole batch from its start,
+re-processing and re-writing every event already handled earlier in that
+attempt. Writes are idempotent (no data loss, no correctness bug — the
+W17 pagination fix already guarantees full range coverage), but every
+retry appends a fresh, uncompressed WAL entry per event regardless of
+whether the value changed, and WAL can't be trimmed until the memtable
+eventually flushes.
+
+### Fixed
+- Reduced the catch-up batch size (`CATCHUP_BATCH_SIZE`) from 2,000 blocks
+  to 200 — a mid-batch failure now re-does at most 1/10th as much
+  already-completed work, bounding both the WAL write amplification and
+  the redundant Klever API calls against a rate-limited endpoint (likely
+  a contributing cause of the node falling behind in the first place).
+  Deferred: `CATCHUP_BATCH_DELAY_MS` (500ms, fixed per-batch) was left
+  unchanged — scaling it down with the smaller batch size could improve
+  zero-failure catch-up throughput, but risks reintroducing 429 storms
+  without empirical validation of Klever's actual rate limits; better
+  assessed by watching real catch-up behavior on testnet than guessed.
+- Capped `libp2p_gossipsub` logging at `warn` by default (new
+  `NOISY_THIRD_PARTY_TARGETS` list in `init_logging`, `RUST_LOG` still
+  overrides per target). Found while investigating the WAL issue above:
+  darkw0rld's journalctl output was dominated by 3 DEBUG lines per
+  subscribed DM topic per gossipsub heartbeat tick (`Updating mesh`,
+  `HEARTBEAT: Mesh low`, `RANDOM PEERS`) — unbounded by topic count, and
+  never actionable at INFO or above (mesh-low reads permanently true on a
+  low-peer testnet). darkw0rld's own `[logging] level` was also `"debug"`
+  network-wide (vs. the shipped example's `"info"`) — reset separately as
+  an ops change, not a code change.
+
+### Security
+- Bumped `libp2p` 0.56.0 → 0.57.0, which pulls `hickory-proto` to 0.26.3
+  (via `libp2p-dns` 0.45.0 and `libp2p-mdns` 0.49.0, both now requiring
+  `hickory-proto ^0.26`). Resolves both previously-deferred advisories
+  against the transitive `hickory-proto 0.25.2` on the DNS-resolver/mDNS
+  peer-discovery path: **RUSTSEC-2026-0119** (O(n²) name-compression CPU
+  exhaustion, patched `>=0.26.1`) and **RUSTSEC-2026-0118** (NSEC3
+  closest-encloser unbounded loop — the affected `DnssecDnsHandle` was
+  removed from `hickory-proto` entirely at 0.26.0, so `>=0.26.0-beta.1` is
+  unaffected rather than newly patched). `cargo audit` now reports 0
+  vulnerabilities (previously 2). This also updates the rest of libp2p's
+  wire-protocol stack (gossipsub, kad, mdns, swarm, noise, yamux) and its
+  crypto dependencies (`curve25519-dalek`, `ed25519-dalek`, `x25519-dalek`
+  — all major-version bumps) — all 762 existing tests pass, but this has
+  not been live-verified for P2P wire compatibility. Deploy to the whole
+  fleet (darkw0rld + freeweb) together, not staggered — no backward
+  compatibility with the old libp2p stack was verified or assumed.
+
 ## [0.130.0] - 2026-09-15
 
 Cross-node private-channel invite delivery. Private channels are host-node-

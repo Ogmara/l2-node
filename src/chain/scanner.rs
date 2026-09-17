@@ -26,7 +26,21 @@ const BACKOFF_BASE_MS: u64 = 5_000;
 /// Maximum backoff cap (ms).
 const BACKOFF_MAX_MS: u64 = 120_000;
 /// Number of blocks per batch during catch-up.
-const CATCHUP_BATCH_SIZE: u64 = 2_000;
+///
+/// The chain cursor only persists after a whole batch succeeds
+/// (`poll_blocks`'s `set_chain_cursor` call) — a failure anywhere inside
+/// `process_range_paged` (rate limit, transient HTTP/JSON error) discards
+/// the batch's progress and the next tick retries it from `start`,
+/// re-processing (and re-writing to RocksDB) every event already handled
+/// earlier in that attempt. Writes are idempotent so this is correctness-
+/// safe, but each retry appends a fresh, uncompressed WAL entry per event
+/// regardless of whether the value changed. On a node that regularly falls
+/// behind and re-syncs, a 2,000-block unit of retry repeatedly amplified
+/// WAL growth far beyond actual live data (observed: a single flush of
+/// ~197k duplicate writes collapsing to a 165KB SST). Kept small so a
+/// mid-batch failure only re-does a bounded, small amount of already-done
+/// work.
+const CATCHUP_BATCH_SIZE: u64 = 200;
 /// Number of blocks per batch when near chain tip.
 const TIP_BATCH_SIZE: u64 = 500;
 /// If we're more than this many blocks behind, we're in catch-up mode.

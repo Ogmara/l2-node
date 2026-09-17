@@ -365,12 +365,28 @@ async fn main() -> Result<()> {
     }
 }
 
+/// Third-party targets that log per-heartbeat/per-topic internals at DEBUG
+/// far below what's useful for operators — capped by default so a broad
+/// `logging.level = "debug"` (meant for our own code) doesn't also turn on
+/// a per-topic, per-heartbeat firehose from a dependency. `libp2p_gossipsub`
+/// was observed on darkw0rld logging 3 lines per subscribed DM topic per
+/// heartbeat tick (`Updating mesh`, `HEARTBEAT: Mesh low`, `RANDOM PEERS`),
+/// unbounded by topic count — with mesh-low being permanently true on a
+/// low-peer testnet, none of it was ever actionable at INFO or above.
+/// `RUST_LOG` (checked first, below) can still override this per target.
+const NOISY_THIRD_PARTY_TARGETS: &[(&str, &str)] = &[("libp2p_gossipsub", "warn")];
+
 /// Initialize the tracing subscriber based on logging config.
 fn init_logging(logging: &config::LoggingConfig) {
     use tracing_subscriber::EnvFilter;
 
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(&logging.level));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        let mut directive = logging.level.clone();
+        for (target, level) in NOISY_THIRD_PARTY_TARGETS {
+            directive.push_str(&format!(",{target}={level}"));
+        }
+        EnvFilter::new(directive)
+    });
 
     match logging.format.as_str() {
         "json" => {

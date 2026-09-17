@@ -1,6 +1,6 @@
 [package]
 name = "ogmara-node"
-version = "0.130.0"
+version = "0.130.1"
 edition = "2021"
 authors = ["Ogmara Contributors"]
 license = "MIT"
@@ -39,7 +39,7 @@ hmac = "0.12"                # HMAC-SHA256 for session tokens
 rocksdb = "0.24"
 
 # Networking
-libp2p = { version = "0.56", features = [
+libp2p = { version = "0.57", features = [
     "gossipsub", "kad", "mdns", "quic", "tcp", "dns",
     "noise", "yamux", "identify", "request-response",
     "memory-connection-limits",
