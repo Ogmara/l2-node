@@ -42,7 +42,17 @@ const BACKOFF_MAX_MS: u64 = 120_000;
 /// work.
 const CATCHUP_BATCH_SIZE: u64 = 200;
 /// Number of blocks per batch when near chain tip.
-const TIP_BATCH_SIZE: u64 = 500;
+///
+/// Same retry-amplification exposure as `CATCHUP_BATCH_SIZE` above — this
+/// path uses the identical cursor-commit-only-on-full-success logic. Live
+/// data from the 0.130.1 fix (which only shrunk `CATCHUP_BATCH_SIZE`) showed
+/// WAL still growing at ~43MB/hour with zero "Catch-up scan starting"
+/// events in the window — i.e. the amplification was happening entirely
+/// through THIS path, not the catch-up one, presumably because the node
+/// sits in the "moderately behind, under the catch-up threshold" zone far
+/// more of the time than it spends in an actual catch-up burst. Shrunk by
+/// the same ~10x factor, same rationale.
+const TIP_BATCH_SIZE: u64 = 50;
 /// If we're more than this many blocks behind, we're in catch-up mode.
 const CATCHUP_THRESHOLD: u64 = 5_000;
 

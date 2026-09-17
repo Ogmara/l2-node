@@ -5,6 +5,25 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.130.2] - 2026-09-17
+
+Chain-scanner retry write amplification, part 2. 0.130.1 shrunk
+`CATCHUP_BATCH_SIZE` on the theory that large catch-up batches were the
+dominant source of WAL write amplification. Live data after deploying
+0.130.1 to darkw0rld disproved that: WAL was still growing at ~43MB/hour
+(vs. the pre-fix ~47MB/hour baseline — essentially unchanged) over a
+2h21m window with **zero** "Catch-up scan starting" events logged. All of
+that growth happened through `TIP_BATCH_SIZE` (500 blocks) instead — the
+scanner apparently spends far more time moderately-behind-but-under-the-
+catch-up-threshold than it does in an actual catch-up burst, so the path
+I didn't touch turned out to be the dominant contributor.
+
+### Fixed
+- Reduced `TIP_BATCH_SIZE` from 500 blocks to 50 — same rationale and same
+  ~10x reduction factor as the 0.130.1 catch-up fix, applied to the path
+  that turned out to actually matter. Preserves the original design
+  ordering (tip batches smaller than catch-up batches).
+
 ## [0.130.1] - 2026-09-17
 
 Chain-scanner retry write amplification. Investigated why darkw0rld's
