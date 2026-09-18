@@ -373,9 +373,31 @@ impl ChainScanner {
     /// Returns `Ok(true)` when the range was fully processed (a short page
     /// terminated it), or `Ok(false)` when it hit the page cap and the caller
     /// must subdivide (audit 2026-06-07 W17).
+    ///
+    /// **The Klever testnet API's `startBlock`/`endBlock` query params are
+    /// silently NOT honored** — confirmed directly: a query with
+    /// `startBlock=1000000&endBlock=1000100` against a chain at height
+    /// ~12.7M still returned the current-tip transactions. The endpoint
+    /// just returns the most recent matching transactions, newest-first,
+    /// regardless of the requested range. Every prior version of this
+    /// function trusted the server to filter and only used `tx_count < 100`
+    /// to detect "range exhausted" — which a consistently-active contract
+    /// never satisfies, so every tick re-walked and re-wrote the same
+    /// recent window of events forever (root cause of l2-node 0.130.1/
+    /// 0.130.2's WAL write amplification investigation — those two fixes
+    /// shrunk the batch size but couldn't fix this, since the bug is
+    /// independent of what range is requested). Filtering is now done
+    /// client-side against `tx.block_num`, with early pagination
+    /// termination once results walk past `start` (safe given the
+    /// newest-first ordering — every subsequent page can only be older
+    /// still, so there is nothing further to find in-range).
     async fn process_range_paged(&self, start: u64, end: u64) -> Result<bool> {
         let mut page = 1u64;
         const MAX_PAGES: u64 = 50;
+        // Set once a transaction older than `start` is seen — newest-first
+        // ordering means every remaining/later-page entry is older still,
+        // so there is nothing left to find in-range and paging can stop.
+        let mut walked_past_start = false;
 
         loop {
             if page > MAX_PAGES {
@@ -428,6 +450,18 @@ impl ChainScanner {
                     continue;
                 }
 
+                // The API does NOT actually filter by startBlock/endBlock (see
+                // the function doc comment) — enforce the intended range
+                // ourselves.
+                match classify_block_range_position(tx.block_num, start, end) {
+                    RangePosition::TooNew => continue,
+                    RangePosition::TooOld => {
+                        walked_past_start = true;
+                        continue;
+                    }
+                    RangePosition::InRange => {}
+                }
+
                 // Already filtered by toAddress in the API query, but double-check
                 // the contract call parameter address matches
                 let contract_address = tx
@@ -464,8 +498,11 @@ impl ChainScanner {
                 }
             }
 
-            // Fewer than a full page → no more transactions in this range.
-            if tx_count < 100 {
+            // Fewer than a full page → no more transactions at all (the
+            // one server-side signal that IS reliable). Or: this page
+            // already walked past `start` — every further page can only
+            // be older still, so there is nothing left to find in-range.
+            if tx_count < 100 || walked_past_start {
                 return Ok(true);
             }
             page += 1;
@@ -920,6 +957,36 @@ impl ChainScanner {
     }
 }
 
+/// Where a transaction's block falls relative to the scan's intended
+/// `[start, end]` range. The Klever testnet API's `startBlock`/`endBlock`
+/// query params are silently not honored (see `process_range_paged`'s doc
+/// comment) — the server just returns its most recent matching
+/// transactions, newest-first, regardless of the requested range. Callers
+/// must classify and act on each transaction themselves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RangePosition {
+    /// Newer than `end` — not this range's concern; a later tick's range
+    /// will cover it once it advances that far.
+    TooNew,
+    /// Within `[start, end]` — process it.
+    InRange,
+    /// Older than `start` — the scan has walked past its intended range.
+    /// Given newest-first ordering, every remaining entry on this page and
+    /// every subsequent page can only be older still, so there is nothing
+    /// further to find in-range and paging can stop.
+    TooOld,
+}
+
+fn classify_block_range_position(block_num: u64, start: u64, end: u64) -> RangePosition {
+    if block_num > end {
+        RangePosition::TooNew
+    } else if block_num < start {
+        RangePosition::TooOld
+    } else {
+        RangePosition::InRange
+    }
+}
+
 /// Blocks past `cutoff_height` before the rollback checkpoint is GC'd.
 /// Conservative — gives the operator time to inspect / notice any
 /// issues before the safety net is removed. Spec 11-snapshot-sync.md §5a.6.
@@ -1132,5 +1199,50 @@ mod user_record_merge_tests {
             assert_eq!(merged["public_key"], serde_json::json!("pk"));
             assert_eq!(merged["address"], serde_json::json!("klv1y"));
         }
+    }
+}
+
+#[cfg(test)]
+mod range_position_tests {
+    use super::*;
+
+    // REGRESSION: the Klever testnet API silently ignores startBlock/endBlock
+    // and just returns its most recent matching transactions regardless of
+    // the requested range. Without this client-side classification, the
+    // scanner reprocessed the same recent window of events on every tick
+    // forever — the root cause of the l2-node 0.130.1/0.130.2 WAL
+    // write-amplification investigation (which fixed the symptom via batch
+    // size, not the actual cause).
+
+    #[test]
+    fn within_range_is_in_range() {
+        assert_eq!(classify_block_range_position(50, 10, 100), RangePosition::InRange);
+        // Inclusive at both boundaries.
+        assert_eq!(classify_block_range_position(10, 10, 100), RangePosition::InRange);
+        assert_eq!(classify_block_range_position(100, 10, 100), RangePosition::InRange);
+    }
+
+    #[test]
+    fn newer_than_end_is_too_new() {
+        assert_eq!(classify_block_range_position(101, 10, 100), RangePosition::TooNew);
+        // The realistic shape of the bug: the API always hands back
+        // current-tip transactions, far newer than an old target range.
+        assert_eq!(
+            classify_block_range_position(12_698_732, 1_000_000, 1_000_100),
+            RangePosition::TooNew
+        );
+    }
+
+    #[test]
+    fn older_than_start_is_too_old() {
+        assert_eq!(classify_block_range_position(9, 10, 100), RangePosition::TooOld);
+        assert_eq!(classify_block_range_position(0, 10, 100), RangePosition::TooOld);
+    }
+
+    #[test]
+    fn single_block_range_only_admits_that_block() {
+        assert_eq!(classify_block_range_position(41, 42, 42), RangePosition::TooOld);
+        assert_eq!(classify_block_range_position(42, 42, 42), RangePosition::InRange);
+        assert_eq!(classify_block_range_position(43, 42, 42), RangePosition::TooNew);
     }
 }

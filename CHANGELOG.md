@@ -5,6 +5,63 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.130.3] - 2026-09-18
+
+Chain-scanner retry write amplification, part 3 — the actual root cause.
+0.130.1 and 0.130.2 shrunk the catch-up and tip batch sizes on the theory
+that large retried batches were the source of WAL write amplification.
+Neither one moved the needle: WAL growth stayed at ~43-47MB/hour across
+every measurement (pre-fix, post-0.130.1, post-0.130.2), which ruled out
+retry-batch-size as the actual mechanism.
+
+Root cause, found by directly querying the Klever testnet API: **the
+`startBlock`/`endBlock` query parameters are silently not honored.**
+Verified directly — a query with `startBlock=1000000&endBlock=1000100`
+against a chain at height ~12.7M still returned current-tip transactions.
+Several alternate parameter name spellings were also tried and all
+ignored, ruling out a simple param-naming bug on our side. The endpoint
+just returns its most recent matching transactions, newest-first,
+regardless of the requested range.
+
+This means every single scan tick — independent of what range the
+scanner's cursor logic computed, independent of batch size — the actual
+HTTP response was just "recent transactions." The scanner faithfully
+re-processed (and re-wrote) the same recent window of real `anchorState`
+events on every tick, forever. A RocksDB compaction event during
+investigation proved this directly: merging 4 recent flush files (9,493
+input records) dropped 7,594 as obsolete duplicates, converging on the
+same ~1,900-record steady state seen across every compaction sampled —
+the true distinct-record count was never growing, just being rewritten
+in a loop. Neither prior batch-size fix could have caught this, since the
+bug is entirely independent of how large the requested range is.
+
+### Fixed
+- `process_range_paged` now filters transactions client-side against
+  `tx.block_num` (already deserialized, just never checked): anything
+  newer than the range's `end` is skipped (a later tick will cover it
+  once the range advances that far); anything older than `start` sets an
+  early-termination flag, since newest-first ordering means every
+  remaining/later-page entry can only be older still. Extracted the
+  classification into a pure `classify_block_range_position` helper with
+  its own unit tests (`chain::scanner::range_position_tests`), since the
+  prior HTTP-coupled code had no way to test this boundary logic directly.
+
+### Known limitation, not fixed here
+- If the API never actually supports historical range queries, genuine
+  catch-up scanning (a node significantly behind — extended downtime, a
+  fresh bootstrap without a snapshot) may be unable to retrieve the
+  historical transactions it needs at all: every range will just get
+  handed "recent" data, which for a stale historical range is always newer
+  than `end` — every entry classifies as `TooNew`, `walked_past_start`
+  never triggers, and MAX_PAGES gets hit repeatedly, driving the W17
+  subdivision logic down toward
+  single-block ranges without ever succeeding. Not observed on darkw0rld/
+  freeweb (neither is in genuine catch-up), but worth a dedicated
+  investigation before relying on catch-up mode for a real recovery
+  scenario — likely needs either a different Klever API endpoint capable
+  of real historical queries, or a different sync strategy entirely
+  (snapshot-bootstrap is the existing fallback for this case).
+
 ## [0.130.2] - 2026-09-17
 
 Chain-scanner retry write amplification, part 2. 0.130.1 shrunk
