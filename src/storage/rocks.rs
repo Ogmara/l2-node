@@ -266,6 +266,17 @@ impl Storage {
         db_opts.set_max_background_jobs(4);
         db_opts.set_max_write_buffer_number(3);
         db_opts.increase_parallelism(num_cpus());
+        // RocksDB's own internal diagnostic LOG (flush/compaction events,
+        // periodic `rocksdb.stats` dumps every stats_dump_period_sec — default
+        // 600s, unchanged here, across every column family) has NO rotation by
+        // default during a continuous run: max_log_file_size and
+        // log_file_time_to_roll both default to 0 (disabled), so without this
+        // it only rolls at the next DB re-open (i.e. a restart). A node that
+        // genuinely never restarts would grow this file unbounded. Cap it and
+        // keep a bounded history instead.
+        db_opts.set_max_log_file_size(64 * 1024 * 1024); // 64MB
+        db_opts.set_log_file_time_to_roll(7 * 24 * 60 * 60); // 7 days, whichever comes first
+        db_opts.set_keep_log_file_num(20);
 
         // Create column family descriptors with default options
         let cf_descriptors: Vec<ColumnFamilyDescriptor> = cf::ALL

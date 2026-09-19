@@ -5,6 +5,29 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.130.4] - 2026-09-19
+
+RocksDB internal LOG file has no rotation during a continuous run.
+Follow-up from the 0.130.3 WAL investigation: with that fixed, the
+question became "what else could grow unbounded on a node that never
+restarts?" RocksDB's own diagnostic `db/LOG` (flush/compaction events,
+periodic `rocksdb.stats` dumps for every column family) previously only
+rotated at the next DB re-open — `max_log_file_size` and
+`log_file_time_to_roll` both default to 0 (disabled), so during a single
+long-running process it just appends forever. `stats_dump_period_sec`
+defaults to 600s (10 min, left unchanged) and dumps stats for all ~55
+column families every cycle, so this was a real, slow, unbounded growth
+source for a node that genuinely never restarts — separate from and much
+smaller per-day than the fixed WAL bug, but unbounded all the same over
+a long enough uptime.
+
+### Fixed
+- `Storage::open()` now sets `max_log_file_size` (64MB) and
+  `log_file_time_to_roll` (7 days), whichever triggers first, plus
+  `keep_log_file_num` (20) to bound retained history. Worst case this
+  caps LOG history at ~1.28GB — a hard bound in place of what was
+  previously unbounded for the life of an uninterrupted process.
+
 ## [0.130.3] - 2026-09-18
 
 Chain-scanner retry write amplification, part 3 — the actual root cause.
