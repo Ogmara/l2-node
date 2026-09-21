@@ -246,6 +246,33 @@ pub struct Attachment {
     pub thumbnail_cid: Option<String>,
 }
 
+// --- Message Buttons (spec 3.3, l2-node 0.131+) ---
+//
+// A message MAY attach up to MAX_BUTTON_ROWS rows of up to MAX_BUTTONS_PER_ROW
+// buttons each (validation.rs), capped overall at MAX_BUTTONS_TOTAL regardless
+// of row/column distribution. Any wallet may attach buttons, not only wallets
+// whose profile declares `is_bot` — see spec §3.3, "Any wallet may attach
+// buttons to its own message".
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageButton {
+    /// 1..=24 UTF-8 bytes. Same control/bidi-codepoint rejection as
+    /// `BotCommand::description` (spec §3.11.1); full Unicode, never ASCII-only.
+    pub label: String,
+    /// 1..=256 UTF-8 bytes. Sent VERBATIM as `content` when the button is
+    /// pressed (spec §3.3 "Pressing a button..."). Convention, not
+    /// node-enforced: SHOULD start with '/' to be `parseCommand()`-compatible
+    /// — the node validates only length and charset, exactly as it does for
+    /// `content` itself.
+    pub command: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ButtonRow {
+    /// <= MAX_BUTTONS_PER_ROW.
+    pub buttons: Vec<MessageButton>,
+}
+
 // --- Chat Message Payload (spec 3.3) ---
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -280,6 +307,19 @@ pub struct ChatMessagePayload {
     /// P2: which `channel_key` epoch `enc_content` was sealed under (≥1).
     #[serde(default)]
     pub key_epoch: Option<u64>,
+    // --- Message buttons (spec 3.3, l2-node 0.131+), trailing + serde-default
+    // for wire-compat with clients that predate this field. PLAINTEXT always —
+    // same treatment as `mentions`/`attachments`, even when the channel is
+    // encrypted (spec §8, Metadata row). ---
+    /// <= MAX_BUTTON_ROWS. `[]` / absent = no buttons.
+    #[serde(default)]
+    pub buttons: Vec<ButtonRow>,
+    /// Client-rendering hint ONLY, never a security boundary (spec §3.3): a
+    /// compliant client suppresses a `true` message from the default chat
+    /// feed. The node MUST NOT special-case this field beyond storing and
+    /// relaying it like any other — no provenance check against `reply_to`.
+    #[serde(default)]
+    pub via_button: bool,
 }
 
 // --- Direct Message Payload (spec 3.4) ---
@@ -569,6 +609,12 @@ pub struct EditPayload {
     /// Optional new attachments (news posts + chat messages).
     #[serde(default)]
     pub attachments: Option<Vec<Attachment>>,
+    /// Optional new buttons (chat messages only). `Some([])` clears the
+    /// button row; `None` leaves it unchanged. This is the button lifecycle
+    /// mechanism (spec §3.7) — a bot disables/replaces/clears buttons, or
+    /// builds an in-place sub-menu, by editing its own message.
+    #[serde(default)]
+    pub buttons: Option<Vec<ButtonRow>>,
     /// DM-only: XChaCha20-Poly1305 ciphertext of the new content under the
     /// conversation key (`conv_key`). Opaque to the node — it relays bytes it
     /// cannot read, identically to `DirectMessagePayload::content`. Present iff
@@ -997,8 +1043,38 @@ pub fn deserialize_payload(
     payload_bytes: &[u8],
 ) -> Result<DeserializedPayload, rmp_serde::decode::Error> {
     match msg_type {
-        MessageType::ChatMessage => Ok(DeserializedPayload::ChatMessage(rmp_serde::from_slice(payload_bytes)?)),
-        MessageType::ChatEdit | MessageType::DirectMessageEdit | MessageType::NewsEdit => {
+        MessageType::ChatMessage => {
+            // Bound the RAW BYTES before deserializing (spec 01 §3.3), mirroring
+            // ProfileUpdate below. Before `buttons` this payload had no overall
+            // byte ceiling of its own — see `MAX_CHAT_PAYLOAD_BYTES`'s doc comment
+            // in validation.rs. Sits here, the single choke point every
+            // ingestion path (gossip, history backfill/reconcile,
+            // `POST /api/v1/messages`) funnels through, so no path can acquire
+            // the gap back by being added later.
+            if payload_bytes.len() > crate::messages::validation::MAX_CHAT_PAYLOAD_BYTES {
+                return Err(rmp_serde::decode::Error::Uncategorized(format!(
+                    "ChatMessage payload too large: {} bytes (max {})",
+                    payload_bytes.len(),
+                    crate::messages::validation::MAX_CHAT_PAYLOAD_BYTES
+                )));
+            }
+            Ok(DeserializedPayload::ChatMessage(rmp_serde::from_slice(payload_bytes)?))
+        }
+        MessageType::ChatEdit => {
+            // Same pre-deserialization bound as ChatMessage above — a ChatEdit
+            // can carry the identical `buttons` array. DirectMessageEdit/NewsEdit
+            // never gain `buttons` (spec §3.7 override table), so they are not
+            // bounded here.
+            if payload_bytes.len() > crate::messages::validation::MAX_CHAT_PAYLOAD_BYTES {
+                return Err(rmp_serde::decode::Error::Uncategorized(format!(
+                    "ChatEdit payload too large: {} bytes (max {})",
+                    payload_bytes.len(),
+                    crate::messages::validation::MAX_CHAT_PAYLOAD_BYTES
+                )));
+            }
+            Ok(DeserializedPayload::Edit(rmp_serde::from_slice(payload_bytes)?))
+        }
+        MessageType::DirectMessageEdit | MessageType::NewsEdit => {
             Ok(DeserializedPayload::Edit(rmp_serde::from_slice(payload_bytes)?))
         }
         MessageType::ChatDelete | MessageType::DirectMessageDelete | MessageType::NewsDelete => {

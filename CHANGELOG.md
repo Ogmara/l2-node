@@ -5,6 +5,74 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.131.0] - 2026-09-21
+
+Message buttons: any wallet may attach a row/grid of interactive buttons to
+a chat message, each bound to a literal command string, so a user can
+trigger a bot follow-up (e.g. switching a chart's timeframe) with a tap
+instead of typing. Spec: `docs/specs/01-protocol.md` §3.3, §3.7.
+
+A button press is deliberately an ordinary signed `ChatMessage` — not a new
+message type — carrying `via_button: true` and `reply_to` pointing at the
+origin message. This is a client-side feed-suppression hint only; the node
+treats it identically to any other chat message (attribution, moderation,
+rate limits all apply unchanged), and never validates it against the origin
+message's actual button list.
+
+### Added
+- `ChatMessagePayload` gains `buttons: Vec<ButtonRow>` and `via_button: bool`
+  (trailing, `#[serde(default)]` — wire-compatible with pre-0.131 clients).
+- `EditPayload` gains `buttons: Option<Vec<ButtonRow>>`, mirroring the
+  existing `attachments` wholesale-replace-on-edit pattern — this is the
+  button lifecycle mechanism (a bot disables/replaces buttons, or builds an
+  in-place sub-menu, by editing its own message; no protocol-level expiry).
+- Validation: `MAX_BUTTON_ROWS` (10), `MAX_BUTTONS_PER_ROW` (8),
+  `MAX_BUTTONS_TOTAL` (40, the binding cross-row constraint), `MAX_BUTTON_LABEL`
+  (24 bytes), `MAX_BUTTON_COMMAND` (256 bytes). Same control/bidi-codepoint
+  rejection as `BotCommand.description` — full Unicode, never ASCII-only.
+  `buttons` is chat-only: `ChatEdit` accepts a replacement, `DirectMessageEdit`
+  and `NewsEdit` reject an explicit value.
+- `MAX_CHAT_PAYLOAD_BYTES` (64 KiB): a new pre-deserialization raw-byte bound
+  on `ChatMessage`/`ChatEdit` envelopes, checked in `deserialize_payload`
+  before any per-field validation runs — mirroring `MAX_PROFILE_PAYLOAD_BYTES`.
+  This payload had no overall byte ceiling of its own before `buttons` added a
+  second variable-length array alongside `attachments`.
+
+### Security
+- Every button-row cap is enforced before storage and before relay
+  (`validate_buttons`, wired into `validate_chat_message` — both the
+  plaintext and P2-encrypted branches — and into `validate_chat_edit`); a
+  violation rejects the whole envelope, never a silent truncation.
+- `via_button` carries no server-side authority by design: moderation,
+  search, and permalink surfaces are unaffected by it (enforced client-side
+  only), and the node does not spend a point-get validating a press's
+  `reply_to` against the origin message's actual buttons — see spec §3.3 for
+  the reasoning (it would cost a lookup per chat message for a purely
+  cosmetic property, and grants the sender no capability they didn't
+  already have).
+
+### Fixed
+- `get_channel_messages`/`get_dm_messages` `limit` clamp lowered from 500 to
+  100, matching every other message-listing endpoint in this file. Found by
+  the mandatory post-build DoS/resource-exhaustion audit: `Envelope.payload`
+  renders as a JSON array of numbers (32 bytes per payload byte with this
+  serde_json build), so `limit=500` at the realistic post-buttons per-message
+  ceiling (~34 KiB, up from ~14 KiB pre-buttons) was ~545 MiB resident per
+  request — pre-existing exposure that this feature measurably worsened by
+  raising the realistic per-message size.
+- **`enrich_message_json`'s "latest edit" projection silently went stale
+  past 100 edits on any message** — `get_edit_history` caps at 100 entries
+  and iterates oldest-first, so its `.last()` returned the 100th-OLDEST edit
+  once a message passed 100 edits, not the newest. Pre-existing bug, made
+  newly reachable in practice by this release: editing one's own message to
+  swap/clear `buttons` IS the documented button lifecycle mechanism (a
+  paginated bot menu spends one edit per press, and 100 presses fit inside
+  the 30-minute edit window at the existing chat-message rate limit). New
+  `Storage::get_latest_edit` seeks the newest entry directly (RocksDB
+  `seek_for_prev`, O(1)) instead of scanning the capped history and taking
+  `.last()`; `enrich_message_json` now calls it instead. Regression-tested
+  past the 100-entry cap.
+
 ## [0.130.4] - 2026-09-19
 
 RocksDB internal LOG file has no rotation during a continuous run.

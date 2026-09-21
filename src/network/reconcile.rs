@@ -695,6 +695,8 @@ mod edit_delete_ride_along_tests {
             enc_content: None,
             enc_nonce: None,
             key_epoch: None,
+            buttons: vec![],
+            via_button: false,
         };
         let env = Envelope {
             version: crate::messages::envelope::PROTOCOL_VERSION,

@@ -58,6 +58,46 @@ pub const MAX_TAG_LENGTH: usize = 64;
 pub const MAX_MENTIONS: usize = 50;
 /// Maximum attachments per message.
 pub const MAX_ATTACHMENTS: usize = 20;
+/// Max button rows per message (spec 01 §3.3).
+pub const MAX_BUTTON_ROWS: usize = 10;
+/// Max buttons within a single row.
+pub const MAX_BUTTONS_PER_ROW: usize = 8;
+/// Max buttons across ALL rows combined, independent of row/column
+/// distribution — the binding constraint for worst-case payload size, not
+/// the row×column product (a bot may legitimately ship any layout inside
+/// this bound, e.g. 4 columns × 3 rows).
+pub const MAX_BUTTONS_TOTAL: usize = 40;
+/// Max bytes of a button's label.
+pub const MAX_BUTTON_LABEL: usize = 24;
+/// Max bytes of a button's command string.
+pub const MAX_BUTTON_COMMAND: usize = 256;
+// NOTE: there is deliberately no separate "total buttons payload bytes" cap.
+// MAX_BUTTONS_TOTAL * (MAX_BUTTON_LABEL + MAX_BUTTON_COMMAND) = 40 * (24 +
+// 256) = 11.2 KB is already the hard worst case implied by the four caps
+// above — any additional byte-sum ceiling at or above that figure would be
+// unreachable dead validation, and anything below it would just be a
+// disguised re-statement of one of the caps already enforced per-field. The
+// real protection against a huge malicious payload is `MAX_CHAT_PAYLOAD_BYTES`
+// below, checked on the RAW bytes BEFORE any of these per-field checks run.
+/// Hard ceiling on a `ChatMessage`/`ChatEdit` envelope payload, checked on
+/// the RAW BYTES **before** deserialization on every ingestion path (spec 01
+/// §3.3), mirroring `MAX_PROFILE_PAYLOAD_BYTES` below.
+///
+/// Before `buttons` this payload had no overall byte ceiling of its own —
+/// only per-field/count caps enforced AFTER a successful decode (too late to
+/// bound the decode itself), with the only pre-deserialization limit being
+/// the transport's (10 MiB HTTP `DefaultBodyLimit`, 256 KiB gossipsub). This
+/// bounds the PAYLOAD decode specifically — the enclosing `Envelope` (whose
+/// `payload: Vec<u8>` this constant checks the length of) is itself decoded
+/// from the raw HTTP/gossip body BEFORE this check ever runs, so a full
+/// 10 MiB body still reaches that outer decode; this is the same shape of
+/// residual gap `MAX_PROFILE_PAYLOAD_BYTES` below already has, not something
+/// specific to buttons, and is not closed here. Sized generously above the
+/// legitimate worst case (~8 KiB encrypted content + ~9 KiB attachments
+/// metadata + ~3 KiB mentions + ~11.2 KiB buttons + msgpack framing ≈ 32 KiB)
+/// to leave headroom without approaching the
+/// transport ceiling.
+pub const MAX_CHAT_PAYLOAD_BYTES: usize = 64 * 1024;
 /// Maximum reason length for kicks/bans (256 chars).
 pub const MAX_REASON: usize = 256;
 /// Maximum repost comment length (512 chars).
@@ -81,11 +121,60 @@ impl std::fmt::Display for ValidationError {
 
 impl std::error::Error for ValidationError {}
 
+/// Validate a message's button rows (spec 01 §3.3).
+///
+/// PLAINTEXT-always metadata (like `mentions`/`attachments`) — `buttons` is
+/// validated once, before `validate_chat_message` branches on
+/// plaintext-vs-encrypted, so the same caps apply regardless of which path
+/// the message takes. Every violation rejects the WHOLE envelope —
+/// same "never silently truncate" rule as `validate_bot_descriptor`. Does
+/// NOT check `command`'s leading character — a leading `/` is a
+/// `parseCommand()`-compatibility convention for bot authors, not a
+/// node-enforced rule (spec §3.3).
+fn validate_buttons(rows: &[ButtonRow]) -> Result<(), ValidationError> {
+    if rows.len() > MAX_BUTTON_ROWS {
+        return Err(ValidationError("too many button rows".into()));
+    }
+    let mut total = 0usize;
+    for row in rows {
+        if row.buttons.is_empty() {
+            return Err(ValidationError("button row must not be empty".into()));
+        }
+        if row.buttons.len() > MAX_BUTTONS_PER_ROW {
+            return Err(ValidationError("too many buttons in a row".into()));
+        }
+        for button in &row.buttons {
+            total += 1;
+            if button.label.is_empty() || button.label.len() > MAX_BUTTON_LABEL {
+                return Err(ValidationError("button label length out of range".into()));
+            }
+            if button.label.chars().any(is_forbidden_descriptor_char) {
+                return Err(ValidationError(
+                    "button label contains a control or bidi codepoint".into(),
+                ));
+            }
+            if button.command.is_empty() || button.command.len() > MAX_BUTTON_COMMAND {
+                return Err(ValidationError("button command length out of range".into()));
+            }
+            if button.command.chars().any(is_forbidden_descriptor_char) {
+                return Err(ValidationError(
+                    "button command contains a control or bidi codepoint".into(),
+                ));
+            }
+        }
+    }
+    if total > MAX_BUTTONS_TOTAL {
+        return Err(ValidationError("too many buttons".into()));
+    }
+    Ok(())
+}
+
 /// Validate a chat message payload.
 pub fn validate_chat_message(p: &ChatMessagePayload) -> Result<(), ValidationError> {
     if p.channel_id == 0 {
         return Err(ValidationError("channel_id must be > 0".into()));
     }
+    validate_buttons(&p.buttons)?;
 
     // P2 OECK: an ENCRYPTED chat message carries only its TEXT as ciphertext in
     // `enc_content` (the plaintext `content` String is then empty and the node skips
@@ -426,6 +515,12 @@ pub fn validate_edit(p: &EditPayload) -> Result<(), ValidationError> {
             return Err(ValidationError("too many attachments".into()));
         }
     }
+    // Defensive fallback treats buttons like the (unreachable in normal
+    // dispatch) news case: not allowed, since this generic path can't know
+    // whether the real target is actually a chat message.
+    if p.buttons.is_some() {
+        return Err(ValidationError("buttons not allowed here".into()));
+    }
     Ok(())
 }
 
@@ -462,6 +557,12 @@ pub fn validate_chat_edit(p: &EditPayload) -> Result<(), ValidationError> {
         if atts.len() > MAX_ATTACHMENTS {
             return Err(ValidationError("too many attachments".into()));
         }
+    }
+    // `Some([])` clears the button row (spec §3.7's button lifecycle
+    // mechanism); `None` leaves it unchanged. Either way, a non-empty
+    // replacement gets the identical caps as a fresh chat message.
+    if let Some(ref rows) = p.buttons {
+        validate_buttons(rows)?;
     }
     Ok(())
 }
@@ -510,7 +611,10 @@ pub fn validate_dm_edit(p: &EditPayload) -> Result<(), ValidationError> {
         ));
     }
     // Field-level overrides have no meaning for an encrypted DM. Reject attempts.
-    if p.title.is_some() || p.tags.is_some() || p.attachments.is_some() {
+    // `buttons` is chat-only (spec §3.7 override table) — DMs have no channel
+    // context for a press to target, so reject an explicit value rather than
+    // silently ignore it.
+    if p.title.is_some() || p.tags.is_some() || p.attachments.is_some() || p.buttons.is_some() {
         return Err(ValidationError(
             "field overrides not allowed on DM edit".into(),
         ));
@@ -557,6 +661,11 @@ pub fn validate_news_edit(p: &EditPayload) -> Result<(), ValidationError> {
         if atts.len() > MAX_ATTACHMENTS {
             return Err(ValidationError("too many attachments".into()));
         }
+    }
+    // `buttons` is chat-only (spec §3.7 override table) — reject an explicit
+    // value on a news edit rather than silently ignore it.
+    if p.buttons.is_some() {
+        return Err(ValidationError("buttons not allowed on news edit".into()));
     }
     Ok(())
 }
@@ -1278,6 +1387,7 @@ mod tests {
             title: None,
             tags: None,
             attachments: None,
+            buttons: None,
             enc_content: None,
             enc_nonce: None,
             key_epoch: None,
@@ -1527,6 +1637,8 @@ mod tests {
             enc_content: None,
             enc_nonce: None,
             key_epoch: None,
+            buttons: vec![],
+            via_button: false,
         }
     }
 
@@ -1953,5 +2065,368 @@ mod bot_descriptor_tests {
             bot: Some(descriptor(vec![cmd("c", "d"); MAX_BOT_COMMANDS + 1])),
         };
         assert!(validate_profile_update(&p).is_err());
+    }
+}
+
+// --- Message buttons (spec 01 §3.3, l2-node 0.131+) ---
+
+#[cfg(test)]
+mod message_button_tests {
+    use super::*;
+    use crate::messages::types::{deserialize_payload, DeserializedPayload, MessageType};
+    use serde::Serialize;
+
+    fn button(label: &str, command: &str) -> MessageButton {
+        MessageButton {
+            label: label.into(),
+            command: command.into(),
+        }
+    }
+
+    fn row(buttons: Vec<MessageButton>) -> ButtonRow {
+        ButtonRow { buttons }
+    }
+
+    fn plaintext_chat() -> ChatMessagePayload {
+        ChatMessagePayload {
+            channel_id: 1,
+            content: "price card".into(),
+            content_rating: ContentRating::General,
+            reply_to: None,
+            mentions: vec!["klv1bot".into()],
+            attachments: vec![],
+            enc_content: None,
+            enc_nonce: None,
+            key_epoch: None,
+            buttons: vec![],
+            via_button: false,
+        }
+    }
+
+    fn chat_edit(target: [u8; 32]) -> EditPayload {
+        EditPayload {
+            target_id: target,
+            channel_id: Some(1),
+            content: "price card".into(),
+            edited_at: 1,
+            title: None,
+            tags: None,
+            attachments: None,
+            buttons: None,
+            enc_content: None,
+            enc_nonce: None,
+            key_epoch: None,
+        }
+    }
+
+    // --- validate_chat_message: buttons accepted on both encryption paths ---
+
+    #[test]
+    fn accepts_a_well_formed_button_row() {
+        let mut p = plaintext_chat();
+        p.buttons = vec![row(vec![button("15m", "/c BTC 15m"), button("1h", "/c BTC 1h")])];
+        assert!(validate_chat_message(&p).is_ok());
+    }
+
+    #[test]
+    fn accepts_absent_and_empty_buttons() {
+        let mut p = plaintext_chat();
+        p.buttons = vec![];
+        assert!(validate_chat_message(&p).is_ok());
+    }
+
+    #[test]
+    fn accepts_buttons_on_an_encrypted_message() {
+        // buttons stays PLAINTEXT even when content is ciphertext (spec §3.3,
+        // §8 Metadata row) — same treatment as mentions/attachments.
+        let mut p = plaintext_chat();
+        p.content = String::new();
+        p.enc_content = Some(vec![0xAB; 64]);
+        p.enc_nonce = Some([0u8; 24]);
+        p.key_epoch = Some(1);
+        p.buttons = vec![row(vec![button("Buy", "/buy KLV")])];
+        assert!(validate_chat_message(&p).is_ok());
+    }
+
+    #[test]
+    fn rejects_empty_row() {
+        let mut p = plaintext_chat();
+        p.buttons = vec![row(vec![])];
+        assert!(validate_chat_message(&p).is_err());
+    }
+
+    #[test]
+    fn rejects_too_many_rows() {
+        let mut p = plaintext_chat();
+        p.buttons = vec![row(vec![button("x", "/x")]); MAX_BUTTON_ROWS + 1];
+        assert!(validate_chat_message(&p).is_err());
+    }
+
+    #[test]
+    fn accepts_exactly_max_rows() {
+        let mut p = plaintext_chat();
+        p.buttons = vec![row(vec![button("x", "/x")]); MAX_BUTTON_ROWS];
+        assert!(validate_chat_message(&p).is_ok());
+    }
+
+    #[test]
+    fn rejects_too_many_buttons_in_a_row() {
+        let mut p = plaintext_chat();
+        p.buttons = vec![row(vec![
+            button("x", "/x");
+            MAX_BUTTONS_PER_ROW + 1
+        ])];
+        assert!(validate_chat_message(&p).is_err());
+    }
+
+    #[test]
+    fn accepts_exactly_max_buttons_per_row() {
+        let mut p = plaintext_chat();
+        p.buttons = vec![row(vec![button("x", "/x"); MAX_BUTTONS_PER_ROW])];
+        assert!(validate_chat_message(&p).is_ok());
+    }
+
+    #[test]
+    fn rejects_more_than_max_buttons_total_even_within_row_and_per_row_caps() {
+        // MAX_BUTTONS_TOTAL is the binding constraint, independent of
+        // row/column distribution: MAX_BUTTON_ROWS * MAX_BUTTONS_PER_ROW
+        // (10 * 8 = 80) exceeds MAX_BUTTONS_TOTAL (40), so a message using
+        // the maximum of BOTH individual caps must still be rejected on the
+        // combined total — neither cap alone catches this.
+        assert!(
+            MAX_BUTTON_ROWS * MAX_BUTTONS_PER_ROW > MAX_BUTTONS_TOTAL,
+            "test assumption: row cap * per-row cap must exceed the total cap"
+        );
+        let mut p = plaintext_chat();
+        p.buttons = vec![row(vec![button("x", "/x"); MAX_BUTTONS_PER_ROW]); MAX_BUTTON_ROWS];
+        assert!(validate_chat_message(&p).is_err());
+    }
+
+    #[test]
+    fn rejects_oversize_label() {
+        let mut p = plaintext_chat();
+        p.buttons = vec![row(vec![button(&"x".repeat(MAX_BUTTON_LABEL + 1), "/x")])];
+        assert!(validate_chat_message(&p).is_err());
+    }
+
+    #[test]
+    fn accepts_exactly_max_label_bytes() {
+        let mut p = plaintext_chat();
+        p.buttons = vec![row(vec![button(&"x".repeat(MAX_BUTTON_LABEL), "/x")])];
+        assert!(validate_chat_message(&p).is_ok());
+    }
+
+    #[test]
+    fn rejects_empty_label() {
+        let mut p = plaintext_chat();
+        p.buttons = vec![row(vec![button("", "/x")])];
+        assert!(validate_chat_message(&p).is_err());
+    }
+
+    #[test]
+    fn rejects_oversize_command() {
+        let mut p = plaintext_chat();
+        p.buttons = vec![row(vec![button("x", &"/".repeat(MAX_BUTTON_COMMAND + 1))])];
+        assert!(validate_chat_message(&p).is_err());
+    }
+
+    #[test]
+    fn accepts_exactly_max_command_bytes() {
+        let mut p = plaintext_chat();
+        // one leading '/' + filler to hit the cap exactly
+        let cmd = format!("/{}", "x".repeat(MAX_BUTTON_COMMAND - 1));
+        assert_eq!(cmd.len(), MAX_BUTTON_COMMAND);
+        p.buttons = vec![row(vec![button("x", &cmd)])];
+        assert!(validate_chat_message(&p).is_ok());
+    }
+
+    #[test]
+    fn rejects_empty_command() {
+        let mut p = plaintext_chat();
+        p.buttons = vec![row(vec![button("x", "")])];
+        assert!(validate_chat_message(&p).is_err());
+    }
+
+    #[test]
+    fn rejects_control_and_bidi_codepoints_in_label_and_command() {
+        let mut p = plaintext_chat();
+        p.buttons = vec![row(vec![button("15m\u{202E}", "/c BTC 15m")])];
+        assert!(validate_chat_message(&p).is_err());
+
+        let mut p = plaintext_chat();
+        p.buttons = vec![row(vec![button("15m", "/c\u{200B}BTC")])];
+        assert!(validate_chat_message(&p).is_err());
+    }
+
+    #[test]
+    fn accepts_full_unicode_label_and_command() {
+        // Full Unicode MUST be accepted (never narrowed to ASCII) — a
+        // Chinese or Japanese bot author's button labels render correctly.
+        let mut p = plaintext_chat();
+        p.buttons = vec![row(vec![button("查看图表", "/图表 BTC")])];
+        assert!(validate_chat_message(&p).is_ok());
+    }
+
+    #[test]
+    fn accepts_the_true_worst_case_at_every_cap_simultaneously() {
+        // Max total buttons, each at max label+command length, packed within
+        // the row/per-row caps: this IS the legitimate worst case (~11.2 KB
+        // of label+command text) and must be accepted, not silently
+        // rejected by some other hidden constraint layered on top of the
+        // four enforced caps (row count, per-row count, total count,
+        // per-field length) — there is deliberately no separate byte-sum
+        // ceiling, since MAX_BUTTONS_TOTAL * (MAX_BUTTON_LABEL +
+        // MAX_BUTTON_COMMAND) already IS that bound.
+        let per_row = MAX_BUTTONS_PER_ROW;
+        let rows = MAX_BUTTON_ROWS.min(MAX_BUTTONS_TOTAL / per_row);
+        assert_eq!(rows * per_row, MAX_BUTTONS_TOTAL, "test assumption: caps divide evenly");
+        let big_label = "x".repeat(MAX_BUTTON_LABEL);
+        let big_cmd = format!("/{}", "y".repeat(MAX_BUTTON_COMMAND - 1));
+        let mut p = plaintext_chat();
+        p.buttons = vec![row(vec![button(&big_label, &big_cmd); per_row]); rows];
+        assert!(validate_chat_message(&p).is_ok());
+    }
+
+    // --- validate_chat_edit: the button lifecycle mechanism (spec §3.7) ---
+
+    #[test]
+    fn chat_edit_accepts_none_buttons_as_unchanged() {
+        let p = chat_edit([1u8; 32]);
+        assert!(p.buttons.is_none());
+        assert!(validate_chat_edit(&p).is_ok());
+    }
+
+    #[test]
+    fn chat_edit_accepts_empty_vec_as_explicit_clear() {
+        let mut p = chat_edit([1u8; 32]);
+        p.buttons = Some(vec![]);
+        assert!(validate_chat_edit(&p).is_ok());
+    }
+
+    #[test]
+    fn chat_edit_accepts_a_replacement_row() {
+        let mut p = chat_edit([1u8; 32]);
+        p.buttons = Some(vec![row(vec![button("4h", "/c BTC 4h")])]);
+        assert!(validate_chat_edit(&p).is_ok());
+    }
+
+    #[test]
+    fn chat_edit_rejects_an_oversize_replacement() {
+        let mut p = chat_edit([1u8; 32]);
+        p.buttons = Some(vec![row(vec![button("x", "/x")]); MAX_BUTTON_ROWS + 1]);
+        assert!(validate_chat_edit(&p).is_err());
+    }
+
+    // --- DM/news edits: buttons is chat-only (spec §3.7 override table) ---
+
+    #[test]
+    fn dm_edit_rejects_explicit_buttons() {
+        let mut p = EditPayload {
+            target_id: [1u8; 32],
+            channel_id: None,
+            content: String::new(),
+            edited_at: 1,
+            title: None,
+            tags: None,
+            attachments: None,
+            buttons: Some(vec![row(vec![button("x", "/x")])]),
+            enc_content: Some(vec![0xAB; 16]),
+            enc_nonce: Some([0u8; 24]),
+            key_epoch: Some(1),
+        };
+        assert!(validate_dm_edit(&p).is_err());
+        p.buttons = None;
+        assert!(validate_dm_edit(&p).is_ok());
+    }
+
+    #[test]
+    fn news_edit_rejects_explicit_buttons() {
+        let mut p = EditPayload {
+            target_id: [1u8; 32],
+            channel_id: None,
+            content: "updated".into(),
+            edited_at: 1,
+            title: None,
+            tags: None,
+            attachments: None,
+            buttons: Some(vec![row(vec![button("x", "/x")])]),
+            enc_content: None,
+            enc_nonce: None,
+            key_epoch: None,
+        };
+        assert!(validate_news_edit(&p).is_err());
+        p.buttons = None;
+        assert!(validate_news_edit(&p).is_ok());
+    }
+
+    // --- Wire round-trip: via_button and buttons survive deserialize_payload ---
+
+    #[test]
+    fn via_button_and_buttons_round_trip_through_deserialize_payload() {
+        let mut p = plaintext_chat();
+        p.via_button = true;
+        p.buttons = vec![row(vec![button("1h", "/c BTC 1h")])];
+        let bytes = rmp_serde::to_vec_named(&p).unwrap();
+        let decoded = match deserialize_payload(MessageType::ChatMessage, &bytes).unwrap() {
+            DeserializedPayload::ChatMessage(p) => p,
+            other => panic!("wrong variant: {other:?}"),
+        };
+        assert!(decoded.via_button);
+        assert_eq!(decoded.buttons.len(), 1);
+        assert_eq!(decoded.buttons[0].buttons[0].command, "/c BTC 1h");
+    }
+
+    #[test]
+    fn old_client_payload_without_buttons_fields_still_decodes() {
+        // Pre-0.131 clients never sent `buttons`/`via_button` — the trailing
+        // #[serde(default)] fields must default cleanly, not fail to decode.
+        #[derive(Serialize)]
+        struct OldChatMessagePayload {
+            channel_id: u64,
+            content: String,
+            content_rating: ContentRating,
+            reply_to: Option<[u8; 32]>,
+            mentions: Vec<String>,
+            attachments: Vec<Attachment>,
+            enc_content: Option<Vec<u8>>,
+            enc_nonce: Option<[u8; 24]>,
+            key_epoch: Option<u64>,
+        }
+        let old = OldChatMessagePayload {
+            channel_id: 1,
+            content: "hi".into(),
+            content_rating: ContentRating::General,
+            reply_to: None,
+            mentions: vec![],
+            attachments: vec![],
+            enc_content: None,
+            enc_nonce: None,
+            key_epoch: None,
+        };
+        let bytes = rmp_serde::to_vec_named(&old).unwrap();
+        let decoded = match deserialize_payload(MessageType::ChatMessage, &bytes).unwrap() {
+            DeserializedPayload::ChatMessage(p) => p,
+            other => panic!("wrong variant: {other:?}"),
+        };
+        assert!(decoded.buttons.is_empty());
+        assert!(!decoded.via_button);
+    }
+
+    // --- Pre-deserialization payload-size bound (mirrors ProfileUpdate) ---
+
+    #[test]
+    fn oversize_raw_chat_message_payload_is_rejected_before_deserialization() {
+        let oversized = vec![0u8; MAX_CHAT_PAYLOAD_BYTES + 1];
+        let err = deserialize_payload(MessageType::ChatMessage, &oversized)
+            .expect_err("oversized raw payload must be rejected");
+        assert!(format!("{err}").contains("too large"));
+    }
+
+    #[test]
+    fn oversize_raw_chat_edit_payload_is_rejected_before_deserialization() {
+        let oversized = vec![0u8; MAX_CHAT_PAYLOAD_BYTES + 1];
+        let err = deserialize_payload(MessageType::ChatEdit, &oversized)
+            .expect_err("oversized raw payload must be rejected");
+        assert!(format!("{err}").contains("too large"));
     }
 }

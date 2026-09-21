@@ -229,6 +229,8 @@ pub async fn dispatch_ogmara_channel_alert(
         enc_content: None,
         enc_nonce: None,
         key_epoch: None,
+        buttons: Vec::new(),
+        via_button: false,
     };
     let payload_bytes = match rmp_serde::to_vec_named(&payload) {
         Ok(b) => b,

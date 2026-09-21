@@ -5277,6 +5277,8 @@ mod dm_reaction_tests {
             enc_content: None,
             enc_nonce: None,
             key_epoch: None,
+            buttons: vec![],
+            via_button: false,
         };
         let chat_envelope = Envelope {
             version: crate::messages::envelope::PROTOCOL_VERSION,
@@ -5596,6 +5598,8 @@ mod edit_delete_index_tests {
             enc_content: None,
             enc_nonce: None,
             key_epoch: None,
+            buttons: vec![],
+            via_button: false,
         };
         let envelope = Envelope {
             version: crate::messages::envelope::PROTOCOL_VERSION,
@@ -5695,6 +5699,7 @@ mod edit_delete_index_tests {
                     title: None,
                     tags: None,
                     attachments: None,
+                    buttons: None,
                     // DM edits carry ciphertext, not plaintext content —
                     // `validate_dm_edit` requires it.
                     enc_content: matches!(msg_type, MessageType::DirectMessageEdit)

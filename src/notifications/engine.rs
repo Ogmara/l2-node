@@ -1315,6 +1315,7 @@ mod tests {
             title: None,
             tags: None,
             attachments: None,
+            buttons: None,
             enc_content: None,
             enc_nonce: None,
             key_epoch: None,

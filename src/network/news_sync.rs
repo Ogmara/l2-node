@@ -691,6 +691,7 @@ mod w37_followers_visibility_tests {
             title: Some("leaked new title".to_string()),
             tags: None,
             attachments: None,
+            buttons: None,
             enc_content: None,
             enc_nonce: None,
             key_epoch: None,

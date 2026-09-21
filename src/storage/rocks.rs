@@ -3221,6 +3221,50 @@ impl Storage {
             .collect())
     }
 
+    /// Get ONLY the most recent edit for a message — O(1) seek, not a scan.
+    ///
+    /// `get_edit_history` above caps at 100 entries and iterates FORWARD
+    /// (oldest-first, per the key encoding), so past 100 edits its
+    /// `.last()` silently returns the 100th-OLDEST entry, not the newest —
+    /// `enrich_message_json`'s read-time edit projection would then freeze
+    /// on stale content forever. Message buttons made this newly reachable
+    /// in practice: editing one's own message to swap/clear `buttons`
+    /// (protocol §3.7's "button lifecycle mechanism") is a per-press
+    /// operation for a paginated bot menu, and 100 presses fits inside the
+    /// 30-minute edit window at the existing chat rate limit. This method
+    /// exists so callers that only need the CURRENT edit (which is all of
+    /// them today) never depend on the capped/ordered scan at all.
+    ///
+    /// Uses `seek_for_prev` against an upper-bound key one past any real
+    /// timestamp under this prefix — the RocksDB-native way to find "the
+    /// last key <= X" without a linear walk.
+    pub fn get_latest_edit(&self, original_msg_id: &[u8; 32]) -> Result<Option<(u64, [u8; 32])>> {
+        use super::schema;
+        let cf = self.cf_handle(cf::EDIT_HISTORY)?;
+        let upper_bound = schema::encode_edit_history_key(original_msg_id, u64::MAX);
+
+        let mut iter = self.db.raw_iterator_cf(&cf);
+        iter.seek_for_prev(&upper_bound);
+
+        if !iter.valid() {
+            return Ok(None);
+        }
+        let (key, value) = match (iter.key(), iter.value()) {
+            (Some(k), Some(v)) => (k, v),
+            _ => return Ok(None),
+        };
+        // seek_for_prev can land on an unrelated, lexicographically-earlier
+        // row (a different original_msg_id, or a different CF entirely if
+        // this prefix has zero entries) — the prefix check is what makes
+        // "no edits for this message" distinguishable from "found one".
+        if !key.starts_with(original_msg_id) || key.len() != 40 || value.len() != 32 {
+            return Ok(None);
+        }
+        let ts = u64::from_be_bytes(key[32..40].try_into().context("edit history key timestamp")?);
+        let edit_id: [u8; 32] = value.try_into().map_err(|_| anyhow::anyhow!("edit history value is not 32 bytes"))?;
+        Ok(Some((ts, edit_id)))
+    }
+
     /// Check if a message has been edited.
     pub fn is_edited(&self, msg_id: &[u8; 32]) -> Result<bool> {
         let entries = self.prefix_iter_cf(cf::EDIT_HISTORY, msg_id, 1)?;
@@ -4340,6 +4384,86 @@ mod channel_key_tests {
 }
 
 #[cfg(test)]
+mod edit_history_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn db() -> (Storage, TempDir) {
+        let dir = TempDir::new().unwrap();
+        (Storage::open(dir.path()).unwrap(), dir)
+    }
+
+    #[test]
+    fn get_latest_edit_returns_none_when_never_edited() {
+        let (s, _d) = db();
+        assert_eq!(s.get_latest_edit(&[1u8; 32]).unwrap(), None);
+    }
+
+    #[test]
+    fn get_latest_edit_returns_the_single_edit() {
+        let (s, _d) = db();
+        let original = [2u8; 32];
+        let edit_id = [3u8; 32];
+        s.store_edit(&original, 1000, &edit_id).unwrap();
+        assert_eq!(s.get_latest_edit(&original).unwrap(), Some((1000, edit_id)));
+    }
+
+    #[test]
+    fn get_latest_edit_returns_the_newest_regardless_of_insertion_order() {
+        let (s, _d) = db();
+        let original = [4u8; 32];
+        let e1 = [10u8; 32];
+        let e2 = [20u8; 32];
+        let e3 = [30u8; 32];
+        // Insert out of chronological order — the index is keyed by
+        // timestamp, not insertion order, so this must not matter.
+        s.store_edit(&original, 2000, &e2).unwrap();
+        s.store_edit(&original, 3000, &e3).unwrap();
+        s.store_edit(&original, 1000, &e1).unwrap();
+        assert_eq!(s.get_latest_edit(&original).unwrap(), Some((3000, e3)));
+    }
+
+    #[test]
+    fn get_latest_edit_is_unaffected_by_other_messages_edit_history() {
+        // seek_for_prev must not cross into a lexicographically-earlier
+        // original_msg_id's entries when this message has none.
+        let (s, _d) = db();
+        let other = [5u8; 32];
+        s.store_edit(&other, 1000, &[9u8; 32]).unwrap();
+        let mine = [6u8; 32]; // > other, so seek_for_prev would land in `other`'s range if unguarded
+        assert_eq!(s.get_latest_edit(&mine).unwrap(), None);
+    }
+
+    #[test]
+    fn get_latest_edit_correct_past_the_get_edit_history_cap() {
+        // Regression test for the bug this method exists to avoid:
+        // `get_edit_history` caps at 100 entries and iterates oldest-first,
+        // so `.last()` on it silently returns the 100th-oldest edit once
+        // there are more than 100 — not the newest. `get_latest_edit` seeks
+        // directly and must be correct regardless of history length.
+        let (s, _d) = db();
+        let original = [7u8; 32];
+        let mut newest_id = [0u8; 32];
+        for i in 0..150u64 {
+            let edit_id = [(i % 256) as u8; 32];
+            s.store_edit(&original, 1_000_000 + i, &edit_id).unwrap();
+            newest_id = edit_id;
+        }
+        assert_eq!(
+            s.get_latest_edit(&original).unwrap(),
+            Some((1_000_000 + 149, newest_id))
+        );
+
+        // Confirm this really would have broken under the old pattern:
+        // `get_edit_history` returns only the oldest 100 (its documented
+        // cap), so its `.last()` is edit #99, NOT edit #149.
+        let history = s.get_edit_history(&original).unwrap();
+        assert_eq!(history.len(), 100);
+        assert_eq!(history.last().unwrap().0, 1_000_000 + 99);
+    }
+}
+
+#[cfg(test)]
 mod tombstone_channel_tests {
     use super::*;
     use tempfile::TempDir;
@@ -5352,6 +5476,8 @@ mod backfill_edit_delete_markers_tests {
                     enc_content: None,
                     enc_nonce: None,
                     key_epoch: None,
+                    buttons: vec![],
+                    via_button: false,
                 })
                 .unwrap(),
                 signature: vec![],
@@ -5446,6 +5572,8 @@ mod backfill_edit_delete_markers_tests {
                     enc_content: None,
                     enc_nonce: None,
                     key_epoch: None,
+                    buttons: vec![],
+                    via_button: false,
                 })
                 .unwrap(),
                 signature: vec![],

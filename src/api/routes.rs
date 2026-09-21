@@ -391,6 +391,11 @@ fn project_edited_payload(
             };
             p.content = edit.content;
             if let Some(a) = edit.attachments { p.attachments = a; }
+            // `Some([])` clears the button row; `None` leaves it unchanged —
+            // this IS the button lifecycle mechanism (spec §3.7): a bot
+            // disables/replaces buttons, or swaps in a sub-menu, by editing
+            // its own message rather than any protocol-level expiry.
+            if let Some(b) = edit.buttons { p.buttons = b; }
             rmp_serde::to_vec_named(&p)
                 .map_err(|e| warn_decode("chat_reencode", &e))
                 .ok()
@@ -482,32 +487,35 @@ fn enrich_message_json(msg: &mut serde_json::Value, storage: &crate::storage::ro
         if let Ok(true) = storage.is_edited(&msg_id) {
             if let serde_json::Value::Object(ref mut map) = msg {
                 map.insert("edited".into(), serde_json::json!(true));
-                if let Ok(edits) = storage.get_edit_history(&msg_id) {
-                    if let Some((last_ts, edit_msg_id)) = edits.last() {
-                        map.insert("last_edited_at".into(), serde_json::json!(last_ts));
-                        match project_edited_payload(&msg_id, edit_msg_id, storage) {
-                            Some(merged) => {
-                                // Bytes form keeps the wire contract identical to a
-                                // never-edited message — clients msgpack-decode the
-                                // payload exactly the same way in both cases.
-                                map.insert("payload".into(), serde_json::json!(merged));
-                            }
-                            None => {
-                                // Privacy guard: an `edited` marker without a
-                                // recoverable edit envelope (orphaned index row,
-                                // corrupted bytes, etc.) would otherwise display
-                                // the PRE-edit content as if it were current. A
-                                // user who edited to redact ("never mind, here's
-                                // the correct statement") would see the original.
-                                // Blank the payload like the deletion path so
-                                // unrecoverable edits fail safe.
-                                tracing::warn!(
-                                    msg_id = %hex::encode(msg_id),
-                                    edit_msg_id = %hex::encode(edit_msg_id),
-                                    "edit projection returned None — blanking payload to avoid pre-edit leak",
-                                );
-                                map.insert("payload".into(), serde_json::Value::Null);
-                            }
+                // `get_latest_edit` seeks the newest entry directly rather than
+                // scanning `get_edit_history`'s capped-at-100, oldest-first list
+                // and taking `.last()` — past 100 edits that pattern silently
+                // returns the 100th-OLDEST edit instead of the newest, freezing
+                // the projection (see `get_latest_edit`'s doc comment).
+                if let Ok(Some((last_ts, edit_msg_id))) = storage.get_latest_edit(&msg_id) {
+                    map.insert("last_edited_at".into(), serde_json::json!(last_ts));
+                    match project_edited_payload(&msg_id, &edit_msg_id, storage) {
+                        Some(merged) => {
+                            // Bytes form keeps the wire contract identical to a
+                            // never-edited message — clients msgpack-decode the
+                            // payload exactly the same way in both cases.
+                            map.insert("payload".into(), serde_json::json!(merged));
+                        }
+                        None => {
+                            // Privacy guard: an `edited` marker without a
+                            // recoverable edit envelope (orphaned index row,
+                            // corrupted bytes, etc.) would otherwise display
+                            // the PRE-edit content as if it were current. A
+                            // user who edited to redact ("never mind, here's
+                            // the correct statement") would see the original.
+                            // Blank the payload like the deletion path so
+                            // unrecoverable edits fail safe.
+                            tracing::warn!(
+                                msg_id = %hex::encode(msg_id),
+                                edit_msg_id = %hex::encode(edit_msg_id),
+                                "edit projection returned None — blanking payload to avoid pre-edit leak",
+                            );
+                            map.insert("payload".into(), serde_json::Value::Null);
                         }
                     }
                 }
@@ -2318,7 +2326,14 @@ pub async fn get_channel_messages(
         }
     }
 
-    let limit = params.limit.unwrap_or(50).min(500) as usize;
+    // Clamped to 100, matching the convention every other message-listing
+    // endpoint in this file uses (get_dm_messages below, news list, etc.) —
+    // `Envelope.payload` renders as a JSON array of numbers (32 bytes per
+    // byte with this serde_json build), so `limit=500` at the post-buttons
+    // realistic per-message ceiling (~34 KiB) is ~545 MiB resident per
+    // request. 100 keeps the same worst case in the ~100 MiB range, in line
+    // with every other paginated read here.
+    let limit = params.limit.unwrap_or(50).min(100) as usize;
     let prefix = channel_id.to_be_bytes();
 
     // Look up the authenticated user's read cursor for unread divider support
@@ -4023,7 +4038,10 @@ pub async fn get_dm_messages(
     if !address.starts_with("klv1") || address.len() < 44 {
         return (StatusCode::BAD_REQUEST, "invalid Klever address").into_response();
     }
-    let limit = params.limit.unwrap_or(50).min(500) as usize;
+    // See the identical clamp + rationale on get_channel_messages above —
+    // same JSON-array-of-numbers payload-inflation exposure applies to DM
+    // history.
+    let limit = params.limit.unwrap_or(50).min(100) as usize;
 
     // Compute conversation_id from auth user + path address
     let conversation_id =
@@ -8809,6 +8827,8 @@ mod edit_projection_tests {
             enc_content: None,
             enc_nonce: None,
             key_epoch: None,
+            buttons: vec![],
+            via_button: false,
         }
     }
 
@@ -9196,6 +9216,7 @@ mod gossip_bridge_tests {
             title: None,
             tags: None,
             attachments: None,
+            buttons: None,
             enc_content: None,
             enc_nonce: None,
             key_epoch: None,
