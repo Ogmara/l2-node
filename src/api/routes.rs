@@ -6715,6 +6715,26 @@ pub async fn mark_channel_read(
     }
 }
 
+/// Named fields deliberately, not two positional `bool`s — the audit that
+/// reviewed this fix flagged that a same-typed positional pair compiles,
+/// passes clippy, and passes both unit tests below even with the two
+/// arguments transposed, silently inverting the decision. This shape makes
+/// that call-site swap impossible to write.
+struct UnreadDecisionInput {
+    via_button: bool,
+    viewer_is_mentioned: bool,
+}
+
+/// Whether an unread message should increment the GENERIC per-channel unread
+/// count (`06-frontend.md` §6.1.3): a button press (`via_button: true`) must
+/// not, for anyone except the wallet it actually addresses — that viewer
+/// still needs the badge to know a command is waiting for their bot. Every
+/// ordinary (non-press) message counts unconditionally, unchanged from
+/// before this field existed.
+fn counts_toward_generic_unread(input: UnreadDecisionInput) -> bool {
+    !input.via_button || input.viewer_is_mentioned
+}
+
 /// GET /api/v1/channels/unread — get unread message counts for all channels.
 ///
 /// For each channel, compares the user's read cursor (last_read_ts) against
@@ -6819,20 +6839,38 @@ pub async fn get_unread_counts(
                 let resolved = state.identity.resolve(&env.author)
                     .unwrap_or_else(|_| env.author.clone());
                 if resolved == auth_user.address { continue; }
-                count += 1;
-                // Only decode the payload if we still need mention info.
-                if mention_count < 99 {
-                    if let Ok(payload) = rmp_serde::from_slice::<crate::messages::types::ChatMessagePayload>(&env.payload) {
-                        let mentioned = payload.mentions.iter().any(|m| {
-                            let resolved_m = state.identity.resolve(m)
-                                .unwrap_or_else(|_| m.clone());
-                            resolved_m == auth_user.address
-                        });
-                        if mentioned {
-                            mention_count += 1;
-                        }
+                // Message buttons (protocol §3.3, l2-node 0.131+): a press is an
+                // ordinary ChatMessage the sender's own client hides from ITS
+                // feed via `via_button`, but every other member's unread count
+                // would otherwise still increment on it — which is exactly the
+                // generic-badge noise `06-frontend.md` §6.1.3 says a compliant
+                // client must not show. The node can't hide the message itself
+                // (that's not the flag's job — see protocol §3.3, no server-side
+                // authority), but it CAN stop counting it toward the generic
+                // unread badge for anyone except the addressed recipient, so the
+                // decode now always runs (not gated on `mention_count < 99`) —
+                // a press must still count for the one channel member it's
+                // actually meant for even after that cap.
+                if let Ok(payload) = rmp_serde::from_slice::<crate::messages::types::ChatMessagePayload>(&env.payload) {
+                    let mentioned = payload.mentions.iter().any(|m| {
+                        let resolved_m = state.identity.resolve(m)
+                            .unwrap_or_else(|_| m.clone());
+                        resolved_m == auth_user.address
+                    });
+                    if mentioned && mention_count < 99 {
+                        mention_count += 1;
+                    }
+                    if !counts_toward_generic_unread(UnreadDecisionInput {
+                        via_button: payload.via_button,
+                        viewer_is_mentioned: mentioned,
+                    }) {
+                        continue;
                     }
                 }
+                // Undecodable payload: fail open on the generic count (matches
+                // pre-existing behavior for any other undecodable message) — the
+                // via_button-aware skip above only applies when decode succeeds.
+                count += 1;
             }
             if count > 0 {
                 unread.insert(channel_id.to_string(), serde_json::json!(count.min(99)));
@@ -6844,6 +6882,34 @@ pub async fn get_unread_counts(
     }
 
     Json(serde_json::json!({ "unread": unread, "mentions": mentions })).into_response()
+}
+
+#[cfg(test)]
+mod unread_button_press_tests {
+    use super::*;
+
+    fn input(via_button: bool, viewer_is_mentioned: bool) -> UnreadDecisionInput {
+        UnreadDecisionInput { via_button, viewer_is_mentioned }
+    }
+
+    #[test]
+    fn ordinary_message_always_counts() {
+        assert!(counts_toward_generic_unread(input(false, false)));
+        assert!(counts_toward_generic_unread(input(false, true)));
+    }
+
+    #[test]
+    fn button_press_counts_only_for_the_addressed_wallet() {
+        assert!(
+            !counts_toward_generic_unread(input(true, false)),
+            "a press must NOT bump the generic badge for an uninvolved member"
+        );
+        assert!(
+            counts_toward_generic_unread(input(true, true)),
+            "a press MUST still bump the badge for the wallet it mentions \
+             (the bot) — it needs to know a command is waiting"
+        );
+    }
 }
 
 /// GET /api/v1/settings — retrieve synced settings (authenticated)

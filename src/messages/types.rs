@@ -296,9 +296,15 @@ pub struct ChatMessagePayload {
     // with plaintext public-channel messages). ---
     /// XChaCha20-Poly1305 ciphertext of the message body under the channel epoch
     /// key. Present iff this is an encrypted (private-channel) message — `content`
-    /// is then empty and `mentions`/`reply_to`/`content_rating` ride INSIDE the
-    /// ciphertext (spec §3.3), so the node learns nothing but channel + timing.
-    /// Opaque to the node.
+    /// is then empty. **Only the text itself is sealed** — `mentions`/`reply_to`/
+    /// `content_rating`/`attachments`/`buttons`/`via_button` all stay PLAINTEXT
+    /// even here (spec §3.3, §8 Metadata row; `validate_chat_message` applies the
+    /// identical bounds to both branches), which is how the node keeps serving
+    /// mention notifications, threading, rating filters, and unread-count
+    /// button-press suppression in encrypted channels too. This comment
+    /// previously (and incorrectly) said `mentions`/`reply_to`/`content_rating`
+    /// ride inside the ciphertext — they never have, in spec or code.
+    /// `enc_content` itself is opaque to the node.
     #[serde(default)]
     pub enc_content: Option<Vec<u8>>,
     /// P2: 24-byte AEAD nonce for `enc_content`.

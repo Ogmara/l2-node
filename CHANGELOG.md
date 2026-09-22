@@ -5,6 +5,30 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.131.1] - 2026-09-22
+
+### Fixed
+
+- **`GET /api/v1/channels/unread` counted a button press (`via_button: true`)
+  toward every channel member's generic unread badge**, not just the wallet
+  it actually addresses — contradicting `06-frontend.md` §6.1.3's "a
+  compliant client must not show" requirement, and caught while building the
+  Phase 4 client UI on top of it. The addressed bot correctly still gets a
+  badge (it needs to know a command is waiting); the bug was every *other*
+  member's badge incrementing on a message they'll never see rendered, since
+  it's suppressed client-side from their feed. Fixed by checking
+  `via_button` alongside the existing mention check before counting a
+  message toward the generic total; the per-mention count (a separate
+  figure) is unaffected. New `counts_toward_generic_unread` helper (named
+  fields, not positional bools — an argument swap here would silently
+  invert the fix and still pass a same-shaped test), unit tested directly
+  rather than only through the full HTTP handler.
+- Corrected a pre-existing, incorrect doc comment on `ChatMessagePayload::
+  enc_content` that claimed `mentions`/`reply_to`/`content_rating` ride
+  inside the ciphertext in encrypted channels — they never have; only the
+  text itself is sealed. Found while verifying this fix behaves correctly
+  in encrypted channels too (it does — the comment was simply wrong).
+
 ## [0.131.0] - 2026-09-21
 
 Message buttons: any wallet may attach a row/grid of interactive buttons to
