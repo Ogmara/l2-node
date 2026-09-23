@@ -340,6 +340,13 @@ pub enum RouteResult {
         msg_type: MessageType,
         /// Raw envelope bytes for downstream processing (notifications, etc.).
         raw_bytes: Vec<u8>,
+        /// Resolved wallet address that authored this envelope — always
+        /// populated (unlike `bot_commands_changed` below), including on the
+        /// sync path. Lets callers (the broadened identity-sync trigger in
+        /// `network/mod.rs::handle_gossip_message`) act on "who sent this"
+        /// without re-parsing `raw_bytes` and re-resolving device→wallet
+        /// themselves.
+        author: String,
         /// `Some(wallet)` when this envelope actually changed that wallet's bot
         /// descriptor, so the caller should emit `bot_commands_changed` and drop
         /// the affected discovery-cache entries (spec 3 §4.3).
@@ -702,6 +709,7 @@ impl MessageRouter {
             msg_id: envelope.msg_id,
             msg_type: envelope.msg_type,
             raw_bytes: raw_bytes.to_vec(),
+            author: resolved_author.clone(),
             // `&& !is_sync` is load-bearing, not belt-and-braces. Identity-sync
             // calls this same function via `process_synced_message`, so without
             // the gate a backfill of N ProfileUpdates would emit N broadcasts —
@@ -6665,5 +6673,150 @@ mod bot_broadcast_signal_tests {
         assert_eq!(rec["is_bot"], serde_json::json!(false));
         assert_eq!(rec["bot_handle"], serde_json::Value::Null);
         assert_eq!(rec["bot_commands"], serde_json::json!([]));
+    }
+}
+
+#[cfg(test)]
+mod route_result_author_tests {
+    //! Design doc "Closing the Identity-Sync Coverage Gap" — `RouteResult::
+    //! Accepted` gained an `author` field so `network::mod::handle_gossip_message`
+    //! can drive the broadened identity-sync trigger without re-parsing
+    //! `raw_bytes` itself. This covers the field is actually populated with
+    //! the envelope's resolved author on real acceptance.
+    use super::*;
+    use tempfile::TempDir;
+
+    fn router() -> (MessageRouter, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let identity = IdentityResolver::new(storage.clone());
+        (
+            MessageRouter::new(storage, identity, None, "testnet".to_string(), usize::MAX, std::sync::Arc::new(crate::metrics::counters::NetworkCounters::new()), crate::config::RateLimitsConfig::default()),
+            dir,
+        )
+    }
+
+    fn register_user(r: &MessageRouter, address: &str, registered_at: u64) {
+        let rec = serde_json::json!({ "address": address, "registered_at": registered_at });
+        r.storage
+            .put_cf(schema::cf::USERS, address.as_bytes(), rec.to_string().as_bytes())
+            .unwrap();
+    }
+
+    fn now_ms() -> u64 {
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
+    }
+
+    fn signed_chat_envelope(
+        sk: &ed25519_dalek::SigningKey,
+        author: &str,
+        channel_id: u64,
+        timestamp: u64,
+    ) -> Vec<u8> {
+        let payload = ChatMessagePayload {
+            channel_id,
+            content: "hello".to_string(),
+            content_rating: Default::default(),
+            reply_to: None,
+            mentions: vec![],
+            attachments: vec![],
+            enc_content: None,
+            enc_nonce: None,
+            key_epoch: None,
+            buttons: vec![],
+            via_button: false,
+        };
+        let payload_bytes = rmp_serde::to_vec_named(&payload).unwrap();
+        let author_pubkey: [u8; 32] = sk.verifying_key().to_bytes();
+        let msg_id =
+            crypto::compute_msg_id("testnet", &author_pubkey, &payload_bytes, timestamp);
+        let signature = signing::sign_ogmara_message(
+            sk,
+            "testnet",
+            crate::messages::envelope::PROTOCOL_VERSION,
+            MessageType::ChatMessage as u8,
+            &msg_id,
+            timestamp,
+            &payload_bytes,
+        );
+        let envelope = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::ChatMessage,
+            msg_id,
+            author: author.to_string(),
+            timestamp,
+            lamport_ts: 0,
+            payload: payload_bytes,
+            signature: signature.to_bytes().to_vec(),
+            relay_path: vec![],
+        };
+        rmp_serde::to_vec_named(&envelope).unwrap()
+    }
+
+    #[test]
+    fn accepted_chat_message_carries_the_resolved_author() {
+        let (r, _d) = router();
+        let sk = crypto::generate_keypair();
+        let author = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        register_user(&r, &author, 1_000);
+
+        let raw = signed_chat_envelope(&sk, &author, 42, now_ms());
+        match r.process_message(&raw) {
+            RouteResult::Accepted { author: got, .. } => {
+                assert_eq!(got, author, "author field must carry the resolved wallet");
+            }
+            other => panic!("expected Accepted, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn resubmitting_an_accepted_envelope_is_still_a_plain_duplicate() {
+        // `Duplicate` is a unit variant — adding a field to `Accepted` cannot
+        // touch it at the type level. This just confirms duplicate detection
+        // still works end-to-end after the change.
+        let (r, _d) = router();
+        let sk = crypto::generate_keypair();
+        let author = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        register_user(&r, &author, 1_000);
+
+        let raw = signed_chat_envelope(&sk, &author, 42, now_ms());
+        assert!(matches!(r.process_message(&raw), RouteResult::Accepted { .. }));
+        assert!(matches!(r.process_message(&raw), RouteResult::Duplicate));
+    }
+
+    #[test]
+    fn accepted_result_uses_the_wallet_not_the_signing_device_key() {
+        // A delegated device signs with its OWN key and `envelope.author` is
+        // the device's ogd1... address — `resolved_author` (the wallet) and
+        // `envelope.author` (the device) genuinely diverge here. A regression
+        // that wired `Accepted.author` from `envelope.author` instead of
+        // `resolved_author` would silently misattribute every delegated-
+        // device message's identity-sync trigger to a device address that
+        // has no USERS row and can never look "complete".
+        let (r, _d) = router();
+        let wallet_sk = crypto::generate_keypair();
+        let wallet = crypto::pubkey_to_address(&wallet_sk.verifying_key()).unwrap();
+        register_user(&r, &wallet, 1_000);
+
+        let device_sk = crypto::generate_keypair();
+        let device_address = crypto::device_pubkey_to_address(&device_sk.verifying_key()).unwrap();
+        r.identity
+            .register_device(&crate::storage::rocks::DeviceClaim {
+                device_address: device_address.clone(),
+                wallet_address: wallet.clone(),
+                device_pubkey_hex: hex::encode(device_sk.verifying_key().to_bytes()),
+                wallet_signature: "test".to_string(),
+                registered_at: 1_000,
+            })
+            .unwrap();
+
+        let raw = signed_chat_envelope(&device_sk, &device_address, 42, now_ms());
+        match r.process_message(&raw) {
+            RouteResult::Accepted { author: got, .. } => {
+                assert_eq!(got, wallet, "must carry the resolved wallet, not the device key");
+                assert_ne!(got, device_address);
+            }
+            other => panic!("expected Accepted, got {:?}", other),
+        }
     }
 }

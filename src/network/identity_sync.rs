@@ -75,6 +75,85 @@ pub fn type_in_scopes(msg_type: u8, scopes: u8) -> bool {
     s != 0 && (s & scopes) != 0
 }
 
+// --- Broadened trigger: fire identity-sync on first OBSERVING an
+// incomplete-looking author via live gossip, not only when that wallet
+// personally authenticates to this node (design doc: "Closing the
+// Identity-Sync Coverage Gap"). ---
+
+/// Returns true iff a message of this type, when its author turns out to
+/// have an incomplete-looking local identity record, is worth triggering a
+/// backfill pull over. Deliberately an ALLOW-list (not a deny-list): a new
+/// message type added later is excluded by default rather than silently
+/// starting to trigger checks on every gossip message, which matters as the
+/// mesh grows toward mainnet's larger peer/message volume.
+///
+/// Any of the five identity types themselves (`scope_of != 0`) qualify —
+/// a ProfileUpdate/Follow/Unfollow/DeviceDelegation/DeviceRevocation from a
+/// wallet with no local record is itself the strongest possible signal.
+/// Beyond those, only types whose AUTHOR is shown to a viewer somewhere
+/// (chat, news, reactions, the sender half of a DM) qualify — types that
+/// carry no author-facing display surface gain nothing from a pull.
+pub fn triggers_identity_check(msg_type: u8) -> bool {
+    if scope_of(msg_type) != 0 {
+        return true;
+    }
+    matches!(
+        msg_type,
+        t if t == MessageType::ChatMessage as u8
+            || t == MessageType::NewsPost as u8
+            || t == MessageType::NewsComment as u8
+            || t == MessageType::ChatReaction as u8
+            || t == MessageType::DirectMessage as u8
+    )
+}
+
+/// Returns true iff `users_row` (a `USERS[wallet]` value, i.e. serialized
+/// user-record JSON) shows no evidence this node has ever actually applied a
+/// `ProfileUpdate` for the wallet — as opposed to a wallet that DID apply one
+/// and legitimately set no `display_name`.
+///
+/// `profile_updated_at` is written into the record ONLY by the ProfileUpdate
+/// apply path (`MessageRouter::process_message_inner`,
+/// `MessageType::ProfileUpdate` arm) — never by Follow, DeviceDelegation, or
+/// chain-scan registration, which can all create a bare `USERS` row with no
+/// such key. Its presence is therefore an unambiguous, already-persisted
+/// signal: present (any value) = "a ProfileUpdate landed here, whatever it
+/// said" = complete, never re-trigger for this reason alone; absent = "no
+/// ProfileUpdate has ever landed here" = incomplete, worth a pull. This is
+/// the distinction that keeps a wallet who genuinely has no display name
+/// from being re-pulled forever.
+pub fn profile_looks_incomplete_json(users_row: &[u8]) -> bool {
+    match serde_json::from_slice::<serde_json::Value>(users_row) {
+        Ok(serde_json::Value::Object(map)) => !map.contains_key("profile_updated_at"),
+        // Unparseable/non-object row — treat as incomplete rather than
+        // silently skipping it; a corrupt row is exactly the kind of gap
+        // this mechanism exists to self-heal.
+        _ => true,
+    }
+}
+
+/// Storage-backed wrapper around [`profile_looks_incomplete_json`]: a wallet
+/// with no `USERS` row at all is incomplete by definition (the darkworld
+/// case in the design doc — `get_user`'s `Ok(None)` branch).
+pub fn identity_looks_incomplete(storage: &Storage, wallet: &str) -> bool {
+    match storage.get_cf(schema::cf::USERS, wallet.as_bytes()) {
+        Ok(Some(bytes)) => profile_looks_incomplete_json(&bytes),
+        Ok(None) => true,
+        // Storage error: don't treat a transient read failure as a green
+        // light to hammer peers — fail toward "looks complete" (no pull)
+        // here; the periodic sweep (§2) will reconsider this wallet again
+        // on its next tick regardless.
+        Err(e) => {
+            tracing::warn!(
+                wallet = %wallet,
+                error = %e,
+                "identity_looks_incomplete: USERS read failed, treating as complete"
+            );
+            false
+        }
+    }
+}
+
 /// Max characters in a valid Ogmara address (bech32 `klv1…`/`ogd1…`).
 const MAX_SUBJECT_LEN: usize = 70;
 
@@ -375,5 +454,136 @@ impl Drop for IdentityResponderGuard {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod coverage_gap_tests {
+    //! Design doc "Closing the Identity-Sync Coverage Gap" — the broadened
+    //! observed-author trigger's core distinguishing logic
+    //! (`triggers_identity_check`/`profile_looks_incomplete_json`/
+    //! `identity_looks_incomplete`). `network::mod`'s
+    //! `identity_staleness_sweep_tests` module covers the periodic sweep's
+    //! pure planning logic (`plan_identity_staleness_sweep`) the same way.
+    //! Neither module constructs a live `NetworkService`/`Swarm`, so there is
+    //! currently no end-to-end "actually converges without a restart" test
+    //! exercising the real trigger wiring in `handle_gossip_message` — a gap
+    //! worth closing with an integration-style test if this area regresses
+    //! again, rather than a claim this module previously made about a test
+    //! that does not exist.
+    use super::*;
+
+    #[test]
+    fn triggers_identity_check_true_for_all_five_identity_types() {
+        for t in [
+            MessageType::DeviceDelegation,
+            MessageType::DeviceRevocation,
+            MessageType::ProfileUpdate,
+            MessageType::Follow,
+            MessageType::Unfollow,
+        ] {
+            assert!(triggers_identity_check(t as u8), "{:?} should trigger", t);
+        }
+    }
+
+    #[test]
+    fn triggers_identity_check_true_for_author_facing_content_types() {
+        for t in [
+            MessageType::ChatMessage,
+            MessageType::NewsPost,
+            MessageType::NewsComment,
+            MessageType::ChatReaction,
+            MessageType::DirectMessage,
+        ] {
+            assert!(triggers_identity_check(t as u8), "{:?} should trigger", t);
+        }
+    }
+
+    #[test]
+    fn triggers_identity_check_false_for_excluded_types() {
+        // Network-internal / no author-facing display surface — an
+        // allow-list miss here must stay a no-trigger, not a crash.
+        for t in [
+            MessageType::ChatEdit,
+            MessageType::ChatDelete,
+            MessageType::ChannelJoin,
+            MessageType::ChannelPinMessage,
+        ] {
+            assert!(!triggers_identity_check(t as u8), "{:?} should NOT trigger", t);
+        }
+    }
+
+    #[test]
+    fn profile_looks_incomplete_true_for_row_missing_profile_updated_at() {
+        // A USERS row that exists only from a Follow-edge or chain-scan
+        // side effect — never had a ProfileUpdate applied to it.
+        let row = serde_json::json!({
+            "address": "klv1example",
+            "public_key": "",
+            "registered_at": 0,
+        });
+        assert!(profile_looks_incomplete_json(
+            &serde_json::to_vec(&row).unwrap()
+        ));
+    }
+
+    #[test]
+    fn profile_looks_incomplete_false_for_row_with_profile_updated_at_and_no_display_name() {
+        // The critical negative case: a wallet that DID apply a
+        // ProfileUpdate and legitimately set no display_name must never be
+        // treated as "incomplete" — otherwise it would be re-pulled
+        // forever, exactly the failure mode the requirements warn against.
+        let row = serde_json::json!({
+            "address": "klv1example",
+            "public_key": "",
+            "registered_at": 0,
+            "profile_updated_at": 1_700_000_000_000u64,
+        });
+        assert!(!profile_looks_incomplete_json(
+            &serde_json::to_vec(&row).unwrap()
+        ));
+    }
+
+    #[test]
+    fn profile_looks_incomplete_false_for_row_with_display_name_and_timestamp() {
+        let row = serde_json::json!({
+            "address": "klv1example",
+            "display_name": "Test0r",
+            "profile_updated_at": 1_700_000_000_000u64,
+        });
+        assert!(!profile_looks_incomplete_json(
+            &serde_json::to_vec(&row).unwrap()
+        ));
+    }
+
+    #[test]
+    fn profile_looks_incomplete_true_for_corrupt_row() {
+        assert!(profile_looks_incomplete_json(b"not valid json"));
+        assert!(profile_looks_incomplete_json(b"[1,2,3]")); // valid JSON, not an object
+    }
+
+    #[test]
+    fn identity_looks_incomplete_true_when_no_users_row_exists() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        assert!(identity_looks_incomplete(&storage, "klv1nobodyhome"));
+    }
+
+    #[test]
+    fn identity_looks_incomplete_false_once_profile_updated_at_is_stored() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let row = serde_json::json!({
+            "address": "klv1example",
+            "profile_updated_at": 1_700_000_000_000u64,
+        });
+        storage
+            .put_cf(
+                schema::cf::USERS,
+                b"klv1example",
+                &serde_json::to_vec(&row).unwrap(),
+            )
+            .unwrap();
+        assert!(!identity_looks_incomplete(&storage, "klv1example"));
     }
 }

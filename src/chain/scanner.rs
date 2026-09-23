@@ -560,6 +560,13 @@ impl ChainScanner {
                         display_name: None,
                         avatar_cid: None,
                         bio: None,
+                        // Sentinel, not a real timestamp — see the field's
+                        // doc comment (`UserRecord::profile_updated_at`,
+                        // security-audit finding HIGH-2). Marks "settled:
+                        // no ProfileUpdate has ever been sent" so this
+                        // wallet isn't re-triggered by the identity-resync
+                        // sweep forever.
+                        profile_updated_at: Some(0),
                     };
                     let bytes = serde_json::to_vec(&record)?;
                     self.storage

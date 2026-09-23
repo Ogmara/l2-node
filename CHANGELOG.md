@@ -5,6 +5,161 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.132.0] - 2026-09-23
+
+### Added
+
+- **Closed the identity-sync coverage gap**, confirmed live: a wallet's
+  display name set on one testnet node (via `ProfileUpdate`) never reached a
+  second node — months later, still not converged. Root cause: the existing
+  identity-sync backfill (P-1, 0.50.0+) only ever triggers when a wallet
+  *personally, authenticatedly connects to that specific node* — a wallet
+  whose peers only ever see it via gossip-relayed messages could never
+  trigger a backfill on that node at all, leaving it permanently dependent
+  on a single live gossip delivery of its `ProfileUpdate`/`Follow`/`Unfollow`
+  never being missed.
+  - **Broadened trigger**: a node now also fires a pull the first time it
+    *observes*, via live gossip, a message from an author whose local
+    `USERS` record has no `profile_updated_at` — i.e. no `ProfileUpdate` has
+    ever actually landed there for that wallet. Precisely distinguished from
+    a wallet that legitimately set no display name (which still stamps
+    `profile_updated_at`) so that case is never repeatedly re-pulled.
+  - **Periodic staleness sweep**: a new bounded, resumable-cursor background
+    sweep of `USERS` (same shape as the DM retention reaper) re-checks
+    previously-seen wallets whose record still looks incomplete — closing
+    the case where a wallet updates *again* later and that gossip is also
+    missed, which the one-shot trigger above cannot catch by itself.
+  - New `[identity_resync]` config section: `enabled` (master switch, default
+    true), `sweep_interval_secs` (default 300), `sweep_batch_size` (default
+    500, scan-cost bound), `max_retriggers_per_sweep` (default 5, the
+    per-sweep request-cost bound — independent of table size or how many
+    incomplete rows one batch contains), `max_observed_triggers_per_interval`
+    (default 20, see Security below). `sweep_batch_size`,
+    `max_retriggers_per_sweep`, and `max_observed_triggers_per_interval` are
+    each soft-clamped (upper bound) in `Config::validate()`;
+    `sweep_batch_size` additionally has a lower-bound clamp (0 would silently
+    make the sweep scan nothing forever); `sweep_interval_secs` is
+    intentionally unclamped (`0` is a meaningful "disabled" value — see
+    Security below for what else that disables).
+  - Spec: `01-protocol.md` §8.4.1(b), new §8.4.5.
+  - 17 new tests (pure trigger/staleness-detection logic, sweep
+    cursor/batch/cap behavior, `RouteResult::Accepted` carrying the
+    *resolved* author — including a delegated-device case proving it's not
+    the signing device key). No SDK or client changes — purely a
+    node-internal libp2p protocol, never exposed over the public REST/WS API.
+  - Deliberately deferred: a watermark/digest exchange for the periodic
+    sweep (the wire protocol already reserves `overlap_digest`/`round` for
+    this) — a full identity-bundle re-pull already fits comfortably inside
+    existing per-request caps at current scale.
+
+### Security
+
+- **The broadened, gossip-observed identity-sync trigger above had no rate
+  limit of its own** (Code + Security audit, run in parallel post-
+  implementation): the gossip path carries no PoW admission cost, so a
+  single attacker-published message — or a burst of them from cheaply
+  mintable fresh keypairs — could force `FANOUT`-many outbound identity-sync
+  requests network-wide with no cap, and per-wallet rate limits don't help
+  against an attacker who never reuses a wallet. Closed with a token-bucket
+  style `max_observed_triggers_per_interval` budget (default 20, refilled
+  each `sweep_interval_secs` tick) gating the trigger before any storage
+  read.
+- **Deterministic, head-of-batch sweep selection could starve most of a
+  large incomplete backlog**: the periodic sweep always picked the first
+  `max_retriggers_per_sweep` incomplete rows in scan order, so entries past
+  that point in a batch could go unselected indefinitely as the cursor
+  advanced. Fixed by shuffling candidates before truncating.
+- **On-chain-registered wallets that never set a display name looked
+  permanently "incomplete" and were re-triggered forever**, burning the
+  sweep's entire budget on wallets that can never converge. `UserRecord`
+  gained `profile_updated_at: Option<u64>`; the chain scanner now stamps a
+  `Some(0)` sentinel on fresh on-chain registration to record "no
+  `ProfileUpdate` has landed, and that's a settled, expected state" —
+  distinct from `None` ("hasn't been checked").
+  Pre-existing rows deserialize as `None` (`#[serde(default)]`); the
+  scanner-time fix does not itself back-migrate rows written before this
+  field existed.
+- Bounded `identity_sync_triggered`'s in-session dedup set via oldest-entry
+  eviction instead of a wholesale clear at 100k entries — the wholesale
+  clear became attacker-triggerable once free, gossip-fed keypairs could
+  grow the set, and clearing it reset the dedup guarantee for every
+  legitimate wallet at once. Mirrors the existing `IdentityResponderLimits`
+  bounded-eviction pattern.
+- Capped `pending_identity_sync_requests` at 8192 (mirrors the existing
+  snapshot-client pending-request cap) — a peer that never replies could
+  otherwise grow this map without limit.
+- Added logging to previously-silent failure paths in
+  `identity_looks_incomplete` and the sweep's cursor read/write, so a
+  storage fault surfaces instead of degrading silently to "skip this
+  wallet"/"rescan from the start".
+- Sweep candidates are now validated the same way a peer-supplied
+  `request.wallet` is before being sent to peers, rather than trusting a
+  `USERS` key via `from_utf8_lossy` — relevant because those keys can arrive
+  from snapshot bootstrap, not only local writes.
+- **Deferred, explicitly** (both audits agreed it's not a security issue):
+  one extra bounded local `USERS` CF read per gossip-accepted message of a
+  triggering type, while the observed-trigger budget isn't exhausted — the
+  budget already bounds the outbound-request worst case; not worth threading
+  a cached flag through the gossip path to save a local point lookup
+  pre-mainnet.
+
+**Re-audit round 2** (mandatory re-run of Code + Security audit against the
+fixed tree above — found the fixes had their own bugs, per this project's
+"3 of 4 second-round findings were caused by the first round's own fixes"
+pattern):
+
+- **The observed-trigger budget (previous entry) was spent even on triggers
+  that dispatched zero requests**, because it was decremented before
+  `maybe_trigger_identity_sync`'s own dedup check, which silently no-ops for
+  a wallet already in `identity_sync_triggered`. A single wallet whose
+  `USERS` row can never converge (e.g. a bare row created as a Follow/
+  DeviceDelegation side effect) — or, on a busy node, simply ordinary chat
+  traffic from wallets with no `USERS` row at all — could pin the budget at
+  0 within seconds of every refill, silently disabling the entire broadened
+  trigger for every OTHER wallet for the rest of the interval. This was the
+  headline finding of both re-audits and defeated the whole point of this
+  release. Fixed by checking `!self.identity_sync_triggered.contains(&author)`
+  before spending a budget unit, so the budget is only ever spent on a
+  trigger that will actually fire.
+- **`sweep_interval_secs = 0`'s doc comment claimed the observed-author
+  trigger "stays active"** when disabling the sweep — false: the budget is
+  refilled only inside the sweep tick, so at `0` it runs its initial
+  allotment down and then silently goes permanently inert for the rest of
+  the process's life. Corrected the doc comment; added a one-time `debug!`
+  log when the budget hits 0 so exhaustion is at least observable.
+- Fixed a misattached doc comment (was documenting
+  `identity_sync_triggered_insert` but attached to the `const` above it),
+  reordered a log line that announced "triggering pull" before the
+  pending-request cap check could still bail it out to "skipping pull",
+  corrected a dangling doc reference to a test module that doesn't exist,
+  and fixed a sweep test fixture (`klv1has-no-name-by-choice`) whose
+  hyphenated wallet key was being excluded by the LOW-1 subject-validation
+  fix regardless of whether the test's actual target logic
+  (`profile_looks_incomplete_json`) was correct — the test would have stayed
+  green even if that logic regressed.
+- **Deferred, explicitly** (design gap, not attacker-exploitable, does not
+  regress below pre-0.132.0 behavior — recorded rather than silently
+  dropped): the `profile_updated_at: Some(0)` sentinel above cannot
+  distinguish "this wallet has genuinely never set a profile anywhere" from
+  "this node just doesn't have this wallet's `ProfileUpdate` yet, and is
+  about to permanently stop looking for one." A wallet whose FIRST contact
+  with a given node is that node's chain scanner discovering its on-chain
+  registration — with no prior gossip contact at all — gets the sentinel
+  stamped immediately, and if that wallet's actual `ProfileUpdate` is never
+  independently gossiped to this node afterward, this node never proactively
+  re-checks for it (though it will still apply one correctly via LWW if
+  gossip ever does deliver it — nothing is corrupted, the row is just never
+  chased). This is not a regression: it is identical to the pre-0.132.0
+  behavior (passive-only) for this specific ordering, which 0.132.0 was
+  never designed to cover — the fix's chain-registration branch only ever
+  runs when no `USERS` row exists yet, so a wallet that has EVER been seen
+  via any gossip (chat, follow, delegation, or a genuinely-received
+  `ProfileUpdate`) before its on-chain registration is scanned is unaffected.
+  Closing this fully needs either a protocol-level "this wallet has ever set
+  a profile" signal (not available on-chain today) or a bounded-retry budget
+  per sentinel row, both judged disproportionate to a narrow, non-adversarial
+  edge case for this pass.
+
 ## [0.131.1] - 2026-09-22
 
 ### Fixed

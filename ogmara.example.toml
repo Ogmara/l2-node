@@ -267,6 +267,37 @@ max_stored_messages_per_recipient = 2000
 # How often the DM retention reaper sweeps for expired rows (W11).
 reap_interval_secs = 900
 
+[identity_resync]
+# Identity-sync coverage-gap policy: closes the gap where a wallet whose
+# ProfileUpdate/Follow/Unfollow gossip is missed by this node, and who
+# never personally authenticates here, would otherwise never backfill.
+# Master switch for both the broadened observed-author trigger and the
+# periodic sweep below.
+enabled = true
+# How often, in seconds, the periodic USERS staleness sweep ticks. This is
+# ALSO the only refill cadence for max_observed_triggers_per_interval below
+# — 0 disables BOTH the sweep AND the observed-author trigger (its initial
+# budget runs out within one interval's worth of gossip, then it goes
+# permanently inert for the rest of the process's life; there is no way to
+# run one without the other at the same cadence).
+sweep_interval_secs = 300
+# Max USERS rows examined per sweep tick (cursor resumes across ticks).
+# Bounds scan cost, not network requests — see max_retriggers_per_sweep.
+sweep_batch_size = 500
+# Max identity-sync pulls the periodic sweep may newly trigger per tick.
+# Bounds the SWEEP's own outbound requests, independent of table size or
+# how many incomplete rows one batch happens to contain.
+max_retriggers_per_sweep = 5
+# Max NEW identity-sync pulls the observed-author trigger (a live gossip
+# message from an unknown/incomplete author) may fire per
+# sweep_interval_secs window. THIS is the actual DoS-relevant knob: gossip
+# has no PoW gate and no per-wallet rate limit that bites a flood of
+# distinct fresh keypairs, so without this budget a single attacker
+# publishing N messages under N free keys could force N x FANOUT(3)
+# outbound requests network-wide, with no ceiling. Auth-triggered pulls
+# are unaffected (already IP-rate-limited).
+max_observed_triggers_per_interval = 20
+
 [notifications]
 # Persisted-notification retention (W31, l2-node 0.104.0+)
 # Days a stored notification is retained. 0 = unlimited. Enforced by the

@@ -934,6 +934,10 @@ impl Node {
             // Spec 3 §dm-offline-store-and-forward (l2-node 0.69.0+) —
             // persistent DM-subscription cap/LRU + dm-sync backfill window.
             self.config.dm.clone(),
+            // Design doc "Closing the Identity-Sync Coverage Gap" —
+            // broadened observed-author trigger + periodic USERS
+            // staleness sweep.
+            self.config.identity_resync.clone(),
         )
         .await
         .context("starting network service")?;

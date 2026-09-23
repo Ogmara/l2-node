@@ -3338,6 +3338,13 @@ pub async fn post_message(
             msg_id,
             raw_bytes,
             msg_type: _,
+            // The caller authenticated to submit this (self-authored)
+            // message, so `api/auth.rs`'s existing one-shot identity-sync
+            // trigger already covers this exact wallet before this handler
+            // ever runs — the broadened observed-author trigger only wires
+            // into the live-gossip path (`handle_gossip_message`), where no
+            // such auth-time trigger exists for a message's author.
+            author: _,
             bot_commands_changed,
         } => {
             state.counters.inc_messages_stored();

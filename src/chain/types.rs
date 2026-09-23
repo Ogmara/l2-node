@@ -84,6 +84,50 @@ pub struct UserRecord {
     pub avatar_cid: Option<String>,
     /// Bio (from L2 ProfileUpdate).
     pub bio: Option<String>,
+    /// Set to `Some(0)` (never a real timestamp — messages that old are
+    /// rejected by the ±5min drift check) by the chain scanner on a fresh
+    /// on-chain registration, to record "this node has a settled view: no
+    /// `ProfileUpdate` has ever been sent for this wallet" — distinct from
+    /// `None`, which security-audit finding HIGH-2 (design doc "Closing
+    /// the Identity-Sync Coverage Gap") identified as indistinguishable
+    /// from "this node hasn't checked/heard yet". Without this, EVERY
+    /// on-chain-registered wallet that never sets a display name — the
+    /// common case, since registration and profile-setting are separate,
+    /// optional actions — looks permanently "incomplete" to
+    /// `identity_sync::profile_looks_incomplete_json` and is re-triggered
+    /// forever, burning the periodic sweep's entire request budget on
+    /// wallets it can never actually fix. A real `MessageType::ProfileUpdate`
+    /// (router.rs's apply arm) always writes its own real timestamp here
+    /// via `#[serde(flatten)]`-free raw JSON, which — being a real
+    /// message timestamp — is always > 0 and correctly overrides this
+    /// sentinel under the existing LWW rule (a timestamp <= the stored
+    /// value is a no-op). `#[serde(default)]` so a row written before this field
+    /// existed still deserializes (as `None` — the pre-existing gap for
+    /// ALREADY-stored rows is a known, accepted limitation, not solved by
+    /// this field alone; see the design doc for why a broader migration
+    /// wasn't judged worth it pre-mainnet).
+    ///
+    /// **Known, deliberately deferred limitation (re-audit round 2):** the
+    /// sentinel cannot distinguish "this wallet has genuinely never sent a
+    /// `ProfileUpdate` anywhere" from "this node just hasn't received this
+    /// wallet's `ProfileUpdate` yet." If a node's FIRST contact with a
+    /// wallet is this scanner discovering its on-chain registration (no
+    /// prior gossip contact at all), the sentinel is stamped immediately —
+    /// and if that wallet's real `ProfileUpdate` is never independently
+    /// gossiped to this node afterward, this node never proactively
+    /// re-checks (though a real `ProfileUpdate` is still applied correctly
+    /// via LWW if it ever does arrive — nothing is corrupted, it's just
+    /// never chased). Not a regression: this specific ordering behaves
+    /// identically to pre-0.132.0 (passive-only), since this branch only
+    /// runs when no `USERS` row exists yet — a wallet seen via ANY prior
+    /// gossip (chat, follow, delegation, or a genuinely-received
+    /// `ProfileUpdate`) is unaffected. Closing this fully needs either an
+    /// on-chain "has ever set a profile" signal (doesn't exist today) or a
+    /// bounded-retry budget per sentinel row — judged disproportionate to a
+    /// narrow, non-adversarial edge case for this pass. Revisit if it proves
+    /// more common in practice than expected.
+    #[serde(default)]
+    pub profile_updated_at: Option<u64>,
 }
 
 /// Local channel state cached from on-chain events + L2 updates.

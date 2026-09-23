@@ -292,6 +292,65 @@ fn plan_dm_conversations_reap(
     (to_delete, Some(next_cursor))
 }
 
+/// Pure planning step for the periodic identity-staleness sweep (design
+/// doc "Closing the Identity-Sync Coverage Gap" §2): given a batch of
+/// `USERS` rows (keyed by wallet address), returns which wallets to
+/// re-trigger an identity-sync pull for and the next cursor.
+///
+/// Unlike the DM reaper's `to_delete` list above, hitting `max_retriggers`
+/// does NOT stop the scan early — every row in `rows` is still examined and
+/// the cursor still advances to the true end of the batch. Scan cost
+/// (`sweep_batch_size`, bounded by the caller's `rows` length) and request
+/// cost (`max_retriggers`, bounded here) are deliberately independent
+/// knobs: local RocksDB I/O is cheap and shouldn't stall cursor progress
+/// just because a batch happened to contain more incomplete rows than the
+/// per-tick outbound-request budget — that would let one incomplete-heavy
+/// region of the table starve every wallet after it from ever being
+/// scanned, not just re-triggered.
+///
+/// **Selection within the cap is RANDOM, not positional** (code-audit
+/// finding, first round): a batch is a deterministic, stable window given a
+/// stable table — head-first truncation (take the first `max_retriggers`
+/// incomplete rows found) would select the SAME wallets on every wrap,
+/// forever, and never even reach a genuinely-stale wallet sorting after
+/// enough permanently-incomplete ones (e.g. on-chain-registered wallets
+/// that never set a display name — common, and by construction always
+/// "incomplete" under `profile_looks_incomplete_json`) in its own batch.
+/// Shuffling means every incomplete row in the batch has an equal, nonzero
+/// probability of being picked each pass, so expected time-to-retry is
+/// finite regardless of how the table is populated.
+fn plan_identity_staleness_sweep(
+    rows: &[(Vec<u8>, Vec<u8>)],
+    max_retriggers: usize,
+) -> (Vec<String>, Option<Vec<u8>>) {
+    if rows.is_empty() {
+        return (Vec::new(), None);
+    }
+    let mut incomplete: Vec<String> = Vec::new();
+    for (key, value) in rows {
+        if !identity_sync::profile_looks_incomplete_json(value) {
+            continue;
+        }
+        // Validated the same way a peer-supplied `request.wallet` would be
+        // (code-audit finding) — a `USERS` key can arrive via snapshot
+        // bootstrap from a peer, not only local writes, so it isn't
+        // unconditionally trusted to already be a well-formed subject
+        // before it's handed to `maybe_trigger_identity_sync` and sent to
+        // 3 peers.
+        match std::str::from_utf8(key) {
+            Ok(s) if identity_sync::is_plausible_subject(s) => incomplete.push(s.to_string()),
+            _ => continue,
+        }
+    }
+    use rand::seq::SliceRandom;
+    incomplete.shuffle(&mut rand::thread_rng());
+    incomplete.truncate(max_retriggers);
+    // rows is non-empty here (checked above), so .last() always succeeds.
+    let mut next_cursor = rows.last().expect("rows non-empty").0.clone();
+    next_cursor.push(0);
+    (incomplete, Some(next_cursor))
+}
+
 /// The running network layer.
 pub struct NetworkService {
     /// The libp2p swarm managing all protocols.
@@ -433,7 +492,15 @@ pub struct NetworkService {
     >,
     /// Wallets this node has triggered an identity-sync pull for at least
     /// once this process lifetime — dedups repeated first-seen triggers.
+    /// Bounded via oldest-entry eviction (security-audit MEDIUM-2, mirrors
+    /// `IdentityResponderLimits::add_served`'s W5 fix): a wholesale clear on
+    /// overflow is attacker-triggerable now that the gossip-observed trigger
+    /// feeds this set from free, attacker-mintable keypairs, and clearing it
+    /// would reset the one-shot-per-session guarantee for every legitimate
+    /// wallet at once. `identity_sync_triggered_order` tracks insertion order
+    /// for eviction; the two must always be updated together.
     identity_sync_triggered: HashSet<String>,
+    identity_sync_triggered_order: std::collections::VecDeque<String>,
     /// Server-side rate-limit state for inbound news-sync requests (P-3).
     news_sync_limits: Arc<news_sync::NewsResponderLimits>,
     /// Outstanding outbound news-sync requests → the peer they went to plus
@@ -451,6 +518,23 @@ pub struct NetworkService {
     /// DM offline store-and-forward policy (spec 3, l2-node 0.69.0+): persistent
     /// DM-subscription cap + LRU, and the dm-sync backfill window.
     dm_config: crate::config::DmConfig,
+    /// Identity-sync coverage-gap policy (design doc: "Closing the
+    /// Identity-Sync Coverage Gap"): the broadened observed-author trigger
+    /// (`handle_gossip_message`) and the periodic `USERS` staleness sweep
+    /// (`sweep_identity_staleness`).
+    identity_resync_config: crate::config::IdentityResyncConfig,
+    /// Remaining observed-author identity-sync triggers this node may fire
+    /// before the next `identity_staleness_interval` refill (security-audit
+    /// finding: live gossip has no PoW gate and no per-wallet rate limit
+    /// that bites a flood of distinct fresh keypairs, so this is the ONLY
+    /// thing bounding that path's outbound request volume — see
+    /// `IdentityResyncConfig::max_observed_triggers_per_interval`'s doc
+    /// comment). Refilled to that config value at the top of every
+    /// `sweep_identity_staleness` tick; decremented in
+    /// `handle_gossip_message` each time the observed-author trigger
+    /// actually fires. Starts at the full budget (not zero) so a
+    /// freshly-started node isn't silently inert for its first interval.
+    observed_trigger_budget: usize,
     /// Server-side rate-limit state for inbound dm-sync requests (Phase 2).
     dm_sync_limits: Arc<dm_sync::DmResponderLimits>,
     /// Outstanding outbound dm-sync requests → `(peer, wallet)` for race-cancel
@@ -841,6 +925,7 @@ impl NetworkService {
         alert_event_tx: Option<crate::notifications::alerts::AlertEventSender>,
         backfill_config: crate::config::BackfillConfig,
         dm_config: crate::config::DmConfig,
+        identity_resync_config: crate::config::IdentityResyncConfig,
     ) -> Result<Self> {
         // Clone before move — the presence subsystem needs its own
         // handle to sign outbound records. libp2p `Keypair` is cheap
@@ -1129,10 +1214,13 @@ impl NetworkService {
             identity_sync_limits: Arc::new(identity_sync::IdentityResponderLimits::default()),
             pending_identity_sync_requests: HashMap::new(),
             identity_sync_triggered: HashSet::new(),
+            identity_sync_triggered_order: std::collections::VecDeque::new(),
             news_sync_limits: Arc::new(news_sync::NewsResponderLimits::default()),
             pending_news_sync_requests: HashMap::new(),
             last_news_sync: None,
             dm_config,
+            observed_trigger_budget: identity_resync_config.max_observed_triggers_per_interval,
+            identity_resync_config,
             dm_sync_limits: Arc::new(dm_sync::DmResponderLimits::default()),
             pending_dm_sync_requests: HashMap::new(),
             dm_backfill_triggered: HashSet::new(),
@@ -1529,6 +1617,94 @@ impl NetworkService {
         }
     }
 
+    /// Periodic staleness-aware identity re-check (design doc "Closing the
+    /// Identity-Sync Coverage Gap" §2) — closes a gap the broadened
+    /// observed-author trigger (`handle_gossip_message`) cannot: that
+    /// trigger is a one-shot per wallet per process lifetime
+    /// (`identity_sync_triggered` dedup), so a wallet whose identity bundle
+    /// looked complete when it was last pulled, but who updates it AGAIN
+    /// later — via a node this one never talks to, with THAT live gossip
+    /// update also missed — would otherwise stay deduped forever with
+    /// nothing to ever revisit it short of a full node restart.
+    ///
+    /// Slow-drips through `USERS` in key order, resuming from a persisted
+    /// cursor each tick — same resumable-batch shape as
+    /// `reap_dm_msg_shaped_cf` above — and only ACTS (clears the dedup
+    /// entry + re-triggers) on rows that still look incomplete per
+    /// `identity_sync::profile_looks_incomplete_json`; most ticks on a
+    /// healthy node find nothing to do. `max_retriggers_per_sweep` bounds
+    /// outbound requests per tick independent of table size or how many
+    /// incomplete rows a batch happens to contain (see
+    /// `plan_identity_staleness_sweep`'s doc comment).
+    fn sweep_identity_staleness(&mut self) {
+        if !self.identity_resync_config.enabled {
+            return;
+        }
+        // Refill the observed-author trigger's budget on every tick of this
+        // interval — the two mechanisms conceptually share one cadence
+        // rather than each owning a dedicated `tokio::time::interval`. This
+        // runs even when the SWEEP portion below is a no-op (an empty
+        // `USERS` table, or between real work), which is fine: the refill
+        // is O(1) regardless.
+        self.observed_trigger_budget = self.identity_resync_config.max_observed_triggers_per_interval;
+        let cursor = match self.storage.get_cf(
+            schema::cf::NODE_STATE,
+            schema::state_keys::IDENTITY_STALENESS_CURSOR,
+        ) {
+            Ok(c) => c.unwrap_or_default(),
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "sweep_identity_staleness: cursor read failed, restarting scan from the beginning"
+                );
+                Vec::new()
+            }
+        };
+        let rows = match self.storage.iter_cf_from(
+            schema::cf::USERS,
+            &cursor,
+            &[],
+            self.identity_resync_config.sweep_batch_size,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(error = %e, "sweep_identity_staleness: scan failed");
+                return;
+            }
+        };
+        let (candidates, next_cursor) = plan_identity_staleness_sweep(
+            &rows,
+            self.identity_resync_config.max_retriggers_per_sweep,
+        );
+        match next_cursor {
+            Some(nc) => {
+                if let Err(e) = self.storage.put_cf(
+                    schema::cf::NODE_STATE,
+                    schema::state_keys::IDENTITY_STALENESS_CURSOR,
+                    &nc,
+                ) {
+                    warn!(error = %e, "sweep_identity_staleness: cursor write failed");
+                }
+            }
+            None => {
+                if let Err(e) = self.storage.delete_cf(
+                    schema::cf::NODE_STATE,
+                    schema::state_keys::IDENTITY_STALENESS_CURSOR,
+                ) {
+                    warn!(error = %e, "sweep_identity_staleness: cursor delete failed");
+                }
+            }
+        }
+        for wallet in candidates {
+            // Force a re-trigger regardless of this session's prior dedup —
+            // the row STILL looks incomplete, so whatever happened before
+            // (never triggered, or triggered but the pull/apply didn't
+            // actually land complete data) needs another try.
+            self.identity_sync_triggered_remove(&wallet);
+            self.maybe_trigger_identity_sync(wallet, identity_sync::SCOPE_ALL);
+        }
+    }
+
     /// Publish a raw message to a GossipSub topic.
     pub fn publish(
         &mut self,
@@ -1635,6 +1811,32 @@ impl NetworkService {
             tokio::time::interval(Duration::from_secs(self.dm_config.reap_interval_secs.max(1)));
         dm_reap_interval.tick().await; // skip immediate tick
 
+        // Identity-staleness sweep cadence (design doc "Closing the
+        // Identity-Sync Coverage Gap" §2) — also the refill cadence for the
+        // observed-author trigger's request budget (`observed_trigger_budget`),
+        // since the two mechanisms share one interval rather than each
+        // owning a dedicated one. Own interval, same reasoning as the DM
+        // reaper above — a `USERS`-table scan shouldn't compete with
+        // mesh-stats' tight 30s budget, and its cadence (data-completeness
+        // convergence) is unrelated to either.
+        //
+        // `None` (not a 1-second interval via `.max(1)`) when
+        // `sweep_interval_secs == 0` — Code Audit finding: a `.max(1)` here
+        // would wake this loop every second forever just to immediately
+        // return, for the life of the process, on the documented "0 means
+        // disabled" config value. Mirrors the existing `None =>
+        // std::future::pending().await` idiom used for the disabled-presence
+        // path above.
+        let mut identity_staleness_interval = if self.identity_resync_config.sweep_interval_secs > 0 {
+            let mut iv = tokio::time::interval(Duration::from_secs(
+                self.identity_resync_config.sweep_interval_secs,
+            ));
+            iv.tick().await; // skip immediate tick
+            Some(iv)
+        } else {
+            None
+        };
+
         // Hot Topics digest publish cadence (spec 3 §3.9). First publish is
         // jittered `0..=publish_jitter_secs` past one full interval to avoid a
         // fleet-wide thundering herd after a coordinated restart. The arm is a
@@ -1722,6 +1924,14 @@ impl NetworkService {
                 }
                 _ = dm_reap_interval.tick() => {
                     self.reap_expired_dms();
+                }
+                _ = async {
+                    match identity_staleness_interval.as_mut() {
+                        Some(iv) => { iv.tick().await; }
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    self.sweep_identity_staleness();
                 }
                 _ = announce_interval.tick() => {
                     self.publish_node_announcement();
@@ -2621,6 +2831,39 @@ impl NetworkService {
         }
     }
 
+    /// Bound on `identity_sync_triggered`'s size before the oldest entry is
+    /// evicted (see `identity_sync_triggered_insert`).
+    const MAX_IDENTITY_SYNC_TRIGGERED: usize = 100_000;
+
+    /// Insert into the bounded `identity_sync_triggered` dedup set, evicting
+    /// the single oldest entry when at capacity (mirrors
+    /// `IdentityResponderLimits::add_served`'s oldest-eviction pattern). A
+    /// no-op if `wallet` is already present.
+    fn identity_sync_triggered_insert(&mut self, wallet: String) {
+        if !self.identity_sync_triggered.insert(wallet.clone()) {
+            return; // already present — order queue already has it
+        }
+        self.identity_sync_triggered_order.push_back(wallet);
+        if self.identity_sync_triggered.len() > Self::MAX_IDENTITY_SYNC_TRIGGERED {
+            if let Some(oldest) = self.identity_sync_triggered_order.pop_front() {
+                self.identity_sync_triggered.remove(&oldest);
+            }
+        }
+    }
+
+    /// Remove `wallet` from the bounded `identity_sync_triggered` dedup set
+    /// (both the set and its order queue), allowing a future re-trigger.
+    /// `VecDeque` has no O(1) remove-by-value, so this is O(n) in the
+    /// order queue's length — acceptable because every caller is
+    /// low-frequency (the sweep's `≤max_retriggers_per_sweep` per tick, the
+    /// pending-cap rollback, the no-connected-peers rollback), never the
+    /// per-message gossip hot path.
+    fn identity_sync_triggered_remove(&mut self, wallet: &str) {
+        if self.identity_sync_triggered.remove(wallet) {
+            self.identity_sync_triggered_order.retain(|w| w != wallet);
+        }
+    }
+
     /// Channel-history backfill trigger (spec 1, l2-node 0.47.0+).
     /// See [`Self::subscribe_channel`] for the full trigger contract.
     /// Lazily pull one wallet's identity bundle (delegation/profile/follows)
@@ -2631,21 +2874,16 @@ impl NetworkService {
         if wallet.is_empty() || scopes == 0 {
             return;
         }
-        // Bound the dedup set (one entry per distinct subject ever seen). It's
-        // only a "don't re-pull this session" optimization, so clearing on
-        // overflow just costs an occasional redundant pull.
-        if self.identity_sync_triggered.len() >= 100_000 {
-            self.identity_sync_triggered.clear();
-        }
-        if !self.identity_sync_triggered.insert(wallet.clone()) {
+        if self.identity_sync_triggered.contains(&wallet) {
             return; // already pulled this session
         }
+        self.identity_sync_triggered_insert(wallet.clone());
         // Any connected peer is a candidate — request-response negotiation
         // refuses non-supporters cleanly.
         let mut candidates: Vec<PeerId> = self.swarm.connected_peers().copied().collect();
         if candidates.is_empty() {
             // No peers yet — allow a future re-trigger when one connects.
-            self.identity_sync_triggered.remove(&wallet);
+            self.identity_sync_triggered_remove(&wallet);
             return;
         }
         use rand::seq::SliceRandom;
@@ -2659,6 +2897,25 @@ impl NetworkService {
             overlap_digest: Vec::new(),
             round: 0,
         };
+        // Bound the pending-request map (audit MEDIUM-1, mirrors
+        // `handle_snapshot_client_command`'s MAX_PENDING_SNAPSHOT_REQUESTS
+        // pattern): a malicious peer that never replies, or a burst of
+        // triggers racing FANOUT peers each, can otherwise grow this map
+        // without limit while requests await their libp2p response/timeout.
+        const MAX_PENDING_IDENTITY_SYNC_REQUESTS: usize = 8192;
+        if self.pending_identity_sync_requests.len() >= MAX_PENDING_IDENTITY_SYNC_REQUESTS {
+            warn!(
+                pending = self.pending_identity_sync_requests.len(),
+                wallet = %wallet,
+                "identity-sync pending-request map at cap — skipping pull"
+            );
+            self.identity_sync_triggered_remove(&wallet);
+            return;
+        }
+        // Logged only once the pull is actually going to be dispatched —
+        // logging this before the cap check above (re-audit finding) meant
+        // "triggering pull" was immediately followed by "skipping pull" for
+        // every wallet under sustained cap pressure.
         info!(wallet = %wallet, scopes, fanout = candidates.len(), "identity-sync: triggering pull");
         for peer in candidates {
             let id = self
@@ -4834,6 +5091,7 @@ impl NetworkService {
                 msg_id,
                 msg_type,
                 raw_bytes,
+                author,
                 bot_commands_changed,
             } => {
                 debug!(
@@ -4844,6 +5102,80 @@ impl NetworkService {
 
                 self.counters.inc_messages_stored();
                 self.adjust_gossip_app_score(propagation_source, VALID_MESSAGE_SCORE_RECOVERY);
+
+                // Broadened identity-sync trigger (design doc: "Closing the
+                // Identity-Sync Coverage Gap") — closes the gap where a
+                // wallet that never personally authenticates to THIS node
+                // (only ever seen via gossip-relayed messages) could never
+                // trigger a backfill here at all, leaving it permanently
+                // dependent on a single live gossip delivery of its
+                // ProfileUpdate/Follow/Unfollow never being missed. Live
+                // gossip only — `process_synced_message` (the sync/backfill
+                // paths) never reaches `handle_gossip_message`, so a synced
+                // message can't re-trigger more syncing.
+                //
+                // `observed_trigger_budget` gates this BEFORE the storage
+                // read (security-audit finding): live gossip has no PoW
+                // gate on this node (`pow: None` for the gossip router) and
+                // no per-wallet rate limit that bites a flood of DISTINCT
+                // fresh keypairs, so without a budget an attacker could
+                // force `FANOUT` (3) outbound requests to random peers per
+                // published message, network-wide, at zero cost — see
+                // `IdentityResyncConfig::max_observed_triggers_per_interval`'s
+                // doc comment for the full threat model. Checked first
+                // (cheapest) so an exhausted budget also skips the
+                // `identity_looks_incomplete` storage read, not just the
+                // pull itself.
+                //
+                // LOW-3 (both audits, explicitly deprioritized as "not a
+                // security issue" — recorded here rather than silently
+                // dropped): this still costs one extra `USERS` CF read per
+                // gossip-accepted message of a triggering type while the
+                // budget isn't exhausted and the wallet isn't already
+                // deduped, on top of the reads `update_indexes` already does
+                // earlier in this path. Deferred: the budget already bounds
+                // the worst case to `max_observed_triggers_per_interval`
+                // *pulls* per tick, and the extra read itself is a bounded
+                // local RocksDB point lookup, not a network operation — not
+                // worth the added complexity of threading a cached "already
+                // looked" flag through `handle_gossip_message` pre-mainnet.
+                //
+                // The `!self.identity_sync_triggered.contains(&author)` guard
+                // (re-audit finding, both Code and Security audits
+                // independently): `maybe_trigger_identity_sync` silently
+                // no-ops for an already-deduped wallet, so without this check
+                // the budget was spent on triggers that dispatch zero
+                // requests. A single wallet whose USERS row can never
+                // converge (e.g. a bare row created by a Follow/
+                // DeviceDelegation side effect, per `identity_sync.rs`'s
+                // "looks incomplete" doc comment) would pin the budget at 0
+                // via ordinary chat traffic well within the existing
+                // per-wallet rate limit — silently disabling the broadened
+                // trigger for every OTHER wallet for the rest of the
+                // interval. Checking dedup here (a cheap hash lookup) instead
+                // of only inside `maybe_trigger_identity_sync` also means the
+                // budget is only ever spent on a trigger that will actually
+                // fire.
+                if self.identity_resync_config.enabled
+                    && self.observed_trigger_budget > 0
+                    && !self.identity_sync_triggered.contains(&author)
+                    && identity_sync::triggers_identity_check(msg_type as u8)
+                    && identity_sync::identity_looks_incomplete(&self.storage, &author)
+                {
+                    self.observed_trigger_budget -= 1;
+                    if self.observed_trigger_budget == 0 {
+                        // Logged once per exhaustion (not per subsequent
+                        // gossip message — the outer `budget > 0` check
+                        // already suppresses those) so an operator can see
+                        // the trigger going inert for this interval, rather
+                        // than it degrading silently.
+                        debug!(
+                            sweep_interval_secs = self.identity_resync_config.sweep_interval_secs,
+                            "identity-sync: observed-author trigger budget exhausted for this interval"
+                        );
+                    }
+                    self.maybe_trigger_identity_sync(author.clone(), identity_sync::SCOPE_ALL);
+                }
 
                 // Feed to notification engine for mention detection (fire-and-forget)
                 if let Some(ref engine) = self.notification_engine {
@@ -5087,5 +5419,106 @@ mod dm_reaper_tests {
         let (to_delete, next_cursor) = plan_dm_conversations_reap(&[], 1000, 100);
         assert!(to_delete.is_empty());
         assert!(next_cursor.is_none());
+    }
+}
+
+#[cfg(test)]
+mod identity_staleness_sweep_tests {
+    //! Design doc "Closing the Identity-Sync Coverage Gap" §2 — pure
+    //! planning logic factored out of `NetworkService::sweep_identity_staleness`.
+    //! See `plan_dm_msg_shaped_reap`'s doc note (`dm_reaper_tests` above) for
+    //! why the `&mut self` sweep method itself isn't tested directly here —
+    //! same reasoning: no existing test in this file constructs a live
+    //! `NetworkService` (it owns a real libp2p `Swarm`), so every test here
+    //! targets the pure decision logic a live sweep would use.
+    use super::*;
+
+    fn users_row(wallet: &[u8], incomplete: bool) -> (Vec<u8>, Vec<u8>) {
+        let json = if incomplete {
+            serde_json::json!({ "address": String::from_utf8_lossy(wallet) })
+        } else {
+            serde_json::json!({
+                "address": String::from_utf8_lossy(wallet),
+                "profile_updated_at": 1_700_000_000_000u64,
+            })
+        };
+        (wallet.to_vec(), serde_json::to_vec(&json).unwrap())
+    }
+
+    #[test]
+    fn plan_identity_staleness_sweep_selects_only_incomplete_rows() {
+        let rows = vec![
+            users_row(b"klv1aaa", true),
+            users_row(b"klv1bbb", false),
+            users_row(b"klv1ccc", true),
+        ];
+        let (mut candidates, next_cursor) = plan_identity_staleness_sweep(&rows, 10);
+        // Selection order is randomized (C1 fix — see the "caps candidates"
+        // test below), so compare as a set.
+        candidates.sort();
+        assert_eq!(candidates, vec!["klv1aaa".to_string(), "klv1ccc".to_string()]);
+        assert!(next_cursor.is_some());
+    }
+
+    #[test]
+    fn plan_identity_staleness_sweep_excludes_a_row_with_no_display_name_but_a_timestamp() {
+        // The negative case the requirements are most worried about: a
+        // wallet that legitimately has no display name (but DOES have
+        // profile_updated_at) must never show up as a candidate. `rows` is
+        // fixed input and this function is pure, so one call over it is
+        // representative of every call over it — this does not need
+        // (and does not claim) to hold across a running sweep's state.
+        //
+        // The key must be alphanumeric (`is_plausible_subject`, LOW-1) so
+        // this test actually discriminates on `profile_looks_incomplete_json`
+        // rather than passing for the unrelated reason that a hyphenated key
+        // would be rejected regardless of that check (re-audit finding).
+        let rows = vec![users_row(b"klv1hasnonamebychoice", false)];
+        let (candidates, _) = plan_identity_staleness_sweep(&rows, 10);
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn plan_identity_staleness_sweep_caps_candidates_at_max_retriggers_but_still_advances_cursor_past_whole_batch() {
+        // 5 incomplete rows in the batch, but max_retriggers=2 — exactly the
+        // "request cost is independent of scan cost" property from the
+        // design doc: the cursor must still land past the LAST row in the
+        // batch (row 5), not just past the 2nd candidate, so an
+        // incomplete-heavy region can never stall scan progress for
+        // everything after it.
+        let rows: Vec<_> = (0..5)
+            .map(|i| users_row(format!("klv1{i}").as_bytes(), true))
+            .collect();
+        let (candidates, next_cursor) = plan_identity_staleness_sweep(&rows, 2);
+        assert_eq!(candidates.len(), 2);
+        let expected_cursor = {
+            let mut c = rows[4].0.clone();
+            c.push(0);
+            c
+        };
+        assert_eq!(next_cursor, Some(expected_cursor));
+    }
+
+    #[test]
+    fn plan_identity_staleness_sweep_empty_batch_returns_none_cursor() {
+        let (candidates, next_cursor) = plan_identity_staleness_sweep(&[], 10);
+        assert!(candidates.is_empty());
+        assert!(next_cursor.is_none());
+    }
+
+    #[test]
+    fn plan_identity_staleness_sweep_zero_max_retriggers_still_advances_cursor() {
+        // A caller passing max_retriggers=0 (e.g. config edge case) must
+        // still make scan progress — this is what proves scan and request
+        // cost are genuinely decoupled, not just "capped low".
+        let rows = vec![users_row(b"klv1aaa", true), users_row(b"klv1bbb", true)];
+        let (candidates, next_cursor) = plan_identity_staleness_sweep(&rows, 0);
+        assert!(candidates.is_empty());
+        let expected_cursor = {
+            let mut c = rows[1].0.clone();
+            c.push(0);
+            c
+        };
+        assert_eq!(next_cursor, Some(expected_cursor));
     }
 }

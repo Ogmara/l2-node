@@ -74,6 +74,10 @@ pub struct Config {
     /// Trending-news-hashtag aggregation (spec 3 §3.9, l2-node 0.124.0+).
     #[serde(default)]
     pub hot_topics: HotTopicsConfig,
+    /// Identity-sync coverage-gap policy (design doc "Closing the
+    /// Identity-Sync Coverage Gap", l2-node 0.132.0+).
+    #[serde(default)]
+    pub identity_resync: IdentityResyncConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -710,6 +714,110 @@ fn default_dm_max_stored_messages_per_recipient() -> usize {
 }
 fn default_dm_reap_interval_secs() -> u64 {
     900
+}
+
+/// Identity-sync coverage-gap policy (design doc "Closing the Identity-Sync
+/// Coverage Gap", l2-node 0.132.0+).
+///
+/// The original identity-sync (P-1, 0.50.0+) only ever fires when a wallet
+/// personally, authenticatedly connects to THIS node — a wallet whose peers
+/// only ever see it via gossip-relayed messages never triggers a backfill
+/// on this node at all, even after months, if the one live gossip delivery
+/// of its ProfileUpdate/Follow/Unfollow is ever missed (peering gap, node
+/// restart timing, small-mesh gossip drop — confirmed live: a wallet's
+/// display name set 2026-07-27 on one testnet node never reached the
+/// other). These knobs close that gap two ways: (1) trigger on first
+/// OBSERVING an incomplete-looking author via live gossip, not just on that
+/// wallet's own auth; (2) a slow, bounded, resumable-cursor sweep of
+/// `USERS` that re-checks previously-seen wallets whose local identity
+/// record still looks incomplete (catches a LATER update whose gossip is
+/// also missed, which a one-shot trigger alone cannot).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentityResyncConfig {
+    /// Master switch for BOTH the broadened observed-author trigger and the
+    /// periodic sweep. Default true.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// How often, in seconds, the periodic `USERS` staleness sweep ticks.
+    /// Default 300 (5 min). **`0` disables BOTH the periodic sweep AND the
+    /// observed-author trigger below** — this same tick is also the ONLY
+    /// place `max_observed_triggers_per_interval`'s budget is refilled
+    /// (re-audit finding: an earlier version of this comment claimed the
+    /// observed-author trigger "stays active" at `0`, which was wrong — it
+    /// instead runs its initial budget down to 0 within one interval's
+    /// worth of gossip and then goes permanently inert, silently, for the
+    /// rest of the process's life). There is no way to run the
+    /// observed-author trigger without the sweep also running at the same
+    /// cadence; set this to a small positive value instead of 0 if the
+    /// sweep's own request cost (bounded separately by
+    /// `max_retriggers_per_sweep`) needs to be minimized.
+    #[serde(default = "default_identity_resync_sweep_interval_secs")]
+    pub sweep_interval_secs: u64,
+    /// Max `USERS` rows examined per sweep tick (cursor resumes across
+    /// ticks, same shape as the DM reaper above). Default 500. Bounds
+    /// RocksDB scan cost per tick — NOT network requests, see
+    /// `max_retriggers_per_sweep` for the request-rate bound.
+    #[serde(default = "default_identity_resync_sweep_batch_size")]
+    pub sweep_batch_size: usize,
+    /// Max identity-sync pulls the periodic sweep may newly (re-)trigger
+    /// per tick, independent of how many incomplete rows it finds in the
+    /// batch. Default 5. Bounds the SWEEP's own outbound requests to
+    /// 5 pulls / 5 min at the default interval, each racing at most
+    /// `identity_sync::FANOUT` (3) peers. Tune down on small meshes; tune
+    /// up only alongside peer-count growth, not `USERS` table growth (scan
+    /// cost already scales with the table independently via
+    /// `sweep_batch_size`/`sweep_interval_secs`). Clamped to 100 in
+    /// `Config::validate`.
+    #[serde(default = "default_identity_resync_max_retriggers_per_sweep")]
+    pub max_retriggers_per_sweep: usize,
+    /// Max NEW identity-sync pulls the OBSERVED-AUTHOR trigger (a live
+    /// gossip message from an author with no/incomplete local record) may
+    /// fire per `sweep_interval_secs` window — refilled on the same tick
+    /// as the sweep above. Default 20. **This, not
+    /// `max_retriggers_per_sweep`, is the actual DoS-relevant knob**: the
+    /// observed-author trigger fires from LIVE GOSSIP, which has no PoW
+    /// gate (`pow = None` on the gossip router — verified during the
+    /// security audit that added this field) and no per-wallet rate limit
+    /// that bites a flood of DISTINCT fresh keypairs (an attacker's cost to
+    /// mint one is free). Without this budget, one attacker publishing N
+    /// messages under N fresh keys costs this node — and, worse, `identity_
+    /// sync::FANOUT` (3) RANDOMLY CHOSEN PEERS PER MESSAGE — N × 3 outbound
+    /// identity-sync requests with no ceiling at all; a single published
+    /// gossip message fans out network-wide, not just to this node. This
+    /// budget bounds that to `max_observed_triggers_per_interval × FANOUT`
+    /// requests per `sweep_interval_secs`, full stop, regardless of gossip
+    /// volume. Auth-triggered pulls (the original mechanism,
+    /// `api/auth.rs`) are UNAFFECTED — they're already IP-rate-limited and
+    /// represent a real authenticated user, not gossip observation.
+    /// Clamped to 1000 in `Config::validate`.
+    #[serde(default = "default_identity_resync_max_observed_triggers_per_interval")]
+    pub max_observed_triggers_per_interval: usize,
+}
+
+impl Default for IdentityResyncConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            sweep_interval_secs: default_identity_resync_sweep_interval_secs(),
+            sweep_batch_size: default_identity_resync_sweep_batch_size(),
+            max_retriggers_per_sweep: default_identity_resync_max_retriggers_per_sweep(),
+            max_observed_triggers_per_interval:
+                default_identity_resync_max_observed_triggers_per_interval(),
+        }
+    }
+}
+
+fn default_identity_resync_sweep_interval_secs() -> u64 {
+    300
+}
+fn default_identity_resync_sweep_batch_size() -> usize {
+    500
+}
+fn default_identity_resync_max_retriggers_per_sweep() -> usize {
+    5
+}
+fn default_identity_resync_max_observed_triggers_per_interval() -> usize {
+    20
 }
 
 /// Persisted-notification retention (audit final pre-mainnet W31,
@@ -3049,6 +3157,64 @@ impl Config {
             }
         }
 
+        // Identity-resync (l2-node 0.132.0+, security-audit-driven): both
+        // knobs are fed straight into per-tick work with no other ceiling —
+        // `sweep_batch_size` into `iter_cf_from`'s in-memory Vec (the
+        // `.min(500)` inside `iter_cf_from` only bounds its INITIAL
+        // allocation, the loop still collects up to the full `limit`
+        // requested), `max_retriggers_per_sweep`/
+        // `max_observed_triggers_per_interval` into outbound identity-sync
+        // requests. A typo or hostile config (e.g. a stray extra zero) would
+        // turn one misconfigured node into a large per-tick memory spike or
+        // a network-wide request-flood source respectively. SOFT clamp +
+        // warn, matching the PoW-difficulty/rate-limit clamps above.
+        const MAX_IDENTITY_SWEEP_BATCH: usize = 10_000;
+        if self.identity_resync.sweep_batch_size > MAX_IDENTITY_SWEEP_BATCH {
+            eprintln!(
+                "[config] identity_resync.sweep_batch_size ({}) exceeds the safe \
+                 maximum; clamping to {} rows per tick.",
+                self.identity_resync.sweep_batch_size, MAX_IDENTITY_SWEEP_BATCH,
+            );
+            self.identity_resync.sweep_batch_size = MAX_IDENTITY_SWEEP_BATCH;
+        }
+        // Unlike `sweep_interval_secs` (where 0 is a meaningful "disabled"),
+        // `sweep_batch_size = 0` has no such meaning: `iter_cf_from` would
+        // return zero rows on every tick, silently making the sweep and the
+        // observed-trigger budget refill run forever while doing nothing
+        // (re-audit finding) — not disabled, just permanently ineffective,
+        // with no warning at startup.
+        const MIN_IDENTITY_SWEEP_BATCH: usize = 1;
+        if self.identity_resync.enabled && self.identity_resync.sweep_batch_size < MIN_IDENTITY_SWEEP_BATCH
+        {
+            eprintln!(
+                "[config] identity_resync.sweep_batch_size (0) would make the \
+                 staleness sweep scan nothing on every tick; clamping to {}.",
+                MIN_IDENTITY_SWEEP_BATCH,
+            );
+            self.identity_resync.sweep_batch_size = MIN_IDENTITY_SWEEP_BATCH;
+        }
+        const MAX_IDENTITY_RETRIGGERS: usize = 100;
+        if self.identity_resync.max_retriggers_per_sweep > MAX_IDENTITY_RETRIGGERS {
+            eprintln!(
+                "[config] identity_resync.max_retriggers_per_sweep ({}) exceeds the \
+                 safe maximum; clamping to {} pulls per tick.",
+                self.identity_resync.max_retriggers_per_sweep, MAX_IDENTITY_RETRIGGERS,
+            );
+            self.identity_resync.max_retriggers_per_sweep = MAX_IDENTITY_RETRIGGERS;
+        }
+        const MAX_IDENTITY_OBSERVED_TRIGGERS: usize = 1_000;
+        if self.identity_resync.max_observed_triggers_per_interval > MAX_IDENTITY_OBSERVED_TRIGGERS {
+            eprintln!(
+                "[config] identity_resync.max_observed_triggers_per_interval ({}) \
+                 exceeds the safe maximum; clamping to {} pulls per interval — this \
+                 is the knob bounding how much outbound P2P traffic a flood of \
+                 gossip messages from unknown authors can force.",
+                self.identity_resync.max_observed_triggers_per_interval,
+                MAX_IDENTITY_OBSERVED_TRIGGERS,
+            );
+            self.identity_resync.max_observed_triggers_per_interval = MAX_IDENTITY_OBSERVED_TRIGGERS;
+        }
+
         Ok(())
     }
 
@@ -3322,6 +3488,37 @@ backfill_max_age_days = 30
 max_stored_messages_per_recipient = 2000
 # How often the DM retention reaper sweeps for expired rows (W11).
 reap_interval_secs = 900
+
+[identity_resync]
+# Identity-sync coverage-gap policy: closes the gap where a wallet whose
+# ProfileUpdate/Follow/Unfollow gossip is missed by this node, and who
+# never personally authenticates here, would otherwise never backfill.
+# Master switch for both the broadened observed-author trigger and the
+# periodic sweep below.
+enabled = true
+# How often, in seconds, the periodic USERS staleness sweep ticks. This is
+# ALSO the only refill cadence for max_observed_triggers_per_interval below
+# — 0 disables BOTH the sweep AND the observed-author trigger (its initial
+# budget runs out within one interval's worth of gossip, then it goes
+# permanently inert for the rest of the process's life; there is no way to
+# run one without the other at the same cadence).
+sweep_interval_secs = 300
+# Max USERS rows examined per sweep tick (cursor resumes across ticks).
+# Bounds scan cost, not network requests — see max_retriggers_per_sweep.
+sweep_batch_size = 500
+# Max identity-sync pulls the periodic sweep may newly trigger per tick.
+# Bounds the SWEEP's own outbound requests, independent of table size or
+# how many incomplete rows one batch happens to contain.
+max_retriggers_per_sweep = 5
+# Max NEW identity-sync pulls the observed-author trigger (a live gossip
+# message from an unknown/incomplete author) may fire per
+# sweep_interval_secs window. THIS is the actual DoS-relevant knob: gossip
+# has no PoW gate and no per-wallet rate limit that bites a flood of
+# distinct fresh keypairs, so without this budget a single attacker
+# publishing N messages under N free keys could force N x FANOUT(3)
+# outbound requests network-wide, with no ceiling. Auth-triggered pulls
+# are unaffected (already IP-rate-limited).
+max_observed_triggers_per_interval = 20
 
 [notifications]
 # Persisted-notification retention (W31, l2-node 0.104.0+)
@@ -4199,6 +4396,7 @@ mod tests {
             "[storage]",
             "[cache]",
             "[dm]",
+            "[identity_resync]",
             "[notifications]",
             "[device_enc]",
             "[channel_delete]",

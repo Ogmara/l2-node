@@ -506,6 +506,10 @@ pub mod state_keys {
     /// 0.108.0+): persisted cursor for the `PENDING_CHANNEL_MEMBER_REMOVALS`
     /// sweep. Same resume-across-restarts rationale as the reaper cursors above.
     pub const CHANNEL_MEMBER_REMOVAL_REAP_CURSOR: &[u8] = b"channel_member_removal_reap_cursor";
+    /// Identity-staleness sweep (design doc "Closing the Identity-Sync
+    /// Coverage Gap"): persisted cursor for the `USERS` sweep. Same
+    /// resume-across-restarts rationale as the reaper cursors above.
+    pub const IDENTITY_STALENESS_CURSOR: &[u8] = b"identity_staleness_cursor";
 }
 
 /// Snapshot bootstrap (spec 11-snapshot-sync.md).
