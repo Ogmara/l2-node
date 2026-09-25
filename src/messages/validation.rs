@@ -533,17 +533,6 @@ pub fn validate_edit(p: &EditPayload) -> Result<(), ValidationError> {
 /// also removing the file. Empty content is rejected only when no
 /// non-empty attachment list is supplied.
 pub fn validate_chat_edit(p: &EditPayload) -> Result<(), ValidationError> {
-    let has_attachments = matches!(p.attachments, Some(ref a) if !a.is_empty());
-    if p.content.is_empty() && !has_attachments {
-        return Err(ValidationError("content or attachments required".into()));
-    }
-    if p.content.len() > MAX_CHAT_CONTENT {
-        return Err(ValidationError(format!(
-            "content too long: {} > {}",
-            p.content.len(),
-            MAX_CHAT_CONTENT
-        )));
-    }
     // Chat edits cannot change title/tags (those fields don't exist on
     // ChatMessagePayload). Reject explicit attempts so the client can't
     // silently set values that the projection will ignore — easier debugging.
@@ -563,6 +552,63 @@ pub fn validate_chat_edit(p: &EditPayload) -> Result<(), ValidationError> {
     // replacement gets the identical caps as a fresh chat message.
     if let Some(ref rows) = p.buttons {
         validate_buttons(rows)?;
+    }
+
+    // Encrypted branch, mirroring `validate_chat_message`'s own plaintext-or-
+    // encrypted split (and `validate_dm_edit`'s equivalent for DMs): an edit
+    // to an ENCRYPTED channel message carries its new text as ciphertext in
+    // `enc_content`, sealed under the channel's epoch key, never as the
+    // plaintext `content` String — see `project_edited_payload` (api/routes.rs)
+    // for how this replaces the original message's `enc_content`/`enc_nonce`/
+    // `key_epoch` at read time, identical to how a DM edit already does.
+    if let Some(ct) = p.enc_content.as_ref() {
+        if ct.is_empty() {
+            return Err(ValidationError("enc_content must not be empty".into()));
+        }
+        if ct.len() > MAX_CHAT_CIPHERTEXT {
+            return Err(ValidationError(format!(
+                "enc_content too long: {} > {}",
+                ct.len(),
+                MAX_CHAT_CIPHERTEXT
+            )));
+        }
+        if p.enc_nonce.is_none() {
+            return Err(ValidationError(
+                "encrypted chat edit requires enc_nonce".into(),
+            ));
+        }
+        match p.key_epoch {
+            Some(e) if e >= 1 => {}
+            _ => {
+                return Err(ValidationError(
+                    "encrypted chat edit requires key_epoch >= 1".into(),
+                ))
+            }
+        }
+        // The encrypted text lives in `enc_content`; the plaintext content
+        // field is unused and must stay empty — same rule
+        // `validate_chat_message` enforces for a fresh encrypted message, so
+        // there is exactly one way to carry encrypted text at either point
+        // in a message's lifecycle, not two.
+        if !p.content.is_empty() {
+            return Err(ValidationError(
+                "encrypted chat edit must not carry plaintext content".into(),
+            ));
+        }
+        return Ok(());
+    }
+
+    // Plaintext path — unchanged.
+    let has_attachments = matches!(p.attachments, Some(ref a) if !a.is_empty());
+    if p.content.is_empty() && !has_attachments {
+        return Err(ValidationError("content or attachments required".into()));
+    }
+    if p.content.len() > MAX_CHAT_CONTENT {
+        return Err(ValidationError(format!(
+            "content too long: {} > {}",
+            p.content.len(),
+            MAX_CHAT_CONTENT
+        )));
     }
     Ok(())
 }
@@ -1482,6 +1528,100 @@ mod tests {
         p.attachments = None;
         assert!(validate_chat_edit(&p).is_err());
         p.attachments = Some(vec![]);
+        assert!(validate_chat_edit(&p).is_err());
+    }
+
+    // -- Encrypted ChatEdit (channel messages) — mirrors the dm_edit_* suite below --
+
+    #[test]
+    fn chat_edit_accepts_encrypted_content() {
+        let mut p = base_edit();
+        p.content = "".into();
+        p.enc_content = Some(vec![1, 2, 3]);
+        p.enc_nonce = Some([9u8; 24]);
+        p.key_epoch = Some(1);
+        assert!(validate_chat_edit(&p).is_ok());
+    }
+
+    #[test]
+    fn chat_edit_rejects_missing_enc_content_paired_with_nonce_alone() {
+        // enc_nonce/key_epoch present but enc_content absent must still fall
+        // through to the plaintext path (empty content, no attachments) and
+        // fail there — not be treated as "encrypted enough".
+        let mut p = base_edit();
+        p.content = "".into();
+        p.enc_nonce = Some([9u8; 24]);
+        p.key_epoch = Some(1);
+        assert!(validate_chat_edit(&p).is_err());
+    }
+
+    #[test]
+    fn chat_edit_rejects_encrypted_content_missing_nonce() {
+        let mut p = base_edit();
+        p.content = "".into();
+        p.enc_content = Some(vec![1, 2, 3]);
+        p.key_epoch = Some(1);
+        assert!(validate_chat_edit(&p).is_err());
+    }
+
+    #[test]
+    fn chat_edit_rejects_encrypted_content_epoch_zero() {
+        let mut p = base_edit();
+        p.content = "".into();
+        p.enc_content = Some(vec![1, 2, 3]);
+        p.enc_nonce = Some([9u8; 24]);
+        p.key_epoch = Some(0);
+        assert!(validate_chat_edit(&p).is_err());
+        p.key_epoch = None;
+        assert!(validate_chat_edit(&p).is_err());
+    }
+
+    #[test]
+    fn chat_edit_rejects_encrypted_content_with_empty_ciphertext() {
+        let mut p = base_edit();
+        p.content = "".into();
+        p.enc_content = Some(vec![]);
+        p.enc_nonce = Some([9u8; 24]);
+        p.key_epoch = Some(1);
+        assert!(validate_chat_edit(&p).is_err());
+    }
+
+    #[test]
+    fn chat_edit_rejects_encrypted_content_alongside_plaintext_content() {
+        // Same rule `validate_chat_message` enforces for a fresh encrypted
+        // message: exactly one way to carry text, never both at once.
+        let mut p = base_edit();
+        p.content = "still here".into();
+        p.enc_content = Some(vec![1, 2, 3]);
+        p.enc_nonce = Some([9u8; 24]);
+        p.key_epoch = Some(1);
+        assert!(validate_chat_edit(&p).is_err());
+    }
+
+    #[test]
+    fn chat_edit_rejects_oversize_ciphertext() {
+        let mut p = base_edit();
+        p.content = "".into();
+        p.enc_content = Some(vec![0u8; MAX_CHAT_CIPHERTEXT + 1]);
+        p.enc_nonce = Some([9u8; 24]);
+        p.key_epoch = Some(1);
+        assert!(validate_chat_edit(&p).is_err());
+    }
+
+    #[test]
+    fn chat_edit_encrypted_content_still_honors_button_caps() {
+        // The button-row check runs before the plaintext/encrypted branch —
+        // confirm an encrypted edit doesn't accidentally skip it.
+        let mut p = base_edit();
+        p.content = "".into();
+        p.enc_content = Some(vec![1, 2, 3]);
+        p.enc_nonce = Some([9u8; 24]);
+        p.key_epoch = Some(1);
+        p.buttons = Some(vec![ButtonRow {
+            buttons: (0..(MAX_BUTTONS_PER_ROW + 1))
+                .map(|i| MessageButton { label: format!("b{i}"), command: "/x".into() })
+                .collect(),
+        }]);
         assert!(validate_chat_edit(&p).is_err());
     }
 

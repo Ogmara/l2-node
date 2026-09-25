@@ -5,6 +5,277 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.133.0] - 2026-09-24
+
+### Added
+
+- **Encrypted `ChatEdit` support** — a `ChatEdit` targeting an already-encrypted
+  channel message can now carry its new text as ciphertext
+  (`enc_content`/`enc_nonce`/`key_epoch`, protocol §3.7), the same mechanism
+  `DirectMessageEdit` has had since L2 v0.70. Previously this was DM-only:
+  `validate_chat_edit` had no encrypted branch at all, and the read-time
+  projection (`project_edited_payload`) only ever merged the plaintext
+  `content`/`attachments`/`buttons` fields for a `ChatMessage` — an encrypted
+  edit would have been REJECTED outright by validation (empty `content`, no
+  attachments), and even if that check were bypassed, the projection would
+  have silently ignored any `enc_content` it carried. This was blocking a
+  real feature: the interactive-message-buttons plan's Phase 6 worked example
+  needs to edit a bot's own message in place (swap in a new button row / new
+  card content) to demonstrate an in-place menu — which only actually works
+  end to end in an encrypted channel if the node can apply an encrypted edit,
+  and new Public/ReadPublic/Private channels are all encrypted by default.
+  Whether the encrypted path applies is derived from the ORIGINAL message's
+  own shape, not a separate flag — an edit whose encrypted-or-plaintext shape
+  disagrees with the message it targets (a crafted edit, or a race with a
+  concurrent edit that changed the shape) is rejected and the original left
+  untouched. `docs/specs/01-protocol.md` §3.7 updated (the `EditPayload`
+  field table, the encrypted-edit paragraph, and the new `enc_content` byte
+  cap). 8 new `validate_chat_edit` unit tests plus 5 new end-to-end tests
+  against a real `Storage` instance (`encrypted_chat_edit_projection_tests`)
+  cover the new branch and the shape-mismatch handling described below.
+
+### Security
+
+- **Shape-mismatch rejection moved to write time, not just read time** — the
+  first pass of the feature above caught an encrypted/plaintext shape
+  mismatch only in `project_edited_payload` (read time), whose existing
+  fail-safe for an unrecoverable edit is to blank the message's payload
+  entirely. Every shipped client today only ever sends a *plaintext*
+  `ChatEdit` (no SDK can build an encrypted one yet), so deploying that
+  check alone would have turned "editing any message in any encrypted
+  channel" — the default for new Public/ReadPublic/Private channels — from a
+  harmless no-op into permanent data loss for every reader, the instant the
+  edit was next displayed. Fixed (code audit, HIGH) by adding a write-time
+  check in `authorize_edit_delete`: a `ChatEdit` whose encrypted-or-plaintext
+  shape disagrees with its target's actual stored shape is rejected outright
+  — the sender gets a normal error, nothing is stored or gossiped. 5 new
+  `chat_edit_encrypted_shape_authorization_tests` drive this through the real
+  `process_message` entry point (full signature verification included).
+- **Edit/delete type confusion across message types (HIGH, PoC-verified)** —
+  `EditPayload`/`DeletePayload` are shared structs with no type tag on
+  `target_id`, so nothing stopped a `NewsEdit` from pointing at a
+  `ChatMessage`. The validator dispatch is keyed on the *edit's own* type
+  (`NewsEdit` → `validate_news_edit`, which has no `enc_content` concept and
+  never inspects it), while the projection dispatch in
+  `project_edited_payload` is keyed on the *target's actual stored* type —
+  so a type-confused `NewsEdit` sailed past `validate_news_edit`, past the
+  new ChatEdit-only shape check above (gated on `envelope.msg_type ==
+  ChatEdit`, so it never even looked at a `NewsEdit`), and landed in the
+  `ChatMessage` projection branch. The security audit's PoC produced a
+  20,000-byte ciphertext (2.4× `MAX_CHAT_CIPHERTEXT`), `key_epoch: 0` (a
+  value every chat/DM validator explicitly forbids for an encrypted
+  message), and plaintext `content` coexisting with `enc_content` — a shape
+  every relevant validator is supposed to forbid — written onto the
+  attacker's own `ChatMessage`. Impact was bounded to the attacker's own
+  messages (the pre-existing authorship check is unbypassed), but it
+  defeated caps the code specifically set out to enforce. Fixed by adding a
+  type-correspondence check in `authorize_edit_delete`, run before
+  authorship or anything type-specific: an edit/delete's own type must match
+  what its `target_id` is actually stored as (`ChatEdit`/`ChatDelete` ↔
+  `ChatMessage`, `DirectMessageEdit`/`DirectMessageDelete` ↔
+  `DirectMessage`, `NewsEdit`/`NewsDelete` ↔ `NewsPost`) — this closes the
+  whole class of type-confusion bugs, not just this instance (the same
+  unconstrained-`target_id` shape existed, unexploited via this specific
+  path, before this version). 5 new `edit_delete_type_correspondence_tests`
+  reproduce the audit's own PoC shape and confirm correctly-typed pairings
+  are unaffected.
+- **Encrypted `ChatEdit` nonce-reuse hardening (NOTE, then found incomplete on
+  re-audit and closed properly)** — an encrypted `ChatEdit` that reused a
+  nonce under an unchanged `key_epoch` would encrypt the new text under the
+  same (key, nonce) pair as whatever ciphertext it collided with, which
+  breaks XChaCha20-Poly1305 confidentiality (the two plaintexts' XOR becomes
+  recoverable from the two ciphertexts) and exposes the reused Poly1305
+  one-time key to forgery. The node never generates nonces itself — all
+  crypto here is client-side, the node only relays ciphertext — so this
+  could only arise from a buggy or malicious client, but nothing rejected
+  it. First fix compared an edit's nonce only against the ORIGINAL message's
+  stored nonce; a re-audit (code audit) caught that this misses edit-vs-edit
+  reuse, since `project_edited_payload` always overlays only the LATEST
+  edit — a second encrypted edit reusing the FIRST edit's nonce at the same
+  epoch was still accepted, because the first edit's own encrypted fields
+  were never queried. Closed properly in `authorize_edit_delete`: an
+  encrypted `ChatEdit` is now compared against the CURRENT effective
+  ciphertext — the latest prior edit's `enc_nonce`/`key_epoch` if one
+  exists, else the original's — and rejected on a match. Reusing the same
+  nonce *bytes* under a *different* epoch remains accepted (a key rotation
+  derives a new key, so it is not the same (key, nonce) pair). Note: nonce
+  uniqueness for the INITIAL `ChatMessage` send (not an edit) remains a pure
+  client obligation — enforcing it server-side would need an unbounded
+  per-channel nonce registry, so this hardening only ever covers the edit
+  path. 2 tests (`encrypted_edit_reusing_original_nonce_at_same_epoch_is_rejected`,
+  `encrypted_edit_reusing_nonce_bytes_under_a_bumped_epoch_is_accepted`).
+- **Deploying this version would have retroactively and permanently blanked
+  pre-existing encrypted messages (BLOCKING, found on re-audit)** — the
+  CHANGELOG originally deferred the "read-time blanking has no recovery
+  path" NOTE on the premise that "no encrypted `ChatEdit` existed before
+  this version, so there is no legacy data it could apply to." That premise
+  was wrong: every node before this version accepted an ORDINARY PLAINTEXT
+  `ChatEdit` against an already-encrypted original (there was no shape check
+  at all pre-v0.133.0), and that `EDIT_HISTORY` row is permanent. Since
+  encrypted channels are the default for new Public/ReadPublic/Private
+  channels and every shipped client only ever sends plaintext edits, that
+  combination is the NORMAL historical case, not a corner case — testnet
+  nodes plausibly already hold such rows. Every node before this version
+  projected that combination as a no-op (only the unused plaintext `content`
+  field changed; `enc_content`, what every compliant client actually
+  renders, was untouched) — but this version's new shape-mismatch check
+  would have turned that same stored row into a permanent `payload: null`
+  for every reader, forever, the instant it was next displayed, on every
+  node that deployed this version. Fixed in `project_edited_payload`
+  (api/routes.rs): the plaintext-edit-vs-encrypted-original direction now
+  leaves `content`/`enc_content`/`enc_nonce`/`key_epoch` untouched
+  (reproducing the exact historical no-op) instead of blanking. The other
+  direction (a crafted encrypted edit against a plaintext original) still
+  fails closed to a blank — no client before this version could construct
+  `enc_content` on a `ChatEdit` at all, so that direction has no legacy rows
+  and can only ever be adversarial. New write attempts of the dangerous
+  combination are unaffected — `authorize_edit_delete` already rejects those
+  before storage, from the fix above.
+  **First version of this fix was itself incomplete (caught on a further
+  re-audit round)**: it early-returned the original unchanged, which also
+  skipped the edit's `attachments`/`buttons` overrides — but every
+  pre-v0.133.0 node DID apply those two for this exact row shape (they were
+  never gated on ciphertext shape). Deploying that version would have
+  silently undone a legacy edit's real effect: restoring an attachment a
+  user had deliberately deleted, or re-arming a bot's button row it had
+  deliberately cleared (the exact interactive-buttons lifecycle mechanism,
+  spec §3.7, that this whole feature exists to support in encrypted
+  channels). Fixed by making the legacy branch skip only the text/ciphertext
+  fields and fall through to the shared attachments/buttons handling like
+  every other edit. Test renamed to
+  `plaintext_edit_against_an_encrypted_original_is_a_legacy_noop_not_a_blank`
+  and extended to assert attachments/buttons ARE still applied, not just
+  that the ciphertext survives.
+- **`DeletionRequest{SingleMessage}` had no authorship check anywhere
+  (BLOCKING, found on re-audit, independently confirmed by both the code and
+  security audits)** — unlike `ChatDelete`/`DirectMessageDelete`/`NewsDelete`
+  (gated by `authorize_edit_delete`'s existing self-authorship rule),
+  `DeletionType::SingleMessage` was never covered by any authorization check:
+  `validate_deletion_request` only checks `target_id` is present and
+  non-zero, `authorize_channel_action` falls through to `Ok(())` for
+  `DeletionRequest`, and the handler wrote a deletion marker for whatever
+  `target_id` the sender supplied — recording who issued the delete, but
+  never checking it matched the target's actual author. Since `is_deleted`
+  is a bare key-existence check honored by every read, and `DeletionRequest`
+  gossips network-wide, this was a working "delete anyone's message"
+  primitive gated only by on-chain registration (a cost, not an
+  authorization) — any registered wallet could permanently tombstone any
+  `ChatMessage`, `NewsPost`, or `DirectMessage` on the entire network just by
+  knowing its `msg_id` (returned in hex in every message listing). A
+  permissionless censorship/griefing primitive in a project whose explicit
+  design principle is no censorship. Pre-existing (not introduced by this
+  version's changes), but directly relevant to this version's own "closes
+  the whole class of type-confusion bugs" claim, which this bug shows was
+  incomplete — `DeletionRequest` carries no type tag at all, so it sat
+  entirely outside that check's scope. Fixed with a new
+  `authorize_deletion_request` function (mirrors `authorize_edit_delete`'s
+  strict self-authorship rule; `DeletionType::AllUserContent` needs no
+  equivalent check, since it already scopes itself to the caller's own
+  address by construction). A target unresolvable locally is now rejected
+  outright rather than writing a marker for an unknown id. 3 new
+  `deletion_request_authorization_tests`, including the exact stranger-
+  deletes-a-stranger's-message regression both audits demonstrated.
+- **Incidental fix, not previously called out**: the type-correspondence
+  check above also closes the identical data-loss shape for `NewsComment`
+  and `NewsRepost` — a `NewsEdit` against either of those (neither has a
+  defined edit-merge rule in `project_edited_payload`, which falls through
+  to its catch-all `None`) used to validate and store fine, then permanently
+  blank the comment/repost the first time anyone read it. Now rejected at
+  write time by the same check, for the same reason.
+
+- **Nonce-reuse check widened again: comparing only the CURRENT edit
+  re-opened the exact gap it was meant to close (found on round-3 re-audit,
+  fixed)** — the previous version of this hardening compared an encrypted
+  edit's nonce/epoch only against the LATEST prior edit (or the original if
+  none existed yet), to close an edit-vs-edit reuse gap found the round
+  before. That itself was incomplete: it REPLACED the comparison target
+  instead of accumulating it, so once any encrypted edit existed, reuse of
+  the ORIGINAL's nonce was no longer checked at all (the exact case the
+  very first version of this hardening covered), and reuse of any
+  non-latest prior edit's nonce was never checked either. Fixed by
+  comparing against the FULL set this message has ever used: the original's
+  `(enc_nonce, key_epoch)` plus every entry in `get_edit_history` (already
+  capped at 100, bounding the scan) — a collision with ANY of them at a
+  matching epoch is rejected, not just the most recent one. New test
+  `encrypted_edit_reusing_the_original_nonce_is_rejected_even_after_an_intervening_edit`
+  reproduces the exact sequence (edit₁ with a fresh nonce+epoch, accepted;
+  edit₂ reusing the ORIGINAL's nonce+epoch — must still be rejected even
+  though it doesn't match edit₁, the "current" edit at that point). A final
+  narrow spot-check round confirmed the decode/skip logic is panic-free on
+  malformed/legacy prior edits and that authorization genuinely runs before
+  any storage write, but flagged the `get_edit_history` scan branch itself
+  had no test (the two tests above both happen to resolve on the pre-loop
+  check against the original) — added
+  `encrypted_edit_reusing_a_non_latest_non_original_prior_edits_nonce_is_rejected`
+  (edit₃ reuses edit₁'s nonce after edit₂ has become the latest edit) to
+  close that gap. Also on that round's advice: the code comment now states
+  plainly that the check is complete only up to a message's first 100 edits
+  (`get_edit_history`'s existing cap, oldest-first — past that, the newest
+  edits are the ones NOT checked), and a storage error while reading edit
+  history now logs a `warn!` before failing the check open, rather than
+  silently bypassing it.
+
+**Deferred, with reason**: a `DeletionRequest{SingleMessage}` now requires
+the target to resolve LOCALLY (fix above), so a node that receives the
+delete before it has synced the target message rejects it — and since
+`DeletionRequest` gossips on a network-wide topic specifically so a deletion
+can reach nodes that haven't yet synced the content (unlike `ChatEdit`/
+`NewsEdit`/`DirectMessageEdit`, which ride along their channel/DM/news sync
+paths), rejecting means gossipsub's `MessageAcceptance::Ignore` does not
+relay it further either — an honest node that simply hasn't synced the
+target yet stops the deletion signal from propagating past it, and if that
+node later backfills the target with no deletion marker in hand, it serves
+it undeleted, with no second delivery attempt to heal that. Two audit passes
+weighed this differently — one read it as consistent with the PRE-EXISTING
+behavior of `ChatDelete`/`NewsDelete`/`DirectMessageDelete` (which have
+always rejected "target message not found" the same way, so not a
+regression) and therefore acceptable; the other read it as a real,
+`DeletionRequest`-specific regression against its documented
+network-wide-erasure design intent (the W23 GDPR/right-to-erasure
+motivation for using a network-wide topic in the first place) and
+recommended moving the authorization decision from write-time rejection to
+READ-time enforcement instead — always accept/store/relay the request
+(restoring full propagation), but have `is_deleted`'s callers honor a
+stored marker only when its already-recorded `deleted_by` actually matches
+the target message's real author once/if that target is later known,
+otherwise treat it as not deleted. That is very likely the right eventual
+design — it keeps both properties (full propagation AND correct
+authorization) — but it touches `is_deleted`'s three call sites plus a
+consistent identity-resolution comparison and is real, separate scope from
+this version's fix. Deferred rather than rushed in: the failure mode in the
+meantime fails toward NOT deleting (content an attacker tried to
+network-wide-erase without authorization stays up on a node that hasn't
+seen it yet) rather than toward wrongly deleting, which is the safer
+direction for a project whose explicit principle is no censorship — the
+BLOCKING bug this version fixes (anyone could delete anyone's message) is
+closed regardless. Tracked as a follow-up, not silently dropped.
+
+`docs/specs/01-protocol.md` §3.8 corrected: it previously claimed "undo by
+sending `NewsDelete` targeting the repost's msg_id", which the new
+type-correspondence check now rejects (`NewsDelete` targets a `NewsPost`,
+not a `NewsRepost`). Investigation found this was never fully correct even
+before this version — the repost dedupe key was never removed by a delete
+either way, so undo was already broken in practice — and no shipped client
+implements repost or repost-undo. Documented as unsupported rather than
+silently left contradictory; a real fix needs the dedupe-key removal
+addressed too, tracked as a follow-up.
+
+848/848 tests pass this version (30 new: 8 `validate_chat_edit` unit tests, 5
+`encrypted_chat_edit_projection_tests`, 9
+`chat_edit_encrypted_shape_authorization_tests`, 5
+`edit_delete_type_correspondence_tests`, 3
+`deletion_request_authorization_tests`; 3 pre-existing tests renamed/re-scoped
+without adding a count, see above). `cargo build`, `cargo clippy --all-targets`
+(zero new warnings in changed ranges), and `cargo audit` (0 vulnerabilities;
+pre-existing unmaintained-crate warnings on `core2`/`paste`/`spin`, unrelated,
+unchanged from prior versions) all re-verified clean after every fix above,
+per this project's re-audit-the-fixed-tree mandate — five rounds of Code
+Audit + Security Audit ran against successive trees before this version was
+considered closed; each of the first four found at least one real,
+independently-reproducible issue or a genuine coverage gap in the round
+before it (the "re-audit the FIXED tree" rule paid for itself concretely
+four times over on this change).
+
 ## [0.132.0] - 2026-09-23
 
 ### Added

@@ -633,6 +633,12 @@ impl MessageRouter {
             return RouteResult::Rejected(format!("dm_reaction_denied: {}", e));
         }
 
+        // Step 7d3: Authorize DeletionRequest — a SingleMessage deletion may
+        // only target the sender's own message (security audit, BLOCKING).
+        if let Err(e) = self.authorize_deletion_request(&envelope, &resolved_author) {
+            return RouteResult::Rejected(format!("deletion_denied: {}", e));
+        }
+
         // Step 7e: Read-only / broadcast channel enforcement — only creator and
         // moderators can post ChatMessage / ChatEdit / ChatDelete in ReadPublic
         // channels. Reactions remain open to all members. See protocol spec §3.6.
@@ -1787,11 +1793,21 @@ impl MessageRouter {
 
     /// Authorize edit and delete operations.
     ///
-    /// Verifies:
+    /// Verifies, in order (numbered to match the steps in the body):
     /// 1. The target message exists.
-    /// 2. The resolved author matches the original message's author.
-    /// 3. For edits: the edit is within the 30-minute window.
-    /// 4. For NewsEdit: the user must be a registered user (exists in USERS CF).
+    /// 2. The target message deserializes.
+    /// 3. The edit/delete's own type corresponds to what `target_id`
+    ///    actually is (`ChatEdit`/`ChatDelete` ↔ `ChatMessage`, etc.) —
+    ///    security audit, BLOCKING; closes a type-confusion class where e.g.
+    ///    a `NewsEdit` could target a `ChatMessage`.
+    /// 4. The original author is resolved to a wallet address.
+    /// 5. The resolved caller matches that resolved original author.
+    /// 6. For a `ChatEdit`: the edit's encrypted-or-plaintext shape matches
+    ///    the original's (rejecting a mismatch at write time, not just read
+    ///    time), and an encrypted edit doesn't reuse the current effective
+    ///    ciphertext's nonce under an unchanged `key_epoch` (AEAD hygiene).
+    /// 7. For edits: the edit is within the 30-minute window.
+    /// 8. For NewsEdit: the user must be a registered user (exists in USERS CF).
     fn authorize_edit_delete(
         &self,
         envelope: &Envelope,
@@ -1799,16 +1815,27 @@ impl MessageRouter {
         now_ms: u64,
     ) -> Result<(), String> {
         // Only applies to edit/delete message types
-        let (target_id, is_edit) = match envelope.msg_type {
+        let (target_id, is_edit, edit_chat_shape) = match envelope.msg_type {
             MessageType::ChatEdit | MessageType::DirectMessageEdit | MessageType::NewsEdit => {
                 let payload = rmp_serde::from_slice::<EditPayload>(&envelope.payload)
                     .map_err(|e| format!("failed to deserialize edit payload: {}", e))?;
-                (payload.target_id, true)
+                // Only meaningful for ChatEdit (checked against the original's
+                // own shape below) — DM edits are unconditionally encrypted
+                // and NewsEdit has no encrypted-content concept at all, so
+                // `None` for those two is simply "not applicable", not
+                // "plaintext". Carries the edit's own enc_nonce/key_epoch
+                // too, needed for the nonce-reuse check below.
+                let edit_chat_shape = if envelope.msg_type == MessageType::ChatEdit {
+                    Some((payload.enc_content.is_some(), payload.enc_nonce, payload.key_epoch))
+                } else {
+                    None
+                };
+                (payload.target_id, true, edit_chat_shape)
             }
             MessageType::ChatDelete | MessageType::DirectMessageDelete | MessageType::NewsDelete => {
                 let payload = rmp_serde::from_slice::<DeletePayload>(&envelope.payload)
                     .map_err(|e| format!("failed to deserialize delete payload: {}", e))?;
-                (payload.target_id, false)
+                (payload.target_id, false, None)
             }
             _ => return Ok(()), // not an edit/delete message
         };
@@ -1824,18 +1851,178 @@ impl MessageRouter {
         let original_envelope: Envelope = rmp_serde::from_slice(&original_bytes)
             .map_err(|e| format!("failed to deserialize original message: {}", e))?;
 
-        // 3. Resolve the original author to wallet address
+        // 3. The edit/delete's own type must correspond to the TARGET's
+        // ACTUAL stored type — `target_id` alone is unconstrained across
+        // every message type (`EditPayload`/`DeletePayload` are shared
+        // structs with no type tag identifying which kind of message they
+        // expect to find; any 32-byte id can be written into `target_id`
+        // regardless of what it actually points at). Without this, a
+        // `NewsEdit` (validated by `validate_news_edit`, which has no
+        // encrypted-content concept and only checks plaintext `content`)
+        // could target a `ChatMessage` and still reach `ChatMessage`'s
+        // type-specific PROJECTION branch in `project_edited_payload`
+        // (api/routes.rs) — which dispatches on the ORIGINAL's type, not
+        // the edit's — bypassing `validate_chat_edit`'s `MAX_CHAT_CIPHERTEXT`
+        // cap, its `key_epoch >= 1` requirement, and the shape-mismatch
+        // check below entirely (found by security audit; PoC confirmed a
+        // `NewsEdit` writing `enc_content` past the chat cap and
+        // `key_epoch: 0` — a value every chat/DM validator explicitly
+        // forbids — onto the author's own `ChatMessage`). Checked BEFORE
+        // authorship: a type mismatch is rejected regardless of who sent
+        // it, so this can't be bypassed by editing/deleting your own
+        // wrongly-typed target either.
+        let expected_original_type = match envelope.msg_type {
+            MessageType::ChatEdit | MessageType::ChatDelete => MessageType::ChatMessage,
+            MessageType::DirectMessageEdit | MessageType::DirectMessageDelete => {
+                MessageType::DirectMessage
+            }
+            MessageType::NewsEdit | MessageType::NewsDelete => MessageType::NewsPost,
+            // Unreachable given the match above this function that already
+            // narrows `envelope.msg_type` to exactly these six variants
+            // (anything else returns `Ok(())` before reaching here) — a
+            // safe `Err` rather than `unreachable!()`/a panic regardless,
+            // since this is a live request-handling path and a future
+            // refactor of that outer match must not be able to turn a
+            // missed case into a node-crashing panic.
+            _ => return Err("not an edit/delete message type".into()),
+        };
+        if original_envelope.msg_type != expected_original_type {
+            return Err(format!(
+                "{:?} may only target a {:?}, but the target message is a {:?}",
+                envelope.msg_type, expected_original_type, original_envelope.msg_type
+            ));
+        }
+
+        // 4. Resolve the original author to wallet address
         let original_resolved = self
             .identity
             .resolve(&original_envelope.author)
             .map_err(|e| format!("failed to resolve original author: {}", e))?;
 
-        // 4. Verify authorship — only the original author can edit/delete their message
+        // 5. Verify authorship — only the original author can edit/delete their message
         if resolved_author != original_resolved {
             return Err("only the original author can edit/delete this message".into());
         }
 
-        // 5. For edits: enforce 30-minute window from original timestamp
+        // 6. For a ChatEdit: reject at WRITE time if its encrypted-or-plaintext
+        // shape disagrees with the ORIGINAL message's own shape, rather than
+        // silently accepting it and only catching the mismatch later, at READ
+        // time, in `project_edited_payload` (api/routes.rs). That function's
+        // `None` fail-safe blanks the payload entirely — correct for a
+        // genuinely corrupt/adversarial edit, but every shipped client today
+        // only ever sends a PLAINTEXT `ChatEdit` (none can build an encrypted
+        // one yet — sdk-js/sdk-rust have no `enc_content` on their edit
+        // builders), so without this check, an ORDINARY edit of an ORDINARY
+        // message in any encrypted channel (the default for new Public/
+        // ReadPublic/Private channels) would be accepted, stored, gossiped —
+        // and then PERMANENTLY blank that message for every reader the
+        // instant it's displayed, where before this feature existed the same
+        // edit was merely ineffective (the pre-existing plaintext-only
+        // projection silently left the original ciphertext in place). Caught
+        // here instead: the sender gets a normal rejected-request error, and
+        // the original message is never touched at all.
+        //
+        // Compared against the ORIGINAL's shape, never the channel's current
+        // `encryption_enabled` flag — a channel flipped to encrypted after
+        // plaintext messages already exist must still allow those specific
+        // messages to keep being edited as plaintext.
+        if let Some((edit_is_encrypted, edit_nonce, edit_epoch)) = edit_chat_shape {
+            let orig: ChatMessagePayload = rmp_serde::from_slice(&original_envelope.payload)
+                .map_err(|e| format!("failed to deserialize original chat message: {}", e))?;
+            let orig_is_encrypted = orig.enc_content.is_some();
+            if edit_is_encrypted != orig_is_encrypted {
+                return Err(if orig_is_encrypted {
+                    "cannot edit an encrypted message with a plaintext edit — this client \
+                     cannot yet build an encrypted edit for this message"
+                        .into()
+                } else {
+                    "cannot edit a plaintext message with an encrypted edit".into()
+                });
+            }
+            // AEAD hygiene (security audit NOTE, then found incomplete on a
+            // further re-audit and closed properly — see below): an edit
+            // that reuses the exact same nonce as ANY ciphertext this
+            // message has ever carried, under an unchanged key_epoch, would
+            // encrypt the new text under the SAME (key, nonce) pair as that
+            // ciphertext — for XChaCha20-Poly1305 that breaks
+            // confidentiality (the two plaintexts' XOR becomes recoverable
+            // from the two ciphertexts) and exposes the reused Poly1305
+            // one-time key to forgery. The node never generates nonces
+            // itself (all crypto here is client-side; the node only relays
+            // ciphertext), so this can only happen from a buggy or
+            // malicious client — reject it rather than store and gossip a
+            // message carrying a provably-broken ciphertext.
+            //
+            // Must check against EVERY prior ciphertext, not just the
+            // latest: an earlier version of this check compared only
+            // against the CURRENT effective ciphertext (the latest edit, or
+            // the original if none) — closing "edit₂ reuses edit₁'s nonce"
+            // but re-opening two others found on re-audit: once ANY
+            // encrypted edit exists, reuse of the ORIGINAL's nonce was no
+            // longer checked at all (the very case the original version of
+            // this hardening covered), and reuse of any NON-latest prior
+            // edit's nonce was never checked. All raw ciphertext stays
+            // retrievable in `MESSAGES` regardless of which edit is
+            // "current" for projection purposes, so every one of them is a
+            // live collision target. `get_edit_history` is capped at 100
+            // entries and iterates OLDEST-first, so this check is complete
+            // only up to a message's first 100 edits — past that, the
+            // oldest 100 are checked and the newest (the ones a buggy
+            // client would most likely collide with) are missed. A
+            // per-`(target, epoch)` seen-nonce index would close that
+            // residual gap but is real added storage cost for an
+            // already-narrow, self-inflicted-only edge case (only the
+            // message's own author can ever submit a colliding edit).
+            if edit_is_encrypted {
+                let mut collision = edit_epoch == orig.key_epoch && edit_nonce.is_some() && edit_nonce == orig.enc_nonce;
+                if !collision {
+                    match self.storage.get_edit_history(&target_id) {
+                        Ok(history) => {
+                            for (_, prior_edit_id) in history {
+                                let prior: Option<EditPayload> = self
+                                    .storage
+                                    .get_message(&prior_edit_id)
+                                    .ok()
+                                    .flatten()
+                                    .and_then(|bytes| rmp_serde::from_slice::<Envelope>(&bytes).ok())
+                                    .and_then(|env| rmp_serde::from_slice::<EditPayload>(&env.payload).ok());
+                                if let Some(prior) = prior {
+                                    if prior.enc_content.is_some()
+                                        && edit_epoch == prior.key_epoch
+                                        && edit_nonce.is_some()
+                                        && edit_nonce == prior.enc_nonce
+                                    {
+                                        collision = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        // Fail-open on a storage error (availability trade,
+                        // matching this message's earlier steps not hard-
+                        // failing the whole edit on a transient read issue)
+                        // — but logged, since this silently bypasses a
+                        // security check rather than merely skipping an
+                        // optional enrichment.
+                        Err(e) => {
+                            tracing::warn!(
+                                target = %hex::encode(target_id),
+                                error = %e,
+                                "nonce-reuse check: could not read edit history, proceeding without it",
+                            );
+                        }
+                    }
+                }
+                if collision {
+                    return Err(
+                        "encrypted chat edit must not reuse a nonce this message has already used under the same key_epoch"
+                            .into(),
+                    );
+                }
+            }
+        }
+
+        // 7. For edits: enforce 30-minute window from original timestamp
         if is_edit {
             const EDIT_WINDOW_MS: u64 = 30 * 60 * 1000;
             if now_ms.saturating_sub(original_envelope.timestamp) > EDIT_WINDOW_MS {
@@ -1843,12 +2030,86 @@ impl MessageRouter {
             }
         }
 
-        // 6. For NewsEdit: defense-in-depth check (Step 4d already gates this,
+        // 8. For NewsEdit: defense-in-depth check (Step 4d already gates this,
         // but verify on-chain registration here too for edit-specific flow).
         if envelope.msg_type == MessageType::NewsEdit && !self.is_registered(resolved_author) {
             return Err("news edits require on-chain registration".into());
         }
 
+        Ok(())
+    }
+
+    /// Authorize `DeletionRequest` (security audit, BLOCKING): a
+    /// `SingleMessage` deletion may only target a message the SENDER
+    /// themself authored.
+    ///
+    /// Before this check, `DeletionType::SingleMessage` had NO authorship
+    /// gate anywhere: `validate_deletion_request` only checks that
+    /// `target_id` is present and non-zero, `authorize_channel_action` falls
+    /// through to `Ok(())` for `DeletionRequest`, and the handler
+    /// (`update_indexes`) calls `store_deletion_marker(&target_id,
+    /// resolved_author, ...)` unconditionally — recording WHO issued the
+    /// delete, but never checking that it matches the target's actual
+    /// author. `is_deleted` is a bare key-existence check on that marker, so
+    /// `enrich_message_json` honors it regardless of who wrote it, and
+    /// `DeletionRequest` gossips network-wide. The result: any wallet that
+    /// clears `requires_verified_identity()` (on-chain registration — a cost
+    /// gate, not an authorship gate) could permanently tombstone ANY
+    /// `ChatMessage`, `NewsPost`, or `DirectMessage` on the entire network
+    /// just by knowing its `msg_id` (returned in hex in every message
+    /// listing) — a working, permissionless censorship/griefing primitive in
+    /// a project whose explicit design principle is no censorship. This
+    /// mirrors `authorize_edit_delete`'s existing rule for `ChatDelete`/
+    /// `DirectMessageDelete`/`NewsDelete` (strict self-authorship, no
+    /// moderator exception — `DeletionRequest` has no channel context at
+    /// all, so there is no moderator role to except here either); it lives
+    /// as a separate function because `DeletionRequest` is not one of the
+    /// six type-tagged edit/delete variants `authorize_edit_delete` handles
+    /// (it carries no `target_id` type tag, so a target's ACTUAL stored type
+    /// is irrelevant here — any type of message the sender authored is a
+    /// legitimate target).
+    ///
+    /// `DeletionType::AllUserContent` needs no equivalent check: it already
+    /// scopes itself to `resolved_author`'s own content by construction (it
+    /// walks `NEWS_BY_AUTHOR` keyed on the caller's own address), so there is
+    /// no attacker-supplied target to authorize.
+    ///
+    /// A target that cannot be resolved locally is rejected outright rather
+    /// than writing a marker for an unknown id — this node has no way to
+    /// verify authorship of a message it has never seen, and correct sync/
+    /// gossip peers only ever construct a `DeletionRequest` against a
+    /// message they can already see.
+    fn authorize_deletion_request(
+        &self,
+        envelope: &Envelope,
+        resolved_author: &str,
+    ) -> Result<(), String> {
+        if envelope.msg_type != MessageType::DeletionRequest {
+            return Ok(());
+        }
+        let payload: DeletionRequestPayload = rmp_serde::from_slice(&envelope.payload)
+            .map_err(|e| format!("failed to deserialize deletion request: {}", e))?;
+        if payload.delete_type != DeletionType::SingleMessage {
+            return Ok(());
+        }
+        let target_id = match payload.target_id {
+            Some(id) => id,
+            None => return Ok(()), // validation already requires this to be present for SingleMessage
+        };
+        let target_bytes = self
+            .storage
+            .get_cf(schema::cf::MESSAGES, &target_id)
+            .map_err(|e| format!("storage error: {}", e))?
+            .ok_or_else(|| "target message not found".to_string())?;
+        let target_envelope: Envelope = rmp_serde::from_slice(&target_bytes)
+            .map_err(|e| format!("failed to deserialize target message: {}", e))?;
+        let target_resolved = self
+            .identity
+            .resolve(&target_envelope.author)
+            .map_err(|e| format!("failed to resolve target author: {}", e))?;
+        if resolved_author != target_resolved {
+            return Err("only the original author can delete this message".into());
+        }
         Ok(())
     }
 
@@ -5916,6 +6177,898 @@ mod edit_delete_index_tests {
             .prefix_iter_cf(schema::cf::CHANNEL_EDIT_DELETE_MSGS, &1u64.to_be_bytes(), 10)
             .unwrap();
         assert!(rows.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod chat_edit_encrypted_shape_authorization_tests {
+    //! Write-time regression guard for the encrypted-`ChatEdit` feature
+    //! (`authorize_edit_delete`'s step 6): before this check existed, an
+    //! ORDINARY plaintext `ChatEdit` against an already-encrypted channel
+    //! message was accepted, stored, and gossiped — then permanently blanked
+    //! by `project_edited_payload`'s (api/routes.rs) shape-mismatch fail-safe
+    //! the moment anyone tried to read it. Every shipped client today only
+    //! ever sends a plaintext `ChatEdit` (no SDK can build an encrypted one
+    //! yet), so without this write-time rejection, deploying the read-side
+    //! encrypted-edit feature alone would have turned "editing any message in
+    //! any encrypted channel" — the default for new Public/ReadPublic/Private
+    //! channels — into silent, permanent data loss. These tests exercise the
+    //! REAL entry point (`process_message`, full signature verification +
+    //! authorization), not `authorize_edit_delete` in isolation.
+    use super::*;
+    use tempfile::TempDir;
+
+    fn router() -> (MessageRouter, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let identity = IdentityResolver::new(storage.clone());
+        (
+            MessageRouter::new(storage, identity, None, "testnet".to_string(), usize::MAX, std::sync::Arc::new(crate::metrics::counters::NetworkCounters::new()), crate::config::RateLimitsConfig::default()),
+            dir,
+        )
+    }
+
+    fn now_ms() -> u64 {
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
+    }
+
+    fn register_user(r: &MessageRouter, address: &str, registered_at: u64) {
+        let rec = serde_json::json!({ "address": address, "registered_at": registered_at });
+        r.storage
+            .put_cf(schema::cf::USERS, address.as_bytes(), rec.to_string().as_bytes())
+            .unwrap();
+    }
+
+    /// Store a genuine ChatMessage directly in MESSAGES — plaintext if
+    /// `enc` is `None`, encrypted otherwise. Bypasses full envelope signing
+    /// (mirrors `edit_delete_index_tests::store_chat_message`; irrelevant to
+    /// what `authorize_edit_delete` reads).
+    fn store_chat_message(
+        r: &MessageRouter,
+        author: &str,
+        channel_id: u64,
+        msg_id: [u8; 32],
+        timestamp: u64,
+        enc: Option<(Vec<u8>, [u8; 24], u64)>,
+    ) {
+        let (content, enc_content, enc_nonce, key_epoch) = match enc {
+            Some((ct, nonce, epoch)) => ("".to_string(), Some(ct), Some(nonce), Some(epoch)),
+            None => ("hello".to_string(), None, None, None),
+        };
+        let payload = ChatMessagePayload {
+            channel_id,
+            content,
+            content_rating: Default::default(),
+            reply_to: None,
+            mentions: vec![],
+            attachments: vec![],
+            enc_content,
+            enc_nonce,
+            key_epoch,
+            buttons: vec![],
+            via_button: false,
+        };
+        let envelope = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::ChatMessage,
+            msg_id,
+            author: author.to_string(),
+            timestamp,
+            lamport_ts: 0,
+            payload: rmp_serde::to_vec_named(&payload).unwrap(),
+            signature: vec![],
+            relay_path: vec![],
+        };
+        r.storage
+            .put_cf(schema::cf::MESSAGES, &msg_id, &rmp_serde::to_vec_named(&envelope).unwrap())
+            .unwrap();
+    }
+
+    /// Build a fully signed `ChatEdit` envelope, plaintext or encrypted
+    /// depending on `enc`.
+    fn signed_chat_edit(
+        sk: &ed25519_dalek::SigningKey,
+        author: &str,
+        target_id: [u8; 32],
+        channel_id: u64,
+        timestamp: u64,
+        enc: Option<(Vec<u8>, [u8; 24], u64)>,
+    ) -> Vec<u8> {
+        let (content, enc_content, enc_nonce, key_epoch) = match enc {
+            Some((ct, nonce, epoch)) => ("".to_string(), Some(ct), Some(nonce), Some(epoch)),
+            None => ("edited".to_string(), None, None, None),
+        };
+        let payload = EditPayload {
+            target_id,
+            channel_id: Some(channel_id),
+            content,
+            edited_at: timestamp,
+            title: None,
+            tags: None,
+            attachments: None,
+            buttons: None,
+            enc_content,
+            enc_nonce,
+            key_epoch,
+        };
+        let payload_bytes = rmp_serde::to_vec_named(&payload).unwrap();
+        let author_pubkey: [u8; 32] = sk.verifying_key().to_bytes();
+        let msg_id = crypto::compute_msg_id("testnet", &author_pubkey, &payload_bytes, timestamp);
+        let signature = signing::sign_ogmara_message(
+            sk,
+            "testnet",
+            crate::messages::envelope::PROTOCOL_VERSION,
+            MessageType::ChatEdit as u8,
+            &msg_id,
+            timestamp,
+            &payload_bytes,
+        );
+        let envelope = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::ChatEdit,
+            msg_id,
+            author: author.to_string(),
+            timestamp,
+            lamport_ts: 0,
+            payload: payload_bytes,
+            signature: signature.to_bytes().to_vec(),
+            relay_path: vec![],
+        };
+        rmp_serde::to_vec_named(&envelope).unwrap()
+    }
+
+    #[test]
+    fn plaintext_edit_against_plaintext_original_is_accepted() {
+        let (r, _dir) = router();
+        let sk = crypto::generate_keypair();
+        let author = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        register_user(&r, &author, 1_000);
+        let channel_id = 42u64;
+        let original_ts = now_ms();
+        let original_id = [1u8; 32];
+        store_chat_message(&r, &author, channel_id, original_id, original_ts, None);
+
+        let edit_raw = signed_chat_edit(&sk, &author, original_id, channel_id, original_ts + 1, None);
+        assert!(matches!(r.process_message(&edit_raw), RouteResult::Accepted { .. }));
+    }
+
+    #[test]
+    fn encrypted_edit_against_encrypted_original_is_accepted() {
+        let (r, _dir) = router();
+        let sk = crypto::generate_keypair();
+        let author = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        register_user(&r, &author, 1_000);
+        let channel_id = 42u64;
+        let original_ts = now_ms();
+        let original_id = [1u8; 32];
+        store_chat_message(
+            &r, &author, channel_id, original_id, original_ts,
+            Some((vec![9, 9, 9], [1u8; 24], 1)),
+        );
+
+        let edit_raw = signed_chat_edit(
+            &sk, &author, original_id, channel_id, original_ts + 1,
+            Some((vec![7, 7, 7], [2u8; 24], 1)),
+        );
+        assert!(matches!(r.process_message(&edit_raw), RouteResult::Accepted { .. }));
+    }
+
+    /// THE regression this module exists to guard: before the write-time
+    /// check, this exact sequence — a normal plaintext edit (all that any
+    /// shipped client can build) against an encrypted original — was
+    /// ACCEPTED and stored, then permanently blanked the message the next
+    /// time anyone read it.
+    #[test]
+    fn plaintext_edit_against_encrypted_original_is_rejected() {
+        let (r, _dir) = router();
+        let sk = crypto::generate_keypair();
+        let author = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        register_user(&r, &author, 1_000);
+        let channel_id = 42u64;
+        let original_ts = now_ms();
+        let original_id = [1u8; 32];
+        store_chat_message(
+            &r, &author, channel_id, original_id, original_ts,
+            Some((vec![9, 9, 9], [1u8; 24], 1)),
+        );
+
+        let edit_raw = signed_chat_edit(&sk, &author, original_id, channel_id, original_ts + 1, None);
+        assert!(matches!(r.process_message(&edit_raw), RouteResult::Rejected(_)));
+
+        // The original message must be completely untouched by the rejected
+        // edit attempt — still readable, still encrypted, unedited.
+        let stored = r.storage.get_cf(schema::cf::MESSAGES, &original_id).unwrap().unwrap();
+        let env: Envelope = rmp_serde::from_slice(&stored).unwrap();
+        let p: ChatMessagePayload = rmp_serde::from_slice(&env.payload).unwrap();
+        assert_eq!(p.enc_content, Some(vec![9, 9, 9]));
+    }
+
+    #[test]
+    fn encrypted_edit_against_plaintext_original_is_rejected() {
+        let (r, _dir) = router();
+        let sk = crypto::generate_keypair();
+        let author = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        register_user(&r, &author, 1_000);
+        let channel_id = 42u64;
+        let original_ts = now_ms();
+        let original_id = [1u8; 32];
+        store_chat_message(&r, &author, channel_id, original_id, original_ts, None);
+
+        let edit_raw = signed_chat_edit(
+            &sk, &author, original_id, channel_id, original_ts + 1,
+            Some((vec![7, 7, 7], [2u8; 24], 1)),
+        );
+        assert!(matches!(r.process_message(&edit_raw), RouteResult::Rejected(_)));
+    }
+
+    /// AEAD hygiene (security audit NOTE): reusing the original's exact
+    /// nonce under an unchanged key_epoch would encrypt the edit under the
+    /// same (key, nonce) pair as the original ciphertext — a confidentiality
+    /// break for XChaCha20-Poly1305. Rejected even though the node never
+    /// generates nonces itself; a client bug/malice is the only way this
+    /// could happen, and storing it would gossip a provably-broken
+    /// ciphertext to every channel member.
+    #[test]
+    fn encrypted_edit_reusing_original_nonce_at_same_epoch_is_rejected() {
+        let (r, _dir) = router();
+        let sk = crypto::generate_keypair();
+        let author = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        register_user(&r, &author, 1_000);
+        let channel_id = 42u64;
+        let original_ts = now_ms();
+        let original_id = [1u8; 32];
+        let shared_nonce = [5u8; 24];
+        store_chat_message(
+            &r, &author, channel_id, original_id, original_ts,
+            Some((vec![9, 9, 9], shared_nonce, 1)),
+        );
+
+        let edit_raw = signed_chat_edit(
+            &sk, &author, original_id, channel_id, original_ts + 1,
+            Some((vec![7, 7, 7], shared_nonce, 1)),
+        );
+        assert!(matches!(r.process_message(&edit_raw), RouteResult::Rejected(_)));
+
+        let stored = r.storage.get_cf(schema::cf::MESSAGES, &original_id).unwrap().unwrap();
+        let env: Envelope = rmp_serde::from_slice(&stored).unwrap();
+        let p: ChatMessagePayload = rmp_serde::from_slice(&env.payload).unwrap();
+        assert_eq!(p.enc_content, Some(vec![9, 9, 9]), "rejected edit must not have touched the original");
+    }
+
+    /// Same physical nonce bytes are safe to reuse across a DIFFERENT
+    /// key_epoch — a key rotation derives a new key, so (new key, reused
+    /// nonce) is not the same pair as (old key, original nonce). Confirms
+    /// the check is scoped to "same epoch", not "ever reused this value".
+    #[test]
+    fn encrypted_edit_reusing_nonce_bytes_under_a_bumped_epoch_is_accepted() {
+        let (r, _dir) = router();
+        let sk = crypto::generate_keypair();
+        let author = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        register_user(&r, &author, 1_000);
+        let channel_id = 42u64;
+        let original_ts = now_ms();
+        let original_id = [1u8; 32];
+        let shared_nonce = [5u8; 24];
+        store_chat_message(
+            &r, &author, channel_id, original_id, original_ts,
+            Some((vec![9, 9, 9], shared_nonce, 1)),
+        );
+
+        let edit_raw = signed_chat_edit(
+            &sk, &author, original_id, channel_id, original_ts + 1,
+            Some((vec![7, 7, 7], shared_nonce, 2)),
+        );
+        assert!(matches!(r.process_message(&edit_raw), RouteResult::Accepted { .. }));
+    }
+
+    /// Regression guard for a bug in an EARLIER version of this hardening:
+    /// once any encrypted edit exists, the check must still catch a LATER
+    /// edit reusing the ORIGINAL's nonce (not just the latest edit's) — an
+    /// earlier version compared only against the current latest edit,
+    /// replacing rather than unioning the comparison set, so this exact
+    /// sequence was wrongly accepted.
+    #[test]
+    fn encrypted_edit_reusing_the_original_nonce_is_rejected_even_after_an_intervening_edit() {
+        let (r, _dir) = router();
+        let sk = crypto::generate_keypair();
+        let author = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        register_user(&r, &author, 1_000);
+        let channel_id = 42u64;
+        let original_ts = now_ms();
+        let original_id = [1u8; 32];
+        let original_nonce = [5u8; 24];
+        store_chat_message(
+            &r, &author, channel_id, original_id, original_ts,
+            Some((vec![9, 9, 9], original_nonce, 1)),
+        );
+
+        // edit1: different nonce AND different epoch — accepted, becomes the
+        // latest edit.
+        let edit1_raw = signed_chat_edit(
+            &sk, &author, original_id, channel_id, original_ts + 1,
+            Some((vec![7, 7, 7], [6u8; 24], 2)),
+        );
+        assert!(matches!(r.process_message(&edit1_raw), RouteResult::Accepted { .. }));
+
+        // edit2: reuses the ORIGINAL's exact (nonce, epoch) — must still be
+        // caught even though it differs from edit1's (the current latest
+        // edit's) nonce and epoch.
+        let edit2_raw = signed_chat_edit(
+            &sk, &author, original_id, channel_id, original_ts + 2,
+            Some((vec![3, 3, 3], original_nonce, 1)),
+        );
+        assert!(matches!(r.process_message(&edit2_raw), RouteResult::Rejected(_)));
+    }
+
+    /// Exercises the `get_edit_history` scan branch specifically (as opposed
+    /// to the pre-loop check against the ORIGINAL): a THIRD edit reuses the
+    /// FIRST edit's nonce+epoch — a collision the loop must catch even
+    /// though neither the original nor the (by-then) latest edit shares
+    /// that nonce. Without the loop (i.e. comparing only against the
+    /// current latest edit, the bug two rounds of audit found and fixed),
+    /// this would be wrongly accepted.
+    #[test]
+    fn encrypted_edit_reusing_a_non_latest_non_original_prior_edits_nonce_is_rejected() {
+        let (r, _dir) = router();
+        let sk = crypto::generate_keypair();
+        let author = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        register_user(&r, &author, 1_000);
+        let channel_id = 42u64;
+        let original_ts = now_ms();
+        let original_id = [1u8; 32];
+        store_chat_message(
+            &r, &author, channel_id, original_id, original_ts,
+            Some((vec![9, 9, 9], [1u8; 24], 1)),
+        );
+
+        // edit1: nonce N1, epoch 2 — accepted.
+        let n1 = [6u8; 24];
+        let edit1_raw = signed_chat_edit(
+            &sk, &author, original_id, channel_id, original_ts + 1,
+            Some((vec![7, 7, 7], n1, 2)),
+        );
+        assert!(matches!(r.process_message(&edit1_raw), RouteResult::Accepted { .. }));
+
+        // edit2: nonce N2 (fresh), epoch 3 — accepted, becomes the new
+        // latest edit. edit1 is now neither the original nor the latest.
+        let edit2_raw = signed_chat_edit(
+            &sk, &author, original_id, channel_id, original_ts + 2,
+            Some((vec![8, 8, 8], [7u8; 24], 3)),
+        );
+        assert!(matches!(r.process_message(&edit2_raw), RouteResult::Accepted { .. }));
+
+        // edit3: reuses edit1's (N1, epoch 2) — must be caught by the
+        // `get_edit_history` scan, since it matches neither the original
+        // nor edit2 (the current latest edit).
+        let edit3_raw = signed_chat_edit(
+            &sk, &author, original_id, channel_id, original_ts + 3,
+            Some((vec![2, 2, 2], n1, 2)),
+        );
+        let result = r.process_message(&edit3_raw);
+        assert!(
+            matches!(&result, RouteResult::Rejected(msg) if msg.contains("reuse a nonce")),
+            "expected a nonce-reuse rejection, got {result:?}",
+        );
+    }
+
+    /// Regression guard: `DirectMessageEdit`/`NewsEdit` must be entirely
+    /// unaffected by the new check (`edit_chat_shape` is `None` for
+    /// both, so the new branch in `authorize_edit_delete` is skipped) — a
+    /// DM edit is ALWAYS encrypted by a different mechanism entirely
+    /// (already enforced by `validate_dm_edit`, untouched by this change).
+    #[test]
+    fn dm_edit_is_unaffected_by_the_new_chat_specific_check() {
+        let (r, _dir) = router();
+        let sk = crypto::generate_keypair();
+        let author = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        let recipient = "klv1recipient00000000000000000000000000000000000000000000000000";
+        register_user(&r, &author, 1_000);
+        let original_ts = now_ms();
+        let original_id = [1u8; 32];
+        let payload = DirectMessagePayload {
+            recipient: recipient.to_string(),
+            conversation_id: crate::crypto::compute_conversation_id(&author, recipient),
+            content: vec![1, 2, 3],
+            nonce: [0u8; 24],
+            key_epoch: 1,
+            reply_to: None,
+            attachments: vec![],
+        };
+        let orig_env = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::DirectMessage,
+            msg_id: original_id,
+            author: author.clone(),
+            timestamp: original_ts,
+            lamport_ts: 0,
+            payload: rmp_serde::to_vec_named(&payload).unwrap(),
+            signature: vec![],
+            relay_path: vec![],
+        };
+        r.storage
+            .put_cf(schema::cf::MESSAGES, &original_id, &rmp_serde::to_vec_named(&orig_env).unwrap())
+            .unwrap();
+
+        let edit_payload_bytes = rmp_serde::to_vec_named(&EditPayload {
+            target_id: original_id,
+            channel_id: None,
+            content: "".to_string(),
+            edited_at: original_ts + 1,
+            title: None,
+            tags: None,
+            attachments: None,
+            buttons: None,
+            enc_content: Some(vec![7, 7, 7]),
+            enc_nonce: Some([2u8; 24]),
+            key_epoch: Some(1),
+        })
+        .unwrap();
+        let author_pubkey: [u8; 32] = sk.verifying_key().to_bytes();
+        let edit_ts = original_ts + 1;
+        let edit_msg_id =
+            crypto::compute_msg_id("testnet", &author_pubkey, &edit_payload_bytes, edit_ts);
+        let signature = signing::sign_ogmara_message(
+            &sk, "testnet", crate::messages::envelope::PROTOCOL_VERSION,
+            MessageType::DirectMessageEdit as u8, &edit_msg_id, edit_ts, &edit_payload_bytes,
+        );
+        let edit_env = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::DirectMessageEdit,
+            msg_id: edit_msg_id,
+            author,
+            timestamp: edit_ts,
+            lamport_ts: 0,
+            payload: edit_payload_bytes,
+            signature: signature.to_bytes().to_vec(),
+            relay_path: vec![],
+        };
+        let edit_raw = rmp_serde::to_vec_named(&edit_env).unwrap();
+        // Accepted (or rejected for some OTHER, unrelated DM-specific reason
+        // — e.g. recipient-cap/rate-limit plumbing this minimal harness
+        // doesn't set up) — the only thing this test guards is that it is
+        // never rejected by the NEW chat-shape check, which would show up as
+        // a `Rejected` whose message names ChatEdit-specific text. Assert on
+        // the error text directly to distinguish "unaffected" from
+        // "coincidentally also rejected, for a different reason" — the
+        // former is fine, the latter would defeat the test.
+        if let RouteResult::Rejected(msg) = r.process_message(&edit_raw) {
+            assert!(
+                !msg.contains("plaintext edit") && !msg.contains("encrypted edit"),
+                "DM edit was rejected by the new ChatEdit-specific shape check: {msg}",
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod edit_delete_type_correspondence_tests {
+    //! Security-audit HIGH finding, PoC-verified: `EditPayload`/`DeletePayload`
+    //! carry `target_id` with no type tag, so nothing stopped a `NewsEdit`
+    //! from pointing its `target_id` at a `ChatMessage`. The VALIDATOR
+    //! dispatch is keyed on the EDIT's own `msg_type` (`NewsEdit` →
+    //! `validate_news_edit`, which has no `enc_content` concept and never
+    //! inspects it), while the PROJECTION dispatch in
+    //! `project_edited_payload` (api/routes.rs) is keyed on the TARGET's
+    //! ACTUAL stored type — so a type-confused `NewsEdit` sailed past
+    //! `validate_news_edit`, past the ChatEdit-only shape check added
+    //! earlier in this same change (gated on `envelope.msg_type ==
+    //! MessageType::ChatEdit`, so it never even looks at a `NewsEdit`), and
+    //! landed in `ChatMessage`'s projection branch — bypassing
+    //! `validate_chat_edit`'s `MAX_CHAT_CIPHERTEXT` cap and `key_epoch >= 1`
+    //! floor entirely (PoC: 20,000-byte ciphertext, `key_epoch: 0`, and
+    //! plaintext `content` coexisting with `enc_content` — a shape every
+    //! relevant validator is supposed to forbid). `authorize_edit_delete`'s
+    //! new step 3 closes the whole class by requiring the edit/delete's own
+    //! type to match what the target is actually stored as, checked before
+    //! anything type-specific runs (including authorship).
+    use super::*;
+    use tempfile::TempDir;
+
+    fn router() -> (MessageRouter, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let identity = IdentityResolver::new(storage.clone());
+        (
+            MessageRouter::new(storage, identity, None, "testnet".to_string(), usize::MAX, std::sync::Arc::new(crate::metrics::counters::NetworkCounters::new()), crate::config::RateLimitsConfig::default()),
+            dir,
+        )
+    }
+
+    fn now_ms() -> u64 {
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
+    }
+
+    fn register_user(r: &MessageRouter, address: &str, registered_at: u64) {
+        let rec = serde_json::json!({ "address": address, "registered_at": registered_at });
+        r.storage
+            .put_cf(schema::cf::USERS, address.as_bytes(), rec.to_string().as_bytes())
+            .unwrap();
+    }
+
+    fn store_message(r: &MessageRouter, msg_type: MessageType, author: &str, msg_id: [u8; 32], timestamp: u64, payload: Vec<u8>) {
+        let envelope = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type,
+            msg_id,
+            author: author.to_string(),
+            timestamp,
+            lamport_ts: 0,
+            payload,
+            signature: vec![],
+            relay_path: vec![],
+        };
+        r.storage
+            .put_cf(schema::cf::MESSAGES, &msg_id, &rmp_serde::to_vec_named(&envelope).unwrap())
+            .unwrap();
+    }
+
+    fn encrypted_chat_message_payload() -> Vec<u8> {
+        rmp_serde::to_vec_named(&ChatMessagePayload {
+            channel_id: 42,
+            content: String::new(),
+            content_rating: Default::default(),
+            reply_to: None,
+            mentions: vec![],
+            attachments: vec![],
+            enc_content: Some(vec![9, 9, 9]),
+            enc_nonce: Some([1u8; 24]),
+            key_epoch: Some(1),
+            buttons: vec![],
+            via_button: false,
+        })
+        .unwrap()
+    }
+
+    fn news_post_payload() -> Vec<u8> {
+        rmp_serde::to_vec_named(&NewsPostPayload {
+            title: "headline".to_string(),
+            content: "body".to_string(),
+            content_rating: Default::default(),
+            tags: vec![],
+            attachments: vec![],
+            visibility: Default::default(),
+        })
+        .unwrap()
+    }
+
+    /// Build a fully signed envelope of `msg_type` carrying `payload_bytes`.
+    fn signed(
+        sk: &ed25519_dalek::SigningKey,
+        author: &str,
+        msg_type: MessageType,
+        timestamp: u64,
+        payload_bytes: Vec<u8>,
+    ) -> Vec<u8> {
+        let author_pubkey: [u8; 32] = sk.verifying_key().to_bytes();
+        let msg_id = crypto::compute_msg_id("testnet", &author_pubkey, &payload_bytes, timestamp);
+        let signature = signing::sign_ogmara_message(
+            sk, "testnet", crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type as u8, &msg_id, timestamp, &payload_bytes,
+        );
+        let envelope = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type,
+            msg_id,
+            author: author.to_string(),
+            timestamp,
+            lamport_ts: 0,
+            payload: payload_bytes,
+            signature: signature.to_bytes().to_vec(),
+            relay_path: vec![],
+        };
+        rmp_serde::to_vec_named(&envelope).unwrap()
+    }
+
+    /// The audit's own PoC shape: a `NewsEdit` whose `target_id` points at
+    /// an encrypted `ChatMessage`, carrying an oversize ciphertext and the
+    /// forbidden `key_epoch: 0` — none of which `validate_news_edit` checks.
+    /// Before the fix, this reached and corrupted the `ChatMessage`.
+    #[test]
+    fn news_edit_cannot_target_a_chat_message() {
+        let (r, _dir) = router();
+        let sk = crypto::generate_keypair();
+        let author = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        register_user(&r, &author, 1_000);
+        let original_ts = now_ms();
+        let original_id = [1u8; 32];
+        store_message(&r, MessageType::ChatMessage, &author, original_id, original_ts, encrypted_chat_message_payload());
+
+        let edit_payload = EditPayload {
+            target_id: original_id,
+            channel_id: None,
+            content: "smuggled plaintext, oversize ciphertext riding along".to_string(),
+            edited_at: original_ts + 1,
+            title: None,
+            tags: None,
+            attachments: None,
+            buttons: None,
+            enc_content: Some(vec![0u8; 20_000]),
+            enc_nonce: Some([2u8; 24]),
+            key_epoch: Some(0),
+        };
+        let edit_raw = signed(&sk, &author, MessageType::NewsEdit, original_ts + 1, rmp_serde::to_vec_named(&edit_payload).unwrap());
+
+        let result = r.process_message(&edit_raw);
+        assert!(
+            matches!(&result, RouteResult::Rejected(msg) if msg.contains("may only target")),
+            "expected a type-correspondence rejection, got {result:?}",
+        );
+
+        // The targeted ChatMessage must be completely untouched.
+        let stored = r.storage.get_cf(schema::cf::MESSAGES, &original_id).unwrap().unwrap();
+        let env: Envelope = rmp_serde::from_slice(&stored).unwrap();
+        let p: ChatMessagePayload = rmp_serde::from_slice(&env.payload).unwrap();
+        assert_eq!(p.enc_content, Some(vec![9, 9, 9]));
+        assert_eq!(p.key_epoch, Some(1));
+        assert!(p.content.is_empty());
+    }
+
+    #[test]
+    fn chat_edit_cannot_target_a_news_post() {
+        let (r, _dir) = router();
+        let sk = crypto::generate_keypair();
+        let author = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        register_user(&r, &author, 1_000);
+        let original_ts = now_ms();
+        let original_id = [1u8; 32];
+        store_message(&r, MessageType::NewsPost, &author, original_id, original_ts, news_post_payload());
+
+        let edit_payload = EditPayload {
+            target_id: original_id,
+            channel_id: Some(42),
+            content: "edited".to_string(),
+            edited_at: original_ts + 1,
+            title: None,
+            tags: None,
+            attachments: None,
+            buttons: None,
+            enc_content: None,
+            enc_nonce: None,
+            key_epoch: None,
+        };
+        let edit_raw = signed(&sk, &author, MessageType::ChatEdit, original_ts + 1, rmp_serde::to_vec_named(&edit_payload).unwrap());
+
+        let result = r.process_message(&edit_raw);
+        assert!(
+            matches!(&result, RouteResult::Rejected(msg) if msg.contains("may only target")),
+            "expected a type-correspondence rejection, got {result:?}",
+        );
+    }
+
+    #[test]
+    fn dm_edit_cannot_target_a_chat_message() {
+        let (r, _dir) = router();
+        let sk = crypto::generate_keypair();
+        let author = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        register_user(&r, &author, 1_000);
+        let original_ts = now_ms();
+        let original_id = [1u8; 32];
+        store_message(&r, MessageType::ChatMessage, &author, original_id, original_ts, encrypted_chat_message_payload());
+
+        let edit_payload = EditPayload {
+            target_id: original_id,
+            channel_id: None,
+            content: String::new(),
+            edited_at: original_ts + 1,
+            title: None,
+            tags: None,
+            attachments: None,
+            buttons: None,
+            enc_content: Some(vec![7, 7, 7]),
+            enc_nonce: Some([3u8; 24]),
+            key_epoch: Some(1),
+        };
+        let edit_raw = signed(&sk, &author, MessageType::DirectMessageEdit, original_ts + 1, rmp_serde::to_vec_named(&edit_payload).unwrap());
+
+        let result = r.process_message(&edit_raw);
+        assert!(
+            matches!(&result, RouteResult::Rejected(msg) if msg.contains("may only target")),
+            "expected a type-correspondence rejection, got {result:?}",
+        );
+    }
+
+    #[test]
+    fn chat_delete_cannot_target_a_news_post() {
+        let (r, _dir) = router();
+        let sk = crypto::generate_keypair();
+        let author = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        register_user(&r, &author, 1_000);
+        let original_ts = now_ms();
+        let original_id = [1u8; 32];
+        store_message(&r, MessageType::NewsPost, &author, original_id, original_ts, news_post_payload());
+
+        let delete_payload = DeletePayload { target_id: original_id, channel_id: Some(42) };
+        let delete_raw = signed(&sk, &author, MessageType::ChatDelete, original_ts + 1, rmp_serde::to_vec_named(&delete_payload).unwrap());
+
+        let result = r.process_message(&delete_raw);
+        assert!(
+            matches!(&result, RouteResult::Rejected(msg) if msg.contains("may only target")),
+            "expected a type-correspondence rejection, got {result:?}",
+        );
+    }
+
+    /// Correctly-typed pairing must remain unaffected by the new check.
+    #[test]
+    fn news_edit_against_a_news_post_is_still_accepted() {
+        let (r, _dir) = router();
+        let sk = crypto::generate_keypair();
+        let author = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        register_user(&r, &author, 1_000);
+        let original_ts = now_ms();
+        let original_id = [1u8; 32];
+        store_message(&r, MessageType::NewsPost, &author, original_id, original_ts, news_post_payload());
+
+        let edit_payload = EditPayload {
+            target_id: original_id,
+            channel_id: None,
+            content: "updated body".to_string(),
+            edited_at: original_ts + 1,
+            title: None,
+            tags: None,
+            attachments: None,
+            buttons: None,
+            enc_content: None,
+            enc_nonce: None,
+            key_epoch: None,
+        };
+        let edit_raw = signed(&sk, &author, MessageType::NewsEdit, original_ts + 1, rmp_serde::to_vec_named(&edit_payload).unwrap());
+        assert!(matches!(r.process_message(&edit_raw), RouteResult::Accepted { .. }));
+    }
+}
+
+#[cfg(test)]
+mod deletion_request_authorization_tests {
+    //! Security-audit BLOCKING finding: `DeletionType::SingleMessage` had
+    //! NO authorship check anywhere in the pipeline — `validate_deletion_request`
+    //! only checks `target_id` is present, `authorize_channel_action` falls
+    //! through to `Ok(())`, and the handler wrote a deletion marker for
+    //! whatever `target_id` the sender supplied, regardless of who actually
+    //! authored it. Since `is_deleted` is a bare key-existence check honored
+    //! by every read, and `DeletionRequest` gossips network-wide, this was a
+    //! working "delete anyone's message" primitive gated only by on-chain
+    //! registration (a cost, not an authorization). These tests drive the
+    //! new `authorize_deletion_request` check through the real
+    //! `process_message` entry point.
+    use super::*;
+    use tempfile::TempDir;
+
+    fn router() -> (MessageRouter, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let identity = IdentityResolver::new(storage.clone());
+        (
+            MessageRouter::new(storage, identity, None, "testnet".to_string(), usize::MAX, std::sync::Arc::new(crate::metrics::counters::NetworkCounters::new()), crate::config::RateLimitsConfig::default()),
+            dir,
+        )
+    }
+
+    fn now_ms() -> u64 {
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
+    }
+
+    fn register_user(r: &MessageRouter, address: &str, registered_at: u64) {
+        let rec = serde_json::json!({ "address": address, "registered_at": registered_at });
+        r.storage
+            .put_cf(schema::cf::USERS, address.as_bytes(), rec.to_string().as_bytes())
+            .unwrap();
+    }
+
+    fn store_chat_message(r: &MessageRouter, author: &str, channel_id: u64, msg_id: [u8; 32], timestamp: u64) {
+        let payload = ChatMessagePayload {
+            channel_id,
+            content: "hello".to_string(),
+            content_rating: Default::default(),
+            reply_to: None,
+            mentions: vec![],
+            attachments: vec![],
+            enc_content: None,
+            enc_nonce: None,
+            key_epoch: None,
+            buttons: vec![],
+            via_button: false,
+        };
+        let envelope = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::ChatMessage,
+            msg_id,
+            author: author.to_string(),
+            timestamp,
+            lamport_ts: 0,
+            payload: rmp_serde::to_vec_named(&payload).unwrap(),
+            signature: vec![],
+            relay_path: vec![],
+        };
+        r.storage
+            .put_cf(schema::cf::MESSAGES, &msg_id, &rmp_serde::to_vec_named(&envelope).unwrap())
+            .unwrap();
+    }
+
+    fn signed_single_message_deletion(
+        sk: &ed25519_dalek::SigningKey,
+        author: &str,
+        target_id: [u8; 32],
+        timestamp: u64,
+    ) -> Vec<u8> {
+        let payload = DeletionRequestPayload {
+            delete_type: DeletionType::SingleMessage,
+            target_id: Some(target_id),
+        };
+        let payload_bytes = rmp_serde::to_vec_named(&payload).unwrap();
+        let author_pubkey: [u8; 32] = sk.verifying_key().to_bytes();
+        let msg_id = crypto::compute_msg_id("testnet", &author_pubkey, &payload_bytes, timestamp);
+        let signature = signing::sign_ogmara_message(
+            sk, "testnet", crate::messages::envelope::PROTOCOL_VERSION,
+            MessageType::DeletionRequest as u8, &msg_id, timestamp, &payload_bytes,
+        );
+        let envelope = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::DeletionRequest,
+            msg_id,
+            author: author.to_string(),
+            timestamp,
+            lamport_ts: 0,
+            payload: payload_bytes,
+            signature: signature.to_bytes().to_vec(),
+            relay_path: vec![],
+        };
+        rmp_serde::to_vec_named(&envelope).unwrap()
+    }
+
+    /// THE regression this module exists to guard: before the fix, this
+    /// exact sequence — a wallet with no relationship to the message at all,
+    /// deleting a stranger's `ChatMessage` — was ACCEPTED and permanently
+    /// tombstoned the message network-wide.
+    #[test]
+    fn deleting_another_authors_message_is_rejected() {
+        let (r, _dir) = router();
+        let victim_sk = crypto::generate_keypair();
+        let victim = crypto::pubkey_to_address(&victim_sk.verifying_key()).unwrap();
+        let attacker_sk = crypto::generate_keypair();
+        let attacker = crypto::pubkey_to_address(&attacker_sk.verifying_key()).unwrap();
+        register_user(&r, &attacker, 1_000);
+        let channel_id = 42u64;
+        let victim_ts = now_ms();
+        let victim_msg_id = [1u8; 32];
+        store_chat_message(&r, &victim, channel_id, victim_msg_id, victim_ts);
+
+        let delete_raw = signed_single_message_deletion(&attacker_sk, &attacker, victim_msg_id, victim_ts + 1);
+        assert!(matches!(r.process_message(&delete_raw), RouteResult::Rejected(_)));
+
+        // The victim's message must still be readable — not tombstoned.
+        assert!(!r.storage.is_deleted(&victim_msg_id).unwrap());
+    }
+
+    #[test]
+    fn deleting_own_message_is_accepted() {
+        let (r, _dir) = router();
+        let sk = crypto::generate_keypair();
+        let author = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        register_user(&r, &author, 1_000);
+        let channel_id = 42u64;
+        let ts = now_ms();
+        let msg_id = [1u8; 32];
+        store_chat_message(&r, &author, channel_id, msg_id, ts);
+
+        let delete_raw = signed_single_message_deletion(&sk, &author, msg_id, ts + 1);
+        assert!(matches!(r.process_message(&delete_raw), RouteResult::Accepted { .. }));
+        assert!(r.storage.is_deleted(&msg_id).unwrap());
+    }
+
+    /// A `SingleMessage` deletion against a `target_id` the node has never
+    /// seen is rejected outright rather than writing a marker on faith —
+    /// there is no way to verify authorship of a message this node cannot
+    /// look up.
+    #[test]
+    fn deleting_an_unknown_target_is_rejected() {
+        let (r, _dir) = router();
+        let sk = crypto::generate_keypair();
+        let author = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        register_user(&r, &author, 1_000);
+        let unknown_id = [0xAAu8; 32];
+
+        let delete_raw = signed_single_message_deletion(&sk, &author, unknown_id, now_ms());
+        assert!(matches!(r.process_message(&delete_raw), RouteResult::Rejected(_)));
+        assert!(!r.storage.is_deleted(&unknown_id).unwrap());
     }
 }
 

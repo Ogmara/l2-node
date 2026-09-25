@@ -294,9 +294,30 @@ fn target_news_item_visible(
 ///
 /// Per-type merge semantics (spec §3.7):
 ///   - `NewsPost`     — content always; title/tags/attachments when `Some(_)`.
-///   - `ChatMessage`  — content always; attachments when `Some(_)`. mentions
-///                      stay untouched by edits (re-triggering @-notifications
-///                      from an edit would invite spam).
+///   - `ChatMessage`  — PLAINTEXT original: content always; attachments/buttons
+///                      when `Some(_)`. ENCRYPTED original (original payload's
+///                      own `enc_content` is `Some`): the edit's `enc_content`/
+///                      `enc_nonce`/`key_epoch` replace the original's wholesale
+///                      instead — `validate_chat_edit` (messages/validation.rs)
+///                      requires an encrypted edit's plaintext `content` to be
+///                      empty, so a plaintext assignment there is a no-op. The
+///                      edit's own encrypted-or-plaintext shape SHOULD match the
+///                      original's; `authorize_edit_delete` rejects any NEW edit
+///                      where it doesn't, but a row written before that check
+///                      existed (v0.133.0) can still carry a plaintext edit
+///                      against an encrypted original — that legacy direction
+///                      still applies the edit's `attachments`/`buttons`
+///                      overrides exactly like any other edit (those were
+///                      never gated on ciphertext shape, even before this
+///                      version), but leaves `content`/`enc_content`/
+///                      `enc_nonce`/`key_epoch` untouched, matching what
+///                      every prior node already served for that row — NOT
+///                      a blank; only the other, edit-encrypted-vs-plaintext-
+///                      original direction (which no client could construct
+///                      before this version, so has no legacy rows) still fails
+///                      closed to `None` — see the branch below. Mentions stay
+///                      untouched by edits either way (re-triggering
+///                      @-notifications from an edit would invite spam).
 ///   - `DirectMessage`— rejected at validation (encrypted ciphertext blobs
 ///                      have no field-level shape from the server's view);
 ///                      returns `None` if it ever gets here.
@@ -389,7 +410,102 @@ fn project_edited_payload(
                 Ok(v) => v,
                 Err(e) => { warn_decode("chat_decode", &e); return None; }
             };
-            p.content = edit.content;
+            // Encrypted branch, mirroring the DirectMessage branch below: an
+            // edit to an ENCRYPTED channel message carries its new text as
+            // fresh ciphertext (`enc_content`/`enc_nonce`/`key_epoch`), which
+            // REPLACES the original message's encrypted fields wholesale.
+            // `validate_chat_edit` (messages/validation.rs) requires the
+            // plaintext `content` to be empty AND `key_epoch >= 1` on an
+            // encrypted edit (matching `validate_dm_edit`'s identical rule
+            // for DMs) — so `edit.key_epoch` is always `Some` by the time a
+            // stored, validated edit reaches this read-time projection; the
+            // `if let` below is defensive symmetry with the DM branch's
+            // identical pattern, not a real "omit to mean unchanged" path.
+            //
+            // The edit's own encrypted-or-plaintext shape must match the
+            // ORIGINAL message's — `validate_chat_edit` only ever sees the
+            // edit payload in isolation, so this is the first point that can
+            // cross-check it against the message it actually targets. A
+            // genuine edit (from this SDK, or any correctly-implemented
+            // client) always mirrors the original's own shape; a mismatch
+            // means either a malformed/crafted edit or one racing a
+            // concurrent edit that changed the shape, and either way the
+            // safe response is the same fail-safe already used for a
+            // missing/unrecoverable DM edit body: return `None` and let the
+            // caller blank the payload, rather than silently wiping a
+            // plaintext message's content to empty (which is what naively
+            // assigning `edit.content` — validated empty for an encrypted
+            // edit — would otherwise do here) or leaving stale ciphertext in
+            // place under a `content` field an encrypted original never uses.
+            let orig_encrypted = p.enc_content.is_some();
+            let edit_encrypted = edit.enc_content.is_some();
+            if edit_encrypted && !orig_encrypted {
+                // No legacy case to preserve here: no client before v0.133.0
+                // could construct `enc_content` on a `ChatEdit` at all (no
+                // SDK exposed it), so a plaintext original can only ever
+                // face an encrypted edit here if it was deliberately crafted
+                // (or raced a concurrent edit that flipped the original's
+                // own shape). The blanking fail-safe remains correct and
+                // necessary for that case — unlike the other direction
+                // below, there is no historical row whose rendering this
+                // would change.
+                warn_decode(
+                    "chat_edit_shape_mismatch",
+                    &"edit's enc_content presence disagrees with the original message's",
+                );
+                return None;
+            }
+            if orig_encrypted && edit_encrypted {
+                let ct = match edit.enc_content {
+                    Some(c) => c,
+                    None => { warn_decode("chat_edit_no_ct", &"missing enc_content"); return None; }
+                };
+                let nonce = match edit.enc_nonce {
+                    Some(n) => n,
+                    None => { warn_decode("chat_edit_no_nonce", &"missing enc_nonce"); return None; }
+                };
+                p.enc_content = Some(ct);
+                p.enc_nonce = Some(nonce);
+                if let Some(e) = edit.key_epoch { p.key_epoch = Some(e); }
+                // Set directly rather than from `edit.content` — validation
+                // already guarantees that's empty for an encrypted edit, but
+                // this way the encrypted arm stays correct on its OWN terms,
+                // independent of that invariant continuing to hold (e.g.
+                // against a future sync/federation/backfill path that writes
+                // envelopes without going through `validate_chat_edit`).
+                p.content = String::new();
+            } else if orig_encrypted {
+                // LEGACY COMPATIBILITY, not a fail-safe: `orig_encrypted &&
+                // !edit_encrypted` — every node before v0.133.0 accepted a
+                // plaintext `ChatEdit` against an encrypted original (there
+                // was no shape check at all), and its `EDIT_HISTORY` row is
+                // permanent — it cannot be un-submitted. The pre-existing
+                // projection for that row did `p.content = edit.content`
+                // (a no-op: every compliant client prefers `enc_content`
+                // over `content` whenever the former is present, so the
+                // text never actually changed) while STILL applying the
+                // edit's `attachments`/`buttons` overrides below exactly as
+                // for any other edit — those two fields are plaintext-even-
+                // when-encrypted (spec §3.7) and were never gated on
+                // `enc_content` shape by the pre-v0.133.0 code. So leave
+                // `p.content`/`enc_content`/`enc_nonce`/`key_epoch` alone
+                // here (skip only the text substitution) and fall through
+                // to the shared attachments/buttons handling below — a
+                // version that dropped those too would silently UNDO a
+                // legacy edit's real effect on deploy: restoring an
+                // attachment the user had deleted, or re-arming a bot's
+                // button row it had deliberately cleared (security audit,
+                // round 3: an earlier version of this branch early-returned
+                // before reaching the attachments/buttons code, which broke
+                // exactly this). Since v0.133.0's own write-time check
+                // (`authorize_edit_delete`) now rejects this shape
+                // combination for every NEW edit (proven by router.rs's
+                // `plaintext_edit_against_encrypted_original_is_rejected`),
+                // this branch can only be reached by a row that predates
+                // this version.
+            } else {
+                p.content = edit.content;
+            }
             if let Some(a) = edit.attachments { p.attachments = a; }
             // `Some([])` clears the button row; `None` leaves it unchanged —
             // this IS the button lifecycle mechanism (spec §3.7): a bot
@@ -8955,6 +9071,278 @@ mod edit_projection_tests {
             "expected msgpack map, got 0x{:02x}",
             bytes[0]
         );
+    }
+}
+
+#[cfg(test)]
+mod encrypted_chat_edit_projection_tests {
+    //! End-to-end coverage for `project_edited_payload`'s new encrypted-
+    //! ChatMessage branch (channel edit support for encrypted channels —
+    //! previously DM-only). Exercises the real function against a real
+    //! `Storage`, unlike `edit_projection_tests` above (which only checks
+    //! the re-encoding shape).
+    use super::project_edited_payload;
+    use crate::messages::envelope::{Envelope, PROTOCOL_VERSION};
+    use crate::messages::types::{ChatMessagePayload, ContentRating, EditPayload, MessageType};
+    use crate::storage::rocks::Storage;
+    use tempfile::TempDir;
+
+    fn db() -> (Storage, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        (storage, dir)
+    }
+
+    fn plaintext_chat_envelope(msg_id: [u8; 32], content: &str) -> Envelope {
+        let payload = ChatMessagePayload {
+            channel_id: 42,
+            content: content.into(),
+            content_rating: ContentRating::General,
+            reply_to: None,
+            mentions: vec![],
+            attachments: vec![],
+            enc_content: None,
+            enc_nonce: None,
+            key_epoch: None,
+            buttons: vec![],
+            via_button: false,
+        };
+        Envelope {
+            version: PROTOCOL_VERSION,
+            msg_type: MessageType::ChatMessage,
+            msg_id,
+            author: "klv1author00000000000000000000000000000000000000000000000000000".into(),
+            timestamp: 1_000,
+            lamport_ts: 0,
+            payload: rmp_serde::to_vec_named(&payload).unwrap(),
+            signature: Vec::new(),
+            relay_path: Vec::new(),
+        }
+    }
+
+    fn encrypted_chat_envelope(
+        msg_id: [u8; 32],
+        enc_content: Vec<u8>,
+        enc_nonce: [u8; 24],
+        key_epoch: u64,
+    ) -> Envelope {
+        let payload = ChatMessagePayload {
+            channel_id: 42,
+            content: "".into(),
+            content_rating: ContentRating::General,
+            reply_to: None,
+            mentions: vec![],
+            attachments: vec![],
+            enc_content: Some(enc_content),
+            enc_nonce: Some(enc_nonce),
+            key_epoch: Some(key_epoch),
+            buttons: vec![],
+            via_button: false,
+        };
+        Envelope {
+            version: PROTOCOL_VERSION,
+            msg_type: MessageType::ChatMessage,
+            msg_id,
+            author: "klv1author00000000000000000000000000000000000000000000000000000".into(),
+            timestamp: 1_000,
+            lamport_ts: 0,
+            payload: rmp_serde::to_vec_named(&payload).unwrap(),
+            signature: Vec::new(),
+            relay_path: Vec::new(),
+        }
+    }
+
+    fn edit_envelope(msg_id: [u8; 32], edit: EditPayload) -> Envelope {
+        Envelope {
+            version: PROTOCOL_VERSION,
+            msg_type: MessageType::ChatEdit,
+            msg_id,
+            author: "klv1author00000000000000000000000000000000000000000000000000000".into(),
+            timestamp: 2_000,
+            lamport_ts: 0,
+            payload: rmp_serde::to_vec_named(&edit).unwrap(),
+            signature: Vec::new(),
+            relay_path: Vec::new(),
+        }
+    }
+
+    fn base_edit(target_id: [u8; 32]) -> EditPayload {
+        EditPayload {
+            target_id,
+            channel_id: Some(42),
+            content: "".into(),
+            edited_at: 3_000,
+            title: None,
+            tags: None,
+            attachments: None,
+            buttons: None,
+            enc_content: None,
+            enc_nonce: None,
+            key_epoch: None,
+        }
+    }
+
+    #[test]
+    fn encrypted_edit_replaces_enc_content_wholesale() {
+        let (s, _dir) = db();
+        let orig_id = [1u8; 32];
+        let edit_id = [2u8; 32];
+        s.store_message(
+            &orig_id,
+            &rmp_serde::to_vec_named(&encrypted_chat_envelope(orig_id, vec![9, 9, 9], [1u8; 24], 1))
+                .unwrap(),
+        )
+        .unwrap();
+        let mut edit = base_edit(orig_id);
+        edit.enc_content = Some(vec![7, 7, 7, 7]);
+        edit.enc_nonce = Some([2u8; 24]);
+        edit.key_epoch = Some(5);
+        s.store_message(&edit_id, &rmp_serde::to_vec_named(&edit_envelope(edit_id, edit)).unwrap())
+            .unwrap();
+
+        let merged = project_edited_payload(&orig_id, &edit_id, &s).expect("projection succeeds");
+        let p: ChatMessagePayload = rmp_serde::from_slice(&merged).unwrap();
+        assert_eq!(p.enc_content, Some(vec![7, 7, 7, 7]));
+        assert_eq!(p.enc_nonce, Some([2u8; 24]));
+        assert_eq!(p.key_epoch, Some(5));
+        assert_eq!(p.content, "", "plaintext content must stay empty on an encrypted message");
+    }
+
+    /// Defensive fail-safe test, NOT real "omit to mean unchanged" semantics
+    /// (code audit: an earlier version of this test's name/comment implied
+    /// the opposite). Per protocol §3.7, an encrypted `ChatEdit` requires
+    /// `key_epoch` to always be `Some(_)` — `validate_chat_edit` rejects
+    /// `None` outright, so `process_message` can never produce the payload
+    /// this test constructs. This test reaches the state only by writing
+    /// directly into `Storage`, bypassing validation entirely, to confirm
+    /// `project_edited_payload` still degrades safely (falls back to the
+    /// original's epoch rather than corrupting the merged payload) if some
+    /// future write path — sync, federation, backfill, a bug — ever manages
+    /// to store an edit envelope validation would have rejected.
+    #[test]
+    fn encrypted_edit_with_a_validation_bypassing_missing_key_epoch_falls_back_to_the_original() {
+        let (s, _dir) = db();
+        let orig_id = [1u8; 32];
+        let edit_id = [2u8; 32];
+        s.store_message(
+            &orig_id,
+            &rmp_serde::to_vec_named(&encrypted_chat_envelope(orig_id, vec![9, 9, 9], [1u8; 24], 3))
+                .unwrap(),
+        )
+        .unwrap();
+        let mut edit = base_edit(orig_id);
+        edit.enc_content = Some(vec![7, 7, 7]);
+        edit.enc_nonce = Some([2u8; 24]);
+        edit.key_epoch = None; // only reachable by bypassing validate_chat_edit, see doc comment above
+        s.store_message(&edit_id, &rmp_serde::to_vec_named(&edit_envelope(edit_id, edit)).unwrap())
+            .unwrap();
+
+        let merged = project_edited_payload(&orig_id, &edit_id, &s).expect("projection succeeds");
+        let p: ChatMessagePayload = rmp_serde::from_slice(&merged).unwrap();
+        assert_eq!(p.key_epoch, Some(3), "epoch must carry over from the original when the edit omits it");
+    }
+
+    #[test]
+    fn encrypted_edit_against_a_plaintext_original_is_rejected() {
+        let (s, _dir) = db();
+        let orig_id = [1u8; 32];
+        let edit_id = [2u8; 32];
+        s.store_message(
+            &orig_id,
+            &rmp_serde::to_vec_named(&plaintext_chat_envelope(orig_id, "hello")).unwrap(),
+        )
+        .unwrap();
+        let mut edit = base_edit(orig_id);
+        edit.enc_content = Some(vec![7, 7, 7]);
+        edit.enc_nonce = Some([2u8; 24]);
+        edit.key_epoch = Some(1);
+        s.store_message(&edit_id, &rmp_serde::to_vec_named(&edit_envelope(edit_id, edit)).unwrap())
+            .unwrap();
+
+        // Must fail closed (None → caller blanks the payload), never silently
+        // wipe the plaintext original's content to empty without ever
+        // applying any real encryption.
+        assert!(project_edited_payload(&orig_id, &edit_id, &s).is_none());
+    }
+
+    /// LEGACY COMPATIBILITY, not a fail-safe: every node before v0.133.0
+    /// accepted a plaintext `ChatEdit` against an encrypted original with no
+    /// shape check at all, and that `EDIT_HISTORY` row is permanent. Every
+    /// node before this version projected it by leaving `content`/
+    /// `enc_content` untouched (a no-op — every compliant client prefers
+    /// `enc_content` when present) while STILL applying the edit's
+    /// `attachments`/`buttons` overrides, exactly like any other edit — those
+    /// two fields are plaintext-even-when-encrypted (spec §3.7) and were
+    /// never gated on ciphertext shape. Since `authorize_edit_delete` now
+    /// rejects this shape combination for every NEW edit, this projection
+    /// path can only be reached by a row that predates v0.133.0 — so it must
+    /// keep reproducing that exact historical behavior. Two things this test
+    /// guards against, both found by the security audit (round 2 and round
+    /// 3 respectively): (a) BLOCKING — naively returning `None` here would
+    /// newly and permanently blank every such legacy message, network-wide,
+    /// the instant this version is deployed; (b) an early-return that skips
+    /// content ONLY WITHOUT falling through to the attachments/buttons
+    /// overrides would silently UNDO a legacy edit's real effect — restoring
+    /// an attachment the user had deleted, or re-arming a bot's button row
+    /// it had deliberately cleared.
+    #[test]
+    fn plaintext_edit_against_an_encrypted_original_is_a_legacy_noop_not_a_blank() {
+        let (s, _dir) = db();
+        let orig_id = [1u8; 32];
+        let edit_id = [2u8; 32];
+        s.store_message(
+            &orig_id,
+            &rmp_serde::to_vec_named(&encrypted_chat_envelope(orig_id, vec![9, 9, 9], [1u8; 24], 1))
+                .unwrap(),
+        )
+        .unwrap();
+        let mut edit = base_edit(orig_id);
+        edit.content = "surprise plaintext".into();
+        // Even a legacy shape-mismatched edit applied its attachments/buttons
+        // overrides on every pre-v0.133.0 node — this must still happen.
+        edit.attachments = Some(vec![]); // clears whatever the original had
+        edit.buttons = Some(vec![crate::messages::types::ButtonRow {
+            buttons: vec![crate::messages::types::MessageButton {
+                label: "1h".into(),
+                command: "/c BTC 1h".into(),
+            }],
+        }]);
+        s.store_message(&edit_id, &rmp_serde::to_vec_named(&edit_envelope(edit_id, edit)).unwrap())
+            .unwrap();
+
+        let merged = project_edited_payload(&orig_id, &edit_id, &s)
+            .expect("legacy plaintext-edit-vs-encrypted-original must project as a no-op, not blank");
+        let p: ChatMessagePayload = rmp_serde::from_slice(&merged).unwrap();
+        assert_eq!(p.enc_content, Some(vec![9, 9, 9]), "original ciphertext must survive untouched");
+        assert!(p.attachments.is_empty(), "attachments override must still apply for a legacy edit");
+        assert_eq!(p.buttons.len(), 1, "buttons override must still apply for a legacy edit");
+        assert_eq!(p.buttons[0].buttons[0].label, "1h");
+        assert_eq!(p.enc_nonce, Some([1u8; 24]));
+        assert_eq!(p.key_epoch, Some(1));
+        assert_eq!(p.content, "", "the legacy edit's plaintext content must never be applied");
+    }
+
+    #[test]
+    fn plaintext_edit_against_a_plaintext_original_is_unaffected_by_the_new_branch() {
+        // Regression guard: the mismatch check must not fire for the
+        // ordinary, already-shipped plaintext-edits-plaintext case.
+        let (s, _dir) = db();
+        let orig_id = [1u8; 32];
+        let edit_id = [2u8; 32];
+        s.store_message(
+            &orig_id,
+            &rmp_serde::to_vec_named(&plaintext_chat_envelope(orig_id, "hello")).unwrap(),
+        )
+        .unwrap();
+        let mut edit = base_edit(orig_id);
+        edit.content = "hello, edited".into();
+        s.store_message(&edit_id, &rmp_serde::to_vec_named(&edit_envelope(edit_id, edit)).unwrap())
+            .unwrap();
+
+        let merged = project_edited_payload(&orig_id, &edit_id, &s).expect("projection succeeds");
+        let p: ChatMessagePayload = rmp_serde::from_slice(&merged).unwrap();
+        assert_eq!(p.content, "hello, edited");
+        assert_eq!(p.enc_content, None);
     }
 }
 

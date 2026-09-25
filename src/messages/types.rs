@@ -594,16 +594,25 @@ pub struct EditPayload {
     pub content: String,
     /// Timestamp of the edit.
     pub edited_at: u64,
-    // -- Optional field-level overrides (spec 3.7, added in L2 v0.37). --
+    // -- Optional field-level overrides (spec 3.7, added in L2 v0.37; the
+    // enc_content/enc_nonce/key_epoch trio was DM-only through L2 v0.37,
+    // extended to cover encrypted ChatEdit too in a later release). --
     // When `None`, the corresponding field on the original payload is preserved
     // (this is what fixes the "edit drops title/tags/attachments" bug). When
     // `Some(_)`, the original field is replaced wholesale during read-time
-    // projection in `enrich_message_json`. Per-type semantics:
+    // projection in `enrich_message_json`/`project_edited_payload` (api/routes.rs).
+    // Per-type semantics:
     //   - NewsEdit:        title, tags, attachments all applicable
-    //   - ChatEdit:        attachments applicable; title/tags ignored
+    //   - ChatEdit:        attachments/buttons applicable; title/tags ignored.
+    //     `enc_content`/`enc_nonce`/`key_epoch` apply ONLY when the ORIGINAL
+    //     message was itself encrypted (`ChatMessagePayload::enc_content` was
+    //     `Some`) — `project_edited_payload` rejects a mismatch either way
+    //     (an encrypted edit targeting a plaintext original, or vice versa)
+    //     rather than silently producing a message in an inconsistent shape.
     //   - DirectMessageEdit: title/tags/attachments ignored; the new content
-    //     rides as ciphertext in `enc_content`/`enc_nonce`/`key_epoch` below
-    //     (the plaintext `content` String is an unused placeholder for DM edits).
+    //     ALWAYS rides as ciphertext in `enc_content`/`enc_nonce`/`key_epoch`
+    //     below (the plaintext `content` String is an unused placeholder for
+    //     DM edits — DMs have no plaintext form to fall back to).
     // Trailing position + `#[serde(default)]` keeps msgpack wire-compat: old
     // 4-element edit envelopes still decode into the new struct.
     /// Optional new title (news posts only).
@@ -621,16 +630,20 @@ pub struct EditPayload {
     /// builds an in-place sub-menu, by editing its own message.
     #[serde(default)]
     pub buttons: Option<Vec<ButtonRow>>,
-    /// DM-only: XChaCha20-Poly1305 ciphertext of the new content under the
-    /// conversation key (`conv_key`). Opaque to the node — it relays bytes it
-    /// cannot read, identically to `DirectMessagePayload::content`. Present iff
-    /// this is an encrypted `DirectMessageEdit`.
+    /// XChaCha20-Poly1305 ciphertext of the new content, sealed under the
+    /// conversation/channel key (`conv_key`/channel epoch key as applicable).
+    /// Opaque to the node — it relays bytes it cannot read, identically to
+    /// `DirectMessagePayload::content`/`ChatMessagePayload::enc_content`.
+    /// Present iff this is an encrypted `DirectMessageEdit`, or a `ChatEdit`
+    /// targeting an originally-encrypted channel message.
     #[serde(default)]
     pub enc_content: Option<Vec<u8>>,
-    /// DM-only: 24-byte AEAD nonce for `enc_content` (matches `DirectMessagePayload::nonce`).
+    /// 24-byte AEAD nonce for `enc_content` (matches `DirectMessagePayload::nonce`/
+    /// `ChatMessagePayload::enc_nonce`).
     #[serde(default)]
     pub enc_nonce: Option<[u8; 24]>,
-    /// DM-only: which `conv_key` epoch `enc_content` was sealed under (§8.2).
+    /// Which key epoch `enc_content` was sealed under (§8.2) — the DM
+    /// `conv_key`'s epoch, or the channel's epoch key, as applicable.
     #[serde(default)]
     pub key_epoch: Option<u64>,
 }
