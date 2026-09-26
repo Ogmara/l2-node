@@ -1541,6 +1541,44 @@ impl Node {
                 }
             });
             anchor_task = Some(handle);
+
+            // Governance auto-executor (l2-node 0.134.0) — reuses the
+            // SAME `gov_tx` sender the HTTP Execute button uses (cloned
+            // here before the tuple below moves the original), so no
+            // second signing path exists. Gated on `auto_execute` (see
+            // `GovernanceConfig` doc) in addition to `anchoring.enabled`
+            // above, since the task is a no-op without a signing
+            // channel regardless.
+            if self.config.governance.auto_execute {
+                let ge_klever_url = self.config.klever.node_url.clone();
+                let ge_contract = self.config.klever.contract_address.clone();
+                let ge_wallet_address = anchor_wallet_address_computed.clone();
+                let ge_storage = self.storage.clone();
+                let ge_gov_tx = gov_tx.clone();
+                let ge_alert_tx = anchor_alert_tx.clone();
+                let ge_check_interval =
+                    std::time::Duration::from_secs(self.config.governance.check_interval_secs);
+                let ge_funds_retry_interval = std::time::Duration::from_secs(
+                    self.config.governance.funds_retry_interval_secs,
+                );
+                let ge_shutdown_rx = self.shutdown_rx();
+                spawn_supervised("governance_autoexec", async move {
+                    match crate::chain::governance_autoexec::GovernanceAutoExecutor::new(
+                        ge_klever_url,
+                        ge_contract,
+                        ge_wallet_address,
+                        ge_storage,
+                        ge_gov_tx,
+                        ge_alert_tx,
+                        ge_check_interval,
+                        ge_funds_retry_interval,
+                    ) {
+                        Ok(executor) => executor.run(ge_shutdown_rx).await,
+                        Err(e) => warn!(error = %e, "Failed to start governance_autoexec"),
+                    }
+                });
+            }
+
             (Some(trigger_tx), Some(gov_tx), Some(anchor_wallet_address_computed))
         } else {
             (None, None, None)

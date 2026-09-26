@@ -17,6 +17,7 @@
 //! transport / decoding errors propagate as `Err`.
 
 use anyhow::{Context, Result};
+use tracing::warn;
 
 /// Minimal big-endian even-length hex encoding of a u64. Mirrors
 /// `chain::anchor_verify::encode_u64_minimal_hex` and the anchor TX
@@ -976,10 +977,32 @@ async fn list_proposals_generic(
             resp.items.len()
         );
     }
-    resp.items
-        .chunks_exact(PROPOSAL_SUMMARY_ITEM_COUNT)
-        .map(|chunk| decode_proposal_summary(func_name, chunk))
-        .collect()
+    // Decode leniently, per row — do NOT fail the whole page on one bad
+    // row. `description`/`param_key` are attacker-influenced and, per
+    // `ProposalSummary`'s own doc, validated only for LENGTH at create
+    // time, never encoding (unlike `param_key`, which the node-track
+    // additionally UTF-8-checks at create time — the user-track
+    // `description` field has no such check on either track). A single
+    // non-UTF-8 `description` used to fail `decode_proposal_summary` and
+    // propagate through this function's old `collect::<Result<Vec<_>>>()`
+    // as an `Err` for the ENTIRE page — and since a page must decode
+    // before pagination can advance past it, one hostile proposal near
+    // the start of the id space would permanently wedge every caller
+    // that walks forward from offset 0, including `governance_autoexec`
+    // (l2-node 0.134.0), which is now an automated, fee-spending
+    // consumer of this exact path (Security Audit finding on that
+    // feature). Skipping the row and logging is strictly safer than
+    // failing the page: the caller sees one fewer row rather than none.
+    let mut out = Vec::with_capacity(resp.items.len() / PROPOSAL_SUMMARY_ITEM_COUNT);
+    for chunk in resp.items.chunks_exact(PROPOSAL_SUMMARY_ITEM_COUNT) {
+        match decode_proposal_summary(func_name, chunk) {
+            Ok(summary) => out.push(summary),
+            Err(e) => {
+                warn!(func_name, error = %e, "skipping undecodable proposal row");
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Shared proposal-count fetch+decode (plain scalar u64 via `/vm/hex`,

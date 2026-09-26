@@ -29,6 +29,10 @@ pub struct Config {
     pub push_gateway: PushGatewayConfig,
     #[serde(default)]
     pub anchoring: AnchoringConfig,
+    /// Auto-execution of this node's own node-track governance
+    /// proposals (l2-node 0.134.0). See [`GovernanceConfig`].
+    #[serde(default)]
+    pub governance: GovernanceConfig,
     #[serde(default)]
     pub snapshot: SnapshotConfig,
     #[serde(default)]
@@ -1760,6 +1764,62 @@ pub struct AnchorMetadataConfig {
     pub multiaddrs: Vec<String>,
 }
 
+/// `[governance]` — auto-execution of this node's OWN node-track
+/// governance proposals (l2-node 0.134.0, `chain::governance_autoexec`).
+///
+/// `executeNodeProposal` is on-chain permissionless (see
+/// `smart-contract/src/node_governance.rs`), but historically nothing
+/// called it once voting ended — a passed proposal just sat `closed`
+/// until an operator noticed and clicked the dashboard Execute button.
+/// This section drives a background task that auto-executes ONLY
+/// proposals this node itself created, using the exact same signing
+/// channel the dashboard button already goes through (no new signing
+/// path, no broader trust boundary than a click already had).
+///
+/// Unlike `[anchoring.metadata]`, default is opt-OUT (`auto_execute =
+/// true`) rather than opt-in: the scope is inherently self-limited (a
+/// node can never touch another node's proposal) and it removes pure
+/// operational friction, not a privacy/visibility trade-off the way
+/// `getActiveNodes` publication is. Operators who want to keep the
+/// manual-only workflow can still set `auto_execute = false`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GovernanceConfig {
+    /// Auto-execute this node's own passed proposals once voting ends.
+    /// Requires `[anchoring] enabled = true` (the task reuses the
+    /// anchor wallet's signing channel) — a no-op otherwise.
+    #[serde(default = "default_true")]
+    pub auto_execute: bool,
+    /// How often to check this node's own open proposals for a closed
+    /// (passed, unexecuted) tally. Default 900s (15 min) — proposals
+    /// run 7-30 days, so promptness here is a courtesy, not a
+    /// correctness requirement.
+    #[serde(default = "default_governance_check_interval_secs")]
+    pub check_interval_secs: u64,
+    /// Backoff applied after a submit attempt fails because the anchor
+    /// wallet can't pay the tx fee, so a drained wallet doesn't get
+    /// hammered every `check_interval_secs` — see
+    /// `governance_autoexec`'s module doc. Default 21600s (6h).
+    #[serde(default = "default_governance_funds_retry_interval_secs")]
+    pub funds_retry_interval_secs: u64,
+}
+
+impl Default for GovernanceConfig {
+    fn default() -> Self {
+        Self {
+            auto_execute: true,
+            check_interval_secs: default_governance_check_interval_secs(),
+            funds_retry_interval_secs: default_governance_funds_retry_interval_secs(),
+        }
+    }
+}
+
+fn default_governance_check_interval_secs() -> u64 {
+    900
+}
+fn default_governance_funds_retry_interval_secs() -> u64 {
+    21600
+}
+
 /// Snapshot bootstrap configuration (spec 11-snapshot-sync.md).
 ///
 /// Controls peer-to-peer state snapshots: a serving node periodically caches
@@ -2451,6 +2511,19 @@ impl Config {
             anyhow::bail!(
                 "network.sc_discovery.max_candidates must be > 0 (default is 5)"
             );
+        }
+        // `tokio::time::interval` panics on a zero `Duration` — a
+        // Code Audit pass on l2-node 0.134.0 found `governance_autoexec`
+        // had no guard for this, unlike every other interval-driven
+        // config knob in this function, so a `check_interval_secs = 0`
+        // (or `funds_retry_interval_secs = 0`, used the same way in the
+        // funds-blocked backoff arithmetic) would boot the node fine and
+        // panic the background task on its first tick.
+        if self.governance.check_interval_secs == 0 {
+            anyhow::bail!("governance.check_interval_secs must be > 0 (default is 900)");
+        }
+        if self.governance.funds_retry_interval_secs == 0 {
+            anyhow::bail!("governance.funds_retry_interval_secs must be > 0 (default is 21600)");
         }
         // Spec 3 §4.1 — bot discovery bounds. Zeros here fail SILENTLY rather
         // than loudly: a zero scan cap makes the endpoint return an empty list
@@ -3593,6 +3666,32 @@ publish = false
 # onion) set this explicitly. Cap: 8 entries × 256 bytes each (SC limit).
 multiaddrs = []
 
+[governance]
+# Auto-execution of THIS node's OWN node-track governance proposals
+# once voting ends and the tally passes (l2-node 0.134.0). Scope is
+# narrow by construction: a node can only ever execute a proposal it
+# itself created (matched by proposer address), never another node's —
+# `executeNodeProposal` is already permissionless on-chain, this just
+# stops a passed proposal from sitting unexecuted until someone notices
+# the dashboard and clicks a button. Reuses the SAME signing channel the
+# dashboard's manual Execute button already goes through — no new key,
+# no new signing path.
+#
+# Defaults to true (opt-OUT, unlike [anchoring.metadata]'s opt-in) —
+# there is no privacy trade-off here and it cannot affect anyone else's
+# proposal, only friction removal. Set to false to keep the fully
+# manual, dashboard-click-only workflow.
+auto_execute = true
+# How often to check this node's own proposals for a closed (passed,
+# unexecuted) tally. Proposals run 7-30 days, so promptness here is a
+# courtesy, not a correctness requirement. Must be > 0.
+check_interval_secs = 900
+# Backoff applied after a submit fails because the anchor wallet can't
+# pay the transaction fee, so a drained wallet isn't hammered every
+# check_interval_secs — a warning alert fires and the next attempt on
+# that proposal waits this long. Must be > 0.
+funds_retry_interval_secs = 21600
+
 [snapshot]
 # Peer-to-peer state snapshots (spec 11-snapshot-sync.md).
 # Phase 3 (v0.36): default-on. Fresh nodes fetch the snapshot from
@@ -3899,6 +3998,38 @@ mod tests {
         c.network.sc_discovery.max_candidates = 0;
         let err = c.validate().expect_err("0 max_candidates must be rejected");
         assert!(format!("{err}").contains("max_candidates"));
+    }
+
+    // --- 0.134.0 governance auto-executor -----------------------------
+
+    #[test]
+    fn validate_rejects_zero_governance_check_interval() {
+        // Code Audit finding, l2-node 0.134.0: `tokio::time::interval`
+        // panics on a zero duration; must fail loudly at config-load
+        // instead of panicking the background task on first tick.
+        let mut c = baseline_config();
+        c.governance.check_interval_secs = 0;
+        let err = c.validate().expect_err("0 check_interval_secs must be rejected");
+        assert!(format!("{err}").contains("check_interval_secs"));
+    }
+
+    #[test]
+    fn validate_rejects_zero_governance_funds_retry_interval() {
+        let mut c = baseline_config();
+        c.governance.funds_retry_interval_secs = 0;
+        let err = c
+            .validate()
+            .expect_err("0 funds_retry_interval_secs must be rejected");
+        assert!(format!("{err}").contains("funds_retry_interval_secs"));
+    }
+
+    #[test]
+    fn validate_passes_default_governance_config() {
+        let mut c = baseline_config();
+        assert!(c.governance.auto_execute);
+        assert_eq!(c.governance.check_interval_secs, 900);
+        assert_eq!(c.governance.funds_retry_interval_secs, 21600);
+        c.validate().expect("defaults must pass validation");
     }
 
     // --- 0.46.7 media peer-fallback (spec 3) -------------------------
@@ -4404,6 +4535,7 @@ mod tests {
             "[push_gateway]",
             "[anchoring]",
             "[anchoring.metadata]",
+            "[governance]",
             "[snapshot]",
             "[bots]",
             "[metrics]",

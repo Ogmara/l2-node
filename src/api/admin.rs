@@ -1509,7 +1509,7 @@ fn now_unix() -> u64 {
 /// supermajority are only meaningful once voting has actually ended —
 /// checking them earlier would misreport an `open` proposal that just
 /// hasn't finished accumulating votes yet as `failed`.
-fn proposal_status(
+pub(crate) fn proposal_status(
     executed: bool,
     expires_at: u64,
     now: u64,
@@ -1830,7 +1830,7 @@ fn encode_bool_calldata_arg(support: bool) -> &'static str {
 /// `"00"` for VIEW-call arguments specifically (`/vm/query`/`/vm/hex`)
 /// — a different RPC context from TX calldata (`/transaction/send`'s
 /// `Data` field, `@`-separated). Do not merge these two encoders.
-fn encode_u64_calldata_arg(v: u64) -> String {
+pub(crate) fn encode_u64_calldata_arg(v: u64) -> String {
     if v == 0 {
         return String::new();
     }

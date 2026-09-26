@@ -2,6 +2,7 @@
 
 pub mod anchor_verify;
 pub mod anchoring;
+pub mod governance_autoexec;
 pub mod metadata_reconcile;
 pub mod parser;
 pub mod sc_views;

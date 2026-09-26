@@ -371,6 +371,32 @@ publish = false
 # onion) set this explicitly. Cap: 8 entries × 256 bytes each (SC limit).
 multiaddrs = []
 
+[governance]
+# Auto-execution of THIS node's OWN node-track governance proposals
+# once voting ends and the tally passes (l2-node 0.134.0). Scope is
+# narrow by construction: a node can only ever execute a proposal it
+# itself created (matched by proposer address), never another node's —
+# `executeNodeProposal` is already permissionless on-chain, this just
+# stops a passed proposal from sitting unexecuted until someone notices
+# the dashboard and clicks a button. Reuses the SAME signing channel the
+# dashboard's manual Execute button already goes through — no new key,
+# no new signing path.
+#
+# Defaults to true (opt-OUT, unlike [anchoring.metadata]'s opt-in) —
+# there is no privacy trade-off here and it cannot affect anyone else's
+# proposal, only friction removal. Set to false to keep the fully
+# manual, dashboard-click-only workflow.
+auto_execute = true
+# How often to check this node's own proposals for a closed (passed,
+# unexecuted) tally. Proposals run 7-30 days, so promptness here is a
+# courtesy, not a correctness requirement. Must be > 0.
+check_interval_secs = 900
+# Backoff applied after a submit fails because the anchor wallet can't
+# pay the transaction fee, so a drained wallet isn't hammered every
+# check_interval_secs — a warning alert fires and the next attempt on
+# that proposal waits this long. Must be > 0.
+funds_retry_interval_secs = 21600
+
 [snapshot]
 # Peer-to-peer state snapshots (spec 11-snapshot-sync.md).
 # Phase 3 (v0.36): default-on. Fresh nodes fetch the snapshot from

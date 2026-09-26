@@ -5,6 +5,66 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.134.0] - 2026-09-26
+
+### Added
+
+- **Governance auto-executor** (`chain::governance_autoexec`, `[governance]`
+  config section) — a node now auto-executes its OWN node-track governance
+  proposals once voting ends and the tally passes (quorum + supermajority
+  met), instead of a proposal sitting `closed` indefinitely until an
+  operator noticed it in the dashboard and clicked Execute.
+  `executeNodeProposal` is already permissionless on-chain
+  (`smart-contract`'s `node_governance.rs`); nothing enforced who — or
+  what — actually called it. Scope is deliberately narrow: a node only
+  ever executes proposals it itself created (matched by `proposer == this
+  node's anchor wallet address`). Discovery uses a persisted incremental
+  cursor (`LAST_SCANNED_TOTAL_KEY`/`TRACKED_IDS_KEY` in the `NODE_STATE`
+  RocksDB CF) rather than re-scanning the full network-wide proposal
+  history every tick, so steady-state cost is O(new proposals since last
+  tick) + O(this node's own currently-open proposals), not O(total
+  proposals ever created) — and the tracked set self-heals across
+  restarts. Reuses the exact same `governance_submit` channel the
+  dashboard's Execute button already goes through — no new signing path.
+  On a submit failure classified as insufficient wallet balance (Klever's
+  tx errors carry no structured code, so this uses the same substring
+  heuristic `desktop`/`web`'s `klever.ts` already use client-side), fires
+  `AlertType::GovernanceProposalExecuteFundsBlocked` (dedup left to
+  `AlertEngine`'s own per-type cooldown, same as `MetadataDriftDetected`)
+  and backs off to `funds_retry_interval_secs` (default 6h) instead of
+  retrying every tick; an unclassified failure backs off 1h. Default
+  `auto_execute = true` (opt-out, not opt-in — unlike
+  `[anchoring.metadata]`, the feature has no privacy trade-off and cannot
+  touch another node's proposal); `check_interval_secs` and
+  `funds_retry_interval_secs` are both validated `> 0` at config-load
+  (`tokio::time::interval` panics on a zero duration).
+
+### Changed
+
+- **`sc_views::list_proposals_generic` (backs `listProposals`/
+  `listNodeProposals`, used by both governance tracks' dashboard views AND
+  the new auto-executor above) now decodes proposal rows leniently.** A
+  single row that fails to decode (e.g. a non-UTF-8 `description` — that
+  field is attacker-influenced and validated only for LENGTH at create
+  time, never encoding) used to fail the ENTIRE page. Since a page must
+  decode successfully before pagination can advance past it, one hostile
+  `createNodeProposal`/`createProposal` call from any registered
+  node/user could have permanently wedged every OTHER node's new
+  auto-executor network-wide, not just the dashboard list view. The
+  function now skips an undecodable row with a `warn!` log instead of
+  failing the page.
+
+### Security
+
+- **Depends on smart-contract 0.11.0's quorum-denominator snapshot fix**
+  for correctness under node churn: `getNodeProposalTally`'s live
+  `active_node_count` denominator could previously be shrunk by
+  `pauseNode`/`unregisterNode` calls made AFTER voting closed, and an
+  automated executor acting on that live tally without a human eyeballing
+  it first would have made that manipulation silently consequential. Once
+  the upgraded contract is deployed, this node reads the corrected,
+  creation-time-snapshotted quorum from the same view unchanged.
+
 ## [0.133.0] - 2026-09-24
 
 ### Added

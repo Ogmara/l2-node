@@ -108,6 +108,24 @@ pub enum AlertType {
     /// Cooldown bounds re-fire so a topic with no subscribers does not
     /// flood the alert log.
     PublishFailedInsufficientPeers,
+    /// `chain::governance_autoexec`'s background task tried to
+    /// auto-execute one of this node's own closed (passed, unexecuted)
+    /// node-governance proposals and the anchor wallet couldn't pay the
+    /// transaction fee (l2-node 0.134.0). Fired on EVERY funds-blocked
+    /// attempt (an earlier draft gated this behind a persisted per-
+    /// proposal "already notified" flag; a Code Audit pass found that
+    /// could permanently suppress a genuinely-new proposal's first alert
+    /// if it fell inside an unrelated proposal's cooldown window, so the
+    /// flag was removed) — dedup across time is left entirely to THIS
+    /// alert's own per-`AlertType` cooldown below, the same pattern
+    /// `MetadataDriftDetected` already relies on. The task's own
+    /// persisted backoff state (`funds_retry_interval_secs`, separate
+    /// from this cooldown) is what paces the underlying retry attempts;
+    /// see that module's doc comment. Clears on its own once the wallet
+    /// is topped up and a retry succeeds — there is no corresponding
+    /// "resolved" alert, the operator just stops seeing new ones for
+    /// that proposal.
+    GovernanceProposalExecuteFundsBlocked,
 }
 
 impl AlertType {
@@ -121,7 +139,8 @@ impl AlertType {
             | AlertType::MemoryUsageHigh
             | AlertType::AnchorOverdue
             | AlertType::ScSyncBehind
-            | AlertType::PublishFailedInsufficientPeers => AlertSeverity::Warning,
+            | AlertType::PublishFailedInsufficientPeers
+            | AlertType::GovernanceProposalExecuteFundsBlocked => AlertSeverity::Warning,
             AlertType::HighRateLimitTriggers
             | AlertType::FailedSignatureSpike
             | AlertType::NodeStarted
@@ -150,6 +169,9 @@ impl AlertType {
             AlertType::PublishFailedInsufficientPeers => {
                 "GossipSub publish failed — no peers subscribed to topic"
             }
+            AlertType::GovernanceProposalExecuteFundsBlocked => {
+                "Auto-execute of own governance proposal blocked on insufficient balance"
+            }
         }
     }
 
@@ -170,6 +192,9 @@ impl AlertType {
             AlertType::BootstrapScFallbackUsed => "bootstrap_sc_fallback_used",
             AlertType::MetadataDriftDetected => "metadata_drift_detected",
             AlertType::PublishFailedInsufficientPeers => "publish_failed_insufficient_peers",
+            AlertType::GovernanceProposalExecuteFundsBlocked => {
+                "governance_proposal_execute_funds_blocked"
+            }
         }
     }
 }
