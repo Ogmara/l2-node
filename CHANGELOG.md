@@ -5,6 +5,18 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.134.1] - 2026-09-27
+
+### Fixed
+
+- **`ogmara.example.toml` — `admin_wallets` quoting footgun.** The example
+  config shipped `admin_wallets = []` with no indication that array
+  elements must be quoted TOML strings. Pasting a bare bech32 address in
+  (e.g. `admin_wallets = [klv1...]`) fails config-load with "string values
+  must be quoted, expected literal string" and crash-loops the node under
+  `--restart unless-stopped` with no obvious cause from the error alone.
+  Added an inline comment with a quoted example directly above the field.
+
 ## [0.134.0] - 2026-09-26
 
 ### Added

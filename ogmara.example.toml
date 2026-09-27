@@ -220,6 +220,10 @@ challenge_ttl_seconds = 300
 [api.admin]
 enabled = true
 dashboard = true
+# Klever bech32 addresses (klv1...) with admin dashboard access. TOML strings
+# MUST be quoted — a bare address is parsed as an identifier, not a string,
+# and fails config-load with "string values must be quoted, expected literal
+# string". Example: admin_wallets = ["klv1nrnd939xzz4ys0pgpfzm2czhv4r77can6vzqz7ajlq9acm8w5d9qrznx8n"]
 admin_wallets = []
 session_ttl_hours = 24
 
