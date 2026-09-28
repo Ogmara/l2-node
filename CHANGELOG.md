@@ -5,6 +5,69 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.134.2] - 2026-09-28
+
+### Fixed
+
+- **Chain scanner: combinatorial-explosion subdivision on a rate-limited
+  catch-up.** When `process_range_paged` hit its 50-page cap, the caller
+  always subdivided the block range and retried each half — correct when a
+  range genuinely holds more matching transactions than the page budget,
+  but useless (and expensive) when the cap was hit purely because the range
+  is far from chain tip: the Klever API ignores `startBlock`/`endBlock` and
+  always returns newest-first, so every subdivision re-walks the identical
+  pages and hits the identical cap. For a 200-block batch far from tip this
+  recursed to single blocks — ~400 near-duplicate `process_range_paged`
+  calls, each burning up to 50 HTTP requests — and was observed live
+  driving a node into a sustained HTTP 429 storm against Klever testnet's
+  15-req/min cap, leaving a catch-up scan barely progressing over multiple
+  days. `process_range_paged` now tracks the page on which it first reached
+  the target range and only subdivides when meaningful budget remained
+  (`classify_cap_outcome`); otherwise it logs and moves on without
+  recursing. A first pass distinguished "reached at all" as a bare bool,
+  which still misclassified a range reached late (e.g. page 48/50) as
+  worth subdividing — fixed before merge by requiring at least half the
+  page budget to remain after reaching the range, not just that it was
+  reached.
+- **Chain scanner: no self-imposed pacing on outbound Klever API calls.**
+  The inter-page delay (100ms) allowed roughly 10 req/s — about 40x over
+  the documented 15-req/min testnet cap — so a catch-up scan typically drew
+  a 429 (discarding the whole batch's progress) well before completing a
+  50-page walk, meaning the subdivision fix above often couldn't even be
+  reached in practice; reactive exponential backoff only kicks in after the
+  wasted requests are already spent. Added `throttle_klever_request`, a
+  self-imposed minimum spacing (4.5s) applied uniformly before every
+  outbound Klever call this scanner makes (block-height poll, transaction
+  paging, channel-slug SC view query), to stay under the limit proactively.
+- **`ogmara.example.toml` / `Config::default_toml()` drift, breaking
+  `config::tests::ogmara_example_toml_matches_default_toml` on HEAD.**
+  0.134.1 hand-edited only the example file when adding the `admin_wallets`
+  quoting comment; `default_toml()` — the actual source of truth the
+  example is generated from and tested against — was never updated,
+  leaving that test failing on the 0.134.1 commit as pushed. Synced.
+
+### Security
+
+- The scanner's "skip without subdividing" path for an unreachable range is
+  a genuine, pre-existing gap (the old subdivide-to-single-block path was
+  equally unable to reach a genuinely-too-deep range — it just spent ~400x
+  the requests failing to), not one newly introduced here — but this fix
+  makes it far cheaper and more likely to actually complete, so it is
+  documented plainly rather than left implicit: a skipped range's SC events
+  (e.g. `ChannelCreated`) are **permanently** missed on that node — nothing
+  currently retries a skipped range, the chain cursor only advances forward,
+  and Phase 2 snapshot bootstrap only ever triggers on a strictly-fresh
+  node (`cursor == 0` at startup), not mid-run. A missed `ChannelCreated`
+  leaves `messages/router.rs`'s unverified L2 `ChannelCreate` skeleton
+  uncorrected, so a squatted `channel_id`'s forged creator can stand
+  permanently on an affected node. Not yet fixed: persisting skipped ranges
+  for retry/operator visibility (the dashboard currently reports a node
+  with silent gaps as fully synced, since `klever_sync_lag_blocks` is
+  computed from the same cursor that just advanced past them), and gating
+  the router's unverified-creator trust on whether a gap covers that
+  `channel_id`. Tracked for a follow-up pass; full 2026-09-28 code + security
+  audit findings recorded for that work.
+
 ## [0.134.1] - 2026-09-27
 
 ### Fixed

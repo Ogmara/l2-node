@@ -56,6 +56,26 @@ const TIP_BATCH_SIZE: u64 = 50;
 /// If we're more than this many blocks behind, we're in catch-up mode.
 const CATCHUP_THRESHOLD: u64 = 5_000;
 
+/// Self-imposed minimum spacing between outbound Klever API requests (ms).
+///
+/// Audit 2026-09-28: the old 100ms inter-page sleep in `process_range_paged`
+/// allowed ~10 req/s — roughly 40x over the testnet API's documented "15
+/// requests in 1m0s" cap — so a catch-up scan reliably drew a 429 partway
+/// through a page walk (often well before reaching `MAX_PAGES`), discarding
+/// the batch's progress before `PageOutcome`'s cap-exceeded classification
+/// could ever run. Reactive exponential backoff after the fact doesn't fix
+/// this: it burns the same wasted requests before backing off, every time.
+/// Pacing every outbound call proactively at a safe fraction of the known
+/// limit avoids the 429 in the first place. 4.5s spacing sustains ~13.3
+/// req/min, leaving margin under 15/min for network/response latency.
+/// Applied uniformly to every Klever HTTP call this scanner makes
+/// (`get_latest_block_height`, `process_range_paged`,
+/// `query_channel_id_by_slug`) via `throttle_klever_request` — the 429's
+/// error text says "for this endpoint", which may mean independent
+/// per-endpoint budgets, but sharing one conservative budget across all of
+/// them is the safe assumption absent confirmation either way.
+const KLEVER_REQUEST_MIN_SPACING_MS: u64 = 4_500;
+
 /// The chain scanner service.
 pub struct ChainScanner {
     /// Klever RPC/API configuration.
@@ -79,6 +99,10 @@ pub struct ChainScanner {
     /// source of chain-scan rate-limit amplification. `Mutex` for interior
     /// mutability (resolution runs on `&self`).
     slug_cache: std::sync::Mutex<std::collections::HashMap<String, u64>>,
+    /// Timestamp of the last outbound Klever API call, for
+    /// `throttle_klever_request`'s self-imposed pacing. `tokio::sync::Mutex`
+    /// since the throttle is held across an `.await` (the sleep itself).
+    last_klever_request: tokio::sync::Mutex<Option<tokio::time::Instant>>,
     /// Audit final pre-mainnet W35: shared millis-since-epoch of the last
     /// successful Klever RPC call, read by `MetricsCollector` into
     /// `MetricsSnapshot::klever_rpc_last_success_ms` for the
@@ -135,6 +159,7 @@ impl ChainScanner {
             consecutive_429s: 0,
             channel_tx,
             slug_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+            last_klever_request: tokio::sync::Mutex::new(None),
             klever_health,
         })
     }
@@ -304,6 +329,23 @@ impl ChainScanner {
         Ok(())
     }
 
+    /// Self-imposed pacing before every outbound Klever API call — see
+    /// `KLEVER_REQUEST_MIN_SPACING_MS`. Proactive, unlike the reactive
+    /// exponential backoff in `run`'s error handler: this avoids drawing a
+    /// 429 in the first place instead of paying for one and backing off
+    /// after the fact.
+    async fn throttle_klever_request(&self) {
+        let mut last = self.last_klever_request.lock().await;
+        if let Some(prev) = *last {
+            let min_next = prev + Duration::from_millis(KLEVER_REQUEST_MIN_SPACING_MS);
+            let now = tokio::time::Instant::now();
+            if min_next > now {
+                tokio::time::sleep(min_next - now).await;
+            }
+        }
+        *last = Some(tokio::time::Instant::now());
+    }
+
     /// Get the latest block height from the Klever API.
     ///
     /// Uses the API block list endpoint (not the node status endpoint)
@@ -311,6 +353,7 @@ impl ChainScanner {
     async fn get_latest_block_height(&self) -> Result<u64> {
         let url = format!("{}/v1.0/block/list?limit=1", self.config.api_url);
 
+        self.throttle_klever_request().await;
         let response = self
             .http
             .get(&url)
@@ -351,17 +394,56 @@ impl ChainScanner {
         // (work stack) so every block is fully covered before the cursor moves.
         let mut stack = vec![(start, end)];
         while let Some((s, e)) = stack.pop() {
-            if !self.process_range_paged(s, e).await? {
-                if s >= e {
-                    // A single block exceeding the cap is pathological (one block
-                    // with >MAX_PAGES*100 SC txs to our contract) — can't split
-                    // further; warn rather than loop forever.
-                    warn!(block = s, "single block exceeds pagination cap — some SC txs may be missed");
-                } else {
-                    let mid = s + (e - s) / 2;
-                    // Push high half first so the low half is processed first.
-                    stack.push((mid + 1, e));
-                    stack.push((s, mid));
+            match self.process_range_paged(s, e).await? {
+                PageOutcome::Complete => {}
+                PageOutcome::CapExceededDense => {
+                    if s >= e {
+                        // A single block exceeding the cap is pathological (one block
+                        // with >MAX_PAGES*100 SC txs to our contract) — can't split
+                        // further; warn rather than loop forever.
+                        warn!(block = s, "single block exceeds pagination cap — some SC txs may be missed");
+                    } else {
+                        let mid = s + (e - s) / 2;
+                        // Push high half first so the low half is processed first.
+                        stack.push((mid + 1, e));
+                        stack.push((s, mid));
+                    }
+                }
+                PageOutcome::CapExceededTooDeep => {
+                    // Subdividing would not help — see `PageOutcome` doc comment.
+                    // Every sub-range would independently re-walk the same
+                    // newest-first pages and hit the same cap, multiplying
+                    // wasted API calls (and rate-limit exposure) for zero
+                    // additional coverage.
+                    //
+                    // SECURITY (audit 2026-09-28): this is a PERMANENT gap, not
+                    // a deferred one. The cursor still advances past `end` once
+                    // `process_block_range` returns (`poll_blocks`'s
+                    // `set_chain_cursor`), and nothing else in this codebase
+                    // ever revisits an already-passed range — there is no gap
+                    // queue, no rewind, and Phase 2 snapshot bootstrap only
+                    // triggers on a strictly-fresh node (`cursor == 0` at
+                    // startup, `node.rs`), never mid-run. A `ChannelCreated`
+                    // lost here means `messages/router.rs`'s unverified L2
+                    // `ChannelCreate` skeleton (which trusts the first author
+                    // as creator until the real on-chain event corrects it) is
+                    // never corrected on THIS node — a squatted channel_id's
+                    // forged ownership stands permanently. This is a real,
+                    // pre-existing gap (the old subdivision-to-single-block
+                    // path was equally unable to reach a genuinely-too-deep
+                    // range — see PageOutcome doc comment) that this change
+                    // makes far cheaper to reach, not one it introduces. Not
+                    // yet fixed: persisting skipped ranges for retry/audit and
+                    // gating the router's unverified-creator trust on whether
+                    // a gap covers that channel_id. See CHANGELOG.
+                    warn!(
+                        start = s,
+                        end = e,
+                        "range too far behind chain tip to reach within the pagination \
+                         budget — skipping without subdividing (see process_range_paged); \
+                         SC events in this range are PERMANENTLY missed on this node, not \
+                         deferred — nothing currently retries a skipped range"
+                    );
                 }
             }
         }
@@ -370,9 +452,11 @@ impl ChainScanner {
 
     /// Page through type-63 SC transactions for `[start, end]`.
     ///
-    /// Returns `Ok(true)` when the range was fully processed (a short page
-    /// terminated it), or `Ok(false)` when it hit the page cap and the caller
-    /// must subdivide (audit 2026-06-07 W17).
+    /// Returns `PageOutcome::Complete` when the range was fully processed (a
+    /// short page terminated it), or one of the two cap-exceeded variants
+    /// (audit 2026-06-07 W17, refined — see `PageOutcome` doc comment) when
+    /// it hit the page cap: `CapExceededDense` if the caller should
+    /// subdivide, `CapExceededTooDeep` if subdividing would not help.
     ///
     /// **The Klever testnet API's `startBlock`/`endBlock` query params are
     /// silently NOT honored** — confirmed directly: a query with
@@ -391,23 +475,42 @@ impl ChainScanner {
     /// termination once results walk past `start` (safe given the
     /// newest-first ordering — every subsequent page can only be older
     /// still, so there is nothing further to find in-range).
-    async fn process_range_paged(&self, start: u64, end: u64) -> Result<bool> {
+    async fn process_range_paged(&self, start: u64, end: u64) -> Result<PageOutcome> {
         let mut page = 1u64;
         const MAX_PAGES: u64 = 50;
         // Set once a transaction older than `start` is seen — newest-first
         // ordering means every remaining/later-page entry is older still,
         // so there is nothing left to find in-range and paging can stop.
         let mut walked_past_start = false;
+        // Page at which paging FIRST reached the neighborhood of `end` (an
+        // in-range or too-old transaction). `None` means every page so far
+        // was still newer than `end`.
+        //
+        // Audit 2026-09-28 (code review, boundary-misclassification finding):
+        // a bare "did we ever reach it" bool is not enough — a range whose
+        // first in-range transaction lands on, say, page 48 has essentially
+        // no real budget left, but a bool would still classify it as
+        // `CapExceededDense` and subdivide. Subdividing does NOT help there:
+        // the upper half shares the identical `end`, so it re-walks the
+        // exact same ~48 TooNew pages and hits the exact same wall; the
+        // lower half's target is only deeper still. That reproduces the
+        // very ~400-call explosion this fix exists to remove, just for a
+        // narrower set of ranges (those whose `end` sits within roughly the
+        // last ~2,500-5,000 matching transactions behind tip). Tracking the
+        // page number lets the cap-check below require that MEANINGFUL
+        // budget remained, not just that the range was technically reached.
+        let mut first_in_range_page: Option<u64> = None;
 
         loop {
             if page > MAX_PAGES {
-                return Ok(false); // over the cap — caller subdivides
+                return Ok(classify_cap_outcome(first_in_range_page, MAX_PAGES));
             }
             let url = format!(
                 "{}/v1.0/transaction/list?status=success&type=63&toAddress={}&page={}&limit=100&startBlock={}&endBlock={}",
                 self.config.api_url, self.config.contract_address, page, start, end
             );
 
+            self.throttle_klever_request().await;
             let response = self
                 .http
                 .get(&url)
@@ -432,7 +535,7 @@ impl ChainScanner {
             // Extract transactions array
             let txs = match resp.pointer("/data/transactions") {
                 Some(serde_json::Value::Array(arr)) if !arr.is_empty() => arr,
-                _ => return Ok(true), // No (more) transactions — range complete
+                _ => return Ok(PageOutcome::Complete), // No (more) transactions — range complete
             };
 
             let tx_count = txs.len();
@@ -457,9 +560,19 @@ impl ChainScanner {
                     RangePosition::TooNew => continue,
                     RangePosition::TooOld => {
                         walked_past_start = true;
+                        // Provably inert today (code audit 2026-09-28):
+                        // `walked_past_start` forces `Complete` at the end of
+                        // THIS page, before the cap-check can ever read
+                        // `first_in_range_page` again. Set anyway — it is
+                        // the semantically correct value (we did reach the
+                        // target range) and is one refactor away from
+                        // mattering if that early return ever changes.
+                        first_in_range_page.get_or_insert(page);
                         continue;
                     }
-                    RangePosition::InRange => {}
+                    RangePosition::InRange => {
+                        first_in_range_page.get_or_insert(page);
+                    }
                 }
 
                 // Already filtered by toAddress in the API query, but double-check
@@ -503,7 +616,7 @@ impl ChainScanner {
             // already walked past `start` — every further page can only
             // be older still, so there is nothing left to find in-range.
             if tx_count < 100 || walked_past_start {
-                return Ok(true);
+                return Ok(PageOutcome::Complete);
             }
             page += 1;
 
@@ -918,6 +1031,7 @@ impl ChainScanner {
             "args": [slug_hex]
         });
 
+        self.throttle_klever_request().await;
         let resp: serde_json::Value = self
             .http
             .post(&url)
@@ -991,6 +1105,58 @@ fn classify_block_range_position(block_num: u64, start: u64, end: u64) -> RangeP
         RangePosition::TooOld
     } else {
         RangePosition::InRange
+    }
+}
+
+/// Outcome of `process_range_paged` for one `[start, end]` attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PageOutcome {
+    /// Fully processed — a short page or a walked-past-start terminated it.
+    Complete,
+    /// Hit `MAX_PAGES` with enough remaining budget, once the target range
+    /// was reached, to make subdividing plausibly worthwhile — this range
+    /// genuinely holds more matching transactions than the page budget
+    /// covers. Subdividing narrows real work.
+    CapExceededDense,
+    /// Hit `MAX_PAGES` without ever reaching the target range with
+    /// meaningful budget left (see `classify_cap_outcome`) — either every
+    /// page was still newer than `end`, or it was reached too late (e.g.
+    /// page ~48/50) for narrowing the range to help. Since the API ignores
+    /// `startBlock`/`endBlock` and always returns the newest transactions
+    /// first (see `process_range_paged` doc comment), this means the target
+    /// range is simply too far from the current chain tip to reach within
+    /// the page budget — a tip-distance problem, not a range-density one.
+    /// Subdividing the block range does nothing to reduce that distance:
+    /// every sub-range would independently re-walk the identical
+    /// newest-first pages and hit the identical cap (audit 2026-09-28:
+    /// this held even for the original bare-bool version whenever the
+    /// range was reached late, reproducing the same combinatorial
+    /// explosion this fix exists to remove — see `classify_cap_outcome`).
+    /// Treat as unreachable this attempt (mirrors the single-block
+    /// pathological case below) instead of recursing.
+    CapExceededTooDeep,
+}
+
+/// Decide `CapExceededDense` vs. `CapExceededTooDeep` once `process_range_paged`
+/// hits `max_pages` without completing.
+///
+/// `first_in_range_page` is the 1-based page on which paging first reached
+/// an in-range (or too-old) transaction, or `None` if every page was still
+/// newer than `end`. Subdividing is only classified as worthwhile when at
+/// least half the page budget remained AFTER reaching the target range —
+/// reaching it with only a sliver of budget left (e.g. page 48 of 50) means
+/// every subdivision would independently re-walk the same near-full prefix
+/// of newer-than-target pages and hit the identical cap, so narrowing the
+/// range buys nothing (audit 2026-09-28, boundary-misclassification finding
+/// — a bare "was it ever reached" bool missed this case entirely).
+fn classify_cap_outcome(first_in_range_page: Option<u64>, max_pages: u64) -> PageOutcome {
+    let dense = first_in_range_page
+        .map(|p| max_pages.saturating_sub(p) >= max_pages / 2)
+        .unwrap_or(false);
+    if dense {
+        PageOutcome::CapExceededDense
+    } else {
+        PageOutcome::CapExceededTooDeep
     }
 }
 
@@ -1251,5 +1417,57 @@ mod range_position_tests {
         assert_eq!(classify_block_range_position(41, 42, 42), RangePosition::TooOld);
         assert_eq!(classify_block_range_position(42, 42, 42), RangePosition::InRange);
         assert_eq!(classify_block_range_position(43, 42, 42), RangePosition::TooNew);
+    }
+}
+
+#[cfg(test)]
+mod cap_outcome_tests {
+    use super::*;
+
+    // Audit 2026-09-28 (code review): the original fix used a bare
+    // "was the target range ever reached" bool, which misclassified a range
+    // reached with almost no budget left (e.g. page 48/50) as `Dense` —
+    // subdividing it reproduces the ~400-call explosion this fix exists to
+    // remove, since every sub-range shares the same tip-distance prefix and
+    // hits the same cap. These tests pin the corrected boundary.
+
+    #[test]
+    fn never_reached_is_too_deep() {
+        assert_eq!(classify_cap_outcome(None, 50), PageOutcome::CapExceededTooDeep);
+    }
+
+    #[test]
+    fn reached_immediately_is_dense() {
+        // Reached on page 1 of 50 — essentially the full budget remains.
+        assert_eq!(classify_cap_outcome(Some(1), 50), PageOutcome::CapExceededDense);
+    }
+
+    #[test]
+    fn reached_at_exact_half_budget_boundary_is_dense() {
+        // 50 - 25 = 25 remaining, which is >= max_pages / 2 (25) — the
+        // boundary is inclusive in favor of subdividing.
+        assert_eq!(classify_cap_outcome(Some(25), 50), PageOutcome::CapExceededDense);
+    }
+
+    #[test]
+    fn reached_just_past_half_budget_boundary_is_too_deep() {
+        // 50 - 26 = 24 remaining, just under the threshold.
+        assert_eq!(classify_cap_outcome(Some(26), 50), PageOutcome::CapExceededTooDeep);
+    }
+
+    #[test]
+    fn reached_on_the_last_page_is_too_deep() {
+        // The live symptom this test exists for: reached with essentially
+        // zero budget left. Subdividing would just re-walk the same ~50
+        // TooNew pages per half and hit the identical cap again.
+        assert_eq!(classify_cap_outcome(Some(50), 50), PageOutcome::CapExceededTooDeep);
+    }
+
+    #[test]
+    fn odd_max_pages_rounds_the_half_budget_down() {
+        // max_pages/2 integer-divides: for 51, half-budget is 25, so
+        // reaching it on page 26 leaves exactly 25 remaining — still dense.
+        assert_eq!(classify_cap_outcome(Some(26), 51), PageOutcome::CapExceededDense);
+        assert_eq!(classify_cap_outcome(Some(27), 51), PageOutcome::CapExceededTooDeep);
     }
 }
