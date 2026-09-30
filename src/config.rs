@@ -513,11 +513,16 @@ fn default_media_peer_fallback_candidate_cache_secs() -> u64 {
 /// requesting from the same peer in cursor batches until the peer
 /// signals `has_more = false`.
 ///
-/// **Per-node semantics**: once reconciled, the local CHANNEL_MSGS is
-/// the system of record. Re-subscribing the same channel does NOT
-/// re-trigger — `prefix_iter_cf` will return non-zero rows. Operators
-/// who want to re-reconcile a stale local history set
-/// `force_resync_if_stale_days > 0`.
+/// **Per-node semantics**: completion is tracked per channel in
+/// `storage::schema::cf::CHANNEL_BACKFILL_STATE` (stamped when some peer's
+/// response signals `has_more = false` after delivering real data), NOT
+/// inferred from "does CHANNEL_MSGS have any row" — that any-row proxy
+/// flipped true, and locked out backfill for the rest of the process, the
+/// moment a single message arrived via live gossip ahead of a full
+/// backfill (found 2026-09-30). A never-completed channel is retried on
+/// every `subscribe_channel` call and by the periodic
+/// `retry_incomplete_channel_backfills` sweep; an already-completed one is
+/// re-checked every `channel_catchup_interval_hours`.
 ///
 /// **Wire protocol**: forward-compatible with a future negentropy-
 /// style multi-round fingerprint exchange. v0.47.0 always sends an
@@ -555,13 +560,24 @@ pub struct BackfillConfig {
     /// pipelined requests.
     #[serde(default = "default_backfill_server_max_concurrent_per_channel")]
     pub server_max_concurrent_per_channel: usize,
-    /// Re-reconciliation knob. Default `0` = off. When `> 0`, re-
-    /// triggers reconciliation on subscribe_channel if the local
-    /// history's newest envelope is older than this many days. The
-    /// gossip mesh fills gaps in real time so the default-off is
-    /// usually right; archive nodes set 1 for "always catch up".
-    #[serde(default)]
-    pub force_resync_if_stale_days: u64,
+    /// How often, in hours, to re-check a channel whose backfill has
+    /// already completed (default 6) — mirrors `news_catchup_interval_hours`
+    /// below. `0` disables re-checking completed channels entirely (a
+    /// never-completed channel is still always retried regardless of this
+    /// setting). Catches drift the gossip mesh alone can miss: a
+    /// `ChannelTransferred`/history-affecting event that lands in a scan
+    /// gap, or a peer whose own data was itself incomplete when it
+    /// confirmed our completion.
+    #[serde(default = "default_backfill_channel_catchup_interval_hours")]
+    pub channel_catchup_interval_hours: u64,
+    /// Max channels examined per periodic retry-sweep tick (default 25).
+    /// The sweep (`retry_incomplete_channel_backfills`) walks a rotating
+    /// cursor over all known channels every 30s, calling the same trigger
+    /// `subscribe_channel` does; this caps per-tick cost to a fixed batch
+    /// regardless of total channel count, so a channel that's already
+    /// complete and not due is a cheap point-read, not a full-table scan.
+    #[serde(default = "default_backfill_catchup_batch_size")]
+    pub catchup_batch_size: usize,
     /// Server-side: max envelopes per response. Default 1000. Larger
     /// fits more in a single libp2p response (cap is ~10 MiB CBOR);
     /// smaller cuts the worst-case latency. Total transfer is the
@@ -607,7 +623,9 @@ impl Default for BackfillConfig {
                 default_backfill_server_max_concurrent_per_peer(),
             server_max_concurrent_per_channel:
                 default_backfill_server_max_concurrent_per_channel(),
-            force_resync_if_stale_days: 0,
+            channel_catchup_interval_hours:
+                default_backfill_channel_catchup_interval_hours(),
+            catchup_batch_size: default_backfill_catchup_batch_size(),
             max_envelopes_per_response:
                 default_backfill_max_envelopes_per_response(),
             total_envelopes_cap: default_backfill_total_envelopes_cap(),
@@ -641,6 +659,12 @@ fn default_backfill_max_envelopes_per_response() -> usize {
 }
 fn default_backfill_total_envelopes_cap() -> usize {
     200_000
+}
+fn default_backfill_channel_catchup_interval_hours() -> u64 {
+    6
+}
+fn default_backfill_catchup_batch_size() -> usize {
+    25
 }
 
 /// Direct-message offline store-and-forward policy (spec 3
@@ -2747,9 +2771,23 @@ impl Config {
             if self.backfill.max_age_days == 0 {
                 anyhow::bail!(
                     "backfill.max_age_days must be > 0 when enabled — use \
-                     `force_resync_if_stale_days = 0` to disable \
-                     re-reconciliation, or `enabled = false` to disable \
-                     backfill entirely"
+                     `enabled = false` to disable backfill entirely"
+                );
+            }
+            if self.backfill.catchup_batch_size == 0 {
+                anyhow::bail!(
+                    "backfill.catchup_batch_size must be > 0 (default 25)"
+                );
+            }
+            const MAX_CATCHUP_BATCH_SIZE: usize = 10_000;
+            if self.backfill.catchup_batch_size > MAX_CATCHUP_BATCH_SIZE {
+                anyhow::bail!(
+                    "backfill.catchup_batch_size = {} exceeds the ceiling of \
+                     {} (each examined channel can fan out up to \
+                     `fanout` outbound requests every ~30s — a huge batch \
+                     turns the periodic sweep into a request storm)",
+                    self.backfill.catchup_batch_size,
+                    MAX_CATCHUP_BATCH_SIZE
                 );
             }
         }
@@ -3622,10 +3660,14 @@ max_envelopes_per_response = 1000
 # 200k = roughly one year of an active channel; stops a malicious
 # client from inducing an unbounded scan.
 total_envelopes_cap = 200000
-# Re-reconciliation knob. 0 = off (gossip mesh fills gaps in real
-# time). N>0 = re-trigger on subscribe if local history's newest
-# envelope is older than N days. Bandwidth cost; default off.
-force_resync_if_stale_days = 0
+# How often (hours) to re-check a channel whose backfill already
+# completed. 0 disables re-checking completed channels (a
+# never-completed channel is always retried regardless).
+channel_catchup_interval_hours = 6
+# Max channels examined per periodic retry-sweep tick (every 30s).
+# Bounds the sweep's cost to a fixed batch regardless of total
+# channel count.
+catchup_batch_size = 25
 
 [api]
 # Set to "0.0.0.0" to accept connections from all interfaces
@@ -4414,6 +4456,24 @@ mod tests {
         c.backfill.fanout = 17;
         let err = c.validate().expect_err("oversize fanout must be rejected");
         assert!(format!("{err}").contains("backfill.fanout"));
+    }
+
+    #[test]
+    fn validate_rejects_zero_catchup_batch_size() {
+        let mut c = baseline_config();
+        c.backfill.catchup_batch_size = 0;
+        let err = c.validate().expect_err("0 catchup_batch_size must be rejected");
+        assert!(format!("{err}").contains("catchup_batch_size"));
+    }
+
+    #[test]
+    fn validate_rejects_oversized_catchup_batch_size() {
+        let mut c = baseline_config();
+        c.backfill.catchup_batch_size = 10_001;
+        let err = c
+            .validate()
+            .expect_err("oversize catchup_batch_size must be rejected");
+        assert!(format!("{err}").contains("catchup_batch_size"));
     }
 
     #[test]

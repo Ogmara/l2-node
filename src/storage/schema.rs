@@ -140,6 +140,33 @@ pub mod cf {
     /// `snapshot::DOMAIN_CFS` — node-local operational state only.
     pub const CHANNEL_VERIFICATION: &str = "channel_verification";
 
+    /// channel_id (8 bytes BE) → unix seconds (8 bytes BE) of the last time a
+    /// channel-history reconciliation session reached NATURAL completion for
+    /// this channel (some peer's `ReconcileResponse` signalled `has_more =
+    /// false` after delivering real data — see
+    /// `network::NetworkService::maybe_trigger_backfill`).
+    ///
+    /// Fixes a permanent-partial-sync bug (found 2026-09-30): the trigger
+    /// used to gate on "does `CHANNEL_MSGS` have ANY row for this channel",
+    /// which flips true — and locks out backfill for the rest of the
+    /// process — the moment a single message arrives via live gossip ahead
+    /// of a full backfill, leaving the channel stuck at whatever partial
+    /// history it had at that moment. Mirrors the fix already shipped for
+    /// the global news feed (`BackfillConfig::news_catchup_interval_hours`):
+    /// a real completion signal plus periodic re-checks, not an any-row
+    /// proxy.
+    ///
+    /// Deliberately a SEPARATE CF from `CHANNEL_VERIFICATION`, not a new
+    /// field on `ChannelVerificationState`: that struct's row is written by
+    /// the chain scanner task via a blind-overwrite path
+    /// (`mark_channel_creator_verified`), and this row is written by the
+    /// network task — sharing one row across two independently-scheduled
+    /// tasks with no shared lock would reintroduce the same read-modify-
+    /// write clobber class the verification CF was itself split out to
+    /// avoid. Owned exclusively by the network task's event loop (never
+    /// concurrent with itself), so no lock is needed here either.
+    pub const CHANNEL_BACKFILL_STATE: &str = "channel_backfill_state";
+
     /// channel_id (8 bytes BE) → PendingChannelDelete JSON (claimant, requested_at) —
     /// a `ChannelDelete` received before the channel is known locally (out-of-order
     /// gossip / chain-scan lag, audit final pre-mainnet W14). Consumed the first time
@@ -390,6 +417,7 @@ pub mod cf {
         DM_READ_STATE,
         DELETED_CHANNELS,
         CHANNEL_VERIFICATION,
+        CHANNEL_BACKFILL_STATE,
         PENDING_CHANNEL_DELETES,
         PENDING_CHANNEL_MEMBER_REMOVALS,
         DELETION_MARKERS,
@@ -600,6 +628,15 @@ pub mod state_keys {
     /// field — an operator without active log scraping had no way to
     /// learn a squat or poisoning attempt occurred at all.
     pub const CHANNEL_VERIFICATION_ALERTS_TOTAL: &[u8] = b"channel_verification_alerts_total";
+    /// Rotating cursor (raw `CHANNELS` key bytes, currently 8-byte BE
+    /// channel_id) for the periodic channel-backfill retry sweep
+    /// (`NetworkService::retry_incomplete_channel_backfills`, l2-node
+    /// 0.136.0). Bounds the sweep's per-tick cost to a fixed batch size
+    /// regardless of total channel count — the same reasoning as
+    /// `ChainScanner::sweep_channel_verification`'s round-robin lane.
+    /// Empty means "start from the beginning" (initial state, and
+    /// whenever a sweep reaches the end of the table).
+    pub const CHANNEL_BACKFILL_RETRY_CURSOR: &[u8] = b"channel_backfill_retry_cursor";
 }
 
 /// Snapshot bootstrap (spec 11-snapshot-sync.md).

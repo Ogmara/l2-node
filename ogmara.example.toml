@@ -182,10 +182,14 @@ max_envelopes_per_response = 1000
 # 200k = roughly one year of an active channel; stops a malicious
 # client from inducing an unbounded scan.
 total_envelopes_cap = 200000
-# Re-reconciliation knob. 0 = off (gossip mesh fills gaps in real
-# time). N>0 = re-trigger on subscribe if local history's newest
-# envelope is older than N days. Bandwidth cost; default off.
-force_resync_if_stale_days = 0
+# How often (hours) to re-check a channel whose backfill already
+# completed. 0 disables re-checking completed channels (a
+# never-completed channel is always retried regardless).
+channel_catchup_interval_hours = 6
+# Max channels examined per periodic retry-sweep tick (every 30s).
+# Bounds the sweep's cost to a fixed batch regardless of total
+# channel count.
+catchup_batch_size = 25
 
 [api]
 # Set to "0.0.0.0" to accept connections from all interfaces

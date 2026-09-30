@@ -577,6 +577,7 @@ impl Storage {
             (cf::CHANNEL_PINS, 100),
             (cf::CHANNEL_INVITES, 10_000),
             (cf::CHANNEL_VERIFICATION, 1),
+            (cf::CHANNEL_BACKFILL_STATE, 1),
         ];
         for &(cf_name, limit) in cleanup_cfs {
             match self.prefix_iter_cf(cf_name, &channel_key, limit) {
@@ -1250,6 +1251,30 @@ impl Storage {
             .flatten()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default()
+    }
+
+    /// Record that a channel-history reconciliation session reached
+    /// natural completion for `channel_id` — see `cf::CHANNEL_BACKFILL_STATE`'s
+    /// doc comment for the bug this closes and why it's a separate CF from
+    /// `CHANNEL_VERIFICATION`. Sole writer is the network task's event
+    /// loop, so no lock is needed.
+    pub fn mark_channel_backfill_complete(&self, channel_id: u64, now: u64) -> Result<()> {
+        self.put_cf(
+            cf::CHANNEL_BACKFILL_STATE,
+            &channel_id.to_be_bytes(),
+            &now.to_be_bytes(),
+        )
+    }
+
+    /// Read the last time `channel_id`'s history backfill reached natural
+    /// completion. `None` means never — either genuinely never attempted,
+    /// or every attempt so far ended without a peer confirming completion.
+    pub fn channel_backfill_completed_at(&self, channel_id: u64) -> Option<u64> {
+        self.get_cf(cf::CHANNEL_BACKFILL_STATE, &channel_id.to_be_bytes())
+            .ok()
+            .flatten()
+            .and_then(|b| <[u8; 8]>::try_from(b.as_slice()).ok())
+            .map(u64::from_be_bytes)
     }
 
     /// Run `f` while holding `channel_membership_lock`.
@@ -4833,6 +4858,22 @@ mod tombstone_channel_tests {
         assert!(s.get_cf(cf::CHANNEL_MEMBERS, &key).unwrap().is_none());
     }
 
+    /// `CHANNEL_BACKFILL_STATE` is a per-channel bookkeeping CF like
+    /// `CHANNEL_VERIFICATION` (l2-node 0.136.0) — it must be swept by the
+    /// same cleanup pass on delete, or a deleted channel's id would leave
+    /// an orphaned completion timestamp behind forever.
+    #[test]
+    fn deleting_a_channel_purges_its_backfill_completion_row() {
+        let (s, _d) = db();
+        let channel_id = 44;
+        s.mark_channel_backfill_complete(channel_id, 1_000).unwrap();
+        assert_eq!(s.channel_backfill_completed_at(channel_id), Some(1_000));
+
+        s.tombstone_channel(channel_id, 1_700_000_000, None).unwrap();
+
+        assert_eq!(s.channel_backfill_completed_at(channel_id), None);
+    }
+
     #[test]
     fn re_deleting_an_already_tombstoned_channel_keeps_the_original_member_list() {
         let (s, _d) = db();
@@ -6088,6 +6129,73 @@ mod dm_recipient_count_tests {
         s.increment_dm_recipient_count(b"klv1bob").unwrap();
         assert_eq!(s.get_dm_recipient_count(b"klv1alice").unwrap(), 2);
         assert_eq!(s.get_dm_recipient_count(b"klv1bob").unwrap(), 1);
+    }
+}
+
+#[cfg(test)]
+mod channel_backfill_state_tests {
+    //! Fix for a permanent-partial-sync bug (found 2026-09-30): backfill
+    //! completeness used to be inferred from "does CHANNEL_MSGS have any
+    //! row", which is not the same question as "did a session ever reach
+    //! natural completion". These cover the persisted signal that replaces
+    //! it — see `cf::CHANNEL_BACKFILL_STATE`'s doc comment.
+    use super::*;
+    use tempfile::TempDir;
+
+    fn db() -> (Storage, TempDir) {
+        let dir = TempDir::new().unwrap();
+        (Storage::open(dir.path()).unwrap(), dir)
+    }
+
+    #[test]
+    fn never_completed_channel_reads_none() {
+        let (s, _d) = db();
+        assert_eq!(s.channel_backfill_completed_at(42), None);
+    }
+
+    #[test]
+    fn mark_complete_then_read_round_trips() {
+        let (s, _d) = db();
+        s.mark_channel_backfill_complete(42, 1_000).unwrap();
+        assert_eq!(s.channel_backfill_completed_at(42), Some(1_000));
+    }
+
+    #[test]
+    fn completion_is_independent_per_channel() {
+        let (s, _d) = db();
+        s.mark_channel_backfill_complete(1, 1_000).unwrap();
+        assert_eq!(s.channel_backfill_completed_at(2), None);
+    }
+
+    #[test]
+    fn re_marking_overwrites_the_previous_timestamp() {
+        let (s, _d) = db();
+        s.mark_channel_backfill_complete(42, 1_000).unwrap();
+        s.mark_channel_backfill_complete(42, 2_000).unwrap();
+        assert_eq!(s.channel_backfill_completed_at(42), Some(2_000));
+    }
+
+    /// The bug this fixes, made concrete: unlike the old any-row proxy,
+    /// having local `CHANNEL_MSGS` rows (even the channel's ENTIRE actual
+    /// history, coincidentally) must NOT by itself imply backfill
+    /// completion — only an explicit `mark_channel_backfill_complete` call
+    /// (driven by a peer's `has_more = false` signal) does.
+    #[test]
+    fn local_messages_existing_does_not_imply_completion() {
+        let (s, _d) = db();
+        let channel_id = 7u64;
+        s.put_cf(
+            cf::CHANNEL_MSGS,
+            &crate::storage::schema::encode_channel_msg_key(channel_id, 1_000, &[1u8; 32]),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            s.channel_backfill_completed_at(channel_id),
+            None,
+            "having ANY local message must not be mistaken for a \
+             confirmed-complete backfill"
+        );
     }
 }
 

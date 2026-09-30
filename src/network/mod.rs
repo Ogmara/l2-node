@@ -457,13 +457,19 @@ pub struct NetworkService {
         libp2p::request_response::OutboundRequestId,
         ReconcilePending,
     >,
-    /// Channel IDs the local node has triggered backfill for AT
-    /// LEAST once during the current process lifetime. Stops
-    /// repeated `subscribe_channel` calls (chain-scanner sends one
-    /// per discovered channel) from spamming reconciliation when
-    /// the local index is still empty for a different reason
-    /// (e.g., the channel is genuinely silent). Cleared on process
-    /// restart.
+    /// Channel IDs with an in-flight (or just-decided-not-due)
+    /// reconciliation session RIGHT NOW — a dedup/mutex-like guard, not a
+    /// "ever triggered" ledger (rewritten 2026-09-30 alongside the
+    /// completion-signal fix — see `storage::schema::cf::
+    /// CHANNEL_BACKFILL_STATE`). Entries are inserted by
+    /// `maybe_trigger_backfill` and removed once that channel's session
+    /// concludes one way or another (not due, no candidates, natural
+    /// completion, every give-up path) — see
+    /// `release_reconcile_trigger_if_no_siblings`. This lets the same
+    /// channel_id be re-evaluated many times across a single process
+    /// lifetime (every `subscribe_channel` call, every periodic
+    /// `retry_incomplete_channel_backfills` tick), which is what makes an
+    /// incomplete channel keep getting retried without needing a restart.
     reconcile_triggered: HashSet<u64>,
     /// Server-side rate-limit state for inbound `sync::SyncRequest`s (audit
     /// final pre-mainnet W7). Reuses `reconcile::ResponderLimits` directly
@@ -700,6 +706,55 @@ struct ReconcilePending {
     /// `MAX_PAGES_PER_SESSION`/`MAX_CONSECUTIVE_UNPRODUCTIVE_PAGES`.
     pages_fetched: u32,
     consecutive_unproductive_pages: u32,
+    /// Cumulative envelopes with `RouteResult::Accepted` — genuinely NEW,
+    /// signature-verified content — across every page of this session.
+    /// Threaded forward across pages so a genuine multi-page session
+    /// accumulates correctly; gates `mark_channel_backfill_complete` and
+    /// sibling-cancellation.
+    ///
+    /// Security-audit findings (2026-09-30, two rounds): a page reporting
+    /// `has_more = false` is NOT itself proof the responder had (or sent)
+    /// any real data. Round 1: an attacker can win the fanout race with
+    /// an instant, trivially-cheap all-garbage response that fails router
+    /// validation. Round 2: counting `RouteResult::Duplicate` toward this
+    /// (as round 1's fix did) is ALSO forgeable near-for-free — the
+    /// router's duplicate check (`Storage::message_exists`) runs BEFORE
+    /// msg_id-binding and signature verification and is keyed globally,
+    /// not per-channel, so an attacker can pair any msg_id that already
+    /// exists ANYWHERE on this node (trivially obtained by posting one
+    /// message themselves, in any channel) with a forged envelope
+    /// claiming this channel and an unchecked signature, and it
+    /// short-circuits straight to `Duplicate`. Only `Accepted` requires a
+    /// real Ed25519 signature over the claimed content, matching the
+    /// existing precedent in this file's `sync` protocol response
+    /// handler, which already excludes `Duplicate` from its own progress
+    /// counter for the same reason.
+    ///
+    /// Accepted residual (round-3 security audit, 2026-09-30; scope
+    /// corrected round 4): a fresh, unregistered Ed25519 keypair can sign
+    /// ONE trivial `ChatMessage` targeting a genuinely open Public
+    /// channel (`channel_type == 0` ONLY — `check_readonly_channel`
+    /// already gates ReadPublic/`channel_type == 1` to the creator or a
+    /// moderator, so this does NOT reach `Accepted` there) with no PoW
+    /// and no rate limit (`process_synced_message` is deliberately
+    /// exempt for the sync/backfill path) and reach `Accepted` for
+    /// near-zero cost, which — as the sole peer left
+    /// after sibling cancellation — unilaterally asserts completion with
+    /// fabricated content. This is NOT merely "a peer's own view might be
+    /// stale" (the framing this comment used before the round-3 audit);
+    /// it is "any single race-winning peer can single-handedly fabricate
+    /// completion," genuinely comparable in cost to the round-1/round-2
+    /// bugs this file just spent two rounds closing. What changed for the
+    /// better: false completion is no longer PERMANENT — it expires
+    /// after `channel_catchup_interval_hours` (default 6h), so an
+    /// attacker must keep re-winning the race every cycle rather than
+    /// masking history once and forever. Fully closing this needs either
+    /// the deferred spec-14 fingerprint/epoch-root completeness proof, or
+    /// a cheaper interim hardening (e.g. requiring 2+ independent peers
+    /// to agree before persisting completion) — deliberately not
+    /// attempted in this pass; recorded here so it isn't mistaken for a
+    /// closed issue.
+    total_accepted: u64,
 }
 
 /// Per-pending-outbound-identity-sync state (P-1).
@@ -766,6 +821,22 @@ pub struct DmSubscribeEvent {
 /// the standard router and is rejected by payload-specific
 /// validation. The cheap pre-check just keeps the obvious smuggle
 /// out of the router pipeline.
+/// Pure completeness-gate check for `NetworkService::maybe_trigger_backfill`
+/// (l2-node 0.136.0 fix). `None` (never reached natural completion) is
+/// always due, regardless of `catchup_interval_hours` — that knob only
+/// governs re-checking an ALREADY-completed channel. `catchup_interval_hours
+/// == 0` disables re-checking completed channels (but never makes a
+/// never-completed channel not-due).
+fn channel_backfill_due(completed_at: Option<u64>, now: u64, catchup_interval_hours: u64) -> bool {
+    match completed_at {
+        None => true,
+        Some(completed) => {
+            catchup_interval_hours > 0
+                && now.saturating_sub(completed) >= catchup_interval_hours.saturating_mul(3600)
+        }
+    }
+}
+
 fn envelope_targets_channel(env_bytes: &[u8], expected_channel: u64) -> bool {
     use crate::messages::envelope::Envelope;
     use crate::messages::types::MessageType;
@@ -1296,10 +1367,12 @@ impl NetworkService {
     /// Subscribe to a channel's GossipSub topic.
     ///
     /// **Channel-history backfill trigger (spec 1, l2-node 0.47.0+).**
-    /// If `[backfill] enabled` AND the local `CHANNEL_MSGS` index
-    /// for `channel_id` is empty AND we have not already triggered
-    /// reconciliation for this channel in the current process, the
-    /// trigger fires: we pick up to `[backfill] fanout` candidate
+    /// If `[backfill] enabled` AND the channel's backfill has never
+    /// reached natural completion (or completed longer ago than
+    /// `channel_catchup_interval_hours` — see `maybe_trigger_backfill`)
+    /// AND we have not already triggered reconciliation for this
+    /// channel in the current process, the trigger fires: we pick up
+    /// to `[backfill] fanout` candidate
     /// peers from the gossip mesh (falling back to SC-active nodes
     /// if mesh is sparse) and send each a `ReconcileRequest`. The
     /// first non-empty response wins; subsequent responses are
@@ -1878,10 +1951,9 @@ impl NetworkService {
                     // Code Audit W2 (0.47.0): route chain-discovered
                     // channels through `Self::subscribe_channel` (not
                     // the bare `Topics::subscribe_channel`) so the
-                    // empty-CHANNEL_MSGS cold-join backfill trigger
-                    // fires. The trigger is idempotent via
-                    // `reconcile_triggered`, so duplicate calls are
-                    // safe.
+                    // cold-join backfill trigger fires. The trigger is
+                    // idempotent via `reconcile_triggered`, so
+                    // duplicate calls are safe.
                     self.subscribe_channel(channel_id);
                     info!(channel_id, "Auto-subscribed to channel topic (chain discovery)");
                 }
@@ -1947,6 +2019,9 @@ impl NetworkService {
                     // missed while this node was down or unmeshed is recovered
                     // rather than lost permanently.
                     self.maybe_trigger_news_backfill();
+                    // l2-node 0.136.0: same idea, per channel — see
+                    // `retry_incomplete_channel_backfills`'s doc comment.
+                    self.retry_incomplete_channel_backfills();
                 }
                 _ = reconnect_interval.tick() => {
                     self.process_reconnect_queue();
@@ -3723,51 +3798,53 @@ impl NetworkService {
         if !self.backfill_config.enabled {
             return;
         }
+        // Code-audit follow-up (2026-09-30): `reconcile::build_response`
+        // refuses every private-channel request unconditionally
+        // (`server_capped`, no envelopes — there's no authenticated-
+        // membership proof in this wire protocol). A private channel can
+        // therefore never reach natural completion over this path, so
+        // without this check it would be retried every periodic-sweep
+        // tick forever, purely wasted fanout traffic. Skip entirely —
+        // this never touches `reconcile_triggered`, so it also never
+        // needs releasing.
+        if reconcile::is_private_channel(&self.storage, channel_id) {
+            return;
+        }
         if !self.reconcile_triggered.insert(channel_id) {
-            // Already triggered this session — don't re-fire.
+            // Already in flight (or due-but-not-yet-resolved) this
+            // session — don't pile another request on top of it.
             return;
         }
 
-        // Empty-check: does `CHANNEL_MSGS` have ANY row for this
-        // channel? prefix_iter with limit=1 short-iters cheaply.
-        let prefix = channel_id.to_be_bytes();
-        let has_local = self
-            .storage
-            .prefix_iter_cf(
-                crate::storage::schema::cf::CHANNEL_MSGS,
-                &prefix,
-                1,
-            )
-            .map(|rows| !rows.is_empty())
-            .unwrap_or(false);
-
-        let resync_active = self.backfill_config.force_resync_if_stale_days > 0;
         // P-3b: also backfill a channel that is a SKELETON — chain-scanned (has
         // the on-chain slug/creator) but missing its L2 metadata (display_name
         // null), even if it already has chat. The reconcile rides the
         // ChannelCreate/Update envelopes on its first page, so this is how an
         // existing chain-discovered channel finally gets its name/logo/members.
-        // `reconcile_triggered` is cleared on restart, so this fires once per
-        // skeleton channel per process — and stops firing once the metadata
-        // lands and the channel is no longer a skeleton.
         let is_skeleton = self.channel_is_skeleton(channel_id);
-        let need_backfill = if !has_local || is_skeleton {
-            true
-        } else if resync_active {
-            // Re-reconciliation knob: read the NEWEST local envelope
-            // and compare timestamps. `prefix_iter` is sorted
-            // ascending by (lamport_ts, msg_id); reading all rows is
-            // O(N) and not worth it. Use a stat or skip for now.
-            // v0.47.0 conservative: re-fire only on truly-empty;
-            // staleness-driven resync is a v0.47.x refinement.
-            false
-        } else {
-            false
-        };
+
+        // Completeness gate (rewritten 2026-09-30 — see
+        // `storage::schema::cf::CHANNEL_BACKFILL_STATE`'s doc comment for the
+        // any-row-proxy bug this replaces). `None` means no reconciliation
+        // session has ever reached natural completion for this channel —
+        // always due, regardless of how much (possibly gossip-delivered,
+        // possibly still-partial) local history already exists. Once
+        // completed, due again only after `channel_catchup_interval_hours`.
+        let completed_at = self.storage.channel_backfill_completed_at(channel_id);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let due = channel_backfill_due(
+            completed_at,
+            now,
+            self.backfill_config.channel_catchup_interval_hours,
+        );
+        let need_backfill = is_skeleton || due;
         if !need_backfill {
-            // Remove from the triggered set so a future
-            // unsubscribe + resubscribe (with the channel still
-            // empty) can re-evaluate.
+            // Not due — release immediately so a future resubscribe
+            // (or the periodic retry sweep) re-evaluates fresh rather
+            // than being blocked by this session's own dedup entry.
             self.reconcile_triggered.remove(&channel_id);
             return;
         }
@@ -3851,8 +3928,105 @@ impl NetworkService {
                     channel_id,
                     pages_fetched: 0,
                     consecutive_unproductive_pages: 0,
+                    total_accepted: 0,
                 },
             );
+        }
+    }
+
+    /// Release `channel_id`'s `reconcile_triggered` dedup entry, but only
+    /// once no OTHER pending reconcile request still references it — a
+    /// still-pending sibling (race-fanout candidate, or a later page of an
+    /// ongoing session) might yet complete the channel, and releasing the
+    /// dedup entry while one is still in flight would let the periodic
+    /// retry sweep fire a redundant extra request on top of it.
+    fn release_reconcile_trigger_if_no_siblings(&mut self, channel_id: u64) {
+        let still_pending = self
+            .pending_reconcile_requests
+            .values()
+            .any(|p| p.channel_id == channel_id);
+        if !still_pending {
+            self.reconcile_triggered.remove(&channel_id);
+        }
+    }
+
+    /// Periodic retry sweep for channel-history backfill (l2-node 0.136.0).
+    ///
+    /// `maybe_trigger_backfill` only fires from `subscribe_channel`, which
+    /// for most existing channels runs exactly once — at startup. Without
+    /// this sweep, a channel whose one attempt gave up (no candidate peers,
+    /// an uninformative response, a page/unproductive-page backstop) has no
+    /// way to ever retry short of a process restart. Mirrors
+    /// `maybe_trigger_news_backfill`'s shape (retry on `bootstrap_interval`
+    /// until due, then back off) but per-channel and persisted, since
+    /// unlike the single global news feed there can be many channels and
+    /// this must survive restarts.
+    ///
+    /// Walks a bounded, rotating batch (`catchup_batch_size`) of the
+    /// `CHANNELS` table per call via a persisted cursor
+    /// (`CHANNEL_BACKFILL_RETRY_CURSOR`) so cost stays flat regardless of
+    /// total channel count — same reasoning as `ChainScanner::
+    /// sweep_channel_verification`'s round-robin lane. Each examined
+    /// channel goes through the exact same due-check `maybe_trigger_backfill`
+    /// already applies, so an already-complete-and-not-yet-due, or
+    /// already-in-flight, channel is just a cheap point read.
+    ///
+    /// Round-3 security-audit correction: a channel that's genuinely
+    /// fully synced but whose completion signal keeps failing to persist
+    /// (every reconcile session comes back all-`Duplicate` — see
+    /// `ReconcilePending::total_accepted`'s doc comment) is NOT a cheap
+    /// point read once triggered — v0.47.0 always bulk-sends, so it pages
+    /// through and deserializes real envelope batches every retry cycle.
+    /// Bounded, not DoS-class, but a real recurring cost until spec-14
+    /// fingerprinting lands.
+    fn retry_incomplete_channel_backfills(&mut self) {
+        if !self.backfill_config.enabled {
+            return;
+        }
+        let cursor_key = crate::storage::schema::state_keys::CHANNEL_BACKFILL_RETRY_CURSOR;
+        let start_key = self
+            .storage
+            .get_cf(crate::storage::schema::cf::NODE_STATE, cursor_key)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let batch = self.backfill_config.catchup_batch_size.max(1);
+        let entries = match self.storage.prefix_iter_cf_after(
+            crate::storage::schema::cf::CHANNELS,
+            &start_key,
+            &[],
+            batch,
+        ) {
+            Ok(e) => e,
+            Err(e) => {
+                warn!(error = %e, "backfill retry sweep: CHANNELS iteration failed");
+                return;
+            }
+        };
+        let hit_end = entries.len() < batch;
+        let mut last_key: Option<Vec<u8>> = None;
+        for (key, _) in &entries {
+            if key.len() == 8 {
+                let channel_id = u64::from_be_bytes(
+                    <[u8; 8]>::try_from(key.as_slice()).expect("len checked"),
+                );
+                self.maybe_trigger_backfill(channel_id);
+            }
+            last_key = Some(key.clone());
+        }
+        // Wrap to the start once the batch runs out of rows; otherwise
+        // resume strictly after the last key we just examined.
+        let next_cursor = if hit_end {
+            Vec::new()
+        } else {
+            last_key.unwrap_or_default()
+        };
+        if let Err(e) = self.storage.put_cf(
+            crate::storage::schema::cf::NODE_STATE,
+            cursor_key,
+            &next_cursor,
+        ) {
+            warn!(error = %e, "backfill retry sweep: failed to persist cursor");
         }
     }
 
@@ -3962,6 +4136,7 @@ impl NetworkService {
                         channel_id = pending.channel_id,
                         "reconcile: peer responded server_capped; ignoring (race siblings may succeed)"
                     );
+                    self.release_reconcile_trigger_if_no_siblings(pending.channel_id);
                     return;
                 }
                 if response.envelopes.is_empty() && !response.has_more {
@@ -3970,19 +4145,21 @@ impl NetworkService {
                         channel_id = pending.channel_id,
                         "reconcile: peer responded empty + no more; ignoring"
                     );
+                    // Uninformative response (this peer may simply know
+                    // nothing about the channel, not that it's genuinely
+                    // empty — the wire protocol can't distinguish the
+                    // two) — don't claim completion. Once every sibling
+                    // has responded this way, release the dedup entry so
+                    // the periodic sweep retries with (possibly
+                    // different) peers later, rather than leaving the
+                    // channel stuck "in flight" forever.
+                    self.release_reconcile_trigger_if_no_siblings(pending.channel_id);
                     return;
                 }
 
-                // Race-winner semantics: cancel sibling outbound
-                // requests by dropping their pending entries. Any
-                // late-arriving response for them will be logged at
-                // debug above and ignored.
-                self.pending_reconcile_requests.retain(|_, p| {
-                    !(p.channel_id == pending.channel_id && p.peer_id != peer)
-                });
-
                 let env_count = response.envelopes.len();
                 let mut admitted = 0usize;
+                let mut newly_accepted = 0usize;
                 let mut cross_channel_dropped = 0usize;
                 // Security-audit follow-up on W9: see identity-sync's arm
                 // (earlier in this file) for the full rationale — refuse to
@@ -4024,11 +4201,23 @@ impl NetworkService {
                         match self.router.process_synced_message(&env_bytes) {
                             crate::messages::router::RouteResult::Accepted { .. } => {
                                 admitted += 1;
+                                newly_accepted += 1;
                             }
                             crate::messages::router::RouteResult::Duplicate => {
-                                // Already had this envelope locally —
-                                // counted as "won the race" but no
-                                // storage write needed.
+                                // Already had this envelope locally — counted
+                                // toward `admitted` ("won the race" — no
+                                // storage write needed) but deliberately NOT
+                                // toward `newly_accepted`. Security-audit
+                                // finding (2026-09-30, round 2): the router's
+                                // duplicate check runs before signature
+                                // verification and is keyed globally by
+                                // msg_id, not per-channel — see
+                                // `ReconcilePending::total_accepted`'s doc
+                                // comment for the exploit this would
+                                // otherwise reopen. Matches this file's
+                                // `sync` protocol handler, which already
+                                // excludes `Duplicate` from its own progress
+                                // counter for the same reason.
                                 admitted += 1;
                             }
                             crate::messages::router::RouteResult::Rejected(reason)
@@ -4052,24 +4241,70 @@ impl NetworkService {
                     channel_id = pending.channel_id,
                     received = env_count,
                     admitted,
+                    newly_accepted,
                     cross_channel_dropped,
                     has_more = response.has_more,
                     "reconcile: applied response batch"
                 );
 
+                // Race-winner semantics: cancel sibling outbound requests
+                // by dropping their pending entries, but ONLY once this
+                // response has contributed real, NEWLY-VERIFIED progress
+                // (`newly_accepted > 0` — strictly `RouteResult::Accepted`,
+                // never `Duplicate`/`Rejected`/`Invalid`/cross-channel-
+                // dropped envelopes).
+                //
+                // Security-audit findings (2026-09-30, two rounds):
+                // cancelling on the mere SHAPE of a response (non-empty
+                // envelopes, or has_more) let an attacker win the fanout
+                // race with an instant, free, all-garbage response —
+                // every honest sibling still in flight got silently
+                // dropped on arrival ("response for unknown request_id"
+                // above). Round 1 gated this on `admitted > 0` instead,
+                // but `admitted` also counts `Duplicate`, which round 2
+                // found is JUST as forgeable (see `ReconcilePending::
+                // total_accepted`'s doc comment) — so gating cancellation
+                // on it left the exact same pre-emption open. Only
+                // `newly_accepted` requires a real signature verification
+                // to reach.
+                if newly_accepted > 0 {
+                    self.pending_reconcile_requests.retain(|_, p| {
+                        !(p.channel_id == pending.channel_id && p.peer_id != peer)
+                    });
+                }
+
                 // Audit final pre-mainnet W9: requester-side paging budget.
+                // Uses `newly_accepted` (not `admitted`), for the same
+                // reason as the sibling-cancellation gate above — an
+                // attacker replaying forgeable `Duplicate`s on every page
+                // would otherwise reset this to 0 every time and never
+                // trip the unproductive-page backstop, stretching a
+                // pure-garbage session out to the much larger
+                // `MAX_PAGES_PER_SESSION` cap instead.
                 let pages_fetched = pending.pages_fetched + 1;
-                let consecutive_unproductive_pages = if admitted > 0 {
+                let consecutive_unproductive_pages = if newly_accepted > 0 {
                     0
                 } else {
                     pending.consecutive_unproductive_pages + 1
                 };
+                let total_accepted = pending.total_accepted + newly_accepted as u64;
                 if pages_fetched >= MAX_PAGES_PER_SESSION {
                     warn!(peer = %peer, channel_id = pending.channel_id, pages_fetched, "reconcile: hit page-count backstop; stopping this session");
+                    // Give up on THIS chain, don't claim completion.
+                    // Sibling cancellation above is now gated on
+                    // `newly_accepted > 0`, so another peer's chain for this
+                    // same channel may still be alive — only release the
+                    // dedup entry once none remain, so a later periodic
+                    // sweep (or resubscribe) retries instead of being
+                    // stuck until process restart, but without piling a
+                    // redundant extra trigger on top of a still-pending
+                    // sibling.
+                    self.release_reconcile_trigger_if_no_siblings(pending.channel_id);
                     return;
                 }
                 if consecutive_unproductive_pages >= MAX_CONSECUTIVE_UNPRODUCTIVE_PAGES {
                     warn!(peer = %peer, channel_id = pending.channel_id, consecutive_unproductive_pages, "reconcile: peer made no progress for too many consecutive pages; stopping this session");
+                    self.release_reconcile_trigger_if_no_siblings(pending.channel_id);
                     return;
                 }
 
@@ -4104,9 +4339,85 @@ impl NetworkService {
                                 channel_id: pending.channel_id,
                                 pages_fetched,
                                 consecutive_unproductive_pages,
+                                total_accepted,
                             },
                         );
+                    } else {
+                        // Code-audit finding (2026-09-30): a peer
+                        // signalling `has_more = true` with no cursor is
+                        // a wire-protocol violation (this node's own
+                        // `build_response` never emits that combination,
+                        // but the response is untrusted). Neither
+                        // "continue paging" nor "natural completion"
+                        // applies — give up on this chain the same way
+                        // the backstops above do, instead of silently
+                        // falling through and leaving the dedup entry
+                        // (and any still-alive siblings' fate) stuck.
+                        warn!(peer = %peer, channel_id = pending.channel_id, "reconcile: peer signalled has_more with no cursor; stopping this session");
+                        self.release_reconcile_trigger_if_no_siblings(pending.channel_id);
                     }
+                } else if total_accepted > 0 {
+                    // Natural completion: this session got at least one
+                    // genuinely NEW, signature-verified envelope
+                    // (`RouteResult::Accepted` — never `Duplicate`, see
+                    // `ReconcilePending::total_accepted`'s doc comment for
+                    // why `Duplicate` is excluded, AND for the still-open
+                    // "single race-winning peer can fabricate this with
+                    // one self-signed throwaway message" residual — not
+                    // fully closed by this gate, only made time-bounded).
+                    // Still strictly better than the prior any-row proxy
+                    // this replaces (2026-09-30) — it requires a real
+                    // signature over genuinely new content, not "we
+                    // happen to have at least one local row" or "the
+                    // response merely wasn't shaped like the
+                    // empty-and-no-more case."
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    if let Err(e) = self
+                        .storage
+                        .mark_channel_backfill_complete(pending.channel_id, now)
+                    {
+                        warn!(channel_id = pending.channel_id, error = %e, "reconcile: failed to persist backfill completion");
+                    }
+                    self.release_reconcile_trigger_if_no_siblings(pending.channel_id);
+                } else {
+                    // Security-audit findings (2026-09-30, two rounds): a
+                    // response can be non-empty (so it skips the
+                    // empty+no-more early return above) yet contribute
+                    // ZERO genuinely new, verified envelopes — round 1's
+                    // example was a single garbage byte that fails to
+                    // deserialize; round 2's was a forged envelope
+                    // replaying a msg_id that already exists ANYWHERE on
+                    // this node (any channel), which reaches
+                    // `RouteResult::Duplicate` with no signature check at
+                    // all. Gating on `total_accepted` (strictly
+                    // `Accepted`) rather than `total_admitted` (which
+                    // included `Duplicate`) closes both — this is a
+                    // give-up, not a completion, either way. Note this
+                    // also correctly covers the legitimate steady-state
+                    // case where a peer confirms "you already have
+                    // everything" via all-`Duplicate` responses: that
+                    // does NOT refresh `mark_channel_backfill_complete`
+                    // either, so such a channel keeps getting
+                    // re-attempted every periodic-sweep tick rather than
+                    // going quiet — in exchange for never trusting an
+                    // unverifiable signal. Round-3 security audit: this
+                    // is a real, NOT fully quiescing steady-state cost —
+                    // v0.47.0 always "bulk-sends everything" (no
+                    // fingerprint diffing yet), so a fully-synced,
+                    // all-Duplicate channel still pages through and
+                    // deserializes real envelope batches on every
+                    // periodic-sweep retry (up to `MAX_CONSECUTIVE_
+                    // UNPRODUCTIVE_PAGES` x `max_envelopes_per_response`
+                    // per cycle), forever, for every such channel — not
+                    // merely a cheap point-read like the genuinely-empty-
+                    // channel case. Bounded per-tick/per-session, so not
+                    // DoS-class, but worth tracking as a real cost that
+                    // only goes away once spec-14 fingerprinting lands.
+                    warn!(peer = %peer, channel_id = pending.channel_id, "reconcile: session ended with has_more=false but zero newly-accepted envelopes; not marking complete");
+                    self.release_reconcile_trigger_if_no_siblings(pending.channel_id);
                 }
             }
             Event::OutboundFailure {
@@ -4124,6 +4435,12 @@ impl NetworkService {
                         error = ?error,
                         "reconcile: outbound failed; siblings may still succeed"
                     );
+                    // Only give up once every sibling for this channel has
+                    // failed — otherwise a still-pending sibling might
+                    // yet complete it, and releasing the dedup entry here
+                    // would let the periodic sweep fire a redundant extra
+                    // request on top of it.
+                    self.release_reconcile_trigger_if_no_siblings(pending.channel_id);
                 }
             }
             Event::InboundFailure { peer, error, .. } => {
@@ -5520,5 +5837,61 @@ mod identity_staleness_sweep_tests {
             c
         };
         assert_eq!(next_cursor, Some(expected_cursor));
+    }
+}
+
+#[cfg(test)]
+mod channel_backfill_due_tests {
+    //! Fix for a permanent-partial-sync bug (found 2026-09-30) — pure
+    //! decision logic factored out of `NetworkService::maybe_trigger_backfill`.
+    //! See `identity_staleness_sweep_tests`'s doc note for why the `&mut
+    //! self` trigger itself isn't tested directly here.
+    use super::*;
+
+    #[test]
+    fn never_completed_is_always_due_regardless_of_interval() {
+        assert!(channel_backfill_due(None, 1_000_000, 6));
+        assert!(channel_backfill_due(None, 1_000_000, 0));
+    }
+
+    #[test]
+    fn recently_completed_is_not_due() {
+        let now = 1_000_000u64;
+        let completed = now - 3600; // 1 hour ago
+        assert!(!channel_backfill_due(Some(completed), now, 6));
+    }
+
+    #[test]
+    fn completed_longer_ago_than_the_interval_is_due_again() {
+        let now = 1_000_000u64;
+        let completed = now - 7 * 3600; // 7 hours ago
+        assert!(channel_backfill_due(Some(completed), now, 6));
+    }
+
+    #[test]
+    fn exactly_at_the_interval_boundary_is_due() {
+        let now = 1_000_000u64;
+        let completed = now - 6 * 3600;
+        assert!(channel_backfill_due(Some(completed), now, 6));
+    }
+
+    /// `catchup_interval_hours = 0` means "never re-check a channel that
+    /// already completed" — but must NOT be confused with "never due at
+    /// all", which would resurrect the any-row-proxy bug for the
+    /// never-completed case.
+    #[test]
+    fn zero_interval_disables_recheck_of_completed_channels_only() {
+        let now = 1_000_000u64;
+        assert!(!channel_backfill_due(Some(now - 1_000_000), now, 0));
+        assert!(channel_backfill_due(None, now, 0));
+    }
+
+    /// A completion timestamp from the future (clock skew, or a
+    /// backwards-adjusted system clock) must not underflow and must not be
+    /// treated as "ancient" — `saturating_sub` keeps this at 0 elapsed.
+    #[test]
+    fn completion_timestamp_in_the_future_does_not_underflow() {
+        let now = 1_000u64;
+        assert!(!channel_backfill_due(Some(now + 1_000_000), now, 6));
     }
 }

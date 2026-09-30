@@ -4,12 +4,25 @@
 //! nodes joining an existing channel were left with empty
 //! `CHANNEL_MSGS` indexes — gossip catches future messages but never
 //! backfills history. This module implements the cold-join backfill:
-//! on the first `subscribe_channel(channel_id)` where the local
-//! `CHANNEL_MSGS` prefix-iter for that channel returns zero rows, the
-//! node requests the missing history from up to `fanout` peers in
-//! parallel, races for the first non-empty response, and pages
-//! through cursor-based batches until the responding peer signals
-//! `has_more = false`.
+//! on `subscribe_channel(channel_id)` (every startup, and whenever the
+//! chain scanner re-touches the channel), the node requests the
+//! missing history from up to `fanout` peers in parallel, races for
+//! the first non-empty response, and pages through cursor-based
+//! batches until the responding peer signals `has_more = false`.
+//!
+//! **Trigger condition** (`NetworkService::maybe_trigger_backfill`,
+//! rewritten 2026-09-30): fires whenever `storage::schema::cf::
+//! CHANNEL_BACKFILL_STATE` has no completion timestamp for the channel,
+//! or the last completion is older than `[backfill]
+//! channel_catchup_interval_hours` — NOT "does the channel have zero
+//! local messages". The earlier any-row check flipped permanently
+//! false (locking out backfill for the process's lifetime) the moment
+//! a single message arrived via live gossip ahead of a full backfill,
+//! leaving a channel stuck at whatever partial history it had at that
+//! instant. A periodic sweep (`retry_incomplete_channel_backfills`,
+//! piggybacked on the 30s bootstrap tick) also re-evaluates every
+//! channel on a rotating cursor, so an incomplete channel keeps
+//! getting retried without needing a restart.
 //!
 //! # Wire protocol
 //!
@@ -335,6 +348,39 @@ pub fn build_response(
     // the cap" vs "iteration ran out of channel rows".
     let probe_limit = cap.saturating_add(1);
 
+    // KNOWN LIMITATION (code-audit finding, round 4, 2026-09-30) — not
+    // fixed in this pass, recorded here so it isn't lost. `probe_limit`
+    // bounds RAW rows fetched, not ELIGIBLE ones, and iteration is always
+    // ascending from the OLDEST message (or from the cursor). If a
+    // channel accumulates more than `probe_limit` (default 1001)
+    // messages older than `request.max_age_secs`'s window (CHANNEL_MSGS
+    // has no age-based reaper — old rows persist indefinitely) AND the
+    // requester's window is finite (the default `[backfill] max_age_days
+    // = 30`, not `u64::MAX`), the FIRST page (`cursor: None`) can fetch
+    // only stale, out-of-window rows: every one hits the `env_secs <
+    // min_timestamp` skip below, so `chat_count` never leaves 0 and the
+    // response comes back `envelopes: [], has_more: false` —
+    // indistinguishable from a genuinely-empty channel. The requester
+    // (`NetworkService`'s reconcile handler) treats that shape as
+    // uninformative and never supplies a cursor to page past the stale
+    // prefix, so recent, genuinely in-window history can never be
+    // delivered to a cold-joining node for such a channel — deterministic
+    // and permanent for as long as the condition holds, the same failure
+    // class this whole feature (l2-node 0.136.0) exists to close, just
+    // reached via the time-window filter instead of the count cap.
+    //
+    // Not reachable at this project's current scale (requires substantial
+    // real usage older than the window before this trips) and has an
+    // immediate operator-level mitigation today: set `[backfill]
+    // max_age_days = 18446744073709551615` (u64::MAX / "archive mode, no
+    // time filter") — with no window filter to skip past, the ascending
+    // scan reaches eligible rows normally regardless of table size. A
+    // real fix needs `build_response` to keep scanning forward (bounded
+    // by a raw-row budget larger than `cap`, with its own cursor
+    // progress independent of whether anything eligible was found yet)
+    // rather than a single `probe_limit`-sized fetch — deferred as a
+    // separate, scoped follow-up rather than expanding this pass further.
+
     // Code Audit C1 (0.47.0): paging requires a seek-from-cursor
     // iterator. The earlier implementation used `prefix_iter_cf`
     // (which always starts at the channel prefix) plus a post-skip
@@ -434,17 +480,41 @@ pub fn build_response(
             continue;
         }
 
+        // Code-audit finding (2026-09-30): the old check here was
+        // `if chat_count >= cap { hit_cap = true; break; }` AFTER
+        // pushing — which set `hit_cap = true` the instant `cap`
+        // qualifying rows had been pushed, regardless of whether a
+        // genuine `(cap+1)`-th qualifying row actually followed. Any
+        // channel whose eligible history landed EXACTLY on `cap` (the
+        // default `max_envelopes_per_response` is 1000) got a false
+        // `has_more = true`, forcing a pointless extra round-trip that
+        // comes back empty+`has_more=false` — which the requester's
+        // `NetworkService` (l2-node 0.136.0) treats as "uninformative,
+        // ignore" rather than "session complete," so
+        // `mark_channel_backfill_complete` never fires despite every
+        // real envelope having already been correctly delivered and
+        // accepted on the first page. That left such a channel
+        // re-fanned-out by the periodic retry sweep forever, since
+        // subsequent attempts see the same page as all-`Duplicate` and
+        // never accumulate `total_accepted` either.
+        //
+        // Fix: `probe_limit` already over-fetches by one row precisely
+        // so this can be checked correctly. Only declare `hit_cap` once
+        // a genuine ADDITIONAL qualifying row is found beyond the first
+        // `cap` — check BEFORE pushing/counting/advancing the cursor,
+        // so the boundary row itself is never counted twice and the
+        // cursor never advances past the last row actually returned.
+        if chat_count >= cap {
+            hit_cap = true;
+            break;
+        }
+
         envelopes.push(raw);
         chat_count += 1;
         last_cursor = Some(ReconcileCursor {
             after_lamport_ts: lamport_ts,
             after_msg_id: msg_id,
         });
-
-        if chat_count >= cap {
-            hit_cap = true;
-            break;
-        }
     }
 
     // Audit final pre-mainnet W6: ride edit/delete envelopes along on the
@@ -642,7 +712,14 @@ fn channel_edit_delete_envelopes(
 ///
 /// Mirrors `crate::messages::router::is_private_channel_meta` and
 /// the inline check at `crate::storage::rocks::Storage::is_local_anchor`.
-fn is_private_channel(storage: &Storage, channel_id: u64) -> bool {
+///
+/// `pub(crate)` (not private) so `NetworkService::maybe_trigger_backfill`
+/// can skip triggering reconciliation for a known-private channel at all
+/// (code-audit follow-up, 2026-09-30) — `build_response` above refuses
+/// every private-channel request unconditionally anyway, so attempting
+/// one is pure wasted fanout traffic, retried every periodic-sweep tick
+/// forever since a refused request can never reach natural completion.
+pub(crate) fn is_private_channel(storage: &Storage, channel_id: u64) -> bool {
     let key = channel_id.to_be_bytes();
     let bytes = match storage.get_cf(schema::cf::CHANNELS, &key) {
         Ok(Some(b)) => b,
@@ -802,6 +879,69 @@ mod edit_delete_ride_along_tests {
         );
     }
 
+    /// Code-audit finding (2026-09-30): a channel whose eligible history
+    /// lands EXACTLY on `cap` must report `has_more = false` on that same
+    /// page — not a false `has_more = true` that forces a pointless extra
+    /// empty round-trip. The old check (`chat_count >= cap` evaluated
+    /// AFTER pushing) got this wrong; `mark_channel_backfill_complete`
+    /// (l2-node 0.136.0) depends on this being right, since a channel
+    /// that never sees a genuine `has_more = false` page can never be
+    /// marked complete and gets re-fanned-out by the periodic retry sweep
+    /// forever.
+    #[test]
+    fn exact_cap_boundary_reports_no_more_on_the_same_page() {
+        let (s, _d) = db();
+        let channel_id = 79u64;
+        for i in 0..3u64 {
+            put_chat_message(&s, channel_id, [i as u8 + 1; 32], 1_000 + i);
+        }
+
+        let req = ReconcileRequest {
+            channel_id,
+            max_age_secs: u64::MAX,
+            cursor: None,
+            fingerprint: Vec::new(),
+            epoch_root_known: None,
+            round: 0,
+        };
+        // cap == the exact number of eligible messages.
+        let resp = build_response(&s, &req, 3, 5_000);
+        assert_eq!(resp.envelopes.len(), 3);
+        assert!(
+            !resp.has_more,
+            "exactly `cap` real rows with nothing beyond must report \
+             has_more = false on this page, not force a follow-up round-trip"
+        );
+        assert!(resp.next_cursor.is_none());
+    }
+
+    /// One genuine row beyond the exact boundary must still be detected
+    /// correctly — the fix must not overcorrect into never capping at all.
+    #[test]
+    fn one_row_past_the_cap_boundary_still_reports_has_more() {
+        let (s, _d) = db();
+        let channel_id = 80u64;
+        for i in 0..4u64 {
+            put_chat_message(&s, channel_id, [i as u8 + 1; 32], 1_000 + i);
+        }
+
+        let req = ReconcileRequest {
+            channel_id,
+            max_age_secs: u64::MAX,
+            cursor: None,
+            fingerprint: Vec::new(),
+            epoch_root_known: None,
+            round: 0,
+        };
+        let resp = build_response(&s, &req, 3, 5_000);
+        assert_eq!(resp.envelopes.len(), 3, "must still cap at exactly `cap` rows");
+        assert!(
+            resp.has_more,
+            "a genuine 4th row beyond cap=3 must still be detected"
+        );
+        assert!(resp.next_cursor.is_some());
+    }
+
     /// A small channel that fits entirely on page 1 (never hits the cap)
     /// gets the ride-along immediately — the gate is `!hit_cap`, not "page
     /// 2 specifically".
@@ -924,6 +1064,54 @@ mod channel_meta_order_tests {
              otherwise a skewed-clock Join can be permanently lost \
              (add_channel_member no-ops when the channel doesn't exist yet)"
         );
+    }
+}
+
+#[cfg(test)]
+mod is_private_channel_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn db() -> (Storage, TempDir) {
+        let dir = TempDir::new().unwrap();
+        (Storage::open(dir.path()).unwrap(), dir)
+    }
+
+    fn put_channel(s: &Storage, channel_id: u64, channel_type: u64) {
+        s.put_cf(
+            schema::cf::CHANNELS,
+            &channel_id.to_be_bytes(),
+            serde_json::to_vec(&serde_json::json!({ "channel_type": channel_type }))
+                .unwrap()
+                .as_slice(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn private_channel_type_is_detected() {
+        let (s, _d) = db();
+        put_channel(&s, 1, 2);
+        assert!(is_private_channel(&s, 1));
+    }
+
+    #[test]
+    fn public_and_read_public_are_not_private() {
+        let (s, _d) = db();
+        put_channel(&s, 1, 0);
+        put_channel(&s, 2, 1);
+        assert!(!is_private_channel(&s, 1));
+        assert!(!is_private_channel(&s, 2));
+    }
+
+    /// Unknown channel_id (no local row at all) defaults to "not private"
+    /// — used by `NetworkService::maybe_trigger_backfill`'s skip check, so
+    /// a channel this node hasn't chain-scanned yet still gets a normal
+    /// backfill attempt rather than being silently skipped forever.
+    #[test]
+    fn unknown_channel_defaults_to_not_private() {
+        let (s, _d) = db();
+        assert!(!is_private_channel(&s, 999));
     }
 }
 

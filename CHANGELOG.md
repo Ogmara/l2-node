@@ -5,6 +5,88 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.136.0] - 2026-09-30
+
+### Fixed
+
+- **Closed a permanent partial-sync bug in channel-history backfill.**
+  `NetworkService::maybe_trigger_backfill` used to gate a channel's P2P
+  history reconciliation on "does `CHANNEL_MSGS` have ANY local row for
+  this channel" — which flips true, and locks out backfill for the rest
+  of the process, the moment a single message arrives via live gossip
+  ahead of a full backfill completing. A node could get stuck at
+  whatever partial history it happened to have at that instant, with no
+  way to recover short of wiping local data and restarting. Found live
+  on a production node: channel/user metadata (chain-scan-driven) synced
+  correctly while message history (gossip-catch-driven) was badly
+  incomplete despite the node running for days.
+  - Replaced the any-row heuristic with a real, persisted completion
+    signal (new `storage::schema::cf::CHANNEL_BACKFILL_STATE`, stamped
+    only when a reconciliation session reaches genuine natural
+    completion) and a new periodic retry sweep
+    (`retry_incomplete_channel_backfills`, piggybacked on the existing
+    30s bootstrap tick, bounded per-tick via a rotating cursor) so an
+    incomplete channel keeps getting retried without needing a restart.
+  - New config: `[backfill] channel_catchup_interval_hours` (default 6,
+    mirrors `news_catchup_interval_hours`) and `catchup_batch_size`
+    (default 25, ceiling 10,000). Removed the dead, never-implemented
+    `force_resync_if_stale_days` field it replaces.
+  - Private channels (unconditionally refused by the responder anyway)
+    are now skipped client-side instead of being retried forever.
+  - Fixed a related off-by-one in `build_response`'s page-cap detection:
+    a channel whose eligible history landed exactly on the page-size
+    boundary got a false `has_more = true`, forcing a pointless
+    follow-up round-trip that then looked "uninformative" and never
+    settled — the same failure class, reached a different way.
+  - **Known, deliberately deferred residual**: if a channel accumulates
+    more stale (older-than-window) messages than the page cap, the
+    ascending-from-oldest scan can exhaust its probe budget on stale
+    rows alone, reproducing a narrower version of this same bug. Not
+    reachable at this project's current scale; mitigated today by
+    setting `max_age_days` to unlimited. See the doc comment above
+    `probe_limit` in `src/network/reconcile.rs`.
+
+### Security
+
+- **Two forgery classes in the new completion signal, found and closed
+  across the fix's own mandatory re-audit rounds** (four rounds total —
+  Code + Security audits run in parallel each round, per this project's
+  pipeline):
+  - Round 1: the completion mark initially fired on any response merely
+    shaped like "no more data," letting an attacker win the fanout race
+    with a single instant, free, all-garbage reply and permanently
+    suppress a channel's real history — worse than the bug being fixed.
+    Closed by requiring genuine router admission before marking
+    complete.
+  - Round 2: that fix still counted `RouteResult::Duplicate`, which the
+    router grants BEFORE signature verification and keys globally (not
+    per-channel) — an attacker could replay any msg_id that already
+    exists anywhere on the node, paired with a forged envelope claiming
+    the target channel, to reach `Duplicate` for free. Also found the
+    same response shape was pre-empting honest still-in-flight fanout
+    siblings. Closed by gating completion, sibling-cancellation, and the
+    unproductive-page backoff strictly on `RouteResult::Accepted` (real
+    signature verification), matching an existing precedent already in
+    this file's `sync` protocol handler.
+  - Round 3 confirmed both classes closed by reading `process_message_
+    inner` end-to-end, and flagged a still-open, explicitly-documented,
+    lower-severity residual: a fresh, unregistered keypair can still
+    sign one trivial message against a genuinely open Public channel
+    (`channel_type == 0`; ReadPublic is unaffected — `check_readonly_
+    channel` already gates it to the creator/a moderator) and reach
+    `Accepted` cheaply, since the sync/backfill ingestion path is
+    deliberately PoW-exempt and unrate-limited. Unlike rounds 1-2, this
+    is no longer *permanent* — a false completion now expires after
+    `channel_catchup_interval_hours` (default 6h). Fully closing it needs
+    either the deferred spec-14 fingerprint/epoch-root completeness proof
+    or a cheaper interim hardening (e.g. requiring 2+ independent peers
+    to agree); deliberately not attempted in this pass and recorded in
+    the `ReconcilePending::total_accepted` doc comment so it isn't
+    mistaken for closed.
+  - Round 4 (the `build_response` off-by-one fix above, plus doc-comment
+    corrections) came back clean from both audits — the pipeline's
+    mandatory re-audit gate is satisfied.
+
 ## [0.135.0] - 2026-09-29
 
 ### Security
