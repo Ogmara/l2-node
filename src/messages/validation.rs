@@ -316,6 +316,45 @@ pub fn validate_channel_create(p: &ChannelCreatePayload) -> Result<(), Validatio
             return Err(ValidationError("moderation rules too long".into()));
         }
     }
+    // Round-4 security audit finding: `channel_id` has no upper bound
+    // anywhere else in the codebase, so the "a Private channel_id
+    // colliding with a real on-chain channel is effectively unreachable"
+    // reasoning (see CHANGELOG's Known limitations) rested entirely on
+    // well-behaved CLIENT derivation (a wide-domain hash,
+    // `docs/specs/05-clients.md` §private-channel-creation) that this
+    // node never verifies. A floor makes that provably true instead of
+    // merely likely: the on-chain sequential space (`channel_count`) will
+    // not reach this floor for a very long time at any realistic growth
+    // rate, so a genuinely client-hashed private id — which lands here
+    // with overwhelming probability already — is essentially never
+    // rejected, while a deliberately low, attacker-chosen id aimed at an
+    // existing on-chain channel now can't even reach the row-write path.
+    const PRIVATE_CHANNEL_ID_FLOOR: u64 = 1 << 32;
+    if p.channel_type == ChannelType::Private && p.channel_id <= PRIVATE_CHANNEL_ID_FLOOR {
+        return Err(ValidationError(
+            "private channel_id too low — must be a properly-derived hash, not a small/sequential value".into(),
+        ));
+    }
+    // Round-6 audit finding (both a code and a security auditor,
+    // independently): `messages::router`'s `PUBLIC_CHANNEL_ID_MARGIN`
+    // check bounds a Public/ReadPublic `channel_id` relative to the
+    // cached on-chain `channel_count` — but that cache is `0` (treated
+    // as "unknown," fails OPEN) on a fresh node before its first sweep
+    // tick, or whenever `[channel_verify]` is disabled, leaving the
+    // FULL `u64` range reachable during that window. This absolute
+    // backstop needs no cache and can never fail open: the SC's
+    // sequential id space will not reach `PRIVATE_CHANNEL_ID_FLOOR` for
+    // a very long time at any realistic growth rate (the same argument
+    // that floor already rests on for Private ids), so rejecting any
+    // Public/ReadPublic claim at or above it bounds the margin check's
+    // fail-open blast radius from "any u64" down to "somewhere under
+    // 2^32" — narrower, not a full fix for that gap on its own, but a
+    // cheap, always-on complement to it.
+    if p.channel_type != ChannelType::Private && p.channel_id >= PRIVATE_CHANNEL_ID_FLOOR {
+        return Err(ValidationError(
+            "public/read-public channel_id impossibly high for the SC's sequential id space".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -2568,5 +2607,52 @@ mod message_button_tests {
         let err = deserialize_payload(MessageType::ChatEdit, &oversized)
             .expect_err("oversized raw payload must be rejected");
         assert!(format!("{err}").contains("too large"));
+    }
+}
+
+// --- validate_channel_create: Private channel_id floor (round-4 security
+// audit) ---
+
+#[cfg(test)]
+mod channel_create_private_id_floor_tests {
+    use super::*;
+
+    fn base_payload(channel_id: u64, channel_type: ChannelType) -> ChannelCreatePayload {
+        ChannelCreatePayload {
+            channel_id,
+            slug: "test-channel".to_string(),
+            channel_type,
+            display_name: None,
+            description: None,
+            content_rating: Default::default(),
+            moderation: ModerationPolicy { admins: vec![], rules: None },
+            encryption_enabled: None,
+            history_visibility: None,
+        }
+    }
+
+    #[test]
+    fn private_channel_id_at_or_below_floor_is_rejected() {
+        let p = base_payload(1 << 32, ChannelType::Private);
+        assert!(validate_channel_create(&p).is_err());
+        let p = base_payload(4245, ChannelType::Private);
+        assert!(validate_channel_create(&p).is_err());
+    }
+
+    #[test]
+    fn private_channel_id_above_floor_is_accepted() {
+        let p = base_payload((1 << 32) + 1, ChannelType::Private);
+        assert!(validate_channel_create(&p).is_ok());
+    }
+
+    #[test]
+    fn public_and_readpublic_low_ids_are_unaffected_by_the_private_floor() {
+        // The floor exists specifically because the SC's own sequential
+        // id space is small — a real Public/ReadPublic channel_id being
+        // low is the EXPECTED case, not a signal to reject.
+        let p = base_payload(1, ChannelType::Public);
+        assert!(validate_channel_create(&p).is_ok());
+        let p = base_payload(2, ChannelType::ReadPublic);
+        assert!(validate_channel_create(&p).is_ok());
     }
 }

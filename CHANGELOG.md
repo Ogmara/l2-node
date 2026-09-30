@@ -5,6 +5,376 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.135.0] - 2026-09-29
+
+### Security
+
+- **Closed the permanent public-channel squatting risk flagged in
+  0.134.2's Security section.** An attacker who gets an L2 node to
+  accept a forged `ChannelCreate` (before the real on-chain
+  `ChannelCreated` event is scanned, or for an id that may never be
+  scanned) previously gained standing `creator` rights — kick/ban/
+  delete/moderate — never actually granted on-chain. This took **TEN
+  audit rounds** to close safely; each of the first nine passes was
+  built, tested, and believed complete, and each of the first nine was
+  then caught by the mandatory "re-audit the FIXED tree" pass with a
+  genuine, sometimes worse, unresolved issue — including two consecutive
+  rounds where the fix for one round's finding became the next round's
+  finding, one round where the fix for a starvation bug introduced a
+  critical detection-bypass in an unrelated code path, one round where a
+  fix applied to one arm of a match left a structurally-identical
+  sibling arm completely unguarded, and one round where sweeping for
+  THAT exact pattern found the identical bug shape pre-existing in a
+  sibling handler nobody had examined. **Round 10 is the first round
+  where both audits came back completely clean** — the pipeline's
+  mandatory re-audit gate is now satisfied. Full round-by-round history,
+  including the process lessons this arc reinforced, is preserved in
+  project memory (`project_l2_node_scanner_pagination_gap.md`) as a
+  process record; this entry describes the FINAL shipped design.
+  - **Bulk SC-authoritative enumeration.** `ChainScanner::
+    sweep_channel_verification` walks the SC's own `1..=channel_count`
+    id space directly (`chain::sc_views::get_stats`), independent of
+    whatever exists locally — channel_ids mint strictly sequentially
+    on-chain and are never reused, so this space is complete and immune
+    to local-table flooding (the original design's fatal flaw).
+  - **Three lanes, each with an independently reserved share of the
+    per-tick RPC budget** (`chain::scanner::partition_sweep_budget`) —
+    no lane can take budget from a lane it hasn't started yet, so a
+    saturated lane degrades only its own throughput:
+    - *Priority* — every id newer than a persisted high-water mark;
+      closes a new squat fast (should be 0-1 ids/tick in practice).
+    - *Out-of-range* — rotates through the BOUNDED window
+      `[channel_count+1, channel_count+PUBLIC_CHANNEL_ID_MARGIN]`
+      (`chain::scanner::next_out_of_range_id`), closing the gap bulk
+      enumeration structurally cannot reach: `channel_id` has no upper
+      bound anywhere in the codebase, so an attacker claiming an id
+      ABOVE the current count — including the very next one about to
+      be minted — would otherwise be invisible. The window's SIZE is
+      bounded at ingestion (`messages::router`'s `ChannelCreate`
+      handler rejects a Public/ReadPublic `channel_id` more than
+      `PUBLIC_CHANNEL_ID_MARGIN` above the cached on-chain count, the
+      same pattern proven below for Private ids) rather than merely
+      making padding it more expensive — a full rotation now completes
+      in a bounded number of ticks no matter how much an attacker pads
+      the window, because there is no slot outside it to hide in.
+    - *Round-robin* — re-walks the FULL `1..=channel_count` space,
+      including already-verified rows (wrapping), catching a
+      `ChannelTransferred` lost to a scan gap or a snapshot-imported
+      row that inherited another node's verdict with no independent
+      check. Skips a row confirmed within the last 24h for free, so
+      budget isn't spent re-confirming fresh rows as often as it's
+      spent on genuinely stale/unverified ones.
+  - **`channel_type` is spec-correct**: a confirmed match never touches
+    it; a correction only overwrites it when the row is *currently*
+    (re-checked fresh under `channel_membership_lock`) Private — the
+    SC's immutable on-chain snapshot never overrides a legitimate
+    L2-authoritative Public↔ReadPublic flip (`ChannelUpdate`).
+  - **Verification bookkeeping lives in its own unhashed
+    `CHANNEL_VERIFICATION` column family**, excluded from
+    `snapshot::DOMAIN_CFS` — none of it touches the CHANNELS row or the
+    anchored Merkle state root, so it can never cause cross-node anchor
+    divergence.
+  - **`PRIVATE_CHANNEL_ID_FLOOR` (2^32)**: a Private-typed
+    `ChannelCreate`'s `channel_id` must exceed this floor
+    (`validate_channel_create`) — bounds a private channel's id, at
+    ingestion, far outside the small sequential space the SC will ever
+    reach, closing a (assessed as already near-impossible, now provably
+    closed) id-collision edge case with an unrelated real channel.
+  - **Tombstone-poisoning cross-check** (`ChannelCreate` a not-yet-real
+    id, then `ChannelDelete` it — permanently blocking its real future
+    creation): `tombstone_channel` records `deleted_by`, and the
+    priority/round-robin lanes cross-check it against the SC's live
+    creator via `verify_one_channel_creator`'s no-local-row branch, the
+    moment the id becomes real and the SC can give a conclusive answer.
+    **Detection, not prevention** — see Known limitations. Exempted for
+    admin/REST-authenticated deletes (`Storage::
+    mark_tombstone_as_admin_delete`), which are a different trust
+    boundary entirely and would otherwise false-alert on every routine
+    moderation delete.
+  - **`RateCategory::ChannelCreate`** (20/hour/wallet) — was previously
+    uncategorized `Other` (144,000/day/wallet).
+  - **`CHANNEL_VERIFICATION_ALERTS_TOTAL`**
+    (`GET /admin/metrics/snapshot` →
+    `chain.channel_verification_alerts_total`): a monotonic counter
+    bumped on every squat-correction and poisoning-mismatch detection —
+    previously `warn!`-log-only, invisible without active log scraping.
+  - `creator_verified_at`/`creator_verification_failed` stripped from
+    public unauthenticated channel API responses.
+  - 24 unit tests cover the invariants each audit round found missing:
+    the confirmed/corrected `channel_type` gate, both cooldown
+    decisions, the out-of-range rotation's bounded coverage, budget
+    partitioning, the private-id floor, and the tombstone-guard race.
+  - **Round 6**: the round-5 diff was re-audited (code + security, in
+    parallel) — this is the round that finally confirmed the Lane 2
+    rotation and margin-based bound genuinely close the "reduced not
+    removed" pattern (both auditors tried hard to break it and could
+    not) — but found ONE new CRITICAL and several real findings in the
+    other round-5 additions:
+    - **CRITICAL, found independently by both auditors — the "admin
+      delete" tombstone-poisoning exemption completely nullified
+      detection.** `DELETE /api/v1/channels/{id}` is plain Klever-wallet
+      auth, and its ONLY authorization check is `creator ==
+      auth_user.address` against the LOCAL, unverified CHANNELS row —
+      the exact forgeable claim the poisoning check exists to catch. Any
+      wallet that forges a `ChannelCreate` naming itself creator was
+      thereby ALSO authorized to call this endpoint and get the
+      exemption stamped, silencing detection more cheaply and quietly
+      than the signed-envelope path it was meant to be safe alongside.
+      **The exemption's stated false-positive premise was also wrong**:
+      this route's own creator check already guarantees `deleted_by ==
+      real_creator` for a genuine on-chain channel, so the "false alert
+      on routine admin deletes" it was built to prevent does not occur
+      for the legitimate case. **Fixed: fully reverted** — the exemption,
+      `Storage::mark_tombstone_as_admin_delete`, and its check in
+      `check_tombstoned_channel_for_poisoning` are removed. No
+      replacement exemption is needed.
+    - **BLOCKING — Lane 1 (priority) forfeited cooldown-deferred ids to
+      Lane 3's weeks-to-years cadence, defeating its own purpose for
+      exactly the ids that matter most.** `verify_one_channel_creator`
+      returned `0` identically for "genuinely nothing to check" and "hit
+      a cooldown" — but an id can carry cooldown state from BEFORE Lane 1
+      ever reaches it (Lane 2 flagged it while still out-of-range, and it
+      became real moments before Lane 1 arrived), so "no RPC spent"
+      didn't mean "safe to advance high-water past." **Fixed**: a new
+      `VerifyStep{rpc_calls, deferred}` return distinguishes the two;
+      Lane 1 now stops advancing `CHANNEL_VERIFY_HIGH_WATER` at the FIRST
+      deferred id each tick (while still spending budget checking ids
+      past it), so a deferred id is re-examined next tick instead of
+      being forfeited.
+    - **WARNING — the margin check's fail-open (`LAST_KNOWN_CHANNEL_COUNT
+      == 0`) conflated "unknown" with "a genuine zero count," and had no
+      backstop for the window it's open.** A fresh node's first sweep
+      tick, `[channel_verify]` disabled, or a stuck/misconfigured Klever
+      endpoint left the FULL `u64` id space unbounded during that window
+      — narrower than pre-round-5, but not closed. **Fixed two ways**: a
+      written `0` (a real fresh-network count) is no longer treated as
+      "unknown" (only a genuinely absent/unparseable cache value is); and
+      a new absolute backstop — reject any Public/ReadPublic `channel_id
+      >= PRIVATE_CHANNEL_ID_FLOOR` (2^32) in `validate_channel_create`
+      itself, needing no cache and therefore never failing open — bounds
+      the remaining gap from "any `u64`" down to "somewhere under 2^32."
+    - **WARNING — a currently-Private row whose id turns out to have real
+      on-chain backing under an unrelated creator was auto-converted to
+      that creator/type.** This was the intended fix for "self-label
+      Private to dodge verification" before `PRIVATE_CHANNEL_ID_FLOOR`
+      existed — but the floor now closes that bypass at ingestion, so
+      the only rows left reaching this path are pre-floor legacy rows,
+      which can no longer be told apart from a genuinely legitimate old
+      private channel that happens to collide with an unrelated on-chain
+      id. **Fixed**: `ChannelVerificationOutcome::Corrected` no longer
+      touches a currently-Private row at all — detected, not corrected
+      (same posture as tombstone-poisoning), surfaced via a `warn!` +
+      the alert counter for operator review. The `getChannelInfo` SC
+      view call this used to make (and the now-fully-unused
+      `ChannelInfo`/`decode_channel_info`) are removed.
+    - Also fixed in this pass: the chain scanner's own `ChannelCreated`
+      re-scan merge path was found to violate the SAME `channel_type`
+      L2-authority invariant this whole feature exists to protect
+      elsewhere (round 2's rejected design, reintroduced in a sibling
+      code path) — it unconditionally overwrote `channel_type` on every
+      re-scan of an already-known channel, reverting any legitimate
+      `ChannelUpdate` ReadPublic flip; now only corrects FROM Private,
+      same as the sweep's own logic. `mark_channel_creator_verified` is
+      now stamped AFTER its corresponding CHANNELS row write succeeds,
+      not before — a failed write no longer leaves a "verified" record
+      standing (which, combined with the new 24h positive-reverify
+      cooldown, could have shielded an uncorrected row from re-checking
+      for up to a day).
+  - **Round 7**: the round-6 diff was re-audited (code + security, in
+    parallel) — the round-6 fixes (admin-delete reversion, Lane 1's
+    deferred-id tracking, the margin/backstop fail-open fixes, the
+    Private-conversion removal, the `mark_channel_creator_verified`
+    reordering) all held up under independent re-verification. Two real
+    findings, both now fixed:
+    - **The `channel_type` protection the round-6 audit added to the
+      `ChannelCreated` re-scan merge left `creator`/`slug`/`created_at`
+      in the SAME branch still unconditional** — a legacy pre-
+      `PRIVATE_CHANNEL_ID_FLOOR` Private row colliding with a real
+      on-chain channel had its ownership and identity silently
+      overwritten every re-scan, the identical self-label-collision
+      class this feature closes elsewhere, reachable through a
+      different code path than the one round 6 actually fixed. **Fixed**:
+      the whole merge decision is now `detect, alert, touch NOTHING`
+      for a currently-Private row (mirroring `apply_channel_
+      verification_result`'s posture exactly), extracted into a new
+      pure `merge_channel_created_into_existing` function — unit-tested
+      directly, since the surrounding event handler has no HTTP-mocking
+      harness otherwise.
+    - **Both places implementing "detect, don't auto-correct" for a
+      Private collision (`apply_channel_verification_result` and the
+      `ChannelCreated` merge above) were unconditionally stamping
+      `creator_verified_at` on the very row they'd just declined to
+      correct.** That armed the new 24h positive-reverify cooldown on
+      exactly the row most needing to stay re-checkable, silencing
+      re-alerting for up to a day on a collision that remained
+      unresolved the entire time — undercutting this round's own
+      "detect and keep alerting" intent. **Fixed**: the verification
+      stamp is now gated on whether a correction actually happened, not
+      merely on whether a check happened — a detected-but-unresolved
+      collision leaves `creator_verified_at` untouched, so the next lane
+      pass that reaches it makes a fresh check and alerts again.
+  - **Round 8**: the round-7 diff was re-audited (code + security, in
+    parallel). The security audit came back clean; the code audit found
+    **one CRITICAL**: `apply_channel_verification_result`'s `Confirmed`
+    arm had NO `currently_private` guard at all, unlike the `Corrected`
+    arm right next to it that rounds 6-7 had just fixed. The caller
+    picks `Confirmed` purely from `verified_creator == stored_creator`,
+    decided BEFORE any Private check — so a currently-Private row whose
+    stored creator happens to MATCH the SC's real on-chain creator for
+    that id reached `Confirmed` with no detection at all. That match is
+    trivial for a deliberate attacker to arrange (sign both the local
+    Private `ChannelCreate` and the real on-chain create with the SAME
+    wallet) — it is, in fact, the ONLY way to dodge `Corrected`'s
+    detection, making this the exact case a determined attacker would
+    engineer, left open by fixing only the accidental-mismatch sibling
+    case. Worse than the round-7 bug it resembles: that one delayed
+    re-alerting by up to 24h; this one alerted NEVER, and self-renewed
+    every time a lane happened to re-check the id, since the same
+    attacker-controlled match holds every time. **Fixed**: `Confirmed`
+    now branches on `currently_private` exactly like `Corrected` —
+    ANY on-chain backing for a claimed-Private id is treated as an
+    anomaly regardless of whether the creator happens to match. A new
+    unit test seeds a currently-Private row against `Confirmed`
+    specifically (the prior test suite only ever seeded `Confirmed`
+    against a diverging ReadPublic type — zero coverage existed for
+    this exact combination). The security audit's own note — a
+    theoretical, currently-unreachable gap if `meta.as_object_mut()`
+    ever returned `None` for a confirmed-non-Private row (no CHANNELS
+    writer in the codebase produces a non-object row today) — is
+    recorded rather than fixed, since closing it would mean guarding
+    against a writer that doesn't exist.
+  - **Round 9**: the round-8 diff was re-audited (code + security, in
+    parallel). Both this round's own targeted fix AND a broader sweep of
+    the whole diff for "an attacker-preferred sibling arm left
+    unguarded" (round 8's newly-named pattern) — the security audit's
+    sweep came back clean; the code audit's sweep found **one CRITICAL,
+    pre-existing** (not introduced by any round of this feature — just
+    never examined until this round's sweep, prompted by round 8 naming
+    the pattern): `ScEvent::ChannelTransferred`'s handler unconditionally
+    overwrote a channel's `creator` field with no currently-Private
+    guard at all — the identical bug `ChannelCreated`'s sibling merge
+    was fixed for in rounds 6-7, in a handler nobody had re-examined
+    since. `messages::router`'s `is_channel_creator`/`channel_creator_
+    check` gate delete/ban/update/invite authority purely on
+    `CHANNELS.creator`, with no `channel_type` distinction — so for a
+    pre-`PRIVATE_CHANNEL_ID_FLOOR` legacy row colliding with a real
+    on-chain id, whoever controls the ON-CHAIN side of that id's
+    transfer (not the victim's own signing key — a materially lower bar
+    than round 8's bug) could silently seize delete/ban/update/invite
+    authority over an unrelated real user's currently-Private channel.
+    **Fixed**: extracted a new pure `apply_channel_transfer_to_existing`
+    function (mirroring `merge_channel_created_into_existing`'s already-
+    established detect/alert/touch-nothing posture and reusing its
+    outcome enum, renamed `ChannelFieldMergeOutcome` since it's now
+    shared) — 3 new unit tests pin the fix directly, since this handler
+    had zero test coverage before this round.
+  - **Round 10**: the round-9 diff was re-audited (code + security, in
+    parallel) — including an explicit sweep for a THIRD instance of the
+    "guard one arm of a match, forget the attacker-preferred sibling"
+    shape rounds 8 and 9 had each found once. **Both audits came back
+    completely clean** — the first fully clean round, on both audits
+    simultaneously, in this feature's entire history. The extracted
+    `apply_channel_transfer_to_existing` function was confirmed
+    behavior-preserving (diffed field-for-field against the code it
+    replaced) and correctly ordered; the historical scanner's shared
+    `ChannelCreated`/`ChannelTransferred` unlocked-write residual
+    (tracked since round 6) is unchanged, not newly introduced; and a
+    review of every other `ScEvent` handler plus `ChannelDelete`/
+    `ChannelUpdate`/`ChannelCreate`/`ChannelJoin` in `messages::router`
+    found no third instance of the pattern — this specific class of bug
+    is judged closed for this feature, not merely unexamined further.
+- **Chain-scan gaps are no longer dashboard-invisible.** Every
+  `PageOutcome::CapExceededTooDeep` skip is persisted
+  (`chain::scanner::GapRecord`, capped at the most recent 500, with
+  same-range-repeat dedup) and surfaced as
+  `MetricsSnapshot::klever_scan_gap_count`/`klever_scan_gap_blocks_total`
+  in `GET /admin/metrics/snapshot`, alongside `sync_lag_blocks` — which
+  alone was misleading, since it's computed from the same cursor that
+  just advanced past a skipped range. `klever_scan_gap_blocks_total` is a
+  separate monotonic lifetime counter, not derived from the capped list
+  (which can shrink as old entries are dropped).
+
+### Known limitations (deliberately out of scope this pass)
+
+- **Tombstone-poisoning is detected, not prevented.** A successful
+  attempt still tombstones the id until a lane reaches it, and nothing
+  automatically reverses it. Synchronously refusing the delete itself
+  would require making `messages::router::update_indexes` (and its
+  whole synchronous caller chain) `async`, a separate and much larger
+  refactor of the core message-ingest path.
+- **Moderator/ban/pin state granted during an attack window is not
+  automatically reversed** by a later creator correction — only
+  `creator` and (conditionally) `channel_type` are corrected. A member
+  list's cosmetic `"role": "creator"` field can also go stale until that
+  member independently reloads.
+- **Self-labeling a channel Private remains a functioning
+  join-authorization bypass** (pre-existing, permissive-by-default
+  design, tracked separately) — this pass does not close it.
+- **Round-robin full-coverage cycle time is impractical at scale** —
+  quantified by audit at ~70 days at 100k channels and ~1.9 years at 1M,
+  using default budgets. The priority and out-of-range lanes stay fast
+  and scale-independent; the round-robin lane's own purpose — catching
+  `ChannelTransferred` events lost to a scan gap, and stale
+  snapshot-bootstrap imports — degrades toward theoretical at large
+  channel counts. A tuning knob (`[channel_verify]` config), not a code
+  fix, this pass — though it can no longer be driven to a literal zero
+  share regardless of configuration (`config::validate`'s floor of 3).
+- Any *other* SC event type lost to a scan gap (user registrations,
+  delegations, non-channel state) has no equivalent independent-reverify
+  path. A gapped block range itself is still never retried.
+- Cross-module Klever RPC rate-limit unification (`sc_discovery`,
+  `anchoring`, `governance_autoexec`, `metadata_reconcile`,
+  `media_fallback` each call the SC independently with no shared budget)
+  remains separate and untouched.
+- `mark_tombstone_poison_checked` (the poisoning-check cache) still does
+  an unlocked read→await→write — low impact since nothing in the
+  codebase ever removes a tombstone, so the worst case is a concurrent
+  second delete's `deleted_at`/`deleted_by` getting reverted, not a
+  resurrection. `sweep_channel_verification`'s shutdown handling has a
+  similar low-severity edge: a shutdown signal arriving in the narrow
+  window between a tick firing and `resubscribe()` completing can delay
+  graceful shutdown by up to ~20-30s.
+- A legitimate Public/ReadPublic channel whose on-chain confirmation is
+  delayed by more than `PUBLIC_CHANNEL_ID_MARGIN` ids' worth of
+  subsequent chain growth (or, separately, more than the sweep's own lag
+  behind the chain tip) would be rejected by the ingestion-time margin
+  check until the cache catches up — assessed as generous headroom for
+  documented-normal "0-1 ids per tick" creation rates, not a realistic
+  ceiling, but worth monitoring if actual usage differs materially.
+- **The ingestion-time bounds are prospective, not retroactive, and Lane
+  2 no longer scans local rows at all — so a Public/ReadPublic row that
+  is ALREADY outside the margin window (or a Private row already below
+  `PRIVATE_CHANNEL_ID_FLOOR`) is unreachable by every lane.** Round 4's
+  design at least attempted to walk such rows (unsafely, per rounds 4-5's
+  own findings); round 6's audits confirmed round 5 closed that
+  unsafety by narrowing the lane's scope to match the now-bounded input
+  — with the tradeoff that anything already outside the bound has no
+  path back into coverage. Three ways such a row could still exist:
+  (1) a fail-open window (this node's very first sweep tick,
+  `[channel_verify]` disabled, or a Klever endpoint outage) — narrowed
+  by the new absolute `PRIVATE_CHANNEL_ID_FLOOR` backstop but not
+  eliminated for ids under 2^32; (2) snapshot-bootstrap import
+  (`network::snapshot_client`) writes `CHANNELS` rows directly, bypassing
+  `validate_channel_create`/`validate_channel_id_margin` entirely — bound
+  by the existing snapshot-quorum-agreement trust model, but a
+  colluding-quorum snapshot (or a node that legitimately accepted a row
+  during its own fail-open window, propagated via snapshot) could still
+  smuggle an out-of-bound row into every bootstrapping peer; (3) any
+  build predating these ingestion-time checks. Not fixed this pass — the
+  cheapest closing move identified (a purely local, zero-RPC periodic
+  scan flagging any out-of-bound row for operator review, since no such
+  row can be legitimate under the current rules) is recorded for a
+  follow-up rather than rushed into this pass, given this exact feature's
+  history of new mechanisms introducing new bugs.
+- `check_tombstoned_channel_for_poisoning` (an id above `channel_count`,
+  visited transiently before Lane 2's window narrowed to exclude such
+  ids) and a non-Public/Private "garbage" row's `NoOnChainBacking` result
+  can each spend an RPC without ever stamping a cooldown — bounded (the
+  lane's own cursor still advances every iteration) but a minor,
+  quantified waste; not fixed this pass.
+- See `project_l2_node_scanner_pagination_gap.md` (project memory) for
+  the full round-by-round history across all ten audit rounds.
+
 ## [0.134.2] - 2026-09-28
 
 ### Fixed

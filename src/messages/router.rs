@@ -104,6 +104,7 @@ enum RateCategory {
     KeyVault,          // 10 per minute (E2E vault — debounced LWW republish)
     DeviceEnc,         // 10 per hour (audit final pre-mainnet W15)
     ChannelMembership, // 20 per hour (join/leave — audit final pre-mainnet Code Audit CRITICAL #1)
+    ChannelCreate,     // 20 per hour (audit 2026-09-29 — see limits() doc comment)
     ProfileUpdate,     // 20/hour unverified, 60/hour registered (spec 01 §6.1)
     Other,             // fallback: 100 per minute
 }
@@ -181,6 +182,21 @@ impl RateCategory {
             // is generous headroom while capping worst-case growth at 480/day/wallet,
             // well under the reaper's throughput.
             Self::ChannelMembership => RateLimits::flat(20, 3_600_000),
+            // Audit 2026-09-29: ChannelCreate previously had NO dedicated
+            // category at all and fell into `Other`'s 100/min — 144,000/day
+            // per wallet. Each accepted ChannelCreate for a not-yet-locally-
+            // known channel_id mints a permanent CHANNELS row and a
+            // permanent obligation for `sweep_channel_verification` to keep
+            // re-checking it (a channel the SC has never heard of never
+            // becomes "verified" and so is never excluded from future
+            // sweeps). A single wallet at the old limit could inject far
+            // more junk unverified rows per day than any realistic
+            // legitimate channel-creation rate, competing for the same
+            // sweep budget as real channels. 20/hour (480/day) is generous
+            // for legitimate use (channel creation is an infrequent,
+            // deliberate action) while cutting the injection ceiling
+            // ~300x.
+            Self::ChannelCreate => RateLimits::flat(20, 3_600_000),
             Self::Other => RateLimits::flat(100, 60_000),
         }
     }
@@ -207,6 +223,7 @@ impl RateCategory {
             MessageType::KeyVaultSync => Self::KeyVault,
             MessageType::DeviceEncBinding | MessageType::DeviceEncRevoke => Self::DeviceEnc,
             MessageType::ChannelJoin | MessageType::ChannelLeave => Self::ChannelMembership,
+            MessageType::ChannelCreate => Self::ChannelCreate,
             _ => Self::Other,
         }
     }
@@ -1177,6 +1194,60 @@ impl MessageRouter {
             .retain(|_, (_, cached_at)| now_ms.saturating_sub(*cached_at) < MAX_WINDOW_MS);
     }
 
+    /// Bounds a Public/ReadPublic `ChannelCreate`'s `channel_id` to
+    /// `chain::scanner::PUBLIC_CHANNEL_ID_MARGIN` above the cached
+    /// `LAST_KNOWN_CHANNEL_COUNT` (round-5 security audit fix). Mirrors
+    /// `PRIVATE_CHANNEL_ID_FLOOR`'s already-proven pattern: bound the
+    /// untrusted input's RANGE at ingestion rather than accept anything
+    /// and try to make a downstream detection sweep cheaper to abuse —
+    /// two prior audit rounds (3.1, 4/5) each found that the sweep-side
+    /// approach only reduced an attacker's cost, never removed the
+    /// underlying unbounded set. `channel_id` is fully attacker-chosen
+    /// with no other bound anywhere in the codebase.
+    ///
+    /// Fails OPEN when the cache is `0` (unknown) — either
+    /// `[channel_verify]` is disabled, or the sweep hasn't completed its
+    /// first tick yet — this check must never brick legitimate channel
+    /// creation on a fresh or differently-configured node. Private
+    /// channels are exempt: their ids are wide-domain hashes with their
+    /// own separate floor (`PRIVATE_CHANNEL_ID_FLOOR`), unrelated to the
+    /// SC's small sequential space.
+    fn validate_channel_id_margin(
+        &self,
+        p: &ChannelCreatePayload,
+    ) -> Result<(), validation::ValidationError> {
+        if p.channel_type == ChannelType::Private {
+            return Ok(());
+        }
+        let Ok(Some(bytes)) = self
+            .storage
+            .get_cf(schema::cf::NODE_STATE, schema::state_keys::LAST_KNOWN_CHANNEL_COUNT)
+        else {
+            return Ok(());
+        };
+        let Ok(arr) = <[u8; 8]>::try_from(bytes.as_slice()) else {
+            return Ok(());
+        };
+        // Round-6 audit finding: "unknown" (never written — the sweep
+        // hasn't ticked yet, or `[channel_verify]` is disabled) is
+        // already handled above by the `Ok(Some(bytes))` match failing
+        // and falling through to fail-open. A WRITTEN value of `0` is a
+        // real answer — a genuinely fresh network legitimately has zero
+        // channels minted — and must be enforced like any other value,
+        // not treated as a second "unknown" sentinel (that previously
+        // left the bound off entirely on a fresh network until the first
+        // channel existed).
+        let known_count = u64::from_be_bytes(arr);
+        if p.channel_id
+            > known_count.saturating_add(crate::chain::scanner::PUBLIC_CHANNEL_ID_MARGIN)
+        {
+            return Err(validation::ValidationError(
+                "channel_id too far above the known on-chain channel count".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Validate the payload based on message type.
     fn validate_payload(&self, envelope: &Envelope, resolved_author: &str) -> Result<(), validation::ValidationError> {
         match deserialize_payload(envelope.msg_type, &envelope.payload) {
@@ -1184,7 +1255,10 @@ impl MessageRouter {
                 DeserializedPayload::ChatMessage(ref p) => validation::validate_chat_message(p),
                 DeserializedPayload::NewsPost(ref p) => validation::validate_news_post(p),
                 DeserializedPayload::NewsComment(ref p) => validation::validate_news_comment(p),
-                DeserializedPayload::ChannelCreate(ref p) => validation::validate_channel_create(p),
+                DeserializedPayload::ChannelCreate(ref p) => {
+                    validation::validate_channel_create(p)?;
+                    self.validate_channel_id_margin(p)
+                }
                 DeserializedPayload::ChannelUpdate(ref p) => validation::validate_channel_update(p),
                 DeserializedPayload::ProfileUpdate(ref p) => validation::validate_profile_update(p),
                 DeserializedPayload::Edit(ref p) => match envelope.msg_type {
@@ -2740,6 +2814,19 @@ impl MessageRouter {
                             "slug": payload.slug,
                             "channel_type": payload.channel_type as u8,
                             "creator": resolved_author,
+                            // NOTE: this creator claim is UNVERIFIED — a
+                            // bare envelope-signer claim, not on-chain-
+                            // confirmed. Verification state itself lives
+                            // in the separate `CHANNEL_VERIFICATION` CF
+                            // (`chain::types::ChannelVerificationState`),
+                            // never as a field on this row — see that
+                            // type's doc comment for why (anchor
+                            // state-root divergence, audit 2026-09-29).
+                            // `ChainScanner::sweep_channel_verification`
+                            // independently confirms/corrects it for a
+                            // public/read-public channel_type; always
+                            // stays unverified for a real private channel
+                            // (Private never exists on-chain).
                             "created_at": envelope.timestamp,
                             "display_name": payload.display_name,
                             "description": payload.description,
@@ -2770,6 +2857,33 @@ impl MessageRouter {
                             "creator",
                         );
 
+                        // Audit history (rounds 3-5): a NEW channel_id
+                        // landing here that's ≤ `sweep_channel_
+                        // verification`'s priority-lane high-water mark
+                        // would otherwise never be looked at again by
+                        // that lane — it only ever walks FORWARD.
+                        // Two successive attempts to close this
+                        // out-of-band (rewinding the shared high-water
+                        // mark, then a capped per-id "pending recheck"
+                        // queue) each turned out to be their OWN
+                        // attacker-exploitable resource: the rewind let
+                        // one message force a weeks-long re-walk of the
+                        // whole covered range; the queue's global cap
+                        // and FIFO drop-newest behavior let an attacker
+                        // fill it with junk so their OWN real target
+                        // was the one silently dropped (round-5 security
+                        // audit). Round 5 removes the out-of-band path
+                        // entirely rather than build a third, more
+                        // complex version of the same shape — this
+                        // specific timing window (a forger submitting
+                        // right after the priority lane passes a given
+                        // id) now converges via the round-robin lane's
+                        // own cadence instead, the SAME already-accepted
+                        // "detection, not instant closure" posture this
+                        // feature already carries for tombstone-poisoning
+                        // and for a `ChannelTransferred` lost to a scan
+                        // gap (see CHANGELOG "Known limitations").
+
                         // W14: this is the first time this channel_id's creator has
                         // become known on this node — consume any pending delete claim
                         // recorded while the channel was still unknown. A match means
@@ -2779,8 +2893,11 @@ impl MessageRouter {
                         // silent no-op — the claim is gone either way, one-shot.
                         if let Ok(claim) = self.storage.take_pending_channel_delete(payload.channel_id) {
                             if channel_delete_claim_matches(claim.as_ref(), resolved_author) {
-                                self.storage
-                                    .tombstone_channel(payload.channel_id, envelope.timestamp)?;
+                                self.storage.tombstone_channel(
+                                    payload.channel_id,
+                                    envelope.timestamp,
+                                    Some(resolved_author),
+                                )?;
                             }
                         }
                     }
@@ -2828,8 +2945,11 @@ impl MessageRouter {
                     // should already have blocked NotCreator.
                     match self.channel_creator_check(payload.channel_id, resolved_author) {
                         Ok(ChannelCreatorCheck::IsCreator) => {
-                            self.storage
-                                .tombstone_channel(payload.channel_id, envelope.timestamp)?;
+                            self.storage.tombstone_channel(
+                                payload.channel_id,
+                                envelope.timestamp,
+                                Some(resolved_author),
+                            )?;
                         }
                         Ok(ChannelCreatorCheck::Unknown) => {
                             self.storage.put_pending_channel_delete(
@@ -3118,8 +3238,19 @@ impl MessageRouter {
                         has_threads_toggle = payload.threads_enabled.is_some(),
                         "Processing ChannelUpdate"
                     );
-                    // Merge updated fields into existing channel metadata
+                    // Merge updated fields into existing channel metadata.
+                    // Audit 2026-09-29 (HIGH finding): this read-modify-
+                    // write used to be unlocked, so it could race
+                    // `ChainScanner::verify_one_channel_creator`'s
+                    // locked apply (or any other locked writer) and
+                    // silently drop this update, or have ITS OWN write
+                    // silently dropped by one that lands after this read
+                    // but before this write. `with_channel_membership_
+                    // lock` closes that for this specific interaction —
+                    // see `Storage::apply_channel_verification_result`'s
+                    // doc comment for the remaining unlocked writers.
                     let key = payload.channel_id.to_be_bytes();
+                    self.storage.with_channel_membership_lock(|| -> Result<()> {
                     if let Ok(Some(existing)) = self.storage.get_cf(schema::cf::CHANNELS, &key) {
                         if let Ok(mut meta) = serde_json::from_slice::<serde_json::Value>(&existing) {
                             if let Some(name) = &payload.display_name {
@@ -3183,6 +3314,8 @@ impl MessageRouter {
                             self.storage.put_cf(schema::cf::CHANNELS, &key, &meta_bytes)?;
                         }
                     }
+                    Ok(())
+                    })?;
                 }
             }
             MessageType::ChatEdit => {
@@ -5019,7 +5152,10 @@ mod channel_delete_before_create_tests {
         let creator_sk = crypto::generate_keypair();
         let creator = crypto::pubkey_to_address(&creator_sk.verifying_key()).unwrap();
         register_user(&r, &creator, 1_000);
-        let cid = 4247u64;
+        // Above `PRIVATE_CHANNEL_ID_FLOOR` (round-4 audit fix,
+        // validation.rs): `signed_create_envelope` builds a Private-typed
+        // payload, which now requires a properly-derived (large) id.
+        let cid = (1u64 << 32) + 4247;
         let create_raw = signed_create_envelope(&creator_sk, &creator, cid, "test-channel", now_ms());
         assert!(matches!(r.process_message(&create_raw), RouteResult::Accepted { .. }));
 
@@ -5042,7 +5178,8 @@ mod channel_delete_before_create_tests {
         let creator_sk = crypto::generate_keypair();
         let creator = crypto::pubkey_to_address(&creator_sk.verifying_key()).unwrap();
         register_user(&r, &creator, 1_000);
-        let cid = 4245u64;
+        // Above `PRIVATE_CHANNEL_ID_FLOOR` — see the sibling test above.
+        let cid = (1u64 << 32) + 4245;
         let create_raw = signed_create_envelope(&creator_sk, &creator, cid, "test-channel", now_ms());
         assert!(matches!(r.process_message(&create_raw), RouteResult::Accepted { .. }));
 
@@ -5063,7 +5200,9 @@ mod channel_delete_before_create_tests {
         let sk = crypto::generate_keypair();
         let creator = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
         register_user(&r, &creator, 1_000);
-        let cid = 4243u64;
+        // Above `PRIVATE_CHANNEL_ID_FLOOR` — see the comment on the
+        // earlier test in this module.
+        let cid = (1u64 << 32) + 4243;
 
         let delete_raw = signed_delete_envelope(&sk, &creator, cid, now_ms());
         assert!(matches!(r.process_message(&delete_raw), RouteResult::Accepted { .. }));
@@ -5094,7 +5233,9 @@ mod channel_delete_before_create_tests {
         let real_creator_sk = crypto::generate_keypair();
         let real_creator = crypto::pubkey_to_address(&real_creator_sk.verifying_key()).unwrap();
         register_user(&r, &real_creator, 1_000);
-        let cid = 4244u64;
+        // Above `PRIVATE_CHANNEL_ID_FLOOR` — see the comment on the
+        // earlier test in this module.
+        let cid = (1u64 << 32) + 4244;
 
         // Attacker guesses the not-yet-used channel_id and claims to delete it.
         let delete_raw = signed_delete_envelope(&attacker_sk, &attacker, cid, now_ms());

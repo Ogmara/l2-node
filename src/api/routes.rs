@@ -1916,6 +1916,7 @@ pub async fn list_channels(
                     let member_key = crate::storage::schema::encode_channel_member_key(id, addr);
                     state.storage.exists_cf(cf::CHANNEL_MEMBERS, &member_key).unwrap_or(false)
                 })
+                .map(strip_channel_verification_fields)
                 .collect();
             let total = channels.len();
             Json(serde_json::json!({
@@ -2227,6 +2228,25 @@ fn channel_id_for_resubscribe(envelope: &crate::messages::envelope::Envelope) ->
     }
 }
 
+/// Strip node-internal channel-creator-verification bookkeeping
+/// (`creator_verified_at`, `creator_verification_failed`) before a raw
+/// CHANNELS row reaches an API response (audit 2026-09-29). Not specified
+/// anywhere, tri-states confusingly on the public read path (a legitimate
+/// private channel and a caught squat both read `creator_verified_at:
+/// null`), and its presence would let an attacker watch in real time
+/// whether their squat attempt has been detected yet. Node-internal state
+/// only — call this at every response-construction site that echoes a raw
+/// CHANNELS value back to a client, not at internal/authz-only reads
+/// (`check_channel_access`, `require_channel_access` never echo the value
+/// they read, so they don't need this).
+fn strip_channel_verification_fields(mut channel: serde_json::Value) -> serde_json::Value {
+    if let Some(obj) = channel.as_object_mut() {
+        obj.remove("creator_verified_at");
+        obj.remove("creator_verification_failed");
+    }
+    channel
+}
+
 fn is_private_channel(channel_meta: &serde_json::Value) -> bool {
     match channel_meta.get("channel_type") {
         Some(serde_json::Value::Number(n)) => n.as_u64() == Some(2),
@@ -2311,7 +2331,7 @@ pub async fn channel_by_slug(
                 if !check_channel_access(&state, &meta, channel_id, caller) {
                     return (StatusCode::NOT_FOUND, "channel not found").into_response();
                 }
-                return Json(meta).into_response();
+                return Json(strip_channel_verification_fields(meta)).into_response();
             }
         }
     }
@@ -2406,7 +2426,7 @@ pub async fn get_channel(
                     .unwrap_or(0);
 
                 Json(serde_json::json!({
-                    "channel": channel,
+                    "channel": strip_channel_verification_fields(channel),
                     "moderators": moderators,
                     "pinned_messages": pinned,
                     "member_count": member_count,
@@ -3653,10 +3673,31 @@ pub async fn delete_channel(
         .unwrap_or_default()
         .as_secs();
 
-    if let Err(e) = state.storage.tombstone_channel(channel_id, now) {
+    if let Err(e) = state.storage.tombstone_channel(channel_id, now, Some(&auth_user.address)) {
         tracing::error!(channel_id, error = %e, "Failed to tombstone channel");
         return (StatusCode::INTERNAL_SERVER_ERROR, "deletion failed").into_response();
     }
+    // Round-6 audit REVERTED the round-5 "admin delete" exemption here
+    // (`Storage::mark_tombstone_as_admin_delete`) — both a code and a
+    // security auditor independently found it completely nullified
+    // tombstone-poisoning detection. This route is plain Klever-wallet
+    // auth (`api/mod.rs`'s `auth_routes`, NOT `admin_auth_middleware`),
+    // and its ONLY authorization check, just above, is
+    // `creator == auth_user.address` against the LOCAL, unverified
+    // CHANNELS row — the exact forgeable claim C1 is about. Any wallet
+    // that forges a `ChannelCreate` naming itself creator is thereby
+    // ALSO authorized to call this endpoint and get the exemption
+    // stamped, which is cheaper and quieter than the signed-envelope
+    // `ChannelDelete` path it was meant to be safe alongside. The
+    // exemption's premise was factually wrong on top of being
+    // exploitable: for a genuine on-chain channel this route's own
+    // creator check already guarantees `deleted_by == real_creator` (the
+    // scanner always writes the on-chain creator into the row), so the
+    // "false alert on routine admin deletes" false-positive this was
+    // built to prevent does not occur for the legitimate case in the
+    // first place — the one case that WOULD mismatch (a stale local
+    // creator after an on-chain transfer lost to a scan gap) is a real
+    // signal worth keeping. No replacement exemption is needed.
 
     tracing::info!(channel_id, creator = %auth_user.address, "Channel deleted (local REST path)");
     Json(OkResponse { ok: true }).into_response()

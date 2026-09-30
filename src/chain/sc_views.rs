@@ -1411,57 +1411,79 @@ pub async fn get_user_registered_at(
     Ok(decode_u64_be(&resp.data))
 }
 
-/// A channel's on-chain type + creation timestamp.
-pub struct ChannelInfo {
-    /// 0 = Public, 1 = ReadPublic.
-    pub channel_type: u8,
-    pub created_at: u64,
-}
-
-/// Returns a channel's type and creation timestamp, or `None` if the
-/// channel does not exist on-chain.
-pub async fn get_channel_info(
+/// Returns a channel's on-chain-verified creator address, or `None` if the
+/// channel does not exist on-chain (never created there, or `channel_id`
+/// simply doesn't correspond to a real SC channel — including every
+/// genuinely private channel, which is L2-only by design).
+///
+/// This is a LIVE, current-state query — unlike the chain scanner's
+/// historical block walk, it is never behind and never subject to the
+/// scanner's pagination-cap gaps (`chain::scanner::PageOutcome::
+/// CapExceededTooDeep`). Used by `ChainScanner::sweep_channel_verification`
+/// to independently re-confirm an L2-only `ChannelCreate` skeleton's
+/// unverified `creator` claim (`messages::router`) without waiting on — or
+/// depending on the completeness of — the historical scan.
+pub async fn get_channel_creator(
     http: &reqwest::Client,
     klever_node_url: &str,
     contract_address: &str,
     channel_id: u64,
-) -> Result<Option<ChannelInfo>> {
-    let resp = vm_query_multi(
+) -> Result<Option<String>> {
+    let resp = vm_hex_call(
         http,
         klever_node_url,
         contract_address,
-        "getChannelInfo",
+        "getChannelCreator",
         &[encode_u64_minimal_hex(channel_id)],
     )
     .await?;
     if resp.is_require_failure() {
         return Ok(None);
     }
-    decode_channel_info(&resp.items).map(Some)
+    if resp.data.is_empty() {
+        return Ok(None);
+    }
+    // ManagedAddress return: 32 raw bytes, hex-encoded for /vm/hex
+    // transport — unlike getCanonicalAnchor's ASCII-hex-string payload,
+    // there is no inner ASCII round-trip here.
+    let raw = hex::decode(&resp.data).context("hex-decoding getChannelCreator data payload")?;
+    decode_address_bytes("getChannelCreator", &raw).map(Some)
 }
 
-/// Decode the `MultiValue2<u8, u64>` payload of `getChannelInfo` into a
-/// [`ChannelInfo`]. Split out from [`get_channel_info`] so the decode logic
-/// is unit-testable without an HTTP round-trip (this crate has no mock-HTTP
-/// harness).
-fn decode_channel_info(items: &[Vec<u8>]) -> Result<ChannelInfo> {
-    // MultiValue2<u8, u64> flattens to exactly 2 return items.
-    if items.len() != 2 {
+/// Platform stats: `(user_count, channel_count, protocol_version)`.
+/// `channel_count` is the current highest assigned channel_id (the SC's
+/// `next_channel_id() - 1`) — channel_ids are minted strictly sequentially
+/// starting at 1 and never reused (confirmed against
+/// `smart-contract/src/channels.rs`: no delete/destroy endpoint exists
+/// on-chain at all), so `1..=channel_count` is a complete, gapless,
+/// authoritative enumeration space. Used by
+/// `ChainScanner::sweep_channel_verification` to walk that space directly
+/// instead of only ever seeing whatever a node's local `CHANNELS` table
+/// happens to contain — the key fix (audit 2026-09-29) that makes the
+/// sweep's cost bounded by the real chain, not by however much junk an
+/// attacker manages to inject locally.
+pub async fn get_stats(
+    http: &reqwest::Client,
+    klever_node_url: &str,
+    contract_address: &str,
+) -> Result<(u64, u64, u32)> {
+    let resp = vm_query_multi(http, klever_node_url, contract_address, "getStats", &[]).await?;
+    if resp.is_require_failure() {
+        // getStats has no require! guard on the SC side — reaching this
+        // means a real transport/contract-address problem, not an
+        // expected "not found" case, so this is a hard error, not Ok(0).
+        anyhow::bail!("getStats returned a require-failure: {}", resp.error);
+    }
+    if resp.items.len() != 3 {
         anyhow::bail!(
-            "getChannelInfo returned unexpected item count: {} (expected 2)",
-            items.len()
+            "getStats returned unexpected item count: {} (expected 3)",
+            resp.items.len()
         );
     }
-    let channel_type = match items[0].as_slice() {
-        [] => 0,
-        [b] => *b,
-        _ => anyhow::bail!("getChannelInfo channel_type has unexpected length"),
-    };
-    let created_at = decode_u64_be_bytes(&items[1]);
-    Ok(ChannelInfo {
-        channel_type,
-        created_at,
-    })
+    let user_count = decode_u64_be_bytes(&resp.items[0]);
+    let channel_count = decode_u64_be_bytes(&resp.items[1]);
+    let protocol_version = decode_u64_be_bytes(&resp.items[2]) as u32;
+    Ok((user_count, channel_count, protocol_version))
 }
 
 // ── Decoding helpers ────────────────────────────────────────────────
@@ -1635,37 +1657,6 @@ mod tests {
             let encoded = encode_u64_minimal_hex(v);
             assert_eq!(decode_u64_be(&encoded), v, "round-trip for {}", v);
         }
-    }
-
-    // --- getChannelInfo decode (SC 0.6.1) -----------------------------
-
-    #[test]
-    fn channel_info_decodes_type_and_timestamp() {
-        // channel_type=1 (ReadPublic), created_at=1_700_000_000
-        // (0x6553F100 big-endian minimal bytes).
-        let info = decode_channel_info(&[vec![1u8], vec![0x65, 0x53, 0xF1, 0x00]]).unwrap();
-        assert_eq!(info.channel_type, 1);
-        assert_eq!(info.created_at, 1_700_000_000);
-    }
-
-    #[test]
-    fn channel_info_zero_values_decode_as_empty_bytes() {
-        // u8(0) and u64(0) both minimal-encode to zero-length on the wire —
-        // mirrors klever-sc's general zero-value convention.
-        let info = decode_channel_info(&[vec![], vec![]]).unwrap();
-        assert_eq!(info.channel_type, 0);
-        assert_eq!(info.created_at, 0);
-    }
-
-    #[test]
-    fn channel_info_rejects_wrong_item_count() {
-        assert!(decode_channel_info(&[vec![1u8]]).is_err());
-        assert!(decode_channel_info(&[vec![1u8], vec![0u8], vec![0u8]]).is_err());
-    }
-
-    #[test]
-    fn channel_info_rejects_oversized_type_byte() {
-        assert!(decode_channel_info(&[vec![1u8, 2u8], vec![]]).is_err());
     }
 
     // --- Transport classifier (spec 13 §4.5, 0.46.5+) ----------------

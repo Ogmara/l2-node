@@ -69,6 +69,29 @@ pub struct MetricsSnapshot {
     // Chain
     pub klever_last_block: u64,
     pub klever_sync_lag_blocks: u64,
+    /// Count of permanently-skipped chain-scan ranges (audit 2026-09-28,
+    /// `chain::scanner::PageOutcome::CapExceededTooDeep`). `klever_sync_lag_
+    /// blocks` above is computed from the same cursor that advances PAST a
+    /// skipped range, so it alone would report a gapped node as fully
+    /// synced — this field is the actual "does this node have missing
+    /// history" signal. `0` in the common case (see
+    /// `chain::scanner::read_chain_scan_gaps`).
+    pub klever_scan_gap_count: usize,
+    /// How many blocks' worth of SC events this node has permanently
+    /// never scanned, not merely how many separate incidents. A
+    /// MONOTONIC lifetime counter (`chain::scanner::
+    /// read_chain_scan_gap_blocks_total`), NOT derived from the (capped,
+    /// oldest-dropped) gap list `klever_scan_gap_count` counts — deriving
+    /// it from that list would let the reported total decrease as a node
+    /// gets worse (audit 2026-09-29 finding).
+    pub klever_scan_gap_blocks_total: u64,
+    /// Monotonic lifetime count of channel-verification alerts — a
+    /// squatted/forged `creator` correction or a tombstone-poisoning
+    /// mismatch detected by `ChainScanner::sweep_channel_verification`
+    /// (security audit 2026-09-29 MEDIUM-4: these were warn!-log-only,
+    /// with no structured operator signal). See
+    /// `state_keys::CHANNEL_VERIFICATION_ALERTS_TOTAL`'s doc comment.
+    pub klever_channel_verification_alerts_total: u64,
     /// Millis-since-epoch of the last successful Klever RPC call, across
     /// the chain scanner/anchorer/metadata-reconciler/sc_discovery (audit
     /// final pre-mainnet W35). `0` = never succeeded (cold start). Drives
@@ -322,6 +345,10 @@ impl MetricsCollector {
             0
         };
 
+        // Audit 2026-09-28: read once, derive both gap fields — avoids a
+        // second storage read + JSON parse for the same list.
+        let scan_gaps = crate::chain::scanner::read_chain_scan_gaps(&self.storage);
+
         let snapshot = MetricsSnapshot {
             timestamp_ms: now_ms,
             cpu_percent: system.cpu_percent,
@@ -356,6 +383,16 @@ impl MetricsCollector {
                 let chain_tip = self.storage.get_stat(state_keys::CHAIN_TIP).unwrap_or(0);
                 chain_tip.saturating_sub(ss.klever_last_block)
             },
+            klever_scan_gap_count: scan_gaps.len(),
+            // Audit 2026-09-29: NOT derived from `scan_gaps` above — that
+            // list is capped (oldest dropped first), so a sum over it can
+            // DECREASE as a node accumulates more gaps than the cap. This
+            // reads a separate monotonic lifetime counter instead.
+            klever_scan_gap_blocks_total: crate::chain::scanner::read_chain_scan_gap_blocks_total(
+                &self.storage,
+            ),
+            klever_channel_verification_alerts_total:
+                crate::chain::scanner::read_channel_verification_alerts_total(&self.storage),
             last_anchor_height: 0,
             last_anchor_age_seconds: anchor_age,
             total_anchors: ss.total_anchors,

@@ -302,6 +302,36 @@ max_retriggers_per_sweep = 5
 # are unaffected (already IP-rate-limited).
 max_observed_triggers_per_interval = 20
 
+[channel_verify]
+# Periodic re-verification of channel creator claims against the SC's
+# live registry. Walks the SC's OWN authoritative id space
+# (1..=channel_count) directly, not a cursor over the local CHANNELS
+# table — immune to local-table flooding. Three lanes, each with its OWN
+# reserved share of the per-tick budget (a saturated lane can only
+# degrade its own throughput, never another lane's): new ids past a
+# high-water mark; a bounded rotation just above channel_count (closes
+# squatting an id before it's even real on-chain — the window's SIZE is
+# capped at ingestion, not merely made expensive to fill); then a
+# round-robin pass re-walking everything including already-verified rows
+# (catches a transfer/stale-import). Master switch for the sweep.
+enabled = true
+# How often, in seconds, the periodic verification sweep ticks. 0
+# disables the sweep entirely.
+sweep_interval_secs = 300
+# Max ids/rows LOCALLY considered per tick by the priority and
+# round-robin lanes (each lane's own cursor resumes across ticks). Bounds
+# RocksDB scan/read cost, not Klever RPC calls — see
+# max_retriggers_per_sweep. The out-of-range lane doesn't use this — its
+# local work is bounded by its own small, fixed candidate window instead.
+sweep_batch_size = 500
+# Max outbound Klever calls (getChannelCreator/getChannelInfo) the sweep
+# may make per tick, split into an independent reserved share per lane.
+# A single id can cost 1 or 2 calls. This is the Klever-RPC-request
+# budget — keep it small; it shares the chain scanner's overall
+# self-imposed rate ceiling with block-height polling and transaction
+# paging. Floored at 3 so no lane is ever silently given a zero share.
+max_retriggers_per_sweep = 5
+
 [notifications]
 # Persisted-notification retention (W31, l2-node 0.104.0+)
 # Days a stored notification is retained. 0 = unlimited. Enforced by the

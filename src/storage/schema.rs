@@ -128,6 +128,18 @@ pub mod cf {
     /// Prevents chain scanner from re-creating channels that were intentionally deleted.
     pub const DELETED_CHANNELS: &str = "deleted_channels";
 
+    /// channel_id (8 bytes BE) → JSON `{creator_verified_at, creator_verification_failed}`
+    /// — `ChainScanner::sweep_channel_verification`'s bookkeeping (audit 2026-09-29).
+    /// Deliberately a SEPARATE CF from `CHANNELS`, not a field on that row: `CHANNELS`
+    /// is in `snapshot::DOMAIN_CFS` and its raw bytes feed the anchored state root
+    /// (`crypto::merkle::StateManager::add_channel`) — a per-node wall-clock
+    /// verification timestamp inside that blob would make every node's root for a
+    /// public channel diverge permanently (every round-robin re-check rewrites a
+    /// DIFFERENT timestamp on every node), not just transiently, and nothing
+    /// anchoring-relevant ever needs to read it. This CF is intentionally NOT in
+    /// `snapshot::DOMAIN_CFS` — node-local operational state only.
+    pub const CHANNEL_VERIFICATION: &str = "channel_verification";
+
     /// channel_id (8 bytes BE) → PendingChannelDelete JSON (claimant, requested_at) —
     /// a `ChannelDelete` received before the channel is known locally (out-of-order
     /// gossip / chain-scan lag, audit final pre-mainnet W14). Consumed the first time
@@ -377,6 +389,7 @@ pub mod cf {
         CHANNEL_READ_STATE,
         DM_READ_STATE,
         DELETED_CHANNELS,
+        CHANNEL_VERIFICATION,
         PENDING_CHANNEL_DELETES,
         PENDING_CHANNEL_MEMBER_REMOVALS,
         DELETION_MARKERS,
@@ -510,6 +523,83 @@ pub mod state_keys {
     /// Coverage Gap"): persisted cursor for the `USERS` sweep. Same
     /// resume-across-restarts rationale as the reaper cursors above.
     pub const IDENTITY_STALENESS_CURSOR: &[u8] = b"identity_staleness_cursor";
+    /// Channel-creator verification sweep, priority lane (audit
+    /// 2026-09-29 v2 redesign): highest channel_id fully covered so far
+    /// against the SC's own authoritative `1..=channel_count` id space
+    /// (`ChainScanner::sweep_channel_verification`). Every id beyond this
+    /// mark gets checked before the round-robin lane below spends any
+    /// remaining per-tick budget — this is what closes a new squatting
+    /// attempt fast.
+    pub const CHANNEL_VERIFY_HIGH_WATER: &[u8] = b"channel_verify_high_water";
+    /// Channel-creator verification sweep, round-robin lane: persisted
+    /// cursor re-walking the FULL `1..=channel_count` id space (including
+    /// already-verified ids), wrapping at the end. Same resume-across-
+    /// restarts rationale as the reaper cursors above — catches a channel
+    /// ownership transfer whose on-chain event fell into a permanent scan
+    /// gap, or a row imported via snapshot bootstrap that inherited
+    /// another node's verdict with no independent check, neither of which
+    /// the priority lane alone (which only looks at NEW ids) would ever
+    /// revisit.
+    pub const CHANNEL_VERIFY_ROUND_ROBIN_CURSOR: &[u8] = b"channel_verify_round_robin_cursor";
+    /// Channel-creator verification sweep, out-of-range lane: persisted
+    /// cursor for the space above `channel_count` (audit round 5). A
+    /// naive version of this lane always restarted its scan at
+    /// `channel_count + 1` every tick — a code+security re-audit found
+    /// that as few as ~13 cheap attacker-planted out-of-range rows at the
+    /// LOWEST ids could occupy the lane's entire per-tick RPC budget
+    /// forever, permanently hiding any real target planted above them
+    /// (rounds 3.1 AND 4's attempted fixes each reduced the cost of this
+    /// attack without removing the underlying unbounded/reactive
+    /// resource — see [[feedback_fixes_cause_regressions]]). A rotating
+    /// cursor guarantees eventual coverage of the WHOLE out-of-range set
+    /// regardless of how much cheap padding sits at the bottom — paired
+    /// with `PUBLIC_CHANNEL_ID_MARGIN` (validation-time bound on
+    /// `ChannelCreate`, see `messages::validation`) that keeps the
+    /// out-of-range set itself small, rather than merely raising the
+    /// cost of padding it. Snapped forward to `channel_count + 1`
+    /// whenever it falls behind the frontier (an id that became `<=
+    /// channel_count` is Lane 1/Lane 3's job now, not this lane's).
+    pub const CHANNEL_VERIFY_OUT_OF_RANGE_CURSOR: &[u8] = b"channel_verify_out_of_range_cursor";
+    /// Cache of the SC's `channel_count` (from `sc_views::get_stats`),
+    /// refreshed every `sweep_channel_verification` tick (audit round 5).
+    /// Used by `messages::validation::validate_channel_create` to bound a
+    /// Public/ReadPublic `channel_id` to `PUBLIC_CHANNEL_ID_MARGIN` above
+    /// this cached value — the same "bound the untrusted input, don't
+    /// just make it more expensive to abuse" pattern already proven for
+    /// `PRIVATE_CHANNEL_ID_FLOOR`. `0` (default/absent) means "unknown"
+    /// and the bound is NOT enforced (fail-open) — either the sweep
+    /// hasn't run its first tick yet, or `[channel_verify]` is disabled
+    /// entirely; both must never brick legitimate channel creation.
+    pub const LAST_KNOWN_CHANNEL_COUNT: &[u8] = b"last_known_channel_count";
+    /// Chain-scanner pagination gaps (audit 2026-09-28): a single
+    /// JSON-serialized, capped `Vec<GapRecord>` (see
+    /// `chain::scanner::GapRecord`) of block ranges the catch-up scan gave
+    /// up on as permanently unreachable
+    /// (`chain::scanner::PageOutcome::CapExceededTooDeep`). Read by
+    /// `MetricsCollector` for `MetricsSnapshot::klever_scan_gap_count` so
+    /// the dashboard stops reporting a gapped node as fully synced.
+    pub const CHAIN_SCAN_GAPS: &[u8] = b"chain_scan_gaps";
+    /// Monotonic lifetime total of blocks covered by every recorded chain-
+    /// scan gap (audit 2026-09-29), as a big-endian `u64`. Separate from
+    /// `CHAIN_SCAN_GAPS` above because that list is CAPPED (oldest dropped
+    /// first) — deriving a "total blocks missed" figure from it alone
+    /// would let the reported total DECREASE as a node accumulates more
+    /// gaps than the cap, exactly the silently-reassuring-metric problem
+    /// this feature exists to eliminate. Only ever incremented, in
+    /// lockstep with a genuine (deduped) new `CHAIN_SCAN_GAPS` append —
+    /// see `ChainScanner::record_chain_scan_gap`.
+    pub const CHAIN_SCAN_GAP_BLOCKS_TOTAL: &[u8] = b"chain_scan_gap_blocks_total";
+    /// Monotonic lifetime counter (big-endian `u64`) of channel-
+    /// verification alerts: a `NoOnChainBacking` result (a channel claims
+    /// Public/ReadPublic with zero on-chain backing) or a tombstone-
+    /// poisoning mismatch (a squat-then-delete signature) — see
+    /// `ChainScanner::verify_one_channel_creator`/
+    /// `check_tombstoned_channel_for_poisoning`. Before this counter
+    /// (audit 2026-09-29), both signals were `warn!`-log-only, unlike the
+    /// chain-scan-gap fix in the same pass, which got a proper metrics
+    /// field — an operator without active log scraping had no way to
+    /// learn a squat or poisoning attempt occurred at all.
+    pub const CHANNEL_VERIFICATION_ALERTS_TOTAL: &[u8] = b"channel_verification_alerts_total";
 }
 
 /// Snapshot bootstrap (spec 11-snapshot-sync.md).

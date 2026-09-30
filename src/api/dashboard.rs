@@ -147,6 +147,18 @@ fn build_ws_payload(state: &AppState, snap: &MetricsSnapshot) -> serde_json::Val
                 "contract_address": &state.contract_address,
                 "last_indexed_block": snap.klever_last_block,
                 "sync_lag_blocks": snap.klever_sync_lag_blocks,
+                // Audit 2026-09-28: sync_lag_blocks alone can report a
+                // gapped node as fully synced (it's computed from the same
+                // cursor that just advanced past a permanently-skipped
+                // range) — these two fields are the actual "does this node
+                // have missing history" signal.
+                "scan_gap_count": snap.klever_scan_gap_count,
+                "scan_gap_blocks_total": snap.klever_scan_gap_blocks_total,
+                // Security audit 2026-09-29 MEDIUM-4: a squatted/forged
+                // creator correction or tombstone-poisoning mismatch was
+                // previously warn!-log-only, invisible without active log
+                // scraping.
+                "channel_verification_alerts_total": snap.klever_channel_verification_alerts_total,
             },
             "anchoring": {
                 "last_anchor_age_seconds": snap.last_anchor_age_seconds,

@@ -151,6 +151,53 @@ pub struct ChannelRecord {
     pub member_count: u64,
 }
 
+/// `chain::sc_views::get_channel_creator` re-verification bookkeeping for
+/// one channel — stored in `storage::schema::cf::CHANNEL_VERIFICATION`,
+/// NOT as a field on `ChannelRecord` (audit 2026-09-29). Deliberately kept
+/// out of the `CHANNELS` row: that CF is in `snapshot::DOMAIN_CFS` and its
+/// raw bytes feed the anchored state root, so a per-node wall-clock
+/// verification timestamp inside it would make every node's root for a
+/// public channel diverge PERMANENTLY (rewritten with a different value on
+/// every independent round-robin re-check), not just transiently — and
+/// nothing anchoring-relevant needs to read it anyway.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ChannelVerificationState {
+    /// Unix seconds when `creator` was last confirmed against the SC's
+    /// `getChannelCreator` view — either by the chain scanner's own
+    /// `ChannelCreated`/`ChannelTransferred` processing, or the periodic
+    /// `ChainScanner::sweep_channel_verification` re-check. `None` means
+    /// never confirmed. A TIMESTAMP, not a bool: the round-robin lane
+    /// re-visits already-confirmed channels too, so a transfer whose
+    /// on-chain event fell into a permanent scan gap doesn't leave a stale
+    /// "verified" standing forever.
+    #[serde(default)]
+    pub creator_verified_at: Option<u64>,
+    /// `true` if the most recent check found the SC has no on-chain record
+    /// for this id at all, while the local row claims Public/ReadPublic —
+    /// a possible fabricated public-channel claim. Visibility only; no
+    /// automatic action taken on this flag.
+    #[serde(default)]
+    pub creator_verification_failed: bool,
+    /// Unix seconds of the last time a `NoOnChainBacking` outcome was
+    /// recorded for this id (audit 2026-09-29 round 3.1 — code+security
+    /// re-audit of the round-3 sweep). Without this, `sweep_channel_
+    /// verification`'s out-of-range lane always starts its scan from the
+    /// same lowest out-of-range key, so a handful of standing fabricated-
+    /// public-claim rows (an attacker's, or — worse — a legitimate row
+    /// mid-on-chain-confirmation) would be re-verified and re-alerted on
+    /// EVERY tick forever, burning the whole per-tick RPC budget and
+    /// starving the round-robin lane permanently. `verify_one_channel_
+    /// creator` skips the RPC entirely while this is within
+    /// `NO_BACKING_RECHECK_COOLDOWN_SECS`. Any GENUINE on-chain progress
+    /// (the historical scanner actually reaching the real
+    /// `ChannelCreated`/`ChannelTransferred` event) bypasses this cooldown
+    /// entirely via `mark_channel_creator_verified`, which overwrites this
+    /// whole struct directly — so a real confirmation is never delayed by
+    /// it, only a repeat negative check is.
+    #[serde(default)]
+    pub no_backing_checked_at: Option<u64>,
+}
+
 /// Local delegation state cached from on-chain events.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DelegationRecord {

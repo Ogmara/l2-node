@@ -82,6 +82,11 @@ pub struct Config {
     /// Identity-Sync Coverage Gap", l2-node 0.132.0+).
     #[serde(default)]
     pub identity_resync: IdentityResyncConfig,
+    /// Periodic public-channel creator re-verification against the SC
+    /// (audit 2026-09-28, closes the permanent-squat risk from a chain-scan
+    /// gap — see `ChannelVerifyConfig`).
+    #[serde(default)]
+    pub channel_verify: ChannelVerifyConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -822,6 +827,85 @@ fn default_identity_resync_max_retriggers_per_sweep() -> usize {
 }
 fn default_identity_resync_max_observed_triggers_per_interval() -> usize {
     20
+}
+
+/// Periodic re-verification of channel `creator` claims against the SC's
+/// live registry (see `chain::types::ChannelVerificationState`).
+/// `ChainScanner::sweep_channel_verification` walks the SC's OWN
+/// authoritative id space (`1..=channel_count`, via `sc_views::
+/// get_stats`) directly, NOT a cursor over the local `CHANNELS` table —
+/// channel_ids are minted strictly sequentially on-chain and never
+/// reused, so this space is complete and immune to local-table flooding.
+/// Three lanes, each with its OWN reserved share of the per-tick request
+/// budget (`chain::scanner::partition_sweep_budget` — a saturated lane
+/// can only degrade its own throughput, never another lane's): new ids
+/// beyond a high-water mark (closes a fresh squat fast); a bounded
+/// rotation through `[channel_count+1, channel_count+
+/// PUBLIC_CHANNEL_ID_MARGIN]` (closes squatting an id before it's even
+/// real on-chain — `channel_id` otherwise has no upper bound at all; the
+/// window's SIZE is capped at ingestion, in `messages::router`'s
+/// `ChannelCreate` handler, not merely made expensive to fill); then a
+/// round-robin pass re-walking the FULL space including already-verified
+/// rows (catches a transfer/stale-import the other two lanes wouldn't
+/// revisit). `sweep_batch_size` bounds LOCAL RocksDB work per tick
+/// (cheap) for the priority and round-robin lanes specifically — the
+/// out-of-range lane's local work is separately bounded by the small,
+/// fixed `PUBLIC_CHANNEL_ID_MARGIN` window itself.
+/// `max_retriggers_per_sweep` bounds actual outbound Klever calls (a
+/// single id can cost 1 or 2 — a correction that also needs
+/// `getChannelInfo`'s authoritative type costs 2) and shares `ChainScanner
+/// ::throttle_klever_request`'s pacing with this scanner's other Klever
+/// RPC calls, so keep it conservative relative to the scanner's overall
+/// ~13.3 req/min self-imposed ceiling.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelVerifyConfig {
+    /// Master switch for the periodic sweep. Default true.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// How often, in seconds, the periodic verification sweep ticks.
+    /// Default 300 (5 min). `0` disables the sweep entirely.
+    #[serde(default = "default_channel_verify_sweep_interval_secs")]
+    pub sweep_interval_secs: u64,
+    /// Max ids/rows LOCALLY considered per sweep tick by the priority and
+    /// round-robin lanes (each lane's own cursor resumes across ticks).
+    /// Default 500. Bounds RocksDB scan/read cost — NOT Klever RPC calls,
+    /// see `max_retriggers_per_sweep` for that bound. The out-of-range
+    /// lane does not use this — its per-tick local work is bounded by
+    /// the small, fixed `PUBLIC_CHANNEL_ID_MARGIN` window instead.
+    #[serde(default = "default_channel_verify_sweep_batch_size")]
+    pub sweep_batch_size: usize,
+    /// Max outbound Klever calls (`getChannelCreator`/`getChannelInfo`)
+    /// the sweep may make per tick, split into an independent reserved
+    /// share per lane (`chain::scanner::partition_sweep_budget`),
+    /// independent of how many ids each lane finds. Default 5. This is
+    /// the Klever-RPC-request budget — keep it small; it shares the
+    /// scanner's overall self-imposed rate ceiling with block-height
+    /// polling and transaction paging. Clamped to [3, 100] in
+    /// `Config::validate` — the floor of 3 guarantees every lane a
+    /// nonzero share (see `partition_sweep_budget`'s doc comment).
+    #[serde(default = "default_channel_verify_max_retriggers_per_sweep")]
+    pub max_retriggers_per_sweep: usize,
+}
+
+impl Default for ChannelVerifyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            sweep_interval_secs: default_channel_verify_sweep_interval_secs(),
+            sweep_batch_size: default_channel_verify_sweep_batch_size(),
+            max_retriggers_per_sweep: default_channel_verify_max_retriggers_per_sweep(),
+        }
+    }
+}
+
+fn default_channel_verify_sweep_interval_secs() -> u64 {
+    300
+}
+fn default_channel_verify_sweep_batch_size() -> usize {
+    500
+}
+fn default_channel_verify_max_retriggers_per_sweep() -> usize {
+    5
 }
 
 /// Persisted-notification retention (audit final pre-mainnet W31,
@@ -3288,6 +3372,67 @@ impl Config {
             self.identity_resync.max_observed_triggers_per_interval = MAX_IDENTITY_OBSERVED_TRIGGERS;
         }
 
+        // Channel-verify (audit 2026-09-28): same shape/rationale as the
+        // identity-resync clamps above, but `max_retriggers_per_sweep` here
+        // bounds Klever RPC calls (getChannelCreator), not P2P requests —
+        // it shares `ChainScanner::throttle_klever_request`'s pacing with
+        // this scanner's other calls, so an oversized value risks pushing
+        // the WHOLE scanner (block polling, transaction paging too) over
+        // Klever's documented rate limit, not just this sweep.
+        const MAX_CHANNEL_VERIFY_SWEEP_BATCH: usize = 10_000;
+        if self.channel_verify.sweep_batch_size > MAX_CHANNEL_VERIFY_SWEEP_BATCH {
+            eprintln!(
+                "[config] channel_verify.sweep_batch_size ({}) exceeds the safe \
+                 maximum; clamping to {} rows per tick.",
+                self.channel_verify.sweep_batch_size, MAX_CHANNEL_VERIFY_SWEEP_BATCH,
+            );
+            self.channel_verify.sweep_batch_size = MAX_CHANNEL_VERIFY_SWEEP_BATCH;
+        }
+        const MIN_CHANNEL_VERIFY_SWEEP_BATCH: usize = 1;
+        if self.channel_verify.enabled
+            && self.channel_verify.sweep_batch_size < MIN_CHANNEL_VERIFY_SWEEP_BATCH
+        {
+            eprintln!(
+                "[config] channel_verify.sweep_batch_size (0) would make the \
+                 verification sweep scan nothing on every tick; clamping to {}.",
+                MIN_CHANNEL_VERIFY_SWEEP_BATCH,
+            );
+            self.channel_verify.sweep_batch_size = MIN_CHANNEL_VERIFY_SWEEP_BATCH;
+        }
+        const MAX_CHANNEL_VERIFY_RETRIGGERS: usize = 100;
+        if self.channel_verify.max_retriggers_per_sweep > MAX_CHANNEL_VERIFY_RETRIGGERS {
+            eprintln!(
+                "[config] channel_verify.max_retriggers_per_sweep ({}) exceeds the \
+                 safe maximum; clamping to {} getChannelCreator calls per tick.",
+                self.channel_verify.max_retriggers_per_sweep, MAX_CHANNEL_VERIFY_RETRIGGERS,
+            );
+            self.channel_verify.max_retriggers_per_sweep = MAX_CHANNEL_VERIFY_RETRIGGERS;
+        }
+        // Round-3.1 re-audit (LOW finding): unlike `sweep_batch_size`
+        // above, `0` here had no floor at all — every lane's `budget > 0`
+        // guard in `sweep_channel_verification` is false from the first
+        // check, so `enabled = true` with this at 0 silently runs a
+        // complete no-op forever (high-water never advances, no channel
+        // is ever verified) with nothing in the logs to say so. Round-5
+        // re-audit finding: a floor of `1` was not enough — with three
+        // lanes now sharing this budget (`chain::scanner::
+        // partition_sweep_budget`), a total below 3 forces at least one
+        // lane to zero, and `1` specifically zeroed BOTH Lane 2 and Lane
+        // 3, silently disabling everything except the fast-squat-
+        // detection lane. Floored at 3 (one full unit per lane) instead —
+        // the smallest value that guarantees no lane is silently zeroed.
+        const MIN_CHANNEL_VERIFY_RETRIGGERS: usize = 3;
+        if self.channel_verify.enabled
+            && self.channel_verify.max_retriggers_per_sweep < MIN_CHANNEL_VERIFY_RETRIGGERS
+        {
+            eprintln!(
+                "[config] channel_verify.max_retriggers_per_sweep ({}) is below the minimum \
+                 that guarantees every sweep lane a nonzero share; clamping to {}.",
+                self.channel_verify.max_retriggers_per_sweep, MIN_CHANNEL_VERIFY_RETRIGGERS,
+            );
+            self.channel_verify.max_retriggers_per_sweep = MIN_CHANNEL_VERIFY_RETRIGGERS;
+        }
+
         Ok(())
     }
 
@@ -3596,6 +3741,36 @@ max_retriggers_per_sweep = 5
 # outbound requests network-wide, with no ceiling. Auth-triggered pulls
 # are unaffected (already IP-rate-limited).
 max_observed_triggers_per_interval = 20
+
+[channel_verify]
+# Periodic re-verification of channel creator claims against the SC's
+# live registry. Walks the SC's OWN authoritative id space
+# (1..=channel_count) directly, not a cursor over the local CHANNELS
+# table — immune to local-table flooding. Three lanes, each with its OWN
+# reserved share of the per-tick budget (a saturated lane can only
+# degrade its own throughput, never another lane's): new ids past a
+# high-water mark; a bounded rotation just above channel_count (closes
+# squatting an id before it's even real on-chain — the window's SIZE is
+# capped at ingestion, not merely made expensive to fill); then a
+# round-robin pass re-walking everything including already-verified rows
+# (catches a transfer/stale-import). Master switch for the sweep.
+enabled = true
+# How often, in seconds, the periodic verification sweep ticks. 0
+# disables the sweep entirely.
+sweep_interval_secs = 300
+# Max ids/rows LOCALLY considered per tick by the priority and
+# round-robin lanes (each lane's own cursor resumes across ticks). Bounds
+# RocksDB scan/read cost, not Klever RPC calls — see
+# max_retriggers_per_sweep. The out-of-range lane doesn't use this — its
+# local work is bounded by its own small, fixed candidate window instead.
+sweep_batch_size = 500
+# Max outbound Klever calls (getChannelCreator/getChannelInfo) the sweep
+# may make per tick, split into an independent reserved share per lane.
+# A single id can cost 1 or 2 calls. This is the Klever-RPC-request
+# budget — keep it small; it shares the chain scanner's overall
+# self-imposed rate ceiling with block-height polling and transaction
+# paging. Floored at 3 so no lane is ever silently given a zero share.
+max_retriggers_per_sweep = 5
 
 [notifications]
 # Persisted-notification retention (W31, l2-node 0.104.0+)

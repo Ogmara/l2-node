@@ -1305,8 +1305,15 @@ impl Node {
         let chain_storage = self.storage.clone();
         let chain_shutdown_rx = self.shutdown_rx();
         let chain_klever_health = klever_health.clone();
+        let chain_channel_verify_config = self.config.channel_verify.clone();
         let mut chain_task = tokio::spawn(async move {
-            match crate::chain::scanner::ChainScanner::new(chain_config, chain_storage, channel_tx, chain_klever_health) {
+            match crate::chain::scanner::ChainScanner::new(
+                chain_config,
+                chain_storage,
+                channel_tx,
+                chain_klever_health,
+                chain_channel_verify_config,
+            ) {
                 Ok(mut scanner) => scanner.run(chain_shutdown_rx).await,
                 Err(e) => warn!(error = %e, "Failed to start chain scanner"),
             }

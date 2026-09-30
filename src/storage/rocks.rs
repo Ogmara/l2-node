@@ -152,6 +152,73 @@ pub struct SelfAnchorStatus {
     pub anchoring_since: Option<u64>,
 }
 
+/// `true` if a CHANNELS row's `channel_type` value resolves to Private(2).
+/// Tolerates the same numeric-or-legacy-string encoding
+/// `messages::router`'s `check_readonly_channel`/`chain::scanner`'s
+/// `resolve_channel_type` do — deliberately a small standalone copy rather
+/// than importing `chain::scanner`'s helper, to keep this storage-layer
+/// module free of a dependency on a higher-level one.
+fn json_channel_type_is_private(channel_type: &serde_json::Value) -> bool {
+    match channel_type {
+        serde_json::Value::Number(n) => n.as_u64() == Some(2),
+        serde_json::Value::String(s) => s == "Private",
+        _ => false,
+    }
+}
+
+/// See `apply_channel_verification_result`'s `NoOnChainBacking` arm (audit
+/// round 4, LOW finding): how recent a `creator_verified_at` must be for a
+/// concurrent negative RPC result to be treated as stale relative to it,
+/// rather than applied. Generously larger than the sweep's own worst-case
+/// per-id latency (`KLEVER_REQUEST_MIN_SPACING_MS` throttle plus a realistic
+/// SC round-trip), so this only ever suppresses a genuinely stale negative,
+/// never a fresh independent one.
+const RECENT_CONFIRMATION_GUARD_SECS: u64 = 60;
+
+/// Outcome of one `getChannelCreator` SC re-verification, for
+/// `Storage::apply_channel_verification_result` (audit 2026-09-29 —
+/// `ChainScanner::sweep_channel_verification`/`verify_one_channel_creator`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChannelVerificationOutcome {
+    /// The SC confirms the currently-stored `creator` — mark verified now.
+    /// Deliberately does NOT touch `channel_type` (audit 2026-09-29,
+    /// CRITICAL finding): the on-chain type is an immutable snapshot from
+    /// creation, but the Public<->ReadPublic distinction is L2-authoritative
+    /// and meant to diverge from it (`messages::router`'s `ChannelUpdate`
+    /// flip, spec 01-protocol.md §"channel_type" — nodes prefer the L2
+    /// value when they differ). Writing the SC's snapshot back here was
+    /// silently reverting every legitimate ReadPublic flip on every
+    /// round-robin pass.
+    Confirmed,
+    /// The SC's creator disagrees with what's stored — correct it (the
+    /// actual squat-or-transfer-caught case) and mark verified now.
+    ///
+    /// Round 6 (security audit finding S4): this used to ALSO overwrite
+    /// `channel_type` back to the SC's on-chain snapshot for a row
+    /// currently self-labeled Private, on the theory that reaching this
+    /// arm at all (Private is purely an L2 concept, the SC has no notion
+    /// of it) already disproves that claim — i.e. the row must be a
+    /// deliberate "self-label Private to dodge verification" attempt.
+    /// That reasoning stopped holding once `PRIVATE_CHANNEL_ID_FLOOR`
+    /// (`messages::validation::validate_channel_create`) closed the
+    /// bypass at ingestion: the ONLY rows that can still reach this arm
+    /// while currently Private are pre-floor legacy rows, which this
+    /// sweep can no longer distinguish from a genuinely legitimate old
+    /// private channel that happens to collide with an unrelated
+    /// on-chain id — auto-converting it silently reassigns a real
+    /// user's channel to a stranger. `apply_channel_verification_result`
+    /// now only ever corrects `creator` for a NON-Private row; a
+    /// currently-Private collision is detected (`Storage::
+    /// apply_channel_verification_result`'s return value) and left
+    /// untouched, same "detect, don't auto-correct" posture as
+    /// tombstone-poisoning elsewhere in this feature.
+    Corrected { verified_creator: String },
+    /// The SC has no such channel right now — a live signal, not
+    /// lag-dependent. Flag for operator visibility; `creator` is left
+    /// untouched.
+    NoOnChainBacking,
+}
+
 /// Wrapper around RocksDB with typed column family access.
 #[derive(Clone)]
 pub struct Storage {
@@ -418,7 +485,24 @@ impl Storage {
     /// best-effort/safe-if-partial and has no resurrection risk on its own,
     /// so it deliberately does NOT hold this node-wide lock for its
     /// duration.
-    pub fn tombstone_channel(&self, channel_id: u64, deleted_at: u64) -> Result<()> {
+    /// `deleted_by` (audit 2026-09-29): the wallet whose envelope triggered
+    /// this delete, when known (the L2 `ChannelDelete` paths pass the
+    /// resolved author; the chain-verified claim-consumption path in
+    /// `chain::scanner` and internal tests pass `None`, since there the
+    /// deleter is either already chain-verified or not meaningful).
+    /// Recorded so `ChainScanner::sweep_channel_verification`'s tombstone
+    /// cross-check can distinguish a legitimate self-delete of a real
+    /// on-chain channel (deleter == the SC's confirmed creator — expected,
+    /// not flagged) from a pre-emptive squat-then-delete poisoning attempt
+    /// (deleter != the SC's confirmed creator — flagged for operator
+    /// visibility). Detection only, not prevention — see that sweep's doc
+    /// comment for why the delete itself isn't blocked synchronously.
+    pub fn tombstone_channel(
+        &self,
+        channel_id: u64,
+        deleted_at: u64,
+        deleted_by: Option<&str>,
+    ) -> Result<()> {
         let channel_key = channel_id.to_be_bytes();
         let _guard = self
             .channel_membership_lock
@@ -471,6 +555,7 @@ impl Storage {
         let tombstone_value = serde_json::to_vec(&serde_json::json!({
             "deleted_at": deleted_at,
             "members": members,
+            "deleted_by": deleted_by,
         }))
         .unwrap_or_else(|_| deleted_at.to_be_bytes().to_vec());
 
@@ -491,6 +576,7 @@ impl Storage {
             (cf::CHANNEL_BANS, 10_000),
             (cf::CHANNEL_PINS, 100),
             (cf::CHANNEL_INVITES, 10_000),
+            (cf::CHANNEL_VERIFICATION, 1),
         ];
         for &(cf_name, limit) in cleanup_cfs {
             match self.prefix_iter_cf(cf_name, &channel_key, limit) {
@@ -937,6 +1023,256 @@ impl Storage {
             self.remove_channel_member_and_raise_epoch_floor_locked(channel_id, &address)?;
         }
         Ok(())
+    }
+
+    /// Apply the result of one `getChannelCreator` re-verification
+    /// (`ChainScanner::verify_one_channel_creator`) to a `CHANNELS` row —
+    /// under `channel_membership_lock`, re-reading fresh state, mutating
+    /// only the verification-related fields.
+    ///
+    /// Audit 2026-09-29 (CRITICAL, both code and security review): the
+    /// first attempt at this feature read a row, awaited a multi-second
+    /// throttled SC call, then blind-wrote back the PRE-AWAIT snapshot —
+    /// unlocked, no re-read, no tombstone check. Anything else touching
+    /// that row during the wait (a member join/leave, a `ChannelDelete`)
+    /// was silently reverted, and a delete landing mid-wait could be
+    /// resurrected with its subsidiary CFs already wiped. This method
+    /// closes both: the tombstone check + fresh-read happen INSIDE
+    /// `channel_membership_lock`, not before the caller's network call.
+    ///
+    /// **`channel_membership_lock` does NOT serialize against every
+    /// CHANNELS-row writer** — a follow-up code review corrected an
+    /// earlier draft of this comment that claimed it did.
+    /// `put_channel_and_replay_pending_member_removals`,
+    /// `remove_channel_member_and_raise_epoch_floor`, and
+    /// `tombstone_channel` all take it, so this method is safe against
+    /// those. `messages::router`'s `ChannelUpdate` handler ALSO now takes
+    /// it (via `with_channel_membership_lock`, added for exactly this
+    /// interaction). Still unlocked, and a known tracked residual: the
+    /// chain scanner's own `ChannelCreated`-merge and `ChannelTransferred`
+    /// handlers, and `normalize_channel_types`.
+    ///
+    /// `now` is passed in (not computed here) so `storage` stays free of
+    /// wall-clock/chain-module concerns — the caller already has it.
+    ///
+    /// Returns `true` when a `Corrected` outcome was DETECTED but
+    /// deliberately NOT applied because the row is currently Private
+    /// (round 6, security finding S4 — see `ChannelVerificationOutcome::
+    /// Corrected`'s doc comment) — the caller uses this to decide whether
+    /// to alert, since `Storage` itself has no access to the sweep's
+    /// alert counter.
+    pub fn apply_channel_verification_result(
+        &self,
+        channel_id: u64,
+        outcome: ChannelVerificationOutcome,
+        now: u64,
+    ) -> Result<bool> {
+        let _guard = self
+            .channel_membership_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = channel_id.to_be_bytes();
+        // Tombstoned since the caller started this check (e.g. a
+        // legitimate delete landed during the throttled SC call) — the
+        // row is gone for good; nothing to apply.
+        if self.exists_cf(cf::DELETED_CHANNELS, &key)? {
+            return Ok(false);
+        }
+        let Some(existing) = self.get_cf(cf::CHANNELS, &key)? else {
+            // Deleted (or never existed) since the caller started —
+            // nothing to verify.
+            return Ok(false);
+        };
+        let mut meta: serde_json::Value = match serde_json::from_slice(&existing) {
+            Ok(m) => m,
+            Err(_) => return Ok(false), // corrupt row — nothing sane to do under the lock
+        };
+
+        // Verification bookkeeping (creator_verified_at / _failed) lives in
+        // its own CF, never in the CHANNELS blob — see
+        // `schema::cf::CHANNEL_VERIFICATION`'s doc comment for why (anchor
+        // state-root divergence, audit 2026-09-29 CRITICAL finding).
+        let mut vstate: crate::chain::types::ChannelVerificationState = self
+            .get_cf(cf::CHANNEL_VERIFICATION, &key)
+            .ok()
+            .flatten()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
+
+        // Only ever correct `channel_type` FROM Private — re-read fresh
+        // here (not the caller's pre-await snapshot) since a legitimate
+        // concurrent Public<->ReadPublic flip could have landed since. The
+        // on-chain snapshot type is never authoritative for an
+        // already-non-Private row (see `ChannelVerificationOutcome`'s doc
+        // comment); it's only meaningful for correcting the ONE case
+        // where the local claim is structurally impossible.
+        let currently_private = meta
+            .get("channel_type")
+            .map(json_channel_type_is_private)
+            .unwrap_or(false);
+
+        let mut channels_row_changed = false;
+        let mut private_collision_detected = false;
+        match outcome {
+            ChannelVerificationOutcome::Confirmed => {
+                // Round 8 (security audit finding, CRITICAL): the
+                // caller picks `Confirmed` purely from `verified_creator
+                // == stored_creator` (`ChainScanner::
+                // verify_one_channel_creator`), BEFORE any Private
+                // check — so a currently-Private row whose stored
+                // creator happens to MATCH the SC's real creator for
+                // that id reached here with no `currently_private`
+                // guard at all, unlike `Corrected` just below. That
+                // match is trivial for a deliberate attacker to
+                // arrange (sign both the local Private `ChannelCreate`
+                // and the real on-chain create with the SAME wallet),
+                // and it's the ONLY way to dodge the `Corrected` arm's
+                // detection — so this was a permanent, self-renewing
+                // blind spot for exactly the deliberate-attacker case,
+                // the mirror image of the accidental-mismatch case
+                // `Corrected` already handles. ANY on-chain backing for
+                // a claimed-Private id is anomalous regardless of
+                // whether the creator happens to match — treat it
+                // identically to `Corrected`'s currently-Private
+                // branch: detect, alert, touch nothing.
+                if currently_private {
+                    private_collision_detected = true;
+                } else {
+                    vstate.creator_verified_at = Some(now);
+                    vstate.creator_verification_failed = false;
+                }
+            }
+            ChannelVerificationOutcome::Corrected { verified_creator } => {
+                if currently_private {
+                    // Round 6 (S4): detect, don't auto-correct — see
+                    // `ChannelVerificationOutcome::Corrected`'s doc
+                    // comment. The row is left completely untouched;
+                    // the caller alerts based on the `true` this
+                    // function returns.
+                    //
+                    // Round 7 (security audit finding): do NOT stamp
+                    // `creator_verified_at` here — this collision is
+                    // detected, not resolved, and stamping it would
+                    // arm `should_skip_recent_positive_reverify`'s 24h
+                    // cooldown on the exact row that most needs to keep
+                    // being re-checked and re-alerted on every future
+                    // pass. Leaving `vstate` untouched means the next
+                    // lane pass that reaches this id makes a fresh RPC
+                    // call and alerts again — undoing round 6/7's own
+                    // "detect and keep alerting" intent, which the
+                    // unconditional stamp below was silently defeating.
+                    private_collision_detected = true;
+                } else if let Some(obj) = meta.as_object_mut() {
+                    obj.insert("creator".into(), serde_json::json!(verified_creator));
+                    channels_row_changed = true;
+                    vstate.creator_verified_at = Some(now);
+                    vstate.creator_verification_failed = false;
+                }
+            }
+            ChannelVerificationOutcome::NoOnChainBacking => {
+                // Round-4 audit finding (LOW, code review): a NEGATIVE
+                // result here can itself be STALE, not just the row it's
+                // about. `mark_channel_creator_verified` (called by the
+                // historical scanner's own `ChannelCreated` processing,
+                // unlocked — it never touches CHANNELS, so it doesn't
+                // need `channel_membership_lock` for that reason) can
+                // write a genuine positive confirmation for this id WHILE
+                // this sweep's own multi-second throttled SC call for the
+                // SAME id is still in flight and about to return a
+                // lagged `None`. Since this outcome was already decided
+                // by the caller before this lock was ever taken, mere
+                // locking here would not fix the ordering — a fresh read
+                // under the lock would just see the one-true-value the
+                // scanner already wrote and then unconditionally
+                // overwrite it with this stale negative anyway. Guard
+                // against it directly: don't downgrade a confirmation
+                // that landed more recently than this negative RPC could
+                // possibly have started (throttle spacing + realistic SC
+                // latency, generously bounded) — a positive verdict this
+                // fresh can only be MORE authoritative than a concurrent
+                // negative, never less.
+                let confirmed_more_recently_than_this_check_could_have_started = vstate
+                    .creator_verified_at
+                    .is_some_and(|t| now.saturating_sub(t) < RECENT_CONFIRMATION_GUARD_SECS);
+                if !confirmed_more_recently_than_this_check_could_have_started {
+                    // Live signal (not lag-dependent): the SC has no such
+                    // channel right now. Flag only — no automatic
+                    // punitive action, and CHANNELS itself is untouched.
+                    // Stamping `no_backing_checked_at` lets the caller
+                    // apply a cooldown before spending another RPC
+                    // re-checking the same standing negative (audit
+                    // 2026-09-29 round 3.1).
+                    vstate.creator_verification_failed = true;
+                    vstate.no_backing_checked_at = Some(now);
+                }
+            }
+        }
+
+        if channels_row_changed {
+            let bytes = serde_json::to_vec(&meta)?;
+            self.put_cf(cf::CHANNELS, &key, &bytes)?;
+        }
+        let vstate_bytes = serde_json::to_vec(&vstate)?;
+        self.put_cf(cf::CHANNEL_VERIFICATION, &key, &vstate_bytes)?;
+        Ok(private_collision_detected)
+    }
+
+    /// Mark a channel's creator as chain-verified right now — for the
+    /// paths that ALREADY know it authoritatively (the historical chain
+    /// scanner's own `ChannelCreated`/`ChannelTransferred` processing),
+    /// as opposed to `apply_channel_verification_result`'s independent
+    /// re-check path. No `channel_membership_lock` needed: this only
+    /// touches `CHANNEL_VERIFICATION`, never `CHANNELS` itself, so it
+    /// can't race with anything that writes the CHANNELS row.
+    pub fn mark_channel_creator_verified(&self, channel_id: u64, now: u64) -> Result<()> {
+        let vstate = crate::chain::types::ChannelVerificationState {
+            creator_verified_at: Some(now),
+            creator_verification_failed: false,
+            no_backing_checked_at: None,
+        };
+        self.put_cf(
+            cf::CHANNEL_VERIFICATION,
+            &channel_id.to_be_bytes(),
+            &serde_json::to_vec(&vstate)?,
+        )
+    }
+
+    /// Read `channel_id`'s `CHANNEL_VERIFICATION` bookkeeping, defaulting to
+    /// "never checked" for an id that has none yet. Read-only, no lock
+    /// needed (mirrors `mark_channel_creator_verified`'s reasoning — this CF
+    /// is never touched by anything that also writes CHANNELS).
+    pub fn read_channel_verification_state(
+        &self,
+        channel_id: u64,
+    ) -> crate::chain::types::ChannelVerificationState {
+        self.get_cf(cf::CHANNEL_VERIFICATION, &channel_id.to_be_bytes())
+            .ok()
+            .flatten()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default()
+    }
+
+    /// Run `f` while holding `channel_membership_lock`.
+    ///
+    /// Audit 2026-09-29 (HIGH finding): several CHANNELS-row writers
+    /// (`ChannelUpdate`'s merge in `messages::router`, the chain scanner's
+    /// `ChannelCreated`-merge and `ChannelTransferred` handlers,
+    /// `normalize_channel_types`) do an unlocked read-modify-write, so a
+    /// doc comment anywhere claiming this lock "serializes against every
+    /// other CHANNELS-row writer" is not accurate — it only covers the
+    /// callers that actually take it. This generic wrapper lets a caller
+    /// OUTSIDE `storage::rocks` (which can't reach the private
+    /// `channel_membership_lock` field directly) join the same lock
+    /// without moving its whole business logic into this module. Used by
+    /// `ChannelUpdate` specifically, as the interaction judged most likely
+    /// to matter in practice; the remaining unlocked writers above are a
+    /// known, tracked residual, not fixed in this pass.
+    pub fn with_channel_membership_lock<T>(&self, f: impl FnOnce() -> T) -> T {
+        let _guard = self
+            .channel_membership_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        f()
     }
 
     /// Get a column family handle for use in WriteBatch operations.
@@ -4485,7 +4821,7 @@ mod tombstone_channel_tests {
         put_member(&s, channel_id, "klv1creator");
         put_member(&s, channel_id, "klv1joiner");
 
-        s.tombstone_channel(channel_id, 1_700_000_000).unwrap();
+        s.tombstone_channel(channel_id, 1_700_000_000, None).unwrap();
 
         let mut members = s.deleted_channel_members(channel_id).unwrap();
         members.sort();
@@ -4502,11 +4838,11 @@ mod tombstone_channel_tests {
         let (s, _d) = db();
         let channel_id = 43;
         put_member(&s, channel_id, "klv1a");
-        s.tombstone_channel(channel_id, 100).unwrap();
+        s.tombstone_channel(channel_id, 100, None).unwrap();
 
         // A second delete (e.g. a re-delivered ChannelDelete) must not overwrite the
         // captured list with an empty one — CHANNEL_MEMBERS is already gone by then.
-        s.tombstone_channel(channel_id, 200).unwrap();
+        s.tombstone_channel(channel_id, 200, None).unwrap();
         assert_eq!(s.deleted_channel_members(channel_id).unwrap(), vec!["klv1a".to_string()]);
     }
 
@@ -4537,7 +4873,7 @@ mod tombstone_channel_tests {
         // matching ChannelCreate.
         let never_created_channel_id = 9999u64;
         assert!(s.get_cf(cf::CHANNELS, &never_created_channel_id.to_be_bytes()).unwrap().is_none());
-        s.tombstone_channel(never_created_channel_id, 1_000).unwrap();
+        s.tombstone_channel(never_created_channel_id, 1_000, None).unwrap();
 
         assert_eq!(
             s.get_stat(crate::storage::schema::state_keys::TOTAL_CHANNELS).unwrap(),
@@ -4567,7 +4903,7 @@ mod tombstone_channel_tests {
         std::thread::scope(|scope| {
             let s1 = s.clone();
             scope.spawn(move || {
-                s1.tombstone_channel(channel_id, 2_000).unwrap();
+                s1.tombstone_channel(channel_id, 2_000, None).unwrap();
             });
             let s2 = s.clone();
             scope.spawn(move || {
