@@ -5,6 +5,64 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.137.0] - 2026-09-30
+
+### Added
+
+- **Peer-completeness comparison + staleness tracking for channel-history
+  backfill.** 0.136.0's completion signal still trusted whichever fanout
+  candidate answered FIRST with verified progress — live-tested on a
+  freshly-reset node, this let a long-decommissioned but still-reachable
+  "ghost" peer (constantly reconnecting, so unusually fast to answer) win
+  the race with its own stale copy of a channel, over darkw0rld/freeweb's
+  fuller, slower responses. A fresh trigger now opens a short (3s,
+  capped at 16 concurrently system-wide) comparison window across every
+  fanout candidate instead of racing to the first one: rank whichever
+  candidates answer informatively by self-reported page size (used only
+  to pick try order, never trusted alone), then try them in that order
+  through the existing router-verification pipeline, stopping at the
+  first one that delivers genuine new signed content. Peers that lose
+  comparisons `[backfill] stale_peer_threshold` (default 3) times in a
+  row get deprioritized — never excluded — in future fanout selection,
+  with a periodic (`stale_peer_reprobe_hours`, default 24h) extra probe
+  so a genuinely-recovered peer can requalify.
+- New config: `[backfill] stale_peer_threshold` and
+  `stale_peer_reprobe_hours`.
+
+### Security
+
+- **Three audit rounds (Code + Security in parallel) on this new
+  feature**, on top of the already-hardened 0.136.0 base:
+  - Round 1 found and closed: staleness scoring fed raw, pre-
+    verification, self-reported page sizes into the comparison BEFORE
+    trying anyone, letting a peer padding a huge garbage/duplicate-heavy
+    count become the reference and drag every honest peer's staleness
+    counter up — the inverse of the feature's purpose. Also found and
+    closed two unrelated-but-real gaps in the same pass: no cap on
+    concurrently-open comparisons (each buffering full response bodies
+    in memory, reachable at scale by the ordinary node-startup subscribe
+    loop with no attacker needed) and no cap/prune on the new per-peer
+    health map (the identical Sybil-growth shape this file had already
+    fixed once for its gossip-rate-limit state, not carried over).
+  - Round 2 found and closed: the redesigned verified-outcome scoring
+    still had a gap — `has_more = true` was treated as an unconditional
+    win regardless of whether that page verified anything, letting a
+    peer claim "more is coming" with a padded or all-duplicate first
+    page and win the comparison for free, fully reopening the round-1
+    class of bug via a different code path. Also tightened the
+    concurrency cap (64 → 16) after finding the original bound worst
+    case at multi-gigabyte memory, and fixed a minor ordering bug where
+    a capped-out trigger could burn a stale peer's daily reprobe chance
+    without ever sending it a request.
+  - Round 3 came back clean from both audits. One non-blocking residual
+    was found and explicitly recorded rather than fixed further: the
+    round-2 fix can also reject a genuinely honest peer whose oldest
+    history happens to overlap ours but who holds real newer content on
+    a later page — judged acceptable to defer (not security/data-loss/
+    DoS-class, self-heals via any other candidate with real first-page
+    content, and a proper fix risked reopening what this round just
+    closed).
+
 ## [0.136.0] - 2026-09-30
 
 ### Fixed

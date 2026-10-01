@@ -6,9 +6,11 @@
 //! backfills history. This module implements the cold-join backfill:
 //! on `subscribe_channel(channel_id)` (every startup, and whenever the
 //! chain scanner re-touches the channel), the node requests the
-//! missing history from up to `fanout` peers in parallel, races for
-//! the first non-empty response, and pages through cursor-based
-//! batches until the responding peer signals `has_more = false`.
+//! missing history from up to `fanout` peers in parallel, compares
+//! their first-page responses rather than racing to whichever answers
+//! first (l2-node 0.137.0 — see `NetworkService::finalize_reconcile_
+//! comparison`), and pages through cursor-based batches with the
+//! chosen candidate until it signals `has_more = false`.
 //!
 //! **Trigger condition** (`NetworkService::maybe_trigger_backfill`,
 //! rewritten 2026-09-30): fires whenever `storage::schema::cf::

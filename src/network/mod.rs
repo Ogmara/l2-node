@@ -89,6 +89,66 @@ const MAX_CONSECUTIVE_UNPRODUCTIVE_PAGES: u32 = 5;
 /// envelope-verification loop.
 const MAX_PAGES_PER_SESSION: u32 = 500;
 
+/// How long `finalize_reconcile_comparison` waits for every fanout
+/// candidate to answer a fresh trigger's first page before deciding with
+/// whoever has answered so far (l2-node 0.137.0). Deliberately well under
+/// the protocol's 45s request timeout (`network::behaviour`) — a real
+/// peer on a LAN/testnet answers in well under a second; this just bounds
+/// how long one slow or dead candidate can hold up the others.
+const RECONCILE_COMPARE_WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Soft cap on concurrently-OPEN `pending_reconcile_comparisons` entries
+/// (l2-node 0.137.0). Security-audit finding (2026-09-30, round 1): unlike
+/// the pre-0.137.0 design (which processed and dropped one response at a
+/// time), a comparison window holds every informative candidate's FULL
+/// `ReconcileResponse` in memory for up to `RECONCILE_COMPARE_WINDOW` —
+/// and node startup (`src/node.rs`) can call `subscribe_channel` for up
+/// to 100,000 channels in a tight loop with no throttling between
+/// iterations, each opening its own comparison. Without a cap, a node
+/// with a large, mostly-incomplete channel set could have thousands of
+/// comparisons open at once right after startup (or after this very
+/// version upgrade), each buffering up to `fanout` responses sized by
+/// the operator's own `max_envelopes_per_response`/`total_envelopes_cap`
+/// knobs — unbounded aggregate memory pressure on a hot, automatic path.
+/// `maybe_trigger_backfill` refuses to open a new comparison past this
+/// cap, releasing `reconcile_triggered` so the periodic retry sweep
+/// picks the channel up on a later tick instead — this bounds worst-case
+/// concurrent memory to a fixed, computable multiple of the existing
+/// per-response caps, independent of total channel count.
+///
+/// Security-audit finding (2026-09-30, round 2): each buffered
+/// `ReconcileResponse` can be as large as the wire cap (~10 MiB CBOR,
+/// `config.rs`'s `max_envelopes_per_response` validation), and a
+/// comparison holds up to `fanout + 1` (the reprobe extra) of them at
+/// once. An earlier value of 64 here bounded worst case to 64 × 4 ×
+/// 10 MiB ≈ 2.5 GB at the default `fanout = 3` (≈ 11 GB at the
+/// configurable ceiling `fanout = 16`) — finite, but not obviously
+/// "small" for the modest VPS-class hardware this project targets.
+/// Lowered to keep the default-config worst case in the hundreds-of-MB
+/// range instead; `catchup_batch_size`'s own default (25) already means
+/// a single periodic-sweep tick naturally exceeds this, so the
+/// remainder just waits for the next 30s tick rather than being able to
+/// trigger all at once — graceful degradation, not a functional loss.
+const MAX_CONCURRENT_RECONCILE_COMPARISONS: usize = 16;
+
+/// Soft cap on distinct PeerIds tracked by `peer_reconcile_health`
+/// between prunes (l2-node 0.137.0) — mirrors `GOSSIP_RATE_LIMITER_SOFT_
+/// CAP`'s defense against a Sybil flood of unique PeerIds growing the
+/// map without bound (a fresh keypair is free to mint). Existing peers
+/// keep being tracked even at the cap; only new-peer inserts are
+/// refused.
+const PEER_RECONCILE_HEALTH_SOFT_CAP: usize = 16_384;
+
+/// How long a `peer_reconcile_health` entry survives with no comparison
+/// touching it before the periodic prune (piggybacked on
+/// `mesh_stats_interval`, same as `gossip_rate_limiter`/`gossip_app_
+/// score`) drops it (l2-node 0.137.0). Generous relative to the default
+/// `[backfill] stale_peer_reprobe_hours` (24h) so ordinary reprobe
+/// cadence doesn't itself cause churn — see `PeerReconcileHealth`'s doc
+/// comment for why losing this bookkeeping early is harmless regardless.
+const PEER_RECONCILE_HEALTH_MAX_IDLE: std::time::Duration =
+    std::time::Duration::from_secs(7 * 24 * 3600);
+
 /// Per-peer non-presence gossip rate limit (audit final pre-mainnet W10):
 /// max messages accepted from a single peer within [`GOSSIP_RATE_WINDOW`]
 /// before `handle_swarm_event` starts reporting `Ignore` without running
@@ -471,6 +531,21 @@ pub struct NetworkService {
     /// `retry_incomplete_channel_backfills` tick), which is what makes an
     /// incomplete channel keep getting retried without needing a restart.
     reconcile_triggered: HashSet<u64>,
+    /// In-progress "pick the most complete first-page responder" windows
+    /// (l2-node 0.137.0), keyed by channel_id. Seeded by
+    /// `maybe_trigger_backfill` when a fresh (cursor: None) fanout is
+    /// dispatched; finalized (winner chosen, losers never processed) once
+    /// every candidate has answered or `reconcile_compare_interval` finds
+    /// its deadline has passed. See `finalize_reconcile_comparison`.
+    pending_reconcile_comparisons: HashMap<u64, ReconcileComparison>,
+    /// Per-peer reconcile completeness tracking (l2-node 0.137.0) —
+    /// in-memory only, never persisted, since completeness is a live
+    /// property a peer can regain at any time. Updated by
+    /// `finalize_reconcile_comparison`; consulted by `maybe_trigger_
+    /// backfill`'s candidate selection to deprioritize (never exclude)
+    /// a peer that's been meaningfully behind its siblings several
+    /// times in a row.
+    peer_reconcile_health: HashMap<PeerId, PeerReconcileHealth>,
     /// Server-side rate-limit state for inbound `sync::SyncRequest`s (audit
     /// final pre-mainnet W7). Reuses `reconcile::ResponderLimits` directly
     /// rather than a duplicate type — `SyncRequestType::ChannelMessages` is
@@ -748,13 +823,96 @@ struct ReconcilePending {
     /// better: false completion is no longer PERMANENT — it expires
     /// after `channel_catchup_interval_hours` (default 6h), so an
     /// attacker must keep re-winning the race every cycle rather than
-    /// masking history once and forever. Fully closing this needs either
-    /// the deferred spec-14 fingerprint/epoch-root completeness proof, or
-    /// a cheaper interim hardening (e.g. requiring 2+ independent peers
-    /// to agree before persisting completion) — deliberately not
-    /// attempted in this pass; recorded here so it isn't mistaken for a
-    /// closed issue.
+    /// masking history once and forever. l2-node 0.137.0 adds the cheaper
+    /// interim hardening floated here — compare every fanout candidate's
+    /// first page instead of trusting whichever answers first, and track
+    /// per-peer staleness (see `ReconcileComparison`/`PeerReconcileHealth`
+    /// below) — which makes a single peer's fabricated response need to
+    /// out-report every honest sibling to win, not merely answer fastest.
+    /// It is still not the full spec-14 fingerprint/epoch-root proof:
+    /// a peer that's ahead of its siblings (including a colluding one)
+    /// can still win and assert completion. Recorded here so neither gap
+    /// is mistaken for fully closed.
     total_accepted: u64,
+}
+
+/// A live comparison window for one channel's freshly-triggered (`cursor:
+/// None`) fanout — l2-node 0.137.0. Exists only between
+/// `maybe_trigger_backfill` dispatching the initial requests and
+/// `finalize_reconcile_comparison` resolving them; a continuation page
+/// (`cursor: Some(_)`) never creates or consults one, since by then a
+/// winner is already committed and normal single-peer paging applies.
+#[derive(Debug)]
+struct ReconcileComparison {
+    /// request_ids still awaiting a `Response` or `OutboundFailure`.
+    /// Finalizes early (§`reconcile_compare_interval`) once this is
+    /// empty, without waiting for `deadline`.
+    outstanding: HashSet<libp2p::request_response::OutboundRequestId>,
+    /// `(peer, response)` for every candidate that answered with
+    /// something informative (not `server_capped`, not empty-with-no-
+    /// more) — ranked by `rank_reconcile_candidates_by_size` at finalize
+    /// time. A peer that answered uninformatively simply never appears
+    /// here, same treatment as one that failed outright.
+    candidates: Vec<(PeerId, reconcile::ReconcileResponse)>,
+    /// Wall-clock deadline for finalizing even if `outstanding` isn't
+    /// empty yet — bounds one slow/dead candidate's worst-case delay to
+    /// `RECONCILE_COMPARE_WINDOW`, well under the protocol's 45s request
+    /// timeout (`network::behaviour`).
+    deadline: Instant,
+}
+
+/// Per-peer reconcile completeness tracking (l2-node 0.137.0) — in-memory
+/// only, deliberately never persisted (see `NetworkService::
+/// peer_reconcile_health`'s doc comment for why). `consecutive_losses`
+/// is a soft, freely-resettable signal, never a security control on its
+/// own (staleness only ever deprioritizes fanout selection, never
+/// excludes or authorizes anything) — so pruning this entry early under
+/// memory pressure (see `PEER_RECONCILE_HEALTH_MAX_IDLE`) just means
+/// this peer resets to "not stale" and gets an earlier-than-scheduled
+/// courtesy reprobe, never a correctness or security issue.
+#[derive(Debug, Clone)]
+struct PeerReconcileHealth {
+    /// Consecutive comparisons (against DIFFERENT channels/triggers, not
+    /// re-counted for the same one) where this peer was TRIED and
+    /// verified to yield zero real progress while a later candidate in
+    /// the SAME comparison proved real content existed — see
+    /// `finalize_reconcile_comparison`'s doc comment for why this must
+    /// be scored from verified trial outcomes, never raw reported
+    /// counts. Reset to 0 the moment this peer wins a comparison again —
+    /// a genuinely-recovered peer sheds the flag automatically, no
+    /// separate "unflag" step.
+    consecutive_losses: u32,
+    /// Last time a currently-stale peer was deliberately given an extra,
+    /// above-`fanout` probe chance (see `maybe_trigger_backfill`'s
+    /// candidate selection) to requalify. `None` means never probed —
+    /// probe immediately next opportunity.
+    last_probed_at: Option<Instant>,
+    /// Last time this entry was touched at all (a comparison result or
+    /// a reprobe stamp) — staleness-based prune key, mirroring
+    /// `gossip_app_score`'s `last_touched`/W10 pattern (a value-only
+    /// prune left an exploitable gap there — see that field's doc
+    /// comment). Security-audit finding (2026-09-30, round 1): this map
+    /// previously had no cap or prune at all, an unbounded-growth Sybil
+    /// vector identical to one this file already closed once for
+    /// `gossip_rate_limiter`/`gossip_app_score`.
+    last_touched: Instant,
+}
+
+/// Outcome of `NetworkService::apply_reconcile_response` for one
+/// candidate. `Handled` means the call already took every appropriate
+/// terminal action for this session (continuation, completion, or a
+/// give-up that already released `reconcile_triggered`) — the caller has
+/// nothing left to do. `NoProgress` means this specific response yielded
+/// zero verified progress and did NOT touch `reconcile_triggered` —
+/// reserved for the comparison-trial loop (`finalize_reconcile_
+/// comparison`), which tries ranked candidates one at a time and must
+/// decide for itself whether to try the next one or, having exhausted
+/// them all, release the dedup guard exactly once (releasing it after
+/// EVERY failed trial would let a later trial's dispatch race a
+/// concurrent re-trigger for the same channel).
+enum ReconcileApplyOutcome {
+    Handled,
+    NoProgress,
 }
 
 /// Per-pending-outbound-identity-sync state (P-1).
@@ -835,6 +993,47 @@ fn channel_backfill_due(completed_at: Option<u64>, now: u64, catchup_interval_ho
                 && now.saturating_sub(completed) >= catchup_interval_hours.saturating_mul(3600)
         }
     }
+}
+
+/// Ranks a resolved comparison's candidates by how much content they
+/// reported, descending (l2-node 0.137.0) — the order
+/// `finalize_reconcile_comparison` tries them in. Ties keep original
+/// (first-seen) order, since `sort_by_key` is stable.
+fn rank_reconcile_candidates_by_size(
+    candidates: &[(PeerId, reconcile::ReconcileResponse)],
+) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..candidates.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(candidates[i].1.envelopes.len()));
+    order
+}
+
+/// Splits a comparison's VERIFIED trial outcomes (l2-node 0.137.0) into
+/// who should be treated as competitive vs. meaningfully behind, for
+/// `record_reconcile_peer_result`. `trials` is `(peer, had_real_progress)`
+/// in the order they were actually tried — see `finalize_reconcile_
+/// comparison`'s doc comment for why this must be fed VERIFIED outcomes
+/// (never raw, pre-verification reported counts) and why a candidate
+/// never tried at all (because an earlier one already won) appears in
+/// neither list.
+fn split_reconcile_trial_results(trials: &[(PeerId, bool)]) -> (Vec<PeerId>, Vec<PeerId>) {
+    let mut competitive = Vec::new();
+    let mut behind = Vec::new();
+    for &(peer, had_progress) in trials {
+        if had_progress {
+            competitive.push(peer);
+        } else {
+            behind.push(peer);
+        }
+    }
+    (competitive, behind)
+}
+
+/// `true` once `consecutive_losses` has reached `threshold` (l2-node
+/// 0.137.0) — `[backfill] stale_peer_threshold`, `0` meaning "disabled,
+/// never flag anyone stale" (mirrors `channel_catchup_interval_hours`'s
+/// `0`-disables convention elsewhere in this same feature).
+fn is_peer_stale(consecutive_losses: u32, threshold: u32) -> bool {
+    threshold > 0 && consecutive_losses >= threshold
 }
 
 fn envelope_targets_channel(env_bytes: &[u8], expected_channel: u64) -> bool {
@@ -1280,6 +1479,8 @@ impl NetworkService {
             reconcile_limits: Arc::new(reconcile::ResponderLimits::default()),
             pending_reconcile_requests: HashMap::new(),
             reconcile_triggered: HashSet::new(),
+            pending_reconcile_comparisons: HashMap::new(),
+            peer_reconcile_health: HashMap::new(),
             sync_limits: Arc::new(reconcile::ResponderLimits::default()),
             pending_sync_requests: HashMap::new(),
             identity_sync_limits: Arc::new(identity_sync::IdentityResponderLimits::default()),
@@ -1372,12 +1573,13 @@ impl NetworkService {
     /// `channel_catchup_interval_hours` — see `maybe_trigger_backfill`)
     /// AND we have not already triggered reconciliation for this
     /// channel in the current process, the trigger fires: we pick up
-    /// to `[backfill] fanout` candidate
-    /// peers from the gossip mesh (falling back to SC-active nodes
-    /// if mesh is sparse) and send each a `ReconcileRequest`. The
-    /// first non-empty response wins; subsequent responses are
-    /// dropped on arrival via the `pending_reconcile_requests` map
-    /// (only the winning peer's continuation is tracked).
+    /// to `[backfill] fanout` candidate peers (deprioritizing, never
+    /// excluding, any currently-flagged-stale ones — l2-node 0.137.0)
+    /// from the gossip mesh (falling back to SC-active nodes if mesh
+    /// is sparse) and send each a `ReconcileRequest`. Rather than
+    /// racing to whichever answers first, we compare their first-page
+    /// responses and commit to whoever reported the most — see
+    /// `finalize_reconcile_comparison`.
     pub fn subscribe_channel(&mut self, channel_id: u64) {
         self.topics
             .subscribe_channel(&mut self.swarm, channel_id);
@@ -1853,6 +2055,17 @@ impl NetworkService {
         let mut reconnect_interval = tokio::time::interval(Duration::from_secs(10));
         reconnect_interval.tick().await;
 
+        // Reconcile first-page comparison deadline sweep (l2-node
+        // 0.137.0, every 1s) — finalizes any `pending_reconcile_
+        // comparisons` entry whose `deadline` has passed even if not
+        // every candidate has answered yet, so one slow/dead peer can't
+        // stall the others past `RECONCILE_COMPARE_WINDOW`. Tight
+        // interval is cheap: this map is empty almost all the time, and
+        // even at scale is bounded by concurrent in-flight triggers, not
+        // by channel count.
+        let mut reconcile_compare_interval = tokio::time::interval(Duration::from_secs(1));
+        reconcile_compare_interval.tick().await;
+
         // Mesh-stats refresh (every 30s) — snapshots per-topic mesh
         // size + subscriber count into `self.mesh_stats` for the
         // `/admin/network/mesh-stats` endpoint (spec 10 §9.2,
@@ -2025,6 +2238,9 @@ impl NetworkService {
                 }
                 _ = reconnect_interval.tick() => {
                     self.process_reconnect_queue();
+                }
+                _ = reconcile_compare_interval.tick() => {
+                    self.finalize_expired_reconcile_comparisons();
                 }
                 Some(_) = sc_reconnect_rx.recv() => {
                     // sc_discovery persisted new multiaddrs from the
@@ -3888,9 +4104,92 @@ impl NetworkService {
             return;
         }
 
+        // l2-node 0.137.0: deprioritize (never exclude) peers currently
+        // flagged stale — see `PeerReconcileHealth`'s doc comment. Split
+        // BEFORE shuffling so a stale peer only fills the fanout when
+        // there aren't enough healthy candidates to do it without them.
         use rand::seq::SliceRandom;
-        candidates.shuffle(&mut rand::thread_rng());
-        candidates.truncate(self.backfill_config.fanout);
+        let stale_threshold = self.backfill_config.stale_peer_threshold;
+        let (mut healthy, mut stale): (Vec<PeerId>, Vec<PeerId>) = candidates
+            .into_iter()
+            .partition(|p| {
+                !is_peer_stale(
+                    self.peer_reconcile_health
+                        .get(p)
+                        .map(|h| h.consecutive_losses)
+                        .unwrap_or(0),
+                    stale_threshold,
+                )
+            });
+        healthy.shuffle(&mut rand::thread_rng());
+        stale.shuffle(&mut rand::thread_rng());
+        healthy.truncate(self.backfill_config.fanout);
+        let mut candidates = healthy;
+        candidates.extend(
+            stale
+                .iter()
+                .copied()
+                .take(self.backfill_config.fanout.saturating_sub(candidates.len())),
+        );
+
+        // l2-node 0.137.0, security-audit finding (2026-09-30, round 1):
+        // refuse to open another comparison past a fixed concurrency
+        // cap — see `MAX_CONCURRENT_RECONCILE_COMPARISONS`'s doc comment
+        // for why an uncapped map here is a real unbounded-memory risk,
+        // not merely theoretical (the startup subscribe loop in
+        // `src/node.rs` can call this for up to 100,000 channels with no
+        // throttling between iterations). Checked BEFORE the reprobe
+        // block and before dispatching any requests (code-audit finding,
+        // 2026-09-30, round 2: checking this AFTER stamping a reprobe
+        // candidate's `last_probed_at` would burn that peer's recovery
+        // window even though no request was ever actually sent to it).
+        if self.pending_reconcile_comparisons.len() >= MAX_CONCURRENT_RECONCILE_COMPARISONS {
+            debug!(
+                channel_id,
+                "backfill: too many concurrent reconcile comparisons in flight; \
+                 deferring to a later periodic-sweep tick"
+            );
+            self.reconcile_triggered.remove(&channel_id);
+            return;
+        }
+
+        // Periodic re-probe (l2-node 0.137.0, `[backfill]
+        // stale_peer_reprobe_hours`): give ONE peer that's still flagged
+        // stale — and wasn't already pulled in as fanout filler above —
+        // an extra, above-`fanout` chance to requalify, so a genuinely
+        // recovered peer isn't deprioritized forever just because there
+        // are always enough healthy siblings around. Resetting
+        // `consecutive_losses` on a competitive showing (`record_
+        // reconcile_peer_result`) is what actually "unflags" it — this
+        // just makes sure that showing happens at all.
+        if self.backfill_config.stale_peer_reprobe_hours > 0 {
+            let reprobe_interval = std::time::Duration::from_secs(
+                self.backfill_config.stale_peer_reprobe_hours.saturating_mul(3600),
+            );
+            let now_instant = Instant::now();
+            if let Some(&candidate) = stale.iter().find(|p| !candidates.contains(p)) {
+                let due = self
+                    .peer_reconcile_health
+                    .get(&candidate)
+                    .and_then(|h| h.last_probed_at)
+                    .map(|last| now_instant.duration_since(last) >= reprobe_interval)
+                    .unwrap_or(true);
+                if due {
+                    candidates.push(candidate);
+                    // `candidate` is only ever drawn from `stale`, which
+                    // requires an existing `peer_reconcile_health` entry
+                    // (see `is_peer_stale`'s use above) — this never
+                    // inserts a new one, so the Sybil soft cap can't be
+                    // hit here; `touch_peer_reconcile_health` is still
+                    // used for consistency with every other write site.
+                    if let Some(health) =
+                        self.touch_peer_reconcile_health(candidate, now_instant)
+                    {
+                        health.last_probed_at = Some(now_instant);
+                    }
+                }
+            }
+        }
 
         let max_age_secs = if self.backfill_config.max_age_days == u64::MAX {
             u64::MAX
@@ -3915,6 +4214,10 @@ impl NetworkService {
             "backfill: triggering channel-history reconciliation"
         );
 
+        // l2-node 0.137.0: every fresh trigger opens a comparison window
+        // instead of racing to the first informative response — see
+        // `ReconcileComparison`'s doc comment.
+        let mut outstanding = HashSet::new();
         for peer in candidates {
             let id = self
                 .swarm
@@ -3931,7 +4234,16 @@ impl NetworkService {
                     total_accepted: 0,
                 },
             );
+            outstanding.insert(id);
         }
+        self.pending_reconcile_comparisons.insert(
+            channel_id,
+            ReconcileComparison {
+                outstanding,
+                candidates: Vec::new(),
+                deadline: Instant::now() + RECONCILE_COMPARE_WINDOW,
+            },
+        );
     }
 
     /// Release `channel_id`'s `reconcile_triggered` dedup entry, but only
@@ -4130,295 +4442,24 @@ impl NetworkService {
                     );
                     return;
                 };
-                if response.server_capped {
-                    debug!(
-                        peer = %peer,
-                        channel_id = pending.channel_id,
-                        "reconcile: peer responded server_capped; ignoring (race siblings may succeed)"
+                // l2-node 0.137.0: a fresh (cursor: None) fanout's first
+                // page is compared across every candidate before any of
+                // them is trusted — see `ReconcileComparison`'s doc
+                // comment for why (a stale-but-fast peer used to win
+                // purely by answering first). A continuation page never
+                // has an open comparison for its channel (the winner is
+                // already committed by then), so this only ever routes
+                // first pages.
+                if self.pending_reconcile_comparisons.contains_key(&pending.channel_id) {
+                    self.record_reconcile_comparison_response(
+                        pending.channel_id,
+                        request_id,
+                        peer,
+                        response,
                     );
-                    self.release_reconcile_trigger_if_no_siblings(pending.channel_id);
                     return;
                 }
-                if response.envelopes.is_empty() && !response.has_more {
-                    debug!(
-                        peer = %peer,
-                        channel_id = pending.channel_id,
-                        "reconcile: peer responded empty + no more; ignoring"
-                    );
-                    // Uninformative response (this peer may simply know
-                    // nothing about the channel, not that it's genuinely
-                    // empty — the wire protocol can't distinguish the
-                    // two) — don't claim completion. Once every sibling
-                    // has responded this way, release the dedup entry so
-                    // the periodic sweep retries with (possibly
-                    // different) peers later, rather than leaving the
-                    // channel stuck "in flight" forever.
-                    self.release_reconcile_trigger_if_no_siblings(pending.channel_id);
-                    return;
-                }
-
-                let env_count = response.envelopes.len();
-                let mut admitted = 0usize;
-                let mut newly_accepted = 0usize;
-                let mut cross_channel_dropped = 0usize;
-                // Security-audit follow-up on W9: see identity-sync's arm
-                // (earlier in this file) for the full rationale — refuse to
-                // verify ANY envelope in a page that exceeds this node's
-                // OWN configured max page size, treating it as unproductive
-                // rather than paying the verification cost. Config-driven
-                // (not a fixed constant like the other three protocols)
-                // since reconcile's page size is an operator knob.
-                let max_page_size = self.backfill_config.max_envelopes_per_response;
-                if env_count > max_page_size {
-                    warn!(
-                        peer = %peer,
-                        channel_id = pending.channel_id,
-                        received = env_count,
-                        expected_max = max_page_size,
-                        "reconcile: response exceeds this node's own max page size; refusing to verify, treating as unproductive"
-                    );
-                } else {
-                    for env_bytes in response.envelopes {
-                        // Security Audit W1 (0.47.0): cross-channel
-                        // smuggling defense. The responder could otherwise
-                        // stuff envelopes for channel B into a response
-                        // we sent for channel A; signatures verify (the
-                        // original authors really signed them) so the
-                        // router would happily index them under B in our
-                        // local CHANNEL_MSGS. Reject any envelope whose
-                        // payload-extracted channel_id does not equal the
-                        // channel we asked for. We can't fully validate
-                        // until after the router has deserialised the
-                        // payload, so we do a cheap pre-check on the
-                        // payload bytes here.
-                        if !envelope_targets_channel(
-                            &env_bytes,
-                            pending.channel_id,
-                        ) {
-                            cross_channel_dropped += 1;
-                            continue;
-                        }
-                        match self.router.process_synced_message(&env_bytes) {
-                            crate::messages::router::RouteResult::Accepted { .. } => {
-                                admitted += 1;
-                                newly_accepted += 1;
-                            }
-                            crate::messages::router::RouteResult::Duplicate => {
-                                // Already had this envelope locally — counted
-                                // toward `admitted` ("won the race" — no
-                                // storage write needed) but deliberately NOT
-                                // toward `newly_accepted`. Security-audit
-                                // finding (2026-09-30, round 2): the router's
-                                // duplicate check runs before signature
-                                // verification and is keyed globally by
-                                // msg_id, not per-channel — see
-                                // `ReconcilePending::total_accepted`'s doc
-                                // comment for the exploit this would
-                                // otherwise reopen. Matches this file's
-                                // `sync` protocol handler, which already
-                                // excludes `Duplicate` from its own progress
-                                // counter for the same reason.
-                                admitted += 1;
-                            }
-                            crate::messages::router::RouteResult::Rejected(reason)
-                            | crate::messages::router::RouteResult::Invalid(reason) => {
-                                warn!(
-                                    peer = %peer,
-                                    channel_id = pending.channel_id,
-                                    reason = %reason,
-                                    "reconcile: peer envelope rejected by router"
-                                );
-                            }
-                            crate::messages::router::RouteResult::PowRequired { .. } => {
-                                // Sync messages are PoW-exempt — should
-                                // not fire. Skip if it does.
-                            }
-                        }
-                    }
-                }
-                info!(
-                    peer = %peer,
-                    channel_id = pending.channel_id,
-                    received = env_count,
-                    admitted,
-                    newly_accepted,
-                    cross_channel_dropped,
-                    has_more = response.has_more,
-                    "reconcile: applied response batch"
-                );
-
-                // Race-winner semantics: cancel sibling outbound requests
-                // by dropping their pending entries, but ONLY once this
-                // response has contributed real, NEWLY-VERIFIED progress
-                // (`newly_accepted > 0` — strictly `RouteResult::Accepted`,
-                // never `Duplicate`/`Rejected`/`Invalid`/cross-channel-
-                // dropped envelopes).
-                //
-                // Security-audit findings (2026-09-30, two rounds):
-                // cancelling on the mere SHAPE of a response (non-empty
-                // envelopes, or has_more) let an attacker win the fanout
-                // race with an instant, free, all-garbage response —
-                // every honest sibling still in flight got silently
-                // dropped on arrival ("response for unknown request_id"
-                // above). Round 1 gated this on `admitted > 0` instead,
-                // but `admitted` also counts `Duplicate`, which round 2
-                // found is JUST as forgeable (see `ReconcilePending::
-                // total_accepted`'s doc comment) — so gating cancellation
-                // on it left the exact same pre-emption open. Only
-                // `newly_accepted` requires a real signature verification
-                // to reach.
-                if newly_accepted > 0 {
-                    self.pending_reconcile_requests.retain(|_, p| {
-                        !(p.channel_id == pending.channel_id && p.peer_id != peer)
-                    });
-                }
-
-                // Audit final pre-mainnet W9: requester-side paging budget.
-                // Uses `newly_accepted` (not `admitted`), for the same
-                // reason as the sibling-cancellation gate above — an
-                // attacker replaying forgeable `Duplicate`s on every page
-                // would otherwise reset this to 0 every time and never
-                // trip the unproductive-page backstop, stretching a
-                // pure-garbage session out to the much larger
-                // `MAX_PAGES_PER_SESSION` cap instead.
-                let pages_fetched = pending.pages_fetched + 1;
-                let consecutive_unproductive_pages = if newly_accepted > 0 {
-                    0
-                } else {
-                    pending.consecutive_unproductive_pages + 1
-                };
-                let total_accepted = pending.total_accepted + newly_accepted as u64;
-                if pages_fetched >= MAX_PAGES_PER_SESSION {
-                    warn!(peer = %peer, channel_id = pending.channel_id, pages_fetched, "reconcile: hit page-count backstop; stopping this session");
-                    // Give up on THIS chain, don't claim completion.
-                    // Sibling cancellation above is now gated on
-                    // `newly_accepted > 0`, so another peer's chain for this
-                    // same channel may still be alive — only release the
-                    // dedup entry once none remain, so a later periodic
-                    // sweep (or resubscribe) retries instead of being
-                    // stuck until process restart, but without piling a
-                    // redundant extra trigger on top of a still-pending
-                    // sibling.
-                    self.release_reconcile_trigger_if_no_siblings(pending.channel_id);
-                    return;
-                }
-                if consecutive_unproductive_pages >= MAX_CONSECUTIVE_UNPRODUCTIVE_PAGES {
-                    warn!(peer = %peer, channel_id = pending.channel_id, consecutive_unproductive_pages, "reconcile: peer made no progress for too many consecutive pages; stopping this session");
-                    self.release_reconcile_trigger_if_no_siblings(pending.channel_id);
-                    return;
-                }
-
-                // Continue paging from the winning peer if the
-                // responder signalled more data.
-                if response.has_more {
-                    if let Some(cursor) = response.next_cursor {
-                        let max_age_secs = if self.backfill_config.max_age_days == u64::MAX {
-                            u64::MAX
-                        } else {
-                            self.backfill_config
-                                .max_age_days
-                                .saturating_mul(24 * 3600)
-                        };
-                        let next_req = reconcile::ReconcileRequest {
-                            channel_id: pending.channel_id,
-                            max_age_secs,
-                            cursor: Some(cursor),
-                            fingerprint: Vec::new(),
-                            epoch_root_known: None,
-                            round: 0,
-                        };
-                        let next_id = self
-                            .swarm
-                            .behaviour_mut()
-                            .reconcile
-                            .send_request(&pending.peer_id, next_req);
-                        self.pending_reconcile_requests.insert(
-                            next_id,
-                            ReconcilePending {
-                                peer_id: pending.peer_id,
-                                channel_id: pending.channel_id,
-                                pages_fetched,
-                                consecutive_unproductive_pages,
-                                total_accepted,
-                            },
-                        );
-                    } else {
-                        // Code-audit finding (2026-09-30): a peer
-                        // signalling `has_more = true` with no cursor is
-                        // a wire-protocol violation (this node's own
-                        // `build_response` never emits that combination,
-                        // but the response is untrusted). Neither
-                        // "continue paging" nor "natural completion"
-                        // applies — give up on this chain the same way
-                        // the backstops above do, instead of silently
-                        // falling through and leaving the dedup entry
-                        // (and any still-alive siblings' fate) stuck.
-                        warn!(peer = %peer, channel_id = pending.channel_id, "reconcile: peer signalled has_more with no cursor; stopping this session");
-                        self.release_reconcile_trigger_if_no_siblings(pending.channel_id);
-                    }
-                } else if total_accepted > 0 {
-                    // Natural completion: this session got at least one
-                    // genuinely NEW, signature-verified envelope
-                    // (`RouteResult::Accepted` — never `Duplicate`, see
-                    // `ReconcilePending::total_accepted`'s doc comment for
-                    // why `Duplicate` is excluded, AND for the still-open
-                    // "single race-winning peer can fabricate this with
-                    // one self-signed throwaway message" residual — not
-                    // fully closed by this gate, only made time-bounded).
-                    // Still strictly better than the prior any-row proxy
-                    // this replaces (2026-09-30) — it requires a real
-                    // signature over genuinely new content, not "we
-                    // happen to have at least one local row" or "the
-                    // response merely wasn't shaped like the
-                    // empty-and-no-more case."
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    if let Err(e) = self
-                        .storage
-                        .mark_channel_backfill_complete(pending.channel_id, now)
-                    {
-                        warn!(channel_id = pending.channel_id, error = %e, "reconcile: failed to persist backfill completion");
-                    }
-                    self.release_reconcile_trigger_if_no_siblings(pending.channel_id);
-                } else {
-                    // Security-audit findings (2026-09-30, two rounds): a
-                    // response can be non-empty (so it skips the
-                    // empty+no-more early return above) yet contribute
-                    // ZERO genuinely new, verified envelopes — round 1's
-                    // example was a single garbage byte that fails to
-                    // deserialize; round 2's was a forged envelope
-                    // replaying a msg_id that already exists ANYWHERE on
-                    // this node (any channel), which reaches
-                    // `RouteResult::Duplicate` with no signature check at
-                    // all. Gating on `total_accepted` (strictly
-                    // `Accepted`) rather than `total_admitted` (which
-                    // included `Duplicate`) closes both — this is a
-                    // give-up, not a completion, either way. Note this
-                    // also correctly covers the legitimate steady-state
-                    // case where a peer confirms "you already have
-                    // everything" via all-`Duplicate` responses: that
-                    // does NOT refresh `mark_channel_backfill_complete`
-                    // either, so such a channel keeps getting
-                    // re-attempted every periodic-sweep tick rather than
-                    // going quiet — in exchange for never trusting an
-                    // unverifiable signal. Round-3 security audit: this
-                    // is a real, NOT fully quiescing steady-state cost —
-                    // v0.47.0 always "bulk-sends everything" (no
-                    // fingerprint diffing yet), so a fully-synced,
-                    // all-Duplicate channel still pages through and
-                    // deserializes real envelope batches on every
-                    // periodic-sweep retry (up to `MAX_CONSECUTIVE_
-                    // UNPRODUCTIVE_PAGES` x `max_envelopes_per_response`
-                    // per cycle), forever, for every such channel — not
-                    // merely a cheap point-read like the genuinely-empty-
-                    // channel case. Bounded per-tick/per-session, so not
-                    // DoS-class, but worth tracking as a real cost that
-                    // only goes away once spec-14 fingerprinting lands.
-                    warn!(peer = %peer, channel_id = pending.channel_id, "reconcile: session ended with has_more=false but zero newly-accepted envelopes; not marking complete");
-                    self.release_reconcile_trigger_if_no_siblings(pending.channel_id);
-                }
+                self.apply_reconcile_response(pending, peer, response, true);
             }
             Event::OutboundFailure {
                 peer,
@@ -4435,6 +4476,13 @@ impl NetworkService {
                         error = ?error,
                         "reconcile: outbound failed; siblings may still succeed"
                     );
+                    // l2-node 0.137.0: route into an open comparison
+                    // window exactly like the Response arm does — see
+                    // that arm's comment.
+                    if self.pending_reconcile_comparisons.contains_key(&pending.channel_id) {
+                        self.record_reconcile_comparison_failure(pending.channel_id, request_id);
+                        return;
+                    }
                     // Only give up once every sibling for this channel has
                     // failed — otherwise a still-pending sibling might
                     // yet complete it, and releasing the dedup entry here
@@ -4453,6 +4501,679 @@ impl NetworkService {
             Event::ResponseSent { .. } => {
                 // Successfully sent — nothing to do.
             }
+        }
+    }
+
+    /// Records one candidate's answer toward an open first-page
+    /// comparison (l2-node 0.137.0) instead of acting on it immediately.
+    /// Finalizes the comparison as soon as every dispatched request has
+    /// resolved one way or another; `reconcile_compare_interval` handles
+    /// the case where one candidate never resolves in time.
+    fn record_reconcile_comparison_response(
+        &mut self,
+        channel_id: u64,
+        request_id: libp2p::request_response::OutboundRequestId,
+        peer: PeerId,
+        response: reconcile::ReconcileResponse,
+    ) {
+        let Some(cmp) = self.pending_reconcile_comparisons.get_mut(&channel_id) else {
+            // Defensive: shouldn't happen, the caller just checked
+            // `contains_key`, but nothing here can race it (single-
+            // threaded event loop) — return rather than panic.
+            return;
+        };
+        // Code-audit finding (2026-09-30, round 1), defense-in-depth:
+        // only record a candidate for a request_id this comparison
+        // actually dispatched. Every current path already guarantees
+        // this (a channel's comparison can't be replaced while a prior
+        // one's requests are still unresolved — `reconcile_triggered`'s
+        // dedup guard depends on `pending_reconcile_requests` being
+        // fully drained first), but that invariant is cross-cutting and
+        // not locally enforced here — cheap to check directly rather
+        // than rely on it holding forever.
+        if !cmp.outstanding.remove(&request_id) {
+            debug!(
+                peer = %peer,
+                channel_id,
+                ?request_id,
+                "reconcile: response for a request_id this comparison never dispatched; ignoring"
+            );
+            return;
+        }
+        let informative =
+            !response.server_capped && !(response.envelopes.is_empty() && !response.has_more);
+        if informative {
+            cmp.candidates.push((peer, response));
+        } else {
+            debug!(
+                peer = %peer,
+                channel_id,
+                "reconcile: comparison candidate answered uninformatively"
+            );
+        }
+        if cmp.outstanding.is_empty() {
+            self.finalize_reconcile_comparison(channel_id);
+        }
+    }
+
+    /// `OutboundFailure` counterpart to `record_reconcile_comparison_response`
+    /// — a failed candidate just leaves `outstanding`, contributing
+    /// nothing to `candidates` (l2-node 0.137.0).
+    fn record_reconcile_comparison_failure(
+        &mut self,
+        channel_id: u64,
+        request_id: libp2p::request_response::OutboundRequestId,
+    ) {
+        let Some(cmp) = self.pending_reconcile_comparisons.get_mut(&channel_id) else {
+            return;
+        };
+        if !cmp.outstanding.remove(&request_id) {
+            return;
+        }
+        if cmp.outstanding.is_empty() {
+            self.finalize_reconcile_comparison(channel_id);
+        }
+    }
+
+    /// Called every `reconcile_compare_interval` tick (l2-node 0.137.0):
+    /// finalizes any open comparison whose `deadline` has passed, even if
+    /// not every candidate has answered — bounds one slow/dead
+    /// candidate's worst-case delay without waiting for the protocol's
+    /// full 45s request timeout. Collects expired keys first since
+    /// `finalize_reconcile_comparison` mutates the same map.
+    fn finalize_expired_reconcile_comparisons(&mut self) {
+        if self.pending_reconcile_comparisons.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let expired: Vec<u64> = self
+            .pending_reconcile_comparisons
+            .iter()
+            .filter(|(_, cmp)| now >= cmp.deadline)
+            .map(|(&channel_id, _)| channel_id)
+            .collect();
+        for channel_id in expired {
+            debug!(channel_id, "reconcile: comparison window deadline reached; finalizing with whoever has answered so far");
+            self.finalize_reconcile_comparison(channel_id);
+        }
+    }
+
+    /// Resolves an open comparison window (l2-node 0.137.0): tries
+    /// whichever candidates answered informatively, ranked by how much
+    /// content they reported — each one fully verified through the same
+    /// pipeline a direct (non-comparison) response would use — stopping
+    /// at the first one that yields genuine (`RouteResult::Accepted`)
+    /// progress.
+    ///
+    /// Trying candidates one at a time (rather than cancelling the
+    /// "losers" up front by raw count alone) matters: a candidate that
+    /// merely reported a bigger first page hasn't yet proven any of it
+    /// verifies. Committing to it immediately — and giving up on genuinely
+    /// better siblings — would just relocate the exact pre-emption bug
+    /// this design exists to close, from "answers fastest wins" to
+    /// "claims the biggest page wins."
+    ///
+    /// Round-1 security-audit finding (2026-09-30): the first version of
+    /// this function updated `peer_reconcile_health` from the RAW,
+    /// pre-verification reported counts before trying anyone — which let
+    /// a single peer padding a huge garbage/duplicate-heavy count (the
+    /// exact ghost-peer/attacker shape this whole feature exists to
+    /// guard against) become the "leading" reference and drag every
+    /// HONEST peer's staleness counter up, inverting the feature's own
+    /// purpose. Fixed by scoring strictly from VERIFIED trial outcomes
+    /// instead: a peer is only ever marked "behind" once it has actually
+    /// been tried and failed to deliver anything real (`NoProgress`)
+    /// AND a later trial in the SAME comparison proved real content
+    /// existed (found a winner). Candidates never tried at all (ranked
+    /// after the winner) get no update either way — there is no
+    /// verified basis to judge them, and trying them just to find out
+    /// would reintroduce the extra verification cost this design
+    /// otherwise avoids. A comparison where nobody wins updates nobody's
+    /// health at all — universal failure isn't evidence of any ONE
+    /// peer being relatively behind.
+    fn finalize_reconcile_comparison(&mut self, channel_id: u64) {
+        let Some(cmp) = self.pending_reconcile_comparisons.remove(&channel_id) else {
+            return;
+        };
+        // Code-audit finding (2026-09-30, round 2): purge any still-
+        // outstanding stragglers' `pending_reconcile_requests` entries
+        // NOW, unconditionally, regardless of how this comparison
+        // resolves below. This finalize can run via the deadline sweep
+        // (`finalize_expired_reconcile_comparisons`) specifically while
+        // `cmp.outstanding` is non-empty — every candidate that HAS
+        // already answered already had its own entry removed the
+        // moment its response/failure arrived (see the `Message::
+        // Response`/`OutboundFailure` arms), so anything still left in
+        // `pending_reconcile_requests` for this channel_id at this
+        // point belongs ONLY to a genuine straggler, never to a
+        // candidate this function is about to try. Purging only from
+        // the "no winner" tail (the original, incomplete fix) missed
+        // the other two exits below — when a straggler's real response
+        // later arrived at an unknown request_id, it fell through to
+        // the DIRECT single-peer path, could pass `newly_accepted > 0`
+        // for an unrelated reason, and its sibling-cancellation retain
+        // would then delete the ACTUAL winner's just-inserted
+        // continuation-page entry (inserted below, after this point) —
+        // silently orphaning that continuation forever and leaving
+        // `reconcile_triggered` stuck until process restart. Running
+        // the purge here, before the winner's own continuation entry
+        // can even be created, makes that ordering impossible.
+        self.pending_reconcile_requests
+            .retain(|_, p| p.channel_id != channel_id);
+        if cmp.candidates.is_empty() {
+            debug!(channel_id, "reconcile: comparison resolved with no informative candidates");
+            self.release_reconcile_trigger_if_no_siblings(channel_id);
+            return;
+        }
+        let order = rank_reconcile_candidates_by_size(&cmp.candidates);
+        info!(
+            channel_id,
+            candidates = cmp.candidates.len(),
+            "reconcile: comparison resolved; trying candidates in ranked order"
+        );
+        let mut slots: Vec<Option<(PeerId, reconcile::ReconcileResponse)>> =
+            cmp.candidates.into_iter().map(Some).collect();
+        // (peer, had_real_progress) for every candidate actually tried,
+        // in try order — fed to `split_reconcile_trial_results` once a
+        // winner is found (or exhausted with none).
+        let mut trials: Vec<(PeerId, bool)> = Vec::new();
+        for idx in order {
+            let (peer, response) = slots[idx].take().expect("each index visited exactly once");
+            let trial_pending = ReconcilePending {
+                peer_id: peer,
+                channel_id,
+                pages_fetched: 0,
+                consecutive_unproductive_pages: 0,
+                total_accepted: 0,
+            };
+            match self.apply_reconcile_response(trial_pending, peer, response, false) {
+                ReconcileApplyOutcome::Handled => {
+                    trials.push((peer, true));
+                    let (competitive, behind) = split_reconcile_trial_results(&trials);
+                    for p in competitive {
+                        self.record_reconcile_peer_result(p, true);
+                    }
+                    for p in behind {
+                        self.record_reconcile_peer_result(p, false);
+                    }
+                    return;
+                }
+                ReconcileApplyOutcome::NoProgress => {
+                    trials.push((peer, false));
+                    continue;
+                }
+            }
+        }
+        // Every informative candidate was tried and none yielded real
+        // progress — no winner to compare anyone against, so staleness
+        // tracking stays untouched this round (see the doc comment
+        // above). Give up on this trigger the same way the direct
+        // path's zero-progress branch does, just once for the whole
+        // comparison rather than once per candidate (see
+        // `ReconcileApplyOutcome::NoProgress`'s doc comment for why the
+        // trials themselves don't release this). Stragglers were
+        // already purged unconditionally above.
+        self.release_reconcile_trigger_if_no_siblings(channel_id);
+    }
+
+    /// Updates `peer_reconcile_health` for one comparison candidate based
+    /// on a VERIFIED trial outcome (l2-node 0.137.0 — see
+    /// `finalize_reconcile_comparison`'s doc comment for why this must
+    /// never be fed raw, pre-verification data).
+    fn record_reconcile_peer_result(&mut self, peer: PeerId, competitive: bool) {
+        let now = Instant::now();
+        let Some(health) = self.touch_peer_reconcile_health(peer, now) else {
+            // Sybil soft cap reached and this is a brand-new peer —
+            // skip tracking rather than growing the map unboundedly
+            // (security-audit finding, 2026-09-30, round 1).
+            return;
+        };
+        if competitive {
+            health.consecutive_losses = 0;
+        } else {
+            health.consecutive_losses = health.consecutive_losses.saturating_add(1);
+        }
+    }
+
+    /// Looks up (or inserts, subject to `PEER_RECONCILE_HEALTH_SOFT_CAP`)
+    /// a peer's `peer_reconcile_health` entry and stamps `last_touched`
+    /// (l2-node 0.137.0) — shared by `record_reconcile_peer_result` and
+    /// the reprobe bookkeeping in `maybe_trigger_backfill`. Returns
+    /// `None` only when this is a genuinely NEW peer and the map is
+    /// already at its Sybil-defense cap; an existing entry is always
+    /// touched and returned regardless of the cap (mirrors
+    /// `check_gossip_rate_limit`'s identical pattern).
+    fn touch_peer_reconcile_health(
+        &mut self,
+        peer: PeerId,
+        now: Instant,
+    ) -> Option<&mut PeerReconcileHealth> {
+        if !self.peer_reconcile_health.contains_key(&peer) {
+            if self.peer_reconcile_health.len() >= PEER_RECONCILE_HEALTH_SOFT_CAP {
+                return None;
+            }
+            self.peer_reconcile_health.insert(
+                peer,
+                PeerReconcileHealth {
+                    consecutive_losses: 0,
+                    last_probed_at: None,
+                    last_touched: now,
+                },
+            );
+        }
+        let entry = self
+            .peer_reconcile_health
+            .get_mut(&peer)
+            .expect("just inserted or already present");
+        entry.last_touched = now;
+        Some(entry)
+    }
+
+    /// Applies one peer's reconcile response — parse, route through the
+    /// router, decide continuation/completion/give-up. Shared by the
+    /// direct (non-comparison, continuation-page) response path and
+    /// `finalize_reconcile_comparison`'s ranked-trial loop, so there is
+    /// exactly one implementation of the admission/completion decision
+    /// (l2-node 0.137.0 — extracted from what used to be inline in the
+    /// `Message::Response` arm; logic otherwise unchanged from 0.136.0).
+    ///
+    /// `release_on_no_progress`: `true` for the direct path (there's only
+    /// ever one active candidate at a time there, so it's safe to decide
+    /// immediately). `false` for a comparison trial — releasing
+    /// `reconcile_triggered` after the FIRST failed trial would let a
+    /// concurrent re-trigger race the trials still to come; the caller
+    /// releases itself exactly once after every candidate has been tried.
+    fn apply_reconcile_response(
+        &mut self,
+        pending: ReconcilePending,
+        peer: PeerId,
+        response: reconcile::ReconcileResponse,
+        release_on_no_progress: bool,
+    ) -> ReconcileApplyOutcome {
+        if response.server_capped {
+            debug!(
+                peer = %peer,
+                channel_id = pending.channel_id,
+                "reconcile: peer responded server_capped; ignoring (race siblings may succeed)"
+            );
+            if release_on_no_progress {
+                self.release_reconcile_trigger_if_no_siblings(pending.channel_id);
+            }
+            return ReconcileApplyOutcome::NoProgress;
+        }
+        if response.envelopes.is_empty() && !response.has_more {
+            debug!(
+                peer = %peer,
+                channel_id = pending.channel_id,
+                "reconcile: peer responded empty + no more; ignoring"
+            );
+            // Uninformative response (this peer may simply know
+            // nothing about the channel, not that it's genuinely
+            // empty — the wire protocol can't distinguish the
+            // two) — don't claim completion. Once every sibling
+            // has responded this way, release the dedup entry so
+            // the periodic sweep retries with (possibly
+            // different) peers later, rather than leaving the
+            // channel stuck "in flight" forever.
+            if release_on_no_progress {
+                self.release_reconcile_trigger_if_no_siblings(pending.channel_id);
+            }
+            return ReconcileApplyOutcome::NoProgress;
+        }
+
+        let env_count = response.envelopes.len();
+        let mut admitted = 0usize;
+        let mut newly_accepted = 0usize;
+        let mut cross_channel_dropped = 0usize;
+        // Security-audit follow-up on W9: see identity-sync's arm
+        // (earlier in this file) for the full rationale — refuse to
+        // verify ANY envelope in a page that exceeds this node's
+        // OWN configured max page size, treating it as unproductive
+        // rather than paying the verification cost. Config-driven
+        // (not a fixed constant like the other three protocols)
+        // since reconcile's page size is an operator knob.
+        let max_page_size = self.backfill_config.max_envelopes_per_response;
+        if env_count > max_page_size {
+            warn!(
+                peer = %peer,
+                channel_id = pending.channel_id,
+                received = env_count,
+                expected_max = max_page_size,
+                "reconcile: response exceeds this node's own max page size; refusing to verify, treating as unproductive"
+            );
+        } else {
+            for env_bytes in response.envelopes {
+                // Security Audit W1 (0.47.0): cross-channel
+                // smuggling defense. The responder could otherwise
+                // stuff envelopes for channel B into a response
+                // we sent for channel A; signatures verify (the
+                // original authors really signed them) so the
+                // router would happily index them under B in our
+                // local CHANNEL_MSGS. Reject any envelope whose
+                // payload-extracted channel_id does not equal the
+                // channel we asked for. We can't fully validate
+                // until after the router has deserialised the
+                // payload, so we do a cheap pre-check on the
+                // payload bytes here.
+                if !envelope_targets_channel(
+                    &env_bytes,
+                    pending.channel_id,
+                ) {
+                    cross_channel_dropped += 1;
+                    continue;
+                }
+                match self.router.process_synced_message(&env_bytes) {
+                    crate::messages::router::RouteResult::Accepted { .. } => {
+                        admitted += 1;
+                        newly_accepted += 1;
+                    }
+                    crate::messages::router::RouteResult::Duplicate => {
+                        // Already had this envelope locally — counted
+                        // toward `admitted` ("won the race" — no
+                        // storage write needed) but deliberately NOT
+                        // toward `newly_accepted`. Security-audit
+                        // finding (2026-09-30, round 2): the router's
+                        // duplicate check runs before signature
+                        // verification and is keyed globally by
+                        // msg_id, not per-channel — see
+                        // `ReconcilePending::total_accepted`'s doc
+                        // comment for the exploit this would
+                        // otherwise reopen. Matches this file's
+                        // `sync` protocol handler, which already
+                        // excludes `Duplicate` from its own progress
+                        // counter for the same reason.
+                        admitted += 1;
+                    }
+                    crate::messages::router::RouteResult::Rejected(reason)
+                    | crate::messages::router::RouteResult::Invalid(reason) => {
+                        warn!(
+                            peer = %peer,
+                            channel_id = pending.channel_id,
+                            reason = %reason,
+                            "reconcile: peer envelope rejected by router"
+                        );
+                    }
+                    crate::messages::router::RouteResult::PowRequired { .. } => {
+                        // Sync messages are PoW-exempt — should
+                        // not fire. Skip if it does.
+                    }
+                }
+            }
+        }
+        info!(
+            peer = %peer,
+            channel_id = pending.channel_id,
+            received = env_count,
+            admitted,
+            newly_accepted,
+            cross_channel_dropped,
+            has_more = response.has_more,
+            "reconcile: applied response batch"
+        );
+
+        // Race-winner semantics: cancel sibling outbound requests
+        // by dropping their pending entries, but ONLY once this
+        // response has contributed real, NEWLY-VERIFIED progress
+        // (`newly_accepted > 0` — strictly `RouteResult::Accepted`,
+        // never `Duplicate`/`Rejected`/`Invalid`/cross-channel-
+        // dropped envelopes). l2-node 0.137.0: for a comparison
+        // trial there is nothing left to retain here — every
+        // sibling's `pending_reconcile_requests` entry was already
+        // removed the moment ITS OWN response/failure arrived, so
+        // this is a harmless no-op there; it still matters for the
+        // direct (continuation-page) path, where a genuine sibling
+        // race can still be in flight.
+        //
+        // Security-audit findings (2026-09-30, two rounds):
+        // cancelling on the mere SHAPE of a response (non-empty
+        // envelopes, or has_more) let an attacker win the fanout
+        // race with an instant, free, all-garbage response —
+        // every honest sibling still in flight got silently
+        // dropped on arrival ("response for unknown request_id"
+        // above). Round 1 gated this on `admitted > 0` instead,
+        // but `admitted` also counts `Duplicate`, which round 2
+        // found is JUST as forgeable (see `ReconcilePending::
+        // total_accepted`'s doc comment) — so gating cancellation
+        // on it left the exact same pre-emption open. Only
+        // `newly_accepted` requires a real signature verification
+        // to reach.
+        if newly_accepted > 0 {
+            self.pending_reconcile_requests.retain(|_, p| {
+                !(p.channel_id == pending.channel_id && p.peer_id != peer)
+            });
+        }
+
+        // Audit final pre-mainnet W9: requester-side paging budget.
+        // Uses `newly_accepted` (not `admitted`), for the same
+        // reason as the sibling-cancellation gate above — an
+        // attacker replaying forgeable `Duplicate`s on every page
+        // would otherwise reset this to 0 every time and never
+        // trip the unproductive-page backstop, stretching a
+        // pure-garbage session out to the much larger
+        // `MAX_PAGES_PER_SESSION` cap instead.
+        let pages_fetched = pending.pages_fetched + 1;
+        let consecutive_unproductive_pages = if newly_accepted > 0 {
+            0
+        } else {
+            pending.consecutive_unproductive_pages + 1
+        };
+        let total_accepted = pending.total_accepted + newly_accepted as u64;
+        if pages_fetched >= MAX_PAGES_PER_SESSION {
+            warn!(peer = %peer, channel_id = pending.channel_id, pages_fetched, "reconcile: hit page-count backstop; stopping this session");
+            // Give up on THIS chain, don't claim completion.
+            // Sibling cancellation above is now gated on
+            // `newly_accepted > 0`, so another peer's chain for this
+            // same channel may still be alive — only release the
+            // dedup entry once none remain, so a later periodic
+            // sweep (or resubscribe) retries instead of being
+            // stuck until process restart, but without piling a
+            // redundant extra trigger on top of a still-pending
+            // sibling.
+            if release_on_no_progress {
+                self.release_reconcile_trigger_if_no_siblings(pending.channel_id);
+            }
+            return ReconcileApplyOutcome::NoProgress;
+        }
+        if consecutive_unproductive_pages >= MAX_CONSECUTIVE_UNPRODUCTIVE_PAGES {
+            warn!(peer = %peer, channel_id = pending.channel_id, consecutive_unproductive_pages, "reconcile: peer made no progress for too many consecutive pages; stopping this session");
+            if release_on_no_progress {
+                self.release_reconcile_trigger_if_no_siblings(pending.channel_id);
+            }
+            return ReconcileApplyOutcome::NoProgress;
+        }
+
+        // Security-audit finding (2026-09-30, round 2, CRITICAL): in a
+        // comparison trial (`release_on_no_progress == false`, always a
+        // FIRST page — `finalize_reconcile_comparison` only ever
+        // constructs `pending` fresh with `pages_fetched: 0`), a
+        // candidate claiming `has_more = true` with ZERO verified
+        // progress on that very first page must NOT be treated as a
+        // win. The `Handled` outcome below (via the has_more branch)
+        // used to fire unconditionally on response SHAPE regardless of
+        // `newly_accepted`, letting a free-to-mint peer identity pad an
+        // oversized or all-`Duplicate` first page, claim `has_more =
+        // true`, and win the comparison outright — starving every
+        // genuinely-content-bearing sibling ranked below it of ever
+        // being tried at all, and resetting its OWN staleness counter
+        // to "competitive" for free. This is the exact "cheap response
+        // wins the race" bug the whole feature exists to close,
+        // reopened via the pagination-claim path instead of the raw-
+        // count path round 1 already closed. Rejecting it here as
+        // `NoProgress` (before ever dispatching a continuation request,
+        // so nothing is left dangling) lets the trial loop correctly
+        // move on to the next ranked candidate instead.
+        //
+        // This does NOT touch the DIRECT (non-comparison) continuation-
+        // page path's existing, already-audited tolerance for a
+        // single zero-`newly_accepted` page mid-session (bounded by
+        // `MAX_CONSECUTIVE_UNPRODUCTIVE_PAGES`) — that path always has
+        // `release_on_no_progress == true` and is unaffected.
+        //
+        // KNOWN LIMITATION (code-audit finding, 2026-09-30, round 3,
+        // reviewed and explicitly deferred rather than fixed here): this
+        // can reject a genuinely HONEST candidate, not just an
+        // adversarial one. `build_response` always pages ascending from
+        // the responder's oldest stored message (`reconcile.rs`'s own
+        // doc comment) and every fresh trigger restarts at `cursor:
+        // None` (never resumes a prior session's cursor). An
+        // intermittently-connected honest peer whose oldest history
+        // happens to already match ours (all-`Duplicate` on page 1) but
+        // who genuinely holds newer gap-filling content on page 2+ gets
+        // rejected here on page 1 and never gets a chance to deliver
+        // that later page — and since every periodic retry re-fetches
+        // the SAME oldest page again, this specific gap shape doesn't
+        // self-heal by retrying, unlike most of this feature's other
+        // accepted residuals. Not fixed in this pass: doing so (e.g.
+        // deferring rather than rejecting a has-more/zero-progress
+        // trial, and falling back to it only if every ranked candidate
+        // comes up empty) would reopen exactly the ordering/dangling-
+        // continuation hazards rounds 2-3 just spent closing, and this
+        // codebase's own audit history (`feedback_fixes_cause_
+        // regressions`) is proof that "reduce a real bug's severity,
+        // then immediately layer a fix for the residual on top" is
+        // precisely the pattern that tends to introduce the NEXT
+        // regression. Judged acceptable to defer: not a security, data-
+        // loss, or DoS-class finding (no category CLAUDE.md marks
+        // blocking), the channel still converges via any OTHER
+        // candidate whose own page 1 has real content (the common case
+        // this feature targets), and it degrades to the SAME "channel
+        // doesn't fully backfill via this one mechanism" residual class
+        // already accepted elsewhere in this exact file (e.g. private-
+        // channel history having no backfill path at all).
+        if !release_on_no_progress && response.has_more && newly_accepted == 0 {
+            debug_assert_eq!(
+                pending.pages_fetched, 0,
+                "this guard assumes a comparison trial is always a first page; a \
+                 release_on_no_progress=false call with pages_fetched != 0 would \
+                 silently bypass it"
+            );
+            warn!(
+                peer = %peer,
+                channel_id = pending.channel_id,
+                "reconcile: comparison trial claimed has_more with zero verified \
+                 progress on its first page; treating as no-progress, not a win"
+            );
+            return ReconcileApplyOutcome::NoProgress;
+        }
+
+        // Continue paging from the winning peer if the
+        // responder signalled more data.
+        if response.has_more {
+            if let Some(cursor) = response.next_cursor {
+                let max_age_secs = if self.backfill_config.max_age_days == u64::MAX {
+                    u64::MAX
+                } else {
+                    self.backfill_config
+                        .max_age_days
+                        .saturating_mul(24 * 3600)
+                };
+                let next_req = reconcile::ReconcileRequest {
+                    channel_id: pending.channel_id,
+                    max_age_secs,
+                    cursor: Some(cursor),
+                    fingerprint: Vec::new(),
+                    epoch_root_known: None,
+                    round: 0,
+                };
+                let next_id = self
+                    .swarm
+                    .behaviour_mut()
+                    .reconcile
+                    .send_request(&pending.peer_id, next_req);
+                self.pending_reconcile_requests.insert(
+                    next_id,
+                    ReconcilePending {
+                        peer_id: pending.peer_id,
+                        channel_id: pending.channel_id,
+                        pages_fetched,
+                        consecutive_unproductive_pages,
+                        total_accepted,
+                    },
+                );
+                ReconcileApplyOutcome::Handled
+            } else {
+                // Code-audit finding (2026-09-30): a peer
+                // signalling `has_more = true` with no cursor is
+                // a wire-protocol violation (this node's own
+                // `build_response` never emits that combination,
+                // but the response is untrusted). Neither
+                // "continue paging" nor "natural completion"
+                // applies — give up on this chain the same way
+                // the backstops above do, instead of silently
+                // falling through and leaving the dedup entry
+                // (and any still-alive siblings' fate) stuck.
+                warn!(peer = %peer, channel_id = pending.channel_id, "reconcile: peer signalled has_more with no cursor; stopping this session");
+                if release_on_no_progress {
+                    self.release_reconcile_trigger_if_no_siblings(pending.channel_id);
+                }
+                ReconcileApplyOutcome::NoProgress
+            }
+        } else if total_accepted > 0 {
+            // Natural completion: this session got at least one
+            // genuinely NEW, signature-verified envelope
+            // (`RouteResult::Accepted` — never `Duplicate`, see
+            // `ReconcilePending::total_accepted`'s doc comment for
+            // why `Duplicate` is excluded, AND for the still-open
+            // "single race-winning peer can fabricate this with
+            // one self-signed throwaway message" residual — not
+            // fully closed by this gate, only made time-bounded).
+            // Still strictly better than the prior any-row proxy
+            // this replaces (2026-09-30) — it requires a real
+            // signature over genuinely new content, not "we
+            // happen to have at least one local row" or "the
+            // response merely wasn't shaped like the
+            // empty-and-no-more case."
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            if let Err(e) = self
+                .storage
+                .mark_channel_backfill_complete(pending.channel_id, now)
+            {
+                warn!(channel_id = pending.channel_id, error = %e, "reconcile: failed to persist backfill completion");
+            }
+            self.release_reconcile_trigger_if_no_siblings(pending.channel_id);
+            ReconcileApplyOutcome::Handled
+        } else {
+            // Security-audit findings (2026-09-30, two rounds): a
+            // response can be non-empty (so it skips the
+            // empty+no-more early return above) yet contribute
+            // ZERO genuinely new, verified envelopes — round 1's
+            // example was a single garbage byte that fails to
+            // deserialize; round 2's was a forged envelope
+            // replaying a msg_id that already exists ANYWHERE on
+            // this node (any channel), which reaches
+            // `RouteResult::Duplicate` with no signature check at
+            // all. Gating on `total_accepted` (strictly
+            // `Accepted`) rather than `total_admitted` (which
+            // included `Duplicate`) closes both — this is a
+            // give-up, not a completion, either way. Note this
+            // also correctly covers the legitimate steady-state
+            // case where a peer confirms "you already have
+            // everything" via all-`Duplicate` responses: that
+            // does NOT refresh `mark_channel_backfill_complete`
+            // either, so such a channel keeps getting
+            // re-attempted every periodic-sweep tick rather than
+            // going quiet — in exchange for never trusting an
+            // unverifiable signal. Round-3 security audit: this
+            // is a real, NOT fully quiescing steady-state cost —
+            // v0.47.0 always "bulk-sends everything" (no
+            // fingerprint diffing yet), so a fully-synced,
+            // all-Duplicate channel still pages through and
+            // deserializes real envelope batches on every
+            // periodic-sweep retry (up to `MAX_CONSECUTIVE_
+            // UNPRODUCTIVE_PAGES` x `max_envelopes_per_response`
+            // per cycle), forever, for every such channel — not
+            // merely a cheap point-read like the genuinely-empty-
+            // channel case. Bounded per-tick/per-session, so not
+            // DoS-class, but worth tracking as a real cost that
+            // only goes away once spec-14 fingerprinting lands.
+            warn!(peer = %peer, channel_id = pending.channel_id, "reconcile: session ended with has_more=false but zero newly-accepted envelopes; not marking complete");
+            if release_on_no_progress {
+                self.release_reconcile_trigger_if_no_siblings(pending.channel_id);
+            }
+            ReconcileApplyOutcome::NoProgress
         }
     }
 
@@ -5353,6 +6074,11 @@ impl NetworkService {
         // value-only (`score != 0`) prune left an exploitable gap.
         self.gossip_app_score
             .retain(|_, e| now.duration_since(e.last_touched) < GOSSIP_APP_SCORE_MAX_IDLE);
+        // l2-node 0.137.0, same Sybil-unbounded-growth shape closed
+        // above, applied to the newer reconcile-staleness map (security-
+        // audit finding, 2026-09-30, round 1).
+        self.peer_reconcile_health
+            .retain(|_, h| now.duration_since(h.last_touched) < PEER_RECONCILE_HEALTH_MAX_IDLE);
     }
 
     /// Update a peer's tracked P5 app-score by `delta` (clamped to
@@ -5893,5 +6619,130 @@ mod channel_backfill_due_tests {
     fn completion_timestamp_in_the_future_does_not_underflow() {
         let now = 1_000u64;
         assert!(!channel_backfill_due(Some(now + 1_000_000), now, 6));
+    }
+}
+
+#[cfg(test)]
+mod reconcile_comparison_tests {
+    //! Peer-completeness comparison + staleness tracking (l2-node
+    //! 0.137.0) — pure decision logic factored out of
+    //! `NetworkService::finalize_reconcile_comparison`/
+    //! `maybe_trigger_backfill`. See `channel_backfill_due_tests`'s doc
+    //! note for why the `&mut self` methods themselves aren't tested
+    //! directly here.
+    use super::*;
+
+    fn fake_peer() -> PeerId {
+        let kp = libp2p::identity::Keypair::generate_ed25519();
+        kp.public().to_peer_id()
+    }
+
+    fn response_with_envelope_count(n: usize) -> reconcile::ReconcileResponse {
+        reconcile::ReconcileResponse {
+            channel_id: 1,
+            envelopes: (0..n).map(|_| Vec::new()).collect(),
+            has_more: false,
+            next_cursor: None,
+            server_capped: false,
+            epoch_root: None,
+        }
+    }
+
+    #[test]
+    fn rank_empty_candidates_returns_empty_order() {
+        let candidates: Vec<(PeerId, reconcile::ReconcileResponse)> = Vec::new();
+        assert_eq!(rank_reconcile_candidates_by_size(&candidates), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn rank_single_candidate_is_trivially_first() {
+        let candidates = vec![(fake_peer(), response_with_envelope_count(5))];
+        assert_eq!(rank_reconcile_candidates_by_size(&candidates), vec![0]);
+    }
+
+    #[test]
+    fn rank_orders_by_envelope_count_descending() {
+        let candidates = vec![
+            (fake_peer(), response_with_envelope_count(3)),
+            (fake_peer(), response_with_envelope_count(107)),
+            (fake_peer(), response_with_envelope_count(50)),
+        ];
+        assert_eq!(rank_reconcile_candidates_by_size(&candidates), vec![1, 2, 0]);
+    }
+
+    /// Stable sort: ties keep first-seen order, so the outcome is
+    /// deterministic rather than depending on hash/shuffle order.
+    #[test]
+    fn rank_ties_keep_first_seen_order() {
+        let candidates = vec![
+            (fake_peer(), response_with_envelope_count(10)),
+            (fake_peer(), response_with_envelope_count(10)),
+        ];
+        assert_eq!(rank_reconcile_candidates_by_size(&candidates), vec![0, 1]);
+    }
+
+    /// Security-audit finding (2026-09-30, round 1): staleness scoring
+    /// must be driven by VERIFIED trial outcomes, never raw pre-
+    /// verification reported counts — a peer padding a huge garbage
+    /// count must gain nothing by out-*reporting* an honest peer, only
+    /// by out-*delivering* one. `split_reconcile_trial_results` is the
+    /// pure core of that: a peer only ever lands in `behind` once it
+    /// was actually tried (verified) and failed, and only when a LATER
+    /// trial in the same list proved real content existed.
+    #[test]
+    fn split_no_trials_is_empty() {
+        let (competitive, behind) = split_reconcile_trial_results(&[]);
+        assert!(competitive.is_empty());
+        assert!(behind.is_empty());
+    }
+
+    #[test]
+    fn split_single_winner_has_no_losers() {
+        let winner = fake_peer();
+        let (competitive, behind) = split_reconcile_trial_results(&[(winner, true)]);
+        assert_eq!(competitive, vec![winner]);
+        assert!(behind.is_empty());
+    }
+
+    #[test]
+    fn split_failed_candidates_before_a_winner_are_behind() {
+        let loser1 = fake_peer();
+        let loser2 = fake_peer();
+        let winner = fake_peer();
+        let (competitive, behind) = split_reconcile_trial_results(&[
+            (loser1, false),
+            (loser2, false),
+            (winner, true),
+        ]);
+        assert_eq!(competitive, vec![winner]);
+        assert_eq!(behind, vec![loser1, loser2]);
+    }
+
+    /// When every TRIED candidate failed (no winner found at all), the
+    /// caller (`finalize_reconcile_comparison`) must not even reach
+    /// this — there's no verified evidence anyone was relatively
+    /// behind. This test just documents the raw split's own behavior in
+    /// that shape (everyone lands in `behind`) so it's clear the
+    /// "don't touch health when nobody wins" decision is the CALLER's
+    /// responsibility, not something this pure function enforces.
+    #[test]
+    fn split_with_no_winner_puts_everyone_in_behind() {
+        let a = fake_peer();
+        let b = fake_peer();
+        let (competitive, behind) = split_reconcile_trial_results(&[(a, false), (b, false)]);
+        assert!(competitive.is_empty());
+        assert_eq!(behind, vec![a, b]);
+    }
+
+    #[test]
+    fn stale_threshold_crossing() {
+        assert!(!is_peer_stale(2, 3), "below threshold must not be stale");
+        assert!(is_peer_stale(3, 3), "at threshold must be stale");
+        assert!(is_peer_stale(10, 3), "well past threshold must be stale");
+    }
+
+    #[test]
+    fn zero_threshold_disables_staleness_tracking() {
+        assert!(!is_peer_stale(1_000_000, 0));
     }
 }

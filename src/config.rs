@@ -611,6 +611,22 @@ pub struct BackfillConfig {
     /// no mechanism that could ever close the gap.
     #[serde(default = "default_backfill_news_catchup_interval_hours")]
     pub news_catchup_interval_hours: u64,
+    /// Consecutive first-page reconcile comparisons (l2-node 0.137.0)
+    /// where a peer's reported count was meaningfully behind the
+    /// leading candidate before it's flagged "stale" and deprioritized
+    /// (never excluded) in future fanout candidate selection. Default 3.
+    /// `0` disables staleness tracking entirely (every peer always
+    /// treated as equally healthy). A flagged peer sheds the flag the
+    /// moment it's competitive again — see `is_reconcile_count_competitive`.
+    #[serde(default = "default_backfill_stale_peer_threshold")]
+    pub stale_peer_threshold: u32,
+    /// How often, in hours, a currently-stale peer gets one extra,
+    /// above-`fanout` probe chance to requalify (default 24 — roughly
+    /// once a day). Without this, a stale peer surrounded by plenty of
+    /// healthy siblings could be deprioritized forever even after it
+    /// genuinely recovers, since it would never get re-contacted at all.
+    #[serde(default = "default_backfill_stale_peer_reprobe_hours")]
+    pub stale_peer_reprobe_hours: u64,
 }
 
 impl Default for BackfillConfig {
@@ -629,6 +645,8 @@ impl Default for BackfillConfig {
             max_envelopes_per_response:
                 default_backfill_max_envelopes_per_response(),
             total_envelopes_cap: default_backfill_total_envelopes_cap(),
+            stale_peer_threshold: default_backfill_stale_peer_threshold(),
+            stale_peer_reprobe_hours: default_backfill_stale_peer_reprobe_hours(),
             news_max_age_days: default_backfill_news_max_age_days(),
             news_catchup_interval_hours:
                 default_backfill_news_catchup_interval_hours(),
@@ -665,6 +683,12 @@ fn default_backfill_channel_catchup_interval_hours() -> u64 {
 }
 fn default_backfill_catchup_batch_size() -> usize {
     25
+}
+fn default_backfill_stale_peer_threshold() -> u32 {
+    3
+}
+fn default_backfill_stale_peer_reprobe_hours() -> u64 {
+    24
 }
 
 /// Direct-message offline store-and-forward policy (spec 3
@@ -3668,6 +3692,15 @@ channel_catchup_interval_hours = 6
 # Bounds the sweep's cost to a fixed batch regardless of total
 # channel count.
 catchup_batch_size = 25
+# Consecutive reconcile comparisons a peer has to lose (report
+# meaningfully less than the leading candidate) before it's flagged
+# stale and deprioritized in future fanouts. 0 disables staleness
+# tracking. Never permanently excludes a peer.
+stale_peer_threshold = 3
+# How often (hours) a stale peer gets one extra probe chance to
+# requalify. 0 disables re-probing (a stale peer stays deprioritized
+# until it happens to win a comparison some other way).
+stale_peer_reprobe_hours = 24
 
 [api]
 # Set to "0.0.0.0" to accept connections from all interfaces

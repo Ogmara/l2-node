@@ -190,6 +190,15 @@ channel_catchup_interval_hours = 6
 # Bounds the sweep's cost to a fixed batch regardless of total
 # channel count.
 catchup_batch_size = 25
+# Consecutive reconcile comparisons a peer has to lose (report
+# meaningfully less than the leading candidate) before it's flagged
+# stale and deprioritized in future fanouts. 0 disables staleness
+# tracking. Never permanently excludes a peer.
+stale_peer_threshold = 3
+# How often (hours) a stale peer gets one extra probe chance to
+# requalify. 0 disables re-probing (a stale peer stays deprioritized
+# until it happens to win a comparison some other way).
+stale_peer_reprobe_hours = 24
 
 [api]
 # Set to "0.0.0.0" to accept connections from all interfaces
