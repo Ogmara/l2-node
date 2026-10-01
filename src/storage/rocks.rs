@@ -2878,12 +2878,24 @@ impl Storage {
 
     /// One-time backfill of `CHANNEL_META_MSGS` from existing `MESSAGES`
     /// (P-3b channel-metadata). Streams every envelope and indexes channel
-    /// metadata/membership types (ChannelCreate/Update/Join/Leave) by
-    /// channel_id, so the channel-history reconcile can serve a channel's L2
-    /// metadata. Idempotent — guarded by `CHANNEL_META_INDEXED`.
+    /// metadata/membership/moderation types by channel_id, so the
+    /// channel-history reconcile can serve a channel's L2 metadata.
+    /// Idempotent — guarded by `CHANNEL_META_INDEXED_V2`.
+    ///
+    /// Security-audit finding (2026-10-01, round 3): the original version of
+    /// this backfill was guarded by `CHANNEL_META_INDEXED` — already set on
+    /// every node that had booted ANY prior version, making a fix here
+    /// permanently unreachable without a new sentinel. Re-run under a new
+    /// sentinel (`_V2`) so already-stored array-encoded (sdk-rust)
+    /// `ChannelCreate`/`ChannelUpdate` envelopes actually get indexed on
+    /// upgrade, not just newly-ingested ones (which `update_indexes`,
+    /// `router.rs`, already covers going forward). Also widened the covered
+    /// type set from 4 (Create/Update/Join/Leave) to the same 8 types
+    /// `update_indexes` indexes live (adds Delete/Kick/Ban/Unban) — those
+    /// were never backfilled at all, by any version, before this.
     pub fn backfill_channel_meta(&self) -> Result<()> {
         use crate::messages::envelope::Envelope;
-        use crate::messages::types::MessageType;
+        use crate::messages::types::{deserialize_payload, DeserializedPayload, MessageType};
         use tracing::info;
 
         let cf = self
@@ -2903,15 +2915,36 @@ impl Storage {
                             | MessageType::ChannelUpdate
                             | MessageType::ChannelJoin
                             | MessageType::ChannelLeave
+                            | MessageType::ChannelDelete
+                            | MessageType::ChannelKick
+                            | MessageType::ChannelBan
+                            | MessageType::ChannelUnban
                     ) {
-                        if let Ok(p) =
-                            rmp_serde::from_slice::<serde_json::Value>(&envelope.payload)
+                        // `deserialize_payload` decodes through each type's
+                        // REAL, complete struct, which by construction has
+                        // the right field count for both the map and
+                        // positional-array (sdk-rust) wire forms — unlike
+                        // a hand-rolled narrower probe, which `rmp_serde`
+                        // rejects with `LengthMismatch` against an array
+                        // whose length doesn't match the probe's own field
+                        // count.
+                        if let Ok(payload) =
+                            deserialize_payload(envelope.msg_type, &envelope.payload)
                         {
-                            if let Some(cid) =
-                                p.get("channel_id").and_then(|v| v.as_u64())
-                            {
+                            let channel_id = match payload {
+                                DeserializedPayload::ChannelCreate(p) => Some(p.channel_id),
+                                DeserializedPayload::ChannelUpdate(p) => Some(p.channel_id),
+                                DeserializedPayload::ChannelJoin(p) => Some(p.channel_id),
+                                DeserializedPayload::ChannelLeave(p) => Some(p.channel_id),
+                                DeserializedPayload::ChannelDelete(p) => Some(p.channel_id),
+                                DeserializedPayload::ChannelKick(p) => Some(p.channel_id),
+                                DeserializedPayload::ChannelBan(p) => Some(p.channel_id),
+                                DeserializedPayload::ChannelUnban(p) => Some(p.channel_id),
+                                _ => None,
+                            };
+                            if let Some(channel_id) = channel_id {
                                 let key = super::schema::encode_channel_meta_key(
-                                    cid,
+                                    channel_id,
                                     envelope.msg_type_u8(),
                                     envelope.timestamp,
                                     &envelope.msg_id,
@@ -2927,11 +2960,11 @@ impl Storage {
         }
 
         if indexed > 0 {
-            info!(indexed, "Backfilled CHANNEL_META_MSGS from MESSAGES");
+            info!(indexed, "Backfilled CHANNEL_META_MSGS from MESSAGES (v2)");
         }
         self.put_cf(
             cf::NODE_STATE,
-            super::schema::state_keys::CHANNEL_META_INDEXED,
+            super::schema::state_keys::CHANNEL_META_INDEXED_V2,
             &1u64.to_be_bytes(),
         )?;
         Ok(())

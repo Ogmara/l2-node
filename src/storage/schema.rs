@@ -475,9 +475,18 @@ pub mod state_keys {
     /// Sentinel: set to 1 after IDENTITY_ENVELOPES is backfilled from existing
     /// MESSAGES (P-1 identity-sync index, l2-node 0.50.0+).
     pub const IDENTITY_ENVELOPES_INDEXED: &[u8] = b"migration_identity_envelopes_indexed";
-    /// Sentinel: set to 1 after CHANNEL_META_MSGS is backfilled from existing
-    /// MESSAGES (P-3b channel-metadata index, l2-node 0.53.0+).
-    pub const CHANNEL_META_INDEXED: &[u8] = b"migration_channel_meta_indexed";
+    /// Sentinel: set to 1 after the `CHANNEL_META_MSGS` backfill runs
+    /// (P-3b channel-metadata index, l2-node 0.53.0+; reworked and renamed
+    /// `_V2` in 0.137.1 — the original key is already set on every node
+    /// that had booted any prior version, which would have made a fix to
+    /// the backfill itself permanently unreachable: array-encoded
+    /// (sdk-rust) `ChannelCreate`/`ChannelUpdate` envelopes already on disk
+    /// would never get indexed, and the newly-covered `ChannelDelete`/
+    /// `Kick`/`Ban`/`Unban` types — matching `update_indexes`'s live set —
+    /// would never be backfilled at all, on any version. The unversioned
+    /// key is removed rather than kept as dead code; this history is the
+    /// record of why `_V2` exists).
+    pub const CHANNEL_META_INDEXED_V2: &[u8] = b"migration_channel_meta_indexed_v2";
     /// Sentinel: set to 1 after CHANNEL_EDIT_DELETE_MSGS/DM_EDIT_DELETE_MSGS/
     /// NEWS_EDIT_DELETE are backfilled from existing MESSAGES (audit final
     /// pre-mainnet W6, l2-node 0.95.0+).

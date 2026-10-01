@@ -5,6 +5,69 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.137.1] - 2026-10-01
+
+### Fixed
+
+- **Real chat content was silently dropped project-wide during reconcile
+  backfill**, hidden behind 0.136.0/0.137.0's "successful" completion
+  signal. Root cause: `envelope_targets_channel`'s cross-channel-smuggling
+  pre-check deserialized payloads into `serde_json::Value` to read just
+  `channel_id` — JSON has no binary type, so this hard-errored (and the
+  envelope was dropped) the instant a payload contained a MessagePack
+  binary field, which every ENCRYPTED `ChatMessage` has
+  (`enc_content`/`enc_nonce`) and every channel in this project is
+  encrypted by default. Confirmed live against real wire bytes (a 62-
+  message real channel entirely missing after a reconcile session that
+  reported itself complete) before fixing.
+- The first fix (a narrower `{ channel_id: u64 }` probe struct) traded
+  that bug for a related one: `rmp_serde` requires a msgpack ARRAY's
+  element count to equal the target struct's field count, so a 1-field
+  probe against `sdk-rust`'s positional-array wire form (11 fields for
+  `ChatMessagePayload`, 9 for `ChannelCreatePayload`, etc.) fails
+  `LengthMismatch` rather than reading the first field — meaning
+  array-encoded envelopes from `sdk-rust` clients were STILL silently
+  dropped. Fixed for real this time by decoding through
+  `deserialize_payload`, the project's one canonical decode function,
+  which uses each type's complete real struct (so field count always
+  matches both wire forms) rather than a narrower stand-in.
+- The identical `serde_json::Value` pattern existed at the LIVE
+  ingest-time index writer too (`MessageRouter::update_indexes`'s P-3b
+  block) — the actual index a backfilling peer is served from. An
+  array-encoded `ChannelCreate`/`ChannelUpdate` (or any of the other 6
+  indexed types) was simply never indexed into `CHANNEL_META_MSGS` at
+  all, so even a correct requester-side fix couldn't help if the
+  responder never had the row. Fixed identically.
+- `Storage::backfill_channel_meta` (the one-time migration doing the same
+  decode) was fixed identically — but discovered to be permanently
+  unreachable on every node that had ever booted a prior version, since
+  it was guarded by a sentinel already set. Introduced a new sentinel
+  (`CHANNEL_META_INDEXED_V2`, replacing the unversioned original, which
+  is removed rather than kept as dead code) so the repaired backfill
+  actually runs once more on upgrade. Also widened its covered type set
+  from 4 (Create/Update/Join/Leave) to the same 8 `update_indexes`
+  covers live (adds Delete/Kick/Ban/Unban) — those were never backfilled
+  at all, by any prior version.
+- `ChatEdit`/`ChatDelete`/`ChatReaction`'s cross-channel check was
+  rejecting on a mismatched `channel_id` — but that field is
+  author-controlled and the router (`resolve_chat_channel_id`)
+  deliberately never trusts it, instead re-deriving the real channel via
+  the edited/deleted message's `target_id`. Rejecting on it actively
+  dropped genuine edits/deletes during backfill, reopening the W6
+  "deleted content resurfaces on a backfilling node" class one layer up.
+  Now defers unconditionally to the router for these three types.
+- `ChannelKick`/`ChannelBan`/`ChannelUnban` ride the same metadata-
+  reconcile page as `ChannelCreate`/`Update`/`Delete` but weren't bound
+  by the per-channel smuggling check, defeating its scoping purpose for
+  these three types. Now bound identically.
+
+### Security
+
+- **Three further audit rounds (Code + Security in parallel) chasing this
+  fix** — each of the first two rounds found a real, confirmed bug in the
+  round before it (see Fixed above); the third round came back with only
+  cosmetic findings (stale comments, a redundant test fixture).
+
 ## [0.137.0] - 2026-09-30
 
 ### Added

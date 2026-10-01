@@ -977,8 +977,13 @@ pub struct DmSubscribeEvent {
 /// on a false-positive (we accept an envelope whose payload doesn't
 /// even have a `channel_id` field) is that the envelope goes through
 /// the standard router and is rejected by payload-specific
-/// validation. The cheap pre-check just keeps the obvious smuggle
-/// out of the router pipeline.
+/// validation. This decodes the FULL typed payload via
+/// `deserialize_payload` — not a narrower probe struct, which is what
+/// caused two earlier rounds of this exact bug (a probe with fewer
+/// fields than the real payload fails outright against the
+/// positional msgpack-array wire form `sdk-rust` uses) — so despite
+/// the "pre-check" framing, this keeps the obvious smuggle out of the
+/// router pipeline using the same decode logic the router itself uses.
 /// Pure completeness-gate check for `NetworkService::maybe_trigger_backfill`
 /// (l2-node 0.136.0 fix). `None` (never reached natural completion) is
 /// always due, regardless of `catchup_interval_hours` — that knob only
@@ -1038,16 +1043,42 @@ fn is_peer_stale(consecutive_losses: u32, threshold: u32) -> bool {
 
 fn envelope_targets_channel(env_bytes: &[u8], expected_channel: u64) -> bool {
     use crate::messages::envelope::Envelope;
-    use crate::messages::types::MessageType;
+    use crate::messages::types::{deserialize_payload, DeserializedPayload, MessageType};
     let envelope: Envelope = match rmp_serde::from_slice(env_bytes) {
         Ok(e) => e,
         Err(_) => return false,
     };
+    // Code-audit finding (2026-10-01, round 3): both prior fixes here
+    // deserialized into a hand-rolled, FEWER-FIELDS-THAN-the-real-struct
+    // probe (`ChannelIdOnlyPayload { channel_id: u64 }`, then
+    // `ChannelIdOptionalPayload { target_id, channel_id }`) to read just
+    // the field this check needs. That sidesteps the original
+    // `serde_json::Value`-vs-binary-field crash, but reintroduces a
+    // narrower version of the SAME class of bug: `rmp_serde` decodes a
+    // msgpack ARRAY (the wire form `sdk-rust` uses, per
+    // `validation.rs`'s documented dual-decode requirement) by matching
+    // the array's element COUNT against the target struct's field
+    // count — a probe struct with fewer fields than the real payload
+    // (every multi-field type here) fails with `LengthMismatch`, not a
+    // partial positional read of the first N elements. Confirmed
+    // empirically against real `ChatMessagePayload`/`EditPayload` wire
+    // bytes. Net effect: array-encoded envelopes for every type in the
+    // first arm below (all of which have 2+ fields, i.e. all but
+    // `ChannelJoin`/`ChannelLeave`/`ChannelDelete`) were STILL silently
+    // dropped during reconcile backfill — the exact bug this session
+    // set out to fix, just not fully closed by the first attempt.
+    //
+    // Fix: decode through `deserialize_payload`, the one function in
+    // this codebase that already decodes every payload type via its
+    // REAL, complete struct — which by construction has exactly the
+    // right field count for both the map and array wire forms, so
+    // `rmp_serde` dispatches to the correct `visit_map`/`visit_seq` path
+    // transparently. This is also the canonical decode path every other
+    // ingestion route (gossip, `POST /api/v1/messages`, identity-sync)
+    // already funnels through, so this is a full typed decode, not a
+    // narrower probe — the exact shortcut that caused rounds 1 and 2.
     match envelope.msg_type {
         MessageType::ChatMessage
-        | MessageType::ChatEdit
-        | MessageType::ChatDelete
-        | MessageType::ChatReaction
         | MessageType::ChannelPinMessage
         | MessageType::ChannelUnpinMessage
         | MessageType::ChannelJoin
@@ -1059,22 +1090,408 @@ fn envelope_targets_channel(env_bytes: &[u8], expected_channel: u64) -> bool {
         | MessageType::ChannelUpdate
         // ChannelDelete also rides the metadata-reconcile page; bind it to the
         // reconciled channel so a relay can't smuggle a delete for another channel.
-        | MessageType::ChannelDelete => {
-            let payload: serde_json::Value =
-                match rmp_serde::from_slice(&envelope.payload) {
-                    Ok(v) => v,
-                    Err(_) => return false,
-                };
-            payload
-                .get("channel_id")
-                .and_then(|v| v.as_u64())
-                .map(|cid| cid == expected_channel)
-                .unwrap_or(false)
+        | MessageType::ChannelDelete
+        // Code-audit finding (2026-10-01, round 3): Kick/Ban/Unban are
+        // indexed into CHANNEL_META_MSGS by `update_indexes` (router.rs)
+        // exactly like Create/Update/Delete above, and `channel_meta_envelopes`
+        // serves them on the same reconcile page — so they need the same
+        // binding, for the same reason. Previously fell through to the
+        // unconditional `_ => true` below, which isn't a forgery risk (the
+        // router re-authorizes moderator permission from the payload's own
+        // channel_id regardless of which reconcile page it arrived on), but
+        // did defeat this function's whole per-channel-scoping purpose for
+        // these three types.
+        | MessageType::ChannelKick
+        | MessageType::ChannelBan
+        | MessageType::ChannelUnban => {
+            match deserialize_payload(envelope.msg_type, &envelope.payload) {
+                Ok(DeserializedPayload::ChatMessage(p)) => p.channel_id == expected_channel,
+                Ok(DeserializedPayload::ChannelPinMessage(p)) => p.channel_id == expected_channel,
+                Ok(DeserializedPayload::ChannelUnpinMessage(p)) => p.channel_id == expected_channel,
+                Ok(DeserializedPayload::ChannelJoin(p)) => p.channel_id == expected_channel,
+                Ok(DeserializedPayload::ChannelLeave(p)) => p.channel_id == expected_channel,
+                Ok(DeserializedPayload::ChannelCreate(p)) => p.channel_id == expected_channel,
+                Ok(DeserializedPayload::ChannelUpdate(p)) => p.channel_id == expected_channel,
+                Ok(DeserializedPayload::ChannelDelete(p)) => p.channel_id == expected_channel,
+                Ok(DeserializedPayload::ChannelKick(p)) => p.channel_id == expected_channel,
+                Ok(DeserializedPayload::ChannelBan(p)) => p.channel_id == expected_channel,
+                Ok(DeserializedPayload::ChannelUnban(p)) => p.channel_id == expected_channel,
+                // A decode failure is conservatively rejected. An `Ok` of
+                // some OTHER variant should be unreachable (it would mean
+                // this match arm's type list and the inner one have drifted
+                // out of sync) — logged rather than silently swallowed, so
+                // that drift surfaces instead of quietly becoming a drop.
+                Ok(other) => {
+                    tracing::debug!(
+                        msg_type = ?envelope.msg_type,
+                        variant = ?other,
+                        "envelope_targets_channel: decoded to an unexpected \
+                         DeserializedPayload variant for this msg_type — \
+                         type-list desync, rejecting conservatively"
+                    );
+                    false
+                }
+                Err(_) => false,
+            }
         }
+        // Security-audit finding (2026-10-01, round 3): `ChatEdit`/
+        // `ChatDelete`/`ChatReaction` (`EditPayload`/`DeletePayload`/
+        // `ReactionPayload`) carry `channel_id: Option<u64>` — and it is
+        // AUTHOR-CONTROLLED, unvalidated by the router (`authorize_edit_
+        // delete` never reads it). `router.rs`'s `resolve_chat_channel_id`
+        // deliberately ignores this field entirely and re-derives the real
+        // channel by looking up the ORIGINAL message via `target_id` — it
+        // treats an absent `channel_id` and a WRONG one identically (both
+        // irrelevant), never trusting either. An earlier version of this
+        // arm rejected on `Some(mismatched)`, which doesn't just fail to
+        // add protection — it actively drops genuine edits/deletes whose
+        // author set a foreign/bogus `channel_id` on their OWN message
+        // (something the router happily applies, since it never looks at
+        // this field). That reopens the W6 "deleted-for-everyone content
+        // resurfaces on a backfilling node" class one layer up: a
+        // perfectly valid delete marker never reaches cold-joining nodes
+        // because this pre-check dropped it first. Since the router is
+        // airtight regardless of what this field says, deferring
+        // unconditionally costs nothing and removes a real harm.
+        MessageType::ChatEdit | MessageType::ChatDelete | MessageType::ChatReaction => true,
         // Non-channel message types should not appear in
         // CHANNEL_MSGS, but be conservative — accept them and let
         // the router decide.
         _ => true,
+    }
+}
+
+#[cfg(test)]
+mod envelope_targets_channel_tests {
+    //! Found live, 2026-10-01: `envelope_targets_channel` used to
+    //! deserialize into `serde_json::Value` to read `channel_id`
+    //! generically — which hard-errors on ANY MessagePack binary field,
+    //! and every ENCRYPTED `ChatMessage` (the default for every Public/
+    //! ReadPublic/Private channel in this project) has one
+    //! (`enc_content`/`enc_nonce`). This silently dropped essentially
+    //! all real chat content during reconcile/cold-join backfill
+    //! project-wide — confirmed against real wire bytes from a live
+    //! node before fixing. These tests pin the fix: a targeted struct
+    //! deserialization that never touches the binary fields at all.
+    use super::*;
+    use crate::messages::envelope::Envelope;
+    use crate::messages::types::{ChatMessagePayload, ContentRating, MessageType};
+
+    fn encrypted_chat_envelope(channel_id: u64) -> Vec<u8> {
+        let payload = ChatMessagePayload {
+            channel_id,
+            content: String::new(),
+            content_rating: ContentRating::default(),
+            reply_to: None,
+            mentions: vec![],
+            attachments: vec![],
+            // The exact shape that broke the old `serde_json::Value`
+            // path: real binary data, not empty/None.
+            enc_content: Some(vec![1, 2, 3, 4, 5]),
+            enc_nonce: Some([7u8; 24]),
+            key_epoch: Some(1),
+            buttons: vec![],
+            via_button: false,
+        };
+        let envelope = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::ChatMessage,
+            msg_id: [9u8; 32],
+            author: "klv1author".to_string(),
+            timestamp: 1_700_000_000_000,
+            lamport_ts: 0,
+            payload: rmp_serde::to_vec_named(&payload).unwrap(),
+            signature: vec![0u8; 64],
+            relay_path: vec![],
+        };
+        rmp_serde::to_vec_named(&envelope).unwrap()
+    }
+
+    #[test]
+    fn encrypted_chat_message_correctly_matches_its_own_channel() {
+        let env_bytes = encrypted_chat_envelope(42);
+        assert!(
+            envelope_targets_channel(&env_bytes, 42),
+            "an encrypted ChatMessage must still be recognized as targeting \
+             its own channel_id — this is exactly the case that used to \
+             hard-fail on the enc_content/enc_nonce binary fields"
+        );
+    }
+
+    #[test]
+    fn encrypted_chat_message_correctly_rejects_a_different_channel() {
+        let env_bytes = encrypted_chat_envelope(42);
+        assert!(
+            !envelope_targets_channel(&env_bytes, 99),
+            "cross-channel smuggling defense must still work for encrypted \
+             messages, not just plaintext ones"
+        );
+    }
+
+    /// Sanity check that the fix didn't regress the plaintext (non-
+    /// encrypted) case, which never hit this bug.
+    #[test]
+    fn plaintext_chat_message_still_matches_its_own_channel() {
+        let payload = ChatMessagePayload {
+            channel_id: 7,
+            content: "hello".to_string(),
+            content_rating: ContentRating::default(),
+            reply_to: None,
+            mentions: vec![],
+            attachments: vec![],
+            enc_content: None,
+            enc_nonce: None,
+            key_epoch: None,
+            buttons: vec![],
+            via_button: false,
+        };
+        let envelope = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::ChatMessage,
+            msg_id: [1u8; 32],
+            author: "klv1author".to_string(),
+            timestamp: 1_700_000_000_000,
+            lamport_ts: 0,
+            payload: rmp_serde::to_vec_named(&payload).unwrap(),
+            signature: vec![0u8; 64],
+            relay_path: vec![],
+        };
+        let env_bytes = rmp_serde::to_vec_named(&envelope).unwrap();
+        assert!(envelope_targets_channel(&env_bytes, 7));
+        assert!(!envelope_targets_channel(&env_bytes, 8));
+    }
+
+    /// A malformed/undecodable envelope must still be conservatively
+    /// rejected, not panic or default to "matches everything".
+    #[test]
+    fn garbage_bytes_do_not_match_any_channel() {
+        assert!(!envelope_targets_channel(b"not a valid envelope", 42));
+    }
+
+    /// Round-3 code-audit finding: the first fix replaced
+    /// `serde_json::Value` with a narrower, FEWER-FIELDS-THAN-the-real-
+    /// struct probe (`ChannelIdOnlyPayload { channel_id: u64 }`), which
+    /// sidestepped the binary-field crash but reintroduced the same class
+    /// of bug for `sdk-rust`'s positional msgpack-ARRAY wire form:
+    /// `rmp_serde` matches the array's element count against the target
+    /// struct's field count, so a 1-field probe against `ChatMessagePayload`'s
+    /// real 11-element array fails `LengthMismatch` rather than reading the
+    /// first element — meaning array-encoded chat messages were STILL
+    /// silently dropped during backfill. This pins the fix: decoding
+    /// through `deserialize_payload` (the real, complete struct) handles
+    /// both wire forms.
+    #[test]
+    fn array_encoded_encrypted_chat_message_matches_its_own_channel() {
+        let payload = ChatMessagePayload {
+            channel_id: 42,
+            content: String::new(),
+            content_rating: ContentRating::default(),
+            reply_to: None,
+            mentions: vec![],
+            attachments: vec![],
+            enc_content: Some(vec![1, 2, 3, 4, 5]),
+            enc_nonce: Some([7u8; 24]),
+            key_epoch: Some(1),
+            buttons: vec![],
+            via_button: false,
+        };
+        let envelope = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::ChatMessage,
+            msg_id: [8u8; 32],
+            author: "klv1author".to_string(),
+            timestamp: 1_700_000_000_000,
+            lamport_ts: 0,
+            // Positional array encoding, matching sdk-rust's wire form —
+            // NOT `to_vec_named`.
+            payload: rmp_serde::to_vec(&payload).unwrap(),
+            signature: vec![0u8; 64],
+            relay_path: vec![],
+        };
+        let env_bytes = rmp_serde::to_vec_named(&envelope).unwrap();
+        assert!(
+            envelope_targets_channel(&env_bytes, 42),
+            "an sdk-rust (array-encoded) encrypted ChatMessage must still be \
+             recognized as targeting its own channel_id"
+        );
+        assert!(!envelope_targets_channel(&env_bytes, 99));
+    }
+
+    /// `ChannelCreatePayload` (9 fields) is a second, independently-shaped
+    /// array-wire-form regression case: a 1-field probe against a 9-element
+    /// array also fails `LengthMismatch`, distinct from the 11-field
+    /// `ChatMessagePayload` case above.
+    #[test]
+    fn array_encoded_channel_create_matches_its_own_channel() {
+        use crate::messages::types::{ChannelCreatePayload, ChannelType, ModerationPolicy};
+        let payload = ChannelCreatePayload {
+            channel_id: 42,
+            slug: "general".to_string(),
+            channel_type: ChannelType::Public,
+            display_name: None,
+            description: None,
+            content_rating: ContentRating::default(),
+            moderation: ModerationPolicy {
+                admins: vec![],
+                rules: None,
+            },
+            encryption_enabled: None,
+            history_visibility: None,
+        };
+        let envelope = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::ChannelCreate,
+            msg_id: [6u8; 32],
+            author: "klv1author".to_string(),
+            timestamp: 1_700_000_000_000,
+            lamport_ts: 0,
+            payload: rmp_serde::to_vec(&payload).unwrap(),
+            signature: vec![0u8; 64],
+            relay_path: vec![],
+        };
+        let env_bytes = rmp_serde::to_vec_named(&envelope).unwrap();
+        assert!(envelope_targets_channel(&env_bytes, 42));
+        assert!(!envelope_targets_channel(&env_bytes, 99));
+    }
+
+    /// Round-3 code-audit finding: `ChannelKick`/`ChannelBan`/`ChannelUnban`
+    /// ride the same metadata-reconcile page as Create/Update/Delete, so
+    /// they need the same per-channel binding — they previously fell
+    /// through to the unconditional `_ => true` catch-all, defeating this
+    /// function's scoping purpose for these three types.
+    #[test]
+    fn channel_kick_ban_unban_are_bound_to_their_own_channel() {
+        use crate::messages::types::{ChannelBanPayload, ChannelKickPayload, ChannelUnbanPayload};
+
+        let kick = chat_envelope(
+            MessageType::ChannelKick,
+            rmp_serde::to_vec_named(&ChannelKickPayload {
+                channel_id: 42,
+                target_user: "klv1target".to_string(),
+                reason: None,
+            })
+            .unwrap(),
+        );
+        assert!(envelope_targets_channel(&kick, 42));
+        assert!(!envelope_targets_channel(&kick, 99));
+
+        let ban = chat_envelope(
+            MessageType::ChannelBan,
+            rmp_serde::to_vec_named(&ChannelBanPayload {
+                channel_id: 42,
+                target_user: "klv1target".to_string(),
+                reason: None,
+                duration_secs: 0,
+            })
+            .unwrap(),
+        );
+        assert!(envelope_targets_channel(&ban, 42));
+        assert!(!envelope_targets_channel(&ban, 99));
+
+        let unban = chat_envelope(
+            MessageType::ChannelUnban,
+            rmp_serde::to_vec_named(&ChannelUnbanPayload {
+                channel_id: 42,
+                target_user: "klv1target".to_string(),
+            })
+            .unwrap(),
+        );
+        assert!(envelope_targets_channel(&unban, 42));
+        assert!(!envelope_targets_channel(&unban, 99));
+    }
+
+    // --- ChatEdit/ChatDelete/ChatReaction (round-3 security-audit finding) ---
+    // `channel_id: Option<u64>` on these three types is author-controlled
+    // and the router (`resolve_chat_channel_id`) never trusts it — it
+    // re-derives the real channel via `target_id` and treats an absent
+    // `channel_id` and a WRONG one identically (both irrelevant). Rejecting
+    // on `Some(mismatched)` doesn't add protection; it drops genuine edits/
+    // deletes whose author set a foreign channel_id on their OWN message,
+    // reopening the W6 "deleted content resurfaces on a backfilling node"
+    // class one layer up. So this arm defers unconditionally — these tests
+    // pin that, across all three types and both a present and absent
+    // channel_id, rather than re-deriving behavior from the (now much
+    // simpler) implementation.
+    use crate::messages::types::{DeletePayload, EditPayload, ReactionPayload};
+
+    fn chat_envelope(msg_type: MessageType, payload_bytes: Vec<u8>) -> Vec<u8> {
+        let envelope = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type,
+            msg_id: [3u8; 32],
+            author: "klv1author".to_string(),
+            timestamp: 1_700_000_000_000,
+            lamport_ts: 0,
+            payload: payload_bytes,
+            signature: vec![0u8; 64],
+            relay_path: vec![],
+        };
+        rmp_serde::to_vec_named(&envelope).unwrap()
+    }
+
+    #[test]
+    fn chat_delete_defers_to_router_regardless_of_its_own_channel_id() {
+        let env_bytes = chat_envelope(
+            MessageType::ChatDelete,
+            rmp_serde::to_vec_named(&DeletePayload {
+                target_id: [5u8; 32],
+                channel_id: Some(42),
+            })
+            .unwrap(),
+        );
+        assert!(envelope_targets_channel(&env_bytes, 42));
+        assert!(
+            envelope_targets_channel(&env_bytes, 99),
+            "a foreign channel_id on a delete the router never trusts must \
+             not cause this pre-check to drop a genuine delete"
+        );
+
+        let absent = chat_envelope(
+            MessageType::ChatDelete,
+            rmp_serde::to_vec_named(&DeletePayload {
+                target_id: [5u8; 32],
+                channel_id: None,
+            })
+            .unwrap(),
+        );
+        assert!(envelope_targets_channel(&absent, 42));
+    }
+
+    #[test]
+    fn chat_edit_defers_to_router_regardless_of_its_own_channel_id() {
+        let payload = EditPayload {
+            target_id: [5u8; 32],
+            channel_id: Some(42),
+            content: "edited".to_string(),
+            edited_at: 1_700_000_000_000,
+            title: None,
+            tags: None,
+            attachments: None,
+            buttons: None,
+            enc_content: Some(vec![1, 2, 3]),
+            enc_nonce: Some([9u8; 24]),
+            key_epoch: Some(1),
+        };
+        let env_bytes = chat_envelope(MessageType::ChatEdit, rmp_serde::to_vec_named(&payload).unwrap());
+        assert!(envelope_targets_channel(&env_bytes, 99));
+
+        // Also pin the array wire form explicitly.
+        let env_bytes_array =
+            chat_envelope(MessageType::ChatEdit, rmp_serde::to_vec(&payload).unwrap());
+        assert!(envelope_targets_channel(&env_bytes_array, 99));
+    }
+
+    #[test]
+    fn chat_reaction_defers_to_router_regardless_of_its_own_channel_id() {
+        let payload = ReactionPayload {
+            target_id: [5u8; 32],
+            channel_id: Some(42),
+            emoji: "👍".to_string(),
+            remove: false,
+        };
+        let env_bytes =
+            chat_envelope(MessageType::ChatReaction, rmp_serde::to_vec_named(&payload).unwrap());
+        assert!(envelope_targets_channel(&env_bytes, 99));
     }
 }
 
@@ -4851,10 +5268,9 @@ impl NetworkService {
                 // router would happily index them under B in our
                 // local CHANNEL_MSGS. Reject any envelope whose
                 // payload-extracted channel_id does not equal the
-                // channel we asked for. We can't fully validate
-                // until after the router has deserialised the
-                // payload, so we do a cheap pre-check on the
-                // payload bytes here.
+                // channel we asked for, BEFORE handing it to the
+                // router (which has no notion of "which channel was
+                // this reconcile for" to check against on its own).
                 if !envelope_targets_channel(
                     &env_bytes,
                     pending.channel_id,

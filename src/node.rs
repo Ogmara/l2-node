@@ -665,10 +665,20 @@ impl Node {
         // Backfill CHANNEL_META_MSGS from MESSAGES (one-time, P-3b channel
         // metadata) so the channel-history reconcile can serve channel
         // name/logo/membership to nodes that chain-discovered the channel.
-        let channel_meta_indexed = storage.get_stat(state_keys::CHANNEL_META_INDEXED)? > 0;
+        //
+        // Security-audit finding (2026-10-01, round 3): `CHANNEL_META_INDEXED`
+        // (no suffix) is already set on every node that has ever booted a
+        // prior version — gating on it made the round-3 decode fix inside
+        // `backfill_channel_meta` (array-encoded sdk-rust payloads were
+        // silently never indexed) permanently unreachable, since the
+        // migration would never run again. `_V2` re-runs it once more on
+        // upgrade; the old key is left in place (harmless, nothing else
+        // reads it) rather than reused, so this migration's history stays
+        // legible.
+        let channel_meta_indexed = storage.get_stat(state_keys::CHANNEL_META_INDEXED_V2)? > 0;
         if !channel_meta_indexed {
             if let Err(e) = storage.backfill_channel_meta() {
-                warn!(error = %e, "Failed to backfill CHANNEL_META_MSGS index");
+                warn!(error = %e, "Failed to backfill CHANNEL_META_MSGS index (v2)");
             }
         }
 

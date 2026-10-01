@@ -2551,8 +2551,55 @@ impl MessageRouter {
                 | MessageType::ChannelBan
                 | MessageType::ChannelUnban
         ) {
-            if let Ok(p) = rmp_serde::from_slice::<serde_json::Value>(&envelope.payload) {
-                if let Some(cid) = p.get("channel_id").and_then(|v| v.as_u64()) {
+            // Code-audit finding (2026-10-01, round 3): this used to
+            // deserialize into `serde_json::Value` to read just
+            // `channel_id` generically. Two independent problems with
+            // that, both found auditing the sibling bug in
+            // `network::mod::envelope_targets_channel`: (1) JSON has no
+            // binary type, so it hard-errors the moment any of these
+            // payloads gains a MessagePack "bin" field — none do today,
+            // but the next one to add one silently stops being indexed
+            // with no error anywhere; (2) a msgpack ARRAY (the wire form
+            // `sdk-rust` uses) decodes into `Value::Array`, and
+            // `.get("channel_id")` on an array is always `None` — so
+            // every array-encoded envelope of these 8 types was NEVER
+            // indexed into `CHANNEL_META_MSGS` at all, meaning a
+            // backfilling peer could never be served this channel's
+            // metadata/membership/moderation history in the first
+            // place, regardless of any fix on the requester side.
+            // `deserialize_payload` decodes through each type's real,
+            // complete struct, which has the right field count for both
+            // wire forms.
+            if let Ok(payload) =
+                crate::messages::types::deserialize_payload(envelope.msg_type, &envelope.payload)
+            {
+                use crate::messages::types::DeserializedPayload;
+                // The `_ => None` arm should be unreachable given the outer
+                // `matches!` gate above — logged rather than silently
+                // skipped, so a future type added to one list but not the
+                // other surfaces instead of silently never being indexed
+                // (the exact shape this whole fix was chasing).
+                let cid = match payload {
+                    DeserializedPayload::ChannelCreate(p) => Some(p.channel_id),
+                    DeserializedPayload::ChannelUpdate(p) => Some(p.channel_id),
+                    DeserializedPayload::ChannelJoin(p) => Some(p.channel_id),
+                    DeserializedPayload::ChannelLeave(p) => Some(p.channel_id),
+                    DeserializedPayload::ChannelDelete(p) => Some(p.channel_id),
+                    DeserializedPayload::ChannelKick(p) => Some(p.channel_id),
+                    DeserializedPayload::ChannelBan(p) => Some(p.channel_id),
+                    DeserializedPayload::ChannelUnban(p) => Some(p.channel_id),
+                    other => {
+                        tracing::debug!(
+                            msg_type = ?envelope.msg_type,
+                            variant = ?other,
+                            "update_indexes P-3b: decoded to an unexpected \
+                             DeserializedPayload variant for this msg_type — \
+                             type-list desync, not indexing into CHANNEL_META_MSGS"
+                        );
+                        None
+                    }
+                };
+                if let Some(cid) = cid {
                     let key = schema::encode_channel_meta_key(
                         cid,
                         envelope.msg_type_u8(),
@@ -5291,6 +5338,81 @@ mod channel_delete_before_create_tests {
         assert!(
             r.storage.get_cf(schema::cf::PENDING_CHANNEL_DELETES, &4246u64.to_be_bytes()).unwrap().is_none(),
             "the normal (non-deferred) path never touches the pending-claim CF"
+        );
+    }
+
+    /// Code-audit finding (2026-10-01, round 3): `update_indexes`'s P-3b
+    /// block used to deserialize into `serde_json::Value` to read
+    /// `channel_id` for `CHANNEL_META_MSGS` indexing. A msgpack ARRAY (the
+    /// wire form `sdk-rust` uses) decodes into `Value::Array`, and
+    /// `.get("channel_id")` on an array is always `None` — so an
+    /// array-encoded `ChannelCreate` was accepted and stored in MESSAGES
+    /// (the envelope itself decodes fine via its full, real struct) but
+    /// NEVER indexed into `CHANNEL_META_MSGS`, meaning a backfilling peer
+    /// could never be served this channel's metadata at all. This pins the
+    /// fix: decoding through `deserialize_payload` indexes the array form
+    /// too.
+    #[test]
+    fn array_encoded_channel_create_is_indexed_into_channel_meta_msgs() {
+        let (r, _d) = router();
+        let sk = crypto::generate_keypair();
+        let creator = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        register_user(&r, &creator, 1_000);
+
+        let channel_id = 4247u64;
+        let timestamp = now_ms();
+        let payload = ChannelCreatePayload {
+            channel_id,
+            slug: "general".to_string(),
+            channel_type: ChannelType::Public,
+            display_name: None,
+            description: None,
+            content_rating: Default::default(),
+            moderation: ModerationPolicy { admins: vec![], rules: None },
+            encryption_enabled: None,
+            history_visibility: None,
+        };
+        // Positional array encoding, matching sdk-rust's wire form — NOT
+        // `to_vec_named` (which every OTHER helper in this module uses).
+        let payload_bytes = rmp_serde::to_vec(&payload).unwrap();
+        let author_pubkey: [u8; 32] = sk.verifying_key().to_bytes();
+        let msg_id = crypto::compute_msg_id("testnet", &author_pubkey, &payload_bytes, timestamp);
+        let signature = signing::sign_ogmara_message(
+            &sk,
+            "testnet",
+            crate::messages::envelope::PROTOCOL_VERSION,
+            MessageType::ChannelCreate as u8,
+            &msg_id,
+            timestamp,
+            &payload_bytes,
+        );
+        let envelope = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::ChannelCreate,
+            msg_id,
+            author: creator.clone(),
+            timestamp,
+            lamport_ts: 0,
+            payload: payload_bytes,
+            signature: signature.to_bytes().to_vec(),
+            relay_path: vec![],
+        };
+        let raw = rmp_serde::to_vec_named(&envelope).unwrap();
+
+        let result = r.process_message(&raw);
+        assert!(matches!(result, RouteResult::Accepted { .. }), "got {:?}", result);
+
+        let key = schema::encode_channel_meta_key(
+            channel_id,
+            MessageType::ChannelCreate as u8,
+            timestamp,
+            &msg_id,
+        );
+        assert!(
+            r.storage.exists_cf(schema::cf::CHANNEL_META_MSGS, &key).unwrap_or(false),
+            "an array-encoded ChannelCreate must still be indexed into \
+             CHANNEL_META_MSGS so a backfilling peer can be served this \
+             channel's metadata"
         );
     }
 }
