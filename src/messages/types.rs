@@ -405,6 +405,23 @@ pub enum ChannelType {
     Private = 0x02,
 }
 
+/// Namespace split point for `channel_id`: `validate_channel_create`
+/// enforces `channel_id > PRIVATE_CHANNEL_ID_FLOOR` for `Private` and
+/// `channel_id < PRIVATE_CHANNEL_ID_FLOOR` for every other type
+/// (`validation.rs`), so for any ID that actually passed validation this
+/// is an exact, storage-free test for "is this a private channel" — used
+/// by every "don't leak private channel ids" filter (REST `network_nodes`,
+/// gossip `publish_node_announcement`) instead of each duplicating the
+/// constant. NOT exact for a legacy row written before this floor
+/// existed (`chain::scanner`'s pre-floor-collision handling) — those can
+/// still read as "public" here despite being `Private`-typed in storage.
+pub const PRIVATE_CHANNEL_ID_FLOOR: u64 = 1 << 32;
+
+/// See `PRIVATE_CHANNEL_ID_FLOOR`'s doc comment for the exactness caveat.
+pub fn is_public_channel_id(channel_id: u64) -> bool {
+    channel_id <= PRIVATE_CHANNEL_ID_FLOOR
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModerationPolicy {
     /// Addresses with mod powers.
@@ -443,6 +460,21 @@ pub struct ChannelCreatePayload {
     /// defaults by type: Private → ForwardOnly, Public/ReadPublic → FullHistory.
     #[serde(default)]
     pub history_visibility: Option<u8>,
+    /// Millisecond timestamp used as the THIRD input of the private-channel
+    /// `channel_id` derivation: `Keccak-256(wallet_address + slug +
+    /// id_derivation_ts) % (2^53-1)` (`docs/specs/05-clients.md`
+    /// §private-channel-creation). Deliberately distinct from
+    /// `Envelope.timestamp` — the two are captured at different points
+    /// client-side (this one BEFORE signing begins, so it can feed the hash;
+    /// `Envelope.timestamp` is set later inside `buildEnvelope`, after a
+    /// possibly-slow signer round trip) and must never be conflated or
+    /// approximated from one another. `None` for a Public/ReadPublic
+    /// channel (SC-assigned `channel_id`, nothing to verify) or for a
+    /// private channel created before this field existed — see
+    /// `MessageRouter::require_private_id_derivation` for how absence is
+    /// handled (never silently treated as "verified").
+    #[serde(default)]
+    pub id_derivation_ts: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

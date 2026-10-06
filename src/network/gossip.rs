@@ -147,9 +147,30 @@ impl TopicManager {
         }
     }
 
-    /// Get the set of subscribed channel IDs.
+    /// Get the set of subscribed channel IDs — public AND private.
+    /// Prefer `subscribed_public_channels()` for anything that crosses a
+    /// trust boundary (gossip, REST, a sync request to an arbitrary
+    /// peer); this raw accessor exists for internal uses that are
+    /// genuinely type-agnostic (e.g. total-subscription counts).
     pub fn subscribed_channels(&self) -> &HashSet<u64> {
         &self.subscribed_channels
+    }
+
+    /// Security-audit hardening (2026-10-06, round 4): the same
+    /// `.filter(is_public_channel_id)` composition was independently
+    /// needed at two call sites (`publish_node_announcement`,
+    /// `sync_channels_with_peer`) after two separate private-channel-id
+    /// leaks were found and fixed there — a caller forgetting to apply
+    /// it is exactly how the next one would happen. Centralizing the
+    /// filter here makes "leaks the full list" opt-in (callers must
+    /// explicitly reach for the raw `subscribed_channels()` instead)
+    /// rather than opt-out.
+    pub fn subscribed_public_channels(&self) -> Vec<u64> {
+        self.subscribed_channels
+            .iter()
+            .copied()
+            .filter(|id| crate::messages::types::is_public_channel_id(*id))
+            .collect()
     }
 
     fn subscribe_topic(&self, swarm: &mut Swarm<OgmaraBehaviour>, topic_str: &str) {
@@ -161,4 +182,48 @@ impl TopicManager {
         }
     }
 
+}
+
+#[cfg(test)]
+mod subscribed_public_channels_tests {
+    use super::*;
+
+    /// No swarm needed: `subscribed_channels` is a plain `HashSet<u64>`
+    /// and this test module is inside the same file, so it can populate
+    /// it directly instead of going through `subscribe_channel` (which
+    /// requires a live `Swarm`).
+    fn manager_with(ids: &[u64]) -> TopicManager {
+        let mut m = TopicManager::new("testnet");
+        m.subscribed_channels = ids.iter().copied().collect();
+        m
+    }
+
+    #[test]
+    fn filters_out_private_ids_keeps_public_ones() {
+        let floor = crate::messages::types::PRIVATE_CHANNEL_ID_FLOOR;
+        let public_id = 42u64;
+        let private_id = floor + 1;
+        let m = manager_with(&[public_id, private_id]);
+        assert_eq!(m.subscribed_public_channels(), vec![public_id]);
+    }
+
+    #[test]
+    fn empty_subscriptions_yields_empty() {
+        let m = manager_with(&[]);
+        assert!(m.subscribed_public_channels().is_empty());
+    }
+
+    #[test]
+    fn all_private_yields_empty() {
+        let floor = crate::messages::types::PRIVATE_CHANNEL_ID_FLOOR;
+        let m = manager_with(&[floor + 1, floor + 2]);
+        assert!(m.subscribed_public_channels().is_empty());
+    }
+
+    #[test]
+    fn raw_accessor_still_returns_everything() {
+        let floor = crate::messages::types::PRIVATE_CHANNEL_ID_FLOOR;
+        let m = manager_with(&[1u64, floor + 1]);
+        assert_eq!(m.subscribed_channels().len(), 2);
+    }
 }

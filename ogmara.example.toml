@@ -360,6 +360,14 @@ sweep_batch_size = 500
 # self-imposed rate ceiling with block-height polling and transaction
 # paging. Floored at 3 so no lane is ever silently given a zero share.
 max_retriggers_per_sweep = 5
+# Require a PRIVATE ChannelCreate's channel_id to verify against its
+# Keccak-256(wallet+slug+ts) derivation on this node's first-ever
+# encounter with that id (closes the federate_channel first-sight-trust
+# residual). A live create (not synced/backfilled) is always required
+# regardless of this flag. Set false only as a temporary unblock if a
+# pre-upgrade private channel (created before this field existed) needs
+# to federate onto a node that has never seen it.
+require_private_id_derivation = true
 
 [notifications]
 # Persisted-notification retention (W31, l2-node 0.104.0+)

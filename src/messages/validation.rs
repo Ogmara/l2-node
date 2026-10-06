@@ -285,8 +285,14 @@ pub fn validate_news_comment(p: &NewsCommentPayload) -> Result<(), ValidationErr
     Ok(())
 }
 
-/// Validate a channel create payload.
-pub fn validate_channel_create(p: &ChannelCreatePayload) -> Result<(), ValidationError> {
+/// Validate a channel create payload. `resolved_author` is the envelope
+/// signer's resolved WALLET address (never a device key — see
+/// `verify_private_channel_id_derivation`'s doc comment for why that
+/// matters), needed to check a private channel's `id_derivation_ts`.
+pub fn validate_channel_create(
+    resolved_author: &str,
+    p: &ChannelCreatePayload,
+) -> Result<(), ValidationError> {
     if p.slug.is_empty() || p.slug.len() > MAX_SLUG {
         return Err(ValidationError("invalid slug length".into()));
     }
@@ -329,7 +335,7 @@ pub fn validate_channel_create(p: &ChannelCreatePayload) -> Result<(), Validatio
     // with overwhelming probability already — is essentially never
     // rejected, while a deliberately low, attacker-chosen id aimed at an
     // existing on-chain channel now can't even reach the row-write path.
-    const PRIVATE_CHANNEL_ID_FLOOR: u64 = 1 << 32;
+    use crate::messages::types::PRIVATE_CHANNEL_ID_FLOOR;
     if p.channel_type == ChannelType::Private && p.channel_id <= PRIVATE_CHANNEL_ID_FLOOR {
         return Err(ValidationError(
             "private channel_id too low — must be a properly-derived hash, not a small/sequential value".into(),
@@ -353,6 +359,73 @@ pub fn validate_channel_create(p: &ChannelCreatePayload) -> Result<(), Validatio
     if p.channel_type != ChannelType::Private && p.channel_id >= PRIVATE_CHANNEL_ID_FLOOR {
         return Err(ValidationError(
             "public/read-public channel_id impossibly high for the SC's sequential id space".into(),
+        ));
+    }
+    // Security fix (2026-10-06): the floor above only enforces NAMESPACE
+    // separation (a private id can't collide with the SC's sequential
+    // space) — it says nothing about WHO chose the id. Closes the
+    // "federate_channel first-sight-trust" residual (l2-node 0.138.0's
+    // CHANGELOG): a node's first-ever encounter with a given private
+    // channel_id used to trust whichever `ChannelCreate` it saw first,
+    // with no way to tell a genuine creator's envelope from an
+    // attacker's self-signed one claiming the same id. The spec
+    // (`docs/specs/05-clients.md` §private-channel-creation) already
+    // defines `channel_id` as `Keccak-256(creator_wallet + slug + ts)` —
+    // verifying it here makes creatorship self-certifying: the id itself
+    // is the proof, checkable with no registry and no prior knowledge.
+    // Only checked when PRESENT — absence policy (whether an old/legacy
+    // channel without this field is still acceptable) needs storage
+    // access this pure function doesn't have, so that decision lives in
+    // `MessageRouter::require_private_id_derivation` instead.
+    if p.channel_type == ChannelType::Private {
+        if let Some(ts) = p.id_derivation_ts {
+            verify_private_channel_id_derivation(resolved_author, &p.slug, ts, p.channel_id)?;
+        }
+    }
+    Ok(())
+}
+
+/// Recompute the private-channel `channel_id` derivation
+/// (`Keccak-256(creator_wallet + slug + id_derivation_ts) % (2^53-1)`,
+/// `docs/specs/05-clients.md` §private-channel-creation) and compare
+/// against the claimed `channel_id`. Pure — no storage, no I/O.
+///
+/// `creator_wallet` MUST be the resolved WALLET address (`klv1...`), never
+/// a device key (`ogd1...`) — the client-side hash always uses the
+/// wallet, even when the envelope is signed by a delegated device key
+/// (`sdk-js`'s `signer.walletAddress ?? signer.address`). The caller
+/// (`validate_channel_create`, called with `resolved_author` from
+/// `MessageRouter::validate_payload`) is safe to pass the envelope's
+/// resolved author directly here WITHOUT a separate "is this actually a
+/// wallet, not an unresolved device address" check: `ChannelCreate` is in
+/// `requires_verified_identity()`, so step 4d already rejects any
+/// `ChannelCreate` whose resolved author isn't an on-chain-registered
+/// wallet before payload validation (this function) ever runs — an
+/// unmapped `ogd1...` device address can never reach here.
+///
+/// The modulus is `Number.MAX_SAFE_INTEGER` (`2^53 - 1`), NOT a naive
+/// 8-byte truncation — the client applies this exact modulus to stay
+/// within a JS-safe integer, so replicating "truncated to u64" (an
+/// earlier, imprecise reading of the spec text) would reject every
+/// legitimately-derived channel_id.
+pub fn verify_private_channel_id_derivation(
+    creator_wallet: &str,
+    slug: &str,
+    id_derivation_ts: u64,
+    channel_id: u64,
+) -> Result<(), ValidationError> {
+    const JS_SAFE_INTEGER_MODULUS: u64 = (1u64 << 53) - 1;
+    let preimage = format!("{creator_wallet}{slug}{id_derivation_ts}");
+    let hash = crate::crypto::keccak256(preimage.as_bytes());
+    let raw = u64::from_be_bytes([
+        hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7],
+    ]);
+    let expected = raw % JS_SAFE_INTEGER_MODULUS;
+    if expected != channel_id {
+        return Err(ValidationError(
+            "private channel_id does not match its Keccak-256(wallet+slug+ts) derivation — \
+             forged or buggy client"
+                .into(),
         ));
     }
     Ok(())
@@ -2617,6 +2690,8 @@ mod message_button_tests {
 mod channel_create_private_id_floor_tests {
     use super::*;
 
+    const AUTHOR: &str = "klv1author";
+
     fn base_payload(channel_id: u64, channel_type: ChannelType) -> ChannelCreatePayload {
         ChannelCreatePayload {
             channel_id,
@@ -2628,21 +2703,22 @@ mod channel_create_private_id_floor_tests {
             moderation: ModerationPolicy { admins: vec![], rules: None },
             encryption_enabled: None,
             history_visibility: None,
+            id_derivation_ts: None,
         }
     }
 
     #[test]
     fn private_channel_id_at_or_below_floor_is_rejected() {
         let p = base_payload(1 << 32, ChannelType::Private);
-        assert!(validate_channel_create(&p).is_err());
+        assert!(validate_channel_create(AUTHOR, &p).is_err());
         let p = base_payload(4245, ChannelType::Private);
-        assert!(validate_channel_create(&p).is_err());
+        assert!(validate_channel_create(AUTHOR, &p).is_err());
     }
 
     #[test]
     fn private_channel_id_above_floor_is_accepted() {
         let p = base_payload((1 << 32) + 1, ChannelType::Private);
-        assert!(validate_channel_create(&p).is_ok());
+        assert!(validate_channel_create(AUTHOR, &p).is_ok());
     }
 
     #[test]
@@ -2651,8 +2727,156 @@ mod channel_create_private_id_floor_tests {
         // id space is small — a real Public/ReadPublic channel_id being
         // low is the EXPECTED case, not a signal to reject.
         let p = base_payload(1, ChannelType::Public);
-        assert!(validate_channel_create(&p).is_ok());
+        assert!(validate_channel_create(AUTHOR, &p).is_ok());
         let p = base_payload(2, ChannelType::ReadPublic);
-        assert!(validate_channel_create(&p).is_ok());
+        assert!(validate_channel_create(AUTHOR, &p).is_ok());
+    }
+}
+
+// --- channel_id identity-binding derivation (security fix, 2026-10-06,
+// closing the federate_channel first-sight-trust residual) ---
+
+#[cfg(test)]
+mod channel_create_private_id_derivation_tests {
+    use super::*;
+
+    const AUTHOR: &str = "klv1author";
+    const SLUG: &str = "test-channel";
+    const TS: u64 = 1_700_000_000_000;
+
+    /// Fixed vector, independently pinned on BOTH sides (sdk-js's
+    /// `channelId.test.ts` has the identical hardcoded expectation). If
+    /// this ever fails, the two implementations have drifted — DO NOT
+    /// "fix" by just updating one side's expected value without first
+    /// understanding why they disagree; a silent drift here means Phase
+    /// 3 enforcement bricks private-channel creation network-wide.
+    #[test]
+    fn matches_the_sdk_js_kat_cross_impl_lock() {
+        let address = "klv1testvector0000000000000000000000000000000000000000000000";
+        let slug = "cross-impl-lock";
+        let ts = 1_700_000_000_000u64;
+        assert!(
+            verify_private_channel_id_derivation(address, slug, ts, 1_746_962_510_838_664).is_ok(),
+            "must match sdk-js's independently-computed expectation for the same inputs"
+        );
+    }
+
+    /// Compute a genuinely-valid channel_id for (AUTHOR, SLUG, TS), the
+    /// same way a compliant client would, so tests don't hardcode a
+    /// value that silently drifts from the real formula.
+    fn valid_id(author: &str, slug: &str, ts: u64) -> u64 {
+        const JS_SAFE_INTEGER_MODULUS: u64 = (1u64 << 53) - 1;
+        let preimage = format!("{author}{slug}{ts}");
+        let hash = crate::crypto::keccak256(preimage.as_bytes());
+        let raw = u64::from_be_bytes([
+            hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7],
+        ]);
+        raw % JS_SAFE_INTEGER_MODULUS
+    }
+
+    #[test]
+    fn valid_derivation_is_accepted() {
+        let id = valid_id(AUTHOR, SLUG, TS);
+        assert!(verify_private_channel_id_derivation(AUTHOR, SLUG, TS, id).is_ok());
+    }
+
+    #[test]
+    fn wrong_address_is_rejected() {
+        let id = valid_id(AUTHOR, SLUG, TS);
+        assert!(verify_private_channel_id_derivation("klv1someoneelse", SLUG, TS, id).is_err());
+    }
+
+    #[test]
+    fn wrong_slug_is_rejected() {
+        let id = valid_id(AUTHOR, SLUG, TS);
+        assert!(verify_private_channel_id_derivation(AUTHOR, "different-slug", TS, id).is_err());
+    }
+
+    #[test]
+    fn wrong_timestamp_is_rejected() {
+        let id = valid_id(AUTHOR, SLUG, TS);
+        assert!(verify_private_channel_id_derivation(AUTHOR, SLUG, TS + 1, id).is_err());
+    }
+
+    #[test]
+    fn off_by_one_channel_id_is_rejected() {
+        let id = valid_id(AUTHOR, SLUG, TS);
+        assert!(verify_private_channel_id_derivation(AUTHOR, SLUG, TS, id + 1).is_err());
+    }
+
+    #[test]
+    fn modulus_is_applied_not_a_naive_truncation() {
+        // Pick a (slug, ts) pair whose raw 8-byte hash value is known to
+        // exceed 2^53-1, so a correct implementation MUST apply the `%`
+        // (a naive truncation would produce a different, wrong value and
+        // this test would fail against the real function).
+        let mut ts = TS;
+        let raw = loop {
+            let preimage = format!("{AUTHOR}{SLUG}{ts}");
+            let hash = crate::crypto::keccak256(preimage.as_bytes());
+            let raw = u64::from_be_bytes([
+                hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7],
+            ]);
+            if raw > (1u64 << 53) - 1 {
+                break raw;
+            }
+            ts += 1;
+        };
+        let expected = raw % ((1u64 << 53) - 1);
+        assert!(verify_private_channel_id_derivation(AUTHOR, SLUG, ts, expected).is_ok());
+        assert!(
+            verify_private_channel_id_derivation(AUTHOR, SLUG, ts, raw).is_err(),
+            "the raw pre-modulus value must NOT verify — proves the function applies % and isn't \
+             accidentally matching on the untruncated hash"
+        );
+    }
+
+    #[test]
+    fn validate_channel_create_checks_derivation_only_when_present() {
+        let mut p = ChannelCreatePayload {
+            channel_id: valid_id(AUTHOR, SLUG, TS),
+            slug: SLUG.to_string(),
+            channel_type: ChannelType::Private,
+            display_name: None,
+            description: None,
+            content_rating: Default::default(),
+            moderation: ModerationPolicy { admins: vec![], rules: None },
+            encryption_enabled: None,
+            history_visibility: None,
+            id_derivation_ts: Some(TS),
+        };
+        assert!(validate_channel_create(AUTHOR, &p).is_ok(), "valid derivation must pass");
+
+        p.id_derivation_ts = Some(TS + 1);
+        assert!(
+            validate_channel_create(AUTHOR, &p).is_err(),
+            "mismatched derivation must fail even though the floor/format checks all pass"
+        );
+
+        p.id_derivation_ts = None;
+        assert!(
+            validate_channel_create(AUTHOR, &p).is_ok(),
+            "absence is NOT this function's call — validate_channel_create stays permissive; \
+             the absence POLICY lives in MessageRouter::require_private_id_derivation"
+        );
+    }
+
+    #[test]
+    fn non_private_channel_type_ignores_a_present_derivation_field() {
+        // SC-assigned ids are never derived — a stray id_derivation_ts on
+        // a Public/ReadPublic create must be ignored, not rejected.
+        let p = ChannelCreatePayload {
+            channel_id: 1,
+            slug: SLUG.to_string(),
+            channel_type: ChannelType::Public,
+            display_name: None,
+            description: None,
+            content_rating: Default::default(),
+            moderation: ModerationPolicy { admins: vec![], rules: None },
+            encryption_enabled: None,
+            history_visibility: None,
+            id_derivation_ts: Some(TS), // deliberately bogus/unrelated to channel_id=1
+        };
+        assert!(validate_channel_create(AUTHOR, &p).is_ok());
     }
 }

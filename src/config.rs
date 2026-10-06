@@ -991,6 +991,25 @@ pub struct ChannelVerifyConfig {
     /// nonzero share (see `partition_sweep_budget`'s doc comment).
     #[serde(default = "default_channel_verify_max_retriggers_per_sweep")]
     pub max_retriggers_per_sweep: usize,
+    /// Security fix (2026-10-06): require a PRIVATE `ChannelCreate`'s
+    /// `channel_id` to verify against its Keccak-256(wallet+slug+ts)
+    /// derivation (`docs/specs/05-clients.md` §private-channel-creation)
+    /// when the envelope was synced/backfilled (`is_sync = true`) AND no
+    /// local `CHANNELS` row for that id already exists — i.e. this
+    /// node's first-ever encounter with the id. Closes the
+    /// `federate_channel` first-sight-trust residual: without this, a
+    /// node's first encounter with a private channel_id trusted
+    /// whichever self-signed `ChannelCreate` arrived first, with no way
+    /// to tell a genuine creator's envelope from an attacker's. A LIVE
+    /// create (not synced) is always required regardless of this flag —
+    /// the timestamp-freshness check already ran, so a "legacy" live
+    /// create is impossible by construction. Default `true`. Set `false`
+    /// only as a temporary operator unblock if a legitimate pre-upgrade
+    /// private channel (created before this field existed, so it has no
+    /// `id_derivation_ts` to verify) needs to federate onto a node that
+    /// has never seen it — see `MessageRouter::require_private_id_derivation`.
+    #[serde(default = "default_true")]
+    pub require_private_id_derivation: bool,
 }
 
 impl Default for ChannelVerifyConfig {
@@ -1000,6 +1019,7 @@ impl Default for ChannelVerifyConfig {
             sweep_interval_secs: default_channel_verify_sweep_interval_secs(),
             sweep_batch_size: default_channel_verify_sweep_batch_size(),
             max_retriggers_per_sweep: default_channel_verify_max_retriggers_per_sweep(),
+            require_private_id_derivation: default_true(),
         }
     }
 }
@@ -3920,6 +3940,14 @@ sweep_batch_size = 500
 # self-imposed rate ceiling with block-height polling and transaction
 # paging. Floored at 3 so no lane is ever silently given a zero share.
 max_retriggers_per_sweep = 5
+# Require a PRIVATE ChannelCreate's channel_id to verify against its
+# Keccak-256(wallet+slug+ts) derivation on this node's first-ever
+# encounter with that id (closes the federate_channel first-sight-trust
+# residual). A live create (not synced/backfilled) is always required
+# regardless of this flag. Set false only as a temporary unblock if a
+# pre-upgrade private channel (created before this field existed) needs
+# to federate onto a node that has never seen it.
+require_private_id_derivation = true
 
 [notifications]
 # Persisted-notification retention (W31, l2-node 0.104.0+)

@@ -1370,9 +1370,10 @@ mod envelope_targets_channel_tests {
         assert!(!envelope_targets_channel(&env_bytes, 99));
     }
 
-    /// `ChannelCreatePayload` (9 fields) is a second, independently-shaped
-    /// array-wire-form regression case: a 1-field probe against a 9-element
-    /// array also fails `LengthMismatch`, distinct from the 11-field
+    /// `ChannelCreatePayload` (10 fields, since the `id_derivation_ts`
+    /// security fix) is a second, independently-shaped array-wire-form
+    /// regression case: a 1-field probe against a 10-element array also
+    /// fails `LengthMismatch`, distinct from the 11-field
     /// `ChatMessagePayload` case above.
     #[test]
     fn array_encoded_channel_create_matches_its_own_channel() {
@@ -1390,6 +1391,7 @@ mod envelope_targets_channel_tests {
             },
             encryption_enabled: None,
             history_visibility: None,
+            id_derivation_ts: None,
         };
         let envelope = Envelope {
             version: crate::messages::envelope::PROTOCOL_VERSION,
@@ -1894,7 +1896,20 @@ impl NetworkService {
             counters.clone(),
             config.api.rate_limits.clone(),
         )
-        .with_hot_topics_config(config.hot_topics.clone());
+        .with_hot_topics_config(config.hot_topics.clone())
+        // Security-audit finding (2026-10-06): this network-layer router
+        // handles EVERY gossip/reconcile/private-channel-sync/news/dm/
+        // identity-sync ingest path — without this, it silently used
+        // `ChannelVerifyConfig::default()` regardless of what the
+        // operator configured, so the `require_private_id_derivation`
+        // escape hatch (meant to unblock a legacy channel's federation)
+        // affected only the API-layer router's `create_channel`/
+        // `federate_channel` handlers, leaving gossip/backfill of the
+        // SAME channel still rejecting it — with nothing in the logs
+        // explaining the inconsistency. Fails toward MORE strict by
+        // default (not a security hole on its own), but the escape
+        // hatch must actually reach every path that evaluates it.
+        .with_channel_verify_config(config.channel_verify.clone());
 
         let public_url = config.api.public_url.clone();
 
@@ -6661,7 +6676,21 @@ impl NetworkService {
     /// for each channel the node is subscribed to, requesting messages after
     /// the latest message the node already has for that channel.
     fn sync_channels_with_peer(&mut self, peer_id: PeerId) {
-        let channel_ids: Vec<u64> = self.topics.subscribed_channels().iter().copied().collect();
+        // Security-audit finding (2026-10-06, round 3): this used to send
+        // a generic `SyncRequest` for EVERY subscribed channel — private
+        // ones included — to every peer the moment Identify succeeds, no
+        // membership check, no peer relationship required. That's a
+        // worse enumeration surface than the REST/gossip leaks fixed
+        // alongside it: those require a query or a propagation wait,
+        // this pushes the node's full private channel_id list to any
+        // peer for free just by connecting. Private channel MESSAGE
+        // backfill already has its own dedicated, auth'd, membership-
+        // gated protocol (`PrivateChannelSyncRequest`/
+        // `maybe_trigger_private_channel_sync`, `private_channel_sync.rs`)
+        // that this generic loop never touches — so restricting this one
+        // to public/read-public channels loses no legitimate private-
+        // channel sync path, it only stops leaking the id list.
+        let channel_ids: Vec<u64> = self.topics.subscribed_public_channels();
 
         if channel_ids.is_empty() {
             return;
@@ -6712,7 +6741,21 @@ impl NetworkService {
         use crate::messages::types::{Capability, MessageType, NodeAnnouncementPayload};
         use ed25519_dalek::Signer;
 
-        let channels: Vec<u64> = self.topics.subscribed_channels().iter().copied().collect();
+        // Security-audit follow-up (2026-10-06, found while fixing the
+        // `/api/v1/network/nodes` enumeration leak): `subscribed_channels`
+        // has no public/private distinction — `federate_channel` calls
+        // the exact same `subscribe_channel` a chain-discovered PUBLIC
+        // channel does. Without this filter, every private channel_id
+        // this node has ever federated gets broadcast network-wide in
+        // the clear, contradicting this payload's own documented
+        // guarantee (protocol spec 01 §network: "Private channels are
+        // NOT announced... no metadata leakage to the network") and
+        // reintroducing the SAME enumerability weakening the identity-
+        // binding fix (l2-node 0.139.0) is specifically meant to avoid —
+        // an attacker who can enumerate N real private ids searches one
+        // Keccak stream against all of them, cutting the expected
+        // forgery cost from ~2^53 to ~2^53/N.
+        let channels: Vec<u64> = self.topics.subscribed_public_channels();
         let user_count = self
             .storage
             .get_stat(crate::storage::schema::state_keys::TOTAL_USERS)

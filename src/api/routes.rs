@@ -1169,6 +1169,25 @@ pub async fn network_nodes(
 
     // Build self entry — this node always appears first
     let self_user_count = state.storage.get_stat(state_keys::TOTAL_USERS).unwrap_or(0) as u32;
+    // Security-audit finding (2026-10-06): this is a NO-AUTH endpoint, and
+    // private channel ids used to be listed here unfiltered — trivially
+    // enumerable (every key > `PRIVATE_CHANNEL_ID_FLOOR`, which is itself
+    // public knowledge), which meaningfully weakens the private-channel
+    // identity-binding fix: an attacker who can enumerate N real private
+    // ids searches a single Keccak stream against all of them at once,
+    // cutting the expected cost of forging a hit from ~2^53 to ~2^53/N.
+    // `list_channels`/`get_channel` already correctly restrict private
+    // channels to members — this endpoint just never applied the same
+    // rule. Filtering by raw id value (not a second per-row metadata
+    // read) is exact and cheap for any row `validate_channel_create` has
+    // ever validated — it enforces the INVERSE bound for every non-
+    // Private channel, so "id is above the floor" and "channel_type ==
+    // Private" are equivalent there. NOT exact for a legacy row written
+    // before the floor existed (`chain::scanner`'s pre-floor-collision
+    // handling): a pre-floor Private channel's id can still read as
+    // "public" here and leak. Honest client derivation lands above the
+    // floor with overwhelming probability, so the residual exposure is
+    // small, but it is real — see `types::PRIVATE_CHANNEL_ID_FLOOR`'s doc.
     let self_channels: Vec<u64> = state
         .storage
         .prefix_iter_cf(cf::CHANNELS, &[], 10_000)
@@ -1181,6 +1200,7 @@ pub async fn network_nodes(
                 None
             }
         })
+        .filter(|id| crate::messages::types::is_public_channel_id(*id))
         .collect();
     let self_anchor_status = state.storage.compute_anchor_status(&state.node_id).unwrap_or_else(|_| {
         crate::storage::rocks::AnchorStatus {
@@ -1260,9 +1280,18 @@ pub async fn network_nodes(
                         return None;
                     }
                     let api_endpoint = ann.get("api_endpoint").and_then(|v| v.as_str()).map(String::from);
+                    // Defense-in-depth (2026-10-06): the sender is now
+                    // fixed to never announce a private channel_id
+                    // (`NetworkService::publish_node_announcement`), but
+                    // never trust a gossiped peer's own claim about what
+                    // it's omitted — filter here too, same as `self_channels`
+                    // above.
                     let channels: Vec<u64> = ann.get("channels")
                         .and_then(|v| v.as_array())
-                        .map(|arr| arr.iter().filter_map(|v| v.as_u64()).collect())
+                        .map(|arr| arr.iter()
+                            .filter_map(|v| v.as_u64())
+                            .filter(|id| crate::messages::types::is_public_channel_id(*id))
+                            .collect())
                         .unwrap_or_default();
                     let user_count = ann.get("user_count").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
 
@@ -3869,6 +3898,7 @@ mod federate_channel_envelope_guard_tests {
             moderation: ModerationPolicy { admins: vec![], rules: None },
             encryption_enabled: None,
             history_visibility: None,
+            id_derivation_ts: None,
         };
         let env = Envelope {
             version: crate::messages::envelope::PROTOCOL_VERSION,
@@ -10014,6 +10044,7 @@ mod channel_resubscribe_tests {
             moderation: ModerationPolicy { admins: Vec::new(), rules: None },
             encryption_enabled: Some(true),
             history_visibility: None,
+            id_derivation_ts: None,
         };
         let env = envelope(MessageType::ChannelCreate, rmp_serde::to_vec(&payload).unwrap());
         assert_eq!(channel_id_for_resubscribe(&env), Some(4242));

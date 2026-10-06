@@ -338,6 +338,11 @@ pub struct MessageRouter {
     /// `HotTopicsConfig::default()`; production overrides via
     /// `with_hot_topics_config`.
     hot_topics_config: crate::config::HotTopicsConfig,
+    /// Channel-identity-verification policy (security fix, 2026-10-06) —
+    /// currently just `require_private_id_derivation`, see that field's
+    /// doc comment. Defaults to `ChannelVerifyConfig::default()` (`true`);
+    /// production overrides via `with_channel_verify_config`.
+    channel_verify_config: crate::config::ChannelVerifyConfig,
 }
 
 /// Rejection reason for step 4d (tiered identity). Shared with
@@ -421,6 +426,7 @@ impl MessageRouter {
             dm_recipient_cap_lock: std::sync::Mutex::new(()),
             counters,
             hot_topics_config: crate::config::HotTopicsConfig::default(),
+            channel_verify_config: crate::config::ChannelVerifyConfig::default(),
         }
     }
 
@@ -432,6 +438,17 @@ impl MessageRouter {
         cfg: crate::config::HotTopicsConfig,
     ) -> Self {
         self.hot_topics_config = cfg;
+        self
+    }
+
+    /// Override the channel-identity-verification policy (production
+    /// wiring — tests keep the default, which is `require_private_id_
+    /// derivation: true`). Builder-style, mirroring `with_hot_topics_config`.
+    pub fn with_channel_verify_config(
+        mut self,
+        cfg: crate::config::ChannelVerifyConfig,
+    ) -> Self {
+        self.channel_verify_config = cfg;
         self
     }
 
@@ -620,7 +637,7 @@ impl MessageRouter {
         }
 
         // Step 7: Validate payload (type-specific rules — uses resolved author)
-        if let Err(e) = self.validate_payload(&envelope, &resolved_author) {
+        if let Err(e) = self.validate_payload(&envelope, &resolved_author, is_sync) {
             return RouteResult::Rejected(format!("payload validation failed: {}", e));
         }
 
@@ -1194,6 +1211,86 @@ impl MessageRouter {
             .retain(|_, (_, cached_at)| now_ms.saturating_sub(*cached_at) < MAX_WINDOW_MS);
     }
 
+    /// Security fix (2026-10-06), closing the `federate_channel`
+    /// first-sight-trust residual (l2-node 0.138.0's CHANGELOG): decide
+    /// whether a PRIVATE `ChannelCreate` missing `id_derivation_ts` is
+    /// still acceptable. `validate_channel_create`/
+    /// `verify_private_channel_id_derivation` already checked a PRESENT
+    /// derivation; this is purely the absence policy, which needs
+    /// storage access (to know whether this is this node's first-ever
+    /// encounter with the id) that the pure validator doesn't have.
+    ///
+    /// - Live (`!is_sync`): always reject if absent. Step 5's timestamp-
+    ///   freshness check already ran, so a "legacy" LIVE create is
+    ///   impossible by construction — there's no legitimate case to
+    ///   grandfather in, so no cutover timestamp is needed or used.
+    /// - Synced/backfilled, local `CHANNELS` row already exists: accept
+    ///   if absent. This is the pure-merge path
+    ///   (`update_indexes`'s existing-row branch), already gated on
+    ///   `meta["creator"] == resolved_author` — it cannot steal
+    ///   creatorship, so legacy backfill/replay for a channel this node
+    ///   ALREADY knows keeps working. (Round-3 re-audit: a non-creator's
+    ///   competing `ChannelCreate` here used to still land in
+    ///   `CHANNEL_META_MSGS` even though this merge ignored it — closed
+    ///   at the indexing site itself, so the "cannot steal creatorship"
+    ///   claim now holds for both the `CHANNELS` row AND the bootstrap
+    ///   index `channel_bootstrap_envelopes` reads from.)
+    /// - Synced/backfilled, no local row (this node's first-ever
+    ///   encounter): reject if absent. This is exactly the vulnerable
+    ///   case this fix closes — fail closed.
+    ///
+    /// Deliberately NOT a timestamp-based grandfather window: `is_sync`
+    /// skips the drift check entirely, so an attacker delivering a
+    /// forged envelope via federate/backfill can freely backdate
+    /// `Envelope.timestamp` to land inside any cutover window. Row
+    /// existence isn't attacker-forgeable; a timestamp would be.
+    fn require_private_id_derivation(
+        &self,
+        p: &ChannelCreatePayload,
+        is_sync: bool,
+    ) -> Result<(), validation::ValidationError> {
+        if p.channel_type != ChannelType::Private || p.id_derivation_ts.is_some() {
+            return Ok(());
+        }
+        // Security-audit finding (2026-10-06): the config-flag check used
+        // to run BEFORE this one, so `require_private_id_derivation =
+        // false` also disabled the LIVE-create requirement — contradicting
+        // this type's own doc comment, the TOML docs, and the CHANGELOG,
+        // all of which say a live create is "always rejected regardless of
+        // this flag". That let an operator's legacy-federation unblock
+        // silently reopen the full original vulnerability on live
+        // traffic (any registered wallet, any unseen private id). The
+        // live check is unconditional and must stay first; the flag only
+        // ever softens the SYNCED/first-sight branch below.
+        if !is_sync {
+            return Err(validation::ValidationError(
+                "private channel_id derivation required for a live create".into(),
+            ));
+        }
+        if !self.channel_verify_config.require_private_id_derivation {
+            return Ok(());
+        }
+        let row_exists = match self.storage.get_cf(schema::cf::CHANNELS, &p.channel_id.to_be_bytes()) {
+            Ok(v) => v.is_some(),
+            Err(e) => {
+                // Code-audit finding (2026-10-06): a transient storage
+                // error used to silently fall through to `false` (reject)
+                // with no signal at all — fails closed, the right
+                // direction, but invisible to an operator debugging a
+                // legitimate backfill that keeps failing.
+                warn!(channel_id = p.channel_id, error = %e, "require_private_id_derivation: CHANNELS read failed");
+                false
+            }
+        };
+        if row_exists {
+            Ok(())
+        } else {
+            Err(validation::ValidationError(
+                "private channel_id derivation required on first encounter with this channel".into(),
+            ))
+        }
+    }
+
     /// Bounds a Public/ReadPublic `ChannelCreate`'s `channel_id` to
     /// `chain::scanner::PUBLIC_CHANNEL_ID_MARGIN` above the cached
     /// `LAST_KNOWN_CHANNEL_COUNT` (round-5 security audit fix). Mirrors
@@ -1249,14 +1346,20 @@ impl MessageRouter {
     }
 
     /// Validate the payload based on message type.
-    fn validate_payload(&self, envelope: &Envelope, resolved_author: &str) -> Result<(), validation::ValidationError> {
+    fn validate_payload(
+        &self,
+        envelope: &Envelope,
+        resolved_author: &str,
+        is_sync: bool,
+    ) -> Result<(), validation::ValidationError> {
         match deserialize_payload(envelope.msg_type, &envelope.payload) {
             Ok(payload) => match payload {
                 DeserializedPayload::ChatMessage(ref p) => validation::validate_chat_message(p),
                 DeserializedPayload::NewsPost(ref p) => validation::validate_news_post(p),
                 DeserializedPayload::NewsComment(ref p) => validation::validate_news_comment(p),
                 DeserializedPayload::ChannelCreate(ref p) => {
-                    validation::validate_channel_create(p)?;
+                    validation::validate_channel_create(resolved_author, p)?;
+                    self.require_private_id_derivation(p, is_sync)?;
                     self.validate_channel_id_margin(p)
                 }
                 DeserializedPayload::ChannelUpdate(ref p) => validation::validate_channel_update(p),
@@ -2600,14 +2703,44 @@ impl MessageRouter {
                     }
                 };
                 if let Some(cid) = cid {
-                    let key = schema::encode_channel_meta_key(
-                        cid,
-                        envelope.msg_type_u8(),
-                        envelope.timestamp,
-                        &envelope.msg_id,
-                    );
-                    self.storage
-                        .put_cf(schema::cf::CHANNEL_META_MSGS, &key, &[])?;
+                    // Security-audit finding (2026-10-06, round 3): a
+                    // non-creator's competing `ChannelCreate` for an
+                    // ALREADY-KNOWN channel_id used to be indexed here
+                    // unconditionally — the existing-row merge arm below
+                    // only skips the metadata merge for it, it never
+                    // suppressed this index. That gave an attacker who
+                    // merely knows a channel's id (anyone legitimately
+                    // joining also knows it) a standing, real row in
+                    // `CHANNEL_META_MSGS`, which they could then backdate
+                    // via the sync path (drift check skipped, see Step 5)
+                    // to win `channel_bootstrap_envelopes`' earliest/
+                    // creator-preferring selection and permanently break
+                    // federation for the real channel — the exact DoS
+                    // that selection logic was meant to prevent. Checking
+                    // the real creator here removes the attacker's
+                    // foothold instead of only filtering it downstream;
+                    // one extra point read, only for `ChannelCreate`.
+                    let is_impostor_create = envelope.msg_type == MessageType::ChannelCreate
+                        && self
+                            .storage
+                            .get_cf(schema::cf::CHANNELS, &cid.to_be_bytes())
+                            .ok()
+                            .flatten()
+                            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                            .and_then(|v| {
+                                v.get("creator").and_then(|c| c.as_str()).map(String::from)
+                            })
+                            .is_some_and(|creator| creator != resolved_author);
+                    if !is_impostor_create {
+                        let key = schema::encode_channel_meta_key(
+                            cid,
+                            envelope.msg_type_u8(),
+                            envelope.timestamp,
+                            &envelope.msg_id,
+                        );
+                        self.storage
+                            .put_cf(schema::cf::CHANNEL_META_MSGS, &key, &[])?;
+                    }
                 }
             }
         }
@@ -5067,13 +5200,38 @@ mod channel_delete_before_create_tests {
         rmp_serde::to_vec_named(&envelope).unwrap()
     }
 
+    /// Security fix (2026-10-06): private channel_id must now verify
+    /// against `Keccak-256(author + slug + id_derivation_ts) %
+    /// (2^53-1)` on a LIVE create (`process_message`, what every caller
+    /// of this helper uses) — an arbitrary caller-chosen `channel_id`
+    /// would now be rejected, breaking every test using this helper for
+    /// unrelated reasons (invite trust, delete/resurrection convergence).
+    /// Derives a genuinely-matching `channel_id` from `(author, slug,
+    /// timestamp)` instead of accepting one, and returns it so callers
+    /// use the real value rather than an arbitrary one.
     fn signed_create_envelope(
         sk: &ed25519_dalek::SigningKey,
         author: &str,
-        channel_id: u64,
         slug: &str,
         timestamp: u64,
-    ) -> Vec<u8> {
+    ) -> (Vec<u8>, u64) {
+        const JS_SAFE_INTEGER_MODULUS: u64 = (1u64 << 53) - 1;
+        // Re-roll (bump the derivation ts) on the ~1-in-2^21 chance the
+        // derived id lands at/below the floor — same retry the real
+        // client-side fix applies, so this test helper can't flake.
+        let mut candidate_ts = timestamp;
+        let (channel_id, timestamp) = loop {
+            let preimage = format!("{author}{slug}{candidate_ts}");
+            let hash = crypto::keccak256(preimage.as_bytes());
+            let raw = u64::from_be_bytes([
+                hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7],
+            ]);
+            let candidate_id = raw % JS_SAFE_INTEGER_MODULUS;
+            if candidate_id > crate::messages::types::PRIVATE_CHANNEL_ID_FLOOR {
+                break (candidate_id, candidate_ts);
+            }
+            candidate_ts += 1;
+        };
         let payload = ChannelCreatePayload {
             channel_id,
             slug: slug.to_string(),
@@ -5084,6 +5242,7 @@ mod channel_delete_before_create_tests {
             moderation: ModerationPolicy { admins: vec![], rules: None },
             encryption_enabled: None,
             history_visibility: None,
+            id_derivation_ts: Some(timestamp),
         };
         let payload_bytes = rmp_serde::to_vec_named(&payload).unwrap();
         let author_pubkey: [u8; 32] = sk.verifying_key().to_bytes();
@@ -5109,7 +5268,7 @@ mod channel_delete_before_create_tests {
             signature: signature.to_bytes().to_vec(),
             relay_path: vec![],
         };
-        rmp_serde::to_vec_named(&envelope).unwrap()
+        (rmp_serde::to_vec_named(&envelope).unwrap(), channel_id)
     }
 
     fn now_ms() -> u64 {
@@ -5199,11 +5358,10 @@ mod channel_delete_before_create_tests {
         let creator_sk = crypto::generate_keypair();
         let creator = crypto::pubkey_to_address(&creator_sk.verifying_key()).unwrap();
         register_user(&r, &creator, 1_000);
-        // Above `PRIVATE_CHANNEL_ID_FLOOR` (round-4 audit fix,
-        // validation.rs): `signed_create_envelope` builds a Private-typed
-        // payload, which now requires a properly-derived (large) id.
-        let cid = (1u64 << 32) + 4247;
-        let create_raw = signed_create_envelope(&creator_sk, &creator, cid, "test-channel", now_ms());
+        // `signed_create_envelope` derives a properly-formed (large,
+        // identity-bound) private channel_id itself (security fix,
+        // 2026-10-06) — no caller-chosen id needed anymore.
+        let (create_raw, cid) = signed_create_envelope(&creator_sk, &creator, "test-channel", now_ms());
         assert!(matches!(r.process_message(&create_raw), RouteResult::Accepted { .. }));
 
         let raw = signed_invite_envelope(&creator_sk, &creator, cid, "klv1target", now_ms() + 1);
@@ -5225,9 +5383,9 @@ mod channel_delete_before_create_tests {
         let creator_sk = crypto::generate_keypair();
         let creator = crypto::pubkey_to_address(&creator_sk.verifying_key()).unwrap();
         register_user(&r, &creator, 1_000);
-        // Above `PRIVATE_CHANNEL_ID_FLOOR` — see the sibling test above.
-        let cid = (1u64 << 32) + 4245;
-        let create_raw = signed_create_envelope(&creator_sk, &creator, cid, "test-channel", now_ms());
+        // See the sibling test above re: `signed_create_envelope`'s
+        // self-derived channel_id.
+        let (create_raw, cid) = signed_create_envelope(&creator_sk, &creator, "test-channel", now_ms());
         assert!(matches!(r.process_message(&create_raw), RouteResult::Accepted { .. }));
 
         let outsider_sk = crypto::generate_keypair();
@@ -5247,14 +5405,14 @@ mod channel_delete_before_create_tests {
         let sk = crypto::generate_keypair();
         let creator = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
         register_user(&r, &creator, 1_000);
-        // Above `PRIVATE_CHANNEL_ID_FLOOR` — see the comment on the
-        // earlier test in this module.
-        let cid = (1u64 << 32) + 4243;
-
+        // Build both envelopes up front (the create's self-derived id is
+        // needed to target the delete at the SAME channel), but PROCESS
+        // them in the original order (delete claim first, then the real
+        // create) — that processing order is what this test exercises.
+        let (create_raw, cid) = signed_create_envelope(&sk, &creator, "test-channel", now_ms() + 1);
         let delete_raw = signed_delete_envelope(&sk, &creator, cid, now_ms());
-        assert!(matches!(r.process_message(&delete_raw), RouteResult::Accepted { .. }));
 
-        let create_raw = signed_create_envelope(&sk, &creator, cid, "test-channel", now_ms() + 1);
+        assert!(matches!(r.process_message(&delete_raw), RouteResult::Accepted { .. }));
         assert!(matches!(r.process_message(&create_raw), RouteResult::Accepted { .. }));
 
         assert!(
@@ -5280,17 +5438,18 @@ mod channel_delete_before_create_tests {
         let real_creator_sk = crypto::generate_keypair();
         let real_creator = crypto::pubkey_to_address(&real_creator_sk.verifying_key()).unwrap();
         register_user(&r, &real_creator, 1_000);
-        // Above `PRIVATE_CHANNEL_ID_FLOOR` — see the comment on the
-        // earlier test in this module.
-        let cid = (1u64 << 32) + 4244;
+        // Build the real creator's envelope first to learn the (self-
+        // derived) channel_id the attacker will "guess" — then process
+        // in the original order (attacker's delete claim first, real
+        // create second).
+        let (create_raw, cid) =
+            signed_create_envelope(&real_creator_sk, &real_creator, "test-channel", now_ms() + 1);
 
         // Attacker guesses the not-yet-used channel_id and claims to delete it.
         let delete_raw = signed_delete_envelope(&attacker_sk, &attacker, cid, now_ms());
         assert!(matches!(r.process_message(&delete_raw), RouteResult::Accepted { .. }));
 
         // The real creator later actually creates it.
-        let create_raw =
-            signed_create_envelope(&real_creator_sk, &real_creator, cid, "test-channel", now_ms() + 1);
         assert!(matches!(r.process_message(&create_raw), RouteResult::Accepted { .. }));
 
         assert!(
@@ -5371,6 +5530,7 @@ mod channel_delete_before_create_tests {
             moderation: ModerationPolicy { admins: vec![], rules: None },
             encryption_enabled: None,
             history_visibility: None,
+            id_derivation_ts: None,
         };
         // Positional array encoding, matching sdk-rust's wire form — NOT
         // `to_vec_named` (which every OTHER helper in this module uses).
@@ -5414,6 +5574,545 @@ mod channel_delete_before_create_tests {
              CHANNEL_META_MSGS so a backfilling peer can be served this \
              channel's metadata"
         );
+    }
+
+    // --- Security fix (2026-10-06): private channel_id identity-binding,
+    // absence policy (MessageRouter::require_private_id_derivation) ---
+
+    #[test]
+    fn live_private_create_without_derivation_is_rejected() {
+        // !is_sync: Step 5's timestamp-freshness check already ran, so a
+        // "legacy" LIVE create without a derivation is impossible by
+        // construction — always reject, no cutover window.
+        let (r, _d) = router();
+        let sk = crypto::generate_keypair();
+        let creator = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        register_user(&r, &creator, 1_000);
+
+        let payload = ChannelCreatePayload {
+            channel_id: (1u64 << 32) + 9001,
+            slug: "test-channel".to_string(),
+            channel_type: ChannelType::Private,
+            display_name: None,
+            description: None,
+            content_rating: Default::default(),
+            moderation: ModerationPolicy { admins: vec![], rules: None },
+            encryption_enabled: None,
+            history_visibility: None,
+            id_derivation_ts: None, // absent — the vulnerable shape
+        };
+        let payload_bytes = rmp_serde::to_vec_named(&payload).unwrap();
+        let timestamp = now_ms();
+        let author_pubkey: [u8; 32] = sk.verifying_key().to_bytes();
+        let msg_id = crypto::compute_msg_id("testnet", &author_pubkey, &payload_bytes, timestamp);
+        let signature = signing::sign_ogmara_message(
+            &sk,
+            "testnet",
+            crate::messages::envelope::PROTOCOL_VERSION,
+            MessageType::ChannelCreate as u8,
+            &msg_id,
+            timestamp,
+            &payload_bytes,
+        );
+        let envelope = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::ChannelCreate,
+            msg_id,
+            author: creator,
+            timestamp,
+            lamport_ts: 0,
+            payload: payload_bytes,
+            signature: signature.to_bytes().to_vec(),
+            relay_path: vec![],
+        };
+        let raw = rmp_serde::to_vec_named(&envelope).unwrap();
+        match r.process_message(&raw) {
+            RouteResult::Rejected(_) => {}
+            other => panic!("expected Rejected (live create needs a derivation), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn synced_private_create_first_sight_without_derivation_is_rejected() {
+        // is_sync + no local CHANNELS row (first-ever encounter): exactly
+        // the federate_channel first-sight-trust case this fix closes —
+        // fail closed.
+        let (r, _d) = router();
+        let sk = crypto::generate_keypair();
+        let creator = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        register_user(&r, &creator, 1_000);
+
+        let payload = ChannelCreatePayload {
+            channel_id: (1u64 << 32) + 9002,
+            slug: "test-channel".to_string(),
+            channel_type: ChannelType::Private,
+            display_name: None,
+            description: None,
+            content_rating: Default::default(),
+            moderation: ModerationPolicy { admins: vec![], rules: None },
+            encryption_enabled: None,
+            history_visibility: None,
+            id_derivation_ts: None,
+        };
+        let payload_bytes = rmp_serde::to_vec_named(&payload).unwrap();
+        let timestamp = now_ms();
+        let author_pubkey: [u8; 32] = sk.verifying_key().to_bytes();
+        let msg_id = crypto::compute_msg_id("testnet", &author_pubkey, &payload_bytes, timestamp);
+        let signature = signing::sign_ogmara_message(
+            &sk,
+            "testnet",
+            crate::messages::envelope::PROTOCOL_VERSION,
+            MessageType::ChannelCreate as u8,
+            &msg_id,
+            timestamp,
+            &payload_bytes,
+        );
+        let envelope = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::ChannelCreate,
+            msg_id,
+            author: creator,
+            timestamp,
+            lamport_ts: 0,
+            payload: payload_bytes,
+            signature: signature.to_bytes().to_vec(),
+            relay_path: vec![],
+        };
+        let raw = rmp_serde::to_vec_named(&envelope).unwrap();
+        match r.process_synced_message(&raw) {
+            RouteResult::Rejected(_) => {}
+            other => panic!("expected Rejected (first sight needs a derivation), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn synced_private_create_for_an_already_known_channel_accepts_absent_derivation() {
+        // is_sync + a local CHANNELS row already exists: the pure-merge
+        // path, already creator-gated — legacy backfill/replay for a
+        // channel this node ALREADY knows must keep working even without
+        // a derivation.
+        let (r, _d) = router();
+        let sk = crypto::generate_keypair();
+        let creator = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        register_user(&r, &creator, 1_000);
+        let channel_id = (1u64 << 32) + 9003;
+        make_channel(&r, channel_id, &creator);
+
+        let payload = ChannelCreatePayload {
+            channel_id,
+            slug: "test-channel".to_string(),
+            channel_type: ChannelType::Private,
+            display_name: None,
+            description: None,
+            content_rating: Default::default(),
+            moderation: ModerationPolicy { admins: vec![], rules: None },
+            encryption_enabled: None,
+            history_visibility: None,
+            id_derivation_ts: None,
+        };
+        let payload_bytes = rmp_serde::to_vec_named(&payload).unwrap();
+        let timestamp = now_ms();
+        let author_pubkey: [u8; 32] = sk.verifying_key().to_bytes();
+        let msg_id = crypto::compute_msg_id("testnet", &author_pubkey, &payload_bytes, timestamp);
+        let signature = signing::sign_ogmara_message(
+            &sk,
+            "testnet",
+            crate::messages::envelope::PROTOCOL_VERSION,
+            MessageType::ChannelCreate as u8,
+            &msg_id,
+            timestamp,
+            &payload_bytes,
+        );
+        let envelope = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::ChannelCreate,
+            msg_id,
+            author: creator,
+            timestamp,
+            lamport_ts: 0,
+            payload: payload_bytes,
+            signature: signature.to_bytes().to_vec(),
+            relay_path: vec![],
+        };
+        let raw = rmp_serde::to_vec_named(&envelope).unwrap();
+        assert!(matches!(r.process_synced_message(&raw), RouteResult::Accepted { .. }));
+    }
+
+    /// Security-audit finding (2026-10-06, round 3): the test above proves
+    /// a non-creator's absent-derivation create is ACCEPTED on the synced+
+    /// existing-row path (by design — legacy backfill must keep working).
+    /// But acceptance alone used to also index the envelope into
+    /// `CHANNEL_META_MSGS` unconditionally, handing an attacker who merely
+    /// knows a private channel's id a standing row they could backdate to
+    /// win `channel_bootstrap_envelopes`' selection — the DoS this test
+    /// guards against. The row must be accepted (merge logic drops it)
+    /// but must NOT be indexed at all.
+    #[test]
+    fn synced_non_creator_create_for_a_known_channel_is_accepted_but_not_indexed() {
+        let (r, _d) = router();
+        let creator_sk = crypto::generate_keypair();
+        let creator = crypto::pubkey_to_address(&creator_sk.verifying_key()).unwrap();
+        register_user(&r, &creator, 1_000);
+        let channel_id = (1u64 << 32) + 9004;
+        make_channel(&r, channel_id, &creator);
+
+        let attacker_sk = crypto::generate_keypair();
+        let attacker = crypto::pubkey_to_address(&attacker_sk.verifying_key()).unwrap();
+        register_user(&r, &attacker, 1_000);
+
+        let payload = ChannelCreatePayload {
+            channel_id,
+            slug: "test-channel".to_string(),
+            channel_type: ChannelType::Private,
+            display_name: None,
+            description: None,
+            content_rating: Default::default(),
+            moderation: ModerationPolicy { admins: vec![], rules: None },
+            encryption_enabled: None,
+            history_visibility: None,
+            id_derivation_ts: None,
+        };
+        let payload_bytes = rmp_serde::to_vec_named(&payload).unwrap();
+        let timestamp = now_ms();
+        let author_pubkey: [u8; 32] = attacker_sk.verifying_key().to_bytes();
+        let msg_id = crypto::compute_msg_id("testnet", &author_pubkey, &payload_bytes, timestamp);
+        let signature = signing::sign_ogmara_message(
+            &attacker_sk,
+            "testnet",
+            crate::messages::envelope::PROTOCOL_VERSION,
+            MessageType::ChannelCreate as u8,
+            &msg_id,
+            timestamp,
+            &payload_bytes,
+        );
+        let envelope = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::ChannelCreate,
+            msg_id,
+            author: attacker,
+            timestamp,
+            lamport_ts: 0,
+            payload: payload_bytes,
+            signature: signature.to_bytes().to_vec(),
+            relay_path: vec![],
+        };
+        let raw = rmp_serde::to_vec_named(&envelope).unwrap();
+
+        assert!(matches!(r.process_synced_message(&raw), RouteResult::Accepted { .. }));
+
+        let key = schema::encode_channel_meta_key(
+            channel_id,
+            MessageType::ChannelCreate as u8,
+            timestamp,
+            &msg_id,
+        );
+        assert!(
+            !r.storage.exists_cf(schema::cf::CHANNEL_META_MSGS, &key).unwrap_or(true),
+            "a non-creator's ChannelCreate for an already-known channel must be accepted (merge \
+             logic drops it) but never indexed into CHANNEL_META_MSGS — indexing it hands an \
+             attacker who merely knows the channel_id a standing row to backdate and win \
+             channel_bootstrap_envelopes' selection"
+        );
+    }
+
+    fn router_with_flag(require_private_id_derivation: bool) -> (MessageRouter, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let identity = IdentityResolver::new(storage.clone());
+        let r = MessageRouter::new(
+            storage,
+            identity,
+            None,
+            "testnet".to_string(),
+            usize::MAX,
+            std::sync::Arc::new(crate::metrics::counters::NetworkCounters::new()),
+            crate::config::RateLimitsConfig::default(),
+        )
+        .with_channel_verify_config(crate::config::ChannelVerifyConfig {
+            require_private_id_derivation,
+            ..Default::default()
+        });
+        (r, dir)
+    }
+
+    fn unsigned_private_create_envelope(
+        sk: &ed25519_dalek::SigningKey,
+        author: &str,
+        channel_id: u64,
+        id_derivation_ts: Option<u64>,
+        timestamp: u64,
+    ) -> Vec<u8> {
+        let payload = ChannelCreatePayload {
+            channel_id,
+            slug: "test-channel".to_string(),
+            channel_type: ChannelType::Private,
+            display_name: None,
+            description: None,
+            content_rating: Default::default(),
+            moderation: ModerationPolicy { admins: vec![], rules: None },
+            encryption_enabled: None,
+            history_visibility: None,
+            id_derivation_ts,
+        };
+        let payload_bytes = rmp_serde::to_vec_named(&payload).unwrap();
+        let author_pubkey: [u8; 32] = sk.verifying_key().to_bytes();
+        let msg_id = crypto::compute_msg_id("testnet", &author_pubkey, &payload_bytes, timestamp);
+        let signature = signing::sign_ogmara_message(
+            &sk,
+            "testnet",
+            crate::messages::envelope::PROTOCOL_VERSION,
+            MessageType::ChannelCreate as u8,
+            &msg_id,
+            timestamp,
+            &payload_bytes,
+        );
+        let envelope = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::ChannelCreate,
+            msg_id,
+            author: author.to_string(),
+            timestamp,
+            lamport_ts: 0,
+            payload: payload_bytes,
+            signature: signature.to_bytes().to_vec(),
+            relay_path: vec![],
+        };
+        rmp_serde::to_vec_named(&envelope).unwrap()
+    }
+
+    /// Security-audit regression (2026-10-06): the config flag check used
+    /// to run BEFORE the `!is_sync` guard, so `require_private_id_
+    /// derivation = false` also accepted an absent derivation on a LIVE
+    /// create — silently reopening the full original vulnerability on
+    /// live traffic. The flag must NEVER soften the live-create
+    /// requirement, only the synced/first-sight one.
+    #[test]
+    fn require_private_id_derivation_false_still_rejects_a_live_create_missing_derivation() {
+        let (r, _d) = router_with_flag(false);
+        let sk = crypto::generate_keypair();
+        let creator = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        register_user(&r, &creator, 1_000);
+        let raw = unsigned_private_create_envelope(&sk, &creator, (1u64 << 32) + 9005, None, now_ms());
+        match r.process_message(&raw) {
+            RouteResult::Rejected(_) => {}
+            other => panic!(
+                "the escape hatch must never accept a LIVE create missing its derivation, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn require_private_id_derivation_false_accepts_synced_first_sight_absence() {
+        // The escape hatch's actual, documented scope: only the
+        // synced/first-sight branch (an operator unblocking a legacy
+        // pre-upgrade channel that needs to federate onto a fresh node).
+        let (r, _d) = router_with_flag(false);
+        let sk = crypto::generate_keypair();
+        let creator = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        register_user(&r, &creator, 1_000);
+        let raw = unsigned_private_create_envelope(&sk, &creator, (1u64 << 32) + 9006, None, now_ms());
+        assert!(matches!(r.process_synced_message(&raw), RouteResult::Accepted { .. }));
+    }
+
+    #[test]
+    fn require_private_id_derivation_false_still_rejects_a_present_mismatched_derivation() {
+        // The flag only ever softens ABSENCE policy — a PRESENT derivation
+        // is unconditionally verified (`validate_channel_create` has no
+        // access to this flag at all), flag or no flag.
+        let (r, _d) = router_with_flag(false);
+        let sk = crypto::generate_keypair();
+        let creator = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        register_user(&r, &creator, 1_000);
+        // A channel_id that does NOT match Keccak-256(creator+slug+ts) for
+        // this ts — i.e. a present, wrong derivation.
+        let raw = unsigned_private_create_envelope(
+            &sk,
+            &creator,
+            (1u64 << 32) + 9007,
+            Some(1_700_000_000_000),
+            now_ms(),
+        );
+        match r.process_synced_message(&raw) {
+            RouteResult::Rejected(_) => {}
+            other => panic!("a present-but-mismatched derivation must be rejected regardless of the flag, got {:?}", other),
+        }
+    }
+
+    /// Security fix (2026-10-06): the hash must use the resolved WALLET
+    /// address, never the signing DEVICE key — a delegated device's
+    /// `ChannelCreate` must verify against its wallet.
+    #[test]
+    fn device_delegated_create_verifies_against_the_wallet_address_not_the_device_key() {
+        let (r, _d) = router();
+        let wallet_sk = crypto::generate_keypair();
+        let wallet = crypto::pubkey_to_address(&wallet_sk.verifying_key()).unwrap();
+        register_user(&r, &wallet, 1_000);
+
+        let device_sk = crypto::generate_keypair();
+        let device_address = crypto::device_pubkey_to_address(&device_sk.verifying_key()).unwrap();
+        r.identity
+            .register_device(&crate::storage::rocks::DeviceClaim {
+                device_address: device_address.clone(),
+                wallet_address: wallet.clone(),
+                device_pubkey_hex: hex::encode(device_sk.verifying_key().to_bytes()),
+                wallet_signature: "test".to_string(),
+                registered_at: 1_000,
+            })
+            .unwrap();
+
+        let slug = "test-channel";
+        let ts = now_ms();
+        const JS_SAFE_INTEGER_MODULUS: u64 = (1u64 << 53) - 1;
+        const FLOOR: u64 = 1 << 32;
+        let derive = |addr: &str, t: u64| -> u64 {
+            let preimage = format!("{addr}{slug}{t}");
+            let hash = crypto::keccak256(preimage.as_bytes());
+            let raw = u64::from_be_bytes([
+                hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7],
+            ]);
+            raw % JS_SAFE_INTEGER_MODULUS
+        };
+        // Hash over the WALLET address (what a compliant client does) —
+        // must be accepted even though the envelope is signed by the device key.
+        let mut ts_wallet = ts;
+        let channel_id = loop {
+            let id = derive(&wallet, ts_wallet);
+            if id > FLOOR {
+                break id;
+            }
+            ts_wallet += 1;
+        };
+        let payload = ChannelCreatePayload {
+            channel_id,
+            slug: slug.to_string(),
+            channel_type: ChannelType::Private,
+            display_name: None,
+            description: None,
+            content_rating: Default::default(),
+            moderation: ModerationPolicy { admins: vec![], rules: None },
+            encryption_enabled: None,
+            history_visibility: None,
+            id_derivation_ts: Some(ts_wallet),
+        };
+        let payload_bytes = rmp_serde::to_vec_named(&payload).unwrap();
+        let device_pubkey: [u8; 32] = device_sk.verifying_key().to_bytes();
+        let msg_id = crypto::compute_msg_id("testnet", &device_pubkey, &payload_bytes, ts_wallet);
+        let signature = signing::sign_ogmara_message(
+            &device_sk,
+            "testnet",
+            crate::messages::envelope::PROTOCOL_VERSION,
+            MessageType::ChannelCreate as u8,
+            &msg_id,
+            ts_wallet,
+            &payload_bytes,
+        );
+        let envelope = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::ChannelCreate,
+            msg_id,
+            author: device_address.clone(), // envelope signed by the DEVICE key
+            timestamp: ts_wallet,
+            lamport_ts: 0,
+            payload: payload_bytes,
+            signature: signature.to_bytes().to_vec(),
+            relay_path: vec![],
+        };
+        let raw = rmp_serde::to_vec_named(&envelope).unwrap();
+        let result = r.process_message(&raw);
+        assert!(
+            matches!(result, RouteResult::Accepted { .. }),
+            "hash over the resolved WALLET address must verify even though the envelope is \
+             device-key-signed, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn device_delegated_create_hashed_over_the_device_key_is_rejected() {
+        // Same setup as above, but the hash is computed over the DEVICE
+        // address instead of the wallet — a buggy (or malicious) client
+        // doing this must be rejected, not silently accepted.
+        let (r, _d) = router();
+        let wallet_sk = crypto::generate_keypair();
+        let wallet = crypto::pubkey_to_address(&wallet_sk.verifying_key()).unwrap();
+        register_user(&r, &wallet, 1_000);
+
+        let device_sk = crypto::generate_keypair();
+        let device_address = crypto::device_pubkey_to_address(&device_sk.verifying_key()).unwrap();
+        r.identity
+            .register_device(&crate::storage::rocks::DeviceClaim {
+                device_address: device_address.clone(),
+                wallet_address: wallet.clone(),
+                device_pubkey_hex: hex::encode(device_sk.verifying_key().to_bytes()),
+                wallet_signature: "test".to_string(),
+                registered_at: 1_000,
+            })
+            .unwrap();
+
+        let slug = "test-channel";
+        const JS_SAFE_INTEGER_MODULUS: u64 = (1u64 << 53) - 1;
+        const FLOOR: u64 = 1 << 32;
+        let derive = |addr: &str, t: u64| -> u64 {
+            let preimage = format!("{addr}{slug}{t}");
+            let hash = crypto::keccak256(preimage.as_bytes());
+            let raw = u64::from_be_bytes([
+                hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7],
+            ]);
+            raw % JS_SAFE_INTEGER_MODULUS
+        };
+        let mut ts_device = now_ms();
+        let channel_id = loop {
+            let id = derive(&device_address, ts_device);
+            if id > FLOOR {
+                break id;
+            }
+            ts_device += 1;
+        };
+        let payload = ChannelCreatePayload {
+            channel_id,
+            slug: slug.to_string(),
+            channel_type: ChannelType::Private,
+            display_name: None,
+            description: None,
+            content_rating: Default::default(),
+            moderation: ModerationPolicy { admins: vec![], rules: None },
+            encryption_enabled: None,
+            history_visibility: None,
+            id_derivation_ts: Some(ts_device),
+        };
+        let payload_bytes = rmp_serde::to_vec_named(&payload).unwrap();
+        let device_pubkey: [u8; 32] = device_sk.verifying_key().to_bytes();
+        let msg_id = crypto::compute_msg_id("testnet", &device_pubkey, &payload_bytes, ts_device);
+        let signature = signing::sign_ogmara_message(
+            &device_sk,
+            "testnet",
+            crate::messages::envelope::PROTOCOL_VERSION,
+            MessageType::ChannelCreate as u8,
+            &msg_id,
+            ts_device,
+            &payload_bytes,
+        );
+        let envelope = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::ChannelCreate,
+            msg_id,
+            author: device_address,
+            timestamp: ts_device,
+            lamport_ts: 0,
+            payload: payload_bytes,
+            signature: signature.to_bytes().to_vec(),
+            relay_path: vec![],
+        };
+        let raw = rmp_serde::to_vec_named(&envelope).unwrap();
+        match r.process_message(&raw) {
+            RouteResult::Rejected(_) => {}
+            other => panic!(
+                "a hash computed over the device address (not the resolved wallet) must be \
+                 rejected, got {:?}",
+                other
+            ),
+        }
     }
 }
 
@@ -5492,6 +6191,7 @@ mod channel_create_encryption_merge_tests {
             // What desktop actually sends (ChannelCreateView.tsx: `encryptionEnabled: true`).
             encryption_enabled: Some(true),
             history_visibility: None,
+            id_derivation_ts: None,
         };
         let payload_bytes = rmp_serde::to_vec_named(&payload).unwrap();
         let author_pubkey: [u8; 32] = sk.verifying_key().to_bytes();

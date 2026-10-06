@@ -1665,7 +1665,8 @@ impl Node {
             network_counters.clone(),
             self.config.api.rate_limits.clone(),
         )
-        .with_hot_topics_config(self.config.hot_topics.clone());
+        .with_hot_topics_config(self.config.hot_topics.clone())
+        .with_channel_verify_config(self.config.channel_verify.clone());
 
         // Start metrics collector (spec 10-dashboard.md §6)
         let node_address = self.address().unwrap_or_default();

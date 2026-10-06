@@ -634,8 +634,10 @@ pub(crate) fn channel_meta_envelopes(storage: &Storage, channel_id: u64) -> Vec<
     out.into_iter().map(|(_, raw)| raw).collect()
 }
 
-/// Fetch the EARLIEST `ChannelCreate` and ALL `ChannelUpdate` (ts-ascending)
-/// original signed envelopes for `channel_id`, for federation bootstrap
+/// Fetch the known CREATOR's `ChannelCreate` (falling back to EARLIEST
+/// only on a genuine first sight, with no local row to check against)
+/// and ALL `ChannelUpdate` (ts-ascending) original signed envelopes for
+/// `channel_id`, for federation bootstrap
 /// (`api::routes::federate_channel` / `get_channel`'s restricted
 /// response). Security-audit finding (2026-10-05): `federate_channel`
 /// used to trust a bespoke JSON summary scraped from an unauthenticated
@@ -704,16 +706,72 @@ pub(crate) fn channel_bootstrap_envelopes(
     channel_id: u64,
 ) -> (Option<Vec<u8>>, Vec<Vec<u8>>) {
     const BOOTSTRAP_UPDATE_CAP: usize = 256;
+    const BOOTSTRAP_CREATE_SCAN_CAP: usize = 256;
+
+    // Security-audit finding (2026-10-06): taking the single oldest
+    // `CHANNEL_META_MSGS` row unconditionally let an attacker who already
+    // knows (or has federated) an EXISTING channel's id inject a
+    // competing, artificially-backdated `ChannelCreate` — accepted via
+    // the sync path (whose drift check is skipped) and indexed
+    // unconditionally even though the merge step ignores its effect on
+    // `CHANNELS` — that then became "the" bootstrap envelope served to
+    // every future first-sight node. Since it carries no matching
+    // derivation, every such node rejects it, turning a perfectly
+    // legitimate, already-verified channel permanently unfederatable —
+    // the fix for forged FIRST sight creating a second-order DoS on
+    // genuine channels. Fixed: when this node already has an
+    // authoritative `CHANNELS` row, prefer the create envelope whose
+    // AUTHOR matches the row's real `creator` over merely "the
+    // earliest" — a competing claim from any other author is excluded
+    // regardless of timestamp.
+    //
+    // Round-3 re-audit found the round-2 fix above still didn't work:
+    // (a) `envelope_author_is` compared the raw, possibly device-signed
+    // `Envelope.author` against the WALLET-valued `creator` field, so it
+    // silently never matched for any device-delegated create — now
+    // resolved to the wallet before comparing, same as `update_indexes`'
+    // own `resolved_author`; and (b) the "no match" fallback used to
+    // retry at earliest-wins, which is exactly as gameable as the
+    // original bug once (a) is accounted for. `update_indexes` now
+    // refuses to even INDEX a non-creator's competing `ChannelCreate`
+    // for an already-known channel (see its own comment), so "no match"
+    // here should mean "no candidate at all," not "the real creator's
+    // envelope must be hiding under a different author" — fall back to
+    // nothing rather than to a row this node already knows isn't the
+    // creator's. Only with NO local row at all (genuine first sight,
+    // nothing to compare against yet) does this use earliest-wins, which
+    // stays the documented, irreducible residual for that specific case
+    // (see this function's doc comment above).
+    let known_creator = storage
+        .get_cf(schema::cf::CHANNELS, &channel_id.to_be_bytes())
+        .ok()
+        .flatten()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| v.get("creator").and_then(|c| c.as_str()).map(|s| s.to_string()));
 
     let create = {
         let mut prefix = channel_id.to_be_bytes().to_vec();
         prefix.push(MessageType::ChannelCreate as u8);
-        storage
-            .prefix_iter_cf(schema::cf::CHANNEL_META_MSGS, &prefix, 1)
-            .ok()
-            .and_then(|rows| rows.into_iter().next())
-            .and_then(|(key, _)| bootstrap_msg_id(&key))
-            .and_then(|msg_id| storage.get_message(&msg_id).ok().flatten())
+        let rows = storage
+            .prefix_iter_cf(schema::cf::CHANNEL_META_MSGS, &prefix, BOOTSTRAP_CREATE_SCAN_CAP)
+            .unwrap_or_default();
+        let mut candidates = rows
+            .into_iter()
+            .filter_map(|(key, _)| bootstrap_msg_id(&key))
+            .filter_map(|msg_id| storage.get_message(&msg_id).ok().flatten());
+        match &known_creator {
+            // No fallback to earliest-wins here: `update_indexes` no
+            // longer indexes a non-creator's competing create for a
+            // known channel at all, so every remaining candidate really
+            // is creator-authored (modulo device-key resolution, which
+            // `envelope_author_is` now handles) — "no match" means no
+            // candidate exists, and serving a known-non-creator's
+            // envelope is strictly worse than serving none (the
+            // requester rejects either outcome, but only the latter
+            // can't be weaponized to permanently poison the selection).
+            Some(creator) => candidates.find(|raw| envelope_author_is(storage, raw, creator)),
+            None => candidates.next(),
+        }
     };
 
     let updates = {
@@ -739,6 +797,34 @@ pub(crate) fn channel_bootstrap_envelopes(
     };
 
     (create, updates)
+}
+
+/// Top-level `Envelope` decode only (never the payload) — safe regardless
+/// of payload content, same pattern as every other "peek at a plain
+/// struct field" decode in this module. Used by `channel_bootstrap_
+/// envelopes` to filter candidate `ChannelCreate` envelopes by author
+/// without needing to deserialize the payload at all.
+///
+/// `expected_author` (the `CHANNELS` row's `creator` field) is always a
+/// WALLET address — `update_indexes` writes it from `resolved_author`,
+/// never the raw envelope author. A device-delegated `ChannelCreate`'s
+/// `Envelope.author` is the device's `ogd1...` address, not the wallet,
+/// so comparing it directly (round-2's bug, caught in round-3 re-audit)
+/// silently never matched any device-signed create — resolve to the
+/// wallet first, same as `IdentityResolver::resolve`'s own fallback
+/// (device unregistered/already-a-wallet → use the address as-is).
+fn envelope_author_is(storage: &Storage, raw: &[u8], expected_author: &str) -> bool {
+    match rmp_serde::from_slice::<crate::messages::envelope::Envelope>(raw) {
+        Ok(env) => {
+            let wallet = storage
+                .resolve_wallet(&env.author)
+                .ok()
+                .flatten()
+                .unwrap_or(env.author);
+            wallet == expected_author
+        }
+        Err(_) => false,
+    }
 }
 
 /// Extract the `msg_id` suffix from a `CHANNEL_META_MSGS` key
@@ -1286,6 +1372,35 @@ mod channel_bootstrap_envelopes_tests {
             .unwrap();
     }
 
+    fn put_meta_envelope_by(
+        s: &Storage,
+        channel_id: u64,
+        msg_type: MessageType,
+        msg_id: [u8; 32],
+        ts: u64,
+        author: &str,
+    ) {
+        let env = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type,
+            msg_id,
+            author: author.to_string(),
+            timestamp: ts,
+            lamport_ts: 0,
+            payload: Vec::new(),
+            signature: vec![],
+            relay_path: vec![],
+        };
+        s.put_cf(
+            schema::cf::CHANNEL_META_MSGS,
+            &schema::encode_channel_meta_key(channel_id, msg_type as u8, ts, &msg_id),
+            &[],
+        )
+        .unwrap();
+        s.put_cf(schema::cf::MESSAGES, &msg_id, &rmp_serde::to_vec_named(&env).unwrap())
+            .unwrap();
+    }
+
     fn msg_id_of(raw: &[u8]) -> [u8; 32] {
         rmp_serde::from_slice::<Envelope>(raw).unwrap().msg_id
     }
@@ -1354,6 +1469,132 @@ mod channel_bootstrap_envelopes_tests {
             create.map(|r| msg_id_of(&r)),
             Some([1u8; 32]),
             "must return the EARLIEST ChannelCreate, not the latest"
+        );
+    }
+
+    /// Security-audit fix (2026-10-06): "earliest wins" alone is
+    /// defeatable once a channel is already known locally. An attacker
+    /// can get their OWN competing `ChannelCreate` accepted+indexed with
+    /// an artificially-backdated (earlier-than-genuine) timestamp via the
+    /// sync path, since it skips the freshness check — "earliest" would
+    /// then select the IMPOSTOR's envelope forever, and every future
+    /// first-sight node rejects it (no matching derivation), permanently
+    /// DoS-ing a perfectly legitimate channel's federation. Once a local
+    /// `CHANNELS` row exists, the real `creator` field is a stronger
+    /// anchor than raw timestamp order — the selection must prefer the
+    /// candidate whose AUTHOR matches it, regardless of which one is
+    /// chronologically earliest.
+    #[test]
+    fn once_a_channel_is_known_the_creators_envelope_wins_even_if_backdated_earlier() {
+        let (s, _d) = db();
+        let channel_id = 6u64;
+        let real_creator = "klv1realcreator";
+        let attacker = "klv1attacker";
+
+        // Establish the authoritative CHANNELS row (as the real
+        // ChannelCreate's own apply step would have done).
+        let meta = serde_json::json!({
+            "channel_id": channel_id,
+            "channel_type": 2u8,
+            "creator": real_creator,
+        });
+        s.put_cf(schema::cf::CHANNELS, &channel_id.to_be_bytes(), meta.to_string().as_bytes())
+            .unwrap();
+
+        // The genuine creator's envelope, indexed at ts=5000.
+        put_meta_envelope_by(&s, channel_id, MessageType::ChannelCreate, [1u8; 32], 5_000, real_creator);
+        // An attacker's competing claim, backdated to ts=100 — earlier
+        // than the genuine one, exactly the forgery this test guards
+        // against.
+        put_meta_envelope_by(&s, channel_id, MessageType::ChannelCreate, [9u8; 32], 100, attacker);
+
+        let (create, _updates) = channel_bootstrap_envelopes(&s, channel_id);
+        assert_eq!(
+            create.map(|r| msg_id_of(&r)),
+            Some([1u8; 32]),
+            "must prefer the envelope authored by the row's REAL creator, not the chronologically \
+             earliest one — an attacker's backdated claim must never win once the channel is known"
+        );
+    }
+
+    /// Round-3 re-audit finding: the round-2 fix compared the raw
+    /// `Envelope.author` against the `CHANNELS` row's WALLET-valued
+    /// `creator`, so it silently never matched a device-delegated
+    /// create — the genuine creator's envelope fell through to the "no
+    /// match" path on every device-signed channel, which is the normal
+    /// case, not an edge case. Register a device→wallet mapping and sign
+    /// the real creator's envelope with the DEVICE address to prove the
+    /// resolved comparison still picks it over the attacker's.
+    #[test]
+    fn creator_preference_resolves_a_device_signed_envelope_to_its_wallet() {
+        let (s, _d) = db();
+        let channel_id = 60u64;
+        let real_wallet = "klv1realcreator";
+        let real_device = "ogd1realdevice";
+        let attacker = "klv1attacker";
+
+        s.register_device(&crate::storage::rocks::DeviceClaim {
+            device_address: real_device.to_string(),
+            wallet_address: real_wallet.to_string(),
+            device_pubkey_hex: "ab".repeat(32),
+            wallet_signature: "cd".repeat(32),
+            registered_at: 1,
+        })
+        .unwrap();
+
+        let meta = serde_json::json!({
+            "channel_id": channel_id,
+            "channel_type": 2u8,
+            "creator": real_wallet,
+        });
+        s.put_cf(schema::cf::CHANNELS, &channel_id.to_be_bytes(), meta.to_string().as_bytes())
+            .unwrap();
+
+        // Genuine creator's envelope, signed by their DEVICE key, backdated
+        // later than the attacker's to isolate the author-match logic from
+        // timestamp ordering.
+        put_meta_envelope_by(&s, channel_id, MessageType::ChannelCreate, [1u8; 32], 5_000, real_device);
+        put_meta_envelope_by(&s, channel_id, MessageType::ChannelCreate, [9u8; 32], 100, attacker);
+
+        let (create, _updates) = channel_bootstrap_envelopes(&s, channel_id);
+        assert_eq!(
+            create.map(|r| msg_id_of(&r)),
+            Some([1u8; 32]),
+            "a device-signed create from the real creator must still be preferred over an \
+             attacker's — comparing raw envelope.author against the wallet-valued creator field \
+             must not cause it to fall through to the no-match path"
+        );
+    }
+
+    /// Round-3 re-audit finding: the prior fallback-to-earliest-wins
+    /// logic for "no candidate matched the known creator" was itself
+    /// gameable — once `update_indexes` stopped indexing a non-creator's
+    /// competing create at all (this session's companion fix), "no
+    /// match" can only mean "no candidate exists," so the only safe
+    /// behavior left is to return no create, never to fall back to
+    /// whatever the scan happens to contain.
+    #[test]
+    fn no_match_against_a_known_creator_returns_none_rather_than_falling_back() {
+        let (s, _d) = db();
+        let channel_id = 61u64;
+        let real_creator = "klv1realcreator";
+
+        let meta = serde_json::json!({
+            "channel_id": channel_id,
+            "channel_type": 2u8,
+            "creator": real_creator,
+        });
+        s.put_cf(schema::cf::CHANNELS, &channel_id.to_be_bytes(), meta.to_string().as_bytes())
+            .unwrap();
+
+        // Only a non-creator candidate exists (e.g. the creator's own
+        // envelope was never indexed, or hasn't arrived yet via this peer).
+        put_meta_envelope_by(&s, channel_id, MessageType::ChannelCreate, [9u8; 32], 100, "klv1someoneelse");
+
+        let (create, _updates) = channel_bootstrap_envelopes(&s, channel_id);
+        assert!(
+            create.is_none(),
+            "must return no create rather than falling back to a known-non-creator's envelope"
         );
     }
 

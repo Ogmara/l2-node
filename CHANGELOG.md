@@ -5,6 +5,158 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.139.0] - 2026-10-06
+
+### Security
+
+- **A private channel's `channel_id` is now verified against its
+  identity-binding derivation, closing the `federate_channel`
+  first-sight-trust residual** documented in 0.138.0's own CHANGELOG
+  entry. Previously, a node's first-ever encounter with a given private
+  `channel_id` (via federation, live gossip, or sync) trusted whichever
+  self-signed `ChannelCreate` it saw first — any registered wallet could
+  forge creatorship of a private channel it didn't create, on any node
+  that hadn't yet encountered the real one. `docs/specs/05-clients.md`
+  has always specified `channel_id = Keccak-256(creator_wallet_address +
+  slug + id_derivation_ts) % (2^53 - 1)` for private channels, and all
+  three GUI clients already compute it this way — the node simply never
+  verified it (only a namespace-separation floor, `channel_id >
+  PRIVATE_CHANNEL_ID_FLOOR`). It does now: `ChannelCreatePayload` gained
+  `id_derivation_ts` (optional, `#[serde(default)]`), and
+  `validate_channel_create`/the new `verify_private_channel_id_derivation`
+  recompute and hard-reject a mismatch.
+  - **Severity**: the channel creator is auto-added as a member at
+    `ChannelCreate` time, and every client derives its key-wrap target
+    set entirely from the member list — so winning first-sight on a
+    node isn't just local metadata corruption, it gets the real private
+    channel key wrapped directly to the attacker on the next honest
+    member's key-rotation pass there.
+  - **Residual, by design, not an oversight**: the derivation is bound
+    by a `2^53 - 1` modulus (a JS-safe-integer constraint on the
+    client), not full 256-bit Keccak strength — forging a SPECIFIC
+    target `channel_id` costs roughly 2^53 Keccak-256 evaluations
+    (hours-to-days of GPU-farm compute), not "infeasible." This raises
+    the bar from "one free signature" to a real, non-trivial, per-channel
+    cost; it is not full cryptographic closure. Full closure needs a
+    separate, later mechanism (out-of-band creator pinning via the
+    invite link itself) — tracked as a follow-up, not implemented here.
+  - **Absence policy** (`MessageRouter::require_private_id_derivation`,
+    new `[channel_verify] require_private_id_derivation` config, default
+    `true`): a LIVE create missing the field is always rejected (the
+    timestamp-freshness check already ran, so a "legacy" live create is
+    impossible by construction — no cutover window needed or used). A
+    synced/backfilled create missing the field is accepted only when
+    this node already has a local record for that `channel_id` (the
+    pure-merge path, already creator-gated, can't be hijacked) —
+    rejected on first-ever encounter, exactly the vulnerable case. Set
+    the config flag to `false` only as a temporary operator unblock.
+  - **Known limitation**: a private channel created before this version
+    has no `id_derivation_ts` (the field didn't exist yet) and cannot
+    retroactively gain one — the original signed envelope can't be
+    amended. It keeps working for members on nodes that already know
+    it, but can no longer be federated onto a node that has never seen
+    it. This is a real, immediate compatibility cost (no rollout
+    waiting window was used for this release) with no code-level fix
+    possible; the config escape hatch is the only mitigation.
+  - An earlier **invite-based cross-check** (verify the bootstrapped
+    creator against whoever the federating caller was invited by) was
+    designed and rejected before implementation: a `ChannelInvite` for
+    an unknown `channel_id` is deferred-but-accepted, so an attacker can
+    trivially self-invite themselves immediately before federating,
+    manufacturing the exact "corroboration" such a check would look
+    for. Recorded so it isn't re-proposed.
+  - Rejects a rare, pre-existing, unrelated bug found while investigating
+    this: a positional-array-encoded `ChannelCreatePayload` (the wire
+    form `sdk-rust` uses) now has one more field (10, was 9) — covered by
+    an extended regression test; no behavior change for that case beyond
+    the new field defaulting to absent.
+  - **Three self-caught regressions in this fix's own first draft**,
+    found by two further audit rounds against the fixed tree (per this
+    project's mandatory re-audit rule) and fixed before shipping:
+    1. The escape-hatch config check originally ran BEFORE the live/
+       synced check, so `require_private_id_derivation = false` also
+       disabled the LIVE-create requirement — silently reopening the
+       full original vulnerability on live traffic for any operator who
+       set the flag for its documented, narrower purpose (unblocking a
+       legacy channel's federation). The live check is now unconditional
+       and always evaluated first.
+    2. `channel_bootstrap_envelopes` (the function `federate_channel`
+       uses to fetch a verifiable `ChannelCreate`) selected the single
+       OLDEST indexed envelope for a channel_id — but an attacker who
+       already knows an EXISTING channel's id can get their own
+       competing `ChannelCreate` accepted+indexed with an artificially
+       backdated timestamp (the sync ingest path skips the freshness
+       check), becoming the new "oldest" and permanently breaking
+       federation for that otherwise-legitimate channel on every future
+       first-sight node (the forged envelope carries no matching
+       derivation). Fixed to prefer the envelope whose author matches
+       the channel's already-known `creator` once this node has a local
+       record, falling back to oldest only for genuine first sight.
+    3. Private channel_ids were trivially enumerable via the unauthenticated
+       `GET /api/v1/network/nodes` (no `channel_type` filter on either
+       this node's own channel list or other peers' gossiped lists) AND
+       via `NodeAnnouncementPayload.channels`, which broadcast every
+       subscribed channel including federated private ones — contradicting
+       the protocol spec's own documented no-leakage claim. Enumerability
+       directly weakens the ~2^53 forgery-cost claim above to ~2^53/N for
+       N enumerated targets; both leaks are now filtered to
+       `channel_id <= PRIVATE_CHANNEL_ID_FLOOR`.
+    4. (Config-consistency note, not a security hole on its own) the
+       network-layer `MessageRouter` — the one handling gossip/reconcile/
+       sync, not just HTTP — never received the `channel_verify` config
+       at all, so the escape hatch above only ever reached API-layer
+       requests. Now wired to both router instances.
+  - **A fourth re-audit round found fix #2 above didn't actually work**,
+    plus a related leak #3 missed:
+    - `channel_bootstrap_envelopes`' creator-preference compared the raw,
+      possibly device-signed `Envelope.author` against the `CHANNELS`
+      row's WALLET-valued `creator` field, so it silently never matched
+      any device-delegated create (the normal case for a Klever-Extension
+      wallet, not an edge case) and fell through to its "no match"
+      fallback — which still fell back to oldest-wins, exactly as gameable
+      as the original bug. Fixed at the root instead of patching the
+      selector again: `update_indexes` now refuses to even INDEX a non-
+      creator's competing `ChannelCreate` for a channel this node already
+      has a `CHANNELS` row for (one extra point read, `ChannelCreate`
+      only), so the attacker's envelope never becomes a candidate in the
+      first place. `envelope_author_is` now also resolves the envelope's
+      author to its wallet before comparing, and "no match against a
+      known creator" now returns no create at all rather than falling
+      back to oldest.
+    - `sync_channels_with_peer` sent a `SyncRequest` for every subscribed
+      channel — private ones included — to every peer as soon as libp2p
+      Identify succeeded, no membership or relationship check at all. A
+      worse disclosure than the REST/gossip leaks above: those need a
+      query or a propagation wait, this pushed the full private
+      channel_id list to any connecting peer for free. Fixed by filtering
+      to public/read-public channels only — private channel MESSAGE
+      backfill already has its own dedicated, authenticated, membership-
+      gated protocol (`PrivateChannelSyncRequest`, `0.138.0` above) that
+      this generic loop never served, so nothing legitimate was lost.
+  - **Round-4 re-audit hardening**: `TopicManager::subscribed_channels()`
+    (undifferentiated public+private) needed the exact same
+    `.filter(is_public_channel_id)` composition bolted on independently
+    at BOTH of its production call sites (`publish_node_announcement`
+    and `sync_channels_with_peer`, fixed separately, two rounds apart) —
+    a pattern that, per this project's own recurring-bug-shapes history,
+    is exactly how a third caller eventually forgets it. Added
+    `TopicManager::subscribed_public_channels()` and switched both call
+    sites to it, making "the full list, private ids included" something
+    a caller must explicitly opt into via the raw accessor rather than
+    something every new caller has to remember to filter out.
+  - `PRIVATE_CHANNEL_ID_FLOOR` and the "is this id private" test are now
+    one shared `pub const`/`fn is_public_channel_id` in `messages::types`
+    instead of four independently-copied local consts (validation.rs,
+    router.rs, network/mod.rs ×2, api/routes.rs) — removes the "a future
+    edit changes one copy" drift risk the round-3 audit flagged. Noted
+    there, and worth restating here: this filter is exact only for a
+    `channel_id` that has actually passed `validate_channel_create`'s
+    floor check — a legacy row written before the floor existed
+    (`chain::scanner`'s pre-floor-collision handling) can still read as
+    "public" here despite being `Private`-typed in storage. Honest client
+    derivation lands above the floor with overwhelming probability, so
+    the residual exposure from this specific gap is small, not zero.
+
 ## [0.138.0] - 2026-10-05
 
 ### Added
