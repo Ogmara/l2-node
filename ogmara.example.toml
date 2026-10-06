@@ -200,6 +200,22 @@ stale_peer_threshold = 3
 # until it happens to win a comparison some other way).
 stale_peer_reprobe_hours = 24
 
+[private_channel_sync]
+# Authenticated, membership-checked history backfill for PRIVATE channels
+# (closes the F2 backfill gap — [backfill] above refuses every private
+# channel outright, since its wire protocol carries no membership proof).
+enabled = true
+# How far back a backfill request asks for envelopes, in days. 0 = unlimited.
+max_age_days = 30
+# How often (hours) to re-check a (wallet, channel) pair whose sync already
+# completed. 0 disables re-checking completed pairs (a never-completed pair
+# is always retried regardless).
+channel_catchup_interval_hours = 6
+# Max (wallet, channel) pairs examined per periodic retry-sweep tick (every
+# 30s). Bounds the sweep's cost to a fixed batch regardless of how many
+# channels have been federated locally.
+catchup_batch_size = 25
+
 [api]
 # Set to "0.0.0.0" to accept connections from all interfaces
 listen_addr = "127.0.0.1"

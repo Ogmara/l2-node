@@ -948,6 +948,9 @@ impl Node {
             // broadened observed-author trigger + periodic USERS
             // staleness sweep.
             self.config.identity_resync.clone(),
+            // Closes the F2 private-channel backfill gap (l2-node
+            // 0.138.0+) — see `network::private_channel_sync`.
+            self.config.private_channel_sync.clone(),
         )
         .await
         .context("starting network service")?;
@@ -1163,6 +1166,12 @@ impl Node {
         let (dm_subscribe_tx, dm_subscribe_rx) =
             tokio::sync::mpsc::unbounded_channel::<crate::network::DmSubscribeEvent>();
 
+        // Channel for API → network: a wallet federated a private channel
+        // to this node (`federate_channel`), asking us to backfill its
+        // missed history (closes the F2 backfill gap, l2-node 0.138.0+).
+        let (private_channel_sync_tx, private_channel_sync_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::network::PrivateChannelSyncTrigger>();
+
         // Subscribe to all existing channels from storage so the node
         // participates in GossipSub for channels it already knows about.
         match self.storage.prefix_iter_cf(
@@ -1226,7 +1235,7 @@ impl Node {
         let network_shutdown_rx = self.shutdown_rx();
         let mut network_task = tokio::spawn(async move {
             network
-                .run(network_shutdown_rx, channel_rx, gossip_rx, sc_reconnect_rx, identity_sync_rx, dm_subscribe_rx)
+                .run(network_shutdown_rx, channel_rx, gossip_rx, sc_reconnect_rx, identity_sync_rx, dm_subscribe_rx, private_channel_sync_rx)
                 .await;
         });
 
@@ -1979,6 +1988,7 @@ impl Node {
             gossip_tx,
             identity_sync_tx,
             dm_subscribe_tx,
+            private_channel_sync_tx,
             channel_subscribe_tx,
             connected_peers,
             network_counters,

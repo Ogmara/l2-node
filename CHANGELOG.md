@@ -5,6 +5,114 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.138.0] - 2026-10-05
+
+### Added
+
+- **Authenticated private-channel history backfill** (`network::private_
+  channel_sync`), closing the long-tracked F2 gap: a private channel
+  previously federated forward-only (gossip subscription only) — history
+  from before federating, or missed while offline, was permanently
+  unrecoverable, since `network::reconcile` (the general backfill
+  protocol) deliberately refuses every private-channel request (no
+  signed membership proof in its wire format). The new protocol is a
+  direct structural port of the already-shipped, already-audited
+  `dm_sync` two-layer host-bound authentication scheme (node self-
+  signature + wallet-delegation claim), with one addition `dm_sync`
+  doesn't need: a live, never-cached, per-request channel-membership
+  re-check, and `history_visibility` (ForwardOnly/FullHistory)
+  enforcement — the first code path capable of violating a creator's
+  explicit ForwardOnly choice at all, so this responder enforces it
+  fail-closed against the requester's own join time.
+  - Triggered by `federate_channel` (first successful federation) and a
+    new periodic retry sweep (`[private_channel_sync]` config section:
+    `channel_catchup_interval_hours`, `catchup_batch_size`, `max_age_days`
+    — mirrors `[backfill]`'s equivalent knobs).
+  - **Deliberately out of scope**: `ChannelKeyEnvelope` (encryption-key)
+    backfill. `CHANNEL_KEYS`' stored value is a derived JSON cache built
+    after the original envelope was validated, not the original signed
+    bytes — there's no way to re-serve a row and have a peer
+    independently re-verify it, so shipping that would have traded a
+    disclosed, bounded gap (a member offline for an entire key rotation
+    stays unable to decrypt until the next rotation) for an unbounded one
+    (a malicious peer forging key material). See the module's own doc
+    comment for the full reasoning.
+
+### Security
+
+- **`federate_channel` no longer trusts an unauthenticated HTTP JSON
+  summary for a private channel's `creator`/`history_visibility`/
+  `encryption_enabled`.** Found during this release's own audit pass:
+  the endpoint rebuilt its ENTIRE local `CHANNELS` row from a bespoke
+  JSON object scraped from a caller-supplied `host_url` on *every* call
+  (not just the first), with no signature check and no merge against the
+  existing row — letting an attacker repeatedly call `/federate` with a
+  forged response to overwrite a channel's `creator` locally (trusted
+  elsewhere for granting mod-level permissions) or widen a creator's
+  ForwardOnly `history_visibility` choice to FullHistory. Fixed by
+  requiring the host's response to also carry the ORIGINAL signed
+  `ChannelCreate` (+ all `ChannelUpdate`) envelope bytes
+  (`reconcile::channel_bootstrap_envelopes`, new, deliberately narrower
+  than the existing `channel_meta_envelopes` — excludes Join/Leave/Kick/
+  Ban/Unban, which would over-disclose to this endpoint's unauthenticated
+  caller) and routing them through `process_synced_message` — the same
+  full-signature-verification pipeline every other envelope in this
+  codebase already goes through, rather than a bespoke, weaker inline
+  path. No information disclosure changed: every field in the new
+  envelope fields was already present, unsigned, in the existing JSON
+  response.
+  - Membership writes changed from a raw, unlocked `put_cf` to the
+    existing hardened, lock-protected `add_channel_member` (gains the
+    `channel_membership_lock`, the `member_count` increment this path
+    always skipped, and the same `invite_links_disabled` gate
+    `ChannelJoin` ingest already enforces, which this endpoint never
+    checked at all).
+  - Fixed a self-introduced regression caught by this release's own
+    re-audit before shipping: the first version of
+    `channel_bootstrap_envelopes` selected the LATEST `ChannelCreate`/
+    `ChannelUpdate` row by timestamp. For `ChannelCreate` this reopened
+    the exact forgery the fix was meant to close — `CHANNEL_META_MSGS`
+    indexes every *accepted* `ChannelCreate` envelope, even one a
+    registered wallet forges for an already-existing channel_id (the
+    merge logic ignores it, but the envelope is still stored+indexed with
+    a later timestamp) — so "latest" could hand a bootstrapping node the
+    impostor's envelope. Fixed to select the EARLIEST `ChannelCreate`
+    (which necessarily predates any such competing claim) and to return
+    ALL `ChannelUpdate` envelopes in order (each is a partial patch, not
+    a snapshot — "only the latest" silently dropped fields set by earlier
+    ones and never touched since).
+  - Fixed an unlocked `CHANNELS`-row read-modify-write (patching
+    `federated_from`) that could revert a concurrent, lock-protected
+    `key_epoch_floor` raise (P2d forward-secrecy) or `member_count`
+    update from a race with `ChannelLeave`/`ChannelUpdate` — now runs
+    inside `Storage::with_channel_membership_lock`.
+  - Added a 4 MiB streamed read cap on the host response (previously
+    unbounded — a memory-exhaustion vector via any caller-suppliable
+    `host_url`).
+  - **Known residual, not fully closed by this fix**: a node's very
+    first encounter with a given private `channel_id` — by federation or
+    any other path — has no independent anchor (private channels never
+    exist on-chain) to distinguish a genuine creator's self-signed
+    `ChannelCreate` from an attacker's. This is a pre-existing property
+    of the whole private-channel trust model, not introduced by
+    federation, but federation is what makes a brand-new node's first
+    encounter attacker-reachable at all. This release raises the bar
+    from "run any HTTPS endpoint" to "hold a registered wallet + a valid
+    signature + the channel_id" (itself already sufficient, by this
+    system's own design, for permissionless `ChannelJoin`) — a real
+    improvement, not a full close. Fully closing it needs either
+    cross-checking the bootstrapped creator against something the
+    federating caller already holds (e.g. the inviter identity from
+    their own `ChannelInvite`), which would require a `FederateRequest`
+    wire-protocol change reaching every client, or accepting this as
+    bounded residual risk consistent with the existing `ChannelJoin`
+    permissionless-by-channel_id design. Left open for a follow-up
+    decision.
+  - **Compatibility**: breaking for federation against a host node not
+    yet running this version — the new verification step fails closed
+    (`BAD_GATEWAY`) rather than falling back to trusting raw JSON.
+    Upgrade hosts before relying on cross-node federation.
+
 ## [0.137.1] - 2026-10-01
 
 ### Fixed

@@ -17,6 +17,7 @@ use crate::config::Config;
 use super::dm_sync::DmSyncCodec;
 use super::identity_sync::IdentitySyncCodec;
 use super::news_sync::NewsSyncCodec;
+use super::private_channel_sync::PrivateChannelSyncCodec;
 use super::reconcile::ReconcileCodec;
 use super::snapshot::SnapshotCodec;
 
@@ -65,6 +66,12 @@ pub struct OgmaraBehaviour {
     /// wallet's missed DMs on a fresh node / after a home-node was down. Wire
     /// types in [`super::dm_sync`].
     pub dm_sync: DmSyncCodec,
+    /// Request-Response for the private-channel-sync protocol (closes the
+    /// F2 backfill gap, l2-node 0.138.0+). Authenticated (node-signed,
+    /// host+channel-bound, wallet-claim-gated, membership-checked)
+    /// backfill of a private channel's missed history on federation /
+    /// after downtime. Wire types in [`super::private_channel_sync`].
+    pub private_channel_sync: PrivateChannelSyncCodec,
 }
 
 /// Build the libp2p swarm with all configured behaviours.
@@ -323,6 +330,25 @@ pub fn build_swarm(config: &Config, keypair: Keypair) -> Result<Swarm<OgmaraBeha
             .with_request_timeout(Duration::from_secs(45)),
     );
 
+    // Private-channel-sync (closes the F2 private-channel backfill gap):
+    // Full. Requests are authenticated (node-signed, host+channel-bound) +
+    // wallet-claim-gated + membership-checked at the handler, same
+    // trust-model shape as dm_sync above.
+    let private_channel_sync_protocol =
+        super::private_channel_sync::protocol_string(config.network_id());
+    let private_channel_sync = libp2p::request_response::cbor::Behaviour::<
+        super::private_channel_sync::PrivateChannelSyncRequest,
+        super::private_channel_sync::PrivateChannelSyncResponse,
+    >::new(
+        [(
+            libp2p::StreamProtocol::try_from_owned(private_channel_sync_protocol)
+                .map_err(|e| anyhow::anyhow!("invalid private-channel-sync protocol string: {}", e))?,
+            libp2p::request_response::ProtocolSupport::Full,
+        )],
+        libp2p::request_response::Config::default()
+            .with_request_timeout(Duration::from_secs(45)),
+    );
+
     let behaviour = OgmaraBehaviour {
         connection_limits,
         gossipsub,
@@ -335,6 +361,7 @@ pub fn build_swarm(config: &Config, keypair: Keypair) -> Result<Swarm<OgmaraBeha
         identity_sync,
         news_sync,
         dm_sync,
+        private_channel_sync,
     };
 
     let swarm = SwarmBuilder::with_existing_identity(keypair)

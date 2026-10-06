@@ -271,6 +271,13 @@ pub struct AppState {
     /// each REST authenticated call, optionally carrying a wallet-signed
     /// dm-sync backfill authorization for this node (audit W5).
     pub dm_subscribe_tx: tokio::sync::mpsc::UnboundedSender<crate::network::DmSubscribeEvent>,
+    /// Tells the network task to lazily backfill a private channel's missed
+    /// history for a wallet that just federated it here (closes the F2
+    /// backfill gap, l2-node 0.138.0+). Fired by `/channels/{id}/federate`,
+    /// optionally carrying a wallet-signed private-channel-sync backfill
+    /// authorization for this node.
+    pub private_channel_sync_tx:
+        tokio::sync::mpsc::UnboundedSender<crate::network::PrivateChannelSyncTrigger>,
     /// Tells the network task to subscribe to a channel's gossip topic so this
     /// node receives that channel's cross-node messages/keys (private-channel
     /// federation, F1). Fired by the `/channels/{id}/federate` endpoint. Reuses the
@@ -543,6 +550,7 @@ impl AppState {
         let (gossip_tx, _) = tokio::sync::mpsc::unbounded_channel();
         let (identity_sync_tx, _) = tokio::sync::mpsc::unbounded_channel();
         let (dm_subscribe_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let (private_channel_sync_tx, _) = tokio::sync::mpsc::unbounded_channel();
         let (channel_subscribe_tx, _) = tokio::sync::mpsc::unbounded_channel();
         let counters = Arc::new(NetworkCounters::new());
         let metrics_latest = Arc::new(RwLock::new(MetricsSnapshot::default()));
@@ -567,6 +575,7 @@ impl AppState {
             gossip_tx,
             identity_sync_tx,
             dm_subscribe_tx,
+            private_channel_sync_tx,
             channel_subscribe_tx,
             Arc::new(RwLock::new(HashMap::new())),
             counters,
@@ -626,6 +635,7 @@ impl AppState {
         gossip_tx: tokio::sync::mpsc::UnboundedSender<crate::network::GossipPublish>,
         identity_sync_tx: tokio::sync::mpsc::UnboundedSender<crate::network::IdentitySyncCommand>,
         dm_subscribe_tx: tokio::sync::mpsc::UnboundedSender<crate::network::DmSubscribeEvent>,
+        private_channel_sync_tx: tokio::sync::mpsc::UnboundedSender<crate::network::PrivateChannelSyncTrigger>,
         channel_subscribe_tx: tokio::sync::mpsc::UnboundedSender<u64>,
         connected_peers: Arc<RwLock<HashMap<String, ConnectedPeerInfo>>>,
         counters: Arc<NetworkCounters>,
@@ -733,6 +743,7 @@ impl AppState {
             gossip_tx,
             identity_sync_tx,
             dm_subscribe_tx,
+            private_channel_sync_tx,
             channel_subscribe_tx,
             connected_peers,
             counters,

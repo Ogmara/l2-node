@@ -1277,6 +1277,37 @@ impl Storage {
             .map(u64::from_be_bytes)
     }
 
+    /// Record that a private-channel-sync session reached natural
+    /// completion for `(wallet, channel_id)` — closes the F2 backfill gap
+    /// (l2-node 0.138.0+). Mirrors `mark_channel_backfill_complete`
+    /// exactly; see `cf::PRIVATE_CHANNEL_SYNC_STATE`'s doc comment. Sole
+    /// writer is the network task's event loop, so no lock is needed.
+    pub fn mark_private_channel_sync_complete(
+        &self,
+        wallet: &str,
+        channel_id: u64,
+        now: u64,
+    ) -> Result<()> {
+        self.put_cf(
+            cf::PRIVATE_CHANNEL_SYNC_STATE,
+            &super::schema::encode_local_channel_fed_key(wallet, channel_id),
+            &now.to_be_bytes(),
+        )
+    }
+
+    /// Read the last time `(wallet, channel_id)`'s private-channel-sync
+    /// backfill reached natural completion. `None` means never.
+    pub fn private_channel_sync_completed_at(&self, wallet: &str, channel_id: u64) -> Option<u64> {
+        self.get_cf(
+            cf::PRIVATE_CHANNEL_SYNC_STATE,
+            &super::schema::encode_local_channel_fed_key(wallet, channel_id),
+        )
+        .ok()
+        .flatten()
+        .and_then(|b| <[u8; 8]>::try_from(b.as_slice()).ok())
+        .map(u64::from_be_bytes)
+    }
+
     /// Run `f` while holding `channel_membership_lock`.
     ///
     /// Audit 2026-09-29 (HIGH finding): several CHANNELS-row writers

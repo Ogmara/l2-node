@@ -14,6 +14,7 @@ pub mod hot_topics;
 pub mod mesh_stats;
 pub mod presence;
 pub mod identity_sync;
+pub mod private_channel_sync;
 pub mod news_sync;
 pub mod reconcile;
 pub mod sc_discovery;
@@ -604,6 +605,10 @@ pub struct NetworkService {
     /// (`handle_gossip_message`) and the periodic `USERS` staleness sweep
     /// (`sweep_identity_staleness`).
     identity_resync_config: crate::config::IdentityResyncConfig,
+    /// Private-channel-sync policy (closes the F2 backfill gap, l2-node
+    /// 0.138.0+): backfill window + periodic retry-sweep cadence/batch
+    /// size. Mirrors `BackfillConfig`'s equivalent knobs.
+    private_channel_sync_config: crate::config::PrivateChannelSyncConfig,
     /// Remaining observed-author identity-sync triggers this node may fire
     /// before the next `identity_staleness_interval` refill (security-audit
     /// finding: live gossip has no PoW gate and no per-wallet rate limit
@@ -644,6 +649,28 @@ pub struct NetworkService {
     /// subscription. Cleared on overflow. (The backfill trigger is gated
     /// separately so it still fires once peers exist.)
     local_dm_users_seen: HashMap<String, u64>,
+    /// Server-side rate-limit state for inbound private-channel-sync
+    /// requests (closes the F2 backfill gap, l2-node 0.138.0+).
+    private_channel_sync_limits: Arc<private_channel_sync::PrivateChannelSyncResponderLimits>,
+    /// Outstanding outbound private-channel-sync requests → pending state
+    /// for race-cancel + cursor paging of that (wallet, channel) pair's
+    /// backfill. See `DmSyncPending`'s doc comment for the paging-budget
+    /// fields' rationale (audit final pre-mainnet W9) — mirrored here.
+    pending_private_channel_sync_requests: HashMap<
+        libp2p::request_response::OutboundRequestId,
+        PrivateChannelSyncPending,
+    >,
+    /// `(wallet, channel_id)` pairs this node has triggered a
+    /// private-channel backfill for at least once this process lifetime —
+    /// dedups repeated first-seen triggers. Mirrors `dm_backfill_triggered`.
+    private_channel_sync_triggered: HashSet<(String, u64)>,
+    /// Wallet → last wallet-signed private-channel-sync authorization claim
+    /// received for it this session. Mirrors `wallet_claims` (dm_sync)
+    /// exactly, but a SEPARATE map with a SEPARATE claim type — the two
+    /// protocols' domain-separated signed strings mean a dm-sync claim can
+    /// never verify here and vice versa; keeping distinct maps avoids any
+    /// accidental cross-use.
+    private_channel_sync_wallet_claims: HashMap<String, private_channel_sync::WalletAuthClaim>,
     /// Presence-gossip manager (spec 13 §10, l2-node 0.48.0+). `Some`
     /// iff `[network.presence] enabled = true` at startup; held in an
     /// `Arc` so the cache + rate limiter can be shared with the REST
@@ -936,6 +963,19 @@ struct DmSyncPending {
     consecutive_unproductive_pages: u32,
 }
 
+/// Per-pending-outbound-private-channel-sync state (closes the F2 backfill
+/// gap). Keyed by `(wallet, channel_id)` rather than just `wallet` (dm_sync)
+/// since one wallet can be independently backfilling several channels.
+#[derive(Debug, Clone)]
+struct PrivateChannelSyncPending {
+    peer_id: PeerId,
+    wallet: String,
+    channel_id: u64,
+    /// See `ReconcilePending`'s doc comment (audit final pre-mainnet W9).
+    pages_fetched: u32,
+    consecutive_unproductive_pages: u32,
+}
+
 /// Per-pending-outbound-news-sync state (P-3). Audit final pre-mainnet W9:
 /// previously a bare `PeerId` (news-sync has no per-subject key, it's a
 /// single global feed) — now a small struct so the requester-side paging
@@ -964,6 +1004,19 @@ pub struct IdentitySyncCommand {
 pub struct DmSubscribeEvent {
     pub wallet: String,
     pub wallet_claim: Option<dm_sync::WalletAuthClaim>,
+}
+
+/// Command from the API layer → network task: a wallet federated a private
+/// channel to this node (`federate_channel`, `api/routes.rs`), optionally
+/// with a wallet-signed private-channel-sync backfill authorization for
+/// THIS node. Sent over `private_channel_sync_tx`. Closes the F2 backfill
+/// gap (l2-node 0.138.0+) — see `network::private_channel_sync`'s module
+/// doc for the full design.
+#[derive(Debug, Clone)]
+pub struct PrivateChannelSyncTrigger {
+    pub channel_id: u64,
+    pub wallet: String,
+    pub wallet_claim: Option<private_channel_sync::WalletAuthClaim>,
 }
 
 /// Cross-channel smuggling defense (Security Audit W1, 0.47.0).
@@ -1613,6 +1666,7 @@ impl NetworkService {
         backfill_config: crate::config::BackfillConfig,
         dm_config: crate::config::DmConfig,
         identity_resync_config: crate::config::IdentityResyncConfig,
+        private_channel_sync_config: crate::config::PrivateChannelSyncConfig,
     ) -> Result<Self> {
         // Clone before move — the presence subsystem needs its own
         // handle to sign outbound records. libp2p `Keypair` is cheap
@@ -1915,6 +1969,11 @@ impl NetworkService {
             dm_backfill_triggered: HashSet::new(),
             wallet_claims: HashMap::new(),
             local_dm_users_seen: HashMap::new(),
+            private_channel_sync_config,
+            private_channel_sync_limits: Arc::new(private_channel_sync::PrivateChannelSyncResponderLimits::default()),
+            pending_private_channel_sync_requests: HashMap::new(),
+            private_channel_sync_triggered: HashSet::new(),
+            private_channel_sync_wallet_claims: HashMap::new(),
             presence_manager,
             presence_topic_hash,
             hot_topics,
@@ -2436,6 +2495,10 @@ impl NetworkService {
         // this node receives that user's cross-node DMs, optionally carrying a
         // wallet-signed dm-sync backfill authorization for this node (W5).
         mut dm_subscribe_rx: tokio::sync::mpsc::UnboundedReceiver<DmSubscribeEvent>,
+        // API → network: a wallet federated a private channel to this node
+        // (`federate_channel`), asking us to backfill its missed history.
+        // Closes the F2 backfill gap (l2-node 0.138.0+).
+        mut private_channel_sync_rx: tokio::sync::mpsc::UnboundedReceiver<PrivateChannelSyncTrigger>,
     ) {
         info!(
             peer_id = %self.swarm.local_peer_id(),
@@ -2577,6 +2640,12 @@ impl NetworkService {
                     self.register_local_dm_user(&event.wallet, event.wallet_claim);
                     debug!(wallet = %event.wallet, "Registered local DM user + subscribed to DM gossip topic");
                 }
+                Some(event) = private_channel_sync_rx.recv() => {
+                    // A wallet federated a private channel here — lazily
+                    // backfill its missed history (gated on a wallet-signed
+                    // authorization, mirroring dm-sync's audit-W5 gate).
+                    self.maybe_trigger_private_channel_sync(event.channel_id, &event.wallet, event.wallet_claim);
+                }
                 Some(channel_id) = channel_rx.recv() => {
                     // Code Audit W2 (0.47.0): route chain-discovered
                     // channels through `Self::subscribe_channel` (not
@@ -2652,6 +2721,10 @@ impl NetworkService {
                     // l2-node 0.136.0: same idea, per channel — see
                     // `retry_incomplete_channel_backfills`'s doc comment.
                     self.retry_incomplete_channel_backfills();
+                    // l2-node 0.138.0: same idea again, for private-channel
+                    // history (F2 backfill gap) — see
+                    // `retry_incomplete_private_channel_syncs`'s doc comment.
+                    self.retry_incomplete_private_channel_syncs();
                 }
                 _ = reconnect_interval.tick() => {
                     self.process_reconnect_queue();
@@ -3067,6 +3140,10 @@ impl NetworkService {
 
             SwarmEvent::Behaviour(OgmaraBehaviourEvent::DmSync(event)) => {
                 self.handle_dm_sync_event(event);
+            }
+
+            SwarmEvent::Behaviour(OgmaraBehaviourEvent::PrivateChannelSync(event)) => {
+                self.handle_private_channel_sync_event(event);
             }
 
             SwarmEvent::NewListenAddr { address, .. } => {
@@ -4394,6 +4471,531 @@ impl NetworkService {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Release the per-process in-flight dedup entry for `(wallet,
+    /// channel_id)` once no sibling fanout request or paging continuation
+    /// is still outstanding for it — mirrors
+    /// `release_reconcile_trigger_if_no_siblings` exactly. Lets a future
+    /// `federate_channel` call or the periodic retry sweep re-evaluate
+    /// (and re-trigger if still due) rather than being blocked forever by
+    /// this session's own dedup entry.
+    fn release_private_channel_sync_trigger_if_no_siblings(&mut self, wallet: &str, channel_id: u64) {
+        let still_pending = self
+            .pending_private_channel_sync_requests
+            .values()
+            .any(|p| p.wallet == wallet && p.channel_id == channel_id);
+        if !still_pending {
+            self.private_channel_sync_triggered.remove(&(wallet.to_string(), channel_id));
+        }
+    }
+
+    /// One-time-per-due-window bounded backfill of a single private
+    /// channel's missed history for `wallet` (closes the F2 backfill gap,
+    /// l2-node 0.138.0+). Fires when a wallet federates a channel here
+    /// (`federate_channel`, over `private_channel_sync_tx`) and from the
+    /// periodic retry sweep (`retry_incomplete_private_channel_syncs`) for
+    /// channels that haven't reached natural completion yet. Each request
+    /// is node-signed + host-bound + channel-bound to its responder
+    /// (`private_channel_sync::sign_request`), AND carries a wallet-signed
+    /// claim proving the wallet authorized THIS node — without one, no
+    /// responder will serve anything (mirrors dm-sync's audit-W5 gate).
+    fn maybe_trigger_private_channel_sync(
+        &mut self,
+        channel_id: u64,
+        wallet: &str,
+        wallet_claim: Option<private_channel_sync::WalletAuthClaim>,
+    ) {
+        if !self.private_channel_sync_config.enabled {
+            return;
+        }
+        // This protocol only serves PRIVATE channels — public ones are
+        // already covered by `reconcile`, which (correctly) refuses every
+        // private-channel request. Mirrors `maybe_trigger_backfill`'s
+        // equivalent guard in the opposite direction.
+        if !reconcile::is_private_channel(&self.storage, channel_id) {
+            return;
+        }
+        let key = (wallet.to_string(), channel_id);
+        if !self.private_channel_sync_triggered.insert(key.clone()) {
+            // Already in flight (or due-but-not-yet-resolved) this
+            // session — don't pile another request on top of it.
+            return;
+        }
+
+        let completed_at = self
+            .storage
+            .private_channel_sync_completed_at(wallet, channel_id);
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let due = channel_backfill_due(
+            completed_at,
+            now_secs,
+            self.private_channel_sync_config.channel_catchup_interval_hours,
+        );
+        if !due {
+            self.private_channel_sync_triggered.remove(&key);
+            return;
+        }
+
+        // W5-equivalent: resolve the freshest available wallet-signed
+        // authorization — prefer one attached to THIS call, else fall
+        // back to one cached from an earlier federation this session.
+        // Without one, retry on a later federation call once one arrives.
+        let Some(claim) = wallet_claim.or_else(|| {
+            self.private_channel_sync_wallet_claims.get(wallet).cloned()
+        }) else {
+            self.private_channel_sync_triggered.remove(&key);
+            return;
+        };
+        // Code-audit finding (2026-10-01): `WALLET_AUTH_MAX_AGE_SECS` (300s)
+        // bounds how long a wallet-signed claim stays valid — correct for
+        // `dm_sync`, which has no periodic retry trigger at all (one claim,
+        // one attempt, right after the auth that produced it). This
+        // protocol DOES have a periodic retry sweep
+        // (`retry_incomplete_private_channel_syncs`, every 30s tick,
+        // `channel_catchup_interval_hours` due-gated — hours, not seconds),
+        // which calls this function with `wallet_claim: None`, falling back
+        // to whatever got cached at the LAST `federate_channel` call. Past
+        // 5 minutes that cached claim is already expired by the time it
+        // would reach a responder — sending it anyway wastes a full fanout
+        // round-trip (and logs a `warn!` on both ends) for a request that
+        // can only ever come back `auth_failed`. Check staleness locally
+        // first and skip outright, same as the "no claim at all" case
+        // above. This does NOT make the sweep able to complete a backfill
+        // autonomously past 5 minutes post-federation — by design, a fresh
+        // wallet signature requires the wallet to actually be present to
+        // sign one. Genuine completion past that window happens the next
+        // time the user's own client calls `/federate` again (which mints
+        // a fresh claim) — the sweep's real job is covering the common
+        // case where the FIRST attempt (at federation time) didn't finish
+        // within its own 5-minute window, not guaranteeing eventual
+        // completion with no further client activity ever again.
+        if now_ms().abs_diff(claim.timestamp)
+            > private_channel_sync::WALLET_AUTH_MAX_AGE_SECS.saturating_mul(1000)
+        {
+            self.private_channel_sync_triggered.remove(&key);
+            return;
+        }
+
+        // Candidate selection: GossipSub mesh peers for this channel's
+        // topic; fall back to any connected peer if the mesh is sparse.
+        let topic = libp2p::gossipsub::IdentTopic::new(gossip::channel_topic(
+            self.topics.network_id(),
+            channel_id,
+        ));
+        let topic_hash = topic.hash();
+        let mut candidates: Vec<PeerId> = self
+            .swarm
+            .behaviour()
+            .gossipsub
+            .mesh_peers(&topic_hash)
+            .copied()
+            .collect();
+        if candidates.len() < private_channel_sync::FANOUT {
+            for p in self.swarm.connected_peers() {
+                if !candidates.contains(p) {
+                    candidates.push(*p);
+                }
+                if candidates.len() >= private_channel_sync::FANOUT * 2 {
+                    break;
+                }
+            }
+        }
+        if candidates.is_empty() {
+            debug!(
+                channel_id, %wallet,
+                "private-channel-sync: no candidate peers; cold-start will retry on next federation/sweep"
+            );
+            self.private_channel_sync_triggered.remove(&key);
+            return;
+        }
+        use rand::seq::SliceRandom;
+        candidates.shuffle(&mut rand::thread_rng());
+        candidates.truncate(private_channel_sync::FANOUT);
+
+        let max_age_secs = if self.private_channel_sync_config.max_age_days == 0 {
+            u64::MAX
+        } else {
+            self.private_channel_sync_config
+                .max_age_days
+                .saturating_mul(24 * 3600)
+        };
+        let network = self.topics.network_id().to_string();
+        let now = now_ms();
+        info!(
+            %wallet, channel_id,
+            fanout = candidates.len(),
+            "private-channel-sync: triggering bounded private-channel backfill"
+        );
+
+        // Cache for the pagination-continuation arm + subsequent triggers
+        // this session. This map has its own independent 100k clear-all
+        // bound (not a security cap — worst case of clearing is one
+        // redundant re-sign later); `private_channel_sync_triggered`
+        // (below) is NOT bounded the same way — unlike `dm_backfill_
+        // triggered`, its entries are actively removed by
+        // `release_private_channel_sync_trigger_if_no_siblings` on every
+        // response/failure path, so it self-limits to roughly the number
+        // of in-flight (wallet, channel) pairs rather than growing
+        // unboundedly over the process lifetime.
+        if self.private_channel_sync_wallet_claims.len() >= 100_000 {
+            self.private_channel_sync_wallet_claims.clear();
+        }
+        self.private_channel_sync_wallet_claims
+            .insert(wallet.to_string(), claim.clone());
+
+        for peer in candidates {
+            let request = private_channel_sync::sign_request(
+                &self.signing_key,
+                &network,
+                &peer.to_string(),
+                wallet,
+                channel_id,
+                now,
+                max_age_secs,
+                None,
+                Some(claim.clone()),
+            );
+            let id = self
+                .swarm
+                .behaviour_mut()
+                .private_channel_sync
+                .send_request(&peer, request);
+            self.pending_private_channel_sync_requests.insert(
+                id,
+                PrivateChannelSyncPending {
+                    peer_id: peer,
+                    wallet: wallet.to_string(),
+                    channel_id,
+                    pages_fetched: 0,
+                    consecutive_unproductive_pages: 0,
+                },
+            );
+        }
+    }
+
+    /// Handle inbound + outbound private-channel-sync request-response
+    /// events (closes the F2 backfill gap, l2-node 0.138.0+).
+    fn handle_private_channel_sync_event(
+        &mut self,
+        event: libp2p::request_response::Event<
+            private_channel_sync::PrivateChannelSyncRequest,
+            private_channel_sync::PrivateChannelSyncResponse,
+        >,
+    ) {
+        use crate::messages::router::RouteResult;
+        use libp2p::request_response::{Event, Message};
+
+        match event {
+            // --- Inbound request: authenticate (incl. membership), then serve ---
+            Event::Message {
+                peer,
+                message: Message::Request { request, channel, request_id: _ },
+                connection_id: _,
+            } => {
+                let network = self.topics.network_id().to_string();
+                let responder_peer_id = self.swarm.local_peer_id().to_string();
+                let now = now_ms();
+
+                // AUTH FIRST — reject before any storage scan (DoS gate).
+                // Security-audit finding (2026-10-01): split into a pure-
+                // crypto check (no storage access) run BEFORE `try_acquire`,
+                // and a separate storage-touching membership check run only
+                // AFTER a concurrency slot is granted — a peer with no valid
+                // membership for anything could otherwise force two RocksDB
+                // point-lookups per request with no per-peer rate cap.
+                if !private_channel_sync::verify_request_crypto_auth(
+                    &request,
+                    &responder_peer_id,
+                    &network,
+                    now,
+                    &peer,
+                ) {
+                    warn!(peer = %peer, channel_id = request.channel_id, wallet = %request.wallet, "private-channel-sync: request auth failed");
+                    if let Err(e) = self
+                        .swarm
+                        .behaviour_mut()
+                        .private_channel_sync
+                        .send_response(channel, private_channel_sync::auth_failed_response(request.channel_id))
+                    {
+                        warn!(peer = %peer, error = ?e, "private-channel-sync: send auth_failed response failed");
+                    }
+                    return;
+                }
+
+                let guard = self.private_channel_sync_limits.try_acquire(
+                    peer,
+                    private_channel_sync::SERVER_MAX_CONCURRENT_PER_PEER,
+                    private_channel_sync::TOTAL_ENVELOPES_CAP,
+                );
+                if guard.is_none() {
+                    if let Err(e) = self
+                        .swarm
+                        .behaviour_mut()
+                        .private_channel_sync
+                        .send_response(channel, private_channel_sync::capped_response(request.channel_id))
+                    {
+                        warn!(peer = %peer, error = ?e, "private-channel-sync: send capped response failed");
+                    }
+                    return;
+                }
+
+                // Gate 5 (membership + genuinely-private-channel), the one
+                // storage-touching check — re-verified fresh on every
+                // request, never cached.
+                if !private_channel_sync::verify_request_membership(
+                    &self.storage,
+                    request.channel_id,
+                    &request.wallet,
+                ) {
+                    warn!(peer = %peer, channel_id = request.channel_id, wallet = %request.wallet, "private-channel-sync: membership check failed");
+                    if let Err(e) = self
+                        .swarm
+                        .behaviour_mut()
+                        .private_channel_sync
+                        .send_response(channel, private_channel_sync::auth_failed_response(request.channel_id))
+                    {
+                        warn!(peer = %peer, error = ?e, "private-channel-sync: send auth_failed response failed");
+                    }
+                    return;
+                }
+
+                let response = private_channel_sync::build_response(
+                    &self.storage,
+                    &request,
+                    private_channel_sync::MAX_ENVELOPES_PER_RESPONSE,
+                    now / 1000,
+                    u64::MAX,
+                );
+                let sent = response.envelopes.len();
+                if sent > 0 {
+                    self.private_channel_sync_limits.add_served(peer, sent as u64);
+                }
+                if let Err(e) = self
+                    .swarm
+                    .behaviour_mut()
+                    .private_channel_sync
+                    .send_response(channel, response)
+                {
+                    warn!(peer = %peer, error = ?e, "private-channel-sync: send_response failed");
+                }
+                drop(guard);
+            }
+            // --- Inbound response: validate + apply, then page ---
+            Event::Message {
+                peer,
+                message: Message::Response { request_id, response },
+                connection_id: _,
+            } => {
+                let pending = match self.pending_private_channel_sync_requests.remove(&request_id) {
+                    Some(p) => p,
+                    None => return,
+                };
+                if response.auth_failed {
+                    warn!(peer = %peer, wallet = %pending.wallet, channel_id = pending.channel_id, "private-channel-sync: responder rejected our auth");
+                    self.release_private_channel_sync_trigger_if_no_siblings(&pending.wallet, pending.channel_id);
+                    return;
+                }
+                if response.server_capped {
+                    self.release_private_channel_sync_trigger_if_no_siblings(&pending.wallet, pending.channel_id);
+                    return;
+                }
+                if response.envelopes.is_empty() && !response.has_more {
+                    self.release_private_channel_sync_trigger_if_no_siblings(&pending.wallet, pending.channel_id);
+                    return;
+                }
+                // Race-winner: cancel sibling requests for this (wallet, channel).
+                let wallet = pending.wallet.clone();
+                let channel_id = pending.channel_id;
+                self.pending_private_channel_sync_requests.retain(|_, p| {
+                    p.peer_id == peer || p.wallet != wallet || p.channel_id != channel_id
+                });
+
+                let count = response.envelopes.len();
+                let mut admitted = 0usize;
+                let mut accepted = 0usize;
+                let mut dropped = 0usize;
+                if count > private_channel_sync::MAX_ENVELOPES_PER_RESPONSE {
+                    warn!(
+                        peer = %peer, %wallet, channel_id, received = count,
+                        expected_max = private_channel_sync::MAX_ENVELOPES_PER_RESPONSE,
+                        "private-channel-sync: response exceeds this protocol's own max page size; refusing to verify, treating as unproductive"
+                    );
+                } else {
+                    for env_bytes in response.envelopes {
+                        if !private_channel_sync::envelope_is_private_channel_sync_type(&env_bytes)
+                            || !envelope_targets_channel(&env_bytes, channel_id)
+                        {
+                            dropped += 1;
+                            continue;
+                        }
+                        match self.router.process_synced_message(&env_bytes) {
+                            RouteResult::Accepted { .. } => {
+                                admitted += 1;
+                                accepted += 1;
+                            }
+                            RouteResult::Duplicate => admitted += 1,
+                            RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
+                                warn!(peer = %peer, reason = %reason, "private-channel-sync: envelope rejected by router");
+                            }
+                            RouteResult::PowRequired { .. } => {}
+                        }
+                    }
+                }
+                info!(peer = %peer, %wallet, channel_id, received = count, admitted, dropped, has_more = response.has_more, "private-channel-sync: applied batch");
+
+                let pages_fetched = pending.pages_fetched + 1;
+                let consecutive_unproductive_pages = if admitted > 0 {
+                    0
+                } else {
+                    pending.consecutive_unproductive_pages + 1
+                };
+                let hit_backstop = pages_fetched >= MAX_PAGES_PER_SESSION
+                    || consecutive_unproductive_pages >= MAX_CONSECUTIVE_UNPRODUCTIVE_PAGES;
+                if hit_backstop {
+                    warn!(peer = %peer, %wallet, channel_id, pages_fetched, consecutive_unproductive_pages, "private-channel-sync: hit a session backstop; stopping");
+                }
+
+                if response.has_more && !hit_backstop {
+                    if let Some(cursor) = response.next_cursor {
+                        let network = self.topics.network_id().to_string();
+                        let max_age_secs = if self.private_channel_sync_config.max_age_days == 0 {
+                            u64::MAX
+                        } else {
+                            self.private_channel_sync_config.max_age_days.saturating_mul(24 * 3600)
+                        };
+                        let claim = self.private_channel_sync_wallet_claims.get(&wallet).cloned();
+                        let next_req = private_channel_sync::sign_request(
+                            &self.signing_key,
+                            &network,
+                            &peer.to_string(),
+                            &wallet,
+                            channel_id,
+                            now_ms(),
+                            max_age_secs,
+                            Some(cursor),
+                            claim,
+                        );
+                        let next_id = self
+                            .swarm
+                            .behaviour_mut()
+                            .private_channel_sync
+                            .send_request(&peer, next_req);
+                        self.pending_private_channel_sync_requests.insert(
+                            next_id,
+                            PrivateChannelSyncPending {
+                                peer_id: peer,
+                                wallet,
+                                channel_id,
+                                pages_fetched,
+                                consecutive_unproductive_pages,
+                            },
+                        );
+                        return;
+                    }
+                }
+                // Natural completion or give-up: only persist completion
+                // when this session actually admitted at least one
+                // genuinely NEW, signature-verified envelope (`Accepted`,
+                // never merely `Duplicate`) — same hardened gate
+                // `handle_reconcile_event` uses (and the exact reasoning
+                // documented there for why `Duplicate` alone must not
+                // qualify: an all-garbage or all-replayed response must
+                // not be trusted as "nothing more to fetch").
+                if !response.has_more && accepted > 0 {
+                    let now_secs = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    if let Err(e) = self
+                        .storage
+                        .mark_private_channel_sync_complete(&wallet, channel_id, now_secs)
+                    {
+                        warn!(%wallet, channel_id, error = %e, "private-channel-sync: failed to persist sync completion");
+                    }
+                }
+                self.release_private_channel_sync_trigger_if_no_siblings(&wallet, channel_id);
+            }
+            Event::OutboundFailure { peer, request_id, error, .. } => {
+                if let Some(p) = self.pending_private_channel_sync_requests.remove(&request_id) {
+                    debug!(peer = %peer, wallet = %p.wallet, channel_id = p.channel_id, error = ?error, "private-channel-sync: outbound failed; siblings may succeed");
+                    self.release_private_channel_sync_trigger_if_no_siblings(&p.wallet, p.channel_id);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Periodic retry sweep for private-channel-history backfill (closes
+    /// the F2 backfill gap, l2-node 0.138.0+). `maybe_trigger_private_
+    /// channel_sync` only fires from `federate_channel`, which for most
+    /// already-federated channels runs exactly once — at federation time.
+    /// Without this sweep, a channel whose one attempt gave up (no
+    /// candidate peers, an uninformative response, a page/unproductive-
+    /// page backstop) has no way to ever retry short of re-federating.
+    /// Mirrors `retry_incomplete_channel_backfills`'s shape exactly, but
+    /// walks `LOCAL_CHANNEL_FED` (already keyed `(wallet, channel_id)` —
+    /// precisely the candidate set this sweep needs) instead of
+    /// `CHANNELS`, with its own rotating cursor so it survives restarts
+    /// independently of the public-channel sweep's progress.
+    fn retry_incomplete_private_channel_syncs(&mut self) {
+        if !self.private_channel_sync_config.enabled {
+            return;
+        }
+        let cursor_key = crate::storage::schema::state_keys::PRIVATE_CHANNEL_SYNC_RETRY_CURSOR;
+        let start_key = self
+            .storage
+            .get_cf(crate::storage::schema::cf::NODE_STATE, cursor_key)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let batch = self.private_channel_sync_config.catchup_batch_size.max(1);
+        let entries = match self.storage.prefix_iter_cf_after(
+            crate::storage::schema::cf::LOCAL_CHANNEL_FED,
+            &start_key,
+            &[],
+            batch,
+        ) {
+            Ok(e) => e,
+            Err(e) => {
+                warn!(error = %e, "private-channel-sync retry sweep: LOCAL_CHANNEL_FED iteration failed");
+                return;
+            }
+        };
+        let hit_end = entries.len() < batch;
+        let mut last_key: Option<Vec<u8>> = None;
+        for (key, _) in &entries {
+            // Key: wallet bytes ++ 0xFF ++ channel_id_be8. Wallet
+            // addresses are bech32 (ASCII, never contains 0xFF), so the
+            // first 0xFF byte unambiguously splits the two fields.
+            if let Some(sep) = key.iter().position(|&b| b == 0xFF) {
+                if key.len() == sep + 1 + 8 {
+                    if let (Ok(wallet), Ok(channel_id_bytes)) = (
+                        std::str::from_utf8(&key[..sep]),
+                        <[u8; 8]>::try_from(&key[sep + 1..]),
+                    ) {
+                        let channel_id = u64::from_be_bytes(channel_id_bytes);
+                        self.maybe_trigger_private_channel_sync(channel_id, wallet, None);
+                    }
+                }
+            }
+            last_key = Some(key.clone());
+        }
+        let next_cursor = if hit_end {
+            Vec::new()
+        } else {
+            last_key.unwrap_or_default()
+        };
+        if let Err(e) = self.storage.put_cf(
+            crate::storage::schema::cf::NODE_STATE,
+            cursor_key,
+            &next_cursor,
+        ) {
+            warn!(error = %e, "private-channel-sync retry sweep: failed to persist cursor");
         }
     }
 

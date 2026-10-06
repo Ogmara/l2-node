@@ -595,7 +595,7 @@ pub fn build_response(
 /// rather than in-session-fixed since closing it means adding drift
 /// validation to the sync ingest path generally, a broader change than this
 /// function.
-fn channel_meta_envelopes(storage: &Storage, channel_id: u64) -> Vec<Vec<u8>> {
+pub(crate) fn channel_meta_envelopes(storage: &Storage, channel_id: u64) -> Vec<Vec<u8>> {
     const CHANNEL_META_CAP: usize = 256;
     let prefix = channel_id.to_be_bytes();
     let rows = match storage.prefix_iter_cf(
@@ -634,6 +634,124 @@ fn channel_meta_envelopes(storage: &Storage, channel_id: u64) -> Vec<Vec<u8>> {
     out.into_iter().map(|(_, raw)| raw).collect()
 }
 
+/// Fetch the EARLIEST `ChannelCreate` and ALL `ChannelUpdate` (ts-ascending)
+/// original signed envelopes for `channel_id`, for federation bootstrap
+/// (`api::routes::federate_channel` / `get_channel`'s restricted
+/// response). Security-audit finding (2026-10-05): `federate_channel`
+/// used to trust a bespoke JSON summary scraped from an unauthenticated
+/// HTTP response for `creator`/`history_visibility`/`encryption_enabled`
+/// — this function lets the caller instead re-serve the ORIGINAL signed
+/// envelope(s) so the requester can independently verify them through
+/// `process_synced_message`, the same never-trust-derived-JSON idiom
+/// `dm_sync`/`identity_sync`/`private_channel_sync`/this module's own
+/// `channel_meta_envelopes` already follow.
+///
+/// Deliberately narrower than `channel_meta_envelopes`: this is served
+/// to an UNAUTHENTICATED caller (see `get_channel`'s restricted branch),
+/// so it must NOT include `ChannelJoin`/`ChannelLeave`/`ChannelKick`/
+/// `ChannelBan`/`ChannelUnban` — those would disclose OTHER users'
+/// membership/moderation history at the same disclosure level as the
+/// private-channel-sync protocol, which gates that content behind a
+/// verified membership check. `ChannelCreate`/`ChannelUpdate` alone carry
+/// nothing beyond what the existing JSON `channel` summary already
+/// discloses to any caller today — this just makes those same fields
+/// verifiable instead of merely claimed.
+///
+/// **Code-audit fix (2026-10-05, round 2)**: the first version of this
+/// function selected the LATEST row of each type, reasoning (wrongly)
+/// that `ChannelUpdate` is a full snapshot and that there's only ever one
+/// `ChannelCreate`. Both were bugs:
+///  - `ChannelUpdatePayload`'s fields are all `Option` and the apply arm
+///    merges only the `Some` ones (`router.rs`) — it's a PARTIAL PATCH,
+///    not a snapshot. Replaying only the latest permanently drops any
+///    field set by an EARLIER update and never touched since (e.g. a
+///    `display_name` set in update #1, then only `logo_cid` changed in
+///    update #2 — bootstrapping from #2 alone loses the name). Fixed by
+///    returning ALL updates, ts-ascending (the correct patch-apply
+///    order), bounded the same way `channel_meta_envelopes` bounds its
+///    own ride-along.
+///  - `CHANNEL_META_MSGS` is NOT "one row per channel" — it's one row
+///    per accepted `ChannelCreate` ENVELOPE, and `update_indexes` indexes
+///    every one unconditionally, even when the apply step's existing-row
+///    branch ignores a non-creator's competing claim for an ALREADY-
+///    KNOWN channel_id (logged, not rejected — see that branch's own
+///    comment). A registered wallet that knows the channel_id (which,
+///    by this system's own design, anyone legitimately joining also
+///    knows) can post such a competing `ChannelCreate` and have it
+///    stored+indexed with a LATER timestamp than the genuine one.
+///    Selecting the latest therefore handed a bootstrapping node the
+///    IMPOSTOR's envelope instead of the real creator's. The genuine
+///    `ChannelCreate` necessarily predates any such competing claim
+///    (you have to already know a channel exists to contest its
+///    creatorship) — so the EARLIEST row is the one that matches
+///    whatever this node's own merge logic would already treat as
+///    authoritative. A forward scan is already ts-ascending, so the
+///    FIRST row is earliest.
+///
+/// Residual (recorded, not closed by this function alone): a node that
+/// has NEVER seen `channel_id` before has no independent anchor to
+/// distinguish a genuine first-sight `ChannelCreate` from an attacker's
+/// self-signed one for the same id — private channels never exist
+/// on-chain, so there is no third-party source of truth beyond "whoever
+/// signed the envelope you encounter first." This is not unique to
+/// federation bootstrap (any node's very first encounter with a
+/// `channel_id`, by any path, has the same property) but federation is
+/// what makes a brand-new node's first encounter attacker-reachable at
+/// all. See `api::routes::federate_channel`'s doc comment for the
+/// current status of this residual.
+pub(crate) fn channel_bootstrap_envelopes(
+    storage: &Storage,
+    channel_id: u64,
+) -> (Option<Vec<u8>>, Vec<Vec<u8>>) {
+    const BOOTSTRAP_UPDATE_CAP: usize = 256;
+
+    let create = {
+        let mut prefix = channel_id.to_be_bytes().to_vec();
+        prefix.push(MessageType::ChannelCreate as u8);
+        storage
+            .prefix_iter_cf(schema::cf::CHANNEL_META_MSGS, &prefix, 1)
+            .ok()
+            .and_then(|rows| rows.into_iter().next())
+            .and_then(|(key, _)| bootstrap_msg_id(&key))
+            .and_then(|msg_id| storage.get_message(&msg_id).ok().flatten())
+    };
+
+    let updates = {
+        let mut prefix = channel_id.to_be_bytes().to_vec();
+        prefix.push(MessageType::ChannelUpdate as u8);
+        let rows = storage
+            .prefix_iter_cf(schema::cf::CHANNEL_META_MSGS, &prefix, BOOTSTRAP_UPDATE_CAP.saturating_add(1))
+            .unwrap_or_default();
+        if rows.len() > BOOTSTRAP_UPDATE_CAP {
+            warn!(
+                channel_id,
+                cap = BOOTSTRAP_UPDATE_CAP,
+                "channel_bootstrap_envelopes: channel has more ChannelUpdate envelopes than the \
+                 bootstrap cap; oldest-in-window excess not served this call (live gossip / a \
+                 later federation retry still covers it once this one applies)"
+            );
+        }
+        rows.into_iter()
+            .take(BOOTSTRAP_UPDATE_CAP)
+            .filter_map(|(key, _)| bootstrap_msg_id(&key))
+            .filter_map(|msg_id| storage.get_message(&msg_id).ok().flatten())
+            .collect()
+    };
+
+    (create, updates)
+}
+
+/// Extract the `msg_id` suffix from a `CHANNEL_META_MSGS` key
+/// (`channel_id:8 ++ msg_type:1 ++ ts:8 ++ msg_id:32` = 49 bytes).
+fn bootstrap_msg_id(key: &[u8]) -> Option<[u8; 32]> {
+    if key.len() != 8 + 1 + 8 + 32 {
+        return None;
+    }
+    let mut msg_id = [0u8; 32];
+    msg_id.copy_from_slice(&key[17..49]);
+    Some(msg_id)
+}
+
 /// Gather a channel's `ChatEdit`/`ChatDelete` envelopes (audit final
 /// pre-mainnet W6) to ride along on the LAST page of a reconcile session.
 /// Without this, edit/delete envelopes never reach a backfilling node at
@@ -650,7 +768,7 @@ fn channel_meta_envelopes(storage: &Storage, channel_id: u64) -> Vec<Vec<u8>> {
 /// accepted for `channel_meta_envelopes`: a channel with more markers than
 /// the cap just doesn't get its oldest excess markers this session (they'll
 /// still arrive via live gossip for anything edited/deleted going forward).
-fn channel_edit_delete_envelopes(
+pub(crate) fn channel_edit_delete_envelopes(
     storage: &Storage,
     channel_id: u64,
     min_timestamp: u64,
@@ -735,6 +853,66 @@ pub(crate) fn is_private_channel(storage: &Storage, channel_id: u64) -> bool {
         meta.get("channel_type").and_then(|v| v.as_u64()),
         Some(2)
     )
+}
+
+/// Free-function equivalent of `MessageRouter::is_channel_member`
+/// ([router.rs](crate::messages::router)), for callers that only have a
+/// `&Storage` (no full `MessageRouter`) — currently
+/// `network::private_channel_sync::verify_request_auth`. Same logic,
+/// same key encoding, just not behind `&self`: do not let this drift
+/// from the router's copy.
+pub(crate) fn is_channel_member(storage: &Storage, channel_id: u64, address: &str) -> bool {
+    let key = schema::encode_channel_member_key(channel_id, address);
+    storage
+        .exists_cf(schema::cf::CHANNEL_MEMBERS, &key)
+        .unwrap_or(false)
+}
+
+/// Resolve a channel's `history_visibility` (`0` = ForwardOnly, `1` =
+/// FullHistory — see `messages::router::channel_encryption_defaults`).
+/// Returns `None` for an unknown channel or a malformed/missing field —
+/// callers must fail closed (treat `None` as ForwardOnly), never as
+/// FullHistory.
+pub(crate) fn channel_history_visibility(storage: &Storage, channel_id: u64) -> Option<u8> {
+    let key = channel_id.to_be_bytes();
+    let bytes = storage.get_cf(schema::cf::CHANNELS, &key).ok().flatten()?;
+    let meta: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    meta.get("history_visibility").and_then(|v| v.as_u64()).map(|v| v as u8)
+}
+
+/// Look up `wallet`'s `joined_at` for `channel_id` from its
+/// `CHANNEL_MEMBERS` row, normalized to unix SECONDS (matching the
+/// second-granularity used throughout `reconcile`/`private_channel_sync`).
+/// Returns `None` if the wallet has no membership row or the field is
+/// missing/malformed.
+///
+/// Security-audit finding (2026-10-01): the writers of this row are NOT
+/// unit-consistent. `routes.rs`'s `federate_channel`/join handlers and
+/// `messages::router`'s `ChatMessage`/`ChannelInvite` auto-add all write
+/// `now_ms` (unix MILLISECONDS) — but `chain::scanner`'s creator-row
+/// writer (on `ChannelCreated`) writes the on-chain transaction's
+/// `timestamp`, which `chain::parser` documents as unix SECONDS. A flat
+/// `/ 1000` (this function's first version) silently divided an
+/// already-in-seconds creator timestamp down to ~1970, disabling the
+/// ForwardOnly floor for every channel's creator — a confidentiality
+/// fail-OPEN, not fail-closed. Disambiguate by magnitude instead: any
+/// real seconds-epoch value stays under 10_000_000_000 (unix seconds
+/// don't reach that until the year 2286), while any real milliseconds-
+/// epoch value for current and foreseeable dates is already far above
+/// it (~1.7e12 today) — so this threshold cannot misclassify a genuine
+/// value from either writer.
+pub(crate) fn member_joined_at(storage: &Storage, channel_id: u64, wallet: &str) -> Option<u64> {
+    const SECONDS_MS_DISAMBIGUATION_THRESHOLD: u64 = 10_000_000_000;
+    let key = schema::encode_channel_member_key(channel_id, wallet);
+    let bytes = storage.get_cf(schema::cf::CHANNEL_MEMBERS, &key).ok().flatten()?;
+    let rec: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    rec.get("joined_at").and_then(|v| v.as_u64()).map(|raw| {
+        if raw >= SECONDS_MS_DISAMBIGUATION_THRESHOLD {
+            raw / 1000
+        } else {
+            raw
+        }
+    })
 }
 
 /// Construct a `server_capped` response (no envelopes) — used when the
@@ -1066,6 +1244,177 @@ mod channel_meta_order_tests {
              otherwise a skewed-clock Join can be permanently lost \
              (add_channel_member no-ops when the channel doesn't exist yet)"
         );
+    }
+}
+
+#[cfg(test)]
+mod channel_bootstrap_envelopes_tests {
+    //! `channel_bootstrap_envelopes` (security-audit fix, 2026-10-05) is
+    //! the responder-side half of `federate_channel`'s verifiable
+    //! bootstrap: it must return the `ChannelCreate` envelope and only
+    //! the LATEST `ChannelUpdate`, never other meta types.
+    use super::*;
+    use crate::messages::envelope::Envelope;
+    use crate::messages::types::MessageType;
+    use crate::storage::rocks::Storage;
+    use tempfile::TempDir;
+
+    fn db() -> (Storage, TempDir) {
+        let dir = TempDir::new().unwrap();
+        (Storage::open(dir.path()).unwrap(), dir)
+    }
+
+    fn put_meta_envelope(s: &Storage, channel_id: u64, msg_type: MessageType, msg_id: [u8; 32], ts: u64) {
+        let env = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type,
+            msg_id,
+            author: "klv1author".to_string(),
+            timestamp: ts,
+            lamport_ts: 0,
+            payload: Vec::new(),
+            signature: vec![],
+            relay_path: vec![],
+        };
+        s.put_cf(
+            schema::cf::CHANNEL_META_MSGS,
+            &schema::encode_channel_meta_key(channel_id, msg_type as u8, ts, &msg_id),
+            &[],
+        )
+        .unwrap();
+        s.put_cf(schema::cf::MESSAGES, &msg_id, &rmp_serde::to_vec_named(&env).unwrap())
+            .unwrap();
+    }
+
+    fn msg_id_of(raw: &[u8]) -> [u8; 32] {
+        rmp_serde::from_slice::<Envelope>(raw).unwrap().msg_id
+    }
+
+    fn msg_ids_of(rows: &[Vec<u8>]) -> Vec<[u8; 32]> {
+        rows.iter().map(|r| msg_id_of(r)).collect()
+    }
+
+    #[test]
+    fn no_channel_create_returns_none_and_empty() {
+        let (s, _d) = db();
+        let (create, updates) = channel_bootstrap_envelopes(&s, 1u64);
+        assert!(create.is_none());
+        assert!(updates.is_empty());
+    }
+
+    #[test]
+    fn create_only_returns_create_and_no_updates() {
+        let (s, _d) = db();
+        let channel_id = 2u64;
+        put_meta_envelope(&s, channel_id, MessageType::ChannelCreate, [1u8; 32], 1_000);
+        let (create, updates) = channel_bootstrap_envelopes(&s, channel_id);
+        assert_eq!(create.map(|r| msg_id_of(&r)), Some([1u8; 32]));
+        assert!(updates.is_empty());
+    }
+
+    #[test]
+    fn multiple_updates_returns_all_ts_ascending() {
+        // Code-audit fix (2026-10-05, round 2): a prior version returned
+        // only the latest update, silently dropping fields set by earlier
+        // ones (ChannelUpdatePayload's fields are a partial PATCH, not a
+        // snapshot). Must return ALL of them, oldest-first — the correct
+        // patch-apply order.
+        let (s, _d) = db();
+        let channel_id = 3u64;
+        put_meta_envelope(&s, channel_id, MessageType::ChannelCreate, [1u8; 32], 1_000);
+        put_meta_envelope(&s, channel_id, MessageType::ChannelUpdate, [2u8; 32], 2_000);
+        put_meta_envelope(&s, channel_id, MessageType::ChannelUpdate, [3u8; 32], 3_000);
+        let (create, updates) = channel_bootstrap_envelopes(&s, channel_id);
+        assert_eq!(create.map(|r| msg_id_of(&r)), Some([1u8; 32]));
+        assert_eq!(
+            msg_ids_of(&updates),
+            vec![[2u8; 32], [3u8; 32]],
+            "must return every ChannelUpdate, oldest first"
+        );
+    }
+
+    #[test]
+    fn two_channel_creates_returns_the_earliest_not_the_latest() {
+        // Code-audit CRITICAL fix (2026-10-05, round 2): `CHANNEL_META_MSGS`
+        // indexes every ACCEPTED ChannelCreate envelope for a channel_id,
+        // even one the apply step's existing-row branch ignored as a
+        // non-creator's competing claim (logged, not rejected — the
+        // envelope is still stored+indexed). A later-timestamped SECOND
+        // ChannelCreate for the same id (the attack this regression-guards
+        // against) must NOT be selected over the genuine, earlier one.
+        let (s, _d) = db();
+        let channel_id = 5u64;
+        put_meta_envelope(&s, channel_id, MessageType::ChannelCreate, [1u8; 32], 1_000);
+        // A later, competing ChannelCreate for the SAME channel_id — as
+        // would result from an attacker's forged claim being accepted
+        // (stored+indexed) but ignored by the merge logic.
+        put_meta_envelope(&s, channel_id, MessageType::ChannelCreate, [9u8; 32], 9_000);
+        let (create, _updates) = channel_bootstrap_envelopes(&s, channel_id);
+        assert_eq!(
+            create.map(|r| msg_id_of(&r)),
+            Some([1u8; 32]),
+            "must return the EARLIEST ChannelCreate, not the latest"
+        );
+    }
+
+    #[test]
+    fn updates_beyond_the_cap_are_truncated_not_silently_replaced_with_a_stale_one() {
+        // Code-audit fix: a prior version used a forward scan bounded at
+        // a cap, then took `.last()` — for more than `cap` updates that
+        // returns the cap-th OLDEST row, not the true latest, silently.
+        // Returning ALL rows up to the cap (oldest-first) at least never
+        // claims to be "the latest" when it isn't — excess is logged.
+        let (s, _d) = db();
+        let channel_id = 6u64;
+        put_meta_envelope(&s, channel_id, MessageType::ChannelCreate, [0u8; 32], 0);
+        for n in 1u64..=300 {
+            let mut mid = [0u8; 32];
+            mid[0..8].copy_from_slice(&n.to_be_bytes());
+            put_meta_envelope(&s, channel_id, MessageType::ChannelUpdate, mid, n * 1_000);
+        }
+        let (_create, updates) = channel_bootstrap_envelopes(&s, channel_id);
+        assert_eq!(updates.len(), 256, "must be capped, not unbounded");
+        // The returned set is the OLDEST 256 (updates 1..=256) — a real
+        // residual (the newest 44 are dropped this call), documented in
+        // the function's own doc comment rather than silently hidden.
+        let first_id = rmp_serde::from_slice::<Envelope>(&updates[0]).unwrap().timestamp;
+        assert_eq!(first_id, 1_000);
+    }
+
+    #[test]
+    fn other_meta_types_never_leak_into_bootstrap_response() {
+        let (s, _d) = db();
+        let channel_id = 4u64;
+        put_meta_envelope(&s, channel_id, MessageType::ChannelCreate, [1u8; 32], 1_000);
+        put_meta_envelope(&s, channel_id, MessageType::ChannelJoin, [2u8; 32], 2_000);
+        put_meta_envelope(&s, channel_id, MessageType::ChannelBan, [3u8; 32], 3_000);
+        let (create, updates) = channel_bootstrap_envelopes(&s, channel_id);
+        assert_eq!(create.map(|r| msg_id_of(&r)), Some([1u8; 32]));
+        assert!(
+            updates.is_empty(),
+            "ChannelJoin/ChannelBan must never be mistaken for a ChannelUpdate — \
+             this response is served to an UNAUTHENTICATED caller and must not \
+             disclose other users' membership/moderation history"
+        );
+    }
+
+    #[test]
+    fn missing_messages_row_is_skipped_not_panicking() {
+        // A CHANNEL_META_MSGS key whose MESSAGES row is gone (e.g. pruned)
+        // must be skipped gracefully, not panic or surface as Some(garbage).
+        let (s, _d) = db();
+        let channel_id = 7u64;
+        let msg_id = [1u8; 32];
+        s.put_cf(
+            schema::cf::CHANNEL_META_MSGS,
+            &schema::encode_channel_meta_key(channel_id, MessageType::ChannelCreate as u8, 1_000, &msg_id),
+            &[],
+        )
+        .unwrap();
+        // Deliberately no MESSAGES row for msg_id.
+        let (create, updates) = channel_bootstrap_envelopes(&s, channel_id);
+        assert!(create.is_none());
+        assert!(updates.is_empty());
     }
 }
 

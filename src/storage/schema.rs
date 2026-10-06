@@ -167,6 +167,23 @@ pub mod cf {
     /// concurrent with itself), so no lock is needed here either.
     pub const CHANNEL_BACKFILL_STATE: &str = "channel_backfill_state";
 
+    /// (wallet, 0xFF, channel_id_be8) → unix seconds (8 bytes BE) of the
+    /// last time a private-channel-sync session reached NATURAL
+    /// completion for that `(wallet, channel_id)` pair (closes the F2
+    /// backfill gap, l2-node 0.138.0+ — see
+    /// `network::private_channel_sync` and
+    /// `network::NetworkService::maybe_trigger_private_channel_sync`).
+    /// Same key shape as `LOCAL_CHANNEL_FED` (the exact candidate set the
+    /// periodic retry sweep walks), and the same simple
+    /// "unix-seconds-of-last-completion" shape as `CHANNEL_BACKFILL_STATE`
+    /// — deliberately NOT a richer peer-health-scoring struct (this
+    /// protocol's eligible-peer pool is small and individually
+    /// authenticated; see the design doc's "do not port 0.137.0's
+    /// staleness-comparison machinery" rationale). NODE-LOCAL operational
+    /// state — excluded from snapshot `DOMAIN_CFS`, same as
+    /// `LOCAL_CHANNEL_FED`/`CHANNEL_BACKFILL_STATE`.
+    pub const PRIVATE_CHANNEL_SYNC_STATE: &str = "private_channel_sync_state";
+
     /// channel_id (8 bytes BE) → PendingChannelDelete JSON (claimant, requested_at) —
     /// a `ChannelDelete` received before the channel is known locally (out-of-order
     /// gossip / chain-scan lag, audit final pre-mainnet W14). Consumed the first time
@@ -418,6 +435,7 @@ pub mod cf {
         DELETED_CHANNELS,
         CHANNEL_VERIFICATION,
         CHANNEL_BACKFILL_STATE,
+        PRIVATE_CHANNEL_SYNC_STATE,
         PENDING_CHANNEL_DELETES,
         PENDING_CHANNEL_MEMBER_REMOVALS,
         DELETION_MARKERS,
@@ -646,6 +664,13 @@ pub mod state_keys {
     /// Empty means "start from the beginning" (initial state, and
     /// whenever a sweep reaches the end of the table).
     pub const CHANNEL_BACKFILL_RETRY_CURSOR: &[u8] = b"channel_backfill_retry_cursor";
+    /// Rotating cursor (raw `LOCAL_CHANNEL_FED` key bytes) for the periodic
+    /// private-channel-sync retry sweep
+    /// (`NetworkService::retry_incomplete_private_channel_syncs`, l2-node
+    /// 0.138.0). Separate from `CHANNEL_BACKFILL_RETRY_CURSOR` so the two
+    /// sweeps progress independently. Empty means "start from the
+    /// beginning".
+    pub const PRIVATE_CHANNEL_SYNC_RETRY_CURSOR: &[u8] = b"private_channel_sync_retry_cursor";
 }
 
 /// Snapshot bootstrap (spec 11-snapshot-sync.md).

@@ -87,6 +87,10 @@ pub struct Config {
     /// gap — see `ChannelVerifyConfig`).
     #[serde(default)]
     pub channel_verify: ChannelVerifyConfig,
+    /// Private-channel-history backfill policy (closes the F2 backfill
+    /// gap, l2-node 0.138.0+). See `network::private_channel_sync`.
+    #[serde(default)]
+    pub private_channel_sync: PrivateChannelSyncConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -689,6 +693,60 @@ fn default_backfill_stale_peer_threshold() -> u32 {
 }
 fn default_backfill_stale_peer_reprobe_hours() -> u64 {
     24
+}
+
+/// Private-channel-history backfill policy (closes the F2 backfill gap,
+/// l2-node 0.138.0+). A federated private channel's history is otherwise
+/// permanently lossy for whatever a node missed before federating or
+/// while offline — `network::reconcile` (the general backfill protocol)
+/// refuses every private-channel request outright (no authenticated
+/// membership proof in its wire format). `network::private_channel_sync`
+/// closes that gap with an authenticated, membership-checked protocol.
+/// Mirrors `BackfillConfig`'s equivalent knobs (a deliberately small
+/// subset — this protocol's eligible-peer pool is inherently small and
+/// individually authenticated, so it doesn't need `BackfillConfig`'s
+/// fanout/stale-peer-comparison machinery).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrivateChannelSyncConfig {
+    /// Master switch. Default `true`.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// How far back a backfill request asks for envelopes, in days.
+    /// Default 30. `0` = unlimited.
+    #[serde(default = "default_private_channel_sync_max_age_days")]
+    pub max_age_days: u64,
+    /// How often, in hours, to re-check a `(wallet, channel)` pair whose
+    /// sync has already completed (default 6). `0` disables re-checking
+    /// completed pairs (a never-completed pair is still always retried).
+    #[serde(default = "default_private_channel_sync_channel_catchup_interval_hours")]
+    pub channel_catchup_interval_hours: u64,
+    /// Max `(wallet, channel)` pairs examined per periodic retry-sweep
+    /// tick (default 25). Caps per-tick cost to a fixed batch regardless
+    /// of how many channels have been federated locally.
+    #[serde(default = "default_private_channel_sync_catchup_batch_size")]
+    pub catchup_batch_size: usize,
+}
+
+impl Default for PrivateChannelSyncConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_age_days: default_private_channel_sync_max_age_days(),
+            channel_catchup_interval_hours:
+                default_private_channel_sync_channel_catchup_interval_hours(),
+            catchup_batch_size: default_private_channel_sync_catchup_batch_size(),
+        }
+    }
+}
+
+fn default_private_channel_sync_max_age_days() -> u64 {
+    30
+}
+fn default_private_channel_sync_channel_catchup_interval_hours() -> u64 {
+    6
+}
+fn default_private_channel_sync_catchup_batch_size() -> usize {
+    25
 }
 
 /// Direct-message offline store-and-forward policy (spec 3
@@ -3701,6 +3759,22 @@ stale_peer_threshold = 3
 # requalify. 0 disables re-probing (a stale peer stays deprioritized
 # until it happens to win a comparison some other way).
 stale_peer_reprobe_hours = 24
+
+[private_channel_sync]
+# Authenticated, membership-checked history backfill for PRIVATE channels
+# (closes the F2 backfill gap — [backfill] above refuses every private
+# channel outright, since its wire protocol carries no membership proof).
+enabled = true
+# How far back a backfill request asks for envelopes, in days. 0 = unlimited.
+max_age_days = 30
+# How often (hours) to re-check a (wallet, channel) pair whose sync already
+# completed. 0 disables re-checking completed pairs (a never-completed pair
+# is always retried regardless).
+channel_catchup_interval_hours = 6
+# Max (wallet, channel) pairs examined per periodic retry-sweep tick (every
+# 30s). Bounds the sweep's cost to a fixed batch regardless of how many
+# channels have been federated locally.
+catchup_batch_size = 25
 
 [api]
 # Set to "0.0.0.0" to accept connections from all interfaces

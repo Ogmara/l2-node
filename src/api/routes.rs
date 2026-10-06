@@ -2381,10 +2381,30 @@ pub async fn get_channel(
                             limited[key] = v.clone();
                         }
                     }
+                    // Security-audit finding (2026-10-05): `federate_channel`
+                    // used to trust this JSON summary's `creator`/
+                    // `history_visibility`/`encryption_enabled` directly —
+                    // discloses nothing new (every field above is already
+                    // unsigned-trusted here), but now also carries the
+                    // ORIGINAL signed envelope(s) so a federating caller can
+                    // independently verify them via `process_synced_message`
+                    // instead of trusting this JSON. See
+                    // `reconcile::channel_bootstrap_envelopes`'s doc comment.
+                    let (create_env, update_envs) =
+                        crate::network::reconcile::channel_bootstrap_envelopes(&state.storage, channel_id);
+                    use base64::Engine;
+                    let b64 = base64::engine::general_purpose::STANDARD;
                     return Json(serde_json::json!({
                         "channel": limited,
                         "member_count": member_count,
                         "restricted": true,
+                        "channel_create_envelope": create_env.map(|b| b64.encode(b)),
+                        // Plural + ts-ascending: a ChannelUpdate is a
+                        // partial patch (all its fields are `Option`),
+                        // not a full snapshot — bootstrapping from only
+                        // the latest one silently drops fields set by an
+                        // earlier update and never touched since.
+                        "channel_update_envelopes": update_envs.into_iter().map(|b| b64.encode(b)).collect::<Vec<_>>(),
                     })).into_response();
                 }
                 // Fetch moderator list
@@ -3783,10 +3803,166 @@ pub struct FederateRequest {
 /// already gossip to `channel_topic(channel_id)`) and the member never leaves their
 /// node. The node learns only ciphertext + membership/timing, never content.
 /// Idempotent.
+/// Confusion/replay guard for `federate_channel`'s bootstrap envelope:
+/// true iff `raw` decodes to a `ChannelCreate` whose payload claims
+/// `expected_channel_id` AND `channel_type == Private`. Same class of
+/// check as `network::envelope_targets_channel` — a host that genuinely
+/// owns some OTHER private channel could otherwise return a validly-
+/// signed envelope for THAT channel and have it mistaken for proof about
+/// the one actually being federated.
+fn envelope_is_channel_create_for(raw: &[u8], expected_channel_id: u64) -> bool {
+    use crate::messages::envelope::Envelope;
+    use crate::messages::types::{deserialize_payload, ChannelType, DeserializedPayload, MessageType};
+    let Ok(envelope) = rmp_serde::from_slice::<Envelope>(raw) else { return false };
+    if envelope.msg_type != MessageType::ChannelCreate {
+        return false;
+    }
+    match deserialize_payload(envelope.msg_type, &envelope.payload) {
+        Ok(DeserializedPayload::ChannelCreate(p)) => {
+            p.channel_id == expected_channel_id && p.channel_type == ChannelType::Private
+        }
+        _ => false,
+    }
+}
+
+/// Same check as [`envelope_is_channel_create_for`], for `ChannelUpdate`.
+/// `ChannelUpdatePayload` has no `channel_type` field (a channel's type
+/// is immutable post-creation — only `ChannelCreate` carries it), so this
+/// only confirms the targeted `channel_id` matches.
+fn envelope_is_channel_update_for(raw: &[u8], expected_channel_id: u64) -> bool {
+    use crate::messages::envelope::Envelope;
+    use crate::messages::types::{deserialize_payload, DeserializedPayload, MessageType};
+    let Ok(envelope) = rmp_serde::from_slice::<Envelope>(raw) else { return false };
+    if envelope.msg_type != MessageType::ChannelUpdate {
+        return false;
+    }
+    matches!(
+        deserialize_payload(envelope.msg_type, &envelope.payload),
+        Ok(DeserializedPayload::ChannelUpdate(p)) if p.channel_id == expected_channel_id
+    )
+}
+
+#[cfg(test)]
+mod federate_channel_envelope_guard_tests {
+    //! `envelope_is_channel_create_for`/`envelope_is_channel_update_for`
+    //! are the confusion/replay guard for `federate_channel`'s verifiable
+    //! bootstrap (security-audit fix, 2026-10-05): a host that genuinely
+    //! owns some OTHER private channel must not be able to have its
+    //! validly-signed envelope mistaken for proof about the channel
+    //! actually being federated. These don't check the signature
+    //! (`process_synced_message` does that separately) — only that the
+    //! content matches what was asked for.
+    use super::*;
+    use crate::messages::envelope::Envelope;
+    use crate::messages::types::{
+        ChannelCreatePayload, ChannelType, ChannelUpdatePayload, ContentRating, ModerationPolicy,
+    };
+
+    fn unsigned_create(channel_id: u64, channel_type: ChannelType) -> Vec<u8> {
+        let payload = ChannelCreatePayload {
+            channel_id,
+            slug: "test-channel".to_string(),
+            channel_type,
+            display_name: None,
+            description: None,
+            content_rating: ContentRating::default(),
+            moderation: ModerationPolicy { admins: vec![], rules: None },
+            encryption_enabled: None,
+            history_visibility: None,
+        };
+        let env = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: crate::messages::types::MessageType::ChannelCreate,
+            msg_id: [1u8; 32],
+            author: "klv1author".to_string(),
+            timestamp: 1_000,
+            lamport_ts: 0,
+            payload: rmp_serde::to_vec_named(&payload).unwrap(),
+            signature: vec![],
+            relay_path: vec![],
+        };
+        rmp_serde::to_vec_named(&env).unwrap()
+    }
+
+    fn unsigned_update(channel_id: u64) -> Vec<u8> {
+        let payload = ChannelUpdatePayload {
+            channel_id,
+            display_name: Some("new name".to_string()),
+            description: None,
+            content_rating: None,
+            moderation: None,
+            logo_cid: None,
+            banner_cid: None,
+            website_url: None,
+            tags: None,
+            channel_type: None,
+            threads_enabled: None,
+        };
+        let env = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: crate::messages::types::MessageType::ChannelUpdate,
+            msg_id: [2u8; 32],
+            author: "klv1author".to_string(),
+            timestamp: 2_000,
+            lamport_ts: 0,
+            payload: rmp_serde::to_vec_named(&payload).unwrap(),
+            signature: vec![],
+            relay_path: vec![],
+        };
+        rmp_serde::to_vec_named(&env).unwrap()
+    }
+
+    #[test]
+    fn create_matching_channel_id_and_private_type_passes() {
+        assert!(envelope_is_channel_create_for(&unsigned_create(42, ChannelType::Private), 42));
+    }
+
+    #[test]
+    fn create_rejects_mismatched_channel_id() {
+        // The confusion attack this guard exists to stop: a host that
+        // legitimately owns channel 99 returns ITS OWN validly-signed
+        // ChannelCreate when asked about channel 42.
+        assert!(!envelope_is_channel_create_for(&unsigned_create(99, ChannelType::Private), 42));
+    }
+
+    #[test]
+    fn create_rejects_non_private_channel_type() {
+        assert!(!envelope_is_channel_create_for(&unsigned_create(42, ChannelType::Public), 42));
+    }
+
+    #[test]
+    fn create_rejects_garbage_bytes() {
+        assert!(!envelope_is_channel_create_for(b"not a valid envelope", 42));
+    }
+
+    #[test]
+    fn create_rejects_wrong_msg_type() {
+        // An envelope that decodes fine but is some OTHER message type
+        // entirely must not be mistaken for a ChannelCreate.
+        assert!(!envelope_is_channel_create_for(&unsigned_update(42), 42));
+    }
+
+    #[test]
+    fn update_matching_channel_id_passes() {
+        assert!(envelope_is_channel_update_for(&unsigned_update(42), 42));
+    }
+
+    #[test]
+    fn update_rejects_mismatched_channel_id() {
+        assert!(!envelope_is_channel_update_for(&unsigned_update(99), 42));
+    }
+
+    #[test]
+    fn update_rejects_wrong_msg_type() {
+        assert!(!envelope_is_channel_update_for(&unsigned_create(42, ChannelType::Private), 42));
+    }
+}
+
 pub async fn federate_channel(
     Extension(state): Extension<Arc<AppState>>,
     Extension(auth_user): Extension<AuthUser>,
     Path(channel_id): Path<u64>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<FederateRequest>,
 ) -> impl IntoResponse {
     use crate::storage::schema as sch;
@@ -3882,7 +4058,36 @@ pub async fn federate_channel(
             Ok(r) if r.status().is_success() => r,
             _ => return (StatusCode::BAD_GATEWAY, "could not reach host channel").into_response(),
         };
-        let detail: serde_json::Value = match resp.json().await {
+        // Security-audit finding (2026-10-05): no body-size cap let any
+        // authenticated caller point `host_url` at a server streaming an
+        // unbounded response, buffered in full by `resp.json()` — a memory
+        // DoS. A channel-detail response (even with the new envelope
+        // fields, up to `BOOTSTRAP_UPDATE_CAP` ChannelUpdates) needs at
+        // most a few hundred KB; cap generously at 4 MiB and abort the
+        // read the moment it's exceeded, rather than buffering first and
+        // checking after (a `Content-Length` header can be absent or
+        // lied about, so this must bound the READ itself, not just the
+        // final size).
+        const MAX_FEDERATE_HOST_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+        if resp.content_length().is_some_and(|len| len > MAX_FEDERATE_HOST_RESPONSE_BYTES as u64) {
+            return (StatusCode::BAD_GATEWAY, "host response too large").into_response();
+        }
+        let mut body = Vec::new();
+        {
+            use futures::StreamExt;
+            let mut stream = resp.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                let chunk = match chunk {
+                    Ok(c) => c,
+                    Err(_) => return (StatusCode::BAD_GATEWAY, "error reading host response").into_response(),
+                };
+                body.extend_from_slice(&chunk);
+                if body.len() > MAX_FEDERATE_HOST_RESPONSE_BYTES {
+                    return (StatusCode::BAD_GATEWAY, "host response too large").into_response();
+                }
+            }
+        }
+        let detail: serde_json::Value = match serde_json::from_slice(&body) {
             Ok(v) => v,
             Err(_) => return (StatusCode::BAD_GATEWAY, "invalid host channel response").into_response(),
         };
@@ -3891,36 +4096,164 @@ pub async fn federate_channel(
         if ctype != 2 {
             return (StatusCode::BAD_REQUEST, "only private channels need federation").into_response();
         }
-        let meta = serde_json::json!({
-            "channel_id": channel_id,
-            "channel_type": 2u8,
-            "slug": ch.get("slug").cloned().unwrap_or(serde_json::Value::Null),
-            "display_name": ch.get("display_name").cloned().unwrap_or(serde_json::Value::Null),
-            "description": ch.get("description").cloned().unwrap_or(serde_json::Value::Null),
-            "logo_cid": ch.get("logo_cid").cloned().unwrap_or(serde_json::Value::Null),
-            "banner_cid": ch.get("banner_cid").cloned().unwrap_or(serde_json::Value::Null),
-            "creator": ch.get("creator").cloned().unwrap_or(serde_json::Value::Null),
-            "member_count": ch.get("member_count").cloned().unwrap_or(serde_json::json!(0)),
-            "encryption_enabled": ch.get("encryption_enabled").cloned().unwrap_or(serde_json::Value::Null),
-            "history_visibility": ch.get("history_visibility").cloned().unwrap_or(serde_json::Value::Null),
-            "federated_from": base,
-        });
-        let bytes = serde_json::to_vec(&meta).unwrap_or_default();
-        // Auditor follow-up (same class as the router.rs/scanner.rs W18-residual
-        // TOCTOU fix, found during that fix's independent final-audit pass): this
-        // write can be this node's FIRST knowledge of `channel_id` (federating a
-        // private channel it never locally created or chain-scanned) — a raw
-        // `put_cf` here left a window for a concurrent `ChannelLeave` targeting
-        // this same channel_id to observe `CHANNELS` absent and persist a pending
-        // member-removal claim that this endpoint would never consume, orphaning
-        // it. Reuses the same `channel_membership_lock`-guarded atomic
-        // write-then-replay used by the L2 `ChannelCreate` handler and the chain
-        // scanner. Harmless no-op on a re-federation refresh (no pending claims to
-        // find) or on a channel with no P2d floor concept yet raised.
-        if let Err(e) = state
-            .storage
-            .put_channel_and_replay_pending_member_removals(channel_id, &bytes)
+
+        // Security-audit finding (2026-10-05): this block used to build an
+        // entirely new, unmerged `CHANNELS` row from this bespoke JSON
+        // every single call (first-time AND every re-federation refresh),
+        // trusting `creator`/`history_visibility`/`encryption_enabled`
+        // from whatever the caller-supplied, SSRF-checked-but-otherwise-
+        // arbitrary `host_url` returned — a repeatable local metadata/
+        // creator-identity forgery primitive. Fixed by requiring the
+        // host's response to carry the ORIGINAL signed `ChannelCreate`
+        // envelope (`get_channel`'s `channel_create_envelope` field,
+        // `reconcile::channel_bootstrap_envelopes`) and routing it
+        // through `process_synced_message` — the same full signature-
+        // verification + creator-match-gated-merge + immutable-encryption-
+        // fields pipeline every other `ChannelCreate` ingest path already
+        // uses. No new trust/merge logic is written here; this just stops
+        // bypassing the logic that already exists. Fails CLOSED: a host
+        // not yet upgraded to serve this field cannot federate (see this
+        // feature's CHANGELOG entry for the compatibility note).
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let Some(create_raw) = detail
+            .get("channel_create_envelope")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .and_then(|s| b64.decode(s).ok())
+        else {
+            return (
+                StatusCode::BAD_GATEWAY,
+                "host did not provide a verifiable channel record",
+            )
+                .into_response();
+        };
+        if !envelope_is_channel_create_for(&create_raw, channel_id) {
+            return (
+                StatusCode::BAD_GATEWAY,
+                "host's channel record envelope does not match the requested channel",
+            )
+                .into_response();
+        }
+        match state.router.process_synced_message(&create_raw) {
+            crate::messages::router::RouteResult::Accepted { .. }
+            | crate::messages::router::RouteResult::Duplicate => {}
+            other => {
+                tracing::warn!(channel_id, ?other, "federate: host's ChannelCreate envelope was rejected");
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    "host's channel record failed verification",
+                )
+                    .into_response();
+            }
+        }
+        // Best-effort, applied in order: ChannelUpdate is a PARTIAL PATCH
+        // (every field is `Option`, merged only when `Some`), not a full
+        // snapshot, so every update must be replayed oldest-first to
+        // reconstruct current state correctly — applying only the latest
+        // would silently drop fields set by an earlier one and never
+        // touched since. None of this is fatal to federation — the
+        // ChannelCreate above already established a verified row.
+        for update_val in detail
+            .get("channel_update_envelopes")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
         {
+            let Some(update_raw) = update_val
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .and_then(|s| b64.decode(s).ok())
+            else {
+                continue;
+            };
+            if !envelope_is_channel_update_for(&update_raw, channel_id) {
+                continue;
+            }
+            if let crate::messages::router::RouteResult::Rejected(reason)
+            | crate::messages::router::RouteResult::Invalid(reason) =
+                state.router.process_synced_message(&update_raw)
+            {
+                tracing::debug!(channel_id, %reason, "federate: host's ChannelUpdate envelope not applied");
+            }
+        }
+
+        // Security-audit finding (2026-10-05): `process_synced_message`
+        // above can return `Accepted`/`Duplicate` without any `CHANNELS`
+        // row ever existing — e.g. the channel is tombstoned
+        // (`DELETED_CHANNELS`), whose apply path returns `Ok(false)`
+        // without writing a row while `update_indexes`'s own failure is
+        // only `warn!`-logged (never turns `Accepted` into a rejection).
+        // Treating that as federation success would report `{"federated":
+        // true}` having recorded no channel and no membership, consumed a
+        // `LOCAL_CHANNEL_FED` slot, and subscribed a gossip topic for
+        // nothing — and since the envelope is now deduped, this channel
+        // could never be federated again on this node. Re-read the row
+        // explicitly and fail closed if it's still missing.
+        //
+        // `federated_from` is node-local bookkeeping (which host this
+        // node asked), not an authoritative channel property — it is
+        // deliberately NOT part of the signed envelope above, so it's
+        // patched on separately rather than routed through the trust
+        // boundary. Drives this endpoint's own `hosted_here` check on any
+        // future re-federation call.
+        //
+        // Security-audit finding (2026-10-05): this read-modify-write
+        // used to run unlocked — the exact "unlocked CHANNELS-row RMW"
+        // class `with_channel_membership_lock`'s own doc comment names as
+        // a known-dangerous pattern (a concurrent `ChannelLeave`'s
+        // `key_epoch_floor` raise, or a concurrent `ChannelUpdate` merge,
+        // landing between this read and this write would be silently
+        // reverted — the P2d forward-secrecy floor rollback this project
+        // has prior regression tests for). Joins the same lock
+        // `ChannelUpdate`'s own merge already uses.
+        let verified_creator: Option<String> = state.storage.with_channel_membership_lock(|| {
+            let Ok(Some(existing)) = state.storage.get_cf(cf::CHANNELS, &channel_id.to_be_bytes()) else {
+                return None;
+            };
+            let Ok(mut meta) = serde_json::from_slice::<serde_json::Value>(&existing) else {
+                return None;
+            };
+            if meta.get("channel_type").and_then(|v| v.as_u64()) != Some(2) {
+                return None;
+            }
+            let creator = meta
+                .get("creator")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            if let Some(obj) = meta.as_object_mut() {
+                obj.insert("federated_from".into(), serde_json::json!(base));
+            }
+            let Ok(bytes) = serde_json::to_vec(&meta) else {
+                return creator;
+            };
+            let _ = state.storage.put_cf(cf::CHANNELS, &channel_id.to_be_bytes(), &bytes);
+            creator
+        });
+        let Some(creator) = verified_creator else {
+            return (
+                StatusCode::BAD_GATEWAY,
+                "channel record did not persist after verification (deleted or corrupt)",
+            )
+                .into_response();
+        };
+        // Defensive, idempotent re-add: the router's own `ChannelCreate`
+        // handler already adds the creator as a member (role "creator")
+        // on the new-row path, but NOT on the existing-row merge path or
+        // on a `Duplicate` outcome — both reachable here (a second
+        // federate call, or a channel already known from another path).
+        // `add_channel_member` no-ops (`Ok(false)`) if already a member,
+        // so this costs nothing on the common path and closes the one gap
+        // where the deleted inline "add creator" block's own rationale
+        // still applies: without it, every `ChannelKeyEnvelope` the real
+        // creator authors fails the author-is-member check on this node.
+        // Called OUTSIDE the lock above — `add_channel_member` takes the
+        // same `channel_membership_lock` itself (not reentrant).
+        let bootstrap_now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        if let Err(e) = state.storage.add_channel_member(channel_id, &creator, bootstrap_now_ms, "creator") {
             return (StatusCode::INTERNAL_SERVER_ERROR, format!("storage error: {}", e)).into_response();
         }
     }
@@ -3930,42 +4263,50 @@ pub async fn federate_channel(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    let member_key = sch::encode_channel_member_key(channel_id, &caller);
-    if state.storage.get_cf(cf::CHANNEL_MEMBERS, &member_key).ok().flatten().is_none() {
-        let rec = serde_json::json!({ "joined_at": now_ms, "role": "member" });
-        if let Err(e) = state.storage.put_cf(cf::CHANNEL_MEMBERS, &member_key, rec.to_string().as_bytes()) {
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("storage error: {}", e)).into_response();
-        }
-    }
-    // The creator is added to CHANNEL_MEMBERS at ChannelCreate on the host (see
-    // `is_channel_member`'s doc comment: "creator is added as a member... at
-    // ChannelCreate, so this covers them too") — but ChannelCreate is L2-only and
-    // never gossips, so a federating node never replays that step and the creator
-    // is otherwise recognized ONLY via `CHANNELS.creator` (is_channel_creator), not
-    // CHANNEL_MEMBERS. `ChannelKeyEnvelope` authorization requires the AUTHOR (and
-    // target) to pass `is_channel_member` specifically — the creator/mod covering a
-    // new joiner is always author'd by the creator, so every cover envelope was
-    // silently rejected on every federated node until a ChatMessage from the
-    // creator happened to auto-add them first (router.rs `add_channel_member` on
-    // ChatMessage receipt). Explicitly mirror the host's invariant here so the
-    // creator is a recognized member from the moment of federation, not by luck of
-    // message ordering.
-    if let Some(creator) = state
-        .storage
-        .get_cf(cf::CHANNELS, &channel_id.to_be_bytes())
-        .ok()
-        .flatten()
-        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-        .and_then(|v| v.get("creator").and_then(|c| c.as_str()).map(|s| s.to_string()))
-    {
-        let creator_key = sch::encode_channel_member_key(channel_id, &creator);
-        if state.storage.get_cf(cf::CHANNEL_MEMBERS, &creator_key).ok().flatten().is_none() {
-            let rec = serde_json::json!({ "joined_at": now_ms, "role": "creator" });
-            if let Err(e) = state.storage.put_cf(cf::CHANNEL_MEMBERS, &creator_key, rec.to_string().as_bytes()) {
-                return (StatusCode::INTERNAL_SERVER_ERROR, format!("storage error: {}", e)).into_response();
+    // Security-audit finding (2026-10-05): apply the SAME `invite_links_
+    // disabled` gate `ChannelJoin` ingest enforces (router.rs) — this
+    // endpoint used to grant membership completely unconditionally, never
+    // checking it at all. `invite_links_disabled` has no writer anywhere
+    // in this codebase today (so this gate is currently always open in
+    // practice, same as ChannelJoin's), but this endpoint shouldn't be
+    // the one path that silently stays permissive if that ever changes.
+    if let Ok(Some(data)) = state.storage.get_cf(cf::CHANNELS, &channel_id.to_be_bytes()) {
+        if let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&data) {
+            let links_disabled = meta
+                .get("invite_links_disabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if links_disabled {
+                let has_invite = state
+                    .storage
+                    .exists_cf(cf::CHANNEL_INVITES, &sch::encode_channel_invite_key(channel_id, &caller))
+                    .unwrap_or(false);
+                if !has_invite {
+                    return (StatusCode::FORBIDDEN, "private channel: invite required").into_response();
+                }
             }
         }
     }
+    // Security-audit finding (2026-10-05): this used to be a raw, unlocked
+    // `put_cf` — no `channel_membership_lock`, no `member_count`
+    // increment, no channel-existence requirement. `add_channel_member`
+    // (`storage::rocks`) is the hardened, lock-protected equivalent
+    // already used by every other membership-granting path (`ChannelJoin`
+    // ingest, the creator-add below); it's a drop-in replacement — `Ok(false)`
+    // covers the same "already a member" idempotent no-op the old
+    // pre-check handled manually.
+    if let Err(e) = state.storage.add_channel_member(channel_id, &caller, now_ms, "member") {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("storage error: {}", e)).into_response();
+    }
+    // NOTE: the creator no longer needs a separate add-as-member step
+    // here. The bootstrap `ChannelCreate` envelope processed above (first
+    // time this node ever sees `channel_id`) already runs the SAME
+    // `add_channel_member(..., "creator")` call as part of the router's
+    // normal new-channel handling (`router.rs`'s `MessageType::
+    // ChannelCreate` arm) — the old justification for duplicating it here
+    // ("ChannelCreate is L2-only and never gossips, so a federating node
+    // never replays that step") no longer holds, since federation now
+    // replays that exact envelope through `process_synced_message`.
     if let Err(e) = state.storage.put_cf(
         cf::LOCAL_CHANNEL_FED,
         &sch::encode_local_channel_fed_key(&caller, channel_id),
@@ -3979,6 +4320,45 @@ pub async fn federate_channel(
     if state.channel_subscribe_tx.send(channel_id).is_err() {
         tracing::warn!(channel_id, "federate: channel subscribe channel closed");
     }
+
+    // Closes the F2 backfill gap (l2-node 0.138.0+): lazily backfill this
+    // channel's missed history now that we've federated it. Optional
+    // wallet-signed private-channel-sync authorization, proving the
+    // WALLET authorized THIS node to pull its private-channel history —
+    // same shape as dm-sync's W5 self-verify in `auth.rs`. Absent/malformed
+    // → no claim attached; this NEVER rejects the request itself, it only
+    // gates whether the backfill can fire.
+    let wallet_claim_raw = headers
+        .get("x-ogmara-pchansync-auth-timestamp")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .zip(headers.get("x-ogmara-pchansync-auth").and_then(|v| v.to_str().ok()))
+        .and_then(|(timestamp, sig_b64)| {
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, sig_b64)
+                .ok()
+                .map(|signature| crate::network::private_channel_sync::WalletAuthClaim { timestamp, signature })
+        });
+    let had_raw_claim = wallet_claim_raw.is_some();
+    let wallet_claim = wallet_claim_raw.filter(|c| {
+        crate::network::private_channel_sync::verify_wallet_claim(
+            c,
+            &state.klever_network,
+            &state.node_id,
+            &caller,
+            now_ms,
+        )
+    });
+    if had_raw_claim && wallet_claim.is_none() {
+        tracing::debug!(
+            address = %caller,
+            "private-channel-sync wallet claim present but failed self-verification; ignoring"
+        );
+    }
+    let _ = state.private_channel_sync_tx.send(crate::network::PrivateChannelSyncTrigger {
+        channel_id,
+        wallet: caller.clone(),
+        wallet_claim,
+    });
 
     Json(serde_json::json!({ "federated": true, "channel_id": channel_id })).into_response()
 }
