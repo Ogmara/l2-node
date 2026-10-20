@@ -1003,13 +1003,45 @@ pub struct ChannelVerifyConfig {
     /// to tell a genuine creator's envelope from an attacker's. A LIVE
     /// create (not synced) is always required regardless of this flag —
     /// the timestamp-freshness check already ran, so a "legacy" live
-    /// create is impossible by construction. Default `true`. Set `false`
-    /// only as a temporary operator unblock if a legitimate pre-upgrade
-    /// private channel (created before this field existed, so it has no
-    /// `id_derivation_ts` to verify) needs to federate onto a node that
-    /// has never seen it — see `MessageRouter::require_private_id_derivation`.
+    /// create is impossible by construction. Default `true`. `false` only
+    /// relaxes first-sight acceptance of a synced/backfilled create
+    /// without `id_derivation_ts` (see `MessageRouter::require_private_id_
+    /// derivation`). **Since l2-node 0.140.0 it no longer affects
+    /// `federate_channel`:** the federation bootstrap gate always requires
+    /// and verifies the derivation, because a forged `ChannelCreate` would
+    /// otherwise make its signer the "creator" the join gate trusts. A
+    /// pre-0.139 private channel without the field therefore cannot be
+    /// federated onto a node that has never seen it, even by its creator;
+    /// nodes that already hold it are unaffected.
     #[serde(default = "default_true")]
     pub require_private_id_derivation: bool,
+    /// Private-channel join gate (l2-node 0.140.0) — unix-ms activation
+    /// instant `PRIVATE_JOIN_PROOF_ACTIVATION_MS`. A `ChannelJoin` to a
+    /// PRIVATE channel whose own signed timestamp is at or after this
+    /// instant must carry a valid signed invite (`ChannelJoinPayload::
+    /// invite`); one strictly before it is accepted without proof. This is
+    /// the ONE grandfathering knob: it lets pre-existing testnet join
+    /// history still backfill, and it is compared against the JOIN's signed
+    /// envelope timestamp — on the live path that timestamp is pinned to
+    /// ±5 min of now by the drift check, so once this instant has passed a
+    /// live proofless join is rejected everywhere. **On mainnet this is
+    /// ALWAYS `0`**: any configured value is ignored (forced at config
+    /// load by `Config::enforce_mainnet_private_join_activation`, and again
+    /// by `MessageRouter::join_proof_activation_ms`). The same
+    /// instant also gates the legacy chat auto-add for private channels.
+    /// Default: `DEFAULT_PRIVATE_JOIN_PROOF_ACTIVATION_MS` (2026-11-01
+    /// 00:00 UTC), a date after the invite-carrying clients ship.
+    #[serde(default = "default_private_join_proof_activation_ms")]
+    pub private_join_proof_activation_ms: u64,
+}
+
+/// Default for `[channel_verify] private_join_proof_activation_ms`:
+/// 2026-11-01T00:00:00Z in unix ms (testnet transition date). Mainnet
+/// config sets `0`.
+pub const DEFAULT_PRIVATE_JOIN_PROOF_ACTIVATION_MS: u64 = 1_793_491_200_000;
+
+fn default_private_join_proof_activation_ms() -> u64 {
+    DEFAULT_PRIVATE_JOIN_PROOF_ACTIVATION_MS
 }
 
 impl Default for ChannelVerifyConfig {
@@ -1020,6 +1052,7 @@ impl Default for ChannelVerifyConfig {
             sweep_batch_size: default_channel_verify_sweep_batch_size(),
             max_retriggers_per_sweep: default_channel_verify_max_retriggers_per_sweep(),
             require_private_id_derivation: default_true(),
+            private_join_proof_activation_ms: default_private_join_proof_activation_ms(),
         }
     }
 }
@@ -1722,6 +1755,17 @@ pub struct AdminConfig {
     /// Session token lifetime in hours (default: 24).
     #[serde(default = "default_24")]
     pub session_ttl_hours: u64,
+    /// Localhost bypass (l2-node 0.140.0, default `true`): a direct local
+    /// request — loopback TCP peer, no proxy header, loopback `Host`,
+    /// absent or same-origin `Origin` (see
+    /// `trusted_proxies::direct_loopback_request`) — reaches the admin API
+    /// without signing in. `false` = every admin request needs an
+    /// `admin_wallets` session, local or not. Turn it off when a forwarder
+    /// that adds no forwarding header (bare `proxy_pass`, HAProxy without
+    /// `forwardfor`, stunnel/socat/`ssh -L`, a Tor hidden service on the
+    /// API port) can reach the API port: its remote requests look local.
+    #[serde(default = "default_true")]
+    pub localhost_bypass: bool,
 }
 
 impl Default for AdminConfig {
@@ -1731,6 +1775,7 @@ impl Default for AdminConfig {
             dashboard: true,
             admin_wallets: Vec::new(),
             session_ttl_hours: 24,
+            localhost_bypass: true,
         }
     }
 }
@@ -2647,6 +2692,28 @@ impl Config {
     /// Return the resolved network ID (always present after apply_migrations).
     pub fn network_id(&self) -> &str {
         self.network.network_id.as_deref().unwrap_or("mainnet")
+    }
+
+    /// Private-channel join gate (l2-node 0.140.0, security audit B1): on
+    /// MAINNET the proofless-join grandfather window must not exist, so
+    /// `private_join_proof_activation_ms` is forced to `0` whatever the
+    /// config says — the default (a testnet transition date) would
+    /// otherwise silently accept proofless private joins on a mainnet node
+    /// running a default/generated config until that date, and backdated
+    /// proofless joins via backfill forever. Forcing (with a one-time
+    /// warning) rather than refusing to start keeps an operator who copied
+    /// a testnet config from bricking their node. `MessageRouter` applies
+    /// the same rule independently (`join_proof_activation_ms`), so this is
+    /// not the only line of defence.
+    pub(crate) fn enforce_mainnet_private_join_activation(&mut self) {
+        if self.network_id() == "mainnet" && self.channel_verify.private_join_proof_activation_ms != 0 {
+            eprintln!(
+                "[config] channel_verify.private_join_proof_activation_ms = {} is ignored on \
+                 mainnet; forcing 0 (every private-channel join must carry an invite proof).",
+                self.channel_verify.private_join_proof_activation_ms,
+            );
+            self.channel_verify.private_join_proof_activation_ms = 0;
+        }
     }
 
     /// Validate the configuration for consistency.
@@ -3573,6 +3640,8 @@ impl Config {
             self.channel_verify.max_retriggers_per_sweep = MIN_CHANNEL_VERIFY_RETRIGGERS;
         }
 
+        self.enforce_mainnet_private_join_activation();
+
         Ok(())
     }
 
@@ -3819,6 +3888,13 @@ rate_limit_per_ip = 100
 # a bare address (`"192.0.2.5"`, `"::1"`). Loopback is always implicitly
 # trusted. Leave empty for single-host deployments where Apache/nginx
 # sits on loopback in front of the node. Malformed entries abort startup.
+# If the proxy reaches the node from a NON-loopback address (Docker
+# bridge gateway, e.g. "172.17.0.0/16"; a separate proxy host), list it
+# here: otherwise every client shares the proxy's IP for the per-IP
+# limits (API rate limit, and federation, where one IP may hold at most
+# 2 of the node's 8 outbound fetch slots). Forwarding headers are read
+# right-to-left and only through trusted hops (the first untrusted hop is
+# the client); a proxied request never gets the admin localhost bypass.
 # trusted_proxies = []
 
 [api.pow]
@@ -3835,6 +3911,15 @@ dashboard = true
 # string". Example: admin_wallets = ["klv1nrnd939xzz4ys0pgpfzm2czhv4r77can6vzqz7ajlq9acm8w5d9qrznx8n"]
 admin_wallets = []
 session_ttl_hours = 24
+# Localhost bypass: a direct request from this machine (loopback TCP peer,
+# no proxy headers, Host 127.x.x.x / [::1] / localhost, no cross-origin
+# Origin) may use the admin API without signing in. A reverse proxy or
+# forwarder that adds NO forwarding headers (bare nginx proxy_pass, HAProxy
+# without forwardfor, stunnel/socat/ssh -L, a Tor hidden service on the API
+# port) makes remote requests look local: configure it to add
+# X-Forwarded-For, or set this to false so every admin request needs an
+# admin_wallets sign-in.
+localhost_bypass = true
 
 [api.rate_limits]
 # Per-wallet news-post budgets (l2-node 0.122.0+, rate-limit rework). Two
@@ -3944,10 +4029,22 @@ max_retriggers_per_sweep = 5
 # Keccak-256(wallet+slug+ts) derivation on this node's first-ever
 # encounter with that id (closes the federate_channel first-sight-trust
 # residual). A live create (not synced/backfilled) is always required
-# regardless of this flag. Set false only as a temporary unblock if a
-# pre-upgrade private channel (created before this field existed) needs
-# to federate onto a node that has never seen it.
+# regardless of this flag. Since l2-node 0.140.0 this flag NO LONGER
+# affects federation: the federate bootstrap always requires the
+# derivation (a forged ChannelCreate would otherwise make its signer the
+# "creator"), so a pre-0.139 private channel without it cannot be
+# federated onto a node that has never seen it, even by its creator.
+# false only relaxes first-sight acceptance on the backfill/sync path.
 require_private_id_derivation = true
+# Private-channel join gate (l2-node 0.140.0). Unix-ms instant after which
+# every ChannelJoin to a PRIVATE channel must carry a signed invite from
+# the creator or a moderator. Joins signed before this instant are accepted
+# without proof, so existing (pre-gate) join history still backfills.
+# MAINNET IS ALWAYS 0: on mainnet this value is ignored and forced to 0.
+# The default (1793491200000 = 2026-11-01T00:00:00Z) exists only for the
+# testnet transition — do not raise it to re-open uninvited joins. All
+# nodes of one network must use the same value.
+private_join_proof_activation_ms = 1793491200000
 
 [notifications]
 # Persisted-notification retention (W31, l2-node 0.104.0+)
@@ -4953,6 +5050,23 @@ mod tests {
                 needle
             );
         }
+    }
+
+    #[test]
+    fn mainnet_forces_private_join_activation_to_zero() {
+        // Security audit B1.
+        let mut c: Config = toml::from_str(&Config::default_toml()).unwrap();
+        c.network.network_id = Some("mainnet".into());
+        assert_ne!(c.channel_verify.private_join_proof_activation_ms, 0);
+        c.enforce_mainnet_private_join_activation();
+        assert_eq!(c.channel_verify.private_join_proof_activation_ms, 0);
+        let mut t: Config = toml::from_str(&Config::default_toml()).unwrap();
+        t.network.network_id = Some("testnet".into());
+        t.enforce_mainnet_private_join_activation();
+        assert_eq!(
+            t.channel_verify.private_join_proof_activation_ms,
+            DEFAULT_PRIVATE_JOIN_PROOF_ACTIVATION_MS
+        );
     }
 
     #[test]

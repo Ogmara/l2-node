@@ -40,6 +40,7 @@ pub async fn start_api_server(
     app_state: Arc<AppState>,
     mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
 ) -> Result<()> {
+    log_admin_bypass_posture(config, std::path::Path::new("/.dockerenv").exists());
     let app = build_router(config, app_state);
 
     let addr: SocketAddr = format!(
@@ -220,6 +221,12 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
             "/api/v1/channels/{channel_id}/moderators/{address}",
             delete(routes::remove_moderator),
         )
+        // Moderator propagation (l2-node 0.140.0): a moderator fetches its
+        // own creator-signed grant to embed in invites as `inviter_grant`.
+        .route(
+            "/api/v1/channels/{channel_id}/moderators/{address}/grant",
+            get(routes::get_moderator_grant),
+        )
         .route(
             "/api/v1/channels/{channel_id}/kick/{address}",
             post(routes::kick_user),
@@ -280,14 +287,16 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
         .route("/api/v1/ws/public", get(websocket::ws_public));
 
     // Admin auth state (shared between middleware and auth endpoints).
-    // Passes app_state.trusted_proxies so the localhost-bypass works when
-    // operators reverse-proxy through Docker (peer IP = bridge gateway,
-    // not loopback). See admin_auth_middleware doc.
+    // The localhost bypass is decided from the TCP peer, the absence of
+    // proxy headers, a loopback `Host` and a same-origin/absent `Origin`
+    // (l2-node 0.140.0, `trusted_proxies::direct_loopback_request`), and
+    // can be disabled with `[api.admin] localhost_bypass = false` —
+    // proxied requests always authenticate.
     let admin_auth_state = std::sync::Arc::new(admin_auth::AdminAuthState::new(
         config.api.admin.admin_wallets.clone(),
         config.api.admin.session_ttl_hours,
         app_state.node_id.clone(),
-        app_state.trusted_proxies.clone(),
+        config.api.admin.localhost_bypass,
     ));
 
     // Admin routes (localhost + wallet auth via middleware)
@@ -437,6 +446,8 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
         .layer(axum::extract::DefaultBodyLimit::max(10 * 1024 * 1024))
         .layer(GovernorLayer::new(governor_conf).error_handler(governor_error_handler))
         .layer(cors)
+        // Wraps the CORS layer: strips its grants from `/admin` responses.
+        .layer(middleware::from_fn(admin_cors_guard))
         .layer(TraceLayer::new_for_http())
         .layer(axum::Extension(app_state))
 }
@@ -514,6 +525,104 @@ fn alerts_test_routes(app_state: &Arc<AppState>) -> Router {
         .layer(GovernorLayer::new(governor_conf).error_handler(|err| err.into()))
 }
 
+/// True for the admin surface (`/admin` and everything below it).
+fn is_admin_path(path: &str) -> bool {
+    path == "/admin" || path.starts_with("/admin/")
+}
+
+/// Response headers through which a CORS layer grants another origin
+/// access. Removed from every `/admin` response by `admin_cors_guard`.
+const CORS_GRANT_HEADERS: &[&str] = &[
+    "access-control-allow-origin",
+    "access-control-allow-credentials",
+    "access-control-allow-methods",
+    "access-control-allow-headers",
+    "access-control-expose-headers",
+    "access-control-max-age",
+];
+
+/// Keep the API-wide CORS policy (`cors_origins`, default `*`) off the
+/// admin surface (l2-node 0.140.0). The public API is meant to be read by
+/// web clients on any origin; the admin API is only ever called by the
+/// built-in dashboard, which is same-origin and needs no CORS. Without this
+/// a cross-origin page got a passing preflight (any method, any header) for
+/// `/admin/...` and could read the responses. With the grant headers
+/// stripped, a browser blocks a cross-origin preflighted call before it is
+/// sent and hides every cross-origin response; requests that need no
+/// preflight are additionally refused by `admin_auth_middleware`'s
+/// Origin/Host/`Sec-Fetch-Site` checks.
+async fn admin_cors_guard(req: axum::extract::Request, next: middleware::Next) -> axum::response::Response {
+    let admin = is_admin_path(req.uri().path());
+    let mut resp = next.run(req).await;
+    if admin {
+        let headers = resp.headers_mut();
+        for h in CORS_GRANT_HEADERS {
+            headers.remove(*h);
+        }
+    }
+    resp
+}
+
+/// Startup log of the admin localhost-bypass posture (`[api.admin]
+/// localhost_bypass`, l2-node 0.140.0). Always says whether the bypass is
+/// on; when it is, warns once if the deployment looks like it has a
+/// forwarder in front of the API port. A forwarder that adds NO
+/// forwarding header (bare `proxy_pass` without `X-Forwarded-For`, HAProxy
+/// without `option forwardfor`, stunnel/socat/`ssh -L`, a Tor hidden
+/// service pointing at the API port) delivers remote requests from a
+/// loopback peer with no proxy header — indistinguishable from a local
+/// call. Returns the warning text when one was logged (for tests).
+fn log_admin_bypass_posture(config: &Config, in_container: bool) -> Option<String> {
+    if !config.api.admin.enabled {
+        return None;
+    }
+    if !config.api.admin.localhost_bypass {
+        info!(
+            "Admin localhost bypass DISABLED ([api.admin] localhost_bypass = false): \
+             every admin request needs an admin_wallets session"
+        );
+        return None;
+    }
+    info!(
+        "Admin localhost bypass ENABLED ([api.admin] localhost_bypass = true): direct \
+         loopback requests with a loopback Host, no proxy headers and no cross-origin \
+         Origin skip admin authentication"
+    );
+    let mut reasons: Vec<&str> = Vec::new();
+    if !config.api.trusted_proxies.is_empty() {
+        reasons.push("api.trusted_proxies is set");
+    }
+    let listen_loopback = config
+        .api
+        .listen_addr
+        .parse::<std::net::IpAddr>()
+        .map(crate::trusted_proxies::is_loopback_canonical)
+        .unwrap_or(false);
+    if !listen_loopback {
+        reasons.push("the API listens on a non-loopback address");
+    }
+    if in_container {
+        reasons.push("running in a container");
+    }
+    if config.api.public_url.as_deref().is_some_and(|u| !u.trim().is_empty()) {
+        reasons.push("api.public_url is set");
+    }
+    if reasons.is_empty() {
+        return None;
+    }
+    let msg = format!(
+        "Admin localhost bypass is enabled and this deployment looks proxied/forwarded ({}). \
+         A reverse proxy or forwarder that adds NO forwarding headers (bare proxy_pass, \
+         HAProxy without forwardfor, stunnel/socat/ssh -L, a Tor hidden service on the API \
+         port) makes remote requests look local and grants them admin access. Configure the \
+         proxy to add X-Forwarded-For, or set [api.admin] localhost_bypass = false and use \
+         admin_wallets.",
+        reasons.join(", ")
+    );
+    tracing::warn!("{msg}");
+    Some(msg)
+}
+
 /// Build CORS layer from configured origins.
 fn build_cors(origins: &[String]) -> CorsLayer {
     use tower_http::cors::AllowOrigin;
@@ -532,6 +641,170 @@ fn build_cors(origins: &[String]) -> CorsLayer {
             .allow_origin(AllowOrigin::list(parsed))
             .allow_methods(Any)
             .allow_headers(Any)
+    }
+}
+
+#[cfg(test)]
+mod admin_access_tests {
+    //! Round-5 S-B1/S-B2: the admin middleware end to end — localhost
+    //! bypass rules (Host/Origin/Sec-Fetch-Site), the `localhost_bypass`
+    //! switch, the dashboard websocket route, and CORS stripped from
+    //! `/admin` responses.
+    use super::*;
+    use axum::body::Body;
+    use axum::extract::ConnectInfo;
+    use axum::http::{Method, Request, StatusCode};
+    use tower::ServiceExt;
+
+    async fn ok() -> &'static str {
+        "ok"
+    }
+
+    /// The admin router shape of `build_router`: protected routes behind
+    /// `admin_auth_middleware`, the API-wide CORS layer (`*`) and the
+    /// admin CORS guard outside it.
+    fn app(localhost_bypass: bool, admin_wallets: Vec<String>) -> Router {
+        let state = Arc::new(admin_auth::AdminAuthState::new(admin_wallets, 24, "node".into(), localhost_bypass));
+        let protected = Router::new()
+            .route("/admin/peers/ban", post(ok))
+            .route("/admin/dashboard/ws", get(ok))
+            .route("/admin/debug/e2e", get(ok))
+            .layer(middleware::from_fn(admin_auth::admin_auth_middleware))
+            .layer(axum::Extension(state));
+        Router::new()
+            .route("/api/v1/health", get(ok))
+            .merge(protected)
+            .layer(build_cors(&["*".to_string()]))
+            .layer(middleware::from_fn(admin_cors_guard))
+    }
+
+    async fn call(app: &Router, method: Method, path: &str, peer: &str, hdrs: &[(&str, &str)]) -> axum::response::Response {
+        let mut b = Request::builder().method(method).uri(path);
+        for (k, v) in hdrs {
+            b = b.header(*k, *v);
+        }
+        let mut req = b.body(Body::empty()).unwrap();
+        req.extensions_mut().insert(ConnectInfo(peer.parse::<std::net::SocketAddr>().unwrap()));
+        app.clone().oneshot(req).await.unwrap()
+    }
+
+    const LOCAL: &str = "127.0.0.1:50000";
+    const HOST: (&str, &str) = ("host", "127.0.0.1:41721");
+
+    #[tokio::test]
+    async fn local_dashboard_and_curl_pass_cross_origin_and_rebinding_do_not() {
+        let app = app(true, vec![]);
+        // curl on the host.
+        assert_eq!(call(&app, Method::POST, "/admin/peers/ban", LOCAL, &[HOST]).await.status(), StatusCode::OK);
+        // The dashboard's own same-origin POST and websocket upgrade.
+        let same = [HOST, ("origin", "http://127.0.0.1:41721"), ("sec-fetch-site", "same-origin")];
+        assert_eq!(call(&app, Method::POST, "/admin/peers/ban", LOCAL, &same).await.status(), StatusCode::OK);
+        let ws = [
+            HOST,
+            ("origin", "http://127.0.0.1:41721"),
+            ("connection", "upgrade"),
+            ("upgrade", "websocket"),
+            ("sec-websocket-version", "13"),
+            ("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="),
+        ];
+        assert_eq!(call(&app, Method::GET, "/admin/dashboard/ws", LOCAL, &ws).await.status(), StatusCode::OK);
+        // A page on another origin, through the operator's browser.
+        let evil = [HOST, ("origin", "https://evil.example"), ("sec-fetch-site", "cross-site")];
+        assert_ne!(call(&app, Method::POST, "/admin/peers/ban", LOCAL, &evil).await.status(), StatusCode::OK);
+        let evil_no_fetch_md = [HOST, ("origin", "https://evil.example")];
+        assert_ne!(call(&app, Method::POST, "/admin/peers/ban", LOCAL, &evil_no_fetch_md).await.status(), StatusCode::OK);
+        // Cross-site websocket hijack attempt.
+        let mut ws_evil = ws;
+        ws_evil[1] = ("origin", "http://evil.example");
+        assert_ne!(call(&app, Method::GET, "/admin/dashboard/ws", LOCAL, &ws_evil).await.status(), StatusCode::OK);
+        // DNS rebinding: same-origin from the page's view, hostile Host.
+        let rebind = [("host", "rebind.evil.example:41721"), ("origin", "http://rebind.evil.example:41721")];
+        assert_ne!(call(&app, Method::GET, "/admin/debug/e2e", LOCAL, &rebind).await.status(), StatusCode::OK);
+        // Not loopback at all.
+        assert_ne!(call(&app, Method::GET, "/admin/debug/e2e", "203.0.113.9:1", &[HOST]).await.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn localhost_bypass_false_requires_a_session() {
+        let app = app(false, vec![]);
+        let r = call(&app, Method::POST, "/admin/peers/ban", LOCAL, &[HOST]).await;
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        let app = app_with_wallet(false);
+        assert_eq!(
+            call(&app, Method::POST, "/admin/peers/ban", LOCAL, &[HOST]).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    fn app_with_wallet(bypass: bool) -> Router {
+        app(bypass, vec!["klv1admin".to_string()])
+    }
+
+    #[tokio::test]
+    async fn cross_site_fetch_metadata_is_refused_even_with_a_session_path() {
+        // Session path (remote peer): a cross-site browser request is refused
+        // before the token is even looked at.
+        let app = app_with_wallet(true);
+        let r = call(
+            &app,
+            Method::POST,
+            "/admin/peers/ban",
+            "203.0.113.9:1",
+            &[("host", "node.example.org"), ("sec-fetch-site", "same-site"), ("cookie", "ogmara_session=x.y")],
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn admin_responses_carry_no_cors_grant_public_api_keeps_it() {
+        let app = app(true, vec![]);
+        let pre = [
+            ("origin", "https://evil.example"),
+            ("access-control-request-method", "POST"),
+            ("access-control-request-headers", "content-type"),
+        ];
+        let r = call(&app, Method::OPTIONS, "/admin/peers/ban", LOCAL, &pre).await;
+        for h in CORS_GRANT_HEADERS {
+            assert!(r.headers().get(*h).is_none(), "{h} on an /admin preflight");
+        }
+        let r = call(&app, Method::GET, "/admin/debug/e2e", LOCAL, &[HOST]).await;
+        assert!(r.headers().get("access-control-allow-origin").is_none());
+        // Public API unchanged: `*`.
+        let r = call(&app, Method::OPTIONS, "/api/v1/health", LOCAL, &pre).await;
+        assert_eq!(r.headers().get("access-control-allow-origin").unwrap(), "*");
+        let r = call(&app, Method::GET, "/api/v1/health", LOCAL, &[("origin", "https://any.example")]).await;
+        assert_eq!(r.headers().get("access-control-allow-origin").unwrap(), "*");
+        assert!(is_admin_path("/admin") && is_admin_path("/admin/x") && !is_admin_path("/administrator"));
+    }
+
+    #[test]
+    fn startup_posture_warns_only_when_forwarded_deployment_and_bypass_on() {
+        let mut c: Config = toml::from_str(&Config::default_toml()).unwrap();
+        assert!(c.api.admin.localhost_bypass, "default stays on");
+        c.api.listen_addr = "127.0.0.1".into();
+        c.api.trusted_proxies.clear();
+        c.api.public_url = None;
+        assert!(log_admin_bypass_posture(&c, false).is_none());
+        assert!(log_admin_bypass_posture(&c, true).unwrap().contains("container"));
+        c.api.trusted_proxies = vec!["172.17.0.0/16".into()];
+        assert!(log_admin_bypass_posture(&c, false).unwrap().contains("X-Forwarded-For"));
+        c.api.trusted_proxies.clear();
+        c.api.listen_addr = "0.0.0.0".into();
+        assert!(log_admin_bypass_posture(&c, false).is_some());
+        c.api.listen_addr = "127.0.0.1".into();
+        c.api.public_url = Some("https://node.example.org".into());
+        assert!(log_admin_bypass_posture(&c, false).is_some());
+        c.api.public_url = Some("  ".into());
+        assert!(log_admin_bypass_posture(&c, false).is_none());
+        // Bypass off: never a warning.
+        c.api.admin.localhost_bypass = false;
+        c.api.trusted_proxies = vec!["10.0.0.0/8".into()];
+        assert!(log_admin_bypass_posture(&c, true).is_none());
+        // `localhost_bypass = false` parses.
+        let t = Config::default_toml().replace("localhost_bypass = true", "localhost_bypass = false");
+        let c: Config = toml::from_str(&t).unwrap();
+        assert!(!c.api.admin.localhost_bypass);
     }
 }
 

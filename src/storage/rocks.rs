@@ -15,6 +15,85 @@ use super::schema::{cf, encode_wallet_device_key};
 /// Type alias for the multi-threaded RocksDB instance.
 pub type RocksDb = DBWithThreadMode<MultiThreaded>;
 
+/// Max `ChannelJoin` + `ChannelLeave` rows indexed into `CHANNEL_META_MSGS`
+/// per (channel, wallet) — the belt-and-braces bound of round-4 audit B2
+/// (see `Storage::index_membership_event`). Past it the OLDEST rows are
+/// evicted, so the newest — the ones that decide final membership — always
+/// stay (round-5 audit C-W3; the bound was 8 and kept the FIRST rows).
+pub const MAX_INDEXED_MEMBERSHIP_ROWS_PER_AUTHOR: u8 = 32;
+
+/// A `CHANNEL_META_MSGS` membership row: `(msg_type, ts, msg_id)`.
+pub type MembershipRow = (u8, u64, [u8; 32]);
+
+/// Kind of membership event passed to `Storage::index_membership_event`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MembershipEvent {
+    /// A `ChannelJoin` authored by the wallet.
+    Join,
+    /// A `ChannelLeave` authored by the wallet.
+    Leave,
+    /// A `ChannelKick`/`ChannelBan` targeting the wallet (indexed by the
+    /// caller; only used here to promote a held-back newer join).
+    Removal,
+}
+
+/// Per-(channel, wallet) `CHANNEL_MEMBERSHIP_INDEX` bookkeeping.
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MembershipIndexState {
+    /// The join + leave rows currently in `CHANNEL_META_MSGS` for this
+    /// (channel, wallet), at most `MAX_INDEXED_MEMBERSHIP_ROWS_PER_AUTHOR`;
+    /// the oldest by `(ts, msg_id)` is evicted first. (A state written by an
+    /// earlier 0.140.0 development build carried only a count, `indexed`;
+    /// that field is ignored and its rows are simply not tracked.)
+    #[serde(default)]
+    pub rows: Vec<MembershipRow>,
+    /// Newest indexed join timestamp.
+    #[serde(default)]
+    pub last_join: Option<u64>,
+    /// Newest indexed leave timestamp.
+    #[serde(default)]
+    pub last_leave: Option<u64>,
+    /// Newest join held back as a no-op (ts, msg_id).
+    #[serde(default)]
+    pub held_join: Option<(u64, [u8; 32])>,
+    /// Newest leave held back as a no-op (ts, msg_id).
+    #[serde(default)]
+    pub held_leave: Option<(u64, [u8; 32])>,
+}
+
+/// What `Storage::index_membership_event` did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct MembershipIndexOutcome {
+    /// `(msg_type, ts, msg_id)` rows written to `CHANNEL_META_MSGS`.
+    pub indexed: Vec<MembershipRow>,
+    /// Older rows of the same (channel, wallet) deleted from
+    /// `CHANNEL_META_MSGS` to stay within the per-author cap.
+    pub evicted: Vec<MembershipRow>,
+    /// Join only: a held-back leave NEWER than this join exists — the join
+    /// must not make the wallet a member.
+    pub join_superseded_by_leave: bool,
+    /// Leave only (round-5 audit S-W1): `(ts, msg_id)` of a held-back join
+    /// NEWER than this leave that this leave just promoted into the index
+    /// (a rejoin that arrived before the leave it follows). Late nodes replay
+    /// leave-then-join; the apply step mirrors that by removing the member
+    /// and then re-applying this join through the normal join apply.
+    pub leave_superseded_by_join: Option<(u64, [u8; 32])>,
+}
+
+/// One `CHANNEL_META_MSGS` row of a replay-order page
+/// (`Storage::channel_meta_replay_page`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetaIndexRow {
+    /// Replay tier the row's msg_type belongs to.
+    pub tier: u8,
+    /// The row's msg_type byte.
+    pub msg_type: u8,
+    /// Signed envelope timestamp (ms) from the key.
+    pub ts: u64,
+    /// The envelope's msg_id (its `MESSAGES` key).
+    pub msg_id: [u8; 32],
+}
+
 /// Associative merge operator for `NODE_STATE`'s `stat_*`/`TOTAL_*` counter
 /// keys (audit final pre-mainnet W19b) — accumulates signed `i64` deltas
 /// (`+1`/`-1`, 8-byte big-endian) without any application-level lock,
@@ -576,6 +655,14 @@ impl Storage {
             (cf::CHANNEL_BANS, 10_000),
             (cf::CHANNEL_PINS, 100),
             (cf::CHANNEL_INVITES, 10_000),
+            // Private-channel join gate (0.140.0): kick/ban/demotion
+            // watermarks die with the channel (a re-created id after a
+            // tombstone is impossible — the tombstone guards it — so
+            // nothing would ever read them again).
+            (cf::CHANNEL_ROLE_WATERMARKS, 10_000),
+            // Membership-index bookkeeping (0.140.0 round 4) dies with the
+            // channel for the same reason.
+            (cf::CHANNEL_MEMBERSHIP_INDEX, 10_000),
             (cf::CHANNEL_VERIFICATION, 1),
             (cf::CHANNEL_BACKFILL_STATE, 1),
         ];
@@ -823,7 +910,499 @@ impl Storage {
             .channel_membership_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.add_channel_member_locked(channel_id, address, timestamp, role)
+    }
 
+    /// Private-channel join gate (l2-node 0.140.0): add `address` as a
+    /// member UNLESS a kick/ban watermark for `(channel_id, address)` at or
+    /// after `joined_at` is stored — the removal wins a tie. The watermark
+    /// read and the member write happen in ONE `channel_membership_lock`
+    /// critical section, so a kick/ban that raised its watermark before
+    /// this call can never be overtaken by the add (the kick/ban apply
+    /// raises the watermark BEFORE its own locked member removal — see
+    /// `MessageRouter::update_indexes`). This is what makes a join that
+    /// arrives AFTER its own later kick (backfill reordering) converge to
+    /// "not a member" instead of silently resurrecting the removed user.
+    ///
+    /// Returns `Ok(false)` (no-op) when the channel is unknown, `address`
+    /// is already a member, or a newer removal is recorded.
+    pub fn add_channel_member_unless_removed(
+        &self,
+        channel_id: u64,
+        address: &str,
+        joined_at: u64,
+        role: &str,
+    ) -> Result<bool> {
+        self.add_channel_member_checked(channel_id, address, joined_at, role, || true)
+    }
+
+    /// `add_channel_member_unless_removed` with an extra caller-supplied
+    /// `precheck` evaluated INSIDE the same `channel_membership_lock`
+    /// critical section, before the removal-watermark check and the write.
+    /// Used by the `ChannelJoin` apply step to re-run the full private-join
+    /// verification under the lock (protocol §3.9.1 "re-check on apply"),
+    /// so a kick/ban/demotion applied between authorization and apply is
+    /// honored. `precheck` MUST NOT take `channel_membership_lock` itself
+    /// (non-reentrant) — the join verification only reads storage.
+    pub fn add_channel_member_checked(
+        &self,
+        channel_id: u64,
+        address: &str,
+        joined_at: u64,
+        role: &str,
+        precheck: impl FnOnce() -> bool,
+    ) -> Result<bool> {
+        let _guard = self
+            .channel_membership_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !precheck() {
+            return Ok(false);
+        }
+        if let Some(cutoff) = self.channel_removal_cutoff(channel_id, address)? {
+            if cutoff >= joined_at {
+                return Ok(false);
+            }
+        }
+        self.add_channel_member_locked(channel_id, address, joined_at, role)
+    }
+
+    /// Read one `CHANNEL_ROLE_WATERMARKS` value (the MAX timestamp ever
+    /// recorded for this key), or `None` if never written.
+    pub fn channel_role_watermark(
+        &self,
+        channel_id: u64,
+        kind: u8,
+        address: &str,
+    ) -> Result<Option<u64>> {
+        let key = super::schema::encode_channel_role_watermark_key(channel_id, kind, address);
+        Ok(self
+            .get_cf(cf::CHANNEL_ROLE_WATERMARKS, &key)?
+            .and_then(|v| <[u8; 8]>::try_from(v.as_slice()).ok())
+            .map(u64::from_be_bytes))
+    }
+
+    /// The join gate's removal cutoff for `(channel_id, address)`: the
+    /// stored `removed` watermark (MAX signed timestamp of any kick or ban
+    /// of that wallet in that channel), or `None` if never removed.
+    pub fn channel_removal_cutoff(&self, channel_id: u64, address: &str) -> Result<Option<u64>> {
+        self.channel_role_watermark(
+            channel_id,
+            super::schema::role_watermark_kind::REMOVED,
+            address,
+        )
+    }
+
+    /// Raise a `CHANNEL_ROLE_WATERMARKS` value to `ts` if `ts` is larger
+    /// than what is stored (MAX semantic — never lowers it, so a replayed
+    /// or reordered older envelope cannot roll a removal back). Runs under
+    /// `channel_membership_lock` so the read-max-write is atomic against
+    /// concurrent raisers and against `add_channel_member_unless_removed`.
+    /// Callers clamp `ts` (it originates in a signed but sender-chosen
+    /// envelope timestamp) before calling.
+    pub fn raise_channel_role_watermark(
+        &self,
+        channel_id: u64,
+        kind: u8,
+        address: &str,
+        ts: u64,
+    ) -> Result<()> {
+        let _guard = self
+            .channel_membership_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(existing) = self.channel_role_watermark(channel_id, kind, address)? {
+            if existing >= ts {
+                return Ok(());
+            }
+        }
+        let key = super::schema::encode_channel_role_watermark_key(channel_id, kind, address);
+        self.put_cf(cf::CHANNEL_ROLE_WATERMARKS, &key, &ts.to_be_bytes())
+    }
+
+    /// Read the `CHANNEL_MEMBERSHIP_INDEX` bookkeeping for (channel, wallet),
+    /// or `None` if nothing was ever recorded. An undecodable row reads as
+    /// `None` (fresh state) — it only ever loosens the no-op filter, never
+    /// the per-author cap below by more than one fresh allowance.
+    pub fn membership_index_state(
+        &self,
+        channel_id: u64,
+        address: &str,
+    ) -> Result<Option<MembershipIndexState>> {
+        let key = super::schema::encode_channel_membership_index_key(channel_id, address);
+        Ok(self
+            .get_cf(cf::CHANNEL_MEMBERSHIP_INDEX, &key)?
+            .and_then(|b| serde_json::from_slice(&b).ok()))
+    }
+
+    /// Decide whether a membership event is indexed into `CHANNEL_META_MSGS`
+    /// (round-4 audit B2) and write the index row(s) + bookkeeping in ONE
+    /// batch under `channel_membership_lock`. Called from the router's
+    /// index step BEFORE the event's own membership apply, so "is a member"
+    /// below is the pre-apply state.
+    ///
+    /// Rules (`wallet` = the joiner/leaver, or the kick/ban target):
+    ///
+    /// * **Join** is a no-op — not indexed, held back — iff `wallet` is
+    ///   currently a member AND its newest indexed join is newer than both
+    ///   its newest indexed leave and its stored kick/ban watermark (an
+    ///   idempotent re-join). Otherwise it is indexed (subject to the cap).
+    /// * **Leave** is a no-op — not indexed, held back — iff `wallet` is NOT
+    ///   currently a member AND it has no indexed join, or its indexed
+    ///   history already ends in a leave. This is what stops a non-member
+    ///   from flooding the index with leaves (the B2 starvation attack):
+    ///   10,000 junk leaves cost one held-back slot, not 10,000 rows.
+    /// * **Out-of-order delivery never loses an event that changes the
+    ///   outcome.** One held-back join and one held-back leave (the newest
+    ///   of each) are remembered. Indexing a join promotes a held-back
+    ///   leave that is NEWER than it (a leave that arrived before its own
+    ///   join); indexing a leave — or a kick/ban of `wallet` (`Removal`) —
+    ///   promotes a held-back join that is newer than it (a rejoin that
+    ///   arrived before the removal it follows). Older held-back events
+    ///   cannot change the final state and stay out of the index.
+    /// * **Per-author cap:** at most `MAX_INDEXED_MEMBERSHIP_ROWS_PER_AUTHOR`
+    ///   join+leave rows per (channel, wallet), including promotions. Past
+    ///   the cap the OLDEST row by `(ts, msg_id)` is evicted (deleted from
+    ///   `CHANNEL_META_MSGS`, reported in `evicted`) — if the new row is
+    ///   itself the oldest it is simply not indexed. The newest rows, which
+    ///   decide the final membership a late node reconstructs, always stay.
+    ///   Only the wallet's OWN join/leave rows count here, so one wallet's
+    ///   churn can never evict another's history.
+    /// * `Removal` never indexes the kick/ban itself (the caller does —
+    ///   moderator-authored rows are not capped) and writes nothing when
+    ///   there is no bookkeeping row yet.
+    ///
+    /// Returns the rows indexed/evicted and, for a Join, whether a held-back
+    /// leave NEWER than the join exists (the join is superseded: the apply
+    /// step must not make the wallet a member — a leave that overtook its
+    /// join); for a Leave, the newer held-back join it promoted, if any
+    /// (`leave_superseded_by_join`).
+    pub fn index_membership_event(
+        &self,
+        channel_id: u64,
+        wallet: &str,
+        event: MembershipEvent,
+        ts: u64,
+        msg_id: &[u8; 32],
+    ) -> Result<MembershipIndexOutcome> {
+        const JOIN: u8 = 0x12;
+        const LEAVE: u8 = 0x13;
+        const CAP: usize = MAX_INDEXED_MEMBERSHIP_ROWS_PER_AUTHOR as usize;
+        let _guard = self
+            .channel_membership_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let existing = self.membership_index_state(channel_id, wallet)?;
+        if matches!(event, MembershipEvent::Removal) && existing.is_none() {
+            return Ok(MembershipIndexOutcome::default());
+        }
+        let mut st = existing.unwrap_or_default();
+        let before = st.clone();
+        let mut out = MembershipIndexOutcome::default();
+        // Keep the NEWER of a held-back event and a new candidate.
+        fn newer(held: Option<(u64, [u8; 32])>, cand: (u64, [u8; 32])) -> Option<(u64, [u8; 32])> {
+            match held {
+                Some(h) if h >= cand => Some(h),
+                _ => Some(cand),
+            }
+        }
+        // Index one row, evicting the OLDEST `(ts, msg_id)` row past the
+        // cap. Returns false when the new row is itself the oldest (then it
+        // is not indexed and nothing changes).
+        fn index_row(st: &mut MembershipIndexState, out: &mut MembershipIndexOutcome, row: MembershipRow) -> bool {
+            st.rows.push(row);
+            if st.rows.len() > CAP {
+                let oldest = st
+                    .rows
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, r)| (r.1, r.2))
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                let evicted = st.rows.swap_remove(oldest);
+                if evicted == row {
+                    return false;
+                }
+                // A row indexed earlier in this SAME call was never written:
+                // drop it from the write set instead of deleting it.
+                if let Some(pos) = out.indexed.iter().position(|r| *r == evicted) {
+                    out.indexed.remove(pos);
+                } else {
+                    out.evicted.push(evicted);
+                }
+            }
+            out.indexed.push(row);
+            true
+        }
+        // An indexed leave/removal at `ts` promotes a held-back join that is
+        // NEWER than it (the rejoin it precedes arrived first). Returns the
+        // promoted join.
+        fn promote_held_join(
+            st: &mut MembershipIndexState,
+            out: &mut MembershipIndexOutcome,
+            ts: u64,
+        ) -> Option<(u64, [u8; 32])> {
+            let (jt, jid) = st.held_join?;
+            if jt <= ts {
+                return None;
+            }
+            st.held_join = None;
+            if index_row(st, out, (JOIN, jt, jid)) {
+                st.last_join = st.last_join.max(Some(jt));
+                Some((jt, jid))
+            } else {
+                None
+            }
+        }
+        match event {
+            MembershipEvent::Join => {
+                let is_member = self.exists_cf(
+                    cf::CHANNEL_MEMBERS,
+                    &super::schema::encode_channel_member_key(channel_id, wallet),
+                )?;
+                out.join_superseded_by_leave = st.held_leave.is_some_and(|(lt, _)| lt > ts);
+                let removal = st
+                    .last_leave
+                    .max(self.channel_removal_cutoff(channel_id, wallet)?);
+                let no_op =
+                    is_member && st.last_join.is_some_and(|j| removal.is_none_or(|r| j > r));
+                if no_op {
+                    st.held_join = newer(st.held_join, (ts, *msg_id));
+                } else if index_row(&mut st, &mut out, (JOIN, ts, *msg_id)) {
+                    st.last_join = st.last_join.max(Some(ts));
+                    // A held-back leave NEWER than this join is a leave that
+                    // overtook its own join: index it too.
+                    if let Some((lt, lid)) = st.held_leave {
+                        if lt > ts {
+                            st.held_leave = None;
+                            if index_row(&mut st, &mut out, (LEAVE, lt, lid)) {
+                                st.last_leave = st.last_leave.max(Some(lt));
+                            }
+                        }
+                    }
+                }
+            }
+            MembershipEvent::Leave => {
+                let is_member = self.exists_cf(
+                    cf::CHANNEL_MEMBERS,
+                    &super::schema::encode_channel_member_key(channel_id, wallet),
+                )?;
+                let no_op = !is_member
+                    && st
+                        .last_join
+                        .is_none_or(|j| st.last_leave.is_some_and(|l| l >= j));
+                if no_op {
+                    st.held_leave = newer(st.held_leave, (ts, *msg_id));
+                } else if index_row(&mut st, &mut out, (LEAVE, ts, *msg_id)) {
+                    st.last_leave = st.last_leave.max(Some(ts));
+                    // Round-5 S-W1: a promoted newer join means the wallet
+                    // rejoined after this leave; the apply step re-applies it.
+                    out.leave_superseded_by_join = promote_held_join(&mut st, &mut out, ts);
+                }
+            }
+            MembershipEvent::Removal => {
+                // Kick/ban: the join is indexed for late nodes, but the local
+                // apply deliberately does NOT re-apply it (a removal fails
+                // closed; the rejoin needs a fresh invite on its own).
+                promote_held_join(&mut st, &mut out, ts);
+            }
+        }
+        if st != before {
+            self.put_membership_index(channel_id, wallet, &st, &out)?;
+        }
+        Ok(out)
+    }
+
+    /// Persist `st` and the index rows in `out.indexed` in one batch.
+    /// Caller holds `channel_membership_lock`.
+    fn put_membership_index(
+        &self,
+        channel_id: u64,
+        wallet: &str,
+        st: &MembershipIndexState,
+        out: &MembershipIndexOutcome,
+    ) -> Result<()> {
+        let meta_cf = self.cf_handle(cf::CHANNEL_META_MSGS)?;
+        let st_cf = self.cf_handle(cf::CHANNEL_MEMBERSHIP_INDEX)?;
+        let mut batch = WriteBatch::default();
+        for (t, ts, id) in &out.evicted {
+            batch.delete_cf(&meta_cf, super::schema::encode_channel_meta_key(channel_id, *t, *ts, id));
+        }
+        for (t, ts, id) in &out.indexed {
+            batch.put_cf(
+                &meta_cf,
+                super::schema::encode_channel_meta_key(channel_id, *t, *ts, id),
+                [],
+            );
+        }
+        batch.put_cf(
+            &st_cf,
+            super::schema::encode_channel_membership_index_key(channel_id, wallet),
+            serde_json::to_vec(st).context("encode membership index state")?,
+        );
+        self.write_batch(batch)
+    }
+
+    /// One page of a channel's `CHANNEL_META_MSGS` rows in REPLAY order
+    /// `(tier, ts, msg_id)`, strictly after `after`, by a k-way merge over
+    /// the per-msg_type key streams (round-4 keyset paging).
+    ///
+    /// `tiers[i]` lists the msg_type bytes of tier `i`. The key layout is
+    /// `channel_id ++ msg_type ++ ts ++ msg_id`, so each type is its own
+    /// `(ts, msg_id)`-sorted stream: one RocksDB iterator per type of the
+    /// current tier is SEEKED straight to the cursor position (no rescan
+    /// from the start of the channel), and the merge then advances one
+    /// iterator per emitted row. Work is O(limit + number of types) seeks
+    /// and steps regardless of how deep into the channel the cursor is.
+    ///
+    /// Returns `(rows, has_more, work)` — `work` counts every iterator
+    /// position read (seeks + steps, including skipped malformed keys), for
+    /// the responder's per-peer budget. `after.tier >= tiers.len()` returns
+    /// an empty, finished page for one unit of work (no I/O).
+    pub fn channel_meta_replay_page(
+        &self,
+        channel_id: u64,
+        tiers: &[&[u8]],
+        after: Option<(u8, u64, [u8; 32])>,
+        limit: usize,
+    ) -> Result<(Vec<MetaIndexRow>, bool, u64)> {
+        let mut work: u64 = 0;
+        let start_tier = after.map(|a| a.0 as usize).unwrap_or(0);
+        if start_tier >= tiers.len() {
+            return Ok((Vec::new(), false, 1));
+        }
+        let cf = self.cf_handle(cf::CHANNEL_META_MSGS)?;
+        let mut rows: Vec<MetaIndexRow> = Vec::with_capacity(limit.min(500));
+
+        // Parse a 49-byte key into (ts, msg_id); `None` for a malformed one.
+        fn parse(key: &[u8]) -> Option<(u64, [u8; 32])> {
+            if key.len() != 8 + 1 + 8 + 32 {
+                return None;
+            }
+            let ts = u64::from_be_bytes(key[9..17].try_into().ok()?);
+            let mut id = [0u8; 32];
+            id.copy_from_slice(&key[17..49]);
+            Some((ts, id))
+        }
+
+        for (tier_idx, types) in tiers.iter().enumerate().skip(start_tier) {
+            // Open + seek one iterator per type of this tier.
+            let mut streams = Vec::with_capacity(types.len());
+            for &t in types.iter() {
+                let mut prefix = channel_id.to_be_bytes().to_vec();
+                prefix.push(t);
+                let mut it = self.db.raw_iterator_cf(&cf);
+                let cursor_here = after.filter(|a| a.0 as usize == tier_idx);
+                match cursor_here {
+                    Some((_, cts, cid)) => {
+                        it.seek(super::schema::encode_channel_meta_key(channel_id, t, cts, &cid));
+                    }
+                    None => it.seek(&prefix),
+                }
+                work += 1;
+                // Advance to the first well-formed row of this type that is
+                // strictly after the cursor (equal `(ts, msg_id)` skipped).
+                let head = loop {
+                    if !it.valid() {
+                        break None;
+                    }
+                    let Some(key) = it.key() else { break None };
+                    if !key.starts_with(&prefix) {
+                        break None;
+                    }
+                    match parse(key) {
+                        Some(p) if cursor_here.is_none_or(|(_, cts, cid)| p > (cts, cid)) => {
+                            break Some(p)
+                        }
+                        _ => {
+                            it.next();
+                            work += 1;
+                        }
+                    }
+                };
+                streams.push((t, prefix, it, head));
+            }
+
+            loop {
+                // Smallest head of this tier.
+                let pick = streams
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, s)| s.3.map(|h| (h, i)))
+                    .min();
+                let Some(((ts, msg_id), i)) = pick else { break };
+                if rows.len() >= limit {
+                    // A further row exists: the page is full.
+                    return Ok((rows, true, work));
+                }
+                let (t, prefix, it, head) = &mut streams[i];
+                rows.push(MetaIndexRow { tier: tier_idx as u8, msg_type: *t, ts, msg_id });
+                // Advance this stream to its next well-formed row.
+                *head = loop {
+                    it.next();
+                    work += 1;
+                    if !it.valid() {
+                        break None;
+                    }
+                    let Some(key) = it.key() else { break None };
+                    if !key.starts_with(prefix.as_slice()) {
+                        break None;
+                    }
+                    if let Some(p) = parse(key) {
+                        break Some(p);
+                    }
+                };
+            }
+        }
+        Ok((rows, false, work))
+    }
+
+    /// One bounded pass of the one-time `CHANNEL_INVITES` purge (l2-node
+    /// 0.140.0 — the CF is no longer written or read). Deletes at most
+    /// `cap` rows and returns how many it deleted; the caller writes the
+    /// `CHANNEL_INVITES_PURGED` sentinel only once a pass deletes fewer
+    /// than `cap` (i.e. the CF is drained), so a very large legacy CF
+    /// drains across several boots instead of stalling one. Idempotent.
+    pub fn purge_channel_invites(&self, cap: usize) -> Result<usize> {
+        let rows = self.prefix_iter_cf(cf::CHANNEL_INVITES, &[], cap)?;
+        let n = rows.len();
+        if n == 0 {
+            return Ok(0);
+        }
+        let handle = self.cf_handle(cf::CHANNEL_INVITES)?;
+        let mut batch = WriteBatch::default();
+        for (key, _) in &rows {
+            batch.delete_cf(&handle, key);
+        }
+        self.write_batch(batch)?;
+        Ok(n)
+    }
+
+    /// Startup driver for the one-time `CHANNEL_INVITES` purge: a no-op once
+    /// `CHANNEL_INVITES_PURGED` is set; otherwise one capped
+    /// `purge_channel_invites` pass, setting the sentinel when that pass
+    /// deleted fewer than `cap` rows (drained). Returns rows deleted.
+    pub fn run_channel_invites_purge(&self, cap: usize) -> Result<usize> {
+        use super::schema::state_keys::CHANNEL_INVITES_PURGED;
+        if self.get_stat(CHANNEL_INVITES_PURGED)? > 0 {
+            return Ok(0);
+        }
+        let n = self.purge_channel_invites(cap)?;
+        if n < cap {
+            self.put_cf(cf::NODE_STATE, CHANNEL_INVITES_PURGED, &1u64.to_be_bytes())?;
+        }
+        Ok(n)
+    }
+
+    /// Body of `add_channel_member`, assuming `channel_membership_lock` is
+    /// already held by the caller (the lock is not reentrant).
+    fn add_channel_member_locked(
+        &self,
+        channel_id: u64,
+        address: &str,
+        timestamp: u64,
+        role: &str,
+    ) -> Result<bool> {
         let channel_key = channel_id.to_be_bytes();
         let Some(channel_data) = self.get_cf(cf::CHANNELS, &channel_key)? else {
             return Ok(false); // channel doesn't exist
@@ -2911,7 +3490,10 @@ impl Storage {
     /// (P-3b channel-metadata). Streams every envelope and indexes channel
     /// metadata/membership/moderation types by channel_id, so the
     /// channel-history reconcile can serve a channel's L2 metadata.
-    /// Idempotent — guarded by `CHANNEL_META_INDEXED_V2`.
+    /// Idempotent — guarded by `CHANNEL_META_INDEXED_V3` (l2-node 0.140.0
+    /// re-runs it once more to also index `ChannelAddModerator`/
+    /// `ChannelRemoveModerator`, moderator propagation; `_V2` is left set
+    /// and unread).
     ///
     /// Security-audit finding (2026-10-01, round 3): the original version of
     /// this backfill was guarded by `CHANNEL_META_INDEXED` — already set on
@@ -2950,6 +3532,8 @@ impl Storage {
                             | MessageType::ChannelKick
                             | MessageType::ChannelBan
                             | MessageType::ChannelUnban
+                            | MessageType::ChannelAddModerator
+                            | MessageType::ChannelRemoveModerator
                     ) {
                         // `deserialize_payload` decodes through each type's
                         // REAL, complete struct, which by construction has
@@ -2971,6 +3555,10 @@ impl Storage {
                                 DeserializedPayload::ChannelKick(p) => Some(p.channel_id),
                                 DeserializedPayload::ChannelBan(p) => Some(p.channel_id),
                                 DeserializedPayload::ChannelUnban(p) => Some(p.channel_id),
+                                DeserializedPayload::ChannelAddModerator(p) => Some(p.channel_id),
+                                DeserializedPayload::ChannelRemoveModerator(p) => {
+                                    Some(p.channel_id)
+                                }
                                 _ => None,
                             };
                             if let Some(channel_id) = channel_id {
@@ -2991,11 +3579,11 @@ impl Storage {
         }
 
         if indexed > 0 {
-            info!(indexed, "Backfilled CHANNEL_META_MSGS from MESSAGES (v2)");
+            info!(indexed, "Backfilled CHANNEL_META_MSGS from MESSAGES (v3)");
         }
         self.put_cf(
             cf::NODE_STATE,
-            super::schema::state_keys::CHANNEL_META_INDEXED_V2,
+            super::schema::state_keys::CHANNEL_META_INDEXED_V3,
             &1u64.to_be_bytes(),
         )?;
         Ok(())
@@ -6516,5 +7104,319 @@ mod synced_blob_lww_tests {
         assert!(!s.store_key_vault(w, &blob("kv1"), 10).unwrap());
         assert_eq!(s.get_key_vault(w).unwrap().unwrap(), blob("kv2"));
         assert_eq!(s.get_key_vault_ts(w).unwrap(), 20);
+    }
+}
+
+#[cfg(test)]
+mod membership_index_tests {
+    //! Round-4 audit B2: no-op `ChannelJoin`/`ChannelLeave` are not indexed
+    //! into `CHANNEL_META_MSGS`, a per-(channel, author) cap bounds the
+    //! rest, and out-of-order delivery never loses an outcome-changing
+    //! event (`Storage::index_membership_event`).
+    use super::*;
+    use crate::storage::schema::{self, cf};
+    use tempfile::TempDir;
+
+    const CID: u64 = (1u64 << 40) + 5;
+    const W: &str = "klv1wallet";
+
+    fn db() -> (Storage, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        s.put_cf(cf::CHANNELS, &CID.to_be_bytes(), br#"{"channel_type":2,"creator":"klv1c"}"#)
+            .unwrap();
+        (s, dir)
+    }
+    fn id(n: u64) -> [u8; 32] {
+        let mut i = [0u8; 32];
+        i[24..].copy_from_slice(&n.to_be_bytes());
+        i
+    }
+    fn meta_rows(s: &Storage) -> Vec<(u8, u64)> {
+        s.prefix_iter_cf(cf::CHANNEL_META_MSGS, &CID.to_be_bytes(), 1_000_000)
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| (k[8], u64::from_be_bytes(k[9..17].try_into().unwrap())))
+            .collect()
+    }
+    fn set_member(s: &Storage, member: bool) {
+        let key = schema::encode_channel_member_key(CID, W);
+        if member {
+            s.put_cf(cf::CHANNEL_MEMBERS, &key, b"{}").unwrap();
+        } else {
+            s.delete_cf(cf::CHANNEL_MEMBERS, &key).unwrap();
+        }
+    }
+    const J: u8 = 0x12;
+    const L: u8 = 0x13;
+
+    #[test]
+    fn junk_leaves_by_a_never_joined_non_member_are_not_indexed() {
+        let (s, _d) = db();
+        for t in 0..10_050u64 {
+            let o = s.index_membership_event(CID, W, MembershipEvent::Leave, 1_000 + t, &id(t)).unwrap();
+            assert!(o.indexed.is_empty());
+        }
+        assert!(meta_rows(&s).is_empty());
+        let st = s.membership_index_state(CID, W).unwrap().unwrap();
+        assert_eq!(st.held_leave.map(|h| h.0), Some(1_000 + 10_049), "only the newest is held");
+        assert!(st.rows.is_empty());
+    }
+
+    #[test]
+    fn a_leave_delivered_before_its_join_is_promoted_and_supersedes_it() {
+        let (s, _d) = db();
+        // True order: join@10, leave@20. Delivered: leave first.
+        assert!(s.index_membership_event(CID, W, MembershipEvent::Leave, 20, &id(2)).unwrap().indexed.is_empty());
+        let o = s.index_membership_event(CID, W, MembershipEvent::Join, 10, &id(1)).unwrap();
+        assert_eq!(o.indexed.iter().map(|r| (r.0, r.1)).collect::<Vec<_>>(), vec![(J, 10), (L, 20)]);
+        assert!(o.join_superseded_by_leave, "the join must not make the wallet a member");
+        // A later REJOIN is not superseded by the older leave.
+        let o = s.index_membership_event(CID, W, MembershipEvent::Join, 30, &id(3)).unwrap();
+        assert!(!o.join_superseded_by_leave);
+        assert_eq!(o.indexed.len(), 1);
+    }
+
+    #[test]
+    fn an_idempotent_rejoin_by_a_member_is_not_indexed() {
+        let (s, _d) = db();
+        let o = s.index_membership_event(CID, W, MembershipEvent::Join, 10, &id(1)).unwrap();
+        assert_eq!(o.indexed.len(), 1);
+        set_member(&s, true); // the apply step made W a member
+        for t in 11..30u64 {
+            assert!(s.index_membership_event(CID, W, MembershipEvent::Join, t, &id(t)).unwrap().indexed.is_empty());
+        }
+        assert_eq!(meta_rows(&s), vec![(J, 10)]);
+        // A member whose join was never indexed (federation, chain scan)
+        // gets its first join indexed.
+        let (s2, _d2) = db();
+        set_member(&s2, true);
+        assert_eq!(s2.index_membership_event(CID, W, MembershipEvent::Join, 5, &id(5)).unwrap().indexed.len(), 1);
+    }
+
+    #[test]
+    fn a_rejoin_held_back_before_its_removal_is_promoted_by_the_removal() {
+        let (s, _d) = db();
+        // True order: join@10, kick@20, join@30. Delivered: join@10,
+        // join@30 (W is still a member here → held back), kick@20.
+        s.index_membership_event(CID, W, MembershipEvent::Join, 10, &id(1)).unwrap();
+        set_member(&s, true);
+        assert!(s.index_membership_event(CID, W, MembershipEvent::Join, 30, &id(3)).unwrap().indexed.is_empty());
+        let o = s.index_membership_event(CID, W, MembershipEvent::Removal, 20, &id(2)).unwrap();
+        assert_eq!(o.indexed.iter().map(|r| (r.0, r.1)).collect::<Vec<_>>(), vec![(J, 30)]);
+        // Same through a leave.
+        let (s, _d) = db();
+        s.index_membership_event(CID, W, MembershipEvent::Join, 10, &id(1)).unwrap();
+        set_member(&s, true);
+        s.index_membership_event(CID, W, MembershipEvent::Join, 30, &id(3)).unwrap();
+        let o = s.index_membership_event(CID, W, MembershipEvent::Leave, 20, &id(2)).unwrap();
+        assert_eq!(o.indexed.iter().map(|r| (r.0, r.1)).collect::<Vec<_>>(), vec![(L, 20), (J, 30)]);
+        // An OLDER held join is not promoted by a newer removal.
+        let (s, _d) = db();
+        s.index_membership_event(CID, W, MembershipEvent::Join, 10, &id(1)).unwrap();
+        set_member(&s, true);
+        s.index_membership_event(CID, W, MembershipEvent::Join, 15, &id(4)).unwrap();
+        assert!(s.index_membership_event(CID, W, MembershipEvent::Removal, 20, &id(2)).unwrap().indexed.is_empty());
+    }
+
+    #[test]
+    fn removal_without_bookkeeping_writes_nothing() {
+        let (s, _d) = db();
+        let o = s.index_membership_event(CID, W, MembershipEvent::Removal, 20, &id(2)).unwrap();
+        assert!(o.indexed.is_empty());
+        assert!(s.membership_index_state(CID, W).unwrap().is_none());
+    }
+
+    const CAP: usize = MAX_INDEXED_MEMBERSHIP_ROWS_PER_AUTHOR as usize;
+
+    /// Final membership a late node reconstructs from the index: the
+    /// newest of the wallet's join/leave rows decides.
+    fn late_node_member(s: &Storage) -> Option<bool> {
+        meta_rows(s).into_iter().max_by_key(|r| r.1).map(|(t, _)| t == J)
+    }
+
+    /// Round-5 C-W3: genuine churn past the cap evicts the OLDEST rows, so
+    /// the newest — which decide final membership — always survive.
+    #[test]
+    fn per_author_cap_evicts_the_oldest_rows() {
+        for (cycles, end_in_join) in [(20u64, true), (20, false), (100, true), (3, false)] {
+            let (s, _d) = db();
+            let mut t = 100u64;
+            for c in 0..cycles {
+                s.index_membership_event(CID, W, MembershipEvent::Join, t, &id(t)).unwrap();
+                set_member(&s, true);
+                t += 1;
+                if c + 1 < cycles || !end_in_join {
+                    s.index_membership_event(CID, W, MembershipEvent::Leave, t, &id(t)).unwrap();
+                    set_member(&s, false);
+                    t += 1;
+                }
+            }
+            let events = (t - 100) as usize;
+            let rows = meta_rows(&s);
+            assert_eq!(rows.len(), events.min(CAP), "{cycles} cycles");
+            assert_eq!(late_node_member(&s), Some(end_in_join), "{cycles} cycles, end_in_join={end_in_join}");
+            // Exactly the newest `CAP` events are kept.
+            let oldest_kept = rows.iter().map(|r| r.1).min().unwrap();
+            assert_eq!(oldest_kept, t - events.min(CAP) as u64);
+            let st = s.membership_index_state(CID, W).unwrap().unwrap();
+            assert_eq!(st.rows.len(), rows.len());
+        }
+    }
+
+    /// An out-of-order event OLDER than every kept row is the one dropped.
+    #[test]
+    fn an_event_older_than_the_kept_window_is_not_indexed() {
+        let (s, _d) = db();
+        for k in 0..(CAP as u64) {
+            let t = 1_000 + k;
+            let ev = if k % 2 == 0 { MembershipEvent::Join } else { MembershipEvent::Leave };
+            s.index_membership_event(CID, W, ev, t, &id(t)).unwrap();
+            set_member(&s, ev == MembershipEvent::Join);
+        }
+        let before = meta_rows(&s);
+        assert_eq!(before.len(), CAP);
+        // W is a non-member whose history ends in a leave: a late, OLD join
+        // is not a no-op, but it is older than the whole window.
+        let o = s.index_membership_event(CID, W, MembershipEvent::Join, 10, &id(10)).unwrap();
+        assert!(o.indexed.is_empty() && o.evicted.is_empty());
+        assert_eq!(meta_rows(&s), before);
+        // A NEW join evicts exactly the oldest row.
+        let o = s.index_membership_event(CID, W, MembershipEvent::Join, 5_000, &id(5_000)).unwrap();
+        assert_eq!(o.indexed.len(), 1);
+        assert_eq!(o.evicted.iter().map(|r| r.1).collect::<Vec<_>>(), vec![1_000]);
+        assert_eq!(meta_rows(&s).len(), CAP);
+        assert_eq!(late_node_member(&s), Some(true));
+    }
+
+    /// Promotions inside one call respect the cap: each extra row evicts
+    /// the oldest, and a row indexed and then evicted in the SAME call is
+    /// never written (nor reported as deleted).
+    #[test]
+    fn promotion_at_the_cap_stays_bounded() {
+        // `CAP` alternating events (k = 0..CAP, ts 100..), ending in a leave.
+        let fill = |s: &Storage| {
+            for k in 0..(CAP as u64) {
+                let t = 100 + k;
+                let ev = if k % 2 == 0 { MembershipEvent::Join } else { MembershipEvent::Leave };
+                s.index_membership_event(CID, W, ev, t, &id(t)).unwrap();
+                set_member(s, ev == MembershipEvent::Join);
+            }
+            assert_eq!(meta_rows(s).len(), CAP);
+        };
+        let (s, _d) = db();
+        fill(&s);
+        // A newer leave while a non-member whose history ends in a leave:
+        // held back. Then the join it follows arrives: both are indexed,
+        // each evicting the oldest row.
+        assert!(s.index_membership_event(CID, W, MembershipEvent::Leave, 3_000, &id(3_000)).unwrap().indexed.is_empty());
+        let o = s.index_membership_event(CID, W, MembershipEvent::Join, 2_000, &id(2_000)).unwrap();
+        assert!(o.join_superseded_by_leave);
+        assert_eq!(o.indexed.iter().map(|r| (r.0, r.1)).collect::<Vec<_>>(), vec![(J, 2_000), (L, 3_000)]);
+        assert_eq!(o.evicted.iter().map(|r| r.1).collect::<Vec<_>>(), vec![100, 101]);
+        assert_eq!(meta_rows(&s).len(), CAP);
+        assert_eq!(late_node_member(&s), Some(false));
+        // The join lands between the two oldest rows: indexing it evicts
+        // row 100, promoting the leave then evicts the join itself.
+        let (s, _d) = db();
+        fill(&s);
+        s.index_membership_event(CID, W, MembershipEvent::Leave, 3_000, &id(3_000)).unwrap();
+        let mut between = id(100);
+        between[0] = 1; // (100, id) sorts after row 100's (100, id(100))
+        let o = s.index_membership_event(CID, W, MembershipEvent::Join, 100, &between).unwrap();
+        assert_eq!(o.indexed.iter().map(|r| (r.0, r.1)).collect::<Vec<_>>(), vec![(L, 3_000)]);
+        assert_eq!(o.evicted.iter().map(|r| r.1).collect::<Vec<_>>(), vec![100]);
+        assert!(o.evicted.iter().all(|e| !o.indexed.contains(e)));
+        let rows = meta_rows(&s);
+        assert_eq!(rows.len(), CAP);
+        assert!(!rows.contains(&(J, 100)), "the same-call evicted join was written");
+        let st = s.membership_index_state(CID, W).unwrap().unwrap();
+        assert_eq!(st.rows.len(), CAP);
+    }
+
+    /// Paging stays exactly-once across evictions between pages: the
+    /// keyset cursor never re-serves a row, and every row still present
+    /// after the cursor is served.
+    #[test]
+    fn replay_paging_is_exactly_once_across_evictions() {
+        let (s, _d) = db();
+        let tiers: [&[u8]; 1] = [&[J, L]];
+        let mut t = 100u64;
+        let churn = |s: &Storage, n: u64, t: &mut u64| {
+            for _ in 0..n {
+                let member = s
+                    .exists_cf(cf::CHANNEL_MEMBERS, &schema::encode_channel_member_key(CID, W))
+                    .unwrap();
+                let ev = if member { MembershipEvent::Leave } else { MembershipEvent::Join };
+                s.index_membership_event(CID, W, ev, *t, &id(*t)).unwrap();
+                set_member(s, !member);
+                *t += 1;
+            }
+        };
+        churn(&s, 40, &mut t);
+        let mut served: Vec<u64> = Vec::new();
+        let mut after = None;
+        loop {
+            let (rows, has_more, _) = s.channel_meta_replay_page(CID, &tiers, after, 5).unwrap();
+            served.extend(rows.iter().map(|r| r.ts));
+            if let Some(last) = rows.last() {
+                after = Some((last.tier, last.ts, last.msg_id));
+            }
+            // Evict more rows between pages.
+            churn(&s, 3, &mut t);
+            if !has_more {
+                break;
+            }
+        }
+        let mut dedup = served.clone();
+        dedup.dedup();
+        assert_eq!(dedup, served, "a row was served twice");
+        assert!(served.windows(2).all(|w| w[0] < w[1]), "not in replay order");
+        // Every row present now and after the first served row was served.
+        let first = served[0];
+        for (_, ts) in meta_rows(&s) {
+            if ts >= first && ts <= *served.last().unwrap() {
+                assert!(served.contains(&ts), "row {ts} skipped");
+            }
+        }
+    }
+
+    /// Round-5 S-W1: a leave that promotes a held-back NEWER join reports
+    /// it, so the apply step can re-apply the join after removing.
+    #[test]
+    fn leave_reports_a_promoted_newer_held_join() {
+        let (s, _d) = db();
+        // J100 (member), J300 held as an idempotent re-join, then L200.
+        s.index_membership_event(CID, W, MembershipEvent::Join, 100, &id(1)).unwrap();
+        set_member(&s, true);
+        assert!(s.index_membership_event(CID, W, MembershipEvent::Join, 300, &id(3)).unwrap().indexed.is_empty());
+        let o = s.index_membership_event(CID, W, MembershipEvent::Leave, 200, &id(2)).unwrap();
+        assert_eq!(o.leave_superseded_by_join, Some((300, id(3))));
+        assert_eq!(late_node_member(&s), Some(true));
+        // Negative control: the held join is OLDER than the leave.
+        let (s, _d) = db();
+        s.index_membership_event(CID, W, MembershipEvent::Join, 100, &id(1)).unwrap();
+        set_member(&s, true);
+        s.index_membership_event(CID, W, MembershipEvent::Join, 150, &id(3)).unwrap();
+        let o = s.index_membership_event(CID, W, MembershipEvent::Leave, 200, &id(2)).unwrap();
+        assert_eq!(o.leave_superseded_by_join, None);
+        assert_eq!(late_node_member(&s), Some(false));
+        // Equal timestamps: the leave wins (strict `>`), nothing promoted.
+        let (s, _d) = db();
+        s.index_membership_event(CID, W, MembershipEvent::Join, 100, &id(1)).unwrap();
+        set_member(&s, true);
+        s.index_membership_event(CID, W, MembershipEvent::Join, 200, &id(3)).unwrap();
+        let o = s.index_membership_event(CID, W, MembershipEvent::Leave, 200, &id(2)).unwrap();
+        assert_eq!(o.leave_superseded_by_join, None);
+        assert!(!meta_rows(&s).contains(&(J, 200)));
+        // A kick/ban (Removal) promotes for late nodes but reports nothing
+        // for re-apply (fails closed).
+        let (s, _d) = db();
+        s.index_membership_event(CID, W, MembershipEvent::Join, 100, &id(1)).unwrap();
+        set_member(&s, true);
+        s.index_membership_event(CID, W, MembershipEvent::Join, 300, &id(3)).unwrap();
+        let o = s.index_membership_event(CID, W, MembershipEvent::Removal, 200, &id(2)).unwrap();
+        assert_eq!(o.leave_superseded_by_join, None);
+        assert_eq!(o.indexed.len(), 1);
     }
 }

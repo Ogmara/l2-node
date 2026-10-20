@@ -675,11 +675,26 @@ impl Node {
         // upgrade; the old key is left in place (harmless, nothing else
         // reads it) rather than reused, so this migration's history stays
         // legible.
-        let channel_meta_indexed = storage.get_stat(state_keys::CHANNEL_META_INDEXED_V2)? > 0;
+        //
+        // l2-node 0.140.0 (moderator propagation): bumped to `_V3` so the
+        // widened type set (ChannelAddModerator/ChannelRemoveModerator)
+        // also gets backfilled for envelopes already on disk.
+        let channel_meta_indexed = storage.get_stat(state_keys::CHANNEL_META_INDEXED_V3)? > 0;
         if !channel_meta_indexed {
             if let Err(e) = storage.backfill_channel_meta() {
-                warn!(error = %e, "Failed to backfill CHANNEL_META_MSGS index (v2)");
+                warn!(error = %e, "Failed to backfill CHANNEL_META_MSGS index (v3)");
             }
+        }
+
+        // One-time purge of the retired CHANNEL_INVITES CF (private-channel
+        // join gate, l2-node 0.140.0, B4): nothing writes or reads it any
+        // more, and its rows were never pruned. Capped per boot so a huge
+        // legacy CF can't stall startup; the sentinel is only written once
+        // a pass finds less than a full batch (i.e. it has drained).
+        match storage.run_channel_invites_purge(50_000) {
+            Ok(0) => {}
+            Ok(n) => info!(purged = n, "Purged retired CHANNEL_INVITES rows"),
+            Err(e) => warn!(error = %e, "Failed to purge retired CHANNEL_INVITES rows"),
         }
 
         // Backfill CHANNEL_EDIT_DELETE_MSGS/DM_EDIT_DELETE_MSGS/NEWS_EDIT_DELETE
@@ -1736,7 +1751,8 @@ impl Node {
                                     derived_address,
                                     self.config.alerts.ogmara_channel.channel_id,
                                     network_counters.clone(),
-                                ))
+                                )
+                                .with_channel_verify_config(self.config.channel_verify.clone()))
                             }
                             Ok(derived_address) => {
                                 warn!(

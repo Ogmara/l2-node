@@ -83,6 +83,14 @@ impl AlertChannelDispatcher {
             channel_id,
         }
     }
+
+    /// Apply the node's real `[channel_verify]` policy to this dispatcher's
+    /// router (round-2 audit N-g), so it can never disagree with the main
+    /// routers on e.g. the private-join activation instant.
+    pub fn with_channel_verify_config(mut self, cfg: crate::config::ChannelVerifyConfig) -> Self {
+        self.router = self.router.with_channel_verify_config(cfg);
+        self
+    }
 }
 
 /// Load the alert-posting wallet's Ed25519 signing key.

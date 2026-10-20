@@ -23,16 +23,11 @@
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-use axum::http::header::FORWARDED;
 use axum::http::Request;
 use tower_governor::errors::GovernorError;
 use tower_governor::key_extractor::KeyExtractor;
 
-use crate::trusted_proxies::{resolve_client_ip, TrustedProxies};
-
-/// `X-Forwarded-For` header name (lowercase; `HeaderMap` lookup is
-/// case-insensitive). `http` has no constant for this de-facto header.
-const X_FORWARDED_FOR: &str = "x-forwarded-for";
+use crate::trusted_proxies::{resolve_client_ip_from_headers, TrustedProxies};
 
 /// Key extractor that resolves the real client IP via the node's
 /// trusted-proxy configuration. Cheap to clone (`Arc` inside) — the
@@ -63,19 +58,12 @@ impl KeyExtractor for TrustedProxyIpKeyExtractor {
             .map(|ci| ci.0)
             .ok_or(GovernorError::UnableToExtractKey)?;
 
-        let forwarded = req
-            .headers()
-            .get(FORWARDED)
-            .and_then(|v| v.to_str().ok());
-        let xff = req
-            .headers()
-            .get(X_FORWARDED_FOR)
-            .and_then(|v| v.to_str().ok());
-
         // resolve_client_ip ignores the headers unless `peer` is
         // loopback or a configured trusted proxy — the security anchor
-        // that stops an untrusted client from spoofing its key.
-        Ok(resolve_client_ip(peer, forwarded, xff, &self.trusted))
+        // that stops an untrusted client from spoofing its key — and
+        // keeps the proxy-appended TAIL of the chain (every field line
+        // of each header), so padding cannot choose the key (0.140.0).
+        Ok(resolve_client_ip_from_headers(peer, req.headers(), &self.trusted))
     }
 }
 
@@ -90,7 +78,7 @@ mod tests {
             .insert(ConnectInfo(peer.parse::<SocketAddr>().unwrap()));
         if let Some(v) = xff {
             req.headers_mut()
-                .insert(X_FORWARDED_FOR, v.parse().unwrap());
+                .insert("x-forwarded-for", v.parse().unwrap());
         }
         req
     }
@@ -137,6 +125,18 @@ mod tests {
             .extract(&req_with("8.8.8.8:5555", Some("203.0.113.7")))
             .unwrap();
         assert_eq!(key, "8.8.8.8".parse::<IpAddr>().unwrap());
+    }
+
+    /// 0.140.0 security fix: padding the header with spoofed entries can
+    /// no longer pick the rate-limit key (the parser keeps the tail).
+    #[test]
+    fn padded_xff_cannot_choose_the_key() {
+        let ex = extractor(&[]);
+        let pad = vec!["198.51.100.99"; 40].join(", ");
+        let key = ex
+            .extract(&req_with("127.0.0.1:5555", Some(&format!("{pad}, 203.0.113.7"))))
+            .unwrap();
+        assert_eq!(key, "203.0.113.7".parse::<IpAddr>().unwrap());
     }
 
     #[test]

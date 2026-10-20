@@ -87,10 +87,7 @@ use std::sync::{Arc, Mutex};
 use tracing::warn;
 
 use crate::crypto::signing;
-use crate::network::reconcile::{
-    self, channel_edit_delete_envelopes, channel_meta_envelopes, is_channel_member,
-    is_private_channel,
-};
+use crate::network::reconcile::{self, is_channel_member, is_private_channel, MetaCursor};
 use crate::storage::rocks::Storage;
 use crate::storage::schema;
 
@@ -123,7 +120,7 @@ pub fn protocol_string(network_id: &str) -> String {
 /// apply to a live-gossip-sourced copy. Exactly the gap `dm_sync` already
 /// closed for its own protocol; this closes the equivalent gap here.
 /// Covers every type `CHANNEL_MSGS`/`channel_meta_envelopes`/
-/// `channel_edit_delete_envelopes` can legitimately contain.
+/// `channel_edit_delete_envelopes_metered` can legitimately contain.
 pub fn is_private_channel_sync_type(msg_type: u8) -> bool {
     use crate::messages::types::MessageType;
     matches!(
@@ -143,6 +140,11 @@ pub fn is_private_channel_sync_type(msg_type: u8) -> bool {
                 | MessageType::ChannelKick
                 | MessageType::ChannelBan
                 | MessageType::ChannelUnban
+                // Moderator propagation (l2-node 0.140.0, B5): now indexed
+                // into CHANNEL_META_MSGS, so a member's home node learns who
+                // the moderators are (and accepts their invites/kicks).
+                | MessageType::ChannelAddModerator
+                | MessageType::ChannelRemoveModerator
         )
     )
 }
@@ -163,14 +165,47 @@ pub fn envelope_is_private_channel_sync_type(env_bytes: &[u8]) -> bool {
 /// Max envelopes a responder returns per page. Same threat shape as
 /// `dm_sync::MAX_ENVELOPES_PER_RESPONSE` — same value.
 pub const MAX_ENVELOPES_PER_RESPONSE: usize = 200;
-/// Hard ceiling on cumulative envelopes one peer may pull for one channel
-/// per process lifetime. Higher than `dm_sync::TOTAL_ENVELOPES_CAP` (5,000):
-/// one node can host multiple local wallets, each independently catching up
-/// on multiple private channels, unlike dm_sync's one-wallet-at-a-time
-/// scope. Kept well below `reconcile`'s 200,000 public-channel ceiling
-/// since this serves E2E ciphertext + membership metadata, not
-/// already-public content.
+/// Share of a LEGACY first page (requester without metadata paging)
+/// reserved for channel metadata, so a full chat page can never crowd the
+/// removal/role state out (round-2 audit R2-1). Capped at half the page.
+/// Paging requesters (0.140.0+) get ALL metadata rows on dedicated
+/// metadata pages instead (round-3 audit R3-1, raw keyset paging since
+/// round 4).
+pub const META_RESERVE: usize = 64;
+/// Hard ceiling on the cumulative budget one peer may spend on this
+/// responder per process lifetime (all channels and wallets together).
+/// Charged per request with `reconcile::budget_charge` — the larger of
+/// envelopes sent and storage rows examined, minimum 1 — so metadata rows
+/// count like chat rows and empty / garbage-cursor pages are not free
+/// (round 4). Higher than `dm_sync::TOTAL_ENVELOPES_CAP` (5,000): one node
+/// can host multiple local wallets, each independently catching up on
+/// multiple private channels. Kept well below `reconcile`'s 200,000
+/// public-channel ceiling since this serves E2E ciphertext + membership
+/// metadata, not already-public content.
+///
+/// **Lifetime interplay (recorded limitation):** every session re-serves
+/// the channel's FULL metadata and then its chat from the start, and the
+/// budget never refills until the responder restarts. A session completes
+/// only if it admitted at least one NEW envelope, so a channel the
+/// requester already holds in full (only `Duplicate`s come back) never
+/// completes and stays due: the 30 s retry sweep re-walks every such
+/// (wallet, channel) pair on each rotation, not only every
+/// `[private_channel_sync] channel_catchup_interval_hours`. A requesting
+/// node whose wallets re-sync channels with N metadata + M chat rows spends
+/// about N + M per session; once it has spent 20,000 this responder answers
+/// it `server_capped` until restart (the requester then tries its other
+/// fanout peers). A single channel with more than ~20,000 metadata rows can
+/// therefore never be fully served by one responder process. Planned
+/// follow-up: a rolling-window budget and a requester-side attempt
+/// throttle.
 pub const TOTAL_ENVELOPES_CAP: u64 = 20_000;
+/// Requester backstop on METADATA pages per session, separate from the
+/// chat-phase `MAX_PAGES_PER_SESSION` so a large metadata history cannot
+/// eat the chat budget: 500 pages × 200 rows = 100,000 rows (more than one
+/// responder's `TOTAL_ENVELOPES_CAP` can serve anyway). With a strictly
+/// increasing cursor check (`SyncSession::advance`) a hostile responder
+/// cannot loop the requester; at most it spends this many pages.
+pub const MAX_META_PAGES_PER_SESSION: u32 = 500;
 /// Max concurrent inbound requests served to one peer. Same as `dm_sync`.
 pub const SERVER_MAX_CONCURRENT_PER_PEER: usize = 2;
 /// How many peers an outbound backfill races. Same as `dm_sync::FANOUT`.
@@ -286,6 +321,34 @@ pub struct PrivateChannelSyncRequest {
     /// `auth_failed_response()`.
     #[serde(default)]
     pub wallet_claim: Option<WalletAuthClaim>,
+    /// Metadata paging (l2-node 0.140.0, round-3 audit R3-1). A requester
+    /// that understands it sets `true` and walks ALL of the channel's
+    /// metadata rows (raw, every indexed row) page by page (`meta_cursor`) before
+    /// any chat; a responder then serves metadata-only pages
+    /// (`meta_phase = true`) until `meta_done`. Absent/false (an older
+    /// requester) = the legacy first page (reserved metadata share + chat).
+    /// Additive, `#[serde(default)]`.
+    #[serde(default)]
+    pub meta_paging: bool,
+    /// Keyset cursor into the metadata in replay order (`None` = start;
+    /// see `reconcile::channel_meta_page` for the exact rule).
+    #[serde(default)]
+    pub meta_cursor: Option<MetaCursor>,
+    /// The requester finished the metadata phase; serve chat pages only.
+    #[serde(default)]
+    pub meta_done: bool,
+}
+
+impl PrivateChannelSyncRequest {
+    /// A page AFTER the first of its session (round-5 C-W1): a chat cursor,
+    /// a metadata cursor, or `meta_done` (the first chat page after this
+    /// session's metadata phase). Only a non-continuation request is
+    /// refused outright when every responder build slot is busy. The claim
+    /// is the requester's own (cursors are not authenticated) — the wait it
+    /// earns is bounded separately (`network::MAX_CONTINUATION_BUILD_WAITERS`).
+    pub fn is_continuation(&self) -> bool {
+        self.cursor.is_some() || self.meta_cursor.is_some() || self.meta_done
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -298,20 +361,34 @@ pub struct PrivateChannelSyncResponse {
     pub envelopes: Vec<Vec<u8>>,
     pub has_more: bool,
     pub next_cursor: Option<PrivateChannelSyncCursor>,
-    /// Set when the responder rate-capped the request (back off + retry
-    /// later).
+    /// Set when the responder rate-capped the request. The requester ends
+    /// the session there — no in-session retry; a later sweep starts the
+    /// pair over from the first page.
     pub server_capped: bool,
     /// Set when the request failed authentication (distinct from
     /// rate-capped — the requester should NOT retry without a fresh,
     /// correctly-bound token/claim).
     #[serde(default)]
     pub auth_failed: bool,
+    /// This page is a METADATA page (answer to a `meta_paging` request in
+    /// the metadata phase). Older responders never set it, which is how a
+    /// new requester recognises a legacy page. Additive.
+    #[serde(default)]
+    pub meta_phase: bool,
+    /// More metadata remains after this page.
+    #[serde(default)]
+    pub meta_has_more: bool,
+    /// Cursor for the next metadata page (the last row of this one).
+    #[serde(default)]
+    pub meta_next_cursor: Option<MetaCursor>,
 }
 
 /// Cursor over one channel's `CHANNEL_MSGS` index — same `(lamport_ts,
 /// msg_id)` shape as `reconcile::ReconcileCursor`, since both page the
 /// same underlying index.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Ordered by `(after_lamport_ts, after_msg_id)` — the index key order — so
+/// the requester can insist that each cursor strictly advances.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct PrivateChannelSyncCursor {
     pub after_lamport_ts: u64,
     pub after_msg_id: [u8; 32],
@@ -326,6 +403,9 @@ pub fn capped_response(channel_id: u64) -> PrivateChannelSyncResponse {
         next_cursor: None,
         server_capped: true,
         auth_failed: false,
+        meta_phase: false,
+        meta_has_more: false,
+        meta_next_cursor: None,
     }
 }
 
@@ -339,6 +419,130 @@ pub fn auth_failed_response(channel_id: u64) -> PrivateChannelSyncResponse {
         next_cursor: None,
         server_capped: false,
         auth_failed: true,
+        meta_phase: false,
+        meta_has_more: false,
+        meta_next_cursor: None,
+    }
+}
+
+/// What a requester does after applying one response (round-3 audit
+/// R3-1). Produced by the pure `SyncSession::advance`, so the two-phase
+/// loop is unit-testable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NextStep {
+    /// Ask for the next metadata page from this cursor.
+    MetaPage(MetaCursor),
+    /// Metadata exhausted: ask for the first chat page (`meta_done`).
+    StartChat,
+    /// Ask for the next chat page from this cursor.
+    ChatPage(PrivateChannelSyncCursor),
+    /// Session over. `complete` = persist the completion marker.
+    Finish { complete: bool },
+}
+
+/// Requester-side state of ONE private-channel-sync session with one peer
+/// (round 4). Lives in `NetworkService`'s pending-request map and is
+/// advanced once per applied response.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SyncSession {
+    /// The chat phase has started (a chat/legacy page was received or
+    /// `StartChat` was issued). A metadata page after this point is a
+    /// protocol violation.
+    pub in_chat: bool,
+    /// Metadata pages received (`MAX_META_PAGES_PER_SESSION`).
+    pub meta_pages: u32,
+    /// Chat (or legacy) pages received (`MAX_PAGES_PER_SESSION`).
+    pub chat_pages: u32,
+    /// Consecutive chat pages that admitted nothing.
+    pub consecutive_unproductive_pages: u32,
+    /// Session-cumulative count of genuinely NEW (`Accepted`, never
+    /// `Duplicate`) envelopes over BOTH phases.
+    pub accepted_total: usize,
+    /// Last metadata cursor followed — the next must be strictly greater.
+    pub last_meta_cursor: Option<MetaCursor>,
+    /// Last chat cursor followed — the next must be strictly greater.
+    pub last_chat_cursor: Option<PrivateChannelSyncCursor>,
+}
+
+impl SyncSession {
+    /// Advance after applying `resp`, which admitted `admitted` envelopes
+    /// (`Accepted` or `Duplicate`) of which `accepted` were `Accepted`.
+    ///
+    /// * **Metadata page** (`meta_phase`): never ends the session as
+    ///   complete. Continues with the next metadata page while
+    ///   `meta_has_more` and the cursor STRICTLY advances, then
+    ///   `StartChat`. Metadata pages never count as "unproductive" (a
+    ///   re-sync legitimately re-serves rows the requester already has, as
+    ///   `Duplicate`); they are bounded instead by the strictly-increasing
+    ///   cursor and `MAX_META_PAGES_PER_SESSION`. A metadata page after the
+    ///   chat phase started, a non-advancing cursor, or `meta_has_more`
+    ///   without a cursor ends the session INCOMPLETE — a hostile responder
+    ///   can neither loop the requester nor skip from chat back to
+    ///   metadata.
+    /// * **Chat page** (or a legacy page from an older responder, which
+    ///   never sets `meta_phase`): continues while `has_more` and the
+    ///   cursor strictly advances; otherwise finishes, `complete` iff the
+    ///   whole session admitted at least one `Accepted` envelope. The
+    ///   page / unproductive-page backstops finish incomplete — but only
+    ///   when another page would be needed: a final page (metadata or chat)
+    ///   that lands exactly on a backstop still moves on / finishes
+    ///   normally (round-5 C-N7).
+    pub fn advance(
+        &mut self,
+        resp: &PrivateChannelSyncResponse,
+        admitted: usize,
+        accepted: usize,
+    ) -> NextStep {
+        const INCOMPLETE: NextStep = NextStep::Finish { complete: false };
+        self.accepted_total += accepted;
+        if resp.meta_phase {
+            if self.in_chat {
+                return INCOMPLETE;
+            }
+            self.meta_pages += 1;
+            // The FINAL metadata page moves on to chat even when it is the
+            // `MAX_META_PAGES_PER_SESSION`-th (round-5 C-N7: the backstop
+            // used to be checked first, so a channel whose metadata ended
+            // exactly on the last allowed page never reached its chat). The
+            // backstop only stops a session that would need ANOTHER page.
+            if !resp.meta_has_more {
+                self.in_chat = true;
+                return NextStep::StartChat;
+            }
+            if self.meta_pages >= MAX_META_PAGES_PER_SESSION {
+                return INCOMPLETE;
+            }
+            return match &resp.meta_next_cursor {
+                Some(c) if self.last_meta_cursor.as_ref().is_none_or(|l| c > l) => {
+                    self.last_meta_cursor = Some(c.clone());
+                    NextStep::MetaPage(c.clone())
+                }
+                _ => INCOMPLETE,
+            };
+        }
+        self.in_chat = true;
+        self.chat_pages += 1;
+        self.consecutive_unproductive_pages = if admitted > 0 {
+            0
+        } else {
+            self.consecutive_unproductive_pages + 1
+        };
+        // A FINAL chat page finishes normally even when it is the page that
+        // reaches a backstop (round-5 C-N7); the backstops only refuse to
+        // ask for ANOTHER page.
+        let Some(c) = resp.next_cursor.as_ref().filter(|_| resp.has_more) else {
+            return NextStep::Finish { complete: self.accepted_total > 0 };
+        };
+        if self.chat_pages >= super::MAX_PAGES_PER_SESSION
+            || self.consecutive_unproductive_pages >= super::MAX_CONSECUTIVE_UNPRODUCTIVE_PAGES
+        {
+            return INCOMPLETE;
+        }
+        if self.last_chat_cursor.as_ref().is_some_and(|l| c <= l) {
+            return INCOMPLETE;
+        }
+        self.last_chat_cursor = Some(c.clone());
+        NextStep::ChatPage(c.clone())
     }
 }
 
@@ -368,45 +572,23 @@ pub fn sign_request(
         max_age_secs,
         cursor,
         wallet_claim,
+        meta_paging: false,
+        meta_cursor: None,
+        meta_done: false,
     }
 }
 
-/// Verify a private-channel-sync request's auth. Returns `true` iff ALL
-/// hold:
-///  1. `requester_pubkey` is a valid 32-byte Ed25519 key whose derived
-///     PeerId equals the connected `peer`;
-///  2. the signed `timestamp` is within `AUTH_MAX_AGE_SECS` of `now_ms`;
-///  3. the signature verifies over the host-bound, channel-bound auth
-///     string built with the RESPONDER's own PeerId;
-///  4. `wallet_claim` is present and verifies for the `node_id` derived
-///     from the already-verified `requester_pubkey`;
-///  5. (the gate `dm_sync` doesn't need) `request.channel_id` is actually
-///     a private channel, AND `request.wallet` is a CURRENT member of it —
-///     re-checked fresh on every request, never cached. Mirrors the exact
-///     existing precedent at `ChannelKeyEnvelope` ingest (`messages::router`):
-///     "non-members can neither distribute nor receive a channel key."
-pub fn verify_request_auth(
-    request: &PrivateChannelSyncRequest,
-    responder_peer_id: &str,
-    network: &str,
-    now_ms: u64,
-    peer: &libp2p::PeerId,
-    storage: &Storage,
-) -> bool {
-    verify_request_crypto_auth(request, responder_peer_id, network, now_ms, peer)
-        && verify_request_membership(storage, request.channel_id, &request.wallet)
-}
-
-/// Gate 5 alone — the channel must genuinely be private, and the wallet
-/// must be a CURRENT member — re-checked fresh on every request, never
-/// cached. Code-audit finding (2026-10-01): the production handler
-/// (`NetworkService::handle_private_channel_sync_event`) runs this AFTER
-/// `try_acquire` (so a never-a-member peer can't force storage I/O ahead
-/// of the per-peer rate limit — see `verify_request_crypto_auth`'s doc
-/// comment), so it can't call the combined `verify_request_auth` above.
-/// Extracted here as the SINGLE copy of the membership gate so the
-/// production call site and `verify_request_auth` (now test-only, kept
-/// for the existing combined-auth test suite) can never drift apart.
+/// Gate 5 — the channel must genuinely be private, and the wallet must be
+/// a CURRENT member — re-checked fresh on every request, never cached.
+/// The production handler (`NetworkService::
+/// handle_private_channel_sync_event`) runs the gates in this order:
+/// `verify_request_crypto_auth` (gates 1-4, pure crypto, no storage) →
+/// per-peer `try_acquire` (DoS gate) → this storage-touching check (code-
+/// audit finding 2026-10-01: a never-a-member peer must not force storage
+/// I/O ahead of the per-peer rate limit). This is the SINGLE copy of the
+/// membership gate. (The old combined `verify_request_auth` wrapper had no
+/// production caller and was removed in round 4 — dead auth code is a
+/// hazard; the tests compose the two gates themselves.)
 pub fn verify_request_membership(storage: &Storage, channel_id: u64, wallet: &str) -> bool {
     is_private_channel(storage, channel_id) && is_channel_member(storage, channel_id, wallet)
 }
@@ -502,6 +684,10 @@ pub fn verify_request_crypto_auth(
 /// missing/malformed `history_visibility` or `joined_at` is treated as
 /// ForwardOnly-since-right-now (serves nothing old) rather than
 /// FullHistory.
+///
+/// (Test convenience wrapper — production calls the `_metered` variant,
+/// which also returns the work done.)
+#[cfg(test)]
 pub fn build_response(
     storage: &Storage,
     request: &PrivateChannelSyncRequest,
@@ -509,6 +695,24 @@ pub fn build_response(
     now_unix: u64,
     window_max_age_secs: u64,
 ) -> PrivateChannelSyncResponse {
+    build_response_metered(storage, request, max_envelopes, now_unix, window_max_age_secs).0
+}
+
+/// `build_response` plus the storage work it did (index rows examined,
+/// `MESSAGES` reads, ride-along work), which the responder charges to the
+/// requesting peer's budget via `reconcile::budget_charge` (round 4: scan
+/// work is charged, not only envelopes sent). Runs off the swarm event
+/// loop (`tokio::task::spawn_blocking`, `NetworkService::
+/// handle_private_channel_sync_event`).
+pub fn build_response_metered(
+    storage: &Storage,
+    request: &PrivateChannelSyncRequest,
+    max_envelopes: usize,
+    now_unix: u64,
+    window_max_age_secs: u64,
+) -> (PrivateChannelSyncResponse, u64) {
+    // Two point reads for the history floor below.
+    let mut work: u64 = 2;
     let empty = PrivateChannelSyncResponse {
         channel_id: request.channel_id,
         envelopes: Vec::new(),
@@ -516,6 +720,9 @@ pub fn build_response(
         next_cursor: None,
         server_capped: false,
         auth_failed: false,
+        meta_phase: false,
+        meta_has_more: false,
+        meta_next_cursor: None,
     };
 
     let cap = max_envelopes.min(reconcile::MAX_ENVELOPES_PER_RESPONSE_CEILING);
@@ -540,8 +747,59 @@ pub fn build_response(
     };
     let min_timestamp = min_timestamp.max(history_floor);
 
+    // --- Metadata phase (paging requesters, round-3 audit R3-1) ---
+    // ALL of the channel's metadata rows — raw, every indexed row (round 4:
+    // a re-granted moderator's actions must survive, B1) — are served
+    // on their own pages in replay order `(tier, ts, msg_id)` with a keyset
+    // cursor, BEFORE any chat, so nothing is starved by a fixed per-page
+    // share. Each page is O(page + types) seeks (`reconcile::
+    // channel_meta_page`). `has_more` stays true (the chat phase is still
+    // to come); the requester switches to chat with `meta_done` once
+    // `meta_has_more` is false.
+    if request.meta_paging && !request.meta_done {
+        let page = reconcile::channel_meta_page(storage, request.channel_id, request.meta_cursor.as_ref(), cap);
+        return (
+            PrivateChannelSyncResponse {
+                channel_id: request.channel_id,
+                envelopes: page.envelopes,
+                has_more: true,
+                next_cursor: None,
+                server_capped: false,
+                auth_failed: false,
+                meta_phase: true,
+                meta_has_more: page.has_more,
+                meta_next_cursor: page.next_cursor,
+            },
+            page.work,
+        );
+    }
+
+    // --- Legacy first page (requester without metadata paging) ---
+    // Metadata from a RESERVED share of the page (round-2 audit R2-1): up
+    // to `META_RESERVE` (never more than half the page, so chat keeps >= 1
+    // slot and `has_more`/`next_cursor` stay meaningful), and after the
+    // chat scan it may also take whatever room the chat left (R3-1 (3)).
+    // Selected by priority with the budget passed IN (never `.take()` a
+    // replay-sorted list; `reconcile::channel_meta_envelopes`). Later legacy
+    // pages and every page of a paging requester's chat phase carry no
+    // metadata. The reservation only needs to know whether the channel has
+    // at least that many metadata rows: a bounded key count, no scan.
+    let legacy_first_page = !request.meta_paging && request.cursor.is_none();
+    let reserved = if legacy_first_page {
+        let want = META_RESERVE.min(cap / 2);
+        work += 1 + want as u64;
+        storage
+            .count_prefix_cf(schema::cf::CHANNEL_META_MSGS, &request.channel_id.to_be_bytes(), want)
+            .map(|n| n as usize)
+            .unwrap_or(0)
+            .min(want)
+    } else {
+        0
+    };
+    let chat_cap = cap - reserved;
+
     let prefix = request.channel_id.to_be_bytes();
-    let probe_limit = cap.saturating_add(1);
+    let probe_limit = chat_cap.saturating_add(1);
 
     let rows = if let Some(c) = request.cursor.as_ref() {
         let start_key =
@@ -554,9 +812,12 @@ pub fn build_response(
         Ok(r) => r,
         Err(e) => {
             warn!(channel_id = request.channel_id, error = %e, "private-channel-sync: CHANNEL_MSGS iteration failed");
-            return empty;
+            return (empty, work + 1);
         }
     };
+    // One unit per index row examined (its MESSAGES read included) —
+    // filtered-out rows too, so a page of too-old rows is not free.
+    work += 1 + rows.len() as u64;
 
     // Chat messages are collected into their own vec first — NEVER
     // shortchanged by ride-along content — and ride-alongs are appended
@@ -574,7 +835,7 @@ pub fn build_response(
     // cursor had already advanced, and completion can never be marked
     // without at least one `Accepted` envelope). Confirmed empirically
     // during audit: cap=3, 3 chat + 5 delete-markers => 8 envelopes.
-    let mut chat_envelopes: Vec<Vec<u8>> = Vec::with_capacity(cap);
+    let mut chat_envelopes: Vec<Vec<u8>> = Vec::with_capacity(chat_cap);
 
     let mut last_cursor: Option<PrivateChannelSyncCursor> = None;
     // `rows` was fetched with `probe_limit = cap + 1` (see above) — the
@@ -584,7 +845,7 @@ pub fn build_response(
     // consuming `rows` into the loop below.
     let probed_count = rows.len();
 
-    for (key, _val) in rows.into_iter().take(cap) {
+    for (key, _val) in rows.into_iter().take(chat_cap) {
         if key.len() != 48 {
             continue;
         }
@@ -637,37 +898,52 @@ pub fn build_response(
     // More beyond this page iff the probe actually returned the extra
     // sentinel row — same "probed_count > cap" shape as
     // `dm_sync::build_response`'s `conv_has_more`.
-    let hit_cap = probed_count > cap;
+    let hit_cap = probed_count > chat_cap;
 
-    let mut envelopes: Vec<Vec<u8>> = Vec::with_capacity(cap);
-    if request.cursor.is_none() {
-        let room = cap.saturating_sub(chat_envelopes.len());
-        envelopes.extend(
-            channel_meta_envelopes(storage, request.channel_id)
-                .into_iter()
-                .take(room),
+    let meta: Vec<Vec<u8>> = if legacy_first_page {
+        let (meta, meta_work) = reconcile::channel_meta_envelopes_metered(
+            storage,
+            request.channel_id,
+            cap.saturating_sub(chat_envelopes.len()),
         );
-    }
+        work += meta_work;
+        meta
+    } else {
+        Vec::new()
+    };
+    let mut envelopes: Vec<Vec<u8>> = Vec::with_capacity(cap);
+    envelopes.extend(meta);
     envelopes.extend(chat_envelopes);
     if !hit_cap {
         let room = cap.saturating_sub(envelopes.len());
         if room > 0 {
-            envelopes.extend(
-                channel_edit_delete_envelopes(storage, request.channel_id, min_timestamp)
-                    .into_iter()
-                    .take(room),
+            // Read only the newest `room` markers (same rows the old
+            // read-2,000-then-`take(room)` kept), not the full ride-along.
+            let (ed, ed_work) = reconcile::channel_edit_delete_envelopes_metered(
+                storage,
+                request.channel_id,
+                min_timestamp,
+                room,
             );
+            work += ed_work;
+            envelopes.extend(ed);
         }
     }
 
-    PrivateChannelSyncResponse {
-        channel_id: request.channel_id,
-        envelopes,
-        has_more: hit_cap,
-        next_cursor: if hit_cap { last_cursor } else { None },
-        server_capped: false,
-        auth_failed: false,
-    }
+    (
+        PrivateChannelSyncResponse {
+            channel_id: request.channel_id,
+            envelopes,
+            has_more: hit_cap,
+            next_cursor: if hit_cap { last_cursor } else { None },
+            server_capped: false,
+            auth_failed: false,
+            meta_phase: false,
+            meta_has_more: false,
+            meta_next_cursor: None,
+        },
+        work,
+    )
 }
 
 // --- Responder rate limiting (per peer) ---
@@ -755,6 +1031,21 @@ mod tests {
     use crate::storage::rocks::Storage;
     use ed25519_dalek::SigningKey;
     use tempfile::TempDir;
+
+    /// Gates 1-5 composed exactly as the production handler runs them
+    /// (crypto first, then membership). Test-only: the production path
+    /// calls the two gates separately around `try_acquire`.
+    fn verify_request_auth(
+        request: &PrivateChannelSyncRequest,
+        responder_peer_id: &str,
+        network: &str,
+        now_ms: u64,
+        peer: &libp2p::PeerId,
+        storage: &Storage,
+    ) -> bool {
+        verify_request_crypto_auth(request, responder_peer_id, network, now_ms, peer)
+            && verify_request_membership(storage, request.channel_id, &request.wallet)
+    }
 
     fn keypair() -> (SigningKey, libp2p::PeerId) {
         let sk = SigningKey::from_bytes(&[7u8; 32]);
@@ -1040,6 +1331,9 @@ mod tests {
             max_age_secs: u64::MAX,
             cursor,
             wallet_claim: None,
+            meta_paging: false,
+            meta_cursor: None,
+            meta_done: false,
         }
     }
 
@@ -1158,7 +1452,7 @@ mod tests {
             .unwrap();
         // 5 edit/delete markers (would ride the LAST page) — key shape
         // matches `CHANNEL_MSGS`: channel_id:8 ++ timestamp_ms:8 ++ msg_id:32
-        // (see `reconcile::channel_edit_delete_envelopes`'s doc comment).
+        // (see `reconcile::channel_edit_delete_envelopes_metered`'s doc comment).
         for n in 0u64..5 {
             let mut mid = [0u8; 32];
             mid[1] = n as u8 + 1;
@@ -1211,5 +1505,989 @@ mod tests {
         assert!(!inner.served.contains_key(&first_peer));
         assert!(inner.served.contains_key(&last_peer));
         assert!(inner.served.contains_key(&overflow_peer));
+    }
+}
+
+#[cfg(test)]
+mod meta_reserve_tests {
+    //! Round-2 audit R2-1: the first page reserves room for channel
+    //! metadata, selected by priority (cap passed IN), so neither 200
+    //! ChannelUpdates nor a full chat page can crowd out kicks/demotions.
+    use super::*;
+    use crate::messages::envelope::Envelope;
+    use crate::messages::types::MessageType;
+    use tempfile::TempDir;
+
+    const CID: u64 = (1u64 << 40) + 11;
+    const BASE: u64 = 1_700_000_000;
+
+    fn setup() -> (Storage, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        s.put_cf(
+            schema::cf::CHANNELS,
+            &CID.to_be_bytes(),
+            br#"{"channel_type":2,"creator":"klv1c","history_visibility":1}"#,
+        )
+        .unwrap();
+        s.put_cf(
+            schema::cf::CHANNEL_MEMBERS,
+            &schema::encode_channel_member_key(CID, "klv1w"),
+            br#"{"joined_at":0,"role":"member"}"#,
+        )
+        .unwrap();
+        (s, dir)
+    }
+
+    fn put_meta(s: &Storage, t: MessageType, ts_ms: u64, tag: u8, seq: u16) -> [u8; 32] {
+        let mut id = [tag; 32];
+        id[30..32].copy_from_slice(&seq.to_be_bytes());
+        let env = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: t,
+            msg_id: id,
+            author: "klv1c".into(),
+            timestamp: ts_ms,
+            lamport_ts: 0,
+            payload: vec![],
+            signature: vec![],
+            relay_path: vec![],
+        };
+        s.put_cf(schema::cf::CHANNEL_META_MSGS, &schema::encode_channel_meta_key(CID, t as u8, ts_ms, &id), &[])
+            .unwrap();
+        s.put_cf(schema::cf::MESSAGES, &id, &rmp_serde::to_vec_named(&env).unwrap()).unwrap();
+        id
+    }
+
+    fn put_chat(s: &Storage, n: u64) {
+        let mut id = [0xC0u8; 32];
+        id[24..32].copy_from_slice(&n.to_be_bytes());
+        let env = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::ChatMessage,
+            msg_id: id,
+            author: "klv1a".into(),
+            timestamp: (BASE + n) * 1000,
+            lamport_ts: 0,
+            payload: vec![],
+            signature: vec![],
+            relay_path: vec![],
+        };
+        s.put_cf(schema::cf::CHANNEL_MSGS, &schema::encode_channel_msg_key(CID, (BASE + n) * 1000, &id), &[])
+            .unwrap();
+        s.put_cf(schema::cf::MESSAGES, &id, &rmp_serde::to_vec_named(&env).unwrap()).unwrap();
+    }
+
+    fn req(cursor: Option<PrivateChannelSyncCursor>) -> PrivateChannelSyncRequest {
+        PrivateChannelSyncRequest {
+            channel_id: CID,
+            wallet: "klv1w".into(),
+            requester_pubkey: vec![0u8; 32],
+            timestamp: 0,
+            signature: vec![0u8; 64],
+            max_age_secs: u64::MAX,
+            cursor,
+            wallet_claim: None,
+            meta_paging: false,
+            meta_cursor: None,
+            meta_done: false,
+        }
+    }
+
+    fn types(resp: &PrivateChannelSyncResponse) -> Vec<MessageType> {
+        resp.envelopes
+            .iter()
+            .map(|raw| rmp_serde::from_slice::<Envelope>(raw).unwrap().msg_type)
+            .collect()
+    }
+
+    fn has_id(resp: &PrivateChannelSyncResponse, id: &[u8; 32]) -> bool {
+        resp.envelopes
+            .iter()
+            .any(|raw| &rmp_serde::from_slice::<Envelope>(raw).unwrap().msg_id == id)
+    }
+
+    #[test]
+    fn many_updates_do_not_push_out_a_demotion_or_a_kick() {
+        let (s, _d) = setup();
+        put_meta(&s, MessageType::ChannelCreate, 1_000, 1, 0);
+        for i in 0..200u16 {
+            put_meta(&s, MessageType::ChannelUpdate, 10_000 + i as u64, 2, i);
+        }
+        let demote = put_meta(&s, MessageType::ChannelRemoveModerator, 5_000, 3, 0);
+        let kick = put_meta(&s, MessageType::ChannelKick, 6_000, 4, 0);
+        let resp = build_response(&s, &req(None), MAX_ENVELOPES_PER_RESPONSE, BASE + 10_000, u64::MAX);
+        assert!(resp.envelopes.len() <= MAX_ENVELOPES_PER_RESPONSE);
+        assert!(has_id(&resp, &demote), "demotion must be served");
+        assert!(has_id(&resp, &kick), "kick must be served");
+    }
+
+    #[test]
+    fn full_chat_first_page_still_carries_reserved_meta() {
+        let (s, _d) = setup();
+        put_meta(&s, MessageType::ChannelCreate, 1_000, 1, 0);
+        let kick = put_meta(&s, MessageType::ChannelKick, 6_000, 4, 0);
+        for n in 0..500u64 {
+            put_chat(&s, n);
+        }
+        let resp = build_response(&s, &req(None), MAX_ENVELOPES_PER_RESPONSE, BASE + 10_000, u64::MAX);
+        assert_eq!(resp.envelopes.len(), MAX_ENVELOPES_PER_RESPONSE);
+        assert!(has_id(&resp, &kick), "a full chat page must not crowd metadata out");
+        assert!(resp.has_more && resp.next_cursor.is_some());
+        let t = types(&resp);
+        assert_eq!(t.iter().filter(|m| **m == MessageType::ChatMessage).count(), 198);
+        // Later pages: chat only, full page budget.
+        let resp2 = build_response(&s, &req(resp.next_cursor), MAX_ENVELOPES_PER_RESPONSE, BASE + 10_000, u64::MAX);
+        assert!(types(&resp2).iter().all(|m| *m == MessageType::ChatMessage));
+        assert_eq!(resp2.envelopes.len(), MAX_ENVELOPES_PER_RESPONSE);
+    }
+
+    #[test]
+    fn paging_and_completion_signals_unchanged_for_a_normal_channel() {
+        // Walk every page: has_more/next_cursor must lead through ALL chat
+        // exactly once and end with has_more=false, and every page is
+        // within the cap.
+        let (s, _d) = setup();
+        put_meta(&s, MessageType::ChannelCreate, 1_000, 1, 0);
+        for i in 0..100u16 {
+            put_meta(&s, MessageType::ChannelJoin, 2_000 + i as u64, 5, i);
+        }
+        for n in 0..450u64 {
+            put_chat(&s, n);
+        }
+        let mut cursor = None;
+        let mut chat_seen = 0usize;
+        let mut pages = 0;
+        loop {
+            let resp = build_response(&s, &req(cursor.clone()), MAX_ENVELOPES_PER_RESPONSE, BASE + 10_000, u64::MAX);
+            pages += 1;
+            assert!(resp.envelopes.len() <= MAX_ENVELOPES_PER_RESPONSE);
+            assert!(!resp.envelopes.is_empty(), "no page may be empty");
+            chat_seen += types(&resp).iter().filter(|m| **m == MessageType::ChatMessage).count();
+            if !resp.has_more {
+                assert!(resp.next_cursor.is_none());
+                break;
+            }
+            cursor = resp.next_cursor.clone();
+            assert!(cursor.is_some());
+            assert!(pages < 10);
+        }
+        assert_eq!(chat_seen, 450);
+        // Page 1 = 64 meta + 136 chat, page 2 = 200, page 3 = 114.
+        assert_eq!(pages, 3);
+    }
+
+    #[test]
+    fn tiny_cap_keeps_at_least_one_chat_slot() {
+        let (s, _d) = setup();
+        put_meta(&s, MessageType::ChannelCreate, 1_000, 1, 0);
+        put_meta(&s, MessageType::ChannelKick, 2_000, 4, 0);
+        for n in 0..5u64 {
+            put_chat(&s, n);
+        }
+        let resp = build_response(&s, &req(None), 3, BASE + 10_000, u64::MAX);
+        assert!(resp.envelopes.len() <= 3);
+        assert!(types(&resp).contains(&MessageType::ChatMessage));
+        assert!(resp.has_more && resp.next_cursor.is_some());
+    }
+}
+
+#[cfg(test)]
+mod meta_paging_tests {
+    //! Round 4: ALL metadata rows, raw, served on keyset
+    //! pages in replay order before chat. These tests drive
+    //! `build_response` on a real responder store and apply every page
+    //! through a real requester router, following `SyncSession::advance`
+    //! exactly as the network loop does.
+    use super::*;
+    use crate::messages::envelope::Envelope;
+    use crate::messages::router::{MessageRouter, RouteResult};
+    use crate::messages::types::*;
+    use crate::network::reconcile::MetaCursor;
+    use crate::storage::identity::IdentityResolver;
+    use std::collections::HashSet;
+    use tempfile::TempDir;
+
+    const CID: u64 = (1u64 << 40) + 21;
+    const T0: u64 = 1_700_000_000_000; // ms
+
+    struct W {
+        sk: ed25519_dalek::SigningKey,
+        addr: String,
+    }
+    fn wallet() -> W {
+        let sk = crate::crypto::generate_keypair();
+        let addr = crate::crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        W { sk, addr }
+    }
+
+    fn node_with(activation_ms: u64) -> (MessageRouter, Storage, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let identity = IdentityResolver::new(storage.clone());
+        let cfg = crate::config::ChannelVerifyConfig {
+            private_join_proof_activation_ms: activation_ms,
+            ..Default::default()
+        };
+        let r = MessageRouter::new(
+            storage.clone(),
+            identity,
+            None,
+            "testnet".into(),
+            usize::MAX,
+            std::sync::Arc::new(crate::metrics::counters::NetworkCounters::new()),
+            crate::config::RateLimitsConfig::default(),
+        )
+        .with_channel_verify_config(cfg);
+        (r, storage, dir)
+    }
+    /// Legacy (pre-activation) joins: the simplest valid history.
+    fn node() -> (MessageRouter, Storage, TempDir) {
+        node_with(u64::MAX / 2)
+    }
+
+    fn register(s: &Storage, addr: &str) {
+        s.put_cf(
+            schema::cf::USERS,
+            addr.as_bytes(),
+            serde_json::json!({"address": addr, "registered_at": 1}).to_string().as_bytes(),
+        )
+        .unwrap();
+    }
+
+    fn setup_channel(s: &Storage, creator: &str) {
+        s.put_cf(
+            schema::cf::CHANNELS,
+            &CID.to_be_bytes(),
+            serde_json::json!({"channel_id": CID, "channel_type": 2, "creator": creator,
+                "history_visibility": 1, "member_count": 0}).to_string().as_bytes(),
+        )
+        .unwrap();
+        s.add_channel_member(CID, creator, 1, "creator").unwrap();
+        register(s, creator);
+    }
+
+    fn sign(w: &W, t: MessageType, payload: Vec<u8>, ts: u64) -> Vec<u8> {
+        let pk: [u8; 32] = w.sk.verifying_key().to_bytes();
+        let msg_id = crate::crypto::compute_msg_id("testnet", &pk, &payload, ts);
+        let sig = signing::sign_ogmara_message(
+            &w.sk, "testnet", crate::messages::envelope::PROTOCOL_VERSION, t as u8, &msg_id, ts, &payload,
+        );
+        rmp_serde::to_vec_named(&Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: t,
+            msg_id,
+            author: w.addr.clone(),
+            timestamp: ts,
+            lamport_ts: 0,
+            payload,
+            signature: sig.to_bytes().to_vec(),
+            relay_path: vec![],
+        })
+        .unwrap()
+    }
+    fn join(w: &W, ts: u64) -> Vec<u8> {
+        join_with(w, None, ts)
+    }
+    fn join_with(w: &W, invite: Option<Vec<u8>>, ts: u64) -> Vec<u8> {
+        sign(w, MessageType::ChannelJoin, rmp_serde::to_vec_named(&ChannelJoinPayload { channel_id: CID, invite }).unwrap(), ts)
+    }
+    fn leave(w: &W, ts: u64) -> Vec<u8> {
+        sign(w, MessageType::ChannelLeave, rmp_serde::to_vec_named(&ChannelLeavePayload { channel_id: CID }).unwrap(), ts)
+    }
+    fn kick(c: &W, target: &str, ts: u64) -> Vec<u8> {
+        sign(c, MessageType::ChannelKick, rmp_serde::to_vec_named(&ChannelKickPayload { channel_id: CID, target_user: target.into(), reason: None }).unwrap(), ts)
+    }
+    fn ban(c: &W, target: &str, ts: u64) -> Vec<u8> {
+        sign(c, MessageType::ChannelBan, rmp_serde::to_vec_named(&ChannelBanPayload { channel_id: CID, target_user: target.into(), reason: Some("x".into()), duration_secs: 0 }).unwrap(), ts)
+    }
+    fn unban(c: &W, target: &str, ts: u64) -> Vec<u8> {
+        sign(c, MessageType::ChannelUnban, rmp_serde::to_vec_named(&ChannelUnbanPayload { channel_id: CID, target_user: target.into() }).unwrap(), ts)
+    }
+    fn add_mod(c: &W, target: &str, ts: u64) -> Vec<u8> {
+        let permissions = ModeratorPermissions {
+            can_mute: true,
+            can_kick: true,
+            can_ban: true,
+            can_pin: true,
+            can_edit_info: true,
+            can_delete_msgs: true,
+        };
+        sign(c, MessageType::ChannelAddModerator, rmp_serde::to_vec_named(&ChannelAddModeratorPayload { channel_id: CID, target_user: target.into(), permissions }).unwrap(), ts)
+    }
+    fn remove_mod(c: &W, target: &str, ts: u64) -> Vec<u8> {
+        sign(c, MessageType::ChannelRemoveModerator, rmp_serde::to_vec_named(&ChannelRemoveModeratorPayload { channel_id: CID, target_user: target.into() }).unwrap(), ts)
+    }
+    fn invite(by: &W, target: &str, ts: u64) -> Vec<u8> {
+        let p = ChannelInvitePayload {
+            channel_id: CID,
+            target_user: target.into(),
+            anchor_node: None,
+            expires_at: None,
+            inviter_grant: None,
+        };
+        sign(by, MessageType::ChannelInvite, rmp_serde::to_vec_named(&p).unwrap(), ts)
+    }
+    fn update_name(by: &W, name: &str, ts: u64) -> Vec<u8> {
+        #[derive(serde::Serialize)]
+        struct U<'a> { channel_id: u64, display_name: Option<&'a str> }
+        sign(by, MessageType::ChannelUpdate, rmp_serde::to_vec_named(&U { channel_id: CID, display_name: Some(name) }).unwrap(), ts)
+    }
+    fn chat(w: &W, ts: u64) -> Vec<u8> {
+        #[derive(serde::Serialize)]
+        struct C { channel_id: u64, content: String }
+        sign(w, MessageType::ChatMessage, rmp_serde::to_vec_named(&C { channel_id: CID, content: "hi".into() }).unwrap(), ts)
+    }
+
+    fn feed(r: &MessageRouter, raw: &[u8]) {
+        let res = r.process_synced_message(raw);
+        assert!(matches!(res, RouteResult::Accepted { .. }), "responder fixture rejected: {res:?}");
+    }
+
+    fn rows(s: &Storage, cf: &str) -> Vec<Vec<u8>> {
+        s.prefix_iter_cf(cf, &CID.to_be_bytes(), 1_000_000).unwrap().into_iter().map(|(k, _)| k).collect()
+    }
+    fn rows_kv(s: &Storage, cf: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
+        s.prefix_iter_cf(cf, &CID.to_be_bytes(), 1_000_000).unwrap()
+    }
+    fn display_name(s: &Storage) -> Option<String> {
+        let row = s.get_cf(schema::cf::CHANNELS, &CID.to_be_bytes()).unwrap()?;
+        serde_json::from_slice::<serde_json::Value>(&row).ok()?
+            .get("display_name")?.as_str().map(String::from)
+    }
+
+    /// The requester ends with the SAME members, bans, removal/demotion
+    /// watermarks and moderator set as the responder.
+    fn assert_converged(rs: &Storage, qs: &Storage) {
+        assert_eq!(rows(qs, schema::cf::CHANNEL_MEMBERS), rows(rs, schema::cf::CHANNEL_MEMBERS), "members");
+        assert_eq!(rows(qs, schema::cf::CHANNEL_BANS), rows(rs, schema::cf::CHANNEL_BANS), "bans");
+        assert_eq!(rows_kv(qs, schema::cf::CHANNEL_ROLE_WATERMARKS), rows_kv(rs, schema::cf::CHANNEL_ROLE_WATERMARKS), "watermarks");
+        assert_eq!(rows(qs, schema::cf::CHANNEL_MODERATORS), rows(rs, schema::cf::CHANNEL_MODERATORS), "moderators");
+    }
+
+    struct SyncRun {
+        pages: usize,
+        last: NextStep,
+        /// msg_ids served on METADATA pages, in order.
+        meta_served: Vec<[u8; 32]>,
+    }
+
+    fn msg_id_of(raw: &[u8]) -> [u8; 32] {
+        rmp_serde::from_slice::<Envelope>(raw).unwrap().msg_id
+    }
+
+    /// Drive the requester loop to the end, exactly like the network loop.
+    fn sync(resp_store: &Storage, requester: &MessageRouter, wallet: &str, paging: bool) -> SyncRun {
+        let mut req = PrivateChannelSyncRequest {
+            channel_id: CID,
+            wallet: wallet.into(),
+            requester_pubkey: vec![0; 32],
+            timestamp: 0,
+            signature: vec![0; 64],
+            max_age_secs: u64::MAX,
+            cursor: None,
+            wallet_claim: None,
+            meta_paging: paging,
+            meta_cursor: None,
+            meta_done: false,
+        };
+        let mut session = SyncSession::default();
+        let mut meta_served = Vec::new();
+        for page in 1..=2000 {
+            let resp = build_response(resp_store, &req, MAX_ENVELOPES_PER_RESPONSE, T0 / 1000 + 10_000_000, u64::MAX);
+            assert!(resp.envelopes.len() <= MAX_ENVELOPES_PER_RESPONSE);
+            let (mut admitted, mut accepted) = (0, 0);
+            for env in &resp.envelopes {
+                if resp.meta_phase {
+                    meta_served.push(msg_id_of(env));
+                }
+                match requester.process_synced_message(env) {
+                    RouteResult::Accepted { .. } => {
+                        admitted += 1;
+                        accepted += 1;
+                    }
+                    RouteResult::Duplicate => admitted += 1,
+                    _ => {}
+                }
+            }
+            let step = session.advance(&resp, admitted, accepted);
+            match step.clone() {
+                NextStep::MetaPage(c) => req.meta_cursor = Some(c),
+                NextStep::StartChat => {
+                    req.meta_done = true;
+                    req.meta_cursor = None;
+                }
+                NextStep::ChatPage(c) => req.cursor = Some(c),
+                NextStep::Finish { .. } => return SyncRun { pages: page, last: step, meta_served },
+            }
+        }
+        panic!("sync did not finish");
+    }
+
+    /// Every metadata row is served exactly once over the metadata pages.
+    fn assert_exactly_once(rs: &Storage, run: &SyncRun) {
+        let set: HashSet<[u8; 32]> = run.meta_served.iter().copied().collect();
+        assert_eq!(set.len(), run.meta_served.len(), "a metadata row was served twice");
+        let all: HashSet<[u8; 32]> = rows(rs, schema::cf::CHANNEL_META_MSGS)
+            .iter()
+            .map(|k| {
+                let mut id = [0u8; 32];
+                id.copy_from_slice(&k[17..49]);
+                id
+            })
+            .collect();
+        assert_eq!(set, all, "every indexed metadata row must be served");
+    }
+
+    // ---------------------------------------------------------------
+    // (h) The auditor's earlier probe.
+    // ---------------------------------------------------------------
+    #[test]
+    fn auditor_probe_everything_is_eventually_served() {
+        // 1 creator + 100 joins + 20 leaves + 1 ban + 70 kicks + 5 chat.
+        let (resp, rs, _d1) = node();
+        let (reqr, qs, _d2) = node();
+        let c = wallet();
+        setup_channel(&rs, &c.addr);
+        setup_channel(&qs, &c.addr);
+        let ws: Vec<W> = (0..100).map(|_| wallet()).collect();
+        for (i, w) in ws.iter().enumerate() {
+            feed(&resp, &join(w, T0 + i as u64));
+        }
+        for w in &ws[0..20] {
+            feed(&resp, &leave(w, T0 + 1_000));
+        }
+        feed(&resp, &ban(&c, &ws[20].addr, T0 + 2_000));
+        for (i, w) in ws[21..91].iter().enumerate() {
+            feed(&resp, &kick(&c, &w.addr, T0 + 3_000 + i as u64));
+        }
+        for i in 0..5 {
+            feed(&resp, &chat(&c, T0 + 5_000 + i));
+        }
+        let run = sync(&rs, &reqr, &c.addr, true);
+        assert_eq!(run.last, NextStep::Finish { complete: true });
+        assert_eq!(run.pages, 2, "one metadata page (191 rows) + one chat page");
+        assert_eq!(run.meta_served.len(), 191);
+        assert_exactly_once(&rs, &run);
+        assert_converged(&rs, &qs);
+        assert_eq!(rows(&qs, schema::cf::CHANNEL_MSGS).len(), 5);
+        assert_eq!(rows(&qs, schema::cf::CHANNEL_MEMBERS).len(), 1 + 100 - 20 - 1 - 70);
+    }
+
+    // ---------------------------------------------------------------
+    // (a) Moderator re-grant history (audit B1).
+    // ---------------------------------------------------------------
+    fn moderator_history(regrant_after_demotion: bool) {
+        let (resp, rs, _d1) = node();
+        let (reqr, qs, _d2) = node();
+        let c = wallet();
+        let m = wallet();
+        let (x, y) = (wallet(), wallet());
+        setup_channel(&rs, &c.addr);
+        setup_channel(&qs, &c.addr);
+        register(&rs, &m.addr);
+        register(&qs, &m.addr);
+        feed(&resp, &add_mod(&c, &m.addr, T0 + 1));
+        feed(&resp, &join(&x, T0 + 2));
+        feed(&resp, &join(&y, T0 + 2));
+        feed(&resp, &ban(&m, &x.addr, T0 + 3));
+        feed(&resp, &kick(&m, &y.addr, T0 + 3));
+        if regrant_after_demotion {
+            feed(&resp, &remove_mod(&c, &m.addr, T0 + 4));
+            feed(&resp, &add_mod(&c, &m.addr, T0 + 5));
+        } else {
+            feed(&resp, &add_mod(&c, &m.addr, T0 + 4));
+        }
+        assert_eq!(rows(&rs, schema::cf::CHANNEL_BANS).len(), 1);
+        let run = sync(&rs, &reqr, &c.addr, true);
+        assert_eq!(run.last, NextStep::Finish { complete: true });
+        assert_exactly_once(&rs, &run);
+        assert_converged(&rs, &qs);
+        assert_eq!(rows(&qs, schema::cf::CHANNEL_BANS).len(), 1, "the re-granted moderator's ban survives");
+        assert_eq!(rows(&qs, schema::cf::CHANNEL_MEMBERS).len(), 1, "X banned + Y kicked: only the creator remains");
+        // Two REMOVED watermarks (X, Y) — plus MODERATOR_REMOVED for M in
+        // the demotion variant.
+        let expected_wm = if regrant_after_demotion { 3 } else { 2 };
+        assert_eq!(rows(&qs, schema::cf::CHANNEL_ROLE_WATERMARKS).len(), expected_wm);
+    }
+
+    #[test]
+    fn moderator_regrant_keeps_the_moderators_earlier_actions() {
+        moderator_history(false);
+    }
+
+    #[test]
+    fn moderator_demoted_then_regranted_keeps_the_earlier_actions() {
+        moderator_history(true);
+    }
+
+    // ---------------------------------------------------------------
+    // (g) A moderator's Unban, Update and moderator-invited Join.
+    // ---------------------------------------------------------------
+    #[test]
+    fn moderator_unban_update_and_invited_join_survive() {
+        // Activation 0: every private join needs a real invite, so the
+        // moderator-invited join only verifies on the requester if M's
+        // grant replayed BEFORE it.
+        let (resp, rs, _d1) = node_with(0);
+        let (reqr, qs, _d2) = node_with(0);
+        let c = wallet();
+        let m = wallet();
+        let x = wallet();
+        let z = wallet();
+        setup_channel(&rs, &c.addr);
+        setup_channel(&qs, &c.addr);
+        register(&rs, &m.addr);
+        register(&qs, &m.addr);
+        feed(&resp, &add_mod(&c, &m.addr, T0 + 1));
+        feed(&resp, &ban(&m, &x.addr, T0 + 2));
+        feed(&resp, &unban(&m, &x.addr, T0 + 3));
+        feed(&resp, &update_name(&m, "renamed by moderator", T0 + 4));
+        let inv = invite(&m, &z.addr, T0 + 5);
+        feed(&resp, &join_with(&z, Some(inv), T0 + 6));
+        assert_eq!(rows(&rs, schema::cf::CHANNEL_MEMBERS).len(), 2);
+        let run = sync(&rs, &reqr, &c.addr, true);
+        assert_eq!(run.last, NextStep::Finish { complete: true });
+        assert_exactly_once(&rs, &run);
+        assert_converged(&rs, &qs);
+        assert!(rows(&qs, schema::cf::CHANNEL_BANS).is_empty(), "the moderator's unban survived");
+        assert_eq!(display_name(&qs).as_deref(), Some("renamed by moderator"), "the moderator's update survived");
+        assert!(
+            qs.exists_cf(schema::cf::CHANNEL_MEMBERS, &schema::encode_channel_member_key(CID, &z.addr)).unwrap(),
+            "the moderator-invited join survived"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // (c) 5 members + 10,050 junk Leaves from a non-member.
+    // ---------------------------------------------------------------
+    #[test]
+    fn junk_leave_flood_is_not_indexed_and_members_converge() {
+        let (resp, rs, _d1) = node();
+        let (reqr, qs, _d2) = node();
+        let c = wallet();
+        setup_channel(&rs, &c.addr);
+        setup_channel(&qs, &c.addr);
+        let members: Vec<W> = (0..5).map(|_| wallet()).collect();
+        for (i, w) in members.iter().enumerate() {
+            feed(&resp, &join(w, T0 + 10 + i as u64));
+        }
+        let junk = wallet(); // unregistered, never joined
+        for i in 0..10_050u64 {
+            feed(&resp, &leave(&junk, T0 + 100 + i));
+        }
+        assert_eq!(
+            rows(&rs, schema::cf::CHANNEL_META_MSGS).len(),
+            5,
+            "the index holds the 5 joins only — no junk leave was indexed"
+        );
+        let run = sync(&rs, &reqr, &c.addr, true);
+        assert_eq!(run.last, NextStep::Finish { complete: true });
+        assert_exactly_once(&rs, &run);
+        assert_converged(&rs, &qs);
+        assert_eq!(rows(&qs, schema::cf::CHANNEL_MEMBERS).len(), 6);
+        assert!(run.pages <= 3, "one metadata page, one empty chat page");
+    }
+
+    /// Out-of-order delivery on the RESPONDER: a member's leave arrives
+    /// before its own join (and a second wallet's rejoin before the kick it
+    /// follows). Neither event is lost from the index, the responder's own
+    /// state is right, and a requester converges to it.
+    #[test]
+    fn out_of_order_membership_events_are_not_lost() {
+        let (resp, rs, _d1) = node();
+        let (reqr, qs, _d2) = node();
+        let c = wallet();
+        setup_channel(&rs, &c.addr);
+        setup_channel(&qs, &c.addr);
+        let a = wallet();
+        let b = wallet();
+        // a: join@10, leave@20 — delivered leave first.
+        feed(&resp, &leave(&a, T0 + 20));
+        feed(&resp, &join(&a, T0 + 10));
+        assert!(
+            !rs.exists_cf(schema::cf::CHANNEL_MEMBERS, &schema::encode_channel_member_key(CID, &a.addr)).unwrap(),
+            "a leave that overtook its join wins"
+        );
+        // b: join@10, kick@20, join@30 — delivered join, join, kick.
+        feed(&resp, &join(&b, T0 + 10));
+        feed(&resp, &join(&b, T0 + 30));
+        feed(&resp, &kick(&c, &b.addr, T0 + 20));
+        assert_eq!(rows(&rs, schema::cf::CHANNEL_META_MSGS).len(), 2 + 3, "a: join+leave, b: join, kick, rejoin");
+        sync(&rs, &reqr, &c.addr, true);
+        // The requester replays in true order: a left; b rejoined after
+        // the kick. (The responder applied b's rejoin before the kick it
+        // follows — a pre-existing apply-order limitation, recorded — so
+        // only a's outcome is compared to the responder.)
+        assert!(!qs.exists_cf(schema::cf::CHANNEL_MEMBERS, &schema::encode_channel_member_key(CID, &a.addr)).unwrap());
+        assert!(qs.exists_cf(schema::cf::CHANNEL_MEMBERS, &schema::encode_channel_member_key(CID, &b.addr)).unwrap());
+    }
+
+    // ---------------------------------------------------------------
+    // (d) 1000 kicks over many targets + an old ban.
+    // ---------------------------------------------------------------
+    #[test]
+    fn thousand_kicks_over_many_targets_and_an_old_ban_all_arrive() {
+        let (resp, rs, _d1) = node();
+        let (reqr, qs, _d2) = node();
+        let c = wallet();
+        setup_channel(&rs, &c.addr);
+        setup_channel(&qs, &c.addr);
+        let banned = wallet();
+        feed(&resp, &ban(&c, &banned.addr, T0)); // oldest event of all
+        for i in 0..1000u64 {
+            feed(&resp, &kick(&c, &format!("klv1target{i:05}"), T0 + 10 + i));
+        }
+        let run = sync(&rs, &reqr, &c.addr, true);
+        assert_eq!(run.last, NextStep::Finish { complete: true });
+        assert_exactly_once(&rs, &run);
+        assert_eq!(rows(&qs, schema::cf::CHANNEL_ROLE_WATERMARKS).len(), 1001);
+        assert_eq!(rows(&qs, schema::cf::CHANNEL_BANS).len(), 1, "a ban is never starved by kicks");
+        assert_converged(&rs, &qs);
+    }
+
+    // ---------------------------------------------------------------
+    // (e) Exactly-once across pages, including EQUAL timestamps.
+    // ---------------------------------------------------------------
+    #[test]
+    fn exactly_once_across_pages_with_equal_timestamps() {
+        let (resp, rs, _d1) = node();
+        let (reqr, qs, _d2) = node();
+        let c = wallet();
+        setup_channel(&rs, &c.addr);
+        setup_channel(&qs, &c.addr);
+        // 650 rows, all at ONE timestamp, across three types — every page
+        // boundary falls inside a run of equal `ts`.
+        for i in 0..450u64 {
+            feed(&resp, &kick(&c, &format!("klv1same{i:04}"), T0 + 7));
+        }
+        for i in 0..100u64 {
+            feed(&resp, &ban(&c, &format!("klv1bann{i:04}"), T0 + 7));
+        }
+        for _ in 0..100 {
+            feed(&resp, &join(&wallet(), T0 + 7));
+        }
+        assert_eq!(rows(&rs, schema::cf::CHANNEL_META_MSGS).len(), 650);
+        let run = sync(&rs, &reqr, &c.addr, true);
+        assert_eq!(run.meta_served.len(), 650, "650 rows over 4 pages, none twice, none skipped");
+        assert_exactly_once(&rs, &run);
+        assert_converged(&rs, &qs);
+        // Served order is replay order: (tier, ts, msg_id) ascending.
+        let ids = run.meta_served.clone();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(ids, sorted, "equal-ts rows are served in msg_id order");
+    }
+
+    // ---------------------------------------------------------------
+    // (f) A tampered / garbled cursor is cheap and safe.
+    // ---------------------------------------------------------------
+    #[test]
+    fn tampered_meta_cursor_is_cheap_and_safe() {
+        let (resp, rs, _d1) = node();
+        let c = wallet();
+        setup_channel(&rs, &c.addr);
+        for i in 0..500u64 {
+            feed(&resp, &kick(&c, &format!("klv1t{i:04}"), T0 + i));
+        }
+        let req = |cursor: Option<MetaCursor>| PrivateChannelSyncRequest {
+            channel_id: CID,
+            wallet: c.addr.clone(),
+            requester_pubkey: vec![0; 32],
+            timestamp: 0,
+            signature: vec![0; 64],
+            max_age_secs: u64::MAX,
+            cursor: None,
+            wallet_claim: None,
+            meta_paging: true,
+            meta_cursor: cursor,
+            meta_done: false,
+        };
+        // Past the end (tier 255): empty, finished, ONE unit of work.
+        let (r, work) = build_response_metered(&rs, &req(Some(MetaCursor { tier: 255, ts: u64::MAX, msg_id: [0xFF; 32] })), MAX_ENVELOPES_PER_RESPONSE, T0 / 1000, u64::MAX);
+        assert!(r.meta_phase && r.envelopes.is_empty() && !r.meta_has_more && r.meta_next_cursor.is_none());
+        assert!(work <= 4, "a past-the-end cursor must cost O(1), got {work}");
+        assert!(reconcile::budget_charge(r.envelopes.len(), work) >= 1, "never free");
+        // Tier 1 at ts MAX: seeks only (one per type), empty, finished.
+        let (r, work) = build_response_metered(&rs, &req(Some(MetaCursor { tier: 1, ts: u64::MAX, msg_id: [0xFF; 32] })), MAX_ENVELOPES_PER_RESPONSE, T0 / 1000, u64::MAX);
+        assert!(r.envelopes.is_empty() && !r.meta_has_more);
+        assert!(work <= 2 + 2 * 9, "an at-the-end cursor costs a seek per type, got {work}");
+        // A garbled msg_id mid-history: a normal page from that position,
+        // bounded by the page cap, never a rescan.
+        let (r, work) = build_response_metered(&rs, &req(Some(MetaCursor { tier: 1, ts: T0 + 100, msg_id: [0xAB; 32] })), MAX_ENVELOPES_PER_RESPONSE, T0 / 1000, u64::MAX);
+        assert_eq!(r.envelopes.len(), MAX_ENVELOPES_PER_RESPONSE);
+        assert!(r.meta_has_more);
+        assert!(work <= 3 * MAX_ENVELOPES_PER_RESPONSE as u64 + 40, "page work is O(page + types), got {work}");
+        let first: Envelope = rmp_serde::from_slice(&r.envelopes[0]).unwrap();
+        assert!(first.timestamp > T0 + 100 || (first.timestamp == T0 + 100 && first.msg_id > [0xAB; 32]), "strictly after the cursor");
+    }
+
+    #[test]
+    fn deep_pages_cost_the_same_as_the_first() {
+        let (resp, rs, _d1) = node();
+        let c = wallet();
+        setup_channel(&rs, &c.addr);
+        for i in 0..1_200u64 {
+            feed(&resp, &kick(&c, &format!("klv1d{i:05}"), T0 + i));
+        }
+        let mut cursor = None;
+        let mut works = Vec::new();
+        loop {
+            let page = crate::network::reconcile::channel_meta_page(&rs, CID, cursor.as_ref(), MAX_ENVELOPES_PER_RESPONSE);
+            works.push(page.work);
+            if !page.has_more {
+                break;
+            }
+            cursor = page.next_cursor;
+        }
+        assert_eq!(works.len(), 6);
+        let (min, max) = (works.iter().min().unwrap(), works.iter().max().unwrap());
+        assert!(max - min <= 20, "per-page work must not grow with depth: {works:?}");
+    }
+
+    // ---------------------------------------------------------------
+    // Requester state machine.
+    // ---------------------------------------------------------------
+    fn meta_resp(has_more: bool, cursor: Option<MetaCursor>) -> PrivateChannelSyncResponse {
+        PrivateChannelSyncResponse {
+            channel_id: CID,
+            envelopes: vec![],
+            has_more: true,
+            next_cursor: None,
+            server_capped: false,
+            auth_failed: false,
+            meta_phase: true,
+            meta_has_more: has_more,
+            meta_next_cursor: cursor,
+        }
+    }
+    fn chat_resp(has_more: bool, cursor: Option<PrivateChannelSyncCursor>) -> PrivateChannelSyncResponse {
+        PrivateChannelSyncResponse {
+            meta_phase: false,
+            meta_has_more: false,
+            has_more,
+            next_cursor: cursor,
+            ..meta_resp(false, None)
+        }
+    }
+    fn mc(ts: u64) -> MetaCursor {
+        MetaCursor { tier: 1, ts, msg_id: [1; 32] }
+    }
+    fn cc(ts: u64) -> PrivateChannelSyncCursor {
+        PrivateChannelSyncCursor { after_lamport_ts: ts, after_msg_id: [2; 32] }
+    }
+
+    #[test]
+    fn completion_only_after_both_phases() {
+        let mut s = SyncSession::default();
+        // A metadata page never finishes the session, even with Accepted.
+        assert_eq!(s.advance(&meta_resp(true, Some(mc(5))), 3, 3), NextStep::MetaPage(mc(5)));
+        assert_eq!(s.advance(&meta_resp(false, None), 3, 3), NextStep::StartChat);
+        assert_eq!(s.advance(&chat_resp(true, Some(cc(1))), 1, 0), NextStep::ChatPage(cc(1)));
+        assert_eq!(s.advance(&chat_resp(false, None), 1, 0), NextStep::Finish { complete: true });
+        // Nothing Accepted in the whole session → not complete.
+        let mut s = SyncSession::default();
+        s.advance(&meta_resp(false, None), 0, 0);
+        assert_eq!(s.advance(&chat_resp(false, None), 0, 0), NextStep::Finish { complete: false });
+        // Duplicates alone never complete.
+        let mut s = SyncSession::default();
+        s.advance(&meta_resp(false, None), 50, 0);
+        assert_eq!(s.advance(&chat_resp(false, None), 9, 0), NextStep::Finish { complete: false });
+    }
+
+    #[test]
+    fn hostile_responder_cannot_loop_rewind_or_switch_phase() {
+        // Non-advancing metadata cursor → incomplete stop.
+        let mut s = SyncSession::default();
+        assert_eq!(s.advance(&meta_resp(true, Some(mc(5))), 1, 1), NextStep::MetaPage(mc(5)));
+        assert_eq!(s.advance(&meta_resp(true, Some(mc(5))), 1, 1), NextStep::Finish { complete: false });
+        let mut s = SyncSession::default();
+        s.advance(&meta_resp(true, Some(mc(5))), 1, 1);
+        assert_eq!(s.advance(&meta_resp(true, Some(mc(4))), 1, 1), NextStep::Finish { complete: false });
+        // `meta_has_more` without a cursor → incomplete stop.
+        let mut s = SyncSession::default();
+        assert_eq!(s.advance(&meta_resp(true, None), 1, 1), NextStep::Finish { complete: false });
+        // A metadata page once chat started → incomplete stop.
+        let mut s = SyncSession::default();
+        s.advance(&meta_resp(false, None), 1, 1);
+        assert_eq!(s.advance(&meta_resp(true, Some(mc(9))), 1, 1), NextStep::Finish { complete: false });
+        // Non-advancing chat cursor → incomplete stop.
+        let mut s = SyncSession::default();
+        s.advance(&chat_resp(true, Some(cc(3))), 1, 1);
+        assert_eq!(s.advance(&chat_resp(true, Some(cc(3))), 1, 1), NextStep::Finish { complete: false });
+        // Metadata page budget.
+        let mut s = SyncSession::default();
+        let mut last = NextStep::StartChat;
+        for i in 1..=MAX_META_PAGES_PER_SESSION as u64 {
+            last = s.advance(&meta_resp(true, Some(mc(i))), 1, 1);
+            if last == (NextStep::Finish { complete: false }) {
+                break;
+            }
+        }
+        assert_eq!(last, NextStep::Finish { complete: false });
+        assert_eq!(s.meta_pages, MAX_META_PAGES_PER_SESSION);
+        // Chat backstop: unproductive pages.
+        let mut s = SyncSession::default();
+        let mut last = NextStep::StartChat;
+        for i in 1..=10 {
+            last = s.advance(&chat_resp(true, Some(cc(i))), 0, 0);
+            if matches!(last, NextStep::Finish { .. }) {
+                break;
+            }
+        }
+        assert_eq!(last, NextStep::Finish { complete: false });
+        assert_eq!(s.chat_pages, crate::network::MAX_CONSECUTIVE_UNPRODUCTIVE_PAGES);
+    }
+
+    #[test]
+    fn continuation_classification() {
+        let sk = crate::crypto::generate_keypair();
+        let mut r = sign_request(&sk, "testnet", "peer", "klv1w", CID, 1, u64::MAX, None, None);
+        r.meta_paging = true;
+        assert!(!r.is_continuation(), "first metadata page starts a session");
+        r.meta_paging = false;
+        assert!(!r.is_continuation(), "legacy first page starts a session");
+        r.meta_cursor = Some(mc(1));
+        assert!(r.is_continuation());
+        r.meta_cursor = None;
+        r.meta_done = true;
+        assert!(r.is_continuation(), "first chat page after the metadata phase");
+        r.meta_done = false;
+        r.cursor = Some(cc(1));
+        assert!(r.is_continuation());
+    }
+
+    /// Round-5 C-N7: a FINAL page that lands exactly on a backstop moves on
+    /// (metadata → chat) or finishes normally instead of ending incomplete.
+    #[test]
+    fn final_page_on_a_backstop_is_not_cut_off() {
+        // Metadata: 499 continuation pages, then the 500th is the last.
+        let mut s = SyncSession::default();
+        for i in 1..MAX_META_PAGES_PER_SESSION as u64 {
+            assert_eq!(s.advance(&meta_resp(true, Some(mc(i))), 1, 1), NextStep::MetaPage(mc(i)));
+        }
+        assert_eq!(s.advance(&meta_resp(false, None), 1, 1), NextStep::StartChat);
+        assert_eq!(s.meta_pages, MAX_META_PAGES_PER_SESSION);
+        // ...but a 500th page that still has more is cut off.
+        let mut s = SyncSession::default();
+        for i in 1..MAX_META_PAGES_PER_SESSION as u64 {
+            s.advance(&meta_resp(true, Some(mc(i))), 1, 1);
+        }
+        assert_eq!(
+            s.advance(&meta_resp(true, Some(mc(10_000))), 1, 1),
+            NextStep::Finish { complete: false }
+        );
+        // Chat: the MAX_PAGES_PER_SESSION-th page is the final one.
+        let max = crate::network::MAX_PAGES_PER_SESSION;
+        let mut s = SyncSession::default();
+        for i in 1..max as u64 {
+            assert_eq!(s.advance(&chat_resp(true, Some(cc(i))), 1, 1), NextStep::ChatPage(cc(i)));
+        }
+        assert_eq!(s.advance(&chat_resp(false, None), 1, 1), NextStep::Finish { complete: true });
+        // ...and one that still has more is cut off.
+        let mut s = SyncSession::default();
+        for i in 1..max as u64 {
+            s.advance(&chat_resp(true, Some(cc(i))), 1, 1);
+        }
+        assert_eq!(
+            s.advance(&chat_resp(true, Some(cc(1_000_000))), 1, 1),
+            NextStep::Finish { complete: false }
+        );
+        // Unproductive backstop reached on the final page: finishes by the
+        // session's own merit (an earlier Accepted → complete).
+        let unprod = crate::network::MAX_CONSECUTIVE_UNPRODUCTIVE_PAGES;
+        let mut s = SyncSession::default();
+        s.advance(&meta_resp(false, None), 1, 1);
+        for i in 1..unprod as u64 {
+            assert_eq!(s.advance(&chat_resp(true, Some(cc(i))), 0, 0), NextStep::ChatPage(cc(i)));
+        }
+        assert_eq!(s.advance(&chat_resp(false, None), 0, 0), NextStep::Finish { complete: true });
+    }
+
+    #[test]
+    fn all_duplicate_metadata_pages_are_not_unproductive() {
+        // A re-sync: the requester already has everything, so every
+        // metadata row comes back Duplicate. Hundreds of such pages must
+        // walk to the chat phase, never trip the unproductive backstop.
+        let mut s = SyncSession::default();
+        for i in 1..=50 {
+            assert_eq!(s.advance(&meta_resp(true, Some(mc(i))), 0, 0), NextStep::MetaPage(mc(i)));
+        }
+        assert_eq!(s.advance(&meta_resp(false, None), 0, 0), NextStep::StartChat);
+        // And end-to-end: a second sync of an already-synced requester.
+        let (resp, rs, _d1) = node();
+        let (reqr, qs, _d2) = node();
+        let c = wallet();
+        setup_channel(&rs, &c.addr);
+        setup_channel(&qs, &c.addr);
+        for i in 0..1_100u64 {
+            feed(&resp, &kick(&c, &format!("klv1r{i:05}"), T0 + i));
+        }
+        assert_eq!(sync(&rs, &reqr, &c.addr, true).last, NextStep::Finish { complete: true });
+        let again = sync(&rs, &reqr, &c.addr, true);
+        assert_eq!(again.meta_served.len(), 1_100, "all 6 duplicate metadata pages walked");
+        assert_eq!(again.last, NextStep::Finish { complete: false }, "nothing new: not re-marked complete");
+        assert_converged(&rs, &qs);
+    }
+
+    #[test]
+    fn metadata_only_channel_completes_after_empty_chat_phase() {
+        let (resp, rs, _d1) = node();
+        let (reqr, qs, _d2) = node();
+        let c = wallet();
+        setup_channel(&rs, &c.addr);
+        setup_channel(&qs, &c.addr);
+        feed(&resp, &join(&wallet(), T0));
+        assert_eq!(sync(&rs, &reqr, &c.addr, true).last, NextStep::Finish { complete: true });
+    }
+
+    #[test]
+    fn old_peer_without_cursor_gets_the_legacy_first_page() {
+        let (resp, rs, _d1) = node();
+        let c = wallet();
+        setup_channel(&rs, &c.addr);
+        for i in 0..300u64 {
+            feed(&resp, &kick(&c, &format!("klv1t{i:04}"), T0 + i));
+        }
+        for i in 0..10 {
+            feed(&resp, &chat(&c, T0 + 1_000 + i));
+        }
+        let req = PrivateChannelSyncRequest {
+            channel_id: CID,
+            wallet: c.addr.clone(),
+            requester_pubkey: vec![0; 32],
+            timestamp: 0,
+            signature: vec![0; 64],
+            max_age_secs: u64::MAX,
+            cursor: None,
+            wallet_claim: None,
+            meta_paging: false,
+            meta_cursor: None,
+            meta_done: false,
+        };
+        let r = build_response(&rs, &req, MAX_ENVELOPES_PER_RESPONSE, T0 / 1000 + 10_000_000, u64::MAX);
+        assert!(!r.meta_phase && r.meta_next_cursor.is_none());
+        assert_eq!(r.envelopes.len(), MAX_ENVELOPES_PER_RESPONSE, "meta fills the room chat left");
+        // A pre-0.140 request (no new fields at all) decodes to the same thing.
+        #[derive(serde::Serialize)]
+        struct Old {
+            channel_id: u64,
+            wallet: String,
+            requester_pubkey: Vec<u8>,
+            timestamp: u64,
+            signature: Vec<u8>,
+            max_age_secs: u64,
+            cursor: Option<PrivateChannelSyncCursor>,
+        }
+        let bytes = serde_json::to_vec(&Old {
+            channel_id: CID, wallet: "w".into(), requester_pubkey: vec![], timestamp: 0,
+            signature: vec![], max_age_secs: 0, cursor: None,
+        })
+        .unwrap();
+        let decoded: PrivateChannelSyncRequest = serde_json::from_slice(&bytes).unwrap();
+        assert!(!decoded.meta_paging && !decoded.meta_done && decoded.meta_cursor.is_none());
+        // And a new requester reading a legacy response treats it as chat.
+        let mut s = SyncSession::default();
+        assert_eq!(s.advance(&r, 1, 1), NextStep::Finish { complete: true });
     }
 }

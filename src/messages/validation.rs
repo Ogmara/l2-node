@@ -1080,6 +1080,79 @@ pub fn validate_channel_invite(p: &ChannelInvitePayload) -> Result<(), Validatio
             ));
         }
     }
+    if let Some(ref grant) = p.inviter_grant {
+        if grant.is_empty() || grant.len() > MAX_INVITER_GRANT_BYTES {
+            return Err(ValidationError(format!(
+                "inviter_grant must be 1..={} bytes",
+                MAX_INVITER_GRANT_BYTES
+            )));
+        }
+    }
+    Ok(())
+}
+
+// --- Private-channel join gate (l2-node 0.140.0) ---
+
+/// Default lifetime of a `ChannelInvite` that carries no `expires_at`
+/// (7 days, ms). Protocol constant `DEFAULT_INVITE_TTL`.
+pub const DEFAULT_INVITE_TTL_MS: u64 = 7 * 24 * 3600 * 1000;
+/// Hard upper bound on an invite's lifetime (14 days, ms). Protocol
+/// constant `MAX_INVITE_TTL`. An `expires_at` further out is rejected.
+pub const MAX_INVITE_TTL_MS: u64 = 14 * 24 * 3600 * 1000;
+/// Cap on `ChannelJoinPayload::invite` (the embedded raw `ChannelInvite`
+/// envelope). Bounds the extra decode/verify work an untrusted join can
+/// force — this caps the untrusted INPUT, never any stored list.
+pub const MAX_JOIN_INVITE_BYTES: usize = 2048;
+/// Cap on `ChannelInvitePayload::inviter_grant` (the embedded raw
+/// creator-signed `ChannelAddModerator` envelope).
+pub const MAX_INVITER_GRANT_BYTES: usize = 1024;
+
+/// Effective expiry of an invite signed at `invite_ts` (unix ms):
+/// `expires_at`, or `invite_ts + DEFAULT_INVITE_TTL_MS` when absent.
+pub fn effective_invite_expiry(p: &ChannelInvitePayload, invite_ts: u64) -> u64 {
+    p.expires_at
+        .unwrap_or_else(|| invite_ts.saturating_add(DEFAULT_INVITE_TTL_MS))
+}
+
+/// Validate an invite's `expires_at` against its own signed envelope
+/// timestamp: `invite_ts < expires_at <= invite_ts + MAX_INVITE_TTL_MS`.
+/// An absent `expires_at` is always valid (it defaults to
+/// `DEFAULT_INVITE_TTL_MS`, which is inside the bound).
+pub fn validate_channel_invite_expiry(
+    p: &ChannelInvitePayload,
+    invite_ts: u64,
+) -> Result<(), ValidationError> {
+    if let Some(exp) = p.expires_at {
+        if exp <= invite_ts {
+            return Err(ValidationError(
+                "expires_at must be after the invite's timestamp".into(),
+            ));
+        }
+        if exp > invite_ts.saturating_add(MAX_INVITE_TTL_MS) {
+            return Err(ValidationError(
+                "expires_at exceeds the maximum invite lifetime (14 days)".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validate a channel join payload: `channel_id > 0`, and the optional
+/// embedded invite proof is non-empty and within `MAX_JOIN_INVITE_BYTES`.
+/// Applies to every channel type (a public join's proof is ignored, but
+/// still capped — see `ChannelJoinPayload::invite`).
+pub fn validate_channel_join(p: &ChannelJoinPayload) -> Result<(), ValidationError> {
+    if p.channel_id == 0 {
+        return Err(ValidationError("channel_id must be > 0".into()));
+    }
+    if let Some(ref inv) = p.invite {
+        if inv.is_empty() || inv.len() > MAX_JOIN_INVITE_BYTES {
+            return Err(ValidationError(format!(
+                "invite proof must be 1..={} bytes",
+                MAX_JOIN_INVITE_BYTES
+            )));
+        }
+    }
     Ok(())
 }
 

@@ -69,8 +69,12 @@
 //!     stops a single peer from monopolising the responder.
 //!
 //! Excess requests get a response with `server_capped = true` and
-//! empty envelopes; the client backs off and retries. We never
-//! queue or block — busy responder = clean back-pressure signal.
+//! empty envelopes. The requester ends that session there (there is no
+//! in-session retry); the channel is tried again by a later backfill
+//! sweep, from the first page. The per-peer/per-channel limits never
+//! queue or block. Only the node-wide build-slot bound lets a
+//! CONTINUATION page (cursor present) wait briefly for a slot instead of
+//! being refused (round-5 C-W1, `network::MAX_CONCURRENT_RESPONDER_BUILDS`).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -123,6 +127,18 @@ pub struct ReconcileRequest {
     /// fingerprint exchange; v0.47.0 always 0.
     #[serde(default)]
     pub round: u8,
+}
+
+impl ReconcileRequest {
+    /// A page AFTER the first of its session (round-5 C-W1): it carries the
+    /// responder's `next_cursor`. Only a non-continuation (first-page)
+    /// request is refused outright when every responder build slot is
+    /// busy. The claim is the requester's own (cursors are not
+    /// authenticated) — the wait it earns is bounded separately
+    /// (`network::MAX_CONTINUATION_BUILD_WAITERS`).
+    pub fn is_continuation(&self) -> bool {
+        self.cursor.is_some()
+    }
 }
 
 /// Reconciliation response.
@@ -285,12 +301,30 @@ pub const MAX_ENVELOPES_PER_RESPONSE_CEILING: usize = 50_000;
 /// The cap (`max_envelopes`) is the smaller of the operator-configured
 /// `[backfill] max_envelopes_per_response` and
 /// [`MAX_ENVELOPES_PER_RESPONSE_CEILING`].
+///
+/// (Test convenience wrapper — production calls the `_metered` variant,
+/// which also returns the work done.)
+#[cfg(test)]
 pub fn build_response(
     storage: &Storage,
     request: &ReconcileRequest,
     max_envelopes: usize,
     now_unix: u64,
 ) -> ReconcileResponse {
+    build_response_metered(storage, request, max_envelopes, now_unix).0
+}
+
+/// `build_response` plus the storage work it did (one unit per seek and per
+/// index row examined, ride-alongs included), for the responder's per-peer
+/// budget (`budget_charge`). Runs off the swarm event loop
+/// (`tokio::task::spawn_blocking`, see `NetworkService::
+/// handle_reconcile_event`).
+pub fn build_response_metered(
+    storage: &Storage,
+    request: &ReconcileRequest,
+    max_envelopes: usize,
+    now_unix: u64,
+) -> (ReconcileResponse, u64) {
     // Security Audit C1 (0.47.0): private channels are not served
     // via the reconcile protocol — the wire types don't carry any
     // signed requester/proof fields, so there is no way to verify
@@ -317,16 +351,19 @@ pub fn build_response(
             channel_id = request.channel_id,
             "reconcile: private channel — refusing (use authenticated sync)"
         );
-        return ReconcileResponse {
-            channel_id: request.channel_id,
-            envelopes: Vec::new(),
-            has_more: false,
-            next_cursor: None,
-            // Use server_capped to signal "go away" without
-            // disclosing whether the channel exists or not.
-            server_capped: true,
-            epoch_root: None,
-        };
+        return (
+            ReconcileResponse {
+                channel_id: request.channel_id,
+                envelopes: Vec::new(),
+                has_more: false,
+                next_cursor: None,
+                // Use server_capped to signal "go away" without
+                // disclosing whether the channel exists or not.
+                server_capped: true,
+                epoch_root: None,
+            },
+            1,
+        );
     }
 
     let cap = max_envelopes.min(MAX_ENVELOPES_PER_RESPONSE_CEILING);
@@ -415,16 +452,22 @@ pub fn build_response(
                 error = %e,
                 "reconcile: CHANNEL_MSGS iteration failed"
             );
-            return ReconcileResponse {
-                channel_id: request.channel_id,
-                envelopes: Vec::new(),
-                has_more: false,
-                next_cursor: None,
-                server_capped: false,
-                epoch_root: None,
-            };
+            return (
+                ReconcileResponse {
+                    channel_id: request.channel_id,
+                    envelopes: Vec::new(),
+                    has_more: false,
+                    next_cursor: None,
+                    server_capped: false,
+                    epoch_root: None,
+                },
+                1,
+            );
         }
     };
+    // Budget (one unit per seek and per index row examined, its MESSAGES
+    // read included — `budget_charge`).
+    let mut work: u64 = 1 + rows.len() as u64;
 
     let mut envelopes: Vec<Vec<u8>> = Vec::with_capacity(cap);
 
@@ -436,7 +479,10 @@ pub fn build_response(
     // envelope (ChannelCreate apply is now merge-safe). Counted separately so
     // the chat `cap` below is unaffected.
     if request.cursor.is_none() {
-        envelopes.extend(channel_meta_envelopes(storage, request.channel_id));
+        let (meta, meta_work) =
+            channel_meta_envelopes_metered(storage, request.channel_id, CHANNEL_META_CAP);
+        work += meta_work;
+        envelopes.extend(meta);
     }
 
     let mut last_cursor: Option<ReconcileCursor> = None;
@@ -526,112 +572,261 @@ pub fn build_response(
     // session could have delivered has already been applied — which
     // `authorize_edit_delete` requires before an edit/delete can be accepted.
     if !hit_cap {
-        envelopes.extend(channel_edit_delete_envelopes(
+        let (ed, ed_work) = channel_edit_delete_envelopes_metered(
             storage,
             request.channel_id,
             min_timestamp,
-        ));
+            CHANNEL_EDIT_DELETE_CAP,
+        );
+        work += ed_work;
+        envelopes.extend(ed);
     }
 
-    ReconcileResponse {
-        channel_id: request.channel_id,
-        envelopes,
-        has_more: hit_cap,
-        next_cursor: if hit_cap { last_cursor } else { None },
-        server_capped: false,
-        epoch_root: None,
+    (
+        ReconcileResponse {
+            channel_id: request.channel_id,
+            envelopes,
+            has_more: hit_cap,
+            next_cursor: if hit_cap { last_cursor } else { None },
+            server_capped: false,
+            epoch_root: None,
+        },
+        work,
+    )
+}
+
+/// Upper bound on metadata envelopes `channel_meta_envelopes` returns.
+pub(crate) const CHANNEL_META_CAP: usize = 256;
+
+/// Replay tiers of a channel's `CHANNEL_META_MSGS` rows (round-4, l2-node
+/// 0.140.0). Serving order = replay order, because the requester applies a
+/// response's envelopes strictly in vector order through
+/// `process_synced_message`:
+///
+/// - **Tier 0: `ChannelCreate` only**, always first regardless of `ts`. A
+///   PURE timestamp sort would let a `ChannelJoin`/`ChannelKick`/etc with an
+///   (unvalidated on the sync path) earlier `ts` replay BEFORE the channel
+///   exists — `add_channel_member` / the removal apply are no-ops without a
+///   `CHANNELS` row, and the envelope is then deduped, so the effect would
+///   be lost for good.
+/// - **Tier 1: everything else, by `(ts, msg_id)`** — `ChannelUpdate`,
+///   `ChannelJoin`/`Leave`, `ChannelAddModerator`/`RemoveModerator`,
+///   `ChannelKick`/`Ban`/`Unban`, `ChannelDelete`. Chronological replay is
+///   what reproduces the responder's state: the router authorises a
+///   moderator's kick/ban/unban/update and a moderator-signed invite
+///   against the moderator record AT REPLAY TIME, so each must replay after
+///   the grant that authorised it and before any later demotion (audit B1);
+///   and `ChannelBan`(0x17) < `ChannelUnban`(0x18) in key order, so key
+///   order would replay ban@1, ban@3, unban@2 and converge "unbanned"
+///   (W12). `ChannelUpdate` used to be tier 0 (with Create): that replayed
+///   a MODERATOR's update before the `ChannelAddModerator` that authorises
+///   it, so a fresh requester rejected it — it is chronological now.
+///
+/// Security-audit residual (unchanged, recorded): `ts` is the originating
+/// envelope's self-reported timestamp, which the sync ingest path does not
+/// drift-check, so a backfilled far-future envelope sorts last on every
+/// serve. Every affected type is still authorised against the RECEIVING
+/// node's state at replay, so this is ordering, not privilege.
+pub(crate) const META_REPLAY_TIERS: [&[u8]; 2] = [
+    &[MessageType::ChannelCreate as u8],
+    &[
+        MessageType::ChannelUpdate as u8,
+        MessageType::ChannelJoin as u8,
+        MessageType::ChannelLeave as u8,
+        MessageType::ChannelAddModerator as u8,
+        MessageType::ChannelRemoveModerator as u8,
+        MessageType::ChannelKick as u8,
+        MessageType::ChannelBan as u8,
+        MessageType::ChannelUnban as u8,
+        MessageType::ChannelDelete as u8,
+    ],
+];
+
+/// Selection priority of the BOUNDED metadata ride-along
+/// (`channel_meta_envelopes`: public reconcile's first page and the legacy
+/// first page of private-channel sync). Identity and persistent removals
+/// first, then the moderator records (creator-only, low volume — all of
+/// them fit before anything high-volume), then `ChannelUpdate` AHEAD of
+/// the cheap, high-volume `ChannelJoin`/`ChannelLeave` (round-4 B2': ~256
+/// joins to a public channel used to push every update out), and
+/// `ChannelLeave` AHEAD of `ChannelJoin` (round-5 C-N4): a leave REMOVES
+/// access, so when the cap is hit the requester must learn who left before
+/// learning who joined — the reverse order let a join flood push every leave
+/// out and a requester then kept leavers as members.
+const RIDE_ALONG_PRIORITY: [MessageType; 10] = [
+    MessageType::ChannelCreate,
+    MessageType::ChannelDelete,
+    MessageType::ChannelRemoveModerator,
+    MessageType::ChannelAddModerator,
+    MessageType::ChannelKick,
+    MessageType::ChannelBan,
+    MessageType::ChannelUnban,
+    MessageType::ChannelUpdate,
+    MessageType::ChannelLeave,
+    MessageType::ChannelJoin,
+];
+
+/// Replay tier of a `CHANNEL_META_MSGS` msg_type byte (see
+/// `META_REPLAY_TIERS`).
+fn replay_tier(msg_type: u8) -> u8 {
+    if msg_type == MessageType::ChannelCreate as u8 {
+        0
+    } else {
+        1
     }
 }
 
-/// Gather a channel's L2 metadata + membership envelopes (P-3b) to ride along
-/// with the first reconcile page. Bounded; the requester re-validates each
-/// envelope through `process_synced_message`.
-///
-/// Audit final pre-mainnet W12: `CHANNEL_META_MSGS`'s key is `channel_id ++
-/// msg_type ++ ts ++ msg_id`, so `prefix_iter_cf` returns rows sorted by
-/// msg_type FIRST, timestamp second — NOT chronologically. The requester
-/// applies `ReconcileResponse::envelopes` in vector order (a plain `for`
-/// loop over `process_synced_message`), so serving order = replay order.
-/// Moderation discriminants don't sort chronologically (e.g. `ChannelBan`
-/// 0x17 < `ChannelUnban` 0x18), so a naive key-order serve could replay
-/// banned@t1, unbanned@t2, re-banned@t3 as Ban, Ban, Unban — converging to
-/// the WRONG final state (unbanned) on the requesting node.
-///
-/// Fix: a two-tier sort key `(tier, ts)`, computed directly from the KEY
-/// bytes (msg_type is `key[8]`, ts is `key[9..17]` — see
-/// `encode_channel_meta_key`) rather than decoding each envelope:
-/// - Tier 0: `ChannelCreate`/`ChannelUpdate` (0x10/0x11), always first,
-///   regardless of `ts`. Code Audit follow-up: a PURE timestamp sort would
-///   let a `ChannelJoin`/`ChannelLeave`/etc envelope with an
-///   (unvalidated on the sync path) earlier `ts` than the channel's own
-///   `ChannelCreate` replay BEFORE it — and `add_channel_member`/
-///   `remove_channel_member_and_raise_epoch_floor` are no-ops when the
-///   `CHANNELS` row doesn't exist yet, so that membership change would be
-///   silently and permanently lost (the envelope is deduped, never
-///   re-applied). Pinning Create/Update to tier 0 preserves the original
-///   key-order's implicit "channel exists before membership/moderation
-///   ops run" guarantee.
-/// - Tier 1: everything else (including Ban/Unban), sorted by `ts` — this
-///   is the actual W12 fix.
-///
-/// Reading straight from the key (rather than decoding the full `Envelope`)
-/// also avoids a full msgpack decode per row on this serving path, and
-/// avoids a behavior change where a row whose stored bytes fail to decode
-/// locally would otherwise be silently dropped instead of forwarded for the
-/// requester to validate — same as the pre-fix code.
-///
-/// Security Audit follow-up, accepted residual (not fixed here): the sort
-/// key `ts` is the ORIGINATING envelope's self-reported `timestamp`, which
-/// `process_synced_message` (the sync/backfill ingest path) does not
-/// subject to the live-gossip ±5-minute drift check — so an envelope that
-/// entered via backfill with an arbitrary far-future `timestamp` sorts last
-/// on every subsequent serve from this node, permanently "winning" tier-1
-/// convergence. Every type this actually affects is still independently
-/// permission-gated against the RECEIVING node's current state
-/// (`authorize_channel_action` re-checks live, not against replay order),
-/// so this is not a straightforward privilege-escalation path, and it is
-/// NOT a regression — raw key order already converged to the same
-/// worst-case final state for Ban/Unban before this fix. Left as a residual
-/// rather than in-session-fixed since closing it means adding drift
-/// validation to the sync ingest path generally, a broader change than this
-/// function.
-pub(crate) fn channel_meta_envelopes(storage: &Storage, channel_id: u64) -> Vec<Vec<u8>> {
-    const CHANNEL_META_CAP: usize = 256;
-    let prefix = channel_id.to_be_bytes();
-    let rows = match storage.prefix_iter_cf(
-        schema::cf::CHANNEL_META_MSGS,
-        &prefix,
-        CHANNEL_META_CAP,
-    ) {
-        Ok(r) => r,
-        Err(_) => return Vec::new(),
-    };
-    let mut out: Vec<((u8, u64), Vec<u8>)> = Vec::new();
-    for (key, _) in rows {
-        // key: channel_id:8 ++ msg_type:1 ++ ts:8 ++ msg_id:32 = 49 bytes.
-        if key.len() != 8 + 1 + 8 + 32 {
-            continue;
-        }
-        let msg_type = key[8];
-        let tier = if msg_type == MessageType::ChannelCreate as u8
-            || msg_type == MessageType::ChannelUpdate as u8
-        {
-            0u8
-        } else {
-            1u8
-        };
-        let ts = u64::from_be_bytes(key[9..17].try_into().unwrap());
-        let mut msg_id = [0u8; 32];
-        msg_id.copy_from_slice(&key[17..49]);
-        let Ok(Some(raw)) = storage.get_message(&msg_id) else {
-            continue;
-        };
-        out.push(((tier, ts), raw));
+/// Parse a `CHANNEL_META_MSGS` key (`channel_id:8 ++ msg_type:1 ++ ts:8 ++
+/// msg_id:32`) into `(msg_type, ts, msg_id)`; `None` if malformed.
+fn parse_meta_key(key: &[u8]) -> Option<(u8, u64, [u8; 32])> {
+    if key.len() != 8 + 1 + 8 + 32 {
+        return None;
     }
-    // Stable sort: ties (identical tier+ts) keep the CF's own key-order
-    // (msg_type-then-msg_id) as a deterministic tiebreak.
-    out.sort_by_key(|(k, _)| *k);
-    out.into_iter().map(|(_, raw)| raw).collect()
+    let ts = u64::from_be_bytes(key[9..17].try_into().ok()?);
+    let mut msg_id = [0u8; 32];
+    msg_id.copy_from_slice(&key[17..49]);
+    Some((key[8], ts, msg_id))
+}
+
+/// A BOUNDED selection of a channel's metadata envelopes, in replay order —
+/// the ride-along for public reconcile's first page and for an older
+/// private-channel-sync requester's first page (P-3b; the full, unbounded
+/// set is only served by metadata paging, `channel_meta_page`).
+///
+/// Raw rows (round 4). The cap is applied to the INPUT
+/// selection, never by truncating a replay-sorted list (that would cut by
+/// timestamp and drop the newest kicks/bans first): rows are taken type by
+/// type in `RIDE_ALONG_PRIORITY` order — newest-first within a type, except
+/// `ChannelCreate` oldest-first (the genuine create precedes any contested
+/// one) — until `cap` (≤ `CHANNEL_META_CAP`) rows are chosen, and only the
+/// chosen rows are sorted into replay order `(tier, ts, msg_id)`. Each type
+/// is read with one bounded seek, so the cost is O(cap + types), not a scan
+/// of the channel's history. A row whose `MESSAGES` entry is gone is
+/// skipped; undecodable stored bytes are forwarded as-is for the requester
+/// to validate.
+///
+/// (Test convenience wrapper — production calls the `_metered` variant,
+/// which also returns the work done.)
+#[cfg(test)]
+pub(crate) fn channel_meta_envelopes(storage: &Storage, channel_id: u64, cap: usize) -> Vec<Vec<u8>> {
+    channel_meta_envelopes_metered(storage, channel_id, cap).0
+}
+
+/// `channel_meta_envelopes` plus the storage work it did (one unit per seek
+/// and per index row read, its `MESSAGES` read included), for the
+/// responder budget.
+pub(crate) fn channel_meta_envelopes_metered(
+    storage: &Storage,
+    channel_id: u64,
+    cap: usize,
+) -> (Vec<Vec<u8>>, u64) {
+    let cap = cap.min(CHANNEL_META_CAP);
+    let mut work: u64 = 0;
+    let mut chosen: Vec<(u8, u64, [u8; 32])> = Vec::with_capacity(cap);
+    for msg_type in RIDE_ALONG_PRIORITY {
+        let room = cap.saturating_sub(chosen.len());
+        if room == 0 {
+            break;
+        }
+        let mut prefix = channel_id.to_be_bytes().to_vec();
+        prefix.push(msg_type as u8);
+        let got = if msg_type == MessageType::ChannelCreate {
+            storage.prefix_iter_cf(schema::cf::CHANNEL_META_MSGS, &prefix, room)
+        } else {
+            let mut upper = prefix.clone();
+            upper.extend_from_slice(&[0xFFu8; 40]);
+            storage.reverse_iter_cf(schema::cf::CHANNEL_META_MSGS, &upper, &prefix, room)
+        };
+        work += 1;
+        let Ok(got) = got else { continue };
+        work += got.len() as u64;
+        chosen.extend(got.iter().filter_map(|(k, _)| parse_meta_key(k)).map(|(t, ts, id)| (replay_tier(t), ts, id)));
+    }
+    chosen.sort();
+    let envelopes = chosen
+        .into_iter()
+        .filter_map(|(_, _, id)| storage.get_message(&id).ok().flatten())
+        .collect();
+    (envelopes, work)
+}
+
+/// Keyset cursor into a channel's metadata in replay order — the position
+/// of the LAST row served (served or skipped because its `MESSAGES` entry
+/// was gone). The next page starts strictly after it. Not authenticated: a
+/// requester can only page its own session, and a garbled value only ever
+/// costs that requester (see `channel_meta_page` for the exact rule).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct MetaCursor {
+    /// Replay tier of the last served row: 0 = `ChannelCreate`, 1 = every
+    /// other metadata type (`META_REPLAY_TIERS`). Any larger value means
+    /// "past the end".
+    pub tier: u8,
+    /// Signed envelope timestamp (unix ms) of the last served row.
+    pub ts: u64,
+    /// `msg_id` of the last served row (tie-breaker for equal `ts`).
+    pub msg_id: [u8; 32],
+}
+
+/// One metadata page (`channel_meta_page`).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct MetaPage {
+    /// Stored envelope bytes in replay order (≤ the page cap).
+    pub envelopes: Vec<Vec<u8>>,
+    /// Position of the last row of this page; `None` for an empty page.
+    pub next_cursor: Option<MetaCursor>,
+    /// Another row exists after `next_cursor`.
+    pub has_more: bool,
+    /// Storage work done (iterator seeks and steps; a row's `MESSAGES`
+    /// read is part of its step).
+    pub work: u64,
+}
+
+/// One page of ALL of a channel's metadata rows (round 4: raw rows —
+/// nothing is dropped) in replay order `(tier, ts, msg_id)`,
+/// strictly after `after`, at most `cap` rows. Keyset paging: the per-type
+/// key streams are SEEKED to the cursor and merged
+/// (`Storage::channel_meta_replay_page`), so every page costs
+/// O(cap + number of types) regardless of depth — never a rescan.
+///
+/// Cursor rule: `after == None` starts at the beginning; any
+/// `(tier ∈ {0, 1}, ts, msg_id)` is a valid seek position (strictly-after
+/// semantics, so equal-`ts` rows are neither duplicated nor skipped); a
+/// `tier` above 1 (e.g. a tampered `tier = 255`) is past the end → an
+/// empty, finished page, for one unit of work and no I/O. A row whose
+/// `MESSAGES` entry is gone is skipped but still advances the cursor.
+pub(crate) fn channel_meta_page(
+    storage: &Storage,
+    channel_id: u64,
+    after: Option<&MetaCursor>,
+    cap: usize,
+) -> MetaPage {
+    let cap = cap.max(1);
+    let after = after.map(|c| (c.tier, c.ts, c.msg_id));
+    let (rows, has_more, work) =
+        match storage.channel_meta_replay_page(channel_id, &META_REPLAY_TIERS, after, cap) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(channel_id, error = %e, "metadata page: CHANNEL_META_MSGS iteration failed");
+                return MetaPage { work: 1, ..Default::default() };
+            }
+        };
+    let next_cursor = rows
+        .last()
+        .map(|r| MetaCursor { tier: r.tier, ts: r.ts, msg_id: r.msg_id });
+    let envelopes = rows
+        .iter()
+        .filter_map(|r| storage.get_message(&r.msg_id).ok().flatten())
+        .collect();
+    MetaPage { envelopes, next_cursor, has_more, work }
+}
+
+/// Per-peer responder budget charge for one served request (round 4): the
+/// larger of envelopes sent and storage work done (one unit per seek and
+/// per index row examined — a served row costs about one unit, like an
+/// envelope did before), and never less than 1 — so an empty, filtered-out
+/// or garbage-cursor page is not free.
+pub fn budget_charge(envelopes_sent: usize, work: u64) -> u64 {
+    (envelopes_sent as u64).max(work).max(1)
 }
 
 /// Fetch the known CREATOR's `ChannelCreate` (falling back to EARLIEST
@@ -838,6 +1033,9 @@ fn bootstrap_msg_id(key: &[u8]) -> Option<[u8; 32]> {
     Some(msg_id)
 }
 
+/// Max edit/delete markers one ride-along carries (public reconcile).
+pub(crate) const CHANNEL_EDIT_DELETE_CAP: usize = 2_000;
+
 /// Gather a channel's `ChatEdit`/`ChatDelete` envelopes (audit final
 /// pre-mainnet W6) to ride along on the LAST page of a reconcile session.
 /// Without this, edit/delete envelopes never reach a backfilling node at
@@ -854,12 +1052,21 @@ fn bootstrap_msg_id(key: &[u8]) -> Option<[u8; 32]> {
 /// accepted for `channel_meta_envelopes`: a channel with more markers than
 /// the cap just doesn't get its oldest excess markers this session (they'll
 /// still arrive via live gossip for anything edited/deleted going forward).
-pub(crate) fn channel_edit_delete_envelopes(
+///
+/// Returns the NEWEST `limit` (≤ `CHANNEL_EDIT_DELETE_CAP`) markers plus the
+/// storage work done. Public reconcile passes the full cap; private-channel
+/// sync passes the room left on its page, so it never reads (and discards)
+/// 2,000 markers to keep a few.
+pub(crate) fn channel_edit_delete_envelopes_metered(
     storage: &Storage,
     channel_id: u64,
     min_timestamp: u64,
-) -> Vec<Vec<u8>> {
-    const CHANNEL_EDIT_DELETE_CAP: usize = 2_000;
+    limit: usize,
+) -> (Vec<Vec<u8>>, u64) {
+    let limit = limit.min(CHANNEL_EDIT_DELETE_CAP);
+    if limit == 0 {
+        return (Vec::new(), 0);
+    }
     let prefix = channel_id.to_be_bytes();
     // Security-audit follow-up (2026-08-18): `CHANNEL_EDIT_DELETE_MSGS` keys
     // use a forward (non-negated) timestamp, so a FORWARD prefix scan is
@@ -873,12 +1080,13 @@ pub(crate) fn channel_edit_delete_envelopes(
         schema::cf::CHANNEL_EDIT_DELETE_MSGS,
         &schema::message_key_upper_bound(&prefix),
         &prefix,
-        CHANNEL_EDIT_DELETE_CAP.saturating_add(1),
+        limit.saturating_add(1),
     ) {
         Ok(r) => r,
-        Err(_) => return Vec::new(),
+        Err(_) => return (Vec::new(), 1),
     };
-    if rows.len() > CHANNEL_EDIT_DELETE_CAP {
+    let work: u64 = 1 + rows.len() as u64;
+    if limit == CHANNEL_EDIT_DELETE_CAP && rows.len() > CHANNEL_EDIT_DELETE_CAP {
         warn!(
             channel_id,
             cap = CHANNEL_EDIT_DELETE_CAP,
@@ -887,7 +1095,7 @@ pub(crate) fn channel_edit_delete_envelopes(
         );
     }
     let mut out = Vec::new();
-    for (key, _) in rows.into_iter().take(CHANNEL_EDIT_DELETE_CAP) {
+    for (key, _) in rows.into_iter().take(limit) {
         // Key shape matches CHANNEL_MSGS: channel_id:8 ++ timestamp:8 ++ msg_id:32.
         if key.len() != 48 {
             continue;
@@ -905,7 +1113,7 @@ pub(crate) fn channel_edit_delete_envelopes(
             out.push(raw);
         }
     }
-    out
+    (out, work)
 }
 
 /// Inspect the `CHANNELS` metadata row for `channel_id` and return
@@ -944,7 +1152,7 @@ pub(crate) fn is_private_channel(storage: &Storage, channel_id: u64) -> bool {
 /// Free-function equivalent of `MessageRouter::is_channel_member`
 /// ([router.rs](crate::messages::router)), for callers that only have a
 /// `&Storage` (no full `MessageRouter`) — currently
-/// `network::private_channel_sync::verify_request_auth`. Same logic,
+/// `network::private_channel_sync::verify_request_membership`. Same logic,
 /// same key encoding, just not behind `&self`: do not let this drift
 /// from the router's copy.
 pub(crate) fn is_channel_member(storage: &Storage, channel_id: u64, address: &str) -> bool {
@@ -1297,7 +1505,7 @@ mod channel_meta_order_tests {
         put_meta_envelope(&s, channel_id, MessageType::ChannelUnban, [2u8; 32], 2_000);
         put_meta_envelope(&s, channel_id, MessageType::ChannelBan, [3u8; 32], 3_000);
 
-        let out = channel_meta_envelopes(&s, channel_id);
+        let out = channel_meta_envelopes(&s, channel_id, CHANNEL_META_CAP);
         assert_eq!(
             msg_types_in_order(&out),
             vec![MessageType::ChannelBan, MessageType::ChannelUnban, MessageType::ChannelBan],
@@ -1322,7 +1530,7 @@ mod channel_meta_order_tests {
         put_meta_envelope(&s, channel_id, MessageType::ChannelJoin, [1u8; 32], 500);
         put_meta_envelope(&s, channel_id, MessageType::ChannelCreate, [2u8; 32], 1_000);
 
-        let out = channel_meta_envelopes(&s, channel_id);
+        let out = channel_meta_envelopes(&s, channel_id, CHANNEL_META_CAP);
         assert_eq!(
             msg_types_in_order(&out),
             vec![MessageType::ChannelCreate, MessageType::ChannelJoin],
@@ -1862,5 +2070,171 @@ mod tests {
         assert_eq!(req.round, 0);
         assert!(req.fingerprint.is_empty());
         assert!(req.epoch_root_known.is_none());
+    }
+}
+
+#[cfg(test)]
+mod channel_meta_type_priority_tests {
+    //! l2-node 0.140.0: `channel_meta_envelopes` (the bounded ride-along)
+    //! selects per msg_type in `RIDE_ALONG_PRIORITY` order with the cap on
+    //! the INPUT, so a channel with more Join rows than the 256 cap still
+    //! serves its moderator grants/removals, kicks and updates (previously
+    //! starved by the single msg_type-ordered scan).
+    use super::*;
+
+    fn put(s: &Storage, cid: u64, t: MessageType, ts: u64, id: u8, seq: u16) {
+        let mut msg_id = [id; 32];
+        msg_id[30..32].copy_from_slice(&seq.to_be_bytes());
+        let key = schema::encode_channel_meta_key(cid, t as u8, ts, &msg_id);
+        s.put_cf(schema::cf::CHANNEL_META_MSGS, &key, &[]).unwrap();
+        // Body = [type, id, seq_hi, seq_lo] so tests can tell rows apart.
+        let seq_b = seq.to_be_bytes();
+        s.store_message(&msg_id, &[t as u8, id, seq_b[0], seq_b[1]]).unwrap();
+    }
+
+    #[test]
+    fn moderator_and_kick_rows_survive_a_join_flood() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let cid = 1u64 << 40;
+        put(&s, cid, MessageType::ChannelCreate, 1, 1, 0);
+        for i in 0..400u16 {
+            put(&s, cid, MessageType::ChannelJoin, 10 + i as u64, 2, i);
+        }
+        put(&s, cid, MessageType::ChannelAddModerator, 5, 3, 0);
+        put(&s, cid, MessageType::ChannelRemoveModerator, 6, 4, 0);
+        put(&s, cid, MessageType::ChannelKick, 7, 5, 0);
+        let out = channel_meta_envelopes(&s, cid, CHANNEL_META_CAP);
+        assert_eq!(out.len(), 256);
+        for t in [
+            MessageType::ChannelCreate,
+            MessageType::ChannelAddModerator,
+            MessageType::ChannelRemoveModerator,
+            MessageType::ChannelKick,
+        ] {
+            assert!(out.iter().any(|raw| raw[0] == t as u8), "{t:?} starved");
+        }
+        // Replay order is still (tier, ts): Create first.
+        assert_eq!(out[0][0], MessageType::ChannelCreate as u8);
+    }
+
+    #[test]
+    fn many_channel_updates_no_longer_push_out_demotions_and_kicks() {
+        // Security audit W4: ChannelUpdate used to be gathered right after
+        // Create, so 256 metadata edits starved every moderation row.
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let cid = 1u64 << 40;
+        put(&s, cid, MessageType::ChannelCreate, 1, 1, 0);
+        for i in 0..300u16 {
+            put(&s, cid, MessageType::ChannelUpdate, 100 + i as u64, 6, i);
+        }
+        put(&s, cid, MessageType::ChannelRemoveModerator, 50, 4, 0);
+        put(&s, cid, MessageType::ChannelKick, 60, 5, 0);
+        put(&s, cid, MessageType::ChannelBan, 61, 7, 0);
+        let out = channel_meta_envelopes(&s, cid, CHANNEL_META_CAP);
+        assert_eq!(out.len(), 256);
+        for t in [
+            MessageType::ChannelRemoveModerator,
+            MessageType::ChannelKick,
+            MessageType::ChannelBan,
+        ] {
+            assert!(out.iter().any(|raw| raw[0] == t as u8), "{t:?} pushed out by updates");
+        }
+    }
+
+    /// Round-4 B2': on a PUBLIC channel ~256 cheap joins used to push every
+    /// `ChannelUpdate` out of the 256-row ride-along. Update now ranks ahead
+    /// of Join/Leave in the selection.
+    #[test]
+    fn one_update_survives_three_hundred_joins_in_the_ride_along() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let cid = 77u64; // public id space
+        put(&s, cid, MessageType::ChannelCreate, 1, 1, 0);
+        put(&s, cid, MessageType::ChannelUpdate, 5, 6, 0);
+        for i in 0..300u16 {
+            put(&s, cid, MessageType::ChannelJoin, 10 + i as u64, 2, i);
+        }
+        let out = channel_meta_envelopes(&s, cid, CHANNEL_META_CAP);
+        assert_eq!(out.len(), CHANNEL_META_CAP);
+        assert!(out.iter().any(|raw| raw[0] == MessageType::ChannelUpdate as u8), "update pushed out by joins");
+        // Replay order: Create (tier 0), then by ts — the update (ts 5)
+        // precedes every kept join.
+        assert_eq!(out[0][0], MessageType::ChannelCreate as u8);
+        assert_eq!(out[1][0], MessageType::ChannelUpdate as u8);
+        // And the whole selection reads O(cap + types) rows, not the channel.
+        let (_, work) = channel_meta_envelopes_metered(&s, cid, CHANNEL_META_CAP);
+        assert!(work <= 3 * CHANNEL_META_CAP as u64 + 20, "work {work}");
+    }
+
+    /// Round-5 C-N4: `ChannelLeave` ranks AHEAD of `ChannelJoin` — a join
+    /// flood must not push the leaves (access removals) out of the cap.
+    #[test]
+    fn leaves_survive_a_join_flood_in_the_ride_along() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let cid = 77u64;
+        put(&s, cid, MessageType::ChannelCreate, 1, 1, 0);
+        for i in 0..20u16 {
+            put(&s, cid, MessageType::ChannelLeave, 5 + i as u64, 8, i);
+        }
+        for i in 0..400u16 {
+            put(&s, cid, MessageType::ChannelJoin, 1_000 + i as u64, 2, i);
+        }
+        let out = channel_meta_envelopes(&s, cid, CHANNEL_META_CAP);
+        assert_eq!(out.len(), CHANNEL_META_CAP);
+        let n = |t: MessageType| out.iter().filter(|raw| raw[0] == t as u8).count();
+        assert_eq!(n(MessageType::ChannelLeave), 20, "every leave kept");
+        assert_eq!(n(MessageType::ChannelJoin), CHANNEL_META_CAP - 21);
+        // And the order of the constant itself.
+        let pos = |t: MessageType| RIDE_ALONG_PRIORITY.iter().position(|x| *x == t).unwrap();
+        assert!(pos(MessageType::ChannelUpdate) < pos(MessageType::ChannelLeave));
+        assert!(pos(MessageType::ChannelLeave) < pos(MessageType::ChannelJoin));
+    }
+
+    /// All moderator grants/demotions (creator-only, low volume) are kept
+    /// even when kicks alone would fill the cap.
+    #[test]
+    fn every_moderator_row_is_kept_under_a_kick_flood() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let cid = 1u64 << 40;
+        put(&s, cid, MessageType::ChannelCreate, 1, 1, 0);
+        for i in 0..20u16 {
+            put(&s, cid, MessageType::ChannelAddModerator, 2 + i as u64, 3, i);
+            put(&s, cid, MessageType::ChannelRemoveModerator, 100 + i as u64, 4, i);
+        }
+        for i in 0..400u16 {
+            put(&s, cid, MessageType::ChannelKick, 1_000 + i as u64, 5, i);
+        }
+        let out = channel_meta_envelopes(&s, cid, CHANNEL_META_CAP);
+        let n = |t: MessageType| out.iter().filter(|raw| raw[0] == t as u8).count();
+        assert_eq!(n(MessageType::ChannelAddModerator), 20);
+        assert_eq!(n(MessageType::ChannelRemoveModerator), 20);
+        assert_eq!(n(MessageType::ChannelKick), CHANNEL_META_CAP - 41);
+    }
+
+    #[test]
+    fn overflowing_type_keeps_its_newest_rows() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let cid = 1u64 << 40;
+        put(&s, cid, MessageType::ChannelCreate, 1, 1, 0);
+        // 400 kicks, ts 1000..1399; only 255 fit after the create.
+        for i in 0..400u16 {
+            put(&s, cid, MessageType::ChannelKick, 1_000 + i as u64, 5, i);
+        }
+        let out = channel_meta_envelopes(&s, cid, CHANNEL_META_CAP);
+        assert_eq!(out.len(), 256);
+        let kick_seqs: Vec<u16> = out
+            .iter()
+            .filter(|raw| raw[0] == MessageType::ChannelKick as u8)
+            .map(|raw| u16::from_be_bytes([raw[2], raw[3]]))
+            .collect();
+        assert_eq!(kick_seqs.len(), 255);
+        // Newest 255 (seq 145..=399) kept, oldest dropped.
+        assert!(kick_seqs.iter().all(|&q| q >= 145), "an old kick survived: {:?}", kick_seqs.iter().min());
+        assert!(kick_seqs.contains(&399));
     }
 }

@@ -99,7 +99,37 @@ pub mod cf {
     /// (channel_id, address) → MemberRecord (serialized: joined_at, role)
     pub const CHANNEL_MEMBERS: &str = "channel_members";
     /// (channel_id, address) → InviteRecord (serialized: invited_by, timestamp)
+    ///
+    /// **No longer written (l2-node 0.140.0).** A join now carries the
+    /// signed invite envelope itself as proof (`ChannelJoinPayload::invite`),
+    /// so this derived, never-pruned grant table had no remaining reader.
+    /// Existing rows are purged once at startup (capped, sentinel-guarded —
+    /// `Storage::purge_channel_invites`). The CF stays declared so RocksDB
+    /// can still open databases that contain it.
     pub const CHANNEL_INVITES: &str = "channel_invites";
+    /// (channel_id_be8, kind:1, address) → u64 big-endian unix-ms
+    /// watermark (l2-node 0.140.0, private-channel join gate). Stores the
+    /// MAXIMUM timestamp ever observed for that (channel, kind, address) —
+    /// never "latest row wins" — so out-of-order delivery (backfill, gossip
+    /// reordering) can only ever raise it. Kinds: `role_watermark_kind::
+    /// REMOVED` (0x01, written by ChannelKick AND ChannelBan apply — NOT by
+    /// ChannelLeave; the join gate's removal cutoff), `MODERATOR_REMOVED`
+    /// (0x02, written by ChannelRemoveModerator apply; kills a demoted
+    /// moderator's grant).
+    /// Node-local derived state: NOT in snapshot `DOMAIN_CFS`. Cleared with
+    /// the channel by `tombstone_channel`.
+    pub const CHANNEL_ROLE_WATERMARKS: &str = "channel_role_watermarks";
+    /// (channel_id_be8, address) → `MembershipIndexState` (JSON) — per
+    /// (channel, wallet) bookkeeping for which `ChannelJoin`/`ChannelLeave`
+    /// envelopes were indexed into `CHANNEL_META_MSGS` (l2-node 0.140.0,
+    /// round-4 audit B2): how many rows, the newest indexed join/leave
+    /// timestamps, and at most ONE held-back (not indexed) join and leave
+    /// that a later out-of-order event can still promote into the index.
+    /// No-op joins/leaves are not indexed, and at most
+    /// `MAX_INDEXED_MEMBERSHIP_ROWS_PER_AUTHOR` rows are indexed per
+    /// (channel, wallet). Node-local derived state: NOT in snapshot
+    /// `DOMAIN_CFS`. Cleared with the channel by `tombstone_channel`.
+    pub const CHANNEL_MEMBERSHIP_INDEX: &str = "channel_membership_index";
 
     /// (node_id, timestamp) → block_height — anchors indexed by submitting node
     pub const ANCHOR_BY_NODE: &str = "anchor_by_node";
@@ -425,6 +455,8 @@ pub mod cf {
         CHANNEL_PINS,
         CHANNEL_MEMBERS,
         CHANNEL_INVITES,
+        CHANNEL_ROLE_WATERMARKS,
+        CHANNEL_MEMBERSHIP_INDEX,
         ANCHOR_BY_NODE,
         NEWS_COMMENTS,
         DEVICE_WALLET_MAP,
@@ -504,7 +536,22 @@ pub mod state_keys {
     /// would never be backfilled at all, on any version. The unversioned
     /// key is removed rather than kept as dead code; this history is the
     /// record of why `_V2` exists).
+    /// No longer read since `_V3` (l2-node 0.140.0); kept as the record of
+    /// which sentinel key earlier versions wrote.
+    #[allow(dead_code)]
     pub const CHANNEL_META_INDEXED_V2: &[u8] = b"migration_channel_meta_indexed_v2";
+    /// Sentinel: set to 1 after the `CHANNEL_META_MSGS` backfill re-runs
+    /// with `ChannelAddModerator`/`ChannelRemoveModerator` added to the
+    /// indexed type set (l2-node 0.140.0, moderator propagation) — so
+    /// moderator grants that predate the upgrade also ride private-channel
+    /// backfill. (It does not give pre-0.140.0 moderator records a
+    /// `grant_msg_id`; the grant endpoint 404s for those.)
+    pub const CHANNEL_META_INDEXED_V3: &[u8] = b"migration_channel_meta_indexed_v3";
+    /// Sentinel: set to 1 once the one-time purge of the retired
+    /// `CHANNEL_INVITES` CF has fully drained (l2-node 0.140.0). The purge
+    /// is capped per boot; the sentinel is only written when a pass finds
+    /// nothing left, so a large CF drains across restarts.
+    pub const CHANNEL_INVITES_PURGED: &[u8] = b"migration_channel_invites_purged";
     /// Sentinel: set to 1 after CHANNEL_EDIT_DELETE_MSGS/DM_EDIT_DELETE_MSGS/
     /// NEWS_EDIT_DELETE are backfilled from existing MESSAGES (audit final
     /// pre-mainnet W6, l2-node 0.95.0+).
@@ -1094,7 +1141,40 @@ pub fn encode_local_channel_fed_key(wallet: &str, channel_id: u64) -> Vec<u8> {
     key
 }
 
+/// Kind byte for `CHANNEL_ROLE_WATERMARKS` keys (spec 03 §3.5).
+pub mod role_watermark_kind {
+    /// `removed`: a `ChannelKick` or `ChannelBan` removed the address (the
+    /// join gate's removal cutoff, protocol §3.9.1 rule 7). A voluntary
+    /// `ChannelLeave` does NOT write it.
+    pub const REMOVED: u8 = 0x01;
+    /// `moderator_removed`: a `ChannelRemoveModerator` demoted the address
+    /// (kills its older grants, protocol §3.9.1 rule 8).
+    pub const MODERATOR_REMOVED: u8 = 0x02;
+}
+
+/// Encode a `CHANNEL_MEMBERSHIP_INDEX` key: (channel_id_be8, address).
+pub fn encode_channel_membership_index_key(channel_id: u64, address: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(8 + address.len());
+    key.extend_from_slice(&channel_id.to_be_bytes());
+    key.extend_from_slice(address.as_bytes());
+    key
+}
+
+/// Encode a `CHANNEL_ROLE_WATERMARKS` key: (channel_id_be8, kind, address).
+pub fn encode_channel_role_watermark_key(channel_id: u64, kind: u8, address: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(8 + 1 + address.len());
+    key.extend_from_slice(&channel_id.to_be_bytes());
+    key.push(kind);
+    key.extend_from_slice(address.as_bytes());
+    key
+}
+
 /// Encode a channel invite key: (channel_id, address).
+///
+/// Only the key FORMAT of the retired `CHANNEL_INVITES` CF (l2-node
+/// 0.140.0 no longer writes it); still used by tests that assert no row is
+/// written.
+#[allow(dead_code)]
 pub fn encode_channel_invite_key(channel_id: u64, address: &str) -> Vec<u8> {
     let mut key = Vec::with_capacity(8 + address.len());
     key.extend_from_slice(&channel_id.to_be_bytes());

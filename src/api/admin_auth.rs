@@ -22,7 +22,6 @@ use tracing::{debug, warn};
 
 use crate::crypto;
 use crate::crypto::signing;
-use crate::trusted_proxies::TrustedProxies;
 
 /// Nonce TTL (5 minutes).
 const NONCE_TTL: Duration = Duration::from_secs(300);
@@ -61,13 +60,9 @@ pub struct AdminAuthState {
     session_ttl_hours: u64,
     /// Node ID (included in challenge message).
     node_id: String,
-    /// Trusted reverse-proxy peer set. A request whose TCP peer IP is
-    /// loopback OR is in this set is allowed to relay client identity
-    /// via `X-Forwarded-For`. Without this the Docker bridge gateway
-    /// (e.g. 172.17.0.1) would fail the loopback check, breaking
-    /// localhost-bypass for operators reverse-proxying through Docker
-    /// even when Apache/nginx is on the host.
-    trusted_proxies: Arc<TrustedProxies>,
+    /// `[api.admin] localhost_bypass`: whether a direct local request
+    /// (`trusted_proxies::direct_loopback_request`) skips authentication.
+    localhost_bypass: bool,
 }
 
 impl AdminAuthState {
@@ -76,7 +71,7 @@ impl AdminAuthState {
         admin_wallets: Vec<String>,
         session_ttl_hours: u64,
         node_id: String,
-        trusted_proxies: Arc<TrustedProxies>,
+        localhost_bypass: bool,
     ) -> Self {
         let mut hmac_secret = [0u8; 32];
         use rand::RngCore;
@@ -88,7 +83,7 @@ impl AdminAuthState {
             admin_wallets,
             session_ttl_hours,
             node_id,
-            trusted_proxies,
+            localhost_bypass,
         }
     }
 
@@ -359,53 +354,72 @@ pub async fn auth_logout() -> impl IntoResponse {
 /// Middleware that allows access from localhost (no auth) or with a valid
 /// session token (for remote access via admin_wallets).
 ///
-/// Supports `Forwarded` / `X-Forwarded-For` headers for reverse proxy
-/// deployments (Apache, nginx). The real client IP is resolved via
-/// `trusted_proxies::resolve_client_ip`, which only consults the headers
-/// when the TCP peer is loopback OR in `[api] trusted_proxies` CIDRs, and
-/// then walks the forwarding chain RIGHT-to-LEFT, skipping trusted hops.
-/// This defeats leftmost-XFF spoofing — an attacker cannot forge a
-/// `127.0.0.1` first entry to bypass auth, because the resolver returns the
-/// first *untrusted* hop, not the spoofed leading value.
+/// **Localhost bypass (spec 10-dashboard.md §5.6) — l2-node 0.140.0:**
+/// granted ONLY to a request whose TCP peer is loopback AND that carries no
+/// proxy header at all (`trusted_proxies::direct_loopback_request`) — a
+/// process on this machine talking to the node's port directly. Every
+/// request that arrived through a reverse proxy (Apache, nginx, Docker
+/// port-forward with a host proxy) must authenticate with a session token,
+/// even when it originates on the same host.
 ///
-/// The trusted_proxies branch matters for Docker deployments: a host-side
-/// Apache/nginx connects to `127.0.0.1:41721` (the Docker port forward),
-/// which inside the container arrives from the Docker bridge gateway
-/// (typically `172.17.0.1`) — NOT loopback. Adding the bridge to
-/// `[api] trusted_proxies = ["172.17.0.0/16"]` re-enables the
-/// localhost-bypass for this topology.
+/// Before 0.140.0 the bypass tested the forwarded-header-RESOLVED client
+/// IP. Behind a loopback reverse proxy that was exploitable: the header
+/// parser kept the FIRST 32 `X-Forwarded-For`/`Forwarded` entries, so a
+/// client that padded the header with more than 32 loopback entries
+/// pushed the proxy-appended real address out of the parsed window, the
+/// right-to-left walk then found only trusted (loopback) hops, fell back
+/// to the loopback peer, and the request was treated as local. The parser
+/// now keeps the tail, AND the bypass no longer depends on header
+/// resolution at all (a proxy that adds its own header line, or a header
+/// made unparseable, would otherwise reach the same fallback).
+///
+/// **Browser-origin checks (l2-node 0.140.0):** a loopback TCP peer is
+/// also what a web page the operator opens in a browser on the node host
+/// produces when it calls `http://127.0.0.1:<port>/admin/...`. The bypass
+/// therefore additionally requires a loopback/`localhost` `Host` (defeats
+/// DNS rebinding) and an absent or same-origin `Origin`; see
+/// `direct_loopback_request` for the exact rules. These apply to every
+/// route behind this middleware, including the `/admin/dashboard/ws`
+/// upgrade. Independently, EVERY request here (bypass or session token)
+/// is refused when the browser reports `Sec-Fetch-Site: same-site` or
+/// `cross-site` (`sec_fetch_site_allows_admin`).
+///
+/// `[api.admin] localhost_bypass = false` disables the bypass entirely:
+/// every request must then present an `admin_wallets` session.
 pub async fn admin_auth_middleware(
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Extension(auth_state): Extension<Arc<AdminAuthState>>,
     req: Request,
     next: Next,
 ) -> Response {
-    // Determine the real client IP. `resolve_client_ip` walks the
-    // forwarding chain RIGHT-to-LEFT, skipping trusted hops, and only
-    // consults the headers when the TCP peer is itself loopback or a
-    // configured trusted proxy. This defeats the leftmost-XFF spoof
-    // (e.g. attacker sends `X-Forwarded-For: 127.0.0.1` and an
-    // appending proxy yields `127.0.0.1, <attacker>`): the right-to-left
-    // walk returns the attacker IP, not the spoofed loopback entry.
-    let forwarded = req.headers().get("forwarded").and_then(|v| v.to_str().ok());
-    let xff = req.headers().get("x-forwarded-for").and_then(|v| v.to_str().ok());
-    let client_ip = crate::trusted_proxies::resolve_client_ip(
-        addr,
-        forwarded,
-        xff,
-        &auth_state.trusted_proxies,
-    );
+    // A browser-initiated request from another origin/site never reaches an
+    // admin handler, whichever way it would authenticate.
+    if !crate::trusted_proxies::sec_fetch_site_allows_admin(req.headers()) {
+        return (StatusCode::FORBIDDEN, "cross-origin admin request refused").into_response();
+    }
 
-    // Localhost always passes (spec 10-dashboard.md §5.6). Tested on the
-    // *resolved* client IP, never on a spoofable header value.
+    // Local bypass — tested on the TCP peer, the ABSENCE of any proxy
+    // header, a loopback `Host` and a same-origin (or absent) `Origin`,
+    // never on a (spoofable or fallback-derived) forwarded-header value.
     // `is_loopback_canonical` also treats `::ffff:127.0.0.1` as loopback.
-    if crate::trusted_proxies::is_loopback_canonical(client_ip) {
+    if auth_state.localhost_bypass
+        && crate::trusted_proxies::direct_loopback_request(
+            addr,
+            req.headers(),
+            req.uri().authority().map(|a| a.as_str()),
+        )
+    {
         return next.run(req).await;
     }
 
     // If no admin_wallets configured, reject remote access
     if !auth_state.remote_auth_enabled() {
-        return (StatusCode::FORBIDDEN, "admin endpoints are localhost-only").into_response();
+        let msg = if auth_state.localhost_bypass {
+            "admin endpoints are localhost-only"
+        } else {
+            "admin endpoints require an admin_wallets session (localhost_bypass is disabled)"
+        };
+        return (StatusCode::FORBIDDEN, msg).into_response();
     }
 
     // Check for session token in cookie or Authorization header

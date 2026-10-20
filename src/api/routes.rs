@@ -1978,17 +1978,35 @@ pub async fn list_channels(
 /// deletes, DMs never reached other nodes). A typed struct that names only the
 /// routing key deserializes the map and ignores every other field, bins
 /// included.
-#[derive(serde::Deserialize)]
-struct ChannelIdExtract {
-    #[serde(default)]
-    channel_id: Option<u64>,
-}
-
-/// Minimal extractor to route a `ChannelInvite` (0x1B) to the INVITEE's
-/// dm_topic rather than the channel topic — see that gossip arm's comment.
-#[derive(serde::Deserialize)]
-struct ChannelInviteTargetExtract {
-    target_user: String,
+///
+/// For channel-scoped and invite payloads the routing key is read through
+/// `deserialize_payload` (the real, complete structs) instead of a narrower
+/// probe struct (security audit W7, recurring bug shape #20): a narrower
+/// struct fails with `LengthMismatch` on the positional-array wire form —
+/// e.g. a 2-element `[channel_id, invite]` `ChannelJoin` or a 5-element
+/// `ChannelInvite` — and the message would silently never gossip.
+fn gossip_channel_id(envelope: &crate::messages::envelope::Envelope) -> Option<u64> {
+    use crate::messages::types::{deserialize_payload, DeserializedPayload as D};
+    match deserialize_payload(envelope.msg_type, &envelope.payload).ok()? {
+        D::ChatMessage(p) => Some(p.channel_id),
+        D::Edit(p) => p.channel_id,
+        D::Delete(p) => p.channel_id,
+        D::Reaction(p) => p.channel_id,
+        D::ChannelPinMessage(p) => Some(p.channel_id),
+        D::ChannelUnpinMessage(p) => Some(p.channel_id),
+        D::ChannelJoin(p) => Some(p.channel_id),
+        D::ChannelLeave(p) => Some(p.channel_id),
+        D::ChannelKick(p) => Some(p.channel_id),
+        D::ChannelBan(p) => Some(p.channel_id),
+        D::ChannelAddModerator(p) => Some(p.channel_id),
+        D::ChannelRemoveModerator(p) => Some(p.channel_id),
+        D::ChannelUnban(p) => Some(p.channel_id),
+        D::ChannelMute(p) => Some(p.channel_id),
+        D::ChannelUnmute(p) => Some(p.channel_id),
+        D::ChannelDelete(p) => Some(p.channel_id),
+        D::ChannelUpdate(p) => Some(p.channel_id),
+        _ => None,
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -2071,12 +2089,10 @@ pub(crate) fn gossip_topic_for_envelope(
         // update can't be forged. The creator is known on every node (set by
         // the chain scanner).
         | MessageType::ChannelUpdate => {
-            // Extract channel_id with a minimal typed struct (NOT
-            // serde_json::Value — it can't decode the bin fields these payloads
-            // carry, which previously dropped replies/reactions/edits/deletes
-            // from gossip entirely).
-            let p: ChannelIdExtract = rmp_serde::from_slice(&envelope.payload).ok()?;
-            Some(gossip::channel_topic(network_id, p.channel_id?))
+            // Typed decode (NOT serde_json::Value — it can't decode the bin
+            // fields these payloads carry), through the complete structs so
+            // both wire forms route (see `gossip_channel_id`).
+            Some(gossip::channel_topic(network_id, gossip_channel_id(envelope)?))
         }
         MessageType::NewsPost => {
             Some(gossip::topic_news_global(network_id))
@@ -2142,8 +2158,12 @@ pub(crate) fn gossip_topic_for_envelope(
         // channel is unknown locally, mirroring `ChannelDelete`'s
         // `channel_creator_check` precedent — see that arm's comment.
         MessageType::ChannelInvite => {
-            let p: ChannelInviteTargetExtract = rmp_serde::from_slice(&envelope.payload).ok()?;
-            Some(gossip::dm_topic(network_id, &p.target_user))
+            match crate::messages::types::deserialize_payload(envelope.msg_type, &envelope.payload) {
+                Ok(crate::messages::types::DeserializedPayload::ChannelInvite(p)) => {
+                    Some(gossip::dm_topic(network_id, &p.target_user))
+                }
+                _ => None,
+            }
         }
         MessageType::DirectMessageEdit | MessageType::DirectMessageDelete
         | MessageType::DirectMessageReaction => {
@@ -3627,7 +3647,7 @@ pub async fn post_message(
         RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
             state.counters.inc_failed_validations();
             state.counters.record_rejection(&reason, &_auth_user.address);
-            (StatusCode::BAD_REQUEST, reason).into_response()
+            rejection_response(reason)
         }
     }
 }
@@ -3678,7 +3698,7 @@ pub async fn create_channel(
         }
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
         RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
-            (StatusCode::BAD_REQUEST, reason).into_response()
+            rejection_response(reason)
         }
     }
 }
@@ -3811,7 +3831,7 @@ pub async fn update_profile(
         }
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
         RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
-            (StatusCode::BAD_REQUEST, reason).into_response()
+            rejection_response(reason)
         }
     }
 }
@@ -3820,18 +3840,13 @@ pub async fn update_profile(
 pub struct FederateRequest {
     /// The host node URL the private channel lives on (from the invite link).
     pub host_url: String,
+    /// Private-channel join gate (l2-node 0.140.0): standard base64 of the
+    /// caller's raw signed `ChannelInvite` envelope — the same bytes its
+    /// `ChannelJoin` carries. Omitted when the caller is already a member.
+    #[serde(default)]
+    pub invite: Option<String>,
 }
 
-/// POST /api/v1/channels/:channel_id/federate — federate a PRIVATE channel hosted
-/// on another node to THIS (the caller's home) node (F1 federation).
-///
-/// Private channels are host-node-scoped; rather than make the member switch their
-/// whole app to the host node, the member's home node fetches the channel record
-/// from the host, records local membership, and subscribes to the channel's gossip
-/// topic — so the channel's encrypted messages + key envelopes flow here live (they
-/// already gossip to `channel_topic(channel_id)`) and the member never leaves their
-/// node. The node learns only ciphertext + membership/timing, never content.
-/// Idempotent.
 /// Confusion/replay guard for `federate_channel`'s bootstrap envelope:
 /// true iff `raw` decodes to a `ChannelCreate` whose payload claims
 /// `expected_channel_id` AND `channel_type == Private`. Same class of
@@ -3988,138 +4003,520 @@ mod federate_channel_envelope_guard_tests {
     }
 }
 
-pub async fn federate_channel(
-    Extension(state): Extension<Arc<AppState>>,
-    Extension(auth_user): Extension<AuthUser>,
-    Path(channel_id): Path<u64>,
-    headers: axum::http::HeaderMap,
-    Json(req): Json<FederateRequest>,
-) -> impl IntoResponse {
+/// Client response for a router rejection (round-3 audit N5, round 4). A
+/// rejection caused by a local infrastructure failure carries exactly
+/// `router::INTERNAL_ERROR_REASON` (the router logs the detail and never
+/// puts RocksDB/anyhow text in a reason): answer a generic 500. Matched
+/// EXACTLY — a substring match let any policy reason that merely mentioned
+/// the phrase become a 500. Every other reason is a policy/validation
+/// verdict and is returned as-is with 400 (clients match on some of these,
+/// e.g. the private-join reason).
+fn rejection_response(reason: String) -> axum::response::Response {
+    if reason == crate::messages::router::INTERNAL_ERROR_REASON {
+        tracing::error!("router rejected a message on an internal error (detail logged by the router)");
+        return (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response();
+    }
+    (StatusCode::BAD_REQUEST, reason).into_response()
+}
+
+/// Current unix time in ms (0 if the clock is before the epoch).
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Per-wallet outbound federation fetches allowed per `FED_WALLET_WINDOW`
+/// (round-2 audit B-1: counted only on the real outbound-fetch path).
+const FED_WALLET_MAX_ATTEMPTS: u32 = 30;
+const FED_WALLET_WINDOW: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+/// Max wallets tracked by the per-wallet limiter, keeping memory bounded.
+/// When full, expired windows are pruned and, if still full, the OLDEST
+/// entry is evicted (round-3 audit W-2) — new wallets are never refused.
+const FED_MAX_TRACKED_WALLETS: usize = 10_000;
+/// Max concurrent outbound federation fetches (DNS + HTTP) node-wide.
+/// Worst case one permit is held ≈ 15 s (5 s DNS + 10 s request/body).
+const FED_MAX_CONCURRENT_FETCHES: usize = 8;
+/// Max of those permits one client IP (trusted-proxy resolved) may hold
+/// at once (round-3 audit R3-2), so a single IP cannot occupy all 8.
+const FED_MAX_CONCURRENT_FETCHES_PER_IP: usize = 2;
+
+/// Per-client-IP count of held federation fetch permits.
+#[derive(Default)]
+struct IpFetchSlots {
+    held: std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>,
+}
+
+/// RAII: releases one per-IP slot on drop.
+struct IpFetchSlot {
+    slots: &'static IpFetchSlots,
+    ip: std::net::IpAddr,
+}
+
+impl Drop for IpFetchSlot {
+    fn drop(&mut self) {
+        let mut held = self.slots.held.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(n) = held.get_mut(&self.ip) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                held.remove(&self.ip);
+            }
+        }
+    }
+}
+
+impl IpFetchSlots {
+    /// Take one slot for `ip`, or `None` if it already holds the maximum.
+    /// The map only ever contains IPs currently holding a permit, so it is
+    /// bounded by `FED_MAX_CONCURRENT_FETCHES`.
+    fn try_take(&'static self, ip: std::net::IpAddr) -> Option<IpFetchSlot> {
+        let mut held = self.held.lock().unwrap_or_else(|p| p.into_inner());
+        let n = held.entry(ip).or_insert(0);
+        if *n >= FED_MAX_CONCURRENT_FETCHES_PER_IP {
+            return None;
+        }
+        *n += 1;
+        Some(IpFetchSlot { slots: self, ip })
+    }
+}
+
+fn federate_ip_slots() -> &'static IpFetchSlots {
+    static SLOTS: std::sync::OnceLock<IpFetchSlots> = std::sync::OnceLock::new();
+    SLOTS.get_or_init(Default::default)
+}
+
+/// Everything held for one outbound federation fetch; dropping it
+/// releases the node-wide permit and the per-IP slot.
+struct OutboundFetchAdmission {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    _ip_slot: IpFetchSlot,
+}
+/// Bound on the host DNS lookup (a slow attacker resolver must not pin a
+/// fetch permit).
+const FED_DNS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Bound on the whole outbound request + body read.
+const FED_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Run `fut` for at most `dur`; `None` on timeout. The future (and anything
+/// it owns) is dropped on timeout, so no permit or socket outlives it.
+async fn timed<F: std::future::Future>(dur: std::time::Duration, fut: F) -> Option<F::Output> {
+    tokio::time::timeout(dur, fut).await.ok()
+}
+
+/// Per-wallet fixed-window limiter for `federate_channel`'s OUTBOUND fetch
+/// (security audit W1, round-2 B-1). Monotonic (`Instant`) windows; only
+/// calls that actually reach the outbound fetch are counted — local
+/// refreshes, hosted-here calls, rejected-early calls and 503s are free.
+/// No global bucket (it let many wallets starve everyone). In-memory,
+/// node-local (a restart resets it). Requires no registered identity;
+/// IP-level flooding is additionally bounded by the API's per-IP governor.
+#[derive(Default)]
+struct FederateLimiter {
+    per_wallet: std::collections::HashMap<String, (std::time::Instant, u32)>,
+}
+
+impl FederateLimiter {
+    /// Count one outbound fetch by `wallet` at `now`; `false` = over the
+    /// limit (a refused call is not counted). When the map is full, expired
+    /// windows are pruned and, if still full, the OLDEST entry is evicted
+    /// (round-3 audit W-2) — refusing every new wallet instead let a Sybil
+    /// set renew a node-wide 429 indefinitely. Eviction can at worst give
+    /// the evicted (oldest) wallet a fresh window; the per-IP governor and
+    /// the fetch permits still bound total outbound work.
+    fn check(&mut self, wallet: &str, now: std::time::Instant) -> bool {
+        if !self.per_wallet.contains_key(wallet) && self.per_wallet.len() >= FED_MAX_TRACKED_WALLETS {
+            self.per_wallet
+                .retain(|_, (start, _)| now.saturating_duration_since(*start) < FED_WALLET_WINDOW);
+            if self.per_wallet.len() >= FED_MAX_TRACKED_WALLETS {
+                if let Some(oldest) = self
+                    .per_wallet
+                    .iter()
+                    .min_by_key(|(_, (start, _))| *start)
+                    .map(|(k, _)| k.clone())
+                {
+                    self.per_wallet.remove(&oldest);
+                }
+            }
+        }
+        let entry = self.per_wallet.entry(wallet.to_string()).or_insert((now, 0));
+        if now.saturating_duration_since(entry.0) >= FED_WALLET_WINDOW {
+            *entry = (now, 0);
+        }
+        if entry.1 >= FED_WALLET_MAX_ATTEMPTS {
+            return false;
+        }
+        entry.1 += 1;
+        true
+    }
+}
+
+fn federate_limiter() -> &'static std::sync::Mutex<FederateLimiter> {
+    static LIMITER: std::sync::OnceLock<std::sync::Mutex<FederateLimiter>> =
+        std::sync::OnceLock::new();
+    LIMITER.get_or_init(Default::default)
+}
+
+/// Why an outbound federation fetch was not admitted.
+#[derive(Debug, PartialEq, Eq)]
+enum FetchAdmission {
+    /// No fetch permit free (503). Consumes NO limiter budget.
+    Busy,
+    /// The wallet's window is spent (429).
+    RateLimited,
+}
+
+/// Admission for a REAL outbound federation fetch: take a permit first
+/// (so a 503 never costs the caller budget), then count the attempt
+/// against the wallet's window. The permit is held by the caller until
+/// the host response has been read (or the bounded fetch timed out).
+fn admit_outbound_fetch(
+    permits: &Arc<tokio::sync::Semaphore>,
+    ip_slots: &'static IpFetchSlots,
+    limiter: &std::sync::Mutex<FederateLimiter>,
+    client_ip: std::net::IpAddr,
+    wallet: &str,
+    now: std::time::Instant,
+) -> Result<OutboundFetchAdmission, FetchAdmission> {
+    let permit = permits.clone().try_acquire_owned().map_err(|_| FetchAdmission::Busy)?;
+    let ip_slot = ip_slots.try_take(client_ip).ok_or(FetchAdmission::Busy)?;
+    if !limiter.lock().unwrap_or_else(|p| p.into_inner()).check(wallet, now) {
+        return Err(FetchAdmission::RateLimited);
+    }
+    Ok(OutboundFetchAdmission { _permit: permit, _ip_slot: ip_slot })
+}
+
+/// `federate_channel`'s local routing decision, made before ANY outbound
+/// work (no DNS, no permit, no limiter budget for the non-`Fetch` cases).
+#[derive(Debug, PartialEq, Eq)]
+enum FederateFetch {
+    /// Known locally and NOT private — or unknown with an id at or below
+    /// `PRIVATE_CHANNEL_ID_FLOOR`, which can never be a (validly created)
+    /// private channel (round-4 audit 9c: refused locally instead of after
+    /// an outbound host fetch): 400 "only private channels need
+    /// federation".
+    KnownPublic,
+    /// Known locally and private (hosted here OR federated earlier): a
+    /// purely LOCAL join/refresh — no outbound fetch, no `federated_from`
+    /// rewrite, no host-chosen `ChannelUpdate` replay, no creator re-add
+    /// (round-3 audit R3-2 (2)). The pre-fetch gate already ran the full
+    /// rules 4-8 for a non-member; the membership gate + in-lock insert
+    /// below decide the rest. Metadata reaches this node via channel-topic
+    /// gossip and private-channel-sync backfill.
+    KnownLocal,
+    /// Unknown here: outbound bootstrap fetch (verify-then-apply).
+    Fetch,
+}
+
+fn federate_fetch_decision(channel_id: u64, local_row: Option<&serde_json::Value>) -> FederateFetch {
+    match local_row {
+        // `validate_channel_create` only admits Private ids ABOVE the floor,
+        // and the bootstrap path re-validates the host's `ChannelCreate`, so
+        // fetching an unknown id at/below it could only ever end in a 400 —
+        // after spending the caller's limiter budget, a fetch permit and a
+        // DNS lookup. (A legacy pre-floor private row is only federatable
+        // where it is already known locally.)
+        None if channel_id <= crate::messages::types::PRIVATE_CHANNEL_ID_FLOOR => {
+            FederateFetch::KnownPublic
+        }
+        None => FederateFetch::Fetch,
+        Some(row) if row.get("channel_type").and_then(|v| v.as_u64()) == Some(2) => {
+            FederateFetch::KnownLocal
+        }
+        Some(_) => FederateFetch::KnownPublic,
+    }
+}
+
+fn federate_fetch_permits() -> Arc<tokio::sync::Semaphore> {
+    static PERMITS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    PERMITS
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(FED_MAX_CONCURRENT_FETCHES)))
+        .clone()
+}
+
+/// The single response for every host-side federation failure (security
+/// audit W1: distinct texts were a host-liveness / internal-DNS oracle).
+fn federate_host_error() -> axum::response::Response {
+    (StatusCode::BAD_GATEWAY, "could not federate channel from host").into_response()
+}
+
+/// Map a join-gate rejection reason to a FIXED client-facing response
+/// (security audit N1): never echo internal/storage text. Storage errors
+/// become a generic 500.
+fn federate_denial_response(reason: &str) -> axum::response::Response {
+    const PROOF: &str = "private channel: invite proof required";
+    const INVITER: &str = "private channel: inviter is not creator or moderator";
+    let msg = if reason == crate::messages::router::INTERNAL_ERROR_REASON {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response();
+    } else if reason == PROOF {
+        PROOF
+    } else if reason == INVITER {
+        INVITER
+    } else if reason.contains("is banned from channel") {
+        "banned"
+    } else if reason.contains("predates the joiner's removal") {
+        "removed from channel"
+    } else {
+        "private channel: invite rejected"
+    };
+    (StatusCode::FORBIDDEN, msg).into_response()
+}
+
+/// `federate_channel`'s local preflight, in its fixed order (round-3 audit
+/// N-4): (1) invite base64/size → 400; (2) pre-fetch invite gate → 403 /
+/// 500; (3) per-wallet federation-slot cap → 429; (4) local channel row →
+/// decision, a known NON-private channel → 400. None of these does any
+/// outbound work or touches the fetch permits/limiter. Returns the decoded
+/// invite and whether an outbound bootstrap fetch is needed.
+// The error side is the client response itself (an axum `Response`), the
+// same type every handler returns — boxing it would buy nothing.
+#[allow(clippy::result_large_err)]
+fn federate_preflight(
+    router: &crate::messages::router::MessageRouter,
+    storage: &crate::storage::rocks::Storage,
+    channel_id: u64,
+    caller: &str,
+    invite_b64: Option<&str>,
+    now_ms: u64,
+) -> Result<(Option<Vec<u8>>, bool), axum::response::Response> {
     use crate::storage::schema as sch;
     /// Cap on how many channels ONE wallet may federate to this node — bounds the
     /// gossip-topic subscriptions a single user can drive (DoS guard).
     const MAX_FEDERATED_PER_WALLET: usize = 256;
-    let caller = auth_user.address;
-
-    // --- SSRF-safe host validation ---
-    // `classify_api_endpoint` rejects bad schemes / onion / IP-LITERAL non-routable
-    // ranges. Then resolve the host and verify EVERY resolved IP is publicly
-    // routable (defeats DNS→internal names + odd IP encodings the string check
-    // misses), and fetch with a NO-REDIRECT client (a public host can't 3xx us to
-    // an internal target). DNS-rebinding TOCTOU between this check and the fetch
-    // remains a documented residual (F3: connect-to-validated-IP).
-    let parsed = match crate::api::media_fallback::classify_api_endpoint(
-        req.host_url.trim_end_matches('/'),
-    ) {
-        Ok(u) => u,
-        Err(e) => return (StatusCode::BAD_REQUEST, format!("host_url rejected: {}", e)).into_response(),
-    };
-    if parsed.scheme() != "https" {
-        return (StatusCode::BAD_REQUEST, "host_url must be https").into_response();
-    }
-    let host_str = parsed.host_str().unwrap_or("").to_string();
-    let port = parsed.port_or_known_default().unwrap_or(443);
-    match tokio::net::lookup_host((host_str.as_str(), port)).await {
-        Ok(addrs) => {
-            let mut saw = false;
-            for a in addrs {
-                saw = true;
-                if !crate::api::media_fallback::ip_is_routable(a.ip()) {
-                    return (StatusCode::BAD_REQUEST, "host resolves to a non-routable address")
-                        .into_response();
-                }
+    // --- Private-channel join gate, pre-fetch (l2-node 0.140.0) ---
+    // Cheap decision BEFORE any outbound DNS/HTTP work — see
+    // `MessageRouter::federate_prefetch_gate` for exactly what it can and
+    // cannot establish (full rules 4-8 for a KNOWN channel; for an UNKNOWN
+    // one only rules 4-7, so a self-signed invite passes it there). No
+    // activation-timestamp exemption: federation is always a live action.
+    let invite_bytes: Option<Vec<u8>> = match invite_b64 {
+        None => None,
+        Some(b64s) => {
+            use base64::Engine as _;
+            // Bound the encoded input before decoding (4/3 expansion + slack).
+            if b64s.len() > crate::messages::validation::MAX_JOIN_INVITE_BYTES * 4 / 3 + 8 {
+                return Err((StatusCode::BAD_REQUEST, "invite too large").into_response());
             }
-            if !saw {
-                return (StatusCode::BAD_GATEWAY, "host did not resolve").into_response();
+            match base64::engine::general_purpose::STANDARD.decode(b64s) {
+                Ok(b)
+                    if !b.is_empty()
+                        && b.len() <= crate::messages::validation::MAX_JOIN_INVITE_BYTES =>
+                {
+                    Some(b)
+                }
+                Ok(_) => return Err((StatusCode::BAD_REQUEST, "invite too large").into_response()),
+                Err(_) => return Err((StatusCode::BAD_REQUEST, "invite is not valid base64").into_response()),
             }
         }
-        Err(_) => return (StatusCode::BAD_GATEWAY, "host did not resolve").into_response(),
-    }
-    let base = match parsed.port() {
-        Some(p) => format!("https://{}:{}", host_str, p),
-        None => format!("https://{}", host_str),
     };
+    if let Err(reason) = router.federate_prefetch_gate(
+        channel_id,
+        caller,
+        now_ms,
+        invite_bytes.as_deref(),
+    ) {
+        tracing::debug!(channel_id, address = %caller, %reason, "federate: pre-fetch invite gate rejected");
+        return Err(federate_denial_response(&reason));
+    }
 
-    // --- Per-wallet federation cap ---
-    let already_fed = state
-        .storage
-        .get_cf(cf::LOCAL_CHANNEL_FED, &sch::encode_local_channel_fed_key(&caller, channel_id))
+    // --- Per-wallet federation-slot cap (cheap, local) ---
+    let already_fed = storage
+        .get_cf(cf::LOCAL_CHANNEL_FED, &sch::encode_local_channel_fed_key(caller, channel_id))
         .ok()
         .flatten()
         .is_some();
     if !already_fed {
-        let count = state
-            .storage
+        let count = storage
             .prefix_iter_cf(
                 cf::LOCAL_CHANNEL_FED,
-                &sch::encode_local_channel_fed_prefix(&caller),
+                &sch::encode_local_channel_fed_prefix(caller),
                 MAX_FEDERATED_PER_WALLET + 1,
             )
             .map(|e| e.len())
             .unwrap_or(0);
         if count >= MAX_FEDERATED_PER_WALLET {
-            return (StatusCode::TOO_MANY_REQUESTS, "federated-channel limit reached").into_response();
+            return Err((StatusCode::TOO_MANY_REQUESTS, "federated-channel limit reached").into_response());
         }
     }
 
-    // --- Fetch + store/REFRESH the channel record, unless this node HOSTS it ---
-    // Refresh (not just create-if-absent) so a federated channel picks up updated
-    // metadata (e.g. a logo set after the first federation). Never touch a channel
-    // this node hosts: a record WITHOUT `federated_from` is authoritative here.
-    let hosted_here = state
-        .storage
-        .get_cf(cf::CHANNELS, &channel_id.to_be_bytes())
-        .ok()
-        .flatten()
-        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-        .map(|v| v.get("federated_from").is_none())
-        .unwrap_or(false);
-    if !hosted_here {
+    // --- Local decision: no DNS, no limiter budget, no fetch permit ---
+    // (round-2 B-1, round-3 R3-2). A channel this node already KNOWS is
+    // never fetched from the host: a public one is answered with the
+    // specified 400; a private one is a purely local join/refresh (the
+    // pre-fetch gate above already ran the full invite rules for a
+    // non-member). Only an UNKNOWN channel is fetched (verify-then-apply).
+    let local_row: Option<serde_json::Value> =
+        match storage.get_cf(cf::CHANNELS, &channel_id.to_be_bytes()) {
+            Ok(None) => None,
+            Ok(Some(b)) => match serde_json::from_slice::<serde_json::Value>(&b) {
+                Ok(v) => Some(v),
+                Err(_) => {
+                    // A corrupt row must not be mistaken for "unknown"
+                    // (that would route a known channel through the
+                    // first-sight bootstrap path).
+                    tracing::error!(channel_id, "federate: unparseable channel row");
+                    return Err((StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response());
+                }
+            },
+            Err(e) => {
+                tracing::error!(channel_id, error = %e, "federate: storage error reading channel");
+                return Err((StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response());
+            }
+        };
+    let needs_fetch = match federate_fetch_decision(channel_id, local_row.as_ref()) {
+        FederateFetch::KnownPublic => {
+            return Err((StatusCode::BAD_REQUEST, "only private channels need federation").into_response());
+        }
+        FederateFetch::KnownLocal => false,
+        FederateFetch::Fetch => true,
+    };
+    Ok((invite_bytes, needs_fetch))
+}
+
+/// POST /api/v1/channels/:channel_id/federate — federate a PRIVATE channel hosted
+/// on another node to THIS (the caller's home) node (F1 federation).
+///
+/// Private channels are host-node-scoped; rather than make the member switch their
+/// whole app to the host node, the member's home node fetches the channel record
+/// from the host, records local membership, and subscribes to the channel's gossip
+/// topic — so the channel's encrypted messages + key envelopes flow here live (they
+/// already gossip to `channel_topic(channel_id)`) and the member never leaves their
+/// node. The node learns only ciphertext + membership/timing, never content.
+/// Idempotent for an existing member (refresh). Gated by the private-
+/// channel join gate (l2-node 0.140.0) — see the inline steps.
+pub async fn federate_channel(
+    Extension(state): Extension<Arc<AppState>>,
+    Extension(auth_user): Extension<AuthUser>,
+    axum::extract::ConnectInfo(peer_addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    Path(channel_id): Path<u64>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<FederateRequest>,
+) -> impl IntoResponse {
+    use crate::storage::schema as sch;
+    let caller = auth_user.address;
+
+    let (invite_bytes, needs_fetch) = match federate_preflight(
+        &state.router,
+        &state.storage,
+        channel_id,
+        &caller,
+        req.invite.as_deref(),
+        now_unix_ms(),
+    ) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+
+
+    // --- Fetch + verify-then-store the channel record from the host ---
+    if needs_fetch {
+        // SSRF-safe host validation. `classify_api_endpoint` rejects bad
+        // schemes / onion / IP-LITERAL non-routable ranges. Then resolve the
+        // host and verify EVERY resolved IP is publicly routable (defeats
+        // DNS→internal names + odd IP encodings the string check misses),
+        // and fetch with a NO-REDIRECT client PINNED to the validated
+        // addresses (`resolve_to_addrs`, closes the DNS-rebinding TOCTOU).
+        // Every host-side failure answers with ONE generic message (W1:
+        // distinct texts were a host-liveness / internal-DNS oracle).
+        let parsed = match crate::api::media_fallback::classify_api_endpoint(
+            req.host_url.trim_end_matches('/'),
+        ) {
+            Ok(u) => u,
+            Err(_) => return (StatusCode::BAD_REQUEST, "host_url rejected").into_response(),
+        };
+        if parsed.scheme() != "https" {
+            return (StatusCode::BAD_REQUEST, "host_url must be https").into_response();
+        }
+        let host_str = parsed.host_str().unwrap_or("").to_string();
+        let port = parsed.port_or_known_default().unwrap_or(443);
+        // Bound concurrent outbound federation work node-wide. Taken
+        // BEFORE the limiter so a 503 never consumes a wallet's budget;
+        // held until the host response has been fully read.
+        // Per-wallet attempt limit — counted ONLY here, on the real
+        // outbound-fetch path (B-1), and only once a permit was obtained.
+        let client_ip = resolve_client_ip(peer_addr, &headers, &state.trusted_proxies);
+        let _fetch_permit = match admit_outbound_fetch(
+            &federate_fetch_permits(),
+            federate_ip_slots(),
+            federate_limiter(),
+            client_ip,
+            &caller,
+            std::time::Instant::now(),
+        ) {
+            Ok(p) => p,
+            Err(FetchAdmission::Busy) => {
+                return (StatusCode::SERVICE_UNAVAILABLE, "federation busy, retry later").into_response();
+            }
+            Err(FetchAdmission::RateLimited) => {
+                return (StatusCode::TOO_MANY_REQUESTS, "too many federation attempts").into_response();
+            }
+        };
+        // Slow attacker DNS must not pin a permit: bounded lookup.
+        let validated_addrs: Vec<std::net::SocketAddr> = match timed(
+            FED_DNS_TIMEOUT,
+            tokio::net::lookup_host((host_str.as_str(), port)),
+        )
+        .await
+        {
+            Some(Ok(addrs)) => addrs.collect(),
+            _ => return federate_host_error(),
+        };
+        if validated_addrs.is_empty()
+            || validated_addrs
+                .iter()
+                .any(|a| !crate::api::media_fallback::ip_is_routable(a.ip()))
+        {
+            return federate_host_error();
+        }
+        let base = match parsed.port() {
+            Some(p) => format!("https://{}:{}", host_str, p),
+            None => format!("https://{}", host_str),
+        };
         let http = match reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
+            .timeout(FED_FETCH_TIMEOUT)
             .redirect(reqwest::redirect::Policy::none())
+            .resolve_to_addrs(&host_str, &validated_addrs)
             .build()
         {
             Ok(c) => c,
-            Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "http client init").into_response(),
+            Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response(),
         };
         let url = format!("{}/api/v1/channels/{}", base, channel_id);
-        let resp = match http.get(&url).send().await {
-            Ok(r) if r.status().is_success() => r,
-            _ => return (StatusCode::BAD_GATEWAY, "could not reach host channel").into_response(),
-        };
         // Security-audit finding (2026-10-05): no body-size cap let any
         // authenticated caller point `host_url` at a server streaming an
         // unbounded response, buffered in full by `resp.json()` — a memory
-        // DoS. A channel-detail response (even with the new envelope
-        // fields, up to `BOOTSTRAP_UPDATE_CAP` ChannelUpdates) needs at
-        // most a few hundred KB; cap generously at 4 MiB and abort the
-        // read the moment it's exceeded, rather than buffering first and
-        // checking after (a `Content-Length` header can be absent or
-        // lied about, so this must bound the READ itself, not just the
-        // final size).
+        // DoS. A channel-detail response needs at most a few hundred KB;
+        // cap generously at 4 MiB and abort the read the moment it's
+        // exceeded (a `Content-Length` header can be absent or lied about,
+        // so this bounds the READ itself). The whole request + body read is
+        // also bounded in TIME (round-2 audit B-1), so a slow host cannot
+        // hold one of the few fetch permits.
         const MAX_FEDERATE_HOST_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
-        if resp.content_length().is_some_and(|len| len > MAX_FEDERATE_HOST_RESPONSE_BYTES as u64) {
-            return (StatusCode::BAD_GATEWAY, "host response too large").into_response();
-        }
-        let mut body = Vec::new();
-        {
+        let fetch = async {
+            let resp = match http.get(&url).send().await {
+                Ok(r) if r.status().is_success() => r,
+                _ => return None,
+            };
+            if resp.content_length().is_some_and(|len| len > MAX_FEDERATE_HOST_RESPONSE_BYTES as u64) {
+                return None;
+            }
+            let mut body = Vec::new();
             use futures::StreamExt;
             let mut stream = resp.bytes_stream();
             while let Some(chunk) = stream.next().await {
-                let chunk = match chunk {
-                    Ok(c) => c,
-                    Err(_) => return (StatusCode::BAD_GATEWAY, "error reading host response").into_response(),
-                };
-                body.extend_from_slice(&chunk);
+                body.extend_from_slice(&chunk.ok()?);
                 if body.len() > MAX_FEDERATE_HOST_RESPONSE_BYTES {
-                    return (StatusCode::BAD_GATEWAY, "host response too large").into_response();
+                    return None;
                 }
             }
-        }
+            Some(body)
+        };
+        let Some(Some(body)) = timed(FED_FETCH_TIMEOUT, fetch).await else {
+            return federate_host_error();
+        };
         let detail: serde_json::Value = match serde_json::from_slice(&body) {
             Ok(v) => v,
-            Err(_) => return (StatusCode::BAD_GATEWAY, "invalid host channel response").into_response(),
+            Err(_) => return federate_host_error(),
         };
         let ch = detail.get("channel").cloned().unwrap_or(serde_json::Value::Null);
         let ctype = ch.get("channel_type").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -4152,29 +4549,53 @@ pub async fn federate_channel(
             .filter(|s| !s.is_empty())
             .and_then(|s| b64.decode(s).ok())
         else {
-            return (
-                StatusCode::BAD_GATEWAY,
-                "host did not provide a verifiable channel record",
-            )
-                .into_response();
+            return federate_host_error();
         };
         if !envelope_is_channel_create_for(&create_raw, channel_id) {
-            return (
-                StatusCode::BAD_GATEWAY,
-                "host's channel record envelope does not match the requested channel",
-            )
-                .into_response();
+            return federate_host_error();
+        }
+        // Verify-then-apply for a channel this node has never seen
+        // (l2-node 0.140.0): decide whether the caller may enter BEFORE
+        // anything is stored — caller is the verified, derivation-checked
+        // creator, or carries an invite passing rules 4-8 against that
+        // creator. A rejection here leaves no channel row, no creator
+        // member, no federation slot and no subscription (ordering, not
+        // rollback).
+        // Re-read (the pre-fetch read is a few awaits old); a storage error
+        // is a 500, never "known" (round-2 audit N-a).
+        let channel_known = match state.storage.exists_cf(cf::CHANNELS, &channel_id.to_be_bytes()) {
+            Ok(k) => k,
+            Err(e) => {
+                tracing::error!(channel_id, error = %e, "federate: storage error checking channel");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response();
+            }
+        };
+        if !channel_known {
+            let now = now_unix_ms();
+            match state.router.federate_bootstrap_gate(
+                &create_raw,
+                channel_id,
+                &caller,
+                now,
+                invite_bytes.as_deref(),
+            ) {
+                Ok(()) => {}
+                Err(crate::messages::router::BootstrapGateError::BadBootstrap(reason)) => {
+                    tracing::warn!(channel_id, %reason, "federate: host's ChannelCreate failed verification");
+                    return federate_host_error();
+                }
+                Err(crate::messages::router::BootstrapGateError::Denied(reason)) => {
+                    tracing::debug!(channel_id, address = %caller, %reason, "federate: bootstrap gate rejected");
+                    return federate_denial_response(&reason);
+                }
+            }
         }
         match state.router.process_synced_message(&create_raw) {
             crate::messages::router::RouteResult::Accepted { .. }
             | crate::messages::router::RouteResult::Duplicate => {}
             other => {
                 tracing::warn!(channel_id, ?other, "federate: host's ChannelCreate envelope was rejected");
-                return (
-                    StatusCode::BAD_GATEWAY,
-                    "host's channel record failed verification",
-                )
-                    .into_response();
+                return federate_host_error();
             }
         }
         // Best-effort, applied in order: ChannelUpdate is a PARTIAL PATCH
@@ -4261,11 +4682,7 @@ pub async fn federate_channel(
             creator
         });
         let Some(creator) = verified_creator else {
-            return (
-                StatusCode::BAD_GATEWAY,
-                "channel record did not persist after verification (deleted or corrupt)",
-            )
-                .into_response();
+            return federate_host_error();
         };
         // Defensive, idempotent re-add: the router's own `ChannelCreate`
         // handler already adds the creator as a member (role "creator")
@@ -4284,7 +4701,8 @@ pub async fn federate_channel(
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
         if let Err(e) = state.storage.add_channel_member(channel_id, &creator, bootstrap_now_ms, "creator") {
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("storage error: {}", e)).into_response();
+            tracing::error!(channel_id, error = %e, "federate: storage error adding creator member");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response();
         }
     }
 
@@ -4293,40 +4711,51 @@ pub async fn federate_channel(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    // Security-audit finding (2026-10-05): apply the SAME `invite_links_
-    // disabled` gate `ChannelJoin` ingest enforces (router.rs) — this
-    // endpoint used to grant membership completely unconditionally, never
-    // checking it at all. `invite_links_disabled` has no writer anywhere
-    // in this codebase today (so this gate is currently always open in
-    // practice, same as ChannelJoin's), but this endpoint shouldn't be
-    // the one path that silently stays permissive if that ever changes.
-    if let Ok(Some(data)) = state.storage.get_cf(cf::CHANNELS, &channel_id.to_be_bytes()) {
-        if let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&data) {
-            let links_disabled = meta
-                .get("invite_links_disabled")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            if links_disabled {
-                let has_invite = state
-                    .storage
-                    .exists_cf(cf::CHANNEL_INVITES, &sch::encode_channel_invite_key(channel_id, &caller))
-                    .unwrap_or(false);
-                if !has_invite {
-                    return (StatusCode::FORBIDDEN, "private channel: invite required").into_response();
+    // Private-channel join gate, post-bootstrap (l2-node 0.140.0): now that
+    // the channel's creator is known from its verified ChannelCreate, run
+    // the active-ban check (B2 — federation used to ignore CHANNEL_BANS),
+    // the removal cutoff and the inviter-authority check, with live
+    // semantics (`now` stands in for join.ts). Replaces the former
+    // `invite_links_disabled` / `CHANNEL_INVITES` gate, which was always
+    // open (the flag had no writer). Residual W3 (a late-federating node
+    // fails open on removals it has not received yet) is documented on
+    // `MessageRouter::federate_membership_gate`.
+    let verified = match state.router.federate_membership_gate(
+        channel_id,
+        &caller,
+        now_ms,
+        invite_bytes.as_deref(),
+    ) {
+        Ok(v) => v,
+        Err(reason) => {
+            tracing::debug!(channel_id, address = %caller, %reason, "federate: membership gate rejected");
+            return federate_denial_response(&reason);
+        }
+    };
+    // Same lock-protected insert as a ChannelJoin apply, with the gate's
+    // cheap re-check run INSIDE the lock (security audit W2), so a kick/
+    // ban/demotion landing between the gate and the insert is honored.
+    match state.router.federate_add_member(channel_id, &caller, now_ms, &verified) {
+        Ok(true) => {}
+        Ok(false) => {
+            // Not added (W6): success only if the caller already IS a
+            // member (an idempotent re-federate refresh); otherwise the
+            // in-lock re-check or the removal cutoff refused, and nothing
+            // further (federation slot, subscription, backfill) happens.
+            match state.router.is_member(channel_id, &caller) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return (StatusCode::FORBIDDEN, "removed from channel").into_response();
+                }
+                Err(_) => {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response();
                 }
             }
         }
-    }
-    // Security-audit finding (2026-10-05): this used to be a raw, unlocked
-    // `put_cf` — no `channel_membership_lock`, no `member_count`
-    // increment, no channel-existence requirement. `add_channel_member`
-    // (`storage::rocks`) is the hardened, lock-protected equivalent
-    // already used by every other membership-granting path (`ChannelJoin`
-    // ingest, the creator-add below); it's a drop-in replacement — `Ok(false)`
-    // covers the same "already a member" idempotent no-op the old
-    // pre-check handled manually.
-    if let Err(e) = state.storage.add_channel_member(channel_id, &caller, now_ms, "member") {
-        return (StatusCode::INTERNAL_SERVER_ERROR, format!("storage error: {}", e)).into_response();
+        Err(e) => {
+            tracing::error!(channel_id, error = %e, "federate: storage error adding member");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response();
+        }
     }
     // NOTE: the creator no longer needs a separate add-as-member step
     // here. The bootstrap `ChannelCreate` envelope processed above (first
@@ -4342,7 +4771,8 @@ pub async fn federate_channel(
         &sch::encode_local_channel_fed_key(&caller, channel_id),
         &now_ms.to_be_bytes(),
     ) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, format!("storage error: {}", e)).into_response();
+        tracing::error!(channel_id, error = %e, "federate: storage error recording federation slot");
+        return (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response();
     }
 
     // Subscribe to the channel's gossip topic (reuses the chain-scanner subscribe
@@ -4444,7 +4874,7 @@ pub async fn send_dm(
         }
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
         RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
-            (StatusCode::BAD_REQUEST, reason).into_response()
+            rejection_response(reason)
         }
     }
 }
@@ -4866,7 +5296,7 @@ pub async fn follow_user(
         RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
         RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
-            (StatusCode::BAD_REQUEST, reason).into_response()
+            rejection_response(reason)
         }
     }
 }
@@ -4889,7 +5319,7 @@ pub async fn unfollow_user(
         RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
         RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
-            (StatusCode::BAD_REQUEST, reason).into_response()
+            rejection_response(reason)
         }
     }
 }
@@ -4965,7 +5395,7 @@ pub async fn react_to_news(
         RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
         RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
-            (StatusCode::BAD_REQUEST, reason).into_response()
+            rejection_response(reason)
         }
     }
 }
@@ -4998,7 +5428,7 @@ pub async fn repost_news(
         }
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
         RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
-            (StatusCode::BAD_REQUEST, reason).into_response()
+            rejection_response(reason)
         }
     }
 }
@@ -5555,9 +5985,84 @@ pub async fn add_moderator(
         RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
         RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
-            (StatusCode::BAD_REQUEST, reason).into_response()
+            rejection_response(reason)
         }
     }
+}
+
+/// Raw stored grant envelope behind `address`'s CURRENT moderator record
+/// for `channel_id`, or `None` when there is no record, the record has no
+/// `grant_msg_id` (written before l2-node 0.140.0), the envelope is gone,
+/// exceeds `MAX_INVITER_GRANT_BYTES`, or no longer decodes as a
+/// `ChannelAddModerator` for exactly this (channel, address).
+pub(crate) fn lookup_moderator_grant(
+    storage: &crate::storage::rocks::Storage,
+    channel_id: u64,
+    address: &str,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    use crate::messages::envelope::Envelope;
+    use crate::messages::types::{deserialize_payload, DeserializedPayload, MessageType};
+    let key = crate::storage::schema::encode_channel_moderator_key(channel_id, address);
+    let Some(record) = storage.get_cf(cf::CHANNEL_MODERATORS, &key)? else {
+        return Ok(None);
+    };
+    let Some(msg_id) = serde_json::from_slice::<serde_json::Value>(&record)
+        .ok()
+        .and_then(|v| v.get("grant_msg_id").and_then(|g| g.as_str()).map(String::from))
+        .and_then(|h| hex::decode(h).ok())
+        .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+    else {
+        return Ok(None);
+    };
+    let Some(raw) = storage.get_message(&msg_id)? else {
+        return Ok(None);
+    };
+    if raw.len() > crate::messages::validation::MAX_INVITER_GRANT_BYTES {
+        return Ok(None);
+    }
+    let matches = rmp_serde::from_slice::<Envelope>(&raw)
+        .ok()
+        .filter(|e| e.msg_type == MessageType::ChannelAddModerator)
+        .and_then(|e| deserialize_payload(e.msg_type, &e.payload).ok())
+        .is_some_and(|p| {
+            matches!(p, DeserializedPayload::ChannelAddModerator(ref g)
+                if g.channel_id == channel_id && g.target_user == address)
+        });
+    Ok(if matches { Some(raw) } else { None })
+}
+
+/// GET /api/v1/channels/{channel_id}/moderators/{address}/grant — the
+/// creator-signed `ChannelAddModerator` envelope behind `{address}`'s
+/// moderator record (moderator propagation, l2-node 0.140.0; spec 03).
+///
+/// Authenticated; the caller's RESOLVED wallet (a delegated device key
+/// resolves to its wallet in `auth_middleware`) must equal `{address}` —
+/// 403 otherwise. 404 when `{address}` is not currently a moderator, the
+/// record predates `grant_msg_id`, or the referenced envelope is gone /
+/// no longer matches. Response: `{ "grant_envelope": "<std base64>" }`,
+/// the raw stored bytes (never re-serialized — the joining node verifies
+/// msg_id and signature over exactly these bytes).
+pub async fn get_moderator_grant(
+    Extension(state): Extension<Arc<AppState>>,
+    Extension(auth_user): Extension<AuthUser>,
+    Path((channel_id, address)): Path<(u64, String)>,
+) -> impl IntoResponse {
+    use base64::Engine as _;
+    if auth_user.address != address {
+        return (StatusCode::FORBIDDEN, "may only fetch your own moderator grant").into_response();
+    }
+    let raw = match lookup_moderator_grant(&state.storage, channel_id, &address) {
+        Ok(Some(raw)) => raw,
+        Ok(None) => return (StatusCode::NOT_FOUND, "no moderator grant").into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "Storage error in get_moderator_grant");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response();
+        }
+    };
+    Json(serde_json::json!({
+        "grant_envelope": base64::engine::general_purpose::STANDARD.encode(&raw),
+    }))
+    .into_response()
 }
 
 /// DELETE /api/v1/channels/:channel_id/moderators/:address — remove moderator (authenticated)
@@ -5578,7 +6083,7 @@ pub async fn remove_moderator(
         RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
         RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
-            (StatusCode::BAD_REQUEST, reason).into_response()
+            rejection_response(reason)
         }
     }
 }
@@ -5600,7 +6105,7 @@ pub async fn kick_user(
         }
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
         RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
-            (StatusCode::BAD_REQUEST, reason).into_response()
+            rejection_response(reason)
         }
         RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
     }
@@ -5623,7 +6128,7 @@ pub async fn ban_user(
         }
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
         RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
-            (StatusCode::BAD_REQUEST, reason).into_response()
+            rejection_response(reason)
         }
         RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
     }
@@ -5646,7 +6151,7 @@ pub async fn unban_user(
         }
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
         RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
-            (StatusCode::BAD_REQUEST, reason).into_response()
+            rejection_response(reason)
         }
         RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
     }
@@ -5678,7 +6183,7 @@ pub async fn mute_user(
         }
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
         RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
-            (StatusCode::BAD_REQUEST, reason).into_response()
+            rejection_response(reason)
         }
         RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
     }
@@ -5706,7 +6211,7 @@ pub async fn unmute_user(
         }
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
         RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
-            (StatusCode::BAD_REQUEST, reason).into_response()
+            rejection_response(reason)
         }
         RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
     }
@@ -5729,7 +6234,7 @@ pub async fn pin_message(
         }
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
         RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
-            (StatusCode::BAD_REQUEST, reason).into_response()
+            rejection_response(reason)
         }
         RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
     }
@@ -5752,7 +6257,7 @@ pub async fn unpin_message(
         }
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
         RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
-            (StatusCode::BAD_REQUEST, reason).into_response()
+            rejection_response(reason)
         }
         RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
     }
@@ -5775,7 +6280,7 @@ pub async fn invite_user(
         }
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
         RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
-            (StatusCode::BAD_REQUEST, reason).into_response()
+            rejection_response(reason)
         }
         RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
     }
@@ -6458,13 +6963,7 @@ fn resolve_client_ip(
     headers: &axum::http::HeaderMap,
     trusted_proxies: &crate::trusted_proxies::TrustedProxies,
 ) -> std::net::IpAddr {
-    let forwarded = headers
-        .get("forwarded")
-        .and_then(|v| v.to_str().ok());
-    let xff = headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok());
-    crate::trusted_proxies::resolve_client_ip(peer, forwarded, xff, trusted_proxies)
+    crate::trusted_proxies::resolve_client_ip_from_headers(peer, headers, trusted_proxies)
 }
 
 /// 304 Not Modified response. Used by the If-None-Match short-circuit.
@@ -8063,6 +8562,53 @@ pub async fn get_user_posts(
     }
 }
 
+/// Private-channel join gate (l2-node 0.140.0, spec 03 §3.7): for a
+/// `channel_invite` notification, attach at READ time `invite_envelope`
+/// (standard base64 of the raw stored `ChannelInvite` envelope bytes —
+/// never re-serialized, its msg_id/signature are verified over exactly
+/// these bytes) and `invite_expires_at` (effective expiry, unix ms). Both
+/// keys are OMITTED — never `null` — when the envelope is gone or does not
+/// decode as a `ChannelInvite`, or exceeds the join-proof cap (it could not
+/// be used as proof anyway). Unverified hints: the node that ingests the
+/// join verifies. Only on this authenticated per-wallet read path — never
+/// on the WS broadcast frame or the push payload.
+fn attach_invite_proof(storage: &crate::storage::rocks::Storage, n: &mut serde_json::Value) {
+    use base64::Engine as _;
+    use crate::messages::envelope::Envelope;
+    use crate::messages::types::{deserialize_payload, DeserializedPayload, MessageType};
+    if n.get("type").and_then(|v| v.as_str()) != Some("channel_invite") {
+        return;
+    }
+    let Some(msg_id) = n
+        .get("msg_id")
+        .and_then(|v| v.as_str())
+        .and_then(|h| hex::decode(h).ok())
+        .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+    else {
+        return;
+    };
+    let Ok(Some(raw)) = storage.get_message(&msg_id) else { return };
+    if raw.len() > crate::messages::validation::MAX_JOIN_INVITE_BYTES {
+        return;
+    }
+    let Ok(env) = rmp_serde::from_slice::<Envelope>(&raw) else { return };
+    if env.msg_type != MessageType::ChannelInvite {
+        return;
+    }
+    let Ok(DeserializedPayload::ChannelInvite(p)) = deserialize_payload(env.msg_type, &env.payload)
+    else {
+        return;
+    };
+    let expires_at = crate::messages::validation::effective_invite_expiry(&p, env.timestamp);
+    if let Some(obj) = n.as_object_mut() {
+        obj.insert(
+            "invite_envelope".into(),
+            serde_json::json!(base64::engine::general_purpose::STANDARD.encode(&raw)),
+        );
+        obj.insert("invite_expires_at".into(), serde_json::json!(expires_at));
+    }
+}
+
 /// GET /api/v1/notifications — list notifications for the authenticated user.
 ///
 /// Authenticated endpoint. Returns notifications in reverse-chronological
@@ -8081,7 +8627,10 @@ pub async fn get_notifications(
         limit,
         params.notification_type.as_deref(),
     ) {
-        Ok(notifications) => {
+        Ok(mut notifications) => {
+            for n in notifications.iter_mut() {
+                attach_invite_proof(&state.storage, n);
+            }
             let total = notifications.len();
             Json(serde_json::json!({
                 "notifications": notifications,
@@ -8459,7 +9008,7 @@ pub async fn distribute_channel_keys(
         }
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
         RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
-            (StatusCode::BAD_REQUEST, reason).into_response()
+            rejection_response(reason)
         }
         RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
     }
@@ -9393,11 +9942,16 @@ mod media_tests {
         assert_eq!(resolve_client_ip(peer, &headers, &empty_proxies()), peer.ip());
     }
 
+    /// l2-node 0.140.0 (round-5 S-N1): an unparseable XFF fails closed to
+    /// `::` — it used to fall back to the (loopback) peer.
     #[test]
-    fn resolve_ip_falls_back_to_peer_on_unparseable_xff() {
+    fn resolve_ip_fails_closed_on_unparseable_xff() {
         let peer = sock("127.0.0.1", 50000);
         let headers = headers_with_xff("not-an-ip");
-        assert_eq!(resolve_client_ip(peer, &headers, &empty_proxies()), peer.ip());
+        assert_eq!(
+            resolve_client_ip(peer, &headers, &empty_proxies()),
+            IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
+        );
     }
 
     #[test]
@@ -9413,16 +9967,18 @@ mod media_tests {
     }
 
     #[test]
-    fn resolve_ip_prefers_forwarded_over_xff() {
-        // v0.42: RFC 7239 Forwarded wins over X-Forwarded-For when
-        // both headers are present.
+    fn resolve_ip_with_disagreeing_forwarded_and_xff_fails_closed() {
+        // 0.140.0: a client-sent `Forwarded` must not override the
+        // `X-Forwarded-For` a proxy appended (or vice versa) — when both
+        // carry a chain and disagree the result is `::`, never either
+        // header's (possibly client-chosen) answer.
         let peer = sock("127.0.0.1", 50000);
         let mut headers = axum::http::HeaderMap::new();
         headers.insert("forwarded", "for=4.4.4.4".parse().unwrap());
         headers.insert("x-forwarded-for", "9.9.9.9".parse().unwrap());
         assert_eq!(
             resolve_client_ip(peer, &headers, &empty_proxies()),
-            IpAddr::V4(Ipv4Addr::new(4, 4, 4, 4))
+            IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
         );
     }
 }
@@ -10052,7 +10608,7 @@ mod channel_resubscribe_tests {
 
     #[test]
     fn channel_join_yields_its_channel_id() {
-        let payload = ChannelJoinPayload { channel_id: 777 };
+        let payload = ChannelJoinPayload { channel_id: 777, invite: None };
         let env = envelope(MessageType::ChannelJoin, rmp_serde::to_vec(&payload).unwrap());
         assert_eq!(channel_id_for_resubscribe(&env), Some(777));
     }
@@ -10095,6 +10651,30 @@ mod gossip_bridge_tests {
             signature: Vec::new(),
             relay_path: Vec::new(),
         }
+    }
+
+    #[test]
+    fn positional_array_join_with_invite_and_invite_route_correctly() {
+        // Security audit W7 (recurring shape #20): a narrower probe struct
+        // failed on these positional-array forms and the message never
+        // gossiped.
+        let cid: u64 = (1 << 40) + 9;
+        let join = envelope(MessageType::ChannelJoin, rmp_serde::to_vec(&(cid, vec![1u8, 2, 3])).unwrap());
+        assert_eq!(
+            gossip_topic_for_envelope(&join, "testnet"),
+            Some(crate::network::gossip::channel_topic("testnet", cid)),
+        );
+        let old_join = envelope(MessageType::ChannelJoin, rmp_serde::to_vec(&(cid,)).unwrap());
+        assert_eq!(
+            gossip_topic_for_envelope(&old_join, "testnet"),
+            Some(crate::network::gossip::channel_topic("testnet", cid)),
+        );
+        let inv5 = (cid, "klv1invitee".to_string(), Option::<String>::None, Some(5u64), Some(vec![9u8]));
+        let invite = envelope(MessageType::ChannelInvite, rmp_serde::to_vec(&inv5).unwrap());
+        assert_eq!(
+            gossip_topic_for_envelope(&invite, "testnet"),
+            Some(crate::network::gossip::dm_topic("testnet", "klv1invitee")),
+        );
     }
 
     #[test]
@@ -10351,6 +10931,8 @@ mod gossip_bridge_tests {
             channel_id: 42,
             target_user: "klv1target".to_string(),
             anchor_node: Some("https://host.example".to_string()),
+            expires_at: None,
+            inviter_grant: None,
         };
         let env = envelope(MessageType::ChannelInvite, rmp_serde::to_vec_named(&invite).unwrap());
         assert_eq!(
@@ -10748,5 +11330,310 @@ mod w37_target_news_item_visible_tests {
         s.apply_follow_edge("klv1fan", "klv1author", true, 500).unwrap();
         assert!(target_news_item_visible(&s, &id, &msg_id, Some("klv1fan")));
         assert!(target_news_item_visible(&s, &id, &msg_id, Some("klv1author")));
+    }
+}
+
+#[cfg(test)]
+mod invite_proof_notification_tests {
+    //! `attach_invite_proof` (private-channel join gate, l2-node 0.140.0,
+    //! spec 03 §3.7): `invite_envelope`/`invite_expires_at` appear on a
+    //! `channel_invite` entry whose envelope is stored, are OMITTED (never
+    //! null) otherwise, and never touch other notification types.
+    use super::*;
+    use crate::messages::envelope::Envelope;
+    use crate::messages::types::{ChannelInvitePayload, MessageType};
+    use base64::Engine as _;
+
+    fn store_invite(s: &crate::storage::rocks::Storage, expires_at: Option<u64>) -> ([u8; 32], Vec<u8>) {
+        let p = ChannelInvitePayload {
+            channel_id: 1 << 40,
+            target_user: "klv1target".into(),
+            anchor_node: None,
+            expires_at,
+            inviter_grant: None,
+        };
+        let env = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::ChannelInvite,
+            msg_id: [9u8; 32],
+            author: "klv1inviter".into(),
+            timestamp: 1_000,
+            lamport_ts: 0,
+            payload: rmp_serde::to_vec_named(&p).unwrap(),
+            signature: vec![0u8; 64],
+            relay_path: vec![],
+        };
+        let raw = rmp_serde::to_vec_named(&env).unwrap();
+        s.store_message(&env.msg_id, &raw).unwrap();
+        (env.msg_id, raw)
+    }
+
+    #[test]
+    fn channel_invite_gets_raw_envelope_and_expiry() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = crate::storage::rocks::Storage::open(dir.path()).unwrap();
+        let (id, raw) = store_invite(&s, None);
+        let mut n = serde_json::json!({ "type": "channel_invite", "msg_id": hex::encode(id) });
+        attach_invite_proof(&s, &mut n);
+        assert_eq!(
+            n["invite_envelope"].as_str().unwrap(),
+            base64::engine::general_purpose::STANDARD.encode(&raw),
+            "must be the raw stored bytes, not a re-serialization"
+        );
+        assert_eq!(
+            n["invite_expires_at"].as_u64().unwrap(),
+            1_000 + crate::messages::validation::DEFAULT_INVITE_TTL_MS
+        );
+    }
+
+    #[test]
+    fn explicit_expiry_is_reported() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = crate::storage::rocks::Storage::open(dir.path()).unwrap();
+        let (id, _) = store_invite(&s, Some(5_000));
+        let mut n = serde_json::json!({ "type": "channel_invite", "msg_id": hex::encode(id) });
+        attach_invite_proof(&s, &mut n);
+        assert_eq!(n["invite_expires_at"].as_u64(), Some(5_000));
+    }
+
+    #[test]
+    fn missing_envelope_and_other_types_omit_keys_never_null() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = crate::storage::rocks::Storage::open(dir.path()).unwrap();
+        let mut gone = serde_json::json!({ "type": "channel_invite", "msg_id": hex::encode([7u8; 32]) });
+        attach_invite_proof(&s, &mut gone);
+        assert!(gone.get("invite_envelope").is_none() && gone.get("invite_expires_at").is_none());
+        let (id, _) = store_invite(&s, None);
+        let mut mention = serde_json::json!({ "type": "mention", "msg_id": hex::encode(id) });
+        attach_invite_proof(&s, &mut mention);
+        assert!(mention.get("invite_envelope").is_none());
+    }
+}
+
+#[cfg(test)]
+mod federate_limiter_tests {
+    //! Security audit W1 / round-2 B-1: per-wallet outbound-fetch limit
+    //! with monotonic windows, timeouts that release permits, fixed-string
+    //! responses.
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn per_wallet_limit_and_window_reset() {
+        let mut l = FederateLimiter::default();
+        let t0 = Instant::now();
+        for _ in 0..FED_WALLET_MAX_ATTEMPTS {
+            assert!(l.check("klv1a", t0));
+        }
+        assert!(!l.check("klv1a", t0 + Duration::from_secs(1)), "over the limit in the window");
+        assert!(l.check("klv1b", t0), "another wallet is unaffected (no global bucket)");
+        assert!(l.check("klv1a", t0 + FED_WALLET_WINDOW), "window reset");
+    }
+
+    #[test]
+    fn many_wallets_are_not_globally_capped() {
+        let mut l = FederateLimiter::default();
+        let t0 = Instant::now();
+        for i in 0..1_000 {
+            assert!(l.check(&format!("klv1w{i}"), t0));
+        }
+    }
+
+    #[test]
+    fn tracked_wallet_map_is_bounded_evicts_oldest_and_prunes() {
+        let mut l = FederateLimiter::default();
+        let t0 = Instant::now();
+        assert!(l.check("klv1oldest", t0));
+        for i in 1..FED_MAX_TRACKED_WALLETS {
+            assert!(l.check(&format!("klv1w{i}"), t0 + Duration::from_millis(1)));
+        }
+        // Full map: a NEW wallet is admitted (round-3 W-2), the oldest
+        // entry is evicted, and the map stays bounded.
+        assert!(l.check("klv1new", t0 + Duration::from_millis(2)));
+        assert!(!l.per_wallet.contains_key("klv1oldest"));
+        assert_eq!(l.per_wallet.len(), FED_MAX_TRACKED_WALLETS);
+        // Expired windows are pruned first.
+        assert!(l.check("klv1later", t0 + FED_WALLET_WINDOW + Duration::from_secs(1)));
+        assert!(l.per_wallet.len() < 10);
+    }
+
+    fn preflight_node() -> (crate::messages::router::MessageRouter, crate::storage::rocks::Storage, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = crate::storage::rocks::Storage::open(dir.path()).unwrap();
+        let identity = crate::storage::identity::IdentityResolver::new(storage.clone());
+        let cfg = crate::config::ChannelVerifyConfig { private_join_proof_activation_ms: 0, ..Default::default() };
+        let r = crate::messages::router::MessageRouter::new(
+            storage.clone(), identity, None, "testnet".into(), usize::MAX,
+            Arc::new(crate::metrics::counters::NetworkCounters::new()),
+            crate::config::RateLimitsConfig::default(),
+        )
+        .with_channel_verify_config(cfg);
+        (r, storage, dir)
+    }
+
+    fn put_row(s: &crate::storage::rocks::Storage, cid: u64, ctype: u8) {
+        s.put_cf(cf::CHANNELS, &cid.to_be_bytes(),
+            serde_json::json!({"channel_type": ctype, "creator": "klv1creator"}).to_string().as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn preflight_order_and_no_outbound_for_known_channels() {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let (r, s, _d) = preflight_node();
+        let now = now_unix_ms();
+        let cid_priv: u64 = (1 << 40) + 1;
+        let cid_unknown: u64 = (1 << 40) + 2;
+        let cid_pub: u64 = 77;
+        put_row(&s, cid_priv, 2);
+        put_row(&s, cid_pub, 0);
+        let status = |res: Result<(Option<Vec<u8>>, bool), axum::response::Response>| match res {
+            Ok((_, fetch)) => if fetch { 0 } else { 1 },
+            Err(resp) => resp.status().as_u16(),
+        };
+        // (1) invite size/encoding first: 400 even where the gate would 403.
+        let huge = b64.encode(vec![0u8; crate::messages::validation::MAX_JOIN_INVITE_BYTES + 1]);
+        assert_eq!(status(federate_preflight(&r, &s, cid_priv, "klv1x", Some(&huge), now)), 400);
+        assert_eq!(status(federate_preflight(&r, &s, cid_priv, "klv1x", Some("!!notb64"), now)), 400);
+        // (2) pre-fetch gate: known private, non-member, no invite → 403.
+        assert_eq!(status(federate_preflight(&r, &s, cid_priv, "klv1x", None, now)), 403);
+        // (3) slot cap before the decision: a wallet with 256 federations → 429.
+        for i in 0..256u64 {
+            s.put_cf(cf::LOCAL_CHANNEL_FED, &crate::storage::schema::encode_local_channel_fed_key("klv1full", 10_000 + i), &[]).unwrap();
+        }
+        assert_eq!(status(federate_preflight(&r, &s, cid_unknown, "klv1full", None, now)), 429);
+        // (4) known PUBLIC → 400, for a non-member with no invite (not 403).
+        assert_eq!(status(federate_preflight(&r, &s, cid_pub, "klv1x", None, now)), 400);
+        // Known private + member/creator → local only (no fetch).
+        assert_eq!(status(federate_preflight(&r, &s, cid_priv, "klv1creator", None, now)), 1);
+        // Unknown, no invite → fetch path (creator bootstrap decides later).
+        assert_eq!(status(federate_preflight(&r, &s, cid_unknown, "klv1x", None, now)), 0);
+        // Round-4 9c: an UNKNOWN id at/below the private floor is refused
+        // locally with the specified 400 — never the outbound fetch path
+        // (no limiter budget, no permit, no DNS) — for any caller.
+        let floor = crate::messages::types::PRIVATE_CHANNEL_ID_FLOOR;
+        for unknown_low in [floor, floor - 1, 12_345u64] {
+            assert_eq!(status(federate_preflight(&r, &s, unknown_low, "klv1x", None, now)), 400);
+        }
+        assert_eq!(status(federate_preflight(&r, &s, floor + 1, "klv1x", None, now)), 0);
+    }
+
+    #[test]
+    fn known_channels_are_never_fetched() {
+        let hosted_priv = serde_json::json!({"channel_type": 2, "creator": "klv1c"});
+        let public = serde_json::json!({"channel_type": 0, "creator": "klv1c"});
+        let read_public = serde_json::json!({"channel_type": 1, "creator": "klv1c"});
+        let fed = serde_json::json!({"channel_type": 2, "creator": "klv1c", "federated_from": "https://h"});
+        let hi = crate::messages::types::PRIVATE_CHANNEL_ID_FLOOR + 5;
+        assert_eq!(federate_fetch_decision(hi, Some(&hosted_priv)), FederateFetch::KnownLocal);
+        assert_eq!(federate_fetch_decision(hi, Some(&fed)), FederateFetch::KnownLocal);
+        assert_eq!(federate_fetch_decision(hi, Some(&public)), FederateFetch::KnownPublic);
+        assert_eq!(federate_fetch_decision(hi, Some(&read_public)), FederateFetch::KnownPublic);
+        assert_eq!(federate_fetch_decision(hi, None), FederateFetch::Fetch);
+        // A legacy pre-floor private row that IS known stays local.
+        assert_eq!(federate_fetch_decision(5, Some(&hosted_priv)), FederateFetch::KnownLocal);
+        assert_eq!(federate_fetch_decision(5, None), FederateFetch::KnownPublic);
+    }
+
+    fn leak_slots() -> &'static IpFetchSlots {
+        Box::leak(Box::default())
+    }
+
+    #[test]
+    fn busy_503_consumes_no_budget_and_only_real_fetches_count() {
+        let t0 = Instant::now();
+        let ip: std::net::IpAddr = "203.0.113.7".parse().unwrap();
+        let slots = leak_slots();
+        let limiter = std::sync::Mutex::new(FederateLimiter::default());
+        let sem = Arc::new(tokio::sync::Semaphore::new(1));
+        let held = admit_outbound_fetch(&sem, slots, &limiter, ip, "klv1a", t0).unwrap();
+        // Busy: refused without touching the wallet's budget.
+        for _ in 0..100 {
+            assert_eq!(
+                admit_outbound_fetch(&sem, slots, &limiter, ip, "klv1a", t0).err(),
+                Some(FetchAdmission::Busy)
+            );
+        }
+        assert_eq!(limiter.lock().unwrap().per_wallet["klv1a"].1, 1);
+        drop(held);
+        // Real fetches count until the window is spent.
+        for _ in 1..FED_WALLET_MAX_ATTEMPTS {
+            drop(admit_outbound_fetch(&sem, slots, &limiter, ip, "klv1a", t0).unwrap());
+        }
+        assert_eq!(
+            admit_outbound_fetch(&sem, slots, &limiter, ip, "klv1a", t0).err(),
+            Some(FetchAdmission::RateLimited)
+        );
+        // A rate-limited refusal released its permit and IP slot.
+        assert_eq!(sem.available_permits(), 1);
+        assert!(slots.held.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn one_ip_cannot_hold_all_fetch_permits() {
+        let t0 = Instant::now();
+        let slots = leak_slots();
+        let limiter = std::sync::Mutex::new(FederateLimiter::default());
+        let sem = Arc::new(tokio::sync::Semaphore::new(FED_MAX_CONCURRENT_FETCHES));
+        let a: std::net::IpAddr = "198.51.100.1".parse().unwrap();
+        let b: std::net::IpAddr = "198.51.100.2".parse().unwrap();
+        let mut held = Vec::new();
+        for i in 0..FED_MAX_CONCURRENT_FETCHES_PER_IP {
+            held.push(admit_outbound_fetch(&sem, slots, &limiter, a, &format!("klv1x{i}"), t0).unwrap());
+        }
+        assert_eq!(
+            admit_outbound_fetch(&sem, slots, &limiter, a, "klv1y", t0).err(),
+            Some(FetchAdmission::Busy),
+            "per-IP cap"
+        );
+        assert!(admit_outbound_fetch(&sem, slots, &limiter, b, "klv1z", t0).is_ok(), "other IPs unaffected");
+        assert_eq!(
+            sem.available_permits(),
+            FED_MAX_CONCURRENT_FETCHES - FED_MAX_CONCURRENT_FETCHES_PER_IP,
+            "the refused attempt and the dropped admission returned their global permits"
+        );
+        held.clear();
+        assert!(admit_outbound_fetch(&sem, slots, &limiter, a, "klv1y", t0).is_ok(), "slots released on drop");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dns_timeout_releases_the_fetch_permit() {
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        {
+            let _permit = sem.clone().try_acquire_owned().unwrap();
+            assert_eq!(sem.available_permits(), 0);
+            // A resolver that never answers.
+            // Outer guard so a broken `timed` fails the test instead of
+            // hanging it (paused clock auto-advances when idle).
+            let out = tokio::time::timeout(
+                FED_DNS_TIMEOUT * 2,
+                timed(FED_DNS_TIMEOUT, std::future::pending::<()>()),
+            )
+            .await
+            .expect("timed() must return within its own bound");
+            assert!(out.is_none(), "lookup must time out");
+        }
+        assert_eq!(sem.available_permits(), 1, "permit released after the timeout");
+    }
+
+    #[test]
+    fn denial_responses_are_fixed_strings() {
+        let st = |r: axum::response::Response| r.status();
+        let internal = crate::messages::router::INTERNAL_ERROR_REASON;
+        assert_eq!(st(federate_denial_response(internal)), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(st(federate_denial_response("user is banned from channel 5")), StatusCode::FORBIDDEN);
+        assert_eq!(st(federate_host_error()), StatusCode::BAD_GATEWAY);
+        // Round-3 N5 / round 4: a router rejection caused by OUR storage
+        // carries exactly the fixed internal reason (no RocksDB text) and
+        // becomes a generic 500; policy reasons come back verbatim as 400 —
+        // classified by exact match, not by a substring that a policy
+        // reason could contain.
+        assert_eq!(st(rejection_response(internal.into())), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(st(rejection_response("unauthorized: private channel: invite proof required".into())), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            st(rejection_response("payload validation failed: field mentions storage error".into())),
+            StatusCode::BAD_REQUEST,
+            "substring match must not turn a policy verdict into a 500"
+        );
     }
 }

@@ -73,7 +73,7 @@ const RECONNECT_MAX_SECS: u64 = 300;
 /// feed keeps `admitted > 0` on nearly every real page, so this has a low
 /// false-positive rate against honest peers while stopping a peer that
 /// simply claims `has_more: true` forever with garbage.
-const MAX_CONSECUTIVE_UNPRODUCTIVE_PAGES: u32 = 5;
+pub(crate) const MAX_CONSECUTIVE_UNPRODUCTIVE_PAGES: u32 = 5;
 /// Requester-side hard backstop on total pages per backfill session,
 /// regardless of productivity — bounds worst-case round-trips even
 /// against a peer that evades the consecutive-unproductive check above by
@@ -88,7 +88,110 @@ const MAX_CONSECUTIVE_UNPRODUCTIVE_PAGES: u32 = 5;
 /// constant alone wouldn't actually bound total verification work — see
 /// each `handle_*_event`'s oversized-page guard, right before its
 /// envelope-verification loop.
-const MAX_PAGES_PER_SESSION: u32 = 500;
+pub(crate) const MAX_PAGES_PER_SESSION: u32 = 500;
+
+/// Max inbound backfill responses (private-channel sync + public
+/// reconcile) being BUILT concurrently on tokio's blocking pool (round 4).
+/// The builds were moved off the swarm event loop
+/// (`tokio::task::spawn_blocking`); this node-wide bound keeps a crowd of
+/// peers from occupying the blocking pool.
+///
+/// Round-5 C-W1: only a SESSION-STARTING request (no cursor: a first
+/// metadata / legacy / reconcile page) that finds every slot busy is
+/// answered `server_capped`. A requester treats `server_capped` as the end
+/// of its session — there is no in-session retry; the next attempt is a
+/// later sweep that starts over from the first page — so refusing a
+/// CONTINUATION page (cursor present) threw away the session's progress
+/// and, under the 0.137.0 peer comparison, made a busy honest peer look
+/// uninformative. A continuation page instead waits up to
+/// `CONTINUATION_BUILD_SLOT_WAIT` for a slot (`responder_build_slot`).
+const MAX_CONCURRENT_RESPONDER_BUILDS: usize = 8;
+
+/// Max continuation requests waiting node-wide for a responder build slot
+/// (round-5 C-W1). Each waiter also holds its per-peer responder slot, so
+/// one peer can hold at most its per-peer concurrency of these; past this
+/// bound a continuation request is answered `server_capped` like a
+/// session-starting one. "Continuation" is the request's own claim (a
+/// cursor is not authenticated), so this bound — not the claim — is what
+/// limits the waiting.
+const MAX_CONTINUATION_BUILD_WAITERS: usize = 16;
+
+/// How long a continuation request waits for a free build slot before it
+/// is answered `server_capped` (round-5 C-W1). Far below the protocols'
+/// 45 s request timeout.
+const CONTINUATION_BUILD_SLOT_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Outcome of `NetworkService::responder_build_slot`.
+enum BuildSlot {
+    /// A build slot is free: build now.
+    Now(tokio::sync::OwnedSemaphorePermit),
+    /// No build slot, but this continuation request may wait for one; the
+    /// permit is its `MAX_CONTINUATION_BUILD_WAITERS` slot.
+    Wait(tokio::sync::OwnedSemaphorePermit),
+    /// Answer `server_capped` now.
+    Refuse,
+}
+
+/// The decision behind `NetworkService::responder_build_slot` (pure over
+/// the two semaphores, for tests).
+fn pick_build_slot(
+    build_permits: &Arc<tokio::sync::Semaphore>,
+    waiter_permits: &Arc<tokio::sync::Semaphore>,
+    continuation: bool,
+) -> BuildSlot {
+    if let Ok(p) = build_permits.clone().try_acquire_owned() {
+        return BuildSlot::Now(p);
+    }
+    if continuation {
+        if let Ok(w) = waiter_permits.clone().try_acquire_owned() {
+            return BuildSlot::Wait(w);
+        }
+    }
+    BuildSlot::Refuse
+}
+
+/// Wait up to `CONTINUATION_BUILD_SLOT_WAIT` for a build slot. `Ok` = the
+/// build slot (the waiter slot is released); `Err` = timed out, returning
+/// the waiter slot so it can ride along with the `server_capped` response
+/// (keeping `deferred_response_tx`'s in-flight items bounded).
+async fn wait_for_build_slot(
+    build_permits: Arc<tokio::sync::Semaphore>,
+    waiter: tokio::sync::OwnedSemaphorePermit,
+) -> Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::OwnedSemaphorePermit> {
+    match tokio::time::timeout(CONTINUATION_BUILD_SLOT_WAIT, build_permits.acquire_owned()).await {
+        Ok(Ok(permit)) => {
+            drop(waiter);
+            Ok(permit)
+        }
+        _ => Err(waiter),
+    }
+}
+
+/// A backfill response built off the swarm event loop, handed back to the
+/// loop (which alone may touch the swarm) to be sent. The responder
+/// guard rides along so the per-peer concurrency slot is held until the
+/// response has actually been handed to libp2p — the same window as when
+/// the build ran inline — and so does the node-wide slot (`_build_permit`:
+/// the build slot, or for a continuation request that timed out waiting,
+/// its waiter slot), which therefore also bounds how many finished
+/// responses can be queued.
+enum DeferredResponse {
+    PrivateChannelSync {
+        peer: PeerId,
+        channel: libp2p::request_response::ResponseChannel<private_channel_sync::PrivateChannelSyncResponse>,
+        response: private_channel_sync::PrivateChannelSyncResponse,
+        _guard: private_channel_sync::PrivateChannelSyncResponderGuard,
+        _build_permit: tokio::sync::OwnedSemaphorePermit,
+    },
+    Reconcile {
+        peer: PeerId,
+        channel_id: u64,
+        channel: libp2p::request_response::ResponseChannel<reconcile::ReconcileResponse>,
+        response: reconcile::ReconcileResponse,
+        _guard: reconcile::ResponderGuard,
+        _build_permit: tokio::sync::OwnedSemaphorePermit,
+    },
+}
 
 /// How long `finalize_reconcile_comparison` waits for every fanout
 /// candidate to answer a fresh trigger's first page before deciding with
@@ -652,6 +755,17 @@ pub struct NetworkService {
     /// Server-side rate-limit state for inbound private-channel-sync
     /// requests (closes the F2 backfill gap, l2-node 0.138.0+).
     private_channel_sync_limits: Arc<private_channel_sync::PrivateChannelSyncResponderLimits>,
+    /// Node-wide bound on backfill responses being built off the event
+    /// loop (`MAX_CONCURRENT_RESPONDER_BUILDS`, round 4).
+    responder_build_permits: Arc<tokio::sync::Semaphore>,
+    /// Node-wide bound on continuation requests waiting for a build slot
+    /// (`MAX_CONTINUATION_BUILD_WAITERS`, round-5 C-W1).
+    continuation_wait_permits: Arc<tokio::sync::Semaphore>,
+    /// Off-loop builds hand their finished response back here; `run()`
+    /// takes the receiver and sends each response on the swarm.
+    deferred_response_tx: tokio::sync::mpsc::UnboundedSender<DeferredResponse>,
+    /// Receiver half of `deferred_response_tx`, taken by `run()`.
+    deferred_response_rx: Option<tokio::sync::mpsc::UnboundedReceiver<DeferredResponse>>,
     /// Outstanding outbound private-channel-sync requests → pending state
     /// for race-cancel + cursor paging of that (wallet, channel) pair's
     /// backfill. See `DmSyncPending`'s doc comment for the paging-budget
@@ -971,9 +1085,12 @@ struct PrivateChannelSyncPending {
     peer_id: PeerId,
     wallet: String,
     channel_id: u64,
-    /// See `ReconcilePending`'s doc comment (audit final pre-mainnet W9).
-    pages_fetched: u32,
-    consecutive_unproductive_pages: u32,
+    /// Two-phase session state: per-phase page budgets (see
+    /// `ReconcilePending`'s doc comment, audit final pre-mainnet W9, and
+    /// `private_channel_sync::MAX_META_PAGES_PER_SESSION`), strictly
+    /// advancing cursors, and the session-cumulative `Accepted` count that
+    /// completion requires (round 4).
+    session: private_channel_sync::SyncSession,
 }
 
 /// Per-pending-outbound-news-sync state (P-3). Audit final pre-mainnet W9:
@@ -1156,7 +1273,11 @@ fn envelope_targets_channel(env_bytes: &[u8], expected_channel: u64) -> bool {
         // these three types.
         | MessageType::ChannelKick
         | MessageType::ChannelBan
-        | MessageType::ChannelUnban => {
+        | MessageType::ChannelUnban
+        // Moderator propagation (l2-node 0.140.0): indexed into
+        // CHANNEL_META_MSGS and served on the same page, so bound the same way.
+        | MessageType::ChannelAddModerator
+        | MessageType::ChannelRemoveModerator => {
             match deserialize_payload(envelope.msg_type, &envelope.payload) {
                 Ok(DeserializedPayload::ChatMessage(p)) => p.channel_id == expected_channel,
                 Ok(DeserializedPayload::ChannelPinMessage(p)) => p.channel_id == expected_channel,
@@ -1169,6 +1290,10 @@ fn envelope_targets_channel(env_bytes: &[u8], expected_channel: u64) -> bool {
                 Ok(DeserializedPayload::ChannelKick(p)) => p.channel_id == expected_channel,
                 Ok(DeserializedPayload::ChannelBan(p)) => p.channel_id == expected_channel,
                 Ok(DeserializedPayload::ChannelUnban(p)) => p.channel_id == expected_channel,
+                Ok(DeserializedPayload::ChannelAddModerator(p)) => p.channel_id == expected_channel,
+                Ok(DeserializedPayload::ChannelRemoveModerator(p)) => {
+                    p.channel_id == expected_channel
+                }
                 // A decode failure is conservatively rejected. An `Ok` of
                 // some OTHER variant should be unreachable (it would mean
                 // this match arm's type list and the inner one have drifted
@@ -1932,6 +2057,12 @@ impl NetworkService {
             .serve_max_concurrent_requests
             .clamp(1, 4096) as usize;
         let snapshot_chunk_semaphore = Arc::new(tokio::sync::Semaphore::new(snapshot_permits));
+        // Off-loop backfill response builds → event loop (round 4). Unbounded
+        // channel, but at most `MAX_CONCURRENT_RESPONDER_BUILDS` +
+        // `MAX_CONTINUATION_BUILD_WAITERS` items can ever be in it: each
+        // carries its build (or waiter) slot, released only after the loop
+        // has sent the response.
+        let (deferred_response_tx, deferred_response_rx) = tokio::sync::mpsc::unbounded_channel();
 
         Ok(Self {
             swarm,
@@ -1986,6 +2117,10 @@ impl NetworkService {
             local_dm_users_seen: HashMap::new(),
             private_channel_sync_config,
             private_channel_sync_limits: Arc::new(private_channel_sync::PrivateChannelSyncResponderLimits::default()),
+            responder_build_permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_RESPONDER_BUILDS)),
+            continuation_wait_permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONTINUATION_BUILD_WAITERS)),
+            deferred_response_tx,
+            deferred_response_rx: Some(deferred_response_rx),
             pending_private_channel_sync_requests: HashMap::new(),
             private_channel_sync_triggered: HashSet::new(),
             private_channel_sync_wallet_claims: HashMap::new(),
@@ -2525,6 +2660,9 @@ impl NetworkService {
         // `handle_presence_message` can hand it to the spawned task.
         // `None` when presence is disabled.
         let mut presence_validation_rx = self.presence_validation_rx.take();
+        // Finished off-loop backfill responses (round 4). Always `Some` on
+        // the first (only) `run()`; a second `run()` would park this arm.
+        let mut deferred_response_rx = self.deferred_response_rx.take();
 
         // Dial persisted peers from previous sessions (survives restart)
         self.dial_persisted_peers();
@@ -2758,6 +2896,14 @@ impl NetworkService {
                 Some(cmd) = self.snapshot_client_rx.recv() => {
                     self.handle_snapshot_client_command(cmd);
                 }
+                Some(deferred) = async {
+                    match deferred_response_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    self.send_deferred_response(deferred);
+                }
                 Some(outcome) = async {
                     match presence_validation_rx.as_mut() {
                         Some(rx) => rx.recv().await,
@@ -2784,6 +2930,41 @@ impl NetworkService {
                     info!("Network shutting down");
                     break;
                 }
+            }
+        }
+    }
+
+    /// Pick the node-wide build slot for an inbound backfill request
+    /// (round-5 C-W1): a free build slot → `Now`; none free → `Wait` for a
+    /// continuation request (`continuation`: it carries a cursor) while a
+    /// waiter slot is free, else `Refuse`.
+    fn responder_build_slot(&self, continuation: bool) -> BuildSlot {
+        pick_build_slot(&self.responder_build_permits, &self.continuation_wait_permits, continuation)
+    }
+
+    /// Send a backfill response that was built off the event loop
+    /// (`DeferredResponse`). The responder guard and the build slot are
+    /// dropped (end of this function) after the response is handed to
+    /// libp2p, as when the build ran inline.
+    fn send_deferred_response(&mut self, deferred: DeferredResponse) {
+        match deferred {
+            DeferredResponse::PrivateChannelSync { peer, channel, response, .. } => {
+                if let Err(e) = self
+                    .swarm
+                    .behaviour_mut()
+                    .private_channel_sync
+                    .send_response(channel, response)
+                {
+                    warn!(peer = %peer, error = ?e, "private-channel-sync: send_response failed");
+                }
+            }
+            DeferredResponse::Reconcile { peer, channel_id, channel, response, .. } => {
+                let envelopes_sent = response.envelopes.len();
+                let has_more = response.has_more;
+                if let Err(e) = self.swarm.behaviour_mut().reconcile.send_response(channel, response) {
+                    warn!(peer = %peer, channel_id, error = ?e, "reconcile: send_response failed");
+                }
+                debug!(peer = %peer, channel_id, envelopes_sent, has_more, "reconcile: served request");
             }
         }
     }
@@ -4675,6 +4856,13 @@ impl NetworkService {
                 None,
                 Some(claim.clone()),
             );
+            // Walk ALL metadata first (R3-1, raw keyset paging); a responder
+            // that predates metadata paging ignores this and answers with
+            // its legacy first page.
+            let request = private_channel_sync::PrivateChannelSyncRequest {
+                meta_paging: true,
+                ..request
+            };
             let id = self
                 .swarm
                 .behaviour_mut()
@@ -4686,8 +4874,7 @@ impl NetworkService {
                     peer_id: peer,
                     wallet: wallet.to_string(),
                     channel_id,
-                    pages_fetched: 0,
-                    consecutive_unproductive_pages: 0,
+                    session: private_channel_sync::SyncSession::default(),
                 },
             );
         }
@@ -4747,7 +4934,7 @@ impl NetworkService {
                     private_channel_sync::SERVER_MAX_CONCURRENT_PER_PEER,
                     private_channel_sync::TOTAL_ENVELOPES_CAP,
                 );
-                if guard.is_none() {
+                let Some(guard) = guard else {
                     if let Err(e) = self
                         .swarm
                         .behaviour_mut()
@@ -4757,7 +4944,7 @@ impl NetworkService {
                         warn!(peer = %peer, error = ?e, "private-channel-sync: send capped response failed");
                     }
                     return;
-                }
+                };
 
                 // Gate 5 (membership + genuinely-private-channel), the one
                 // storage-touching check — re-verified fresh on every
@@ -4779,26 +4966,78 @@ impl NetworkService {
                     return;
                 }
 
-                let response = private_channel_sync::build_response(
-                    &self.storage,
-                    &request,
-                    private_channel_sync::MAX_ENVELOPES_PER_RESPONSE,
-                    now / 1000,
-                    u64::MAX,
-                );
-                let sent = response.envelopes.len();
-                if sent > 0 {
-                    self.private_channel_sync_limits.add_served(peer, sent as u64);
+                // Build OFF the swarm event loop (round 4: a metadata or
+                // chat page is up to a few hundred RocksDB reads; done
+                // inline it stalled every other peer's gossip). A node-wide
+                // build slot bounds the blocking-pool use; none free →
+                // `server_capped` for a session-starting request, a bounded
+                // wait for a continuation (round-5 C-W1). `meta_done`
+                // without a cursor is the first chat page after this
+                // session's metadata phase — a continuation too.
+                let continuation = request.is_continuation();
+                let slot = self.responder_build_slot(continuation);
+                if matches!(slot, BuildSlot::Refuse) {
+                    if let Err(e) = self
+                        .swarm
+                        .behaviour_mut()
+                        .private_channel_sync
+                        .send_response(channel, private_channel_sync::capped_response(request.channel_id))
+                    {
+                        warn!(peer = %peer, error = ?e, "private-channel-sync: send capped response failed");
+                    }
+                    return;
                 }
-                if let Err(e) = self
-                    .swarm
-                    .behaviour_mut()
-                    .private_channel_sync
-                    .send_response(channel, response)
-                {
-                    warn!(peer = %peer, error = ?e, "private-channel-sync: send_response failed");
+                let storage = self.storage.clone();
+                let limits = Arc::clone(&self.private_channel_sync_limits);
+                let tx = self.deferred_response_tx.clone();
+                // `Ok` = build slot; `Err` = a continuation timed out waiting
+                // (the waiter slot rides along with the capped response).
+                let run = move |slot: Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::OwnedSemaphorePermit>| {
+                    let build_permit = match slot {
+                        Ok(p) => p,
+                        Err(waiter) => {
+                            let _ = tx.send(DeferredResponse::PrivateChannelSync {
+                                peer,
+                                channel,
+                                response: private_channel_sync::capped_response(request.channel_id),
+                                _guard: guard,
+                                _build_permit: waiter,
+                            });
+                            return;
+                        }
+                    };
+                    tokio::task::spawn_blocking(move || {
+                        let (response, work) = private_channel_sync::build_response_metered(
+                            &storage,
+                            &request,
+                            private_channel_sync::MAX_ENVELOPES_PER_RESPONSE,
+                            now / 1000,
+                            u64::MAX,
+                        );
+                        // Charge scan work as well as envelopes sent, minimum
+                        // 1 per request (empty / garbage-cursor pages are not
+                        // free). Charged here, before the response is queued,
+                        // so the peer's next request already sees it.
+                        limits.add_served(peer, reconcile::budget_charge(response.envelopes.len(), work));
+                        // The loop may be shutting down (receiver gone): the
+                        // response, guard and slot are simply dropped.
+                        let _ = tx.send(DeferredResponse::PrivateChannelSync {
+                            peer,
+                            channel,
+                            response,
+                            _guard: guard,
+                            _build_permit: build_permit,
+                        });
+                    });
+                };
+                match slot {
+                    BuildSlot::Now(p) => run(Ok(p)),
+                    BuildSlot::Wait(w) => {
+                        let permits = self.responder_build_permits.clone();
+                        tokio::spawn(async move { run(wait_for_build_slot(permits, w).await) });
+                    }
+                    BuildSlot::Refuse => {}
                 }
-                drop(guard);
             }
             // --- Inbound response: validate + apply, then page ---
             Event::Message {
@@ -4819,7 +5058,10 @@ impl NetworkService {
                     self.release_private_channel_sync_trigger_if_no_siblings(&pending.wallet, pending.channel_id);
                     return;
                 }
-                if response.envelopes.is_empty() && !response.has_more {
+                // Nothing at all, and nothing earlier in this session: done,
+                // not complete. (An empty FINAL chat page after a productive
+                // metadata phase falls through so completion is recorded.)
+                if response.envelopes.is_empty() && !response.has_more && pending.session.accepted_total == 0 {
                     self.release_private_channel_sync_trigger_if_no_siblings(&pending.wallet, pending.channel_id);
                     return;
                 }
@@ -4841,14 +5083,14 @@ impl NetworkService {
                         "private-channel-sync: response exceeds this protocol's own max page size; refusing to verify, treating as unproductive"
                     );
                 } else {
-                    for env_bytes in response.envelopes {
-                        if !private_channel_sync::envelope_is_private_channel_sync_type(&env_bytes)
-                            || !envelope_targets_channel(&env_bytes, channel_id)
+                    for env_bytes in &response.envelopes {
+                        if !private_channel_sync::envelope_is_private_channel_sync_type(env_bytes)
+                            || !envelope_targets_channel(env_bytes, channel_id)
                         {
                             dropped += 1;
                             continue;
                         }
-                        match self.router.process_synced_message(&env_bytes) {
+                        match self.router.process_synced_message(env_bytes) {
                             RouteResult::Accepted { .. } => {
                                 admitted += 1;
                                 accepted += 1;
@@ -4863,75 +5105,92 @@ impl NetworkService {
                 }
                 info!(peer = %peer, %wallet, channel_id, received = count, admitted, dropped, has_more = response.has_more, "private-channel-sync: applied batch");
 
-                let pages_fetched = pending.pages_fetched + 1;
-                let consecutive_unproductive_pages = if admitted > 0 {
-                    0
-                } else {
-                    pending.consecutive_unproductive_pages + 1
+                // Two-phase state machine (round 4): per-phase page
+                // budgets, strictly advancing cursors, no metadata page
+                // after the chat phase started; completion only after the
+                // chat phase ends with >= 1 `Accepted` in the session.
+                let mut session = pending.session;
+                let step = session.advance(&response, admitted, accepted);
+                if step == (private_channel_sync::NextStep::Finish { complete: false })
+                    && (response.has_more || response.meta_phase)
+                {
+                    warn!(
+                        peer = %peer, %wallet, channel_id,
+                        meta_pages = session.meta_pages, chat_pages = session.chat_pages,
+                        consecutive_unproductive_pages = session.consecutive_unproductive_pages,
+                        "private-channel-sync: hit a session backstop or a non-advancing/out-of-phase page; stopping"
+                    );
+                }
+                let follow_up: Option<(
+                    Option<private_channel_sync::PrivateChannelSyncCursor>,
+                    Option<crate::network::reconcile::MetaCursor>,
+                    bool,
+                )> = match step {
+                    private_channel_sync::NextStep::MetaPage(c) => Some((None, Some(c), false)),
+                    private_channel_sync::NextStep::StartChat => Some((None, None, true)),
+                    private_channel_sync::NextStep::ChatPage(c) => Some((Some(c), None, true)),
+                    private_channel_sync::NextStep::Finish { complete } => {
+                        // Completion only after BOTH phases ended and the
+                        // session admitted at least one genuinely NEW,
+                        // signature-verified envelope (`Accepted`, never
+                        // merely `Duplicate`) — same hardened gate as
+                        // `handle_reconcile_event` (an all-replayed
+                        // response must not count as "nothing more").
+                        if complete {
+                            let now_secs = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            if let Err(e) = self
+                                .storage
+                                .mark_private_channel_sync_complete(&wallet, channel_id, now_secs)
+                            {
+                                warn!(%wallet, channel_id, error = %e, "private-channel-sync: failed to persist sync completion");
+                            }
+                        }
+                        None
+                    }
                 };
-                let hit_backstop = pages_fetched >= MAX_PAGES_PER_SESSION
-                    || consecutive_unproductive_pages >= MAX_CONSECUTIVE_UNPRODUCTIVE_PAGES;
-                if hit_backstop {
-                    warn!(peer = %peer, %wallet, channel_id, pages_fetched, consecutive_unproductive_pages, "private-channel-sync: hit a session backstop; stopping");
-                }
-
-                if response.has_more && !hit_backstop {
-                    if let Some(cursor) = response.next_cursor {
-                        let network = self.topics.network_id().to_string();
-                        let max_age_secs = if self.private_channel_sync_config.max_age_days == 0 {
-                            u64::MAX
-                        } else {
-                            self.private_channel_sync_config.max_age_days.saturating_mul(24 * 3600)
-                        };
-                        let claim = self.private_channel_sync_wallet_claims.get(&wallet).cloned();
-                        let next_req = private_channel_sync::sign_request(
-                            &self.signing_key,
-                            &network,
-                            &peer.to_string(),
-                            &wallet,
+                if let Some((cursor, meta_cursor, meta_done)) = follow_up {
+                    let network = self.topics.network_id().to_string();
+                    let max_age_secs = if self.private_channel_sync_config.max_age_days == 0 {
+                        u64::MAX
+                    } else {
+                        self.private_channel_sync_config.max_age_days.saturating_mul(24 * 3600)
+                    };
+                    let claim = self.private_channel_sync_wallet_claims.get(&wallet).cloned();
+                    let next_req = private_channel_sync::sign_request(
+                        &self.signing_key,
+                        &network,
+                        &peer.to_string(),
+                        &wallet,
+                        channel_id,
+                        now_ms(),
+                        max_age_secs,
+                        cursor,
+                        claim,
+                    );
+                    let next_req = private_channel_sync::PrivateChannelSyncRequest {
+                        meta_paging: true,
+                        meta_cursor,
+                        meta_done,
+                        ..next_req
+                    };
+                    let next_id = self
+                        .swarm
+                        .behaviour_mut()
+                        .private_channel_sync
+                        .send_request(&peer, next_req);
+                    self.pending_private_channel_sync_requests.insert(
+                        next_id,
+                        PrivateChannelSyncPending {
+                            peer_id: peer,
+                            wallet,
                             channel_id,
-                            now_ms(),
-                            max_age_secs,
-                            Some(cursor),
-                            claim,
-                        );
-                        let next_id = self
-                            .swarm
-                            .behaviour_mut()
-                            .private_channel_sync
-                            .send_request(&peer, next_req);
-                        self.pending_private_channel_sync_requests.insert(
-                            next_id,
-                            PrivateChannelSyncPending {
-                                peer_id: peer,
-                                wallet,
-                                channel_id,
-                                pages_fetched,
-                                consecutive_unproductive_pages,
-                            },
-                        );
-                        return;
-                    }
-                }
-                // Natural completion or give-up: only persist completion
-                // when this session actually admitted at least one
-                // genuinely NEW, signature-verified envelope (`Accepted`,
-                // never merely `Duplicate`) — same hardened gate
-                // `handle_reconcile_event` uses (and the exact reasoning
-                // documented there for why `Duplicate` alone must not
-                // qualify: an all-garbage or all-replayed response must
-                // not be trusted as "nothing more to fetch").
-                if !response.has_more && accepted > 0 {
-                    let now_secs = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    if let Err(e) = self
-                        .storage
-                        .mark_private_channel_sync_complete(&wallet, channel_id, now_secs)
-                    {
-                        warn!(%wallet, channel_id, error = %e, "private-channel-sync: failed to persist sync completion");
-                    }
+                            session,
+                        },
+                    );
+                    return;
                 }
                 self.release_private_channel_sync_trigger_if_no_siblings(&wallet, channel_id);
             }
@@ -5406,61 +5665,93 @@ impl NetworkService {
                     self.backfill_config.server_max_concurrent_per_channel,
                     total_cap,
                 );
-                let response = if guard.is_none() {
+                // Round 4: the build runs OFF the swarm event loop under a
+                // node-wide build slot; a capped request (per-peer limits,
+                // session budget, or no free build slot for a
+                // session-starting page) is answered inline. A continuation
+                // page (cursor present) waits briefly for a slot instead
+                // (round-5 C-W1, `responder_build_slot`).
+                let admitted = guard.and_then(|g| match self.responder_build_slot(request.is_continuation()) {
+                    BuildSlot::Refuse => None,
+                    slot => Some((g, slot)),
+                });
+                let Some((guard, slot)) = admitted else {
                     debug!(
                         peer = %peer,
                         channel_id = request.channel_id,
-                        "reconcile: rate-limited or session-cap exhausted; \
+                        "reconcile: rate-limited, session-cap exhausted or no build slot; \
                          responding server_capped"
                     );
-                    reconcile::capped_response(&request)
-                } else {
-                    let now_unix = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    reconcile::build_response(
-                        &self.storage,
-                        &request,
-                        self.backfill_config.max_envelopes_per_response,
-                        now_unix,
-                    )
+                    if let Err(e) = self
+                        .swarm
+                        .behaviour_mut()
+                        .reconcile
+                        .send_response(channel, reconcile::capped_response(&request))
+                    {
+                        warn!(
+                            peer = %peer,
+                            channel_id = request.channel_id,
+                            error = ?e,
+                            "reconcile: send_response failed"
+                        );
+                    }
+                    return;
                 };
-                let envelopes_sent = response.envelopes.len();
-                let has_more = response.has_more;
-                // Audit C2: only count toward the cumulative session
-                // total when we actually served envelopes (skipping
-                // the server_capped / private-channel refusal paths
-                // keeps the cap from being burned on no-op
-                // responses).
-                if envelopes_sent > 0 {
-                    self.reconcile_limits.add_served(
-                        peer,
-                        request.channel_id,
-                        envelopes_sent as u64,
-                    );
+                let now_unix = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let storage = self.storage.clone();
+                let limits = Arc::clone(&self.reconcile_limits);
+                let max_envelopes = self.backfill_config.max_envelopes_per_response;
+                let tx = self.deferred_response_tx.clone();
+                // `Ok` = build slot; `Err` = a continuation timed out waiting
+                // (the waiter slot rides along with the capped response).
+                let run = move |slot: Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::OwnedSemaphorePermit>| {
+                    let build_permit = match slot {
+                        Ok(p) => p,
+                        Err(waiter) => {
+                            let _ = tx.send(DeferredResponse::Reconcile {
+                                peer,
+                                channel_id: request.channel_id,
+                                channel,
+                                response: reconcile::capped_response(&request),
+                                _guard: guard,
+                                _build_permit: waiter,
+                            });
+                            return;
+                        }
+                    };
+                    tokio::task::spawn_blocking(move || {
+                        let (response, work) =
+                            reconcile::build_response_metered(&storage, &request, max_envelopes, now_unix);
+                        // Audit C2 + round 4: charge the (peer, channel)
+                        // session budget for scan work as well as envelopes
+                        // sent (minimum 1 — empty pages, including the
+                        // private-channel refusal, are no longer free).
+                        limits.add_served(
+                            peer,
+                            request.channel_id,
+                            reconcile::budget_charge(response.envelopes.len(), work),
+                        );
+                        let _ = tx.send(DeferredResponse::Reconcile {
+                            peer,
+                            channel_id: request.channel_id,
+                            channel,
+                            response,
+                            _guard: guard,
+                            _build_permit: build_permit,
+                        });
+                    });
+                };
+                match slot {
+                    BuildSlot::Now(p) => run(Ok(p)),
+                    BuildSlot::Wait(w) => {
+                        let permits = self.responder_build_permits.clone();
+                        tokio::spawn(async move { run(wait_for_build_slot(permits, w).await) });
+                    }
+                    BuildSlot::Refuse => {}
                 }
-                if let Err(e) = self
-                    .swarm
-                    .behaviour_mut()
-                    .reconcile
-                    .send_response(channel, response)
-                {
-                    warn!(
-                        peer = %peer,
-                        channel_id = request.channel_id,
-                        error = ?e,
-                        "reconcile: send_response failed"
-                    );
-                }
-                drop(guard);
-                debug!(
-                    peer = %peer,
-                    channel_id = request.channel_id,
-                    envelopes_sent,
-                    has_more,
-                    "reconcile: served request"
-                );
             }
             Event::Message {
                 peer,
@@ -7805,5 +8096,150 @@ mod reconcile_comparison_tests {
     #[test]
     fn zero_threshold_disables_staleness_tracking() {
         assert!(!is_peer_stale(1_000_000, 0));
+    }
+}
+
+#[cfg(test)]
+mod responder_build_slot_tests {
+    //! Round-5 C-W1: the node-wide responder build cap refuses only
+    //! session-STARTING requests; a continuation page waits (bounded) for a
+    //! slot instead of being answered `server_capped`.
+    use super::*;
+    use tokio::sync::Semaphore;
+
+    fn sems() -> (Arc<Semaphore>, Arc<Semaphore>) {
+        (
+            Arc::new(Semaphore::new(MAX_CONCURRENT_RESPONDER_BUILDS)),
+            Arc::new(Semaphore::new(MAX_CONTINUATION_BUILD_WAITERS)),
+        )
+    }
+
+    #[test]
+    fn busy_slots_refuse_starts_but_let_continuations_wait() {
+        let (build, wait) = sems();
+        // Free slot: both kinds build now.
+        assert!(matches!(pick_build_slot(&build, &wait, false), BuildSlot::Now(_)));
+        assert!(matches!(pick_build_slot(&build, &wait, true), BuildSlot::Now(_)));
+        // All build slots busy.
+        let held: Vec<_> = (0..MAX_CONCURRENT_RESPONDER_BUILDS)
+            .map(|_| build.clone().try_acquire_owned().unwrap())
+            .collect();
+        assert!(matches!(pick_build_slot(&build, &wait, false), BuildSlot::Refuse));
+        let mut waiters = Vec::new();
+        for _ in 0..MAX_CONTINUATION_BUILD_WAITERS {
+            match pick_build_slot(&build, &wait, true) {
+                BuildSlot::Wait(w) => waiters.push(w),
+                _ => panic!("a continuation must be allowed to wait"),
+            }
+        }
+        // Waiters are bounded too.
+        assert!(matches!(pick_build_slot(&build, &wait, true), BuildSlot::Refuse));
+        drop(waiters);
+        assert!(matches!(pick_build_slot(&build, &wait, true), BuildSlot::Wait(_)));
+        drop(held);
+    }
+
+    /// Hold every build slot and run `continuation` (the request's own
+    /// classification, exactly what the handlers pass to
+    /// `responder_build_slot`) through the slot decision.
+    fn decide_when_busy(continuation: bool) -> &'static str {
+        let (build, wait) = sems();
+        let _held: Vec<_> = (0..MAX_CONCURRENT_RESPONDER_BUILDS)
+            .map(|_| build.clone().try_acquire_owned().unwrap())
+            .collect();
+        match pick_build_slot(&build, &wait, continuation) {
+            BuildSlot::Now(_) => "now",
+            BuildSlot::Wait(_) => "wait",
+            BuildSlot::Refuse => "refuse",
+        }
+    }
+
+    fn reconcile_req(cursor: Option<reconcile::ReconcileCursor>) -> reconcile::ReconcileRequest {
+        reconcile::ReconcileRequest {
+            channel_id: 7,
+            max_age_secs: u64::MAX,
+            cursor,
+            fingerprint: Vec::new(),
+            epoch_root_known: None,
+            round: 0,
+        }
+    }
+
+    /// Round-6: the reconcile handler's classification. A first page (no
+    /// cursor) STARTS a session and is refused `server_capped` when all 8
+    /// builds are busy; a cursor-bearing page is a continuation and waits
+    /// on the bounded waiter pool.
+    #[test]
+    fn reconcile_first_page_is_refused_and_cursor_page_waits_when_busy() {
+        let first = reconcile_req(None);
+        assert!(!first.is_continuation(), "a first page starts a session");
+        assert_eq!(decide_when_busy(first.is_continuation()), "refuse");
+
+        let next = reconcile_req(Some(reconcile::ReconcileCursor {
+            after_lamport_ts: 42,
+            after_msg_id: [3u8; 32],
+        }));
+        assert!(next.is_continuation(), "a cursor-bearing page continues a session");
+        assert_eq!(decide_when_busy(next.is_continuation()), "wait");
+    }
+
+    /// Round-6: the private-channel-sync handler's classification
+    /// (`PrivateChannelSyncRequest::is_continuation`) through the same
+    /// busy-slot decision.
+    #[test]
+    fn private_sync_first_page_is_refused_and_continuations_wait_when_busy() {
+        use private_channel_sync::PrivateChannelSyncCursor;
+        use reconcile::MetaCursor;
+        let sk = crate::crypto::generate_keypair();
+        let mut r = private_channel_sync::sign_request(
+            &sk, "testnet", "peer", "klv1w", 7, 1, u64::MAX, None, None,
+        );
+        r.meta_paging = true;
+        assert_eq!(decide_when_busy(r.is_continuation()), "refuse", "first metadata page");
+        r.meta_paging = false;
+        assert_eq!(decide_when_busy(r.is_continuation()), "refuse", "legacy first page");
+
+        r.meta_cursor = Some(MetaCursor { tier: 1, ts: 1, msg_id: [1; 32] });
+        assert_eq!(decide_when_busy(r.is_continuation()), "wait", "metadata cursor");
+        r.meta_cursor = None;
+        r.meta_done = true;
+        assert_eq!(decide_when_busy(r.is_continuation()), "wait", "first chat page after metadata");
+        r.meta_done = false;
+        r.cursor = Some(PrivateChannelSyncCursor { after_lamport_ts: 1, after_msg_id: [0u8; 32] });
+        assert_eq!(decide_when_busy(r.is_continuation()), "wait", "chat cursor");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_waiting_continuation_gets_the_next_free_slot() {
+        let (build, wait) = sems();
+        let held: Vec<_> = (0..MAX_CONCURRENT_RESPONDER_BUILDS)
+            .map(|_| build.clone().try_acquire_owned().unwrap())
+            .collect();
+        let w = wait.clone().try_acquire_owned().unwrap();
+        let b2 = build.clone();
+        let task = tokio::spawn(async move { wait_for_build_slot(b2, w).await });
+        tokio::time::sleep(CONTINUATION_BUILD_SLOT_WAIT / 2).await;
+        drop(held); // a build finishes
+        let got = task.await.unwrap();
+        assert!(got.is_ok(), "the continuation must get the freed slot");
+        // Its waiter slot was released.
+        assert_eq!(wait.available_permits(), MAX_CONTINUATION_BUILD_WAITERS);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_waiting_continuation_times_out_with_its_waiter_slot() {
+        let (build, wait) = sems();
+        let _held: Vec<_> = (0..MAX_CONCURRENT_RESPONDER_BUILDS)
+            .map(|_| build.clone().try_acquire_owned().unwrap())
+            .collect();
+        let w = wait.clone().try_acquire_owned().unwrap();
+        let got = wait_for_build_slot(build.clone(), w).await;
+        let waiter = got.expect_err("must time out while every slot stays busy");
+        // The waiter slot is still held (it rides along with the capped
+        // response), and released when that response is dropped.
+        assert_eq!(wait.available_permits(), MAX_CONTINUATION_BUILD_WAITERS - 1);
+        drop(waiter);
+        assert_eq!(wait.available_permits(), MAX_CONTINUATION_BUILD_WAITERS);
+        assert!(CONTINUATION_BUILD_SLOT_WAIT < std::time::Duration::from_secs(45));
     }
 }

@@ -23,7 +23,7 @@ use tracing::{debug, warn};
 use crate::crypto;
 use crate::crypto::signing;
 use crate::storage::identity::IdentityResolver;
-use crate::storage::rocks::Storage;
+use crate::storage::rocks::{MembershipEvent, Storage};
 use crate::storage::schema;
 use ed25519_dalek;
 
@@ -88,6 +88,93 @@ enum ChannelCreatorCheck {
     IsCreator,
     NotCreator,
     Unknown,
+}
+
+/// Outcome of a SUCCESSFUL `MessageRouter::verify_private_join` (private-
+/// channel join gate, l2-node 0.140.0). Every variant means "accept";
+/// a rejection is the `Err` side. Kept as distinct variants (rather than a
+/// bool) so tests can assert WHICH rule admitted a join — a verdict that
+/// silently skipped verification is the failure shape this guards against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JoinVerdict {
+    /// Rule 1: not a private channel — no proof needed (any attached
+    /// `invite` is ignored; it was already size-capped by validation).
+    NotPrivate,
+    /// Rule 2: the joiner is already a member, or is the creator.
+    AlreadyMemberOrCreator,
+    /// Rule 3: proofless join signed before
+    /// `private_join_proof_activation_ms`.
+    LegacyBeforeActivation,
+    /// Rules 4-8: a valid invite from the creator or a verified moderator.
+    Invited,
+    /// Rules 4-7 passed but the channel is unknown locally, so the
+    /// inviter's authority (rule 8) cannot be checked yet. Accepted and
+    /// stored; membership is NOT applied (there is no channel row) —
+    /// identical to the pre-gate unknown-channel behaviour.
+    InvitedUnknownChannel,
+}
+
+/// Which rule-8 branch authorized an invite's inviter. Carried out of the
+/// (crypto-heavy) verification so the apply step can re-check it under the
+/// membership lock with cheap reads only (security audit N2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InviterAuthority {
+    /// The inviter is the channel creator.
+    Creator,
+    /// A valid creator-signed grant dated `grant_ts`.
+    Grant { grant_ts: u64 },
+    /// The inviter is listed in local `CHANNEL_MODERATORS`.
+    LocalModerator,
+}
+
+/// Facts about the invite a join was admitted with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InviteFacts {
+    inviter: String,
+    invite_ts: u64,
+    /// `None` for an unknown channel (rule 8 not evaluated).
+    authority: Option<InviterAuthority>,
+    /// See `verify_inviter_authority`.
+    kill_horizon: u64,
+}
+
+/// A successful `verify_private_join`: the verdict plus what the apply
+/// step needs to re-check under the membership lock without repeating any
+/// signature verification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VerifiedJoin {
+    pub(crate) verdict: JoinVerdict,
+    invite: Option<InviteFacts>,
+}
+
+/// Why `MessageRouter::federate_bootstrap_gate` refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BootstrapGateError {
+    /// The host's `ChannelCreate` is not a valid, correctly-derived private
+    /// channel creation for this id (the host's fault — maps to 502).
+    BadBootstrap(String),
+    /// The caller is not entitled to join (maps to 403).
+    Denied(String),
+}
+
+/// What the join gate knows about a channel id locally.
+enum ChannelGateInfo {
+    /// A `CHANNELS` row exists.
+    Known { private: bool, creator: Option<String> },
+    /// No local row. `private` is inferred from the id namespace
+    /// (`channel_id > PRIVATE_CHANNEL_ID_FLOOR`).
+    Unknown { private: bool },
+}
+
+/// A `ChannelInvite` envelope that passed the join gate's structural,
+/// binding, time and removal-cutoff checks (rules 4-7).
+struct VerifiedInvite {
+    /// Wallet the invite's signing key resolves to.
+    inviter: String,
+    /// The invite envelope's signed timestamp.
+    invite_ts: u64,
+    /// The invite's raw `inviter_grant`, if any.
+    inviter_grant: Option<Vec<u8>>,
 }
 
 /// Rate limit categories with per-spec limits (spec Part 5).
@@ -345,6 +432,32 @@ pub struct MessageRouter {
     channel_verify_config: crate::config::ChannelVerifyConfig,
 }
 
+/// Reason of EVERY router rejection caused by a local infrastructure
+/// failure (storage, identity resolution) — a fixed string. The underlying
+/// error (RocksDB / anyhow text) is logged by `internal_error`, never put
+/// in the reason, because reasons reach HTTP clients;
+/// `api::routes::rejection_response` maps exactly this reason to a generic
+/// 500 (round-4 audit 9b). Step-7 wrappers pass it through unprefixed
+/// (`wrap_rejection`).
+pub(crate) const INTERNAL_ERROR_REASON: &str = "storage error";
+
+/// Log an internal failure with its detail and return the fixed
+/// `INTERNAL_ERROR_REASON` (see there).
+fn internal_error(context: &str, e: impl std::fmt::Display) -> String {
+    warn!(context, error = %e, "router: internal error (not echoed to the client)");
+    INTERNAL_ERROR_REASON.to_string()
+}
+
+/// Prefix a step-7 rejection reason with its step label — except the
+/// internal-error reason, which stays exact so the API can classify it.
+fn wrap_rejection(prefix: &str, e: String) -> String {
+    if e == INTERNAL_ERROR_REASON {
+        e
+    } else {
+        format!("{prefix}: {e}")
+    }
+}
+
 /// Rejection reason for step 4d (tiered identity). Shared with
 /// `network::handle_gossip_message`, which pattern-matches on this exact
 /// text to decide whether a `Rejected` result is a routine policy denial
@@ -517,7 +630,7 @@ impl MessageRouter {
         match self.storage.message_exists(&envelope.msg_id) {
             Ok(true) => return RouteResult::Duplicate,
             Ok(false) => {}
-            Err(e) => return RouteResult::Rejected(format!("storage error: {}", e)),
+            Err(e) => return RouteResult::Rejected(internal_error("storage", e)),
         }
 
         // Step 4a: Verify msg_id computation
@@ -540,7 +653,7 @@ impl MessageRouter {
         // storage, indexing, rate limiting, and authorization.
         let resolved_author = match self.identity.resolve(&envelope.author) {
             Ok(addr) => addr,
-            Err(e) => return RouteResult::Rejected(format!("identity resolution failed: {}", e)),
+            Err(e) => return RouteResult::Rejected(internal_error("identity resolution", e)),
         };
 
         // Device enc-key bindings MUST be authored directly by the WALLET (protocol
@@ -643,47 +756,47 @@ impl MessageRouter {
 
         // Step 7b: Check ban enforcement — banned users cannot post to channels
         if let Err(e) = self.check_channel_ban(&envelope, &resolved_author) {
-            return RouteResult::Rejected(format!("banned: {}", e));
+            return RouteResult::Rejected(wrap_rejection("banned", e));
         }
 
         // Step 7b2: Check mute enforcement — muted users cannot send messages/reactions
         if let Err(e) = self.check_channel_mute(&envelope, &resolved_author) {
-            return RouteResult::Rejected(format!("muted: {}", e));
+            return RouteResult::Rejected(wrap_rejection("muted", e));
         }
 
         // Step 7c: Authorize channel admin operations
-        if let Err(e) = self.authorize_channel_action(&envelope, &resolved_author) {
-            return RouteResult::Rejected(format!("unauthorized: {}", e));
+        if let Err(e) = self.authorize_channel_action(&envelope, &resolved_author, is_sync) {
+            return RouteResult::Rejected(wrap_rejection("unauthorized", e));
         }
 
         // Step 7d: Authorize edit/delete operations — author must match original, edits have 30-min window
         if let Err(e) = self.authorize_edit_delete(&envelope, &resolved_author, now_ms) {
-            return RouteResult::Rejected(format!("edit/delete denied: {}", e));
+            return RouteResult::Rejected(wrap_rejection("edit/delete denied", e));
         }
 
         // Step 7d2: Authorize DM reactions — reactor must be a participant of
         // the target DM conversation (audit W27 security follow-up).
         if let Err(e) = self.authorize_dm_reaction(&envelope, &resolved_author) {
-            return RouteResult::Rejected(format!("dm_reaction_denied: {}", e));
+            return RouteResult::Rejected(wrap_rejection("dm_reaction_denied", e));
         }
 
         // Step 7d3: Authorize DeletionRequest — a SingleMessage deletion may
         // only target the sender's own message (security audit, BLOCKING).
         if let Err(e) = self.authorize_deletion_request(&envelope, &resolved_author) {
-            return RouteResult::Rejected(format!("deletion_denied: {}", e));
+            return RouteResult::Rejected(wrap_rejection("deletion_denied", e));
         }
 
         // Step 7e: Read-only / broadcast channel enforcement — only creator and
         // moderators can post ChatMessage / ChatEdit / ChatDelete in ReadPublic
         // channels. Reactions remain open to all members. See protocol spec §3.6.
         if let Err(e) = self.check_readonly_channel(&envelope, &resolved_author) {
-            return RouteResult::Rejected(format!("broadcast_channel_post_denied: {}", e));
+            return RouteResult::Rejected(wrap_rejection("broadcast_channel_post_denied", e));
         }
 
         // Step 7f (P4): an `encryption_enabled` channel rejects plaintext-text chat
         // (no-downgrade guarantee). Encrypted + attachment-only messages pass.
         if let Err(e) = self.check_channel_encryption_required(&envelope) {
-            return RouteResult::Rejected(format!("channel_encryption_required: {}", e));
+            return RouteResult::Rejected(wrap_rejection("channel_encryption_required", e));
         }
 
         // Step 7g (audit final pre-mainnet W11): per-recipient DM storage cap.
@@ -694,7 +807,7 @@ impl MessageRouter {
         // rejected message would still consume disk as an orphaned,
         // unindexed MESSAGES row.
         if let Err(e) = self.reserve_dm_recipient_slot(&envelope) {
-            return RouteResult::Rejected(format!("dm_recipient_cap_exceeded: {}", e));
+            return RouteResult::Rejected(wrap_rejection("dm_recipient_cap_exceeded", e));
         }
 
         // Step 8: Store message (atomically increments total_messages counter)
@@ -711,11 +824,11 @@ impl MessageRouter {
                         .decrement_dm_recipient_count(payload.recipient.as_bytes());
                 }
             }
-            return RouteResult::Rejected(format!("storage error: {}", e));
+            return RouteResult::Rejected(internal_error("storage", e));
         }
 
         // Step 8b: Update indexes using resolved wallet address
-        let bot_changed = match self.update_indexes(&envelope, &resolved_author) {
+        let bot_changed = match self.update_indexes_with(&envelope, &resolved_author, is_sync) {
             Ok(changed) => changed,
             Err(e) => {
                 warn!(error = %e, "Failed to update indexes (message still stored)");
@@ -1414,8 +1527,10 @@ impl MessageRouter {
                     validation::validate_channel_unpin(p)
                 }
                 DeserializedPayload::ChannelInvite(ref p) => {
-                    validation::validate_channel_invite(p)
+                    validation::validate_channel_invite(p)?;
+                    validation::validate_channel_invite_expiry(p, envelope.timestamp)
                 }
+                DeserializedPayload::ChannelJoin(ref p) => validation::validate_channel_join(p),
                 DeserializedPayload::NewsRepost(ref p) => {
                     validation::validate_news_repost(resolved_author, p)
                 }
@@ -1642,7 +1757,7 @@ impl MessageRouter {
             // Channel not found: let downstream handle it. A truly orphan write
             // will be rejected by validation/index pathways.
             Ok(None) => return Ok(()),
-            Err(e) => return Err(format!("storage error: {}", e)),
+            Err(e) => return Err(internal_error("storage", e)),
         };
         let meta: serde_json::Value = match serde_json::from_slice(&data) {
             Ok(m) => m,
@@ -1695,7 +1810,12 @@ impl MessageRouter {
     /// Authorize channel admin operations per spec section 2.6.
     /// Verifies the sender has the required role/permissions.
     /// Uses `resolved_author` (wallet address) for all permission checks.
-    fn authorize_channel_action(&self, envelope: &Envelope, resolved_author: &str) -> Result<(), String> {
+    fn authorize_channel_action(
+        &self,
+        envelope: &Envelope,
+        resolved_author: &str,
+        is_sync: bool,
+    ) -> Result<(), String> {
         match envelope.msg_type {
             // Creator-only actions
             MessageType::ChannelAddModerator | MessageType::ChannelRemoveModerator => {
@@ -1800,40 +1920,25 @@ impl MessageRouter {
                     .ok_or("missing or invalid channel_id")?;
                 self.require_mod_permission(channel_id, resolved_author, "can_edit_info")
             }
-            // Private channel join: allow with explicit invite or via invite link.
-            // Knowing the channel_id (via shared invite link) is sufficient proof
-            // of invitation unless the owner has explicitly disabled invite links.
+            // Private-channel join gate (l2-node 0.140.0). Replaces the old
+            // `!has_invite && invite_links_disabled` check, which was always
+            // open in practice (`invite_links_disabled` had no writer) and
+            // fell through to Ok(()) for an unknown channel. Every private
+            // join signed at/after `private_join_proof_activation_ms` must
+            // now carry the inviter's signed `ChannelInvite`; see
+            // `verify_private_join` for the full rule list. The same check
+            // runs again in the apply step (`update_indexes`).
             MessageType::ChannelJoin => {
-                if let Ok(p) = rmp_serde::from_slice::<ChannelJoinPayload>(&envelope.payload) {
-                    if let Ok(Some(data)) = self.storage.get_cf(
-                        schema::cf::CHANNELS, &p.channel_id.to_be_bytes(),
-                    ) {
-                        if let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&data) {
-                            let is_private = match meta.get("channel_type") {
-                                Some(serde_json::Value::Number(n)) => n.as_u64() == Some(2),
-                                Some(serde_json::Value::String(s)) => s == "Private",
-                                _ => false,
-                            };
-                            if is_private {
-                                let invite_key = schema::encode_channel_invite_key(
-                                    p.channel_id, resolved_author,
-                                );
-                                let has_invite = self.storage.exists_cf(
-                                    schema::cf::CHANNEL_INVITES, &invite_key,
-                                ).unwrap_or(false);
-                                // Only reject if invite links are explicitly disabled
-                                let links_disabled = meta
-                                    .get("invite_links_disabled")
-                                    .and_then(|v| v.as_bool())
-                                    .unwrap_or(false);
-                                if !has_invite && links_disabled {
-                                    return Err("private channel: invite required".into());
-                                }
-                            }
-                        }
-                    }
-                }
-                Ok(())
+                let p = rmp_serde::from_slice::<ChannelJoinPayload>(&envelope.payload)
+                    .map_err(|e| format!("invalid channel join payload: {}", e))?;
+                self.verify_private_join(
+                    p.channel_id,
+                    resolved_author,
+                    envelope.timestamp,
+                    p.invite.as_deref(),
+                    is_sync,
+                )
+                .map(|_| ())
             }
             // Creator + any moderator. A channel this node has never seen
             // locally (out-of-order gossip, or — the common case now that
@@ -1844,33 +1949,45 @@ impl MessageRouter {
             // creator nor moderator status can be checked until the channel
             // actually exists locally, and the cross-node notification
             // delivery this exists for needs the message ACCEPTED
-            // regardless. This does NOT by itself grant anything — deferring
-            // authorization here is safe ONLY because `update_indexes`'s
-            // `ChannelInvite` apply step separately re-verifies creator/mod
-            // status before ever writing the `CHANNEL_INVITES` record
-            // `ChannelJoin` later trusts as invitation proof (security
-            // audit, CRITICAL, 2026-09-15 — the first version of this fix
-            // let an Unknown-channel invite write that record unverified,
-            // which let any wallet self-grant "invited" status on any
-            // private channel, including inviting itself, by targeting a
-            // node that hadn't federated it yet). See that apply step's
-            // comment for the full reasoning.
+            // regardless. Deferring is safe because an accepted invite
+            // GRANTS nothing by itself any more (l2-node 0.140.0 — the
+            // `CHANNEL_INVITES` record is no longer written): an invite only
+            // ever has an effect when presented inside a `ChannelJoin`, and
+            // `verify_private_join` re-verifies the inviter's authority
+            // there against whatever the JOINING node knows.
+            //
+            // For a KNOWN channel a moderator's invite is also accepted on
+            // a node that has not (yet) learned the moderator, if it carries
+            // a valid creator-signed `inviter_grant` (B5 fix — remote nodes
+            // used to reject every moderator-issued invite).
             MessageType::ChannelInvite => {
-                let channel_id = self
-                    .extract_channel_id(envelope)
-                    .ok_or("missing or invalid channel_id")?;
-                match self.channel_creator_check(channel_id, resolved_author)? {
-                    ChannelCreatorCheck::IsCreator | ChannelCreatorCheck::Unknown => {
-                        return Ok(());
-                    }
-                    ChannelCreatorCheck::NotCreator => {}
+                let p = rmp_serde::from_slice::<ChannelInvitePayload>(&envelope.payload)
+                    .map_err(|e| format!("invalid channel invite payload: {}", e))?;
+                match self.channel_gate_info(p.channel_id)? {
+                    ChannelGateInfo::Unknown { .. } => Ok(()),
+                    ChannelGateInfo::Known { creator, .. } => self.verify_inviter_authority(
+                        p.channel_id,
+                        creator.as_deref(),
+                        resolved_author,
+                        envelope.timestamp,
+                        p.inviter_grant.as_deref(),
+                        envelope.timestamp,
+                    )
+                    .map(|_| ())
+                    .map_err(|e| {
+                        // A storage error is an internal failure, not an
+                        // authorization verdict (round-2 audit N-i): log it
+                        // and surface it as such (`Rejected` is the
+                        // router's local/non-penalizing outcome, so a
+                        // relaying peer is not punished for our I/O).
+                        if e == INTERNAL_ERROR_REASON {
+                            // Detail already logged by `internal_error`.
+                            e
+                        } else {
+                            "only creator or moderators can invite users".to_string()
+                        }
+                    }),
                 }
-                if self.storage.is_channel_moderator(channel_id, resolved_author)
-                    .unwrap_or(false)
-                {
-                    return Ok(());
-                }
-                Err("only creator or moderators can invite users".into())
             }
             // Private channel key distribution — creator or moderator of the channel.
             // Only valid on the anchor node (where the channel was created).
@@ -1881,7 +1998,7 @@ impl MessageRouter {
                 // Verify this is a private channel and we are the anchor node
                 let key = channel_id.to_be_bytes();
                 let meta_bytes = self.storage.get_cf(schema::cf::CHANNELS, &key)
-                    .map_err(|e| format!("storage error: {}", e))?
+                    .map_err(|e| internal_error("storage", e))?
                     .ok_or_else(|| "channel not found".to_string())?;
                 let meta: serde_json::Value = serde_json::from_slice(&meta_bytes)
                     .map_err(|e| format!("invalid channel metadata: {}", e))?;
@@ -1955,7 +2072,7 @@ impl MessageRouter {
                         let max_epoch = self
                             .storage
                             .max_channel_key_epoch(&expected)
-                            .map_err(|e| format!("storage error checking epoch: {}", e))?;
+                            .map_err(|e| internal_error("channel key epoch", e))?;
                         if p.epoch > max_epoch.saturating_add(CHANNEL_KEY_EPOCH_MAX_JUMP) {
                             return Err("channel key epoch too far ahead of the current epoch".into());
                         }
@@ -2021,7 +2138,7 @@ impl MessageRouter {
         let original_bytes = self
             .storage
             .get_cf(schema::cf::MESSAGES, &target_id)
-            .map_err(|e| format!("storage error: {}", e))?
+            .map_err(|e| internal_error("storage", e))?
             .ok_or_else(|| "target message not found".to_string())?;
 
         // 2. Deserialize the original envelope to get its author
@@ -2074,7 +2191,7 @@ impl MessageRouter {
         let original_resolved = self
             .identity
             .resolve(&original_envelope.author)
-            .map_err(|e| format!("failed to resolve original author: {}", e))?;
+            .map_err(|e| internal_error("resolve original author", e))?;
 
         // 5. Verify authorship — only the original author can edit/delete their message
         if resolved_author != original_resolved {
@@ -2276,14 +2393,14 @@ impl MessageRouter {
         let target_bytes = self
             .storage
             .get_cf(schema::cf::MESSAGES, &target_id)
-            .map_err(|e| format!("storage error: {}", e))?
+            .map_err(|e| internal_error("storage", e))?
             .ok_or_else(|| "target message not found".to_string())?;
         let target_envelope: Envelope = rmp_serde::from_slice(&target_bytes)
             .map_err(|e| format!("failed to deserialize target message: {}", e))?;
         let target_resolved = self
             .identity
             .resolve(&target_envelope.author)
-            .map_err(|e| format!("failed to resolve target author: {}", e))?;
+            .map_err(|e| internal_error("resolve target author", e))?;
         if resolved_author != target_resolved {
             return Err("only the original author can delete this message".into());
         }
@@ -2323,7 +2440,7 @@ impl MessageRouter {
         let original_bytes = self
             .storage
             .get_cf(schema::cf::MESSAGES, &payload.target_id)
-            .map_err(|e| format!("storage error: {}", e))?
+            .map_err(|e| internal_error("storage", e))?
             .ok_or_else(|| "target message not found".to_string())?;
         let original_envelope: Envelope = rmp_serde::from_slice(&original_bytes)
             .map_err(|e| format!("failed to deserialize original message: {}", e))?;
@@ -2335,7 +2452,7 @@ impl MessageRouter {
         let original_sender = self
             .identity
             .resolve(&original_envelope.author)
-            .map_err(|e| format!("failed to resolve original DM sender: {}", e))?;
+            .map_err(|e| internal_error("resolve original DM sender", e))?;
 
         if resolved_author != original_sender && resolved_author != dm_payload.recipient {
             return Err("only DM conversation participants can react to this message".into());
@@ -2436,7 +2553,7 @@ impl MessageRouter {
                 }
             }
             Ok(None) => Err(format!("channel {} not found", channel_id)),
-            Err(e) => Err(format!("storage error: {}", e)),
+            Err(e) => Err(internal_error("storage", e)),
         }
     }
 
@@ -2459,7 +2576,7 @@ impl MessageRouter {
                 _ => ChannelCreatorCheck::NotCreator,
             }),
             Ok(None) => Ok(ChannelCreatorCheck::Unknown),
-            Err(e) => Err(format!("storage error: {}", e)),
+            Err(e) => Err(internal_error("storage", e)),
         }
     }
 
@@ -2469,7 +2586,7 @@ impl MessageRouter {
         let key = schema::encode_channel_member_key(channel_id, address);
         self.storage
             .exists_cf(schema::cf::CHANNEL_MEMBERS, &key)
-            .map_err(|e| format!("storage error: {}", e))
+            .map_err(|e| internal_error("storage", e))
     }
 
     /// Check if the user is the creator or a moderator with the required permission.
@@ -2502,8 +2619,715 @@ impl MessageRouter {
                 }
             }
             Ok(None) => Err("not a moderator of this channel".into()),
-            Err(e) => Err(format!("storage error: {}", e)),
+            Err(e) => Err(internal_error("storage", e)),
         }
+    }
+
+    // ---------------------------------------------------------------
+    // Private-channel join gate (l2-node 0.140.0)
+    // ---------------------------------------------------------------
+
+    /// The effective `PRIVATE_JOIN_PROOF_ACTIVATION_MS`. Always `0` on
+    /// mainnet regardless of config (security audit B1): the grandfather
+    /// window exists only for testnet history. Enforced here as well as at
+    /// config load so a router built from any config path is safe.
+    fn join_proof_activation_ms(&self) -> u64 {
+        if self.network == "mainnet" {
+            return 0;
+        }
+        self.channel_verify_config.private_join_proof_activation_ms
+    }
+
+    /// Read what the join gate needs about `channel_id`. A storage error
+    /// is returned as `Err` (the gate fails CLOSED on it); a corrupt row is
+    /// treated as a known PRIVATE channel with no creator, which only ever
+    /// makes the gate stricter.
+    fn channel_gate_info(&self, channel_id: u64) -> Result<ChannelGateInfo, String> {
+        match self.storage.get_cf(schema::cf::CHANNELS, &channel_id.to_be_bytes()) {
+            Ok(Some(data)) => match serde_json::from_slice::<serde_json::Value>(&data) {
+                Ok(meta) => {
+                    let private = match meta.get("channel_type") {
+                        Some(serde_json::Value::Number(n)) => n.as_u64() == Some(2),
+                        Some(serde_json::Value::String(s)) => s == "Private",
+                        _ => false,
+                    };
+                    let creator = meta
+                        .get("creator")
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
+                    Ok(ChannelGateInfo::Known { private, creator })
+                }
+                Err(_) => Ok(ChannelGateInfo::Known { private: true, creator: None }),
+            },
+            Ok(None) => Ok(ChannelGateInfo::Unknown {
+                private: channel_id > PRIVATE_CHANNEL_ID_FLOOR,
+            }),
+            Err(e) => Err(internal_error("storage", e)),
+        }
+    }
+
+    /// True when the join gate treats `channel_id` as private: a known row
+    /// typed Private, or an unknown id above `PRIVATE_CHANNEL_ID_FLOOR`.
+    /// A storage error counts as private (fail closed).
+    fn channel_is_private_for_gate(&self, channel_id: u64) -> bool {
+        match self.channel_gate_info(channel_id) {
+            Ok(ChannelGateInfo::Known { private, .. }) => private,
+            Ok(ChannelGateInfo::Unknown { private }) => private,
+            Err(_) => true,
+        }
+    }
+
+    /// Clamp a sender-chosen envelope timestamp before it is stored as a
+    /// role watermark: never further in the future than `now + drift`.
+    /// The live path already pins timestamps to ±drift; this bounds the
+    /// sync path, where a far-future kick/demotion timestamp would
+    /// otherwise lock a user out (or kill a grant) until that date.
+    fn clamp_watermark_ts(ts: u64) -> u64 {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        ts.min(now_ms.saturating_add(super::envelope::MAX_TIMESTAMP_DRIFT_MS))
+    }
+
+    /// Decode + cryptographically verify an EMBEDDED envelope (an invite
+    /// inside a join, or a moderator grant inside an invite): size cap,
+    /// structure, exact `expected` type, msg_id binding and signature
+    /// (`verify_signature`'s ordinary Ogmara/Klever-message path — the
+    /// claim-string paths only exist for device/enc types, which `expected`
+    /// can never be). Returns the envelope and the wallet its signing key
+    /// resolves to. An unknown device key resolves to itself, so an
+    /// unresolvable signer can never match a creator/moderator wallet —
+    /// the callers' identity comparisons fail closed.
+    fn verify_embedded_envelope(
+        &self,
+        raw: &[u8],
+        expected: MessageType,
+        max_len: usize,
+    ) -> Result<(Envelope, String), String> {
+        if raw.is_empty() || raw.len() > max_len {
+            return Err(format!("embedded {:?} exceeds {} bytes", expected, max_len));
+        }
+        let env: Envelope = rmp_serde::from_slice(raw)
+            .map_err(|_| format!("embedded {:?} is not a valid envelope", expected))?;
+        env.validate_structure()
+            .map_err(|e| format!("embedded {:?}: {}", expected, e))?;
+        // Type confusion guard: an embedded proof must be EXACTLY the type
+        // its slot expects (a join can't smuggle e.g. a ChannelAddModerator
+        // as its "invite", and an invite can't nest another invite as its
+        // "grant").
+        if env.msg_type != expected {
+            return Err(format!(
+                "embedded envelope is {:?}, expected {:?}",
+                env.msg_type, expected
+            ));
+        }
+        self.verify_msg_id(&env)
+            .map_err(|e| format!("embedded {:?}: {}", expected, e))?;
+        self.verify_signature(&env)
+            .map_err(|_| format!("embedded {:?}: signature verification failed", expected))?;
+        let signer = self
+            .identity
+            .resolve(&env.author)
+            .map_err(|e| internal_error("embedded envelope identity resolution", e))?;
+        Ok((env, signer))
+    }
+
+    /// Rules 4-7 of the join gate: the attached invite is a genuine signed
+    /// `ChannelInvite` (4), bound to this channel and this joiner (5),
+    /// inside its validity window relative to the JOIN's signed timestamp
+    /// (6), and issued AFTER the joiner's last kick/ban on this node (7).
+    /// Uses envelope timestamps only (never the local clock), so the same
+    /// historical join verifies identically on the live and the sync path.
+    fn verify_invite_proof(
+        &self,
+        channel_id: u64,
+        joiner: &str,
+        join_ts: u64,
+        invite_raw: &[u8],
+    ) -> Result<VerifiedInvite, String> {
+        // Rule 4 — structure + signature + inviter identity.
+        let (inv_env, inviter) = self.verify_embedded_envelope(
+            invite_raw,
+            MessageType::ChannelInvite,
+            validation::MAX_JOIN_INVITE_BYTES,
+        )?;
+        let p = match deserialize_payload(MessageType::ChannelInvite, &inv_env.payload) {
+            Ok(DeserializedPayload::ChannelInvite(p)) => p,
+            _ => return Err("embedded invite payload is malformed".into()),
+        };
+        validation::validate_channel_invite(&p).map_err(|e| format!("embedded invite: {}", e))?;
+        validation::validate_channel_invite_expiry(&p, inv_env.timestamp)
+            .map_err(|e| format!("embedded invite: {}", e))?;
+
+        // Rule 5 — binding. A forwarded invite names someone else.
+        if p.channel_id != channel_id {
+            return Err("invite is for a different channel".into());
+        }
+        if p.target_user != joiner {
+            return Err("invite is addressed to a different wallet".into());
+        }
+
+        // Rule 6 — time, from signed envelope timestamps only. The invite
+        // may not be dated (beyond clock skew) after the join that presents
+        // it, and the join must not be later than the invite's expiry. The
+        // TTL bound itself (ts < exp <= ts + MAX) was checked above.
+        let invite_ts = inv_env.timestamp;
+        if invite_ts > join_ts.saturating_add(super::envelope::MAX_TIMESTAMP_DRIFT_MS) {
+            return Err("invite is dated after the join".into());
+        }
+        let exp = validation::effective_invite_expiry(&p, invite_ts);
+        if join_ts > exp {
+            return Err("invite has expired".into());
+        }
+
+        // Rule 7 — removal cutoff: an invite issued at or before the
+        // joiner's latest kick/ban on this channel is dead (a kicked user
+        // can't replay the invite they were originally let in with).
+        match self.storage.channel_removal_cutoff(channel_id, joiner) {
+            Ok(Some(cutoff)) if invite_ts <= cutoff => {
+                return Err("invite predates the joiner's removal from this channel".into());
+            }
+            Ok(_) => {}
+            Err(e) => return Err(internal_error("storage", e)),
+        }
+
+        Ok(VerifiedInvite {
+            inviter,
+            invite_ts,
+            inviter_grant: p.inviter_grant,
+        })
+    }
+
+    /// Verify a raw moderator GRANT (a creator-signed `ChannelAddModerator`
+    /// envelope) naming `inviter` as a moderator of `channel_id`, issued no
+    /// later than `invite_ts`. Returns the grant's signed timestamp.
+    fn verify_moderator_grant(
+        &self,
+        channel_id: u64,
+        creator: &str,
+        inviter: &str,
+        invite_ts: u64,
+        grant_raw: &[u8],
+    ) -> Result<u64, String> {
+        let (g_env, signer) = self.verify_embedded_envelope(
+            grant_raw,
+            MessageType::ChannelAddModerator,
+            validation::MAX_INVITER_GRANT_BYTES,
+        )?;
+        if signer != creator {
+            return Err("moderator grant is not signed by the channel creator".into());
+        }
+        let p = match deserialize_payload(MessageType::ChannelAddModerator, &g_env.payload) {
+            Ok(DeserializedPayload::ChannelAddModerator(p)) => p,
+            _ => return Err("moderator grant payload is malformed".into()),
+        };
+        if p.channel_id != channel_id {
+            return Err("moderator grant is for a different channel".into());
+        }
+        if p.target_user != inviter {
+            return Err("moderator grant names a different wallet than the inviter".into());
+        }
+        if g_env.timestamp > invite_ts {
+            return Err("moderator grant is dated after the invite".into());
+        }
+        Ok(g_env.timestamp)
+    }
+
+    /// Rule 8 of the join gate (also used when a `ChannelInvite` itself is
+    /// ingested): is `inviter` entitled to invite into `channel_id`?
+    ///   * the creator always is;
+    ///   * else a valid creator-signed grant naming the inviter, dated no
+    ///     later than the invite, that no stored moderator removal kills.
+    ///     A removal kills the grant when `rm_ts > grant_ts` AND
+    ///     `rm_ts <= kill_horizon` — callers pass the live join timestamp
+    ///     for a live join, and the INVITE timestamp for a synced
+    ///     join or an invite ingest (a historical invite issued while the
+    ///     inviter was still a moderator stays valid in backfill);
+    ///   * else the inviter is listed in local `CHANNEL_MODERATORS` (an
+    ///     invite issued before grants existed, on a node that knows the
+    ///     moderator).
+    fn verify_inviter_authority(
+        &self,
+        channel_id: u64,
+        creator: Option<&str>,
+        inviter: &str,
+        invite_ts: u64,
+        grant: Option<&[u8]>,
+        kill_horizon: u64,
+    ) -> Result<InviterAuthority, String> {
+        if creator == Some(inviter) {
+            return Ok(InviterAuthority::Creator);
+        }
+        let mut grant_error: Option<String> = None;
+        if let (Some(grant_raw), Some(creator)) = (grant, creator) {
+            match self.verify_moderator_grant(channel_id, creator, inviter, invite_ts, grant_raw) {
+                Ok(grant_ts) => {
+                    let rm = self
+                        .storage
+                        .channel_role_watermark(
+                            channel_id,
+                            schema::role_watermark_kind::MODERATOR_REMOVED,
+                            inviter,
+                        )
+                        .map_err(|e| internal_error("storage", e))?;
+                    match rm {
+                        Some(rm_ts) if rm_ts > grant_ts && rm_ts <= kill_horizon => {
+                            grant_error = Some(
+                                "the inviter's moderator grant was revoked".to_string(),
+                            );
+                        }
+                        _ => return Ok(InviterAuthority::Grant { grant_ts }),
+                    }
+                }
+                Err(e) => grant_error = Some(e),
+            }
+        }
+        if self.local_moderator_authorizes(channel_id, inviter, invite_ts)? {
+            return Ok(InviterAuthority::LocalModerator);
+        }
+        if let Some(e) = grant_error {
+            debug!(channel_id, inviter, reason = %e, "inviter grant not accepted");
+        }
+        Err("private channel: inviter is not creator or moderator".to_string())
+    }
+
+    /// Rule 8's local-moderator fallback (security audit N3): `inviter` is
+    /// listed in `CHANNEL_MODERATORS` AND that listing already covered the
+    /// invite's timestamp. A record carries the `grant_ts` of the grant it
+    /// came from; an invite signed BEFORE that grant (e.g. while the
+    /// moderator was demoted, or before their first promotion) does not
+    /// become valid through a later re-promotion. A record written before
+    /// 0.140.0 has no `grant_ts`; it is accepted unless a demotion at or
+    /// after the invite is recorded. Strict by design: a creator
+    /// re-issuing a grant (e.g. to change permissions) invalidates that
+    /// moderator's earlier, grant-less invites on nodes that rely on this
+    /// fallback — invites carrying their grant are unaffected.
+    fn local_moderator_authorizes(
+        &self,
+        channel_id: u64,
+        inviter: &str,
+        invite_ts: u64,
+    ) -> Result<bool, String> {
+        let key = schema::encode_channel_moderator_key(channel_id, inviter);
+        let Some(record) = self
+            .storage
+            .get_cf(schema::cf::CHANNEL_MODERATORS, &key)
+            .map_err(|e| internal_error("storage", e))?
+        else {
+            return Ok(false);
+        };
+        let grant_ts = serde_json::from_slice::<serde_json::Value>(&record)
+            .ok()
+            .and_then(|v| v.get("grant_ts").and_then(|t| t.as_u64()));
+        match grant_ts {
+            Some(g) => Ok(g <= invite_ts),
+            None => {
+                let demoted = self
+                    .storage
+                    .channel_role_watermark(
+                        channel_id,
+                        schema::role_watermark_kind::MODERATOR_REMOVED,
+                        inviter,
+                    )
+                    .map_err(|e| internal_error("storage", e))?;
+                Ok(demoted.is_none_or(|m| m < invite_ts))
+            }
+        }
+    }
+
+    /// The `ChannelJoin` membership apply: make `author` a member of
+    /// `channel_id` if the channel row exists, `author` is not already a
+    /// member, the join passes the private-join gate against current state
+    /// (`verify_private_join`, crypto OUTSIDE the lock) and the cheap
+    /// authoritative re-checks (`recheck_join_locked`, INSIDE it, right
+    /// before the write). Idempotent; failures are logged, never errors.
+    fn apply_join_membership(
+        &self,
+        channel_id: u64,
+        author: &str,
+        join_ts: u64,
+        invite: Option<&[u8]>,
+        is_sync: bool,
+    ) {
+        // Cheap reads first (security audit N2): an unknown channel never
+        // gets membership applied, and an existing member is a no-op —
+        // neither needs the signature work.
+        let row_exists = self
+            .storage
+            .exists_cf(schema::cf::CHANNELS, &channel_id.to_be_bytes())
+            .unwrap_or(false);
+        if !row_exists || self.is_channel_member(channel_id, author).unwrap_or(true) {
+            return;
+        }
+        // Full re-verification (crypto) OUTSIDE the lock...
+        match self.verify_private_join(channel_id, author, join_ts, invite, is_sync) {
+            // ...then only cheap, authoritative re-checks (ban, removal
+            // cutoff, inviter authority) INSIDE it, immediately before the
+            // write.
+            Ok(v) => {
+                let _ = self.storage.add_channel_member_checked(
+                    channel_id,
+                    author,
+                    join_ts,
+                    "member",
+                    || self.recheck_join_locked(channel_id, author, &v),
+                );
+            }
+            Err(reason) => {
+                debug!(
+                    channel_id,
+                    author = %author,
+                    %reason,
+                    "ChannelJoin accepted earlier but failed the apply-time re-check — membership not applied"
+                );
+            }
+        }
+    }
+
+    /// Re-apply a held-back `ChannelJoin` (`join_id`, signed at `join_ts`)
+    /// that a later-delivered, OLDER `ChannelLeave` of the same author just
+    /// promoted into the metadata index (round-5 audit S-W1). Loads the
+    /// stored envelope and runs the normal join apply with sync semantics —
+    /// exactly what a late node replaying the index does with it. The join
+    /// is re-gated from scratch: the author is no longer a member, so a
+    /// private channel needs the join's own invite proof.
+    fn reapply_promoted_join(&self, channel_id: u64, author: &str, join_ts: u64, join_id: &[u8; 32]) {
+        let Some(env) = self
+            .storage
+            .get_message(join_id)
+            .ok()
+            .flatten()
+            .and_then(|b| rmp_serde::from_slice::<Envelope>(&b).ok())
+        else {
+            return;
+        };
+        if env.msg_type != MessageType::ChannelJoin || env.timestamp != join_ts {
+            return;
+        }
+        let Ok(payload) = rmp_serde::from_slice::<ChannelJoinPayload>(&env.payload) else {
+            return;
+        };
+        if payload.channel_id != channel_id {
+            return;
+        }
+        self.apply_join_membership(channel_id, author, join_ts, payload.invite.as_deref(), true);
+    }
+
+    /// The cheap re-check the join apply step (and `federate_channel`'s
+    /// final insert) runs INSIDE the membership lock, right before the
+    /// member row is written (protocol §3.9.1 "re-check on apply"). No
+    /// signature work — `verify_private_join` already did that outside the
+    /// lock (security audit N2) — only reads of state that a concurrent
+    /// kick/ban/demotion can change: active ban, removal cutoff (rule 7)
+    /// and the inviter's authority (rule 8). The removal-vs-join-timestamp
+    /// check runs right after this inside `add_channel_member_checked`.
+    /// Any storage error fails closed.
+    fn recheck_join_locked(&self, channel_id: u64, joiner: &str, v: &VerifiedJoin) -> bool {
+        // A join admitted while the channel was unknown never had rule 8
+        // evaluated — never apply it, even if the row appeared meanwhile.
+        if v.verdict == JoinVerdict::InvitedUnknownChannel {
+            return false;
+        }
+        if self.storage.is_channel_banned(channel_id, joiner).unwrap_or(true) {
+            return false;
+        }
+        let Some(f) = v.invite.as_ref() else { return true };
+        match self.storage.channel_removal_cutoff(channel_id, joiner) {
+            Ok(Some(cutoff)) if f.invite_ts <= cutoff => return false,
+            Ok(_) => {}
+            Err(_) => return false,
+        }
+        match f.authority {
+            None | Some(InviterAuthority::Creator) => true,
+            Some(InviterAuthority::Grant { grant_ts }) => match self.storage.channel_role_watermark(
+                channel_id,
+                schema::role_watermark_kind::MODERATOR_REMOVED,
+                &f.inviter,
+            ) {
+                Ok(Some(m)) => !(m > grant_ts && m <= f.kill_horizon),
+                Ok(None) => true,
+                Err(_) => false,
+            },
+            Some(InviterAuthority::LocalModerator) => self
+                .local_moderator_authorizes(channel_id, &f.inviter, f.invite_ts)
+                .unwrap_or(false),
+        }
+    }
+
+    /// The private-channel join gate (l2-node 0.140.0). Decides whether a
+    /// `ChannelJoin` by `joiner` (signed at `join_ts`) may be accepted.
+    /// Called from `authorize_channel_action`, AGAIN from the join apply
+    /// step (re-check on apply, against fresh state), and from
+    /// `federate_channel`. Rules, in order:
+    ///
+    /// 1. Not private (row typed non-Private, or unknown id at/below the
+    ///    floor) → accept; an attached invite is ignored.
+    /// 2. Joiner already a member, or the creator → accept (idempotent).
+    /// 3. No invite → accept only if `join_ts < activation`, else reject.
+    /// 4. Rules 4-7 → `verify_invite_proof`.
+    /// 5. Rule 8: channel known → `verify_inviter_authority`; unknown →
+    ///    accept structurally, membership is not applied (no row).
+    ///
+    /// The ban check is NOT here: `check_channel_ban` (Step 7b) already
+    /// runs for every `ChannelJoin`, and `federate_channel` calls its own.
+    pub(crate) fn verify_private_join(
+        &self,
+        channel_id: u64,
+        joiner: &str,
+        join_ts: u64,
+        invite: Option<&[u8]>,
+        is_sync: bool,
+    ) -> Result<VerifiedJoin, String> {
+        let plain = |verdict| Ok(VerifiedJoin { verdict, invite: None });
+        // Rule 1.
+        let info = self.channel_gate_info(channel_id)?;
+        let (known, creator) = match info {
+            ChannelGateInfo::Known { private: false, .. }
+            | ChannelGateInfo::Unknown { private: false } => return plain(JoinVerdict::NotPrivate),
+            ChannelGateInfo::Known { private: true, creator } => (true, creator),
+            ChannelGateInfo::Unknown { private: true } => (false, None),
+        };
+
+        // Rule 2.
+        if known
+            && (creator.as_deref() == Some(joiner) || self.is_channel_member(channel_id, joiner)?)
+        {
+            return plain(JoinVerdict::AlreadyMemberOrCreator);
+        }
+
+        // Rule 3.
+        let Some(invite_raw) = invite else {
+            if join_ts < self.join_proof_activation_ms() {
+                return plain(JoinVerdict::LegacyBeforeActivation);
+            }
+            return Err("private channel: invite proof required".into());
+        };
+
+        // Rules 4-7.
+        let inv = self.verify_invite_proof(channel_id, joiner, join_ts, invite_raw)?;
+
+        // Rule 8.
+        let kill_horizon = if is_sync { inv.invite_ts } else { join_ts };
+        if !known {
+            return Ok(VerifiedJoin {
+                verdict: JoinVerdict::InvitedUnknownChannel,
+                invite: Some(InviteFacts {
+                    inviter: inv.inviter,
+                    invite_ts: inv.invite_ts,
+                    authority: None,
+                    kill_horizon,
+                }),
+            });
+        }
+        let authority = self.verify_inviter_authority(
+            channel_id,
+            creator.as_deref(),
+            &inv.inviter,
+            inv.invite_ts,
+            inv.inviter_grant.as_deref(),
+            kill_horizon,
+        )?;
+        Ok(VerifiedJoin {
+            verdict: JoinVerdict::Invited,
+            invite: Some(InviteFacts {
+                inviter: inv.inviter,
+                invite_ts: inv.invite_ts,
+                authority: Some(authority),
+                kill_horizon,
+            }),
+        })
+    }
+
+    /// `federate_channel`'s pre-fetch gate. Runs BEFORE any outbound DNS/
+    /// HTTP request to the caller-supplied host.
+    ///
+    /// **What it does NOT do (security audit W1, corrected claim):** for a
+    /// channel this node does NOT know it cannot verify inviter AUTHORITY —
+    /// nobody's creator/moderator status is known yet, and a self-signed
+    /// "invite" passes rules 4-7. So it is NOT an SSRF/fetch
+    /// barrier against an authenticated caller; the SSRF-validated fetch
+    /// stays reachable for any authenticated wallet exactly as in 0.139.0.
+    /// That surface is bounded instead by `federate_channel`'s per-wallet
+    /// outbound-fetch limit, the fetch concurrency cap, DNS/fetch timeouts,
+    /// the per-IP API governor and connect-to-validated-IP pinning.
+    ///
+    /// What it DOES decide, cheaply:
+    ///  * channel KNOWN locally: the caller must already be a member or
+    ///    the creator, or attach an invite passing the FULL rules 4-8
+    ///    (`now_ms` as the join time) — inviter authority is checkable
+    ///    because the creator/moderators are known locally;
+    ///  * channel UNKNOWN: no invite is fine (the caller may be the
+    ///    creator; `federate_bootstrap_gate` decides after the fetch,
+    ///    before anything is stored); an attached invite must pass rules
+    ///    4-7 now.
+    pub(crate) fn federate_prefetch_gate(
+        &self,
+        channel_id: u64,
+        caller: &str,
+        now_ms: u64,
+        invite: Option<&[u8]>,
+    ) -> Result<(), String> {
+        match self.channel_gate_info(channel_id)? {
+            // A known NON-private channel needs no invite: the handler
+            // answers the specified 400 "only private channels need
+            // federation" for it (round-3: this used to 403 a non-member).
+            ChannelGateInfo::Known { private: false, .. } => Ok(()),
+            ChannelGateInfo::Known { creator, .. } => {
+                if creator.as_deref() == Some(caller) || self.is_channel_member(channel_id, caller)? {
+                    return Ok(());
+                }
+                // KNOWN channel (round-2 audit N-b): creator and moderators
+                // are known locally, so run the FULL rules 4-8 here — a
+                // self-signed invite must not trigger the outbound fetch,
+                // the envelope replay or the `federated_from` rewrite.
+                let Some(raw) = invite else {
+                    return Err("private channel: invite proof required".into());
+                };
+                let inv = self.verify_invite_proof(channel_id, caller, now_ms, raw)?;
+                self.verify_inviter_authority(
+                    channel_id,
+                    creator.as_deref(),
+                    &inv.inviter,
+                    inv.invite_ts,
+                    inv.inviter_grant.as_deref(),
+                    now_ms,
+                )
+                .map(|_| ())
+            }
+            // UNKNOWN channel: no invite is fine (the caller may be the
+            // creator); an attached invite is checked structurally (4-7)
+            // now and fully by `federate_bootstrap_gate` after the fetch.
+            ChannelGateInfo::Unknown { .. } => match invite {
+                Some(raw) => self.verify_invite_proof(channel_id, caller, now_ms, raw).map(|_| ()),
+                None => Ok(()),
+            },
+        }
+    }
+
+    /// `federate_channel`'s verify-then-apply gate for a channel this node
+    /// has NEVER seen. Runs on the host's bootstrap `ChannelCreate` BEFORE
+    /// `process_synced_message` stores anything, so a rejection leaves no
+    /// channel row, no creator member, no federation slot and no topic
+    /// subscription behind — by ordering, with no rollback code.
+    ///
+    /// 1. The envelope is a genuine (msg_id + signature) `ChannelCreate`
+    ///    for exactly `channel_id`, typed Private, carrying
+    ///    `id_derivation_ts`, whose id matches its Keccak derivation from
+    ///    the resolved creator wallet. The derivation is REQUIRED here
+    ///    regardless of `[channel_verify] require_private_id_derivation`:
+    ///    this path is a member's own entry decision, so a legacy channel
+    ///    without the field can only be entered via a node that knows it.
+    /// 2. The caller is that creator, OR attached an invite passing rules
+    ///    4-8 against that creator (live semantics, `now_ms` = join time).
+    pub(crate) fn federate_bootstrap_gate(
+        &self,
+        create_raw: &[u8],
+        channel_id: u64,
+        caller: &str,
+        now_ms: u64,
+        invite: Option<&[u8]>,
+    ) -> Result<(), BootstrapGateError> {
+        const MAX_BOOTSTRAP_CREATE_BYTES: usize = 16 * 1024;
+        let bad = |e: String| BootstrapGateError::BadBootstrap(e);
+        let (env, creator) = self
+            .verify_embedded_envelope(create_raw, MessageType::ChannelCreate, MAX_BOOTSTRAP_CREATE_BYTES)
+            .map_err(bad)?;
+        let p = match deserialize_payload(MessageType::ChannelCreate, &env.payload) {
+            Ok(DeserializedPayload::ChannelCreate(p)) => p,
+            _ => return Err(bad("bootstrap ChannelCreate payload is malformed".into())),
+        };
+        if p.channel_id != channel_id || p.channel_type != ChannelType::Private {
+            return Err(bad("bootstrap ChannelCreate is not this private channel".into()));
+        }
+        let Some(derivation_ts) = p.id_derivation_ts else {
+            return Err(bad("bootstrap ChannelCreate has no id derivation".into()));
+        };
+        validation::validate_channel_create(&creator, &p).map_err(|e| bad(e.0))?;
+        // Belt-and-braces: `validate_channel_create` only checks the
+        // derivation when the field is present (it is, by the check above).
+        validation::verify_private_channel_id_derivation(&creator, &p.slug, derivation_ts, channel_id)
+            .map_err(|e| bad(e.0))?;
+
+        if caller == creator {
+            return Ok(());
+        }
+        let denied = BootstrapGateError::Denied;
+        let Some(raw) = invite else {
+            return Err(denied("private channel: invite proof required".into()));
+        };
+        let inv = self.verify_invite_proof(channel_id, caller, now_ms, raw).map_err(denied)?;
+        self.verify_inviter_authority(
+            channel_id,
+            Some(&creator),
+            &inv.inviter,
+            inv.invite_ts,
+            inv.inviter_grant.as_deref(),
+            now_ms,
+        )
+        .map_err(denied)?;
+        Ok(())
+    }
+
+    /// `federate_channel`'s post-bootstrap gate: the full join gate
+    /// (rules 1-8, live semantics with `now_ms` as the join time) plus the
+    /// ban check `ChannelJoin` ingest gets from Step 7b. Fixes B2 —
+    /// federation used to ignore `CHANNEL_BANS` entirely.
+    ///
+    /// Known residual (security audit W3, deferred by decision): a node
+    /// that federates late, or lags, only knows the kicks/bans/demotions
+    /// it has already received — until it has paged through the channel's
+    /// metadata via private-channel sync (which delivers every indexed
+    /// kick/ban/demotion, see `reconcile::channel_meta_page`) it fails
+    /// OPEN on those removals. Bounded by the invite TTL (≤ 14 d)
+    /// until then; a node that never completes a metadata pass (no member
+    /// peer reachable, no fresh wallet claim) stays bounded only by that
+    /// TTL. Closed properly by Phase 2 client-side proof verification.
+    pub(crate) fn federate_membership_gate(
+        &self,
+        channel_id: u64,
+        caller: &str,
+        now_ms: u64,
+        invite: Option<&[u8]>,
+    ) -> Result<VerifiedJoin, String> {
+        if self
+            .storage
+            .is_channel_banned(channel_id, caller)
+            .map_err(|e| internal_error("storage", e))?
+        {
+            return Err(format!("user is banned from channel {}", channel_id));
+        }
+        self.verify_private_join(channel_id, caller, now_ms, invite, false)
+    }
+
+    /// `federate_channel`'s final insert (security audit W2): the same
+    /// lock-protected, removal-aware insert as a `ChannelJoin` apply, with
+    /// `recheck_join_locked` as the in-lock precheck, so a kick/ban/
+    /// demotion landing between `federate_membership_gate` and the insert
+    /// is honored. `Ok(true)` = added; `Ok(false)` = not added (already a
+    /// member, or the re-check / removal cutoff refused).
+    pub(crate) fn federate_add_member(
+        &self,
+        channel_id: u64,
+        caller: &str,
+        now_ms: u64,
+        v: &VerifiedJoin,
+    ) -> Result<bool> {
+        // The creator federating/refreshing their own channel without a
+        // member row is (re)added with role "creator", never "member"
+        // (round-3 audit N4) — the same role `ChannelCreate` gives them.
+        let role = match self.channel_gate_info(channel_id) {
+            Ok(ChannelGateInfo::Known { creator: Some(c), .. }) if c == caller => "creator",
+            _ => "member",
+        };
+        self.storage.add_channel_member_checked(channel_id, caller, now_ms, role, || {
+            self.recheck_join_locked(channel_id, caller, v)
+        })
+    }
+
+    /// True if `address` is in `CHANNEL_MEMBERS` for `channel_id`.
+    pub(crate) fn is_member(&self, channel_id: u64, address: &str) -> Result<bool, String> {
+        self.is_channel_member(channel_id, address)
     }
 
     // Audit final pre-mainnet W18: channel membership add/remove + the P2d
@@ -2602,9 +3426,32 @@ impl MessageRouter {
     /// something" flag: bots republish their descriptor on every start, and a
     /// restart always carries a fresh timestamp, so the LWW watermark alone
     /// would let every restart through to a network-wide broadcast.
+    #[cfg(test)]
     fn update_indexes(&self, envelope: &Envelope, resolved_author: &str) -> Result<bool> {
+        self.update_indexes_with(envelope, resolved_author, false)
+    }
+
+    /// `update_indexes` with the ingest path's `is_sync` flag — the
+    /// `ChannelJoin` apply step re-runs the private-join gate and needs the
+    /// same live-vs-sync semantics `authorize_channel_action` used.
+    fn update_indexes_with(
+        &self,
+        envelope: &Envelope,
+        resolved_author: &str,
+        is_sync: bool,
+    ) -> Result<bool> {
         // Set by the ProfileUpdate arm; see the doc comment above.
         let mut bot_changed = false;
+        // Set by the CHANNEL_META_MSGS index step for a `ChannelJoin` whose
+        // author has a held-back `ChannelLeave` NEWER than the join (the
+        // leave overtook its join in delivery): the join apply below must
+        // not make the author a member.
+        let mut join_superseded_by_leave = false;
+        // Set by the same index step for a `ChannelLeave` that promoted the
+        // author's held-back NEWER `ChannelJoin` (round-5 audit S-W1): the
+        // leave apply below removes the member and then re-applies that join,
+        // reproducing the leave-then-join replay a late node performs.
+        let mut leave_superseded_by_join: Option<(u64, [u8; 32])> = None;
         // P-1 (identity-sync): index a user's signed identity envelopes
         // (delegation/revocation/profile/follow/unfollow) under their wallet so
         // the per-wallet identity-sync responder can re-serve them to a node the
@@ -2653,6 +3500,14 @@ impl MessageRouter {
                 | MessageType::ChannelKick
                 | MessageType::ChannelBan
                 | MessageType::ChannelUnban
+                // Moderator propagation (l2-node 0.140.0, B5): index grants
+                // and demotions too, so private-channel backfill carries
+                // them to a member's home node (which otherwise rejects a
+                // moderator's invites/kicks forever). (The moderator-grant
+                // endpoint does NOT scan this index — it serves only a
+                // record's own `grant_msg_id`.)
+                | MessageType::ChannelAddModerator
+                | MessageType::ChannelRemoveModerator
         ) {
             // Code-audit finding (2026-10-01, round 3): this used to
             // deserialize into `serde_json::Value` to read just
@@ -2682,15 +3537,20 @@ impl MessageRouter {
                 // skipped, so a future type added to one list but not the
                 // other surfaces instead of silently never being indexed
                 // (the exact shape this whole fix was chasing).
-                let cid = match payload {
-                    DeserializedPayload::ChannelCreate(p) => Some(p.channel_id),
-                    DeserializedPayload::ChannelUpdate(p) => Some(p.channel_id),
-                    DeserializedPayload::ChannelJoin(p) => Some(p.channel_id),
-                    DeserializedPayload::ChannelLeave(p) => Some(p.channel_id),
-                    DeserializedPayload::ChannelDelete(p) => Some(p.channel_id),
-                    DeserializedPayload::ChannelKick(p) => Some(p.channel_id),
-                    DeserializedPayload::ChannelBan(p) => Some(p.channel_id),
-                    DeserializedPayload::ChannelUnban(p) => Some(p.channel_id),
+                // `removal_target`: the wallet a kick/ban removes — its
+                // indexing may promote that wallet's held-back rejoin (see
+                // `Storage::index_membership_event`).
+                let (cid, removal_target) = match payload {
+                    DeserializedPayload::ChannelCreate(p) => (Some(p.channel_id), None),
+                    DeserializedPayload::ChannelUpdate(p) => (Some(p.channel_id), None),
+                    DeserializedPayload::ChannelJoin(p) => (Some(p.channel_id), None),
+                    DeserializedPayload::ChannelLeave(p) => (Some(p.channel_id), None),
+                    DeserializedPayload::ChannelDelete(p) => (Some(p.channel_id), None),
+                    DeserializedPayload::ChannelKick(p) => (Some(p.channel_id), Some(p.target_user)),
+                    DeserializedPayload::ChannelBan(p) => (Some(p.channel_id), Some(p.target_user)),
+                    DeserializedPayload::ChannelUnban(p) => (Some(p.channel_id), None),
+                    DeserializedPayload::ChannelAddModerator(p) => (Some(p.channel_id), None),
+                    DeserializedPayload::ChannelRemoveModerator(p) => (Some(p.channel_id), None),
                     other => {
                         tracing::debug!(
                             msg_type = ?envelope.msg_type,
@@ -2699,7 +3559,7 @@ impl MessageRouter {
                              DeserializedPayload variant for this msg_type — \
                              type-list desync, not indexing into CHANNEL_META_MSGS"
                         );
-                        None
+                        (None, None)
                     }
                 };
                 if let Some(cid) = cid {
@@ -2731,7 +3591,32 @@ impl MessageRouter {
                                 v.get("creator").and_then(|c| c.as_str()).map(String::from)
                             })
                             .is_some_and(|creator| creator != resolved_author);
-                    if !is_impostor_create {
+                    let membership_event = match envelope.msg_type {
+                        MessageType::ChannelJoin => Some(MembershipEvent::Join),
+                        MessageType::ChannelLeave => Some(MembershipEvent::Leave),
+                        _ => None,
+                    };
+                    if let Some(event) = membership_event {
+                        // Round-4 audit B2: a no-op join/leave (a leave by a
+                        // non-member that never joined, an idempotent re-join
+                        // by a member) is NOT indexed, and at most
+                        // `MAX_INDEXED_MEMBERSHIP_ROWS_PER_AUTHOR` rows are
+                        // indexed per (channel, wallet) — a non-member can no
+                        // longer flood `CHANNEL_META_MSGS` with leaves and
+                        // starve the real joins. Out-of-order rules (a leave
+                        // arriving before its join, a rejoin before the
+                        // removal it follows) live in
+                        // `Storage::index_membership_event`.
+                        let outcome = self.storage.index_membership_event(
+                            cid,
+                            resolved_author,
+                            event,
+                            envelope.timestamp,
+                            &envelope.msg_id,
+                        )?;
+                        join_superseded_by_leave = outcome.join_superseded_by_leave;
+                        leave_superseded_by_join = outcome.leave_superseded_by_join;
+                    } else if !is_impostor_create {
                         let key = schema::encode_channel_meta_key(
                             cid,
                             envelope.msg_type_u8(),
@@ -2740,6 +3625,15 @@ impl MessageRouter {
                         );
                         self.storage
                             .put_cf(schema::cf::CHANNEL_META_MSGS, &key, &[])?;
+                        if let Some(target) = removal_target.as_deref() {
+                            self.storage.index_membership_event(
+                                cid,
+                                target,
+                                MembershipEvent::Removal,
+                                envelope.timestamp,
+                                &envelope.msg_id,
+                            )?;
+                        }
                     }
                 }
             }
@@ -2767,13 +3661,31 @@ impl MessageRouter {
                     self.storage
                         .increment_stat(schema::state_keys::TOTAL_CHANNEL_MESSAGES)?;
 
-                    // Auto-add author as channel member on first message
-                    let _ = self.storage.add_channel_member(
-                        payload.channel_id,
-                        resolved_author,
-                        envelope.timestamp,
-                        "member",
-                    );
+                    // Auto-add author as channel member on first message —
+                    // PUBLIC channels only (B1 fix, l2-node 0.140.0). For a
+                    // private channel this used to be a second, ungated way
+                    // in: any wallet that knew the id could post one chat
+                    // message and become a member (and so a key-cover
+                    // target). The message itself is still accepted — only
+                    // the membership side effect is gated. Legacy history
+                    // (signed before `private_join_proof_activation_ms`)
+                    // keeps the old behaviour so pre-gate backfill converges,
+                    // minus any author kicked/banned at or after the message.
+                    if !self.channel_is_private_for_gate(payload.channel_id) {
+                        let _ = self.storage.add_channel_member(
+                            payload.channel_id,
+                            resolved_author,
+                            envelope.timestamp,
+                            "member",
+                        );
+                    } else if envelope.timestamp < self.join_proof_activation_ms() {
+                        let _ = self.storage.add_channel_member_unless_removed(
+                            payload.channel_id,
+                            resolved_author,
+                            envelope.timestamp,
+                            "member",
+                        );
+                    }
                 }
             }
             MessageType::DirectMessage => {
@@ -3087,13 +3999,34 @@ impl MessageRouter {
                 if let Ok(payload) =
                     rmp_serde::from_slice::<ChannelJoinPayload>(&envelope.payload)
                 {
-                    // Validates channel exists and is idempotent (skips if already member)
-                    let _ = self.storage.add_channel_member(
-                        payload.channel_id,
-                        resolved_author,
-                        envelope.timestamp,
-                        "member",
-                    );
+                    // Re-check on apply (private-channel join gate, l2-node
+                    // 0.140.0): `authorize_channel_action` ran before this
+                    // envelope was stored, against state that may have moved
+                    // since (a concurrent kick/ban/demotion). The full
+                    // re-check runs UNDER the membership lock, and the add
+                    // happens only if no kick/ban at or after
+                    // the join's own timestamp is recorded — on the backfill
+                    // path a kick can be applied BEFORE the join it
+                    // supersedes, and the join must not resurrect the user.
+                    // Idempotent: a no-op if already a member or the channel
+                    // is unknown (deferred joins never apply membership).
+                    // See `apply_join_membership` (shared with the S-W1
+                    // re-apply of a promoted join after a late leave).
+                    if join_superseded_by_leave {
+                        debug!(
+                            channel_id = payload.channel_id,
+                            author = %resolved_author,
+                            "ChannelJoin superseded by the author's own newer ChannelLeave (delivered out of order) — membership not applied"
+                        );
+                    } else {
+                        self.apply_join_membership(
+                            payload.channel_id,
+                            resolved_author,
+                            envelope.timestamp,
+                            payload.invite.as_deref(),
+                            is_sync,
+                        );
+                    }
                 }
             }
             MessageType::ChannelLeave => {
@@ -3107,6 +4040,16 @@ impl MessageRouter {
                         payload.channel_id,
                         resolved_author,
                     )?;
+                    // Round-5 audit S-W1: the author's own NEWER join was
+                    // delivered before this leave and held back as a no-op
+                    // re-join (it was still a member then). The index step
+                    // just promoted it, so a late node replays leave → join;
+                    // re-apply it here so this node converges to the same
+                    // state (member iff that join passes the gate on its own
+                    // now). Kick/ban deliberately get no such re-apply.
+                    if let Some((join_ts, join_id)) = leave_superseded_by_join {
+                        self.reapply_promoted_join(payload.channel_id, resolved_author, join_ts, &join_id);
+                    }
                 }
             }
             MessageType::ChannelDelete => {
@@ -3210,10 +4153,50 @@ impl MessageRouter {
                         payload.channel_id,
                         &payload.target_user,
                     );
-                    let perms = serde_json::to_vec(&payload.permissions)
-                        .context("serializing moderator permissions")?;
-                    self.storage
-                        .put_cf(schema::cf::CHANNEL_MODERATORS, &key, &perms)?;
+                    // Moderator propagation (l2-node 0.140.0): also record
+                    // WHICH signed envelope granted this role, so the
+                    // moderator can fetch it (`GET .../moderators/{addr}/
+                    // grant`) and attach it to invites as `inviter_grant`.
+                    // Extra key alongside the permission flags — every
+                    // reader looks fields up by name, so this is additive.
+                    //
+                    // Now that backfill also replays moderator messages,
+                    // ordering matters: (a) a grant OLDER than the one
+                    // already recorded never replaces it (`grant_ts` LWW —
+                    // spec 03: "replaced only by a grant with a NEWER signed
+                    // timestamp"; records from before 0.140.0 carry no
+                    // `grant_ts` and are always replaced), and (b) a grant
+                    // at or before a known demotion of the same wallet
+                    // (`moderator_removed` watermark) must not reinstate it.
+                    let demoted_after = self
+                        .storage
+                        .channel_role_watermark(
+                            payload.channel_id,
+                            schema::role_watermark_kind::MODERATOR_REMOVED,
+                            &payload.target_user,
+                        )?
+                        .is_some_and(|m| m >= envelope.timestamp);
+                    let newer_recorded = self
+                        .storage
+                        .get_cf(schema::cf::CHANNEL_MODERATORS, &key)?
+                        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                        .and_then(|v| v.get("grant_ts").and_then(|t| t.as_u64()))
+                        .is_some_and(|t| t >= envelope.timestamp);
+                    if !demoted_after && !newer_recorded {
+                        let mut perms = serde_json::to_value(&payload.permissions)
+                            .context("serializing moderator permissions")?;
+                        if let Some(obj) = perms.as_object_mut() {
+                            obj.insert(
+                                "grant_msg_id".into(),
+                                serde_json::json!(hex::encode(envelope.msg_id)),
+                            );
+                            obj.insert("grant_ts".into(), serde_json::json!(envelope.timestamp));
+                        }
+                        let perms = serde_json::to_vec(&perms)
+                            .context("serializing moderator record")?;
+                        self.storage
+                            .put_cf(schema::cf::CHANNEL_MODERATORS, &key, &perms)?;
+                    }
                 }
             }
             MessageType::ChannelRemoveModerator => {
@@ -3224,14 +4207,47 @@ impl MessageRouter {
                         payload.channel_id,
                         &payload.target_user,
                     );
-                    self.storage
-                        .delete_cf(schema::cf::CHANNEL_MODERATORS, &key)?;
+                    // Private-channel join gate: remember WHEN this wallet
+                    // was demoted (MAX watermark) so a grant it was issued
+                    // earlier stops authorizing new invites/joins
+                    // (`verify_inviter_authority`).
+                    self.storage.raise_channel_role_watermark(
+                        payload.channel_id,
+                        schema::role_watermark_kind::MODERATOR_REMOVED,
+                        &payload.target_user,
+                        Self::clamp_watermark_ts(envelope.timestamp),
+                    )?;
+                    // Symmetric to the AddModerator LWW above: a demotion
+                    // OLDER than the currently recorded grant (backfill
+                    // replaying history out of order) must not delete it.
+                    let newer_grant = self
+                        .storage
+                        .get_cf(schema::cf::CHANNEL_MODERATORS, &key)?
+                        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                        .and_then(|v| v.get("grant_ts").and_then(|t| t.as_u64()))
+                        .is_some_and(|t| t > envelope.timestamp);
+                    if !newer_grant {
+                        self.storage
+                            .delete_cf(schema::cf::CHANNEL_MODERATORS, &key)?;
+                    }
                 }
             }
             MessageType::ChannelKick => {
                 if let Ok(payload) =
                     rmp_serde::from_slice::<ChannelKickPayload>(&envelope.payload)
                 {
+                    // Private-channel join gate (B3 fix): record the kick as
+                    // a MAX watermark BEFORE removing the member, so a join
+                    // racing this removal can never be re-added after it
+                    // (`add_channel_member_unless_removed` reads this under
+                    // the same lock) and an old invite can't be replayed to
+                    // rejoin (`verify_invite_proof` rule 7).
+                    self.storage.raise_channel_role_watermark(
+                        payload.channel_id,
+                        schema::role_watermark_kind::REMOVED,
+                        &payload.target_user,
+                        Self::clamp_watermark_ts(envelope.timestamp),
+                    )?;
                     // Atomic (W18): member-removal + P2d epoch-floor raise (so the
                     // kicked member can't read future messages) in one batched,
                     // lock-guarded write.
@@ -3245,6 +4261,15 @@ impl MessageRouter {
                 if let Ok(payload) =
                     rmp_serde::from_slice::<ChannelBanPayload>(&envelope.payload)
                 {
+                    // Same `removed` watermark as ChannelKick above (it
+                    // outlives an Unban: a rejoin after an unban needs an
+                    // invite issued after the ban).
+                    self.storage.raise_channel_role_watermark(
+                        payload.channel_id,
+                        schema::role_watermark_kind::REMOVED,
+                        &payload.target_user,
+                        Self::clamp_watermark_ts(envelope.timestamp),
+                    )?;
                     // Atomic (W18): member-removal (updates member_count) + P2d
                     // epoch-floor raise (so the banned member can't read future
                     // messages) in one batched, lock-guarded write.
@@ -3347,64 +4372,15 @@ impl MessageRouter {
                     }
                 }
             }
-            MessageType::ChannelInvite => {
-                if let Ok(payload) =
-                    rmp_serde::from_slice::<ChannelInvitePayload>(&envelope.payload)
-                {
-                    // Re-verify fresh here rather than trusting the earlier
-                    // authorize_channel_action pass (security audit, CRITICAL,
-                    // 2026-09-15): that check now defers (Ok) on a channel
-                    // this node has never seen locally, so a NotCreator
-                    // author would never even reach this apply step for a
-                    // KNOWN channel — but for an UNKNOWN one, "deferred"
-                    // does not mean "verified", and this CHANNEL_INVITES
-                    // record is later trusted by `ChannelJoin` as bare PROOF
-                    // of a real invite (the `invite_links_disabled` gate).
-                    // Writing it on unverifiable say-so would let any wallet
-                    // self-grant "invited" status on any private channel it
-                    // can merely name the id of — including inviting itself
-                    // — just by targeting a node that hasn't federated that
-                    // channel yet, which is the default state of most of the
-                    // network for most private channels. The cross-node
-                    // notification delivery this session's fix exists for
-                    // does NOT depend on this record at all (see `process()`
-                    // in notifications/engine.rs, an independent mechanism),
-                    // so skipping the write for an unverifiable invite costs
-                    // nothing there — it only means a channel with
-                    // `invite_links_disabled: true` needs a genuine
-                    // re-invite once the invitee's node has federated and
-                    // can verify the inviter for real, same as it would
-                    // with no cross-node delivery at all.
-                    let verified = match self
-                        .channel_creator_check(payload.channel_id, resolved_author)
-                    {
-                        Ok(ChannelCreatorCheck::IsCreator) => true,
-                        Ok(ChannelCreatorCheck::Unknown)
-                        | Ok(ChannelCreatorCheck::NotCreator)
-                        | Err(_) => self
-                            .storage
-                            .is_channel_moderator(payload.channel_id, resolved_author)
-                            .unwrap_or(false),
-                    };
-                    if verified {
-                        let key = schema::encode_channel_invite_key(
-                            payload.channel_id,
-                            &payload.target_user,
-                        );
-                        let record = serde_json::json!({
-                            "invited_by": resolved_author,
-                            "timestamp": envelope.timestamp,
-                        });
-                        let record_bytes = serde_json::to_vec(&record)
-                            .context("serializing invite record")?;
-                        self.storage.put_cf(
-                            schema::cf::CHANNEL_INVITES,
-                            &key,
-                            &record_bytes,
-                        )?;
-                    }
-                }
-            }
+            // ChannelInvite has NO apply-step side effect any more (l2-node
+            // 0.140.0, B4). It used to write a `CHANNEL_INVITES` row that
+            // `ChannelJoin` trusted as bare proof of invitation — a derived
+            // grant that was never pruned and (with `invite_links_disabled`
+            // never written) never actually consulted for anything. The
+            // signed invite envelope itself is now the proof: it is stored
+            // in `MESSAGES` like every accepted message, surfaced to the
+            // invitee via `GET /api/v1/notifications` (`invite_envelope`),
+            // and verified in full when presented inside a `ChannelJoin`.
             MessageType::ChannelUpdate => {
                 if let Ok(payload) =
                     rmp_serde::from_slice::<ChannelUpdatePayload>(&envelope.payload)
@@ -4847,7 +5823,7 @@ mod enc_supersede_tests {
         add_member(&r, cid, member);
         let scope = crate::crypto::compute_channel_scope(cid);
         let env = channel_key_env(cid, scope, creator, member);
-        assert!(r.authorize_channel_action(&env, creator).is_ok());
+        assert!(r.authorize_channel_action(&env, creator, false).is_ok());
     }
 
     #[test]
@@ -4858,7 +5834,7 @@ mod enc_supersede_tests {
         add_member(&r, cid, member);
         let scope = crate::crypto::compute_channel_scope(cid);
         let env = channel_key_env(cid, scope, outsider, member);
-        assert!(r.authorize_channel_action(&env, outsider).is_err());
+        assert!(r.authorize_channel_action(&env, outsider, false).is_err());
     }
 
     #[test]
@@ -4868,7 +5844,7 @@ mod enc_supersede_tests {
         make_channel(&r, cid, creator);
         let scope = crate::crypto::compute_channel_scope(cid);
         let env = channel_key_env(cid, scope, creator, outsider);
-        assert!(r.authorize_channel_action(&env, creator).is_err());
+        assert!(r.authorize_channel_action(&env, creator, false).is_err());
     }
 
     #[test]
@@ -4879,7 +5855,7 @@ mod enc_supersede_tests {
         // key_scope for a DIFFERENT channel → reject even though author is a member.
         let wrong_scope = crate::crypto::compute_channel_scope(999);
         let env = channel_key_env(cid, wrong_scope, creator, creator);
-        assert!(r.authorize_channel_action(&env, creator).is_err());
+        assert!(r.authorize_channel_action(&env, creator, false).is_err());
     }
 }
 
@@ -5172,6 +6148,8 @@ mod channel_delete_before_create_tests {
             channel_id,
             target_user: target_user.to_string(),
             anchor_node: Some("https://host.example".to_string()),
+            expires_at: None,
+            inviter_grant: None,
         };
         let payload_bytes = rmp_serde::to_vec_named(&payload).unwrap();
         let author_pubkey: [u8; 32] = sk.verifying_key().to_bytes();
@@ -5351,16 +6329,15 @@ mod channel_delete_before_create_tests {
     }
 
     #[test]
-    fn invite_for_a_known_channel_by_the_real_creator_still_grants_the_record() {
-        // The fix above must not also break the legitimate, KNOWN-channel
-        // case: a real creator's invite still writes CHANNEL_INVITES.
+    fn invite_for_a_known_channel_by_the_real_creator_is_accepted_but_writes_no_record() {
+        // l2-node 0.140.0 (private-channel join gate, B4): a real creator's
+        // invite for a known channel is still ACCEPTED (stored + notified),
+        // but the node no longer writes a `CHANNEL_INVITES` grant row — the
+        // signed invite itself is the proof a later ChannelJoin carries.
         let (r, _d) = router();
         let creator_sk = crypto::generate_keypair();
         let creator = crypto::pubkey_to_address(&creator_sk.verifying_key()).unwrap();
         register_user(&r, &creator, 1_000);
-        // `signed_create_envelope` derives a properly-formed (large,
-        // identity-bound) private channel_id itself (security fix,
-        // 2026-10-06) — no caller-chosen id needed anymore.
         let (create_raw, cid) = signed_create_envelope(&creator_sk, &creator, "test-channel", now_ms());
         assert!(matches!(r.process_message(&create_raw), RouteResult::Accepted { .. }));
 
@@ -5369,8 +6346,8 @@ mod channel_delete_before_create_tests {
 
         let key = schema::encode_channel_invite_key(cid, "klv1target");
         assert!(
-            r.storage.get_cf(schema::cf::CHANNEL_INVITES, &key).unwrap().is_some(),
-            "a real creator's invite for a known channel must still grant the record"
+            r.storage.get_cf(schema::cf::CHANNEL_INVITES, &key).unwrap().is_none(),
+            "0.140.0+: an accepted invite must not write a CHANNEL_INVITES record"
         );
     }
 
@@ -8934,5 +9911,1336 @@ mod route_result_author_tests {
             }
             other => panic!("expected Accepted, got {:?}", other),
         }
+    }
+}
+
+#[cfg(test)]
+mod private_join_gate_tests {
+    //! Private-channel join gate (l2-node 0.140.0, protocol §3.9.1). Every
+    //! rule has an accept AND a reject case; envelopes are fully signed and
+    //! go through the real `process_message` / `process_synced_message`
+    //! pipeline unless a test targets a single helper.
+    use super::*;
+    use crate::messages::envelope::MAX_TIMESTAMP_DRIFT_MS as DRIFT;
+    use tempfile::TempDir;
+
+    /// A private-namespace channel id (above `PRIVATE_CHANNEL_ID_FLOOR`).
+    const CID: u64 = (1u64 << 40) + 7;
+    const DAY: u64 = 24 * 3600 * 1000;
+    /// Activation far in the future: every join is "legacy".
+    const FAR_FUTURE: u64 = u64::MAX / 2;
+
+    struct W {
+        sk: ed25519_dalek::SigningKey,
+        addr: String,
+    }
+
+    fn wallet() -> W {
+        let sk = crypto::generate_keypair();
+        let addr = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        W { sk, addr }
+    }
+
+    fn router_with_activation(activation: u64) -> (MessageRouter, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let identity = IdentityResolver::new(storage.clone());
+        let cfg = crate::config::ChannelVerifyConfig {
+            private_join_proof_activation_ms: activation,
+            ..Default::default()
+        };
+        (
+            MessageRouter::new(
+                storage,
+                identity,
+                None,
+                "testnet".to_string(),
+                usize::MAX,
+                std::sync::Arc::new(crate::metrics::counters::NetworkCounters::new()),
+                crate::config::RateLimitsConfig::default(),
+            )
+            .with_channel_verify_config(cfg),
+            dir,
+        )
+    }
+
+    /// Enforced from the start (mainnet setting).
+    fn enforced() -> (MessageRouter, TempDir) {
+        router_with_activation(0)
+    }
+
+    fn now() -> u64 {
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
+    }
+
+    fn sign(w: &W, msg_type: MessageType, payload: Vec<u8>, ts: u64) -> Vec<u8> {
+        let pk: [u8; 32] = w.sk.verifying_key().to_bytes();
+        let msg_id = crypto::compute_msg_id("testnet", &pk, &payload, ts);
+        let sig = signing::sign_ogmara_message(
+            &w.sk,
+            "testnet",
+            crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type as u8,
+            &msg_id,
+            ts,
+            &payload,
+        );
+        let env = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type,
+            msg_id,
+            author: w.addr.clone(),
+            timestamp: ts,
+            lamport_ts: 0,
+            payload,
+            signature: sig.to_bytes().to_vec(),
+            relay_path: vec![],
+        };
+        rmp_serde::to_vec_named(&env).unwrap()
+    }
+
+    fn grant(creator: &W, cid: u64, target: &str, ts: u64) -> Vec<u8> {
+        let p = ChannelAddModeratorPayload {
+            channel_id: cid,
+            target_user: target.to_string(),
+            permissions: ModeratorPermissions {
+                can_mute: true,
+                can_kick: true,
+                can_ban: true,
+                can_pin: true,
+                can_edit_info: false,
+                can_delete_msgs: false,
+            },
+        };
+        sign(creator, MessageType::ChannelAddModerator, rmp_serde::to_vec_named(&p).unwrap(), ts)
+    }
+
+    fn invite(
+        inviter: &W,
+        cid: u64,
+        target: &str,
+        ts: u64,
+        expires_at: Option<u64>,
+        inviter_grant: Option<Vec<u8>>,
+    ) -> Vec<u8> {
+        let p = ChannelInvitePayload {
+            channel_id: cid,
+            target_user: target.to_string(),
+            anchor_node: Some("https://host.example".to_string()),
+            expires_at,
+            inviter_grant,
+        };
+        sign(inviter, MessageType::ChannelInvite, rmp_serde::to_vec_named(&p).unwrap(), ts)
+    }
+
+    fn join(joiner: &W, cid: u64, invite: Option<Vec<u8>>, ts: u64) -> Vec<u8> {
+        let p = ChannelJoinPayload { channel_id: cid, invite };
+        sign(joiner, MessageType::ChannelJoin, rmp_serde::to_vec_named(&p).unwrap(), ts)
+    }
+
+    fn kick(by: &W, cid: u64, target: &str, ts: u64) -> Vec<u8> {
+        let p = ChannelKickPayload { channel_id: cid, target_user: target.to_string(), reason: None };
+        sign(by, MessageType::ChannelKick, rmp_serde::to_vec_named(&p).unwrap(), ts)
+    }
+
+    fn ban(by: &W, cid: u64, target: &str, ts: u64) -> Vec<u8> {
+        let p = ChannelBanPayload {
+            channel_id: cid,
+            target_user: target.to_string(),
+            reason: Some("test".into()),
+            duration_secs: 0,
+        };
+        sign(by, MessageType::ChannelBan, rmp_serde::to_vec_named(&p).unwrap(), ts)
+    }
+
+    fn leave(w: &W, cid: u64, ts: u64) -> Vec<u8> {
+        let p = ChannelLeavePayload { channel_id: cid };
+        sign(w, MessageType::ChannelLeave, rmp_serde::to_vec_named(&p).unwrap(), ts)
+    }
+
+    fn remove_mod(creator: &W, cid: u64, target: &str, ts: u64) -> Vec<u8> {
+        let p = ChannelRemoveModeratorPayload { channel_id: cid, target_user: target.to_string() };
+        sign(creator, MessageType::ChannelRemoveModerator, rmp_serde::to_vec_named(&p).unwrap(), ts)
+    }
+
+    fn chat(w: &W, cid: u64, ts: u64) -> Vec<u8> {
+        #[derive(serde::Serialize)]
+        struct C {
+            channel_id: u64,
+            content: String,
+        }
+        let p = C { channel_id: cid, content: "hi".into() };
+        sign(w, MessageType::ChatMessage, rmp_serde::to_vec_named(&p).unwrap(), ts)
+    }
+
+    fn register(r: &MessageRouter, addr: &str) {
+        let rec = serde_json::json!({ "address": addr, "registered_at": 1_000u64 });
+        r.storage.put_cf(schema::cf::USERS, addr.as_bytes(), rec.to_string().as_bytes()).unwrap();
+    }
+
+    fn make_channel(r: &MessageRouter, cid: u64, creator: &str, channel_type: u8) {
+        let meta = serde_json::json!({
+            "channel_id": cid,
+            "channel_type": channel_type,
+            "creator": creator,
+            "member_count": 0u64,
+        });
+        r.storage.put_cf(schema::cf::CHANNELS, &cid.to_be_bytes(), meta.to_string().as_bytes()).unwrap();
+        r.storage.add_channel_member(cid, creator, 1, "creator").unwrap();
+        register(r, creator);
+    }
+
+    fn is_member(r: &MessageRouter, cid: u64, addr: &str) -> bool {
+        r.storage
+            .exists_cf(schema::cf::CHANNEL_MEMBERS, &schema::encode_channel_member_key(cid, addr))
+            .unwrap()
+    }
+
+    fn accepted(res: &RouteResult) -> bool {
+        if !matches!(res, RouteResult::Accepted { .. }) {
+            eprintln!("not accepted: {res:?}");
+        }
+        matches!(res, RouteResult::Accepted { .. })
+    }
+
+    fn rejected_with(res: RouteResult, needle: &str) {
+        match res {
+            RouteResult::Rejected(r) => assert!(r.contains(needle), "unexpected reason: {r}"),
+            other => panic!("expected Rejected containing {needle:?}, got {other:?}"),
+        }
+    }
+
+    // ---- Rule 1: not private ----
+
+    #[test]
+    fn rule1_public_channel_join_needs_no_proof() {
+        let (r, _d) = enforced();
+        let (c, j) = (wallet(), wallet());
+        make_channel(&r, 55, &c.addr, 0);
+        assert!(accepted(&r.process_message(&join(&j, 55, None, now()))));
+        assert!(is_member(&r, 55, &j.addr));
+    }
+
+    #[test]
+    fn rule1_unknown_id_at_or_below_floor_is_public() {
+        let (r, _d) = enforced();
+        let j = wallet();
+        assert_eq!(
+            r.verify_private_join(PRIVATE_CHANNEL_ID_FLOOR, &j.addr, now(), None, false).map(|v| v.verdict),
+            Ok(JoinVerdict::NotPrivate)
+        );
+    }
+
+    #[test]
+    fn rule1_reject_unknown_id_above_floor_is_private_and_needs_proof() {
+        let (r, _d) = enforced();
+        let j = wallet();
+        rejected_with(r.process_message(&join(&j, CID, None, now())), "private channel: invite proof required");
+    }
+
+    // ---- Rule 2: shortcuts ----
+
+    #[test]
+    fn rule2_existing_member_and_creator_rejoin_without_proof() {
+        let (r, _d) = enforced();
+        let (c, m) = (wallet(), wallet());
+        make_channel(&r, CID, &c.addr, 2);
+        r.storage.add_channel_member(CID, &m.addr, 1, "member").unwrap();
+        assert!(accepted(&r.process_message(&join(&m, CID, None, now()))));
+        assert!(accepted(&r.process_message(&join(&c, CID, None, now()))));
+    }
+
+    #[test]
+    fn rule2_reject_non_member_without_proof() {
+        let (r, _d) = enforced();
+        let (c, j) = (wallet(), wallet());
+        make_channel(&r, CID, &c.addr, 2);
+        rejected_with(r.process_message(&join(&j, CID, None, now())), "private channel: invite proof required");
+        assert!(!is_member(&r, CID, &j.addr));
+    }
+
+    // ---- Rule 3: activation ----
+
+    #[test]
+    fn rule3_proofless_live_join_before_activation_is_legacy_accepted() {
+        let (r, _d) = router_with_activation(FAR_FUTURE);
+        let (c, j) = (wallet(), wallet());
+        make_channel(&r, CID, &c.addr, 2);
+        assert!(accepted(&r.process_message(&join(&j, CID, None, now()))));
+        assert!(is_member(&r, CID, &j.addr));
+    }
+
+    #[test]
+    fn rule3_sync_legacy_join_vs_post_activation_sync_join() {
+        let activation = now() - 10 * DAY;
+        let (r, _d) = router_with_activation(activation);
+        let (c, a, b) = (wallet(), wallet(), wallet());
+        make_channel(&r, CID, &c.addr, 2);
+        // Backfilled history from before activation: accepted + applied.
+        assert!(accepted(&r.process_synced_message(&join(&a, CID, None, activation - 1))));
+        assert!(is_member(&r, CID, &a.addr));
+        // A backdated-to-activation proofless join: rejected (boundary is exclusive).
+        rejected_with(
+            r.process_synced_message(&join(&b, CID, None, activation)),
+            "private channel: invite proof required",
+        );
+        assert!(!is_member(&r, CID, &b.addr));
+    }
+
+    #[test]
+    fn rule3_attached_bad_invite_is_verified_even_before_activation() {
+        let (r, _d) = router_with_activation(FAR_FUTURE);
+        let (c, j, other) = (wallet(), wallet(), wallet());
+        make_channel(&r, CID, &c.addr, 2);
+        // Invite addressed to someone else — must NOT fall back to "no proof".
+        let inv = invite(&c, CID, &other.addr, now() - 1_000, None, None);
+        rejected_with(r.process_message(&join(&j, CID, Some(inv), now())), "different wallet");
+        assert!(!is_member(&r, CID, &j.addr));
+    }
+
+    // ---- Rule 4: invite envelope ----
+
+    #[test]
+    fn rule4_valid_creator_invite_is_accepted_and_applied() {
+        let (r, _d) = enforced();
+        let (c, j) = (wallet(), wallet());
+        make_channel(&r, CID, &c.addr, 2);
+        let inv = invite(&c, CID, &j.addr, now() - 1_000, None, None);
+        assert!(accepted(&r.process_message(&join(&j, CID, Some(inv), now()))));
+        assert!(is_member(&r, CID, &j.addr));
+    }
+
+    #[test]
+    fn rule4_reject_tampered_signature() {
+        let (r, _d) = enforced();
+        let (c, j) = (wallet(), wallet());
+        make_channel(&r, CID, &c.addr, 2);
+        let raw = invite(&c, CID, &j.addr, now() - 1_000, None, None);
+        let mut env: Envelope = rmp_serde::from_slice(&raw).unwrap();
+        env.signature[0] ^= 0xFF;
+        let bad = rmp_serde::to_vec_named(&env).unwrap();
+        rejected_with(r.process_message(&join(&j, CID, Some(bad), now())), "signature");
+        assert!(!is_member(&r, CID, &j.addr));
+    }
+
+    #[test]
+    fn rule4_reject_garbage_and_oversized_proof() {
+        let (r, _d) = enforced();
+        let (c, j) = (wallet(), wallet());
+        make_channel(&r, CID, &c.addr, 2);
+        rejected_with(r.process_message(&join(&j, CID, Some(vec![1, 2, 3]), now())), "not a valid envelope");
+        // Size cap is structural (validation), applies on every channel type.
+        rejected_with(
+            r.process_message(&join(&j, CID, Some(vec![0u8; validation::MAX_JOIN_INVITE_BYTES + 1]), now())),
+            "invite proof must be",
+        );
+        make_channel(&r, 56, &c.addr, 0);
+        rejected_with(
+            r.process_message(&join(&j, 56, Some(vec![0u8; validation::MAX_JOIN_INVITE_BYTES + 1]), now())),
+            "invite proof must be",
+        );
+    }
+
+    #[test]
+    fn rule4_reject_nested_type_confusion() {
+        let (r, _d) = enforced();
+        let (c, j) = (wallet(), wallet());
+        make_channel(&r, CID, &c.addr, 2);
+        // A creator-signed ChannelAddModerator smuggled in the invite slot.
+        let g = grant(&c, CID, &j.addr, now() - 2_000);
+        rejected_with(r.process_message(&join(&j, CID, Some(g), now())), "expected ChannelInvite");
+        // A ChannelJoin nested as the "invite".
+        let inner = join(&j, CID, None, now() - 1_000);
+        rejected_with(r.process_message(&join(&j, CID, Some(inner), now())), "expected ChannelInvite");
+        // An invite whose `inviter_grant` is itself an invite.
+        let m = wallet();
+        let fake_grant = invite(&c, CID, &m.addr, now() - 3_000, None, None);
+        let inv = invite(&m, CID, &j.addr, now() - 1_000, None, Some(fake_grant));
+        rejected_with(r.process_message(&join(&j, CID, Some(inv), now())), "inviter is not creator or moderator");
+        assert!(!is_member(&r, CID, &j.addr));
+    }
+
+    // ---- Rule 5: binding ----
+
+    #[test]
+    fn rule5_reject_forwarded_invite_and_wrong_channel() {
+        let (r, _d) = enforced();
+        let (c, j, friend) = (wallet(), wallet(), wallet());
+        make_channel(&r, CID, &c.addr, 2);
+        let for_friend = invite(&c, CID, &friend.addr, now() - 1_000, None, None);
+        rejected_with(r.process_message(&join(&j, CID, Some(for_friend.clone()), now())), "different wallet");
+        let other_channel = invite(&c, CID + 1, &j.addr, now() - 1_000, None, None);
+        rejected_with(r.process_message(&join(&j, CID, Some(other_channel), now())), "different channel");
+        // The named friend is still admitted by the same bytes.
+        assert!(accepted(&r.process_message(&join(&friend, CID, Some(for_friend), now()))));
+    }
+
+    // ---- Rule 6: time ----
+
+    #[test]
+    fn rule6_expiry_default_ttl_live() {
+        let (r, _d) = enforced();
+        let (c, j, k) = (wallet(), wallet(), wallet());
+        make_channel(&r, CID, &c.addr, 2);
+        // 6.9 days old, default 7d TTL: still valid.
+        let fresh = invite(&c, CID, &j.addr, now() - 7 * DAY + 60_000, None, None);
+        assert!(accepted(&r.process_message(&join(&j, CID, Some(fresh), now()))));
+        // 7d + 1 min old: expired.
+        let stale = invite(&c, CID, &k.addr, now() - 7 * DAY - 60_000, None, None);
+        rejected_with(r.process_message(&join(&k, CID, Some(stale), now())), "expired");
+    }
+
+    #[test]
+    fn rule6_explicit_expires_at_and_ttl_bounds() {
+        let (r, _d) = enforced();
+        let (c, j, k, l) = (wallet(), wallet(), wallet(), wallet());
+        make_channel(&r, CID, &c.addr, 2);
+        let ts = now() - 1_000;
+        // 1h validity, still inside.
+        assert!(accepted(&r.process_message(&join(&j, CID, Some(invite(&c, CID, &j.addr, ts, Some(ts + 3_600_000), None)), now()))));
+        // Already past an explicit short expiry.
+        let short = invite(&c, CID, &k.addr, ts, Some(ts + 500), None);
+        rejected_with(r.process_message(&join(&k, CID, Some(short), now())), "expired");
+        // expires_at beyond MAX_INVITE_TTL is malformed.
+        let too_long = invite(&c, CID, &l.addr, ts, Some(ts + validation::MAX_INVITE_TTL_MS + 1), None);
+        rejected_with(r.process_message(&join(&l, CID, Some(too_long), now())), "maximum invite lifetime");
+        // expires_at at/before the invite ts is malformed.
+        let backwards = invite(&c, CID, &l.addr, ts, Some(ts), None);
+        rejected_with(r.process_message(&join(&l, CID, Some(backwards), now())), "after the invite");
+    }
+
+    #[test]
+    fn rule6_future_invite_beyond_drift_rejected_within_drift_accepted() {
+        let (r, _d) = enforced();
+        let (c, j, k) = (wallet(), wallet(), wallet());
+        make_channel(&r, CID, &c.addr, 2);
+        let join_ts = now() - 30 * DAY; // historical, via sync
+        let ahead = invite(&c, CID, &j.addr, join_ts + DRIFT + 1, None, None);
+        rejected_with(r.process_synced_message(&join(&j, CID, Some(ahead), join_ts)), "dated after the join");
+        let skewed = invite(&c, CID, &k.addr, join_ts + DRIFT, None, None);
+        assert!(accepted(&r.process_synced_message(&join(&k, CID, Some(skewed), join_ts))));
+    }
+
+    #[test]
+    fn rule6_historical_join_still_valid_on_backfill_after_its_invite_expired() {
+        let (r, _d) = enforced();
+        let (c, j) = (wallet(), wallet());
+        make_channel(&r, CID, &c.addr, 2);
+        let t = now() - 60 * DAY;
+        let inv = invite(&c, CID, &j.addr, t - 1_000, None, None);
+        // Live: the same invite is long expired.
+        rejected_with(r.process_message(&join(&j, CID, Some(inv.clone()), now())), "expired");
+        // Sync: the historical join used it in time — envelope clocks only.
+        assert!(accepted(&r.process_synced_message(&join(&j, CID, Some(inv), t))));
+        assert!(is_member(&r, CID, &j.addr));
+    }
+
+    // ---- Rule 7: removal cutoff ----
+
+    #[test]
+    fn rule7_kicked_user_cannot_replay_old_invite_but_fresh_invite_works() {
+        let (r, _d) = enforced();
+        let (c, j) = (wallet(), wallet());
+        make_channel(&r, CID, &c.addr, 2);
+        let old = invite(&c, CID, &j.addr, now() - 10_000, None, None);
+        assert!(accepted(&r.process_message(&join(&j, CID, Some(old.clone()), now() - 5_000))));
+        assert!(accepted(&r.process_message(&kick(&c, CID, &j.addr, now() - 2_000))));
+        assert!(!is_member(&r, CID, &j.addr));
+        rejected_with(r.process_message(&join(&j, CID, Some(old), now())), "predates the joiner's removal");
+        assert!(!is_member(&r, CID, &j.addr));
+        let fresh = invite(&c, CID, &j.addr, now() - 1_000, None, None);
+        assert!(accepted(&r.process_message(&join(&j, CID, Some(fresh), now()))));
+        assert!(is_member(&r, CID, &j.addr));
+    }
+
+    #[test]
+    fn rule7_ban_cutoff_outlives_unban() {
+        let (r, _d) = enforced();
+        let (c, j) = (wallet(), wallet());
+        make_channel(&r, CID, &c.addr, 2);
+        let old = invite(&c, CID, &j.addr, now() - 10_000, None, None);
+        assert!(accepted(&r.process_message(&ban(&c, CID, &j.addr, now() - 5_000))));
+        r.storage.delete_cf(schema::cf::CHANNEL_BANS, &schema::encode_channel_ban_key(CID, &j.addr)).unwrap();
+        rejected_with(r.process_message(&join(&j, CID, Some(old), now())), "predates the joiner's removal");
+    }
+
+    #[test]
+    fn rule7_voluntary_leave_writes_no_cutoff() {
+        let (r, _d) = enforced();
+        let (c, j) = (wallet(), wallet());
+        make_channel(&r, CID, &c.addr, 2);
+        let inv = invite(&c, CID, &j.addr, now() - 10_000, None, None);
+        assert!(accepted(&r.process_message(&join(&j, CID, Some(inv.clone()), now() - 5_000))));
+        assert!(accepted(&r.process_message(&leave(&j, CID, now() - 2_000))));
+        assert!(r.storage.channel_removal_cutoff(CID, &j.addr).unwrap().is_none());
+        assert!(accepted(&r.process_message(&join(&j, CID, Some(inv), now()))));
+        assert!(is_member(&r, CID, &j.addr));
+    }
+
+    #[test]
+    fn apply_step_backfilled_join_after_its_superseding_kick_is_not_applied() {
+        // Backfill delivers the kick (t2) BEFORE the legacy join (t1 < t2):
+        // the join is a valid historical message (Accepted) but must not
+        // resurrect the member.
+        let (r, _d) = router_with_activation(FAR_FUTURE);
+        let (c, j) = (wallet(), wallet());
+        make_channel(&r, CID, &c.addr, 2);
+        let t1 = now() - 10 * DAY;
+        assert!(accepted(&r.process_synced_message(&kick(&c, CID, &j.addr, t1 + 1_000))));
+        assert!(accepted(&r.process_synced_message(&join(&j, CID, None, t1))));
+        assert!(!is_member(&r, CID, &j.addr));
+        // Tie: removal wins.
+        let k = wallet();
+        assert!(accepted(&r.process_synced_message(&kick(&c, CID, &k.addr, t1))));
+        assert!(accepted(&r.process_synced_message(&join(&k, CID, None, t1))));
+        assert!(!is_member(&r, CID, &k.addr));
+        // Control: a join AFTER the kick is applied.
+        assert!(accepted(&r.process_synced_message(&join(&j, CID, None, t1 + 2_000))));
+        assert!(is_member(&r, CID, &j.addr));
+    }
+
+    /// Round-5 S-W1: J1, J3 (held no-op re-join while a member), then the
+    /// OLDER leave L2 arrives late. The index promotes J3, so a late node
+    /// replays J1 → L2 → J3; this node must converge to the same state
+    /// instead of applying the leave unconditionally.
+    #[test]
+    fn late_leave_before_a_held_rejoin_converges_with_a_late_node() {
+        let (r, _d) = router_with_activation(FAR_FUTURE);
+        let (c, j) = (wallet(), wallet());
+        make_channel(&r, CID, &c.addr, 2);
+        let t = now() - 10 * DAY;
+        let (j1, l2, j3) = (join(&j, CID, None, t), leave(&j, CID, t + 1_000), join(&j, CID, None, t + 2_000));
+        assert!(accepted(&r.process_synced_message(&j1)));
+        assert!(accepted(&r.process_synced_message(&j3)));
+        assert!(is_member(&r, CID, &j.addr));
+        assert!(accepted(&r.process_synced_message(&l2)));
+        assert!(is_member(&r, CID, &j.addr), "the newer rejoin must survive the late leave");
+        // Late node: chronological replay of the same envelopes.
+        let (late, _d2) = router_with_activation(FAR_FUTURE);
+        make_channel(&late, CID, &c.addr, 2);
+        for e in [&j1, &l2, &j3] {
+            assert!(accepted(&late.process_synced_message(e)));
+        }
+        assert!(is_member(&late, CID, &j.addr));
+
+        // Negative control: the late leave is NEWER than the held rejoin.
+        let k = wallet();
+        assert!(accepted(&r.process_synced_message(&join(&k, CID, None, t))));
+        assert!(accepted(&r.process_synced_message(&join(&k, CID, None, t + 1_000))));
+        assert!(accepted(&r.process_synced_message(&leave(&k, CID, t + 2_000))));
+        assert!(!is_member(&r, CID, &k.addr));
+
+        // Equal timestamps: the leave wins (as on a late node, which never
+        // gets the tied rejoin indexed). The rejoin carries an invite only
+        // so its payload — and so its msg_id, which does not cover the
+        // msg_type — differs from the leave's.
+        let m = wallet();
+        assert!(accepted(&r.process_synced_message(&join(&m, CID, None, t))));
+        let inv_m = invite(&c, CID, &m.addr, t + 1_000, None, None);
+        assert!(accepted(&r.process_synced_message(&join(&m, CID, Some(inv_m), t + 2_000))));
+        assert!(accepted(&r.process_synced_message(&leave(&m, CID, t + 2_000))));
+        assert!(!is_member(&r, CID, &m.addr));
+    }
+
+    /// Round-5 S-W1, enforced private channel: the held rejoin carried NO
+    /// invite (a member needs none). Re-applied after the late leave it is
+    /// re-gated from scratch — as on a late node, where the same join
+    /// arrives after the leave and is refused — so both end non-member.
+    /// With its own invite it is applied on both.
+    #[test]
+    fn late_leave_reapplied_rejoin_is_regated_like_on_a_late_node() {
+        let (r, _d) = enforced();
+        let (c, j) = (wallet(), wallet());
+        make_channel(&r, CID, &c.addr, 2);
+        let t = now() - 60_000;
+        let inv = invite(&c, CID, &j.addr, t - 1_000, None, None);
+        assert!(accepted(&r.process_synced_message(&join(&j, CID, Some(inv.clone()), t))));
+        let j3 = join(&j, CID, None, t + 2_000);
+        assert!(accepted(&r.process_synced_message(&j3)));
+        assert!(accepted(&r.process_synced_message(&leave(&j, CID, t + 1_000))));
+        assert!(!is_member(&r, CID, &j.addr), "a proofless rejoin must not survive re-gating");
+        // Late node: L2 makes J3 a non-member join without proof → refused.
+        let (late, _d2) = enforced();
+        make_channel(&late, CID, &c.addr, 2);
+        assert!(accepted(&late.process_synced_message(&join(&j, CID, Some(inv.clone()), t))));
+        assert!(accepted(&late.process_synced_message(&leave(&j, CID, t + 1_000))));
+        rejected_with(late.process_synced_message(&j3), "invite proof required");
+        assert!(!is_member(&late, CID, &j.addr));
+
+        // Same shape, the rejoin carries its own invite: member.
+        let k = wallet();
+        let inv_k = invite(&c, CID, &k.addr, t - 1_000, None, None);
+        assert!(accepted(&r.process_synced_message(&join(&k, CID, Some(inv_k.clone()), t))));
+        assert!(accepted(&r.process_synced_message(&join(&k, CID, Some(inv_k), t + 2_000))));
+        assert!(accepted(&r.process_synced_message(&leave(&k, CID, t + 1_000))));
+        assert!(is_member(&r, CID, &k.addr));
+    }
+
+    /// Round-6: the S-W1 re-apply must never undo a ban. Public channel:
+    /// J@t, J@t+3 (held no-op re-join), Ban@t+4, then the late L@t+2
+    /// promotes J@t+3 — the re-applied join is refused (active ban in
+    /// `recheck_join_locked`, plus the ban's REMOVED watermark at t+4).
+    #[test]
+    fn late_leave_after_ban_does_not_readd_the_banned_member() {
+        let (r, _d) = enforced();
+        let c = wallet();
+        make_channel(&r, CID, &c.addr, 0);
+        let t = now() - 10 * DAY;
+        // Positive control: without the ban the late leave re-applies the
+        // held rejoin (so the refusals below are the re-apply's, not a
+        // path that never ran).
+        let k = wallet();
+        assert!(accepted(&r.process_synced_message(&join(&k, CID, None, t))));
+        assert!(accepted(&r.process_synced_message(&join(&k, CID, None, t + 3_000))));
+        assert!(accepted(&r.process_synced_message(&leave(&k, CID, t + 2_000))));
+        assert!(is_member(&r, CID, &k.addr), "control: held rejoin re-applied");
+
+        let j = wallet();
+        assert!(accepted(&r.process_synced_message(&join(&j, CID, None, t))));
+        assert!(accepted(&r.process_synced_message(&join(&j, CID, None, t + 3_000))));
+        assert!(accepted(&r.process_synced_message(&ban(&c, CID, &j.addr, t + 4_000))));
+        assert!(!is_member(&r, CID, &j.addr));
+        let _ = r.process_synced_message(&leave(&j, CID, t + 2_000));
+        assert!(!is_member(&r, CID, &j.addr), "a late leave must not re-add a banned member");
+
+        // Same shape with the REMOVED watermark absent (a ban recorded
+        // before 0.140.0 wrote no watermark): only the active-ban re-check
+        // stands between the re-apply and the member row.
+        let b = wallet();
+        assert!(accepted(&r.process_synced_message(&join(&b, CID, None, t))));
+        assert!(accepted(&r.process_synced_message(&join(&b, CID, None, t + 3_000))));
+        assert!(accepted(&r.process_synced_message(&ban(&c, CID, &b.addr, t + 4_000))));
+        r.storage
+            .delete_cf(
+                schema::cf::CHANNEL_ROLE_WATERMARKS,
+                &schema::encode_channel_role_watermark_key(CID, schema::role_watermark_kind::REMOVED, &b.addr),
+            )
+            .unwrap();
+        assert!(r.storage.channel_removal_cutoff(CID, &b.addr).unwrap().is_none());
+        let _ = r.process_synced_message(&leave(&b, CID, t + 2_000));
+        assert!(!is_member(&r, CID, &b.addr), "the active ban alone must refuse the re-apply");
+    }
+
+    /// Round-6: kick mirror of the above. J@t, J@t+3 (held), Kick@t+4, late
+    /// L@t+2 — the re-applied J@t+3 is refused by the kick's REMOVED
+    /// watermark (t+4 >= t+3) in `add_channel_member_checked`.
+    #[test]
+    fn late_leave_after_kick_does_not_readd_the_kicked_member() {
+        let (r, _d) = enforced();
+        let c = wallet();
+        make_channel(&r, CID, &c.addr, 0);
+        let t = now() - 10 * DAY;
+        let j = wallet();
+        assert!(accepted(&r.process_synced_message(&join(&j, CID, None, t))));
+        assert!(accepted(&r.process_synced_message(&join(&j, CID, None, t + 3_000))));
+        assert!(accepted(&r.process_synced_message(&kick(&c, CID, &j.addr, t + 4_000))));
+        assert!(!is_member(&r, CID, &j.addr));
+        let _ = r.process_synced_message(&leave(&j, CID, t + 2_000));
+        assert!(!is_member(&r, CID, &j.addr), "a late leave must not re-add a kicked member");
+        // A join AFTER the kick is still applied (the watermark only
+        // shadows joins at or before it).
+        assert!(accepted(&r.process_synced_message(&join(&j, CID, None, t + 5_000))));
+        assert!(is_member(&r, CID, &j.addr));
+    }
+
+    #[test]
+    fn removal_watermark_is_max_and_clamped() {
+        let (r, _d) = enforced();
+        r.storage.raise_channel_role_watermark(CID, schema::role_watermark_kind::REMOVED, "klv1x", 500).unwrap();
+        r.storage.raise_channel_role_watermark(CID, schema::role_watermark_kind::REMOVED, "klv1x", 200).unwrap();
+        assert_eq!(r.storage.channel_removal_cutoff(CID, "klv1x").unwrap(), Some(500));
+        let far = now() + 365 * DAY;
+        assert!(MessageRouter::clamp_watermark_ts(far) <= now() + DRIFT + 1_000);
+        assert_eq!(MessageRouter::clamp_watermark_ts(500), 500);
+    }
+
+    // ---- Rule 8: inviter authority ----
+
+    #[test]
+    fn rule8_moderator_with_grant_accepted_on_node_that_does_not_know_moderators() {
+        let (r, _d) = enforced();
+        let (c, m, j) = (wallet(), wallet(), wallet());
+        make_channel(&r, CID, &c.addr, 2);
+        let g = grant(&c, CID, &m.addr, now() - 5_000);
+        let inv = invite(&m, CID, &j.addr, now() - 1_000, None, Some(g));
+        assert!(accepted(&r.process_message(&join(&j, CID, Some(inv), now()))));
+        assert!(is_member(&r, CID, &j.addr));
+    }
+
+    #[test]
+    fn rule8_reject_non_moderator_without_grant() {
+        let (r, _d) = enforced();
+        let (c, m, j) = (wallet(), wallet(), wallet());
+        make_channel(&r, CID, &c.addr, 2);
+        let inv = invite(&m, CID, &j.addr, now() - 1_000, None, None);
+        rejected_with(r.process_message(&join(&j, CID, Some(inv), now())), "private channel: inviter is not creator or moderator");
+    }
+
+    #[test]
+    fn rule8_locally_known_moderator_without_grant_is_accepted() {
+        let (r, _d) = enforced();
+        let (c, m, j) = (wallet(), wallet(), wallet());
+        make_channel(&r, CID, &c.addr, 2);
+        r.storage.put_cf(schema::cf::CHANNEL_MODERATORS, &schema::encode_channel_moderator_key(CID, &m.addr), b"{}").unwrap();
+        let inv = invite(&m, CID, &j.addr, now() - 1_000, None, None);
+        assert!(accepted(&r.process_message(&join(&j, CID, Some(inv), now()))));
+    }
+
+    #[test]
+    fn rule8_reject_forged_wrong_target_and_future_grants() {
+        let (r, _d) = enforced();
+        let (c, m, j, impostor) = (wallet(), wallet(), wallet(), wallet());
+        make_channel(&r, CID, &c.addr, 2);
+        // Forged: "grant" signed by someone who is not the creator.
+        let forged = grant(&impostor, CID, &m.addr, now() - 5_000);
+        let inv = invite(&m, CID, &j.addr, now() - 1_000, None, Some(forged));
+        rejected_with(r.process_message(&join(&j, CID, Some(inv), now())), "inviter is not creator or moderator");
+        // Genuine grant, but for a different wallet than the inviter.
+        let other = grant(&c, CID, &impostor.addr, now() - 5_000);
+        let inv = invite(&m, CID, &j.addr, now() - 1_000, None, Some(other));
+        rejected_with(r.process_message(&join(&j, CID, Some(inv), now())), "inviter is not creator or moderator");
+        // Genuine grant for a different channel.
+        let other_ch = grant(&c, CID + 1, &m.addr, now() - 5_000);
+        let inv = invite(&m, CID, &j.addr, now() - 1_000, None, Some(other_ch));
+        rejected_with(r.process_message(&join(&j, CID, Some(inv), now())), "inviter is not creator or moderator");
+        // grant.ts > invite.ts.
+        let later = grant(&c, CID, &m.addr, now() - 500);
+        let inv = invite(&m, CID, &j.addr, now() - 1_000, None, Some(later));
+        rejected_with(r.process_message(&join(&j, CID, Some(inv), now())), "inviter is not creator or moderator");
+        assert!(!is_member(&r, CID, &j.addr));
+    }
+
+    #[test]
+    fn rule8_demoted_moderator_live_vs_sync() {
+        let (r, _d) = enforced();
+        let (c, m, j, k) = (wallet(), wallet(), wallet(), wallet());
+        make_channel(&r, CID, &c.addr, 2);
+        let g_ts = now() - 20 * 60_000;
+        let g = grant(&c, CID, &m.addr, g_ts);
+        let inv_j = invite(&m, CID, &j.addr, g_ts + 1_000, None, Some(g.clone()));
+        let inv_k = invite(&m, CID, &k.addr, g_ts + 1_000, None, Some(g));
+        // Demotion after the invites were issued.
+        assert!(accepted(&r.process_message(&remove_mod(&c, CID, &m.addr, now() - 60_000))));
+        // Live join now: the demoted moderator's outstanding invite is dead.
+        rejected_with(r.process_message(&join(&j, CID, Some(inv_j), now())), "inviter is not creator or moderator");
+        // Historical (sync) join that happened before the demotion: still valid history.
+        assert!(accepted(&r.process_synced_message(&join(&k, CID, Some(inv_k), g_ts + 2_000))));
+        assert!(is_member(&r, CID, &k.addr));
+    }
+
+    #[test]
+    fn invited_unknown_channel_is_accepted_but_not_applied() {
+        let (r, _d) = enforced();
+        let (c, j) = (wallet(), wallet());
+        let inv = invite(&c, CID, &j.addr, now() - 1_000, None, None);
+        assert_eq!(
+            r.verify_private_join(CID, &j.addr, now(), Some(&inv), false).map(|v| v.verdict),
+            Ok(JoinVerdict::InvitedUnknownChannel)
+        );
+        assert!(accepted(&r.process_message(&join(&j, CID, Some(inv), now()))));
+        assert!(!is_member(&r, CID, &j.addr));
+        // Rules 4-7 still run for an unknown channel.
+        let wrong = invite(&c, CID, &c.addr, now() - 1_000, None, None);
+        rejected_with(r.process_message(&join(&j, CID, Some(wrong), now())), "different wallet");
+    }
+
+    // ---- Chat no-auto-add (B1) ----
+
+    #[test]
+    fn chat_in_private_channel_no_longer_auto_adds_but_is_accepted() {
+        let (r, _d) = enforced();
+        let (c, x) = (wallet(), wallet());
+        make_channel(&r, CID, &c.addr, 2);
+        assert!(accepted(&r.process_message(&chat(&x, CID, now()))));
+        assert!(!is_member(&r, CID, &x.addr));
+    }
+
+    #[test]
+    fn chat_legacy_and_public_still_auto_add() {
+        let (r, _d) = router_with_activation(FAR_FUTURE);
+        let (c, x, y) = (wallet(), wallet(), wallet());
+        make_channel(&r, CID, &c.addr, 2);
+        assert!(accepted(&r.process_message(&chat(&x, CID, now()))));
+        assert!(is_member(&r, CID, &x.addr));
+        make_channel(&r, 57, &c.addr, 0);
+        let (r2, _d2) = enforced();
+        make_channel(&r2, 57, &c.addr, 0);
+        assert!(accepted(&r2.process_message(&chat(&y, 57, now()))));
+        assert!(is_member(&r2, 57, &y.addr));
+    }
+
+    #[test]
+    fn chat_legacy_auto_add_respects_newer_kick() {
+        let (r, _d) = router_with_activation(FAR_FUTURE);
+        let (c, x) = (wallet(), wallet());
+        make_channel(&r, CID, &c.addr, 2);
+        let t = now() - DAY;
+        assert!(accepted(&r.process_synced_message(&kick(&c, CID, &x.addr, t + 1_000))));
+        assert!(accepted(&r.process_synced_message(&chat(&x, CID, t))));
+        assert!(!is_member(&r, CID, &x.addr));
+    }
+
+    // ---- ChannelInvite ingest ----
+
+    #[test]
+    fn invite_ingest_grant_on_node_without_moderators_accepted_plain_non_mod_rejected() {
+        let (r, _d) = enforced();
+        let (c, m, t) = (wallet(), wallet(), wallet());
+        make_channel(&r, CID, &c.addr, 2);
+        register(&r, &m.addr);
+        let g = grant(&c, CID, &m.addr, now() - 5_000);
+        assert!(accepted(&r.process_message(&invite(&m, CID, &t.addr, now(), None, Some(g)))));
+        rejected_with(r.process_message(&invite(&m, CID, &t.addr, now() + 1, None, None)), "only creator or moderators");
+    }
+
+    #[test]
+    fn invite_ingest_demoted_moderator_grant_rejected() {
+        let (r, _d) = enforced();
+        let (c, m, t) = (wallet(), wallet(), wallet());
+        make_channel(&r, CID, &c.addr, 2);
+        register(&r, &m.addr);
+        let g = grant(&c, CID, &m.addr, now() - 50_000);
+        assert!(accepted(&r.process_message(&remove_mod(&c, CID, &m.addr, now() - 10_000))));
+        rejected_with(r.process_message(&invite(&m, CID, &t.addr, now(), None, Some(g))), "only creator or moderators");
+    }
+
+    #[test]
+    fn invite_ingest_bad_expiry_and_oversized_grant_rejected() {
+        let (r, _d) = enforced();
+        let (c, t) = (wallet(), wallet());
+        make_channel(&r, CID, &c.addr, 2);
+        let ts = now();
+        rejected_with(r.process_message(&invite(&c, CID, &t.addr, ts, Some(ts + validation::MAX_INVITE_TTL_MS + 1), None)), "maximum invite lifetime");
+        rejected_with(r.process_message(&invite(&c, CID, &t.addr, ts + 1, Some(ts), None)), "after the invite");
+        rejected_with(r.process_message(&invite(&c, CID, &t.addr, ts + 2, None, Some(vec![0u8; validation::MAX_INVITER_GRANT_BYTES + 1]))), "inviter_grant");
+        assert!(accepted(&r.process_message(&invite(&c, CID, &t.addr, ts + 3, Some(ts + 3 + validation::MAX_INVITE_TTL_MS), None))));
+    }
+
+    // ---- Federate gates ----
+
+    #[test]
+    fn federate_prefetch_gate_unknown_channel_and_invite_rules() {
+        let (r, _d) = enforced();
+        let (c, j, m) = (wallet(), wallet(), wallet());
+        // Unknown channel, no invite: allowed to fetch — the caller may be
+        // the creator; `federate_bootstrap_gate` decides before storing.
+        assert!(r.federate_prefetch_gate(CID, &j.addr, now(), None).is_ok());
+        let inv = invite(&c, CID, &j.addr, now() - 1_000, None, None);
+        assert!(r.federate_prefetch_gate(CID, &j.addr, now(), Some(&inv)).is_ok());
+        // An attached invite must still pass rules 4-7.
+        assert!(r.federate_prefetch_gate(CID, &m.addr, now(), Some(&inv)).is_err());
+        let old = invite(&c, CID, &j.addr, now() - 8 * DAY, None, None);
+        assert!(r.federate_prefetch_gate(CID, &j.addr, now(), Some(&old)).is_err());
+        // Known channel: non-member without invite is refused before any fetch.
+        make_channel(&r, CID, &c.addr, 2);
+        assert_eq!(
+            r.federate_prefetch_gate(CID, &j.addr, now(), None).unwrap_err(),
+            "private channel: invite proof required"
+        );
+        // Known channel, already a member: refresh allowed without invite.
+        r.storage.add_channel_member(CID, &m.addr, 1, "member").unwrap();
+        assert!(r.federate_prefetch_gate(CID, &m.addr, now(), None).is_ok());
+    }
+
+    #[test]
+    fn federate_prefetch_gate_known_channel_runs_full_inviter_authority() {
+        // Round-2 audit N-b: for a channel this node already knows, a
+        // self-signed (non-moderator) invite must be refused BEFORE any
+        // outbound fetch / envelope replay / federated_from rewrite.
+        let (r, _d) = enforced();
+        let (c, x, j) = (wallet(), wallet(), wallet());
+        make_channel(&r, CID, &c.addr, 2);
+        let selfish = invite(&x, CID, &x.addr, now() - 1_000, None, None);
+        assert_eq!(
+            r.federate_prefetch_gate(CID, &x.addr, now(), Some(&selfish)).unwrap_err(),
+            "private channel: inviter is not creator or moderator"
+        );
+        let genuine = invite(&c, CID, &j.addr, now() - 1_000, None, None);
+        assert!(r.federate_prefetch_gate(CID, &j.addr, now(), Some(&genuine)).is_ok());
+    }
+
+    #[test]
+    fn federate_prefetch_gate_passes_known_public_channels_to_the_400() {
+        // Round-3: a non-member with no invite federating a known PUBLIC
+        // channel must get the specified 400, not a private-channel 403.
+        let (r, _d) = enforced();
+        let (c, x) = (wallet(), wallet());
+        make_channel(&r, 55, &c.addr, 0);
+        make_channel(&r, 56, &c.addr, 1);
+        assert!(r.federate_prefetch_gate(55, &x.addr, now(), None).is_ok());
+        assert!(r.federate_prefetch_gate(56, &x.addr, now(), None).is_ok());
+    }
+
+    #[test]
+    fn creator_without_member_row_is_added_with_creator_role() {
+        // Round-3 N4.
+        let (r, _d) = enforced();
+        let c = wallet();
+        make_channel(&r, CID, &c.addr, 2);
+        r.storage
+            .delete_cf(schema::cf::CHANNEL_MEMBERS, &schema::encode_channel_member_key(CID, &c.addr))
+            .unwrap();
+        let v = r.federate_membership_gate(CID, &c.addr, now(), None).unwrap();
+        assert!(r.federate_add_member(CID, &c.addr, now(), &v).unwrap());
+        let rec = r
+            .storage
+            .get_cf(schema::cf::CHANNEL_MEMBERS, &schema::encode_channel_member_key(CID, &c.addr))
+            .unwrap()
+            .unwrap();
+        let rec: serde_json::Value = serde_json::from_slice(&rec).unwrap();
+        assert_eq!(rec["role"], "creator");
+    }
+
+    #[test]
+    fn federate_prefetch_gate_has_no_activation_exemption() {
+        let (r, _d) = router_with_activation(FAR_FUTURE);
+        let (c, j) = (wallet(), wallet());
+        make_channel(&r, CID, &c.addr, 2);
+        assert!(r.federate_prefetch_gate(CID, &j.addr, now(), None).is_err());
+    }
+
+    #[test]
+    fn federate_membership_gate_ban_authority_and_refresh() {
+        let (r, _d) = enforced();
+        let (c, j, b, m, x) = (wallet(), wallet(), wallet(), wallet(), wallet());
+        make_channel(&r, CID, &c.addr, 2);
+        let inv = invite(&c, CID, &j.addr, now() - 1_000, None, None);
+        assert_eq!(r.federate_membership_gate(CID, &j.addr, now(), Some(&inv)).map(|v| v.verdict), Ok(JoinVerdict::Invited));
+        // Banned: rejected even with a valid fresh invite.
+        assert!(accepted(&r.process_message(&ban(&c, CID, &b.addr, now() - 5_000))));
+        let inv_b = invite(&c, CID, &b.addr, now() - 1_000, None, None);
+        assert!(r.federate_membership_gate(CID, &b.addr, now(), Some(&inv_b)).unwrap_err().contains("banned"));
+        // Non-moderator inviter: rejected after bootstrap.
+        let bad = invite(&x, CID, &m.addr, now() - 1_000, None, None);
+        assert!(r.federate_membership_gate(CID, &m.addr, now(), Some(&bad)).is_err());
+        // Refresh by an existing member: no invite needed.
+        r.storage.add_channel_member(CID, &m.addr, 1, "member").unwrap();
+        assert_eq!(r.federate_membership_gate(CID, &m.addr, now(), None).map(|v| v.verdict), Ok(JoinVerdict::AlreadyMemberOrCreator));
+    }
+
+    // ---- Storage: purge + moderator LWW + grant lookup ----
+
+    #[test]
+    fn channel_invites_purge_is_capped_and_idempotent() {
+        let (r, _d) = enforced();
+        for i in 0..5u64 {
+            r.storage.put_cf(schema::cf::CHANNEL_INVITES, &schema::encode_channel_invite_key(i + 1, "klv1a"), b"{}").unwrap();
+        }
+        assert_eq!(r.storage.run_channel_invites_purge(3).unwrap(), 3);
+        assert_eq!(r.storage.get_stat(schema::state_keys::CHANNEL_INVITES_PURGED).unwrap(), 0);
+        assert_eq!(r.storage.run_channel_invites_purge(3).unwrap(), 2);
+        assert_eq!(r.storage.get_stat(schema::state_keys::CHANNEL_INVITES_PURGED).unwrap(), 1);
+        assert_eq!(r.storage.prefix_iter_cf(schema::cf::CHANNEL_INVITES, &[], 10).unwrap().len(), 0);
+        // Sentinel set: later passes do nothing, even if a stray row appears.
+        r.storage.put_cf(schema::cf::CHANNEL_INVITES, b"stray", b"{}").unwrap();
+        assert_eq!(r.storage.run_channel_invites_purge(3).unwrap(), 0);
+    }
+
+    #[test]
+    fn moderator_grant_record_lww_and_demotion_ordering() {
+        let (r, _d) = enforced();
+        let (c, m) = (wallet(), wallet());
+        make_channel(&r, CID, &c.addr, 2);
+        let t = now() - DAY;
+        let newer = grant(&c, CID, &m.addr, t + 2_000);
+        let older = grant(&c, CID, &m.addr, t + 1_000);
+        assert!(accepted(&r.process_synced_message(&newer)));
+        assert!(accepted(&r.process_synced_message(&older)));
+        let looked = crate::api::routes::lookup_moderator_grant(&r.storage, CID, &m.addr).unwrap().unwrap();
+        assert_eq!(looked, newer, "an older grant must not replace grant_msg_id");
+        assert_eq!(crate::api::routes::lookup_moderator_grant(&r.storage, CID, &c.addr).unwrap(), None);
+        // An older demotion replayed later must not delete the newer grant.
+        assert!(accepted(&r.process_synced_message(&remove_mod(&c, CID, &m.addr, t + 1_500))));
+        assert!(r.storage.is_channel_moderator(CID, &m.addr).unwrap());
+        // A newer demotion does; an older grant replayed afterwards can't reinstate.
+        assert!(accepted(&r.process_synced_message(&remove_mod(&c, CID, &m.addr, t + 3_000))));
+        assert!(!r.storage.is_channel_moderator(CID, &m.addr).unwrap());
+        let old2 = grant(&c, CID, &m.addr, t + 2_500);
+        assert!(accepted(&r.process_synced_message(&old2)));
+        assert!(!r.storage.is_channel_moderator(CID, &m.addr).unwrap());
+        // Both moderator types are indexed for backfill (B5).
+        let rows = r.storage.prefix_iter_cf(schema::cf::CHANNEL_META_MSGS, &CID.to_be_bytes(), 100).unwrap();
+        assert!(rows.iter().any(|(k, _)| k[8] == MessageType::ChannelAddModerator as u8));
+        assert!(rows.iter().any(|(k, _)| k[8] == MessageType::ChannelRemoveModerator as u8));
+    }
+
+    // ---- Cross-node ----
+
+    #[test]
+    fn cross_node_moderator_invite_join_converges() {
+        let (host, _d1) = enforced();
+        let (remote, _d2) = enforced();
+        let (c, m, j) = (wallet(), wallet(), wallet());
+        for r in [&host, &remote] {
+            make_channel(r, CID, &c.addr, 2);
+            register(r, &m.addr);
+        }
+        // Host knows the moderator; the remote node never saw the grant.
+        let g = grant(&c, CID, &m.addr, now() - 10_000);
+        assert!(accepted(&host.process_message(&g)));
+        let inv = invite(&m, CID, &j.addr, now() - 5_000, None, Some(g));
+        for r in [&host, &remote] {
+            assert!(accepted(&r.process_message(&inv)), "invite must be accepted on both nodes");
+        }
+        let jn = join(&j, CID, Some(inv), now());
+        for r in [&host, &remote] {
+            assert!(accepted(&r.process_message(&jn)));
+            assert!(is_member(r, CID, &j.addr));
+        }
+        // A proofless join is rejected identically on both.
+        let x = wallet();
+        let bad = join(&x, CID, None, now());
+        for r in [&host, &remote] {
+            rejected_with(r.process_message(&bad), "private channel: invite proof required");
+        }
+    }
+
+    // ---- Audit-fix round (0.140.0): mainnet, federate creator path, rechecks ----
+
+    fn mainnet_router(activation: u64) -> (MessageRouter, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let identity = IdentityResolver::new(storage.clone());
+        let cfg = crate::config::ChannelVerifyConfig {
+            private_join_proof_activation_ms: activation,
+            ..Default::default()
+        };
+        (
+            MessageRouter::new(
+                storage,
+                identity,
+                None,
+                "mainnet".to_string(),
+                usize::MAX,
+                std::sync::Arc::new(crate::metrics::counters::NetworkCounters::new()),
+                crate::config::RateLimitsConfig::default(),
+            )
+            .with_channel_verify_config(cfg),
+            dir,
+        )
+    }
+
+    #[test]
+    fn mainnet_ignores_a_nonzero_activation_and_requires_proof() {
+        // Security audit B1: a mainnet node on a default/testnet-copied
+        // config must not accept proofless private joins.
+        let (r, _d) = mainnet_router(FAR_FUTURE);
+        assert_eq!(r.join_proof_activation_ms(), 0);
+        let j = wallet();
+        assert_eq!(
+            r.verify_private_join(CID, &j.addr, 1_000, None, true).unwrap_err(),
+            "private channel: invite proof required",
+            "even a backdated sync join is refused on mainnet"
+        );
+        // Control: the same config on testnet grandfathers it.
+        let (t, _d2) = router_with_activation(FAR_FUTURE);
+        assert!(t.verify_private_join(CID, &j.addr, 1_000, None, true).is_ok());
+    }
+
+    /// A signed private ChannelCreate whose id matches its derivation.
+    fn derived_create(w: &W, slug: &str, ts: u64, forge: bool) -> (Vec<u8>, u64) {
+        const M: u64 = (1u64 << 53) - 1;
+        let mut t = ts;
+        let cid = loop {
+            let h = crypto::keccak256(format!("{}{}{}", w.addr, slug, t).as_bytes());
+            let id = u64::from_be_bytes(h[..8].try_into().unwrap()) % M;
+            if id > PRIVATE_CHANNEL_ID_FLOOR {
+                break id;
+            }
+            t += 1;
+        };
+        let cid = if forge { cid + 1 } else { cid };
+        let p = ChannelCreatePayload {
+            channel_id: cid,
+            slug: slug.to_string(),
+            channel_type: ChannelType::Private,
+            display_name: None,
+            description: None,
+            content_rating: Default::default(),
+            moderation: ModerationPolicy { admins: vec![], rules: None },
+            encryption_enabled: None,
+            history_visibility: None,
+            id_derivation_ts: Some(t),
+        };
+        (sign(w, MessageType::ChannelCreate, rmp_serde::to_vec_named(&p).unwrap(), t), cid)
+    }
+
+    #[test]
+    fn federate_bootstrap_gate_creator_path_and_invites() {
+        let (r, _d) = enforced();
+        let (c, j, x, m) = (wallet(), wallet(), wallet(), wallet());
+        let (create, cid) = derived_create(&c, "secret-room", now() - 60_000, false);
+        // Creator federating their own channel: no invite needed.
+        assert_eq!(r.federate_bootstrap_gate(&create, cid, &c.addr, now(), None), Ok(()));
+        // Someone else without an invite: denied with the stable reason.
+        assert_eq!(
+            r.federate_bootstrap_gate(&create, cid, &j.addr, now(), None),
+            Err(BootstrapGateError::Denied("private channel: invite proof required".into()))
+        );
+        // A creator-signed invite: accepted.
+        let inv = invite(&c, CID, &j.addr, now() - 1_000, None, None);
+        let inv_ok = invite(&c, cid, &j.addr, now() - 1_000, None, None);
+        assert_eq!(r.federate_bootstrap_gate(&create, cid, &j.addr, now(), Some(&inv_ok)), Ok(()));
+        // Invite for another channel: denied.
+        assert!(matches!(
+            r.federate_bootstrap_gate(&create, cid, &j.addr, now(), Some(&inv)),
+            Err(BootstrapGateError::Denied(_))
+        ));
+        // Self-signed "invite" by a non-moderator: passes rules 4-7 (so it
+        // gets past the pre-fetch gate) but is denied here, rule 8.
+        let selfish = invite(&x, cid, &x.addr, now() - 1_000, None, None);
+        assert!(r.federate_prefetch_gate(cid, &x.addr, now(), Some(&selfish)).is_ok());
+        assert_eq!(
+            r.federate_bootstrap_gate(&create, cid, &x.addr, now(), Some(&selfish)),
+            Err(BootstrapGateError::Denied("private channel: inviter is not creator or moderator".into()))
+        );
+        // Moderator invite with a creator grant: accepted.
+        let g = grant(&c, cid, &m.addr, now() - 5_000);
+        let mod_inv = invite(&m, cid, &j.addr, now() - 1_000, None, Some(g));
+        assert_eq!(r.federate_bootstrap_gate(&create, cid, &j.addr, now(), Some(&mod_inv)), Ok(()));
+        // Nothing was stored by any of these decisions.
+        assert!(!r.storage.exists_cf(schema::cf::CHANNELS, &cid.to_be_bytes()).unwrap());
+        assert!(!is_member(&r, cid, &c.addr));
+    }
+
+    #[test]
+    fn federate_bootstrap_gate_rejects_forged_derivation_even_when_policy_is_off() {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let identity = IdentityResolver::new(storage.clone());
+        let cfg = crate::config::ChannelVerifyConfig {
+            require_private_id_derivation: false,
+            private_join_proof_activation_ms: 0,
+            ..Default::default()
+        };
+        let r = MessageRouter::new(
+            storage,
+            identity,
+            None,
+            "testnet".to_string(),
+            usize::MAX,
+            std::sync::Arc::new(crate::metrics::counters::NetworkCounters::new()),
+            crate::config::RateLimitsConfig::default(),
+        )
+        .with_channel_verify_config(cfg);
+        let c = wallet();
+        let (forged, cid) = derived_create(&c, "secret-room", now() - 60_000, true);
+        assert!(matches!(
+            r.federate_bootstrap_gate(&forged, cid, &c.addr, now(), None),
+            Err(BootstrapGateError::BadBootstrap(_))
+        ));
+        // Wrong channel id asked for, and garbage bytes: also bad bootstrap.
+        let (good, gcid) = derived_create(&c, "other-room", now() - 60_000, false);
+        assert!(matches!(
+            r.federate_bootstrap_gate(&good, gcid + 7, &c.addr, now(), None),
+            Err(BootstrapGateError::BadBootstrap(_))
+        ));
+        assert!(matches!(
+            r.federate_bootstrap_gate(b"junk", gcid, &c.addr, now(), None),
+            Err(BootstrapGateError::BadBootstrap(_))
+        ));
+    }
+
+    #[test]
+    fn apply_time_recheck_catches_a_ban_landing_after_authorization() {
+        let (r, _d) = enforced();
+        let (c, j) = (wallet(), wallet());
+        make_channel(&r, CID, &c.addr, 2);
+        let inv = invite(&c, CID, &j.addr, now() - 1_000, None, None);
+        let v = r.verify_private_join(CID, &j.addr, now(), Some(&inv), false).unwrap();
+        // Ban lands between the gate and the insert. Dated BEFORE the
+        // invite, so only the active-ban re-check (not the removal cutoff)
+        // can catch it.
+        assert!(accepted(&r.process_message(&ban(&c, CID, &j.addr, now() - 5_000))));
+        assert!(!r.federate_add_member(CID, &j.addr, now(), &v).unwrap());
+        assert!(!is_member(&r, CID, &j.addr));
+    }
+
+    #[test]
+    fn apply_time_recheck_catches_a_demotion_landing_after_authorization() {
+        let (r, _d) = enforced();
+        let (c, m, j) = (wallet(), wallet(), wallet());
+        make_channel(&r, CID, &c.addr, 2);
+        let g = grant(&c, CID, &m.addr, now() - 50_000);
+        let inv = invite(&m, CID, &j.addr, now() - 10_000, None, Some(g));
+        let join_ts = now();
+        let v = r.verify_private_join(CID, &j.addr, join_ts, Some(&inv), false).unwrap();
+        assert_eq!(v.verdict, JoinVerdict::Invited);
+        // Demotion lands between the gate and the insert.
+        r.storage
+            .raise_channel_role_watermark(CID, schema::role_watermark_kind::MODERATOR_REMOVED, &m.addr, join_ts - 1)
+            .unwrap();
+        assert!(!r.federate_add_member(CID, &j.addr, join_ts, &v).unwrap());
+        assert!(!is_member(&r, CID, &j.addr));
+        // Control: without the demotion the same facts are added.
+        let (r2, _d2) = enforced();
+        make_channel(&r2, CID, &c.addr, 2);
+        let v2 = r2.verify_private_join(CID, &j.addr, join_ts, Some(&inv), false).unwrap();
+        assert!(r2.federate_add_member(CID, &j.addr, join_ts, &v2).unwrap());
+    }
+
+    #[test]
+    fn federate_add_member_reports_not_added_after_a_kick_and_unknown_channel_is_never_applied() {
+        let (r, _d) = enforced();
+        let (c, j) = (wallet(), wallet());
+        make_channel(&r, CID, &c.addr, 2);
+        let inv = invite(&c, CID, &j.addr, now() - 10_000, None, None);
+        let v = r.verify_private_join(CID, &j.addr, now(), Some(&inv), false).unwrap();
+        assert!(accepted(&r.process_message(&kick(&c, CID, &j.addr, now() - 1_000))));
+        assert!(!r.federate_add_member(CID, &j.addr, now(), &v).unwrap());
+        // A verdict reached while the channel was unknown is never applied,
+        // even if the row appears before the insert.
+        let (r2, _d2) = enforced();
+        let inv2 = invite(&c, CID, &j.addr, now() - 1_000, None, None);
+        let v2 = r2.verify_private_join(CID, &j.addr, now(), Some(&inv2), false).unwrap();
+        assert_eq!(v2.verdict, JoinVerdict::InvitedUnknownChannel);
+        make_channel(&r2, CID, &c.addr, 2);
+        assert!(!r2.federate_add_member(CID, &j.addr, now(), &v2).unwrap());
+        assert!(!is_member(&r2, CID, &j.addr));
+    }
+
+    #[test]
+    fn local_moderator_fallback_requires_the_listing_to_cover_the_invite() {
+        // Security audit N3: an invite signed while the moderator was not
+        // (yet / no longer) a moderator must not become valid through a
+        // later re-promotion.
+        let (r, _d) = enforced();
+        let (c, m, j, k, l) = (wallet(), wallet(), wallet(), wallet(), wallet());
+        make_channel(&r, CID, &c.addr, 2);
+        let key = schema::encode_channel_moderator_key(CID, &m.addr);
+        let invite_ts = now() - 20_000;
+        // Record from a grant dated AFTER the invite: rejected.
+        r.storage
+            .put_cf(schema::cf::CHANNEL_MODERATORS, &key, serde_json::json!({"grant_ts": invite_ts + 5}).to_string().as_bytes())
+            .unwrap();
+        let inv = invite(&m, CID, &j.addr, invite_ts, None, None);
+        rejected_with(r.process_message(&join(&j, CID, Some(inv), now())), "inviter is not creator or moderator");
+        // Record from a grant dated BEFORE the invite: accepted.
+        r.storage
+            .put_cf(schema::cf::CHANNEL_MODERATORS, &key, serde_json::json!({"grant_ts": invite_ts - 5}).to_string().as_bytes())
+            .unwrap();
+        let inv = invite(&m, CID, &k.addr, invite_ts, None, None);
+        assert!(accepted(&r.process_message(&join(&k, CID, Some(inv), now()))));
+        // Legacy record (no grant_ts) + a demotion at/after the invite: rejected.
+        r.storage.put_cf(schema::cf::CHANNEL_MODERATORS, &key, b"{}").unwrap();
+        r.storage
+            .raise_channel_role_watermark(CID, schema::role_watermark_kind::MODERATOR_REMOVED, &m.addr, invite_ts)
+            .unwrap();
+        let inv = invite(&m, CID, &l.addr, invite_ts, None, None);
+        rejected_with(r.process_message(&join(&l, CID, Some(inv), now())), "inviter is not creator or moderator");
+    }
+
+    #[test]
+    fn positional_channel_invite_payloads_decode() {
+        // 3-element (pre-0.140.0 sdk-rust) and 5-element positional forms.
+        let three = rmp_serde::to_vec(&(CID, "klv1t".to_string(), Option::<String>::None)).unwrap();
+        let p: ChannelInvitePayload = rmp_serde::from_slice(&three).unwrap();
+        assert_eq!((p.channel_id, p.expires_at, p.inviter_grant), (CID, None, None));
+        let five = rmp_serde::to_vec(&(
+            CID,
+            "klv1t".to_string(),
+            Some("https://h.example".to_string()),
+            Some(99u64),
+            Some(vec![7u8, 8]),
+        ))
+        .unwrap();
+        let p: ChannelInvitePayload = rmp_serde::from_slice(&five).unwrap();
+        assert_eq!(p.expires_at, Some(99));
+        assert_eq!(p.inviter_grant, Some(vec![7, 8]));
+        // A 4-element form (grant omitted, expires_at nil) also decodes.
+        let four = rmp_serde::to_vec(&(CID, "klv1t".to_string(), Option::<String>::None, Option::<u64>::None)).unwrap();
+        let p: ChannelInvitePayload = rmp_serde::from_slice(&four).unwrap();
+        assert_eq!(p.inviter_grant, None);
+    }
+
+    #[test]
+    fn backfill_channel_meta_v3_indexes_moderator_messages() {
+        let (r, _d) = enforced();
+        let c = wallet();
+        let m = wallet();
+        let add = grant(&c, CID, &m.addr, 10_000);
+        let rm = remove_mod(&c, CID, &m.addr, 20_000);
+        for raw in [&add, &rm] {
+            let env: Envelope = rmp_serde::from_slice(raw).unwrap();
+            r.storage.store_message(&env.msg_id, raw).unwrap();
+        }
+        assert!(r.storage.prefix_iter_cf(schema::cf::CHANNEL_META_MSGS, &CID.to_be_bytes(), 10).unwrap().is_empty());
+        r.storage.backfill_channel_meta().unwrap();
+        let rows = r.storage.prefix_iter_cf(schema::cf::CHANNEL_META_MSGS, &CID.to_be_bytes(), 10).unwrap();
+        assert!(rows.iter().any(|(k, _)| k[8] == MessageType::ChannelAddModerator as u8));
+        assert!(rows.iter().any(|(k, _)| k[8] == MessageType::ChannelRemoveModerator as u8));
+        assert_eq!(r.storage.get_stat(schema::state_keys::CHANNEL_META_INDEXED_V3).unwrap(), 1);
+    }
+
+    // ---- Wire fixtures ----
+
+    /// Hand-built msgpack, as `@msgpack/msgpack` emits it: a MAP with a
+    /// `bin` value for `invite`.
+    fn js_map_join_payload(cid: u64, invite: &[u8]) -> Vec<u8> {
+        let mut b = vec![0x82];
+        b.push(0xa0 | 10);
+        b.extend_from_slice(b"channel_id");
+        b.push(0xcf);
+        b.extend_from_slice(&cid.to_be_bytes());
+        b.push(0xa0 | 6);
+        b.extend_from_slice(b"invite");
+        b.push(0xc5);
+        b.extend_from_slice(&(invite.len() as u16).to_be_bytes());
+        b.extend_from_slice(invite);
+        b
+    }
+
+    #[test]
+    fn js_map_with_bin_join_payload_decodes_and_is_accepted() {
+        let (r, _d) = enforced();
+        let (c, j) = (wallet(), wallet());
+        make_channel(&r, CID, &c.addr, 2);
+        let inv = invite(&c, CID, &j.addr, now() - 1_000, None, None);
+        let payload = js_map_join_payload(CID, &inv);
+        let decoded: ChannelJoinPayload = rmp_serde::from_slice(&payload).unwrap();
+        assert_eq!(decoded.channel_id, CID);
+        assert_eq!(decoded.invite.as_deref(), Some(inv.as_slice()));
+        let raw = sign(&j, MessageType::ChannelJoin, payload, now());
+        assert!(accepted(&r.process_message(&raw)));
+        assert!(is_member(&r, CID, &j.addr));
+    }
+
+    #[test]
+    fn positional_array_join_payloads_decode() {
+        // sdk-rust form: [channel_id] (pre-0.140.0) and [channel_id, invite].
+        let one = rmp_serde::to_vec(&(CID,)).unwrap();
+        let p: ChannelJoinPayload = rmp_serde::from_slice(&one).unwrap();
+        assert_eq!((p.channel_id, p.invite), (CID, None));
+        let two = rmp_serde::to_vec(&(CID, vec![1u8, 2, 3])).unwrap();
+        let p: ChannelJoinPayload = rmp_serde::from_slice(&two).unwrap();
+        assert_eq!(p.invite, Some(vec![1, 2, 3]));
+        // A proofless map join still encodes exactly like before (no key).
+        let legacy = rmp_serde::to_vec_named(&ChannelJoinPayload { channel_id: CID, invite: None }).unwrap();
+        assert_eq!(legacy[0], 0x81);
+    }
+}
+
+#[cfg(test)]
+mod internal_error_reason_tests {
+    //! Round-4 audit 9b: infrastructure failures never put RocksDB/anyhow
+    //! text into a rejection reason (reasons reach HTTP clients), and the
+    //! step-7 wrappers keep the internal reason EXACT so the API maps it to
+    //! a generic 500.
+    use super::*;
+
+    #[test]
+    fn internal_error_returns_the_fixed_reason_without_detail() {
+        let r = internal_error("storage", "IO error: /var/lib/ogmara/db/000123.sst: corruption");
+        assert_eq!(r, INTERNAL_ERROR_REASON);
+        assert!(!r.contains("IO error") && !r.contains("/var/lib"));
+    }
+
+    #[test]
+    fn wrappers_pass_the_internal_reason_through_unprefixed() {
+        assert_eq!(wrap_rejection("unauthorized", INTERNAL_ERROR_REASON.to_string()), INTERNAL_ERROR_REASON);
+        assert_eq!(
+            wrap_rejection("unauthorized", "only the channel creator can manage moderators".into()),
+            "unauthorized: only the channel creator can manage moderators"
+        );
     }
 }

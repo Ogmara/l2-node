@@ -348,11 +348,24 @@ impl NotificationEngine {
                 }
             }
             MessageType::ChannelJoin | MessageType::ChannelLeave => {
-                #[derive(serde::Deserialize)]
-                struct E {
-                    channel_id: u64,
-                }
-                if let Ok(p) = rmp_serde::from_slice::<E>(&envelope.payload) {
+                // Decode through the REAL payload structs (l2-node 0.140.0):
+                // `ChannelJoinPayload` gained a trailing `invite` field, and
+                // a narrower `{ channel_id }` probe fails with
+                // `LengthMismatch` on a 2-element positional-array payload
+                // (recurring bug shape #20).
+                let channel_id = match crate::messages::types::deserialize_payload(
+                    envelope.msg_type,
+                    &envelope.payload,
+                ) {
+                    Ok(crate::messages::types::DeserializedPayload::ChannelJoin(p)) => {
+                        Some(p.channel_id)
+                    }
+                    Ok(crate::messages::types::DeserializedPayload::ChannelLeave(p)) => {
+                        Some(p.channel_id)
+                    }
+                    _ => None,
+                };
+                if let Some(channel_id) = channel_id {
                     let member = self.resolve_member_wallet(&envelope.author);
                     let action = if envelope.msg_type == MessageType::ChannelJoin {
                         "join"
@@ -363,8 +376,8 @@ impl NotificationEngine {
                     // so a join/leave invalidates it. Unlike a descriptor change
                     // this trigger IS keyed by channel, so it can be a point
                     // eviction rather than a full flush.
-                    self.channel_bots_invalidate(p.channel_id).await;
-                    self.broadcast_channel_membership_change(p.channel_id, action, &member);
+                    self.channel_bots_invalidate(channel_id).await;
+                    self.broadcast_channel_membership_change(channel_id, action, &member);
                 }
             }
             MessageType::ChannelKick | MessageType::ChannelBan => {
@@ -448,6 +461,17 @@ impl NotificationEngine {
         // via gossip before its CHANNELS metadata arrives doesn't get a spurious
         // member-targeted push.
         if !self.channel_needs_key_cover(channel_id) {
+            return;
+        }
+        // Private-channel join gate (l2-node 0.140.0): an ACCEPTED join is
+        // not necessarily an APPLIED one — the apply step skips a join that
+        // a newer kick/ban supersedes, or that fails its re-check. Never
+        // announce a "join" (which prompts members' clients to wrap the
+        // channel key) for someone the node did not actually add. A direct
+        // point lookup, NOT a scan of the (capped, 4096-row) audience list
+        // — a joiner sorting past the cap would otherwise never be
+        // announced and never get the key wrapped (security audit W5).
+        if action == "join" && !self.is_channel_member(channel_id, member) {
             return;
         }
         let mut audience = self.channel_member_addresses(channel_id);
@@ -696,6 +720,20 @@ impl NotificationEngine {
             .and_then(|data| serde_json::from_slice::<serde_json::Value>(&data).ok())
             .and_then(|meta| meta.get("key_epoch_floor").and_then(|v| v.as_u64()))
             .unwrap_or(0)
+    }
+
+    /// Point lookup: is `address` in `CHANNEL_MEMBERS` for `channel_id`?
+    /// `false` without storage or on a read error.
+    fn is_channel_member(&self, channel_id: u64, address: &str) -> bool {
+        let Some(storage) = self.storage.as_ref() else {
+            return false;
+        };
+        storage
+            .exists_cf(
+                cf::CHANNEL_MEMBERS,
+                &crate::storage::schema::encode_channel_member_key(channel_id, address),
+            )
+            .unwrap_or(false)
     }
 
     /// Member wallet addresses of a channel (from `CHANNEL_MEMBERS`). Bounded scan.
@@ -1459,6 +1497,8 @@ mod tests {
             channel_id: 42,
             target_user: "klv1invitee".into(),
             anchor_node: None,
+            expires_at: None,
+            inviter_grant: None,
         };
         let e = env(
             MessageType::ChannelInvite,
@@ -1511,6 +1551,8 @@ mod tests {
             channel_id: 7,
             target_user: "klv1invitee".into(),
             anchor_node: None,
+            expires_at: None,
+            inviter_grant: None,
         };
         let e = env(
             MessageType::ChannelInvite,
@@ -1552,6 +1594,8 @@ mod tests {
             channel_id: 9,
             target_user: "klv1invitee".into(),
             anchor_node: None,
+            expires_at: None,
+            inviter_grant: None,
         };
         let e = env(
             MessageType::ChannelInvite,
@@ -1668,5 +1712,110 @@ mod channel_bots_cache_tests {
         // A different wallet is not coalesced against the first.
         e.broadcast_bot_commands_changed("klv1b").await;
         assert!(rx.try_recv().is_ok(), "a different wallet must still broadcast");
+    }
+}
+
+#[cfg(test)]
+mod join_announcement_tests {
+    //! Private-channel join gate (l2-node 0.140.0): `channel_members_changed`
+    //! "join" fires only for a member the node actually added (point lookup,
+    //! security audit W5), and join payloads decode in every wire form.
+    use super::*;
+    use crate::messages::envelope::Envelope;
+    use crate::messages::types::MessageType;
+    use crate::storage::schema;
+    use tempfile::TempDir;
+
+    const CID: u64 = (1u64 << 40) + 3;
+
+    fn engine() -> (NotificationEngine, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        storage
+            .put_cf(
+                cf::CHANNELS,
+                &CID.to_be_bytes(),
+                &serde_json::to_vec(&serde_json::json!({"channel_type": 2, "creator": "klv1c"})).unwrap(),
+            )
+            .unwrap();
+        let mut e = NotificationEngine::new_for_test();
+        e.set_storage(storage);
+        (e, dir)
+    }
+
+    fn join_env(author: &str, payload: Vec<u8>) -> Envelope {
+        Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::ChannelJoin,
+            msg_id: [1u8; 32],
+            author: author.into(),
+            timestamp: 1,
+            lamport_ts: 0,
+            payload,
+            signature: vec![0u8; 64],
+            relay_path: vec![],
+        }
+    }
+
+    fn add(e: &NotificationEngine, addr: &str) {
+        e.storage
+            .as_ref()
+            .unwrap()
+            .put_cf(cf::CHANNEL_MEMBERS, &schema::encode_channel_member_key(CID, addr), b"{}")
+            .unwrap();
+    }
+
+    fn got_join(rx: &mut tokio::sync::broadcast::Receiver<Arc<WsOutbound>>) -> bool {
+        while let Ok(m) = rx.try_recv() {
+            if m.json.contains("channel_members_changed") && m.json.contains("\"join\"") {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn map_payload() -> Vec<u8> {
+        rmp_serde::to_vec_named(&crate::messages::types::ChannelJoinPayload {
+            channel_id: CID,
+            invite: None,
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn accepted_but_not_applied_join_is_not_announced() {
+        let (e, _d) = engine();
+        add(&e, "klv1c");
+        let mut rx = e.ws_broadcast.subscribe();
+        e.process(&join_env("klv1joiner", map_payload())).await;
+        assert!(!got_join(&mut rx), "a join the node did not apply must not be announced");
+        add(&e, "klv1joiner");
+        e.process(&join_env("klv1joiner", map_payload())).await;
+        assert!(got_join(&mut rx), "an applied join must be announced");
+    }
+
+    #[tokio::test]
+    async fn joiner_sorting_past_the_member_scan_cap_is_still_announced() {
+        let (e, _d) = engine();
+        for i in 0..4100u32 {
+            add(&e, &format!("klv1a{i:06}"));
+        }
+        add(&e, "klv1zzzz");
+        let mut rx = e.ws_broadcast.subscribe();
+        e.process(&join_env("klv1zzzz", map_payload())).await;
+        assert!(got_join(&mut rx), "membership check must be a point lookup, not a capped scan");
+    }
+
+    #[tokio::test]
+    async fn positional_array_join_payloads_decode_like_map_ones() {
+        let (e, _d) = engine();
+        add(&e, "klv1j");
+        let mut rx = e.ws_broadcast.subscribe();
+        // sdk-rust pre-0.140 form: [channel_id]
+        e.process(&join_env("klv1j", rmp_serde::to_vec(&(CID,)).unwrap())).await;
+        assert!(got_join(&mut rx), "1-element array");
+        // new 2-element form: [channel_id, invite]
+        e.process(&join_env("klv1j", rmp_serde::to_vec(&(CID, vec![1u8, 2])).unwrap())).await;
+        assert!(got_join(&mut rx), "2-element array (narrow probe would fail here)");
     }
 }

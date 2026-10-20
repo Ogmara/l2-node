@@ -239,6 +239,13 @@ rate_limit_per_ip = 100
 # a bare address (`"192.0.2.5"`, `"::1"`). Loopback is always implicitly
 # trusted. Leave empty for single-host deployments where Apache/nginx
 # sits on loopback in front of the node. Malformed entries abort startup.
+# If the proxy reaches the node from a NON-loopback address (Docker
+# bridge gateway, e.g. "172.17.0.0/16"; a separate proxy host), list it
+# here: otherwise every client shares the proxy's IP for the per-IP
+# limits (API rate limit, and federation, where one IP may hold at most
+# 2 of the node's 8 outbound fetch slots). Forwarding headers are read
+# right-to-left and only through trusted hops (the first untrusted hop is
+# the client); a proxied request never gets the admin localhost bypass.
 # trusted_proxies = []
 
 [api.pow]
@@ -255,6 +262,15 @@ dashboard = true
 # string". Example: admin_wallets = ["klv1nrnd939xzz4ys0pgpfzm2czhv4r77can6vzqz7ajlq9acm8w5d9qrznx8n"]
 admin_wallets = []
 session_ttl_hours = 24
+# Localhost bypass: a direct request from this machine (loopback TCP peer,
+# no proxy headers, Host 127.x.x.x / [::1] / localhost, no cross-origin
+# Origin) may use the admin API without signing in. A reverse proxy or
+# forwarder that adds NO forwarding headers (bare nginx proxy_pass, HAProxy
+# without forwardfor, stunnel/socat/ssh -L, a Tor hidden service on the API
+# port) makes remote requests look local: configure it to add
+# X-Forwarded-For, or set this to false so every admin request needs an
+# admin_wallets sign-in.
+localhost_bypass = true
 
 [api.rate_limits]
 # Per-wallet news-post budgets (l2-node 0.122.0+, rate-limit rework). Two
@@ -364,10 +380,22 @@ max_retriggers_per_sweep = 5
 # Keccak-256(wallet+slug+ts) derivation on this node's first-ever
 # encounter with that id (closes the federate_channel first-sight-trust
 # residual). A live create (not synced/backfilled) is always required
-# regardless of this flag. Set false only as a temporary unblock if a
-# pre-upgrade private channel (created before this field existed) needs
-# to federate onto a node that has never seen it.
+# regardless of this flag. Since l2-node 0.140.0 this flag NO LONGER
+# affects federation: the federate bootstrap always requires the
+# derivation (a forged ChannelCreate would otherwise make its signer the
+# "creator"), so a pre-0.139 private channel without it cannot be
+# federated onto a node that has never seen it, even by its creator.
+# false only relaxes first-sight acceptance on the backfill/sync path.
 require_private_id_derivation = true
+# Private-channel join gate (l2-node 0.140.0). Unix-ms instant after which
+# every ChannelJoin to a PRIVATE channel must carry a signed invite from
+# the creator or a moderator. Joins signed before this instant are accepted
+# without proof, so existing (pre-gate) join history still backfills.
+# MAINNET IS ALWAYS 0: on mainnet this value is ignored and forced to 0.
+# The default (1793491200000 = 2026-11-01T00:00:00Z) exists only for the
+# testnet transition — do not raise it to re-open uninvited joins. All
+# nodes of one network must use the same value.
+private_join_proof_activation_ms = 1793491200000
 
 [notifications]
 # Persisted-notification retention (W31, l2-node 0.104.0+)

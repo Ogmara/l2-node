@@ -5,6 +5,541 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.140.0] - 2026-10-20
+
+### Security
+
+- **Client-IP resolution kept the wrong end of long forwarding headers
+  (pre-existing since v0.42; shipped code).** `X-Forwarded-For` and RFC 7239
+  `Forwarded` were cut to their FIRST 32 entries — the part the client
+  writes — before the right-to-left trusted-hop walk. Behind a reverse
+  proxy that appends the client address (the usual Apache/nginx setup), a
+  client could send more than 32 entries of its own so the appended real
+  address was cut off: the node then resolved an address of the client's
+  choosing, or, with padding made of loopback/trusted entries, fell back to
+  the proxy peer itself. Impact: (1) the per-IP API rate limit and the
+  per-IP federation fetch-slot cap could be evaded or charged to someone
+  else; (2) **behind a reverse proxy running on the node's own host, a
+  remote request could be treated as `localhost` by the admin dashboard
+  and admin API (spec 10 §5.6 localhost bypass) — unauthenticated admin
+  access.** Direct (un-proxied) deployments and deployments whose proxy
+  reaches the node from a non-trusted address were not affected by (2).
+  Fixed at the root:
+  - the parsers keep the LAST 32 entries (the proxy-appended end); a chain
+    longer than that whose kept tail is entirely trusted resolves to `::`
+    (never loopback, never the peer);
+  - every field line of a repeated header is combined in order (a
+    client's own `X-Forwarded-For` line no longer shadows one a proxy adds
+    as a separate line), and non-UTF-8 bytes no longer discard the whole
+    header;
+  - `Forwarded` no longer simply wins over `X-Forwarded-For`: a proxy
+    typically maintains one of them and passes the other through from the
+    client, so a client-sent `Forwarded` could choose the address. Each is
+    resolved on its own; when both yield an address and they differ, the
+    result is `::` (a shared key that is never loopback and never chosen by
+    the client);
+  - the admin localhost bypass no longer looks at forwarding headers at
+    all: it is granted only when the TCP peer is loopback AND the request
+    carries no proxy header (`Forwarded`, `X-Forwarded-*`, `X-Real-IP`,
+    `Via`, …). **Behaviour change:** an operator who reached the dashboard
+    through a local reverse proxy without signing in must now use
+    `[api.admin] admin_wallets` sign-in or the node's port directly.
+  Operators running the node behind a reverse proxy on the same host
+  should review their proxy / admin-API access logs for unexpected admin
+  requests and rotate anything an admin action could have changed.
+- **Admin localhost bypass was reachable from web pages in the operator's
+  browser (pre-existing; shipped code).** A page the operator opened in a
+  browser on the node host could call the admin API on
+  `http://127.0.0.1:<port>`: the TCP peer of that request is loopback and
+  it carries no proxy header, so it passed the bypass — and the API-wide
+  CORS policy (`cors_origins = ["*"]`, any method/header) let it read the
+  responses; DNS rebinding reached the same endpoints without any CORS
+  involvement. Reachable actions included governance node votes, proposal
+  create/execute and earnings claims (real transactions signed by the
+  anchor wallet), peer bans, the E2E debug dump and the dashboard
+  websocket. The bypass now additionally requires (1) the request's own
+  `Host` (or HTTP/2 `:authority`) to be a loopback literal (`127.x.y.z`,
+  `[::1]`) or `localhost`, with an optional port — any other, absent or
+  repeated host denies; (2) `Origin` absent, or same-origin with that host
+  (`http`/`https`, same host and port); `Origin: null` or any other origin
+  denies; (3) `Sec-Fetch-Site`, when sent, to be `none` or `same-origin`.
+  These apply to every protected admin route including the
+  `/admin/dashboard/ws` upgrade. Independently, every protected admin
+  request — session-token path included — is refused when the browser
+  reports `Sec-Fetch-Site: same-site` or `cross-site`, and the API-wide
+  CORS headers are stripped from all `/admin` responses (the built-in
+  dashboard is same-origin and needs none; public API CORS is unchanged).
+  curl/scripts on the host and the dashboard opened at
+  `http://127.0.0.1:<port>/admin/dashboard` or `http://localhost:<port>/…`
+  keep working without sign-in.
+- **New `[api.admin] localhost_bypass` switch (default `true`).** `false`
+  makes every admin request — local or not — require an `admin_wallets`
+  session. The node now logs at startup whether the bypass is on, and
+  warns once when it is on and the deployment looks proxied or forwarded
+  (`trusted_proxies` set, a non-loopback `listen_addr`, running in a
+  container, or `public_url` set). A reverse proxy or forwarder that adds
+  NO forwarding headers (bare nginx `proxy_pass`, HAProxy without
+  `forwardfor`, stunnel/socat/`ssh -L`, a Tor hidden service on the API
+  port) makes remote requests look local — configure the proxy to add
+  `X-Forwarded-For`, or disable the bypass.
+- **Client-IP resolution fails closed on unparseable forwarding entries.**
+  `X-Forwarded-For` / `Forwarded` entries that are not addresses
+  (`unknown`, RFC 7239 obfuscated identifiers, garbage, empty segments,
+  invalid ports) used to be skipped, so the right-to-left walk could step
+  past one and return an address further left, chosen by the client. Such
+  an entry now ends the walk and the request resolves to `::` (shared,
+  never loopback, never client-chosen); entries to the LEFT of the first
+  untrusted address are irrelevant as before. `ip:port` and `[ipv6]:port`
+  entries (Azure Application Gateway style) are now parsed as addresses. A
+  `Forwarded` header without any `for=` still defers to
+  `X-Forwarded-For`. Common Apache/nginx setups are unaffected.
+- **Dependency (runtime, Rust):** `rustls` 0.23.45 → 0.23.46 via
+  `cargo update -p rustls` (lockfile only), clearing RUSTSEC-2026-0346/0347/
+  0348/0349. Shipped code: the TLS stack under every outbound connection.
+  `cargo audit` reports 0 vulnerabilities after this and the `quinn-proto`
+  bump below.
+- **Dependency (runtime, Rust):** `quinn-proto` 0.11.15 → 0.11.19 via
+  `cargo update -p quinn-proto` (lockfile only), clearing
+  RUSTSEC-2026-0338/0339/0340/0341/0342 (remote-triggerable panics and
+  memory-exhaustion guards in QUIC). Shipped code: it is the QUIC transport
+  under libp2p (`libp2p-quic`). `cargo audit` now reports 0 vulnerabilities.
+  Live P2P wire compatibility with un-upgraded peers is not yet verified.
+- **Private channels are now invite-gated, verified by every node**
+  (protocol §3.9.1). Previously any signed wallet that knew a private
+  `channel_id` could join: the only check was `!has_invite &&
+  invite_links_disabled`, and `invite_links_disabled` had no writer, so the
+  gate was always open (and an unknown channel fell straight through to
+  accept). A `ChannelJoin` to a Private channel signed at or after
+  `[channel_verify] private_join_proof_activation_ms` must now carry, in
+  the new optional `invite` field, the `ChannelInvite` envelope a creator
+  or moderator signed for exactly that wallet. The node verifies it in
+  full (structure, type, `msg_id`, signature, channel + invitee binding,
+  validity window from signed envelope timestamps only, removal cutoff,
+  inviter authority) in the channel-action authorization, AGAIN in the
+  apply step under the membership lock, and in `federate_channel`. A
+  missing proof is rejected with the stable reason `private channel:
+  invite proof required`. An attached proof is always verified, even
+  before activation.
+- **Kick no longer allows a free rejoin (B3).** New `channel_role_watermarks`
+  CF records the MAX signed timestamp of every kick/ban (`removed`, kind
+  0x01) per (channel, wallet); an invite issued at or before it can never
+  be replayed. The apply step also refuses a join whose own timestamp is at
+  or before a stored removal, so backfill delivering a kick before the join
+  it supersedes no longer resurrects the member (ties go to the removal).
+  A voluntary `ChannelLeave` does not write the watermark. Watermark
+  values are clamped to `now + 5 min` before storage so a far-future
+  backfilled kick cannot lock a user out indefinitely.
+- **Chat no longer auto-adds members of private channels (B1).** A
+  `ChatMessage` from a non-member of a Private channel is still accepted,
+  but no longer makes its author a member (a second, ungated way in).
+  Legacy messages signed before the activation instant keep the old
+  behaviour unless a newer removal is stored. Public channels unchanged.
+- **`federate_channel` is gated (B2), verify-then-apply.**
+  - Fixed local order, all before any outbound work: invite base64/size
+    (400) → pre-fetch gate → per-wallet federation-slot cap (429) → local
+    decision.
+  - Pre-fetch gate: a channel this node KNOWS that is not private passes
+    (the handler answers 400 `only private channels need federation` for
+    everyone, members or not); for a known PRIVATE channel the caller must
+    be a member/creator or attach an `invite` (base64) passing the FULL
+    invite rules incl. inviter authority. For a channel it does NOT know,
+    a no-invite call may proceed (the caller may be the creator); an
+    attached invite is checked structurally.
+  - A channel this node already KNOWS is never fetched from the host:
+    joining or re-federating it is purely local (membership, subscription,
+    backfill trigger) — no `federated_from` rewrite, no host-chosen
+    `ChannelUpdate` replay, no creator re-add. Metadata updates arrive via
+    channel-topic gossip and private-channel-sync backfill. The creator
+    re-federating without a member row is re-added with role `creator`.
+  - For a channel this node does not know, the host's bootstrap
+    `ChannelCreate` is verified (signature, msg_id, and the private
+    channel-id derivation — required on this path regardless of
+    `require_private_id_derivation`) and the caller must be that creator
+    or carry an invite passing rules 4-8 against it — all BEFORE anything
+    is stored. A rejection stores nothing (no channel row, creator member,
+    federation slot or subscription).
+  - After the bootstrap: active ban (previously ignored entirely), removal
+    cutoff and inviter authority, then the same lock-protected insert as a
+    join apply with the gate's re-check run inside the lock (a kick/ban/
+    demotion landing in between is honored). A caller who ends up not
+    added gets 403 `removed from channel` and no federation slot,
+    subscription or backfill; 200 only if already a member (refresh).
+  - Responses are fixed strings (`banned`, `removed from channel`, the
+    stable proof/inviter reasons, `private channel: invite rejected`);
+    storage errors are a generic 500; every host-side failure is one
+    generic 502 (the distinct texts were a host-liveness / internal-DNS
+    oracle). No activation exemption: federation is always a live action.
+  - **Correction of an earlier claim:** for a channel the node does not
+    know, the pre-fetch check is NOT an SSRF barrier against an
+    authenticated caller — it cannot verify inviter authority, and a
+    self-signed "invite" passes it. The outbound fetch (unknown channels
+    only) stays reachable for any authenticated wallet (as in 0.139.0) and
+    is bounded instead by: a per-wallet limit of 30 outbound fetches per
+    10 minutes (monotonic clock; only calls that actually reach the fetch
+    count — known-channel calls, early rejections and 503s are free; a
+    full 10,000-wallet table evicts its oldest entry rather than refusing
+    new wallets); a node-wide cap of 8 concurrent outbound fetches, of
+    which one client IP (trusted-proxy resolved) may hold at most 2 (503
+    when busy); a 5 s DNS timeout and a 10 s bound on the whole request +
+    body read, so one permit is held at most ~15 s; the API's existing
+    per-IP governor; and a fetch pinned to the DNS-validated addresses
+    (closes the DNS-rebinding TOCTOU residual). No registered identity is
+    required.
+  - The shared SSRF address check additionally rejects 0.0.0.0/8,
+    192.0.0.0/24, 192.88.99.0/24, 198.18.0.0/15, 240.0.0.0/4, 6to4
+    (2002::/16), Teredo (2001::/32), site-local fec0::/10, IPv4-compatible
+    and IPv4-translated (::ffff:0:a.b.c.d) IPv6 (NAT64 64:ff9b::/32 —
+    covering 64:ff9b:1::/48 — and IPv4-mapped were already rejected). This
+    also applies to the media-fallback peer URL check.
+- **Mainnet never grandfathers proofless joins (audit B1).** On mainnet
+  `private_join_proof_activation_ms` is forced to `0` whatever the config
+  says (a one-time warning is printed if another value was set), at config
+  load and again inside the router. Previously a mainnet node running a
+  default or testnet-copied config would have accepted proofless private
+  joins until 2026-11-01 and backdated proofless joins via backfill
+  forever.
+- **Demoted moderators' outstanding invites die.** `ChannelRemoveModerator`
+  apply records a `moderator_removed` watermark (kind 0x02); a grant older
+  than it no longer authorizes a live join (a historical, backfilled join
+  made while the moderator was still in office stays valid).
+- **`channel_members_changed` "join" is only broadcast for a member the
+  node actually added** — an accepted-but-not-applied join (superseded by
+  a kick, or failing the apply re-check) no longer prompts members'
+  clients to wrap the channel key to the joiner.
+- The `CHANNEL_INVITES` derived grant table (never pruned, B4) is no longer
+  written and is purged once at startup (capped at 50,000 rows per boot,
+  sentinel `migration_channel_invites_purged` written once drained). The CF
+  stays declared.
+
+### Added
+
+- `ChannelJoinPayload.invite` (bin, ≤ 2048 bytes) and
+  `ChannelInvitePayload.expires_at` (unix ms; default `timestamp + 7d`,
+  bounded to `(timestamp, timestamp + 14d]`) and
+  `ChannelInvitePayload.inviter_grant` (bin, ≤ 1024 bytes: the
+  creator-signed `ChannelAddModerator` naming the inviter). All optional
+  and `#[serde(default)]`; map and positional-array payloads from older
+  encoders still decode.
+- `ChannelInvite` ingest on a known channel also accepts a moderator that
+  this node has not learned yet if it carries a valid `inviter_grant`
+  (B5 — remote nodes used to reject every moderator-issued invite), and
+  rejects an out-of-range `expires_at` / oversized grant.
+- `GET /api/v1/notifications`: `channel_invite` entries carry
+  `invite_envelope` (standard base64 of the raw stored `ChannelInvite`
+  bytes) and `invite_expires_at` (unix ms), attached at read time and
+  OMITTED (never null) when unavailable. Never added to the WS broadcast
+  or the push payload.
+- `POST /api/v1/channels/{id}/federate` body: optional `invite` (standard
+  base64; invalid base64 or > 2048 bytes → 400; failing the gate → 403).
+- Moderator propagation: `ChannelAddModerator`/`ChannelRemoveModerator`
+  are indexed into `CHANNEL_META_MSGS` (one-time `_V3` backfill of
+  existing envelopes), allowed on the private-channel sync type allowlist
+  and bound to the reconciled channel, so a member's home node learns the
+  channel's moderators. `CHANNEL_MODERATORS` records gain `grant_msg_id` +
+  `grant_ts`; a grant only replaces the record when newer, a grant at or
+  before a known demotion does not reinstate the moderator, and an older
+  demotion replayed later does not delete a newer grant.
+- `GET /api/v1/channels/{id}/moderators/{address}/grant` (authenticated;
+  the caller's resolved wallet — device keys resolve to their wallet —
+  must equal `{address}`, else 403): `{ "grant_envelope": "<base64>" }`,
+  404 when there is no current record, no `grant_msg_id` (moderators added
+  before 0.140.0 — the creator can re-issue `ChannelAddModerator`), or the
+  envelope is gone.
+- Config `[channel_verify] private_join_proof_activation_ms` (default
+  `1793491200000` = 2026-11-01T00:00:00Z, the testnet transition instant
+  after the supporting clients ship). **Mainnet is always `0`** (forced;
+  any configured value is ignored). All nodes of one network must use the
+  same value.
+
+### Changed
+
+- **Private-channel sync pages ALL channel metadata (round-3/4 audits).**
+  Every `CHANNEL_META_MSGS` row is served — nothing dropped — on dedicated
+  metadata pages
+  BEFORE any chat, in replay order `(tier, ts, msg_id)`: tier 0 =
+  `ChannelCreate`, tier 1 = every other metadata type by its signed
+  timestamp (`ChannelUpdate` moved out of tier 0, so a moderator's update
+  replays after the grant that authorises it). Paging is a keyset cursor
+  `meta_cursor = {tier, ts, msg_id}` (strictly after; equal timestamps are
+  neither repeated nor skipped) served by seeking each per-type index
+  stream to the cursor and merging them, so every page costs O(page +
+  types) — never a rescan of the channel. Pages hold at most 200 rows. A
+  cursor with `tier` > 1 is past the end (empty, finished page). Wire
+  change is additive: requests gain optional `meta_paging`/`meta_cursor`/
+  `meta_done`, responses `meta_phase`/`meta_has_more`/`meta_next_cursor`.
+  Previously only a fixed share of metadata rode along the first page —
+  joins, leaves and bans could be starved permanently by many kicks, so a
+  lagging node never caught up.
+- **Requester state machine (private-channel sync):** completion only after
+  BOTH phases and at least one `Accepted` envelope in the session (never
+  `Duplicate` alone); a metadata page never ends a session; metadata pages
+  are never "unproductive" (a re-sync legitimately gets `Duplicate`s) and
+  have their own 500-page budget, separate from the chat phase's; each
+  cursor must strictly advance and a metadata page after the chat phase
+  started ends the session incomplete — a hostile responder can neither
+  loop the requester nor switch back from chat to metadata.
+- A requester that does not page metadata (older node) gets the legacy
+  first page: up to 64 metadata envelopes reserved (at most half the page)
+  plus any room the chat rows leave. That bounded selection — also the
+  ≤ 256-row metadata ride-along of public channel reconcile — takes rows
+  type by type in the priority Create, Delete, RemoveModerator,
+  AddModerator, Kick, Ban, Unban, **Update, then Leave, then Join** (Update
+  now ahead of the cheap, high-volume Join/Leave: ~256 joins to a public
+  channel used to push every update out; Leave ahead of Join so a join
+  flood cannot push access removals out), newest-first within a type
+  (Create oldest-first), with the cap applied to the selection and only
+  the selected rows sorted into replay order. All moderator grants and
+  demotions fit ahead of the high-volume types.
+- **No-op `ChannelJoin`/`ChannelLeave` are no longer indexed into
+  `CHANNEL_META_MSGS`** (round-4 audit B2). A leave by a wallet that is
+  not a member and has no indexed join (or whose indexed history already
+  ends in a leave), and a re-join by a current member whose newest indexed
+  join is newer than its last leave/kick/ban, are held back instead: a
+  non-member could otherwise flood leaves into the index (no verified
+  identity needed) and starve the real joins. At most 32 join+leave rows
+  are indexed per (channel, wallet); past that the OLDEST of that wallet's
+  rows is evicted (deleted from the index), so the newest rows — which
+  decide final membership — always stay. Out-of-order delivery cannot lose an
+  outcome-changing event: the newest held-back join and leave per
+  (channel, wallet) are kept in the new node-local CF
+  `channel_membership_index`; indexing a join promotes a held-back leave
+  NEWER than it (and that join then does not make the wallet a member — a
+  leave that overtook its own join wins), and indexing a leave or a
+  kick/ban of the wallet promotes a held-back join newer than it.
+- Responder work is charged to the requesting peer's budget: the larger of
+  envelopes sent and storage rows examined, minimum 1 per request
+  (`budget_charge`) — empty, filtered-out and garbage-cursor pages are no
+  longer free. Applies to private-channel sync (`TOTAL_ENVELOPES_CAP`) and
+  public reconcile (`[backfill] total_envelopes_cap`; a refused private-
+  channel request now costs 1).
+- Both backfill responders build their response OFF the libp2p event loop
+  (`tokio::task::spawn_blocking`), at most 8 builds node-wide. A
+  session-STARTING request (no cursor) arriving when all are busy is
+  answered `server_capped`; a continuation page waits up to 5 s for a slot
+  (at most 16 waiters node-wide) — see Fixed; the per-peer
+  concurrency slot is held until the response is handed to libp2p, as
+  before. The edit/delete ride-along of a private-channel page reads only
+  the markers that fit instead of up to 2,000.
+- The notification engine decodes `ChannelJoin`/`ChannelLeave` through the
+  real payload structs, and gossip routing reads `channel_id` / the
+  invitee through `deserialize_payload` (a narrow probe would fail on a
+  2-element positional-array join or a 5-element invite, so the message
+  would never gossip).
+- The `channel_members_changed` "join" check is a point lookup in
+  `CHANNEL_MEMBERS`, not a scan of the 4096-capped audience list (a joiner
+  sorting past the cap was never announced, so never got the key wrapped).
+- `ChannelInvite` authorization surfaces a storage error as such (logged)
+  instead of mislabelling it "only creator or moderators can invite
+  users". **Correction of an earlier draft of this entry:** the router
+  used to put RocksDB/anyhow text into rejection reasons (`storage error:
+  …`, and `identity resolution failed: …` / `failed to resolve … author:
+  …`), and the submission endpoints only turned reasons CONTAINING
+  "storage error" into a 500 — identity-resolution failures still echoed
+  internal text in the 400 body. Now every infrastructure failure in the
+  router is logged with its detail and rejected with the fixed reason
+  `storage error` (unprefixed), and the endpoints map exactly that reason
+  to a generic 500; every other reason is a policy verdict returned as a
+  400. The alert-channel dispatcher's router now uses the node's real
+  `[channel_verify]` config; federate storage errors are logged and
+  answered with a generic 500 (a storage error while checking whether the
+  channel exists is no longer treated as "known").
+- The join apply step does cheap reads first (unknown channel / already a
+  member → no work), runs the signature checks outside the membership
+  lock, and re-checks ban, removal cutoff and inviter authority inside it.
+- Rule 8's local-moderator fallback requires the moderator record's
+  `grant_ts` to be at or before the invite (a record without `grant_ts`
+  is accepted unless a demotion at/after the invite is stored), so an
+  invite signed while the inviter was not a moderator does not become
+  valid through a later re-promotion.
+
+### Fixed
+
+- **Late `ChannelLeave` vs. a held-back newer rejoin (S-W1).** Sequence
+  join@1, join@3 (held back as an idempotent re-join while still a member),
+  then the older leave@2 delivered late: the index promoted join@3 (a late
+  node replays join → leave → join), but the local apply removed the member
+  unconditionally and join@3 was never re-applied, so this node disagreed
+  with late nodes. A leave that promotes a NEWER held-back join now removes
+  the member and then re-applies that join through the normal join apply
+  (private-join gate, ban/removal re-checks), so this node converges with
+  late nodes for a late leave that promotes a HELD-BACK newer join; a
+  rejoin that needs an invite it does not carry stays refused on both, and
+  a ban or kick newer than the re-applied join keeps the member out.
+  Equal timestamps: the leave wins (not promoted). Kick/ban get no such
+  re-apply (a removal fails closed). Other out-of-order join/leave
+  sequences do not converge — see Known limitations.
+- **Continuation pages no longer refused by the node-wide build cap
+  (C-W1).** The 8-slot responder build cap answered `server_capped` even
+  to continuation pages mid-session; the requester treats that as the end
+  of the session (there is no in-session retry — an earlier doc comment
+  promising one was wrong), so the next attempt restarted from the first
+  metadata page and re-charged the responder budget, and under the 0.137.0
+  peer comparison a busy honest peer looked uninformative. Only
+  session-starting requests are refused when all slots are busy now; a
+  continuation (chat cursor, metadata cursor, or the first chat page after
+  the metadata phase) waits up to 5 s for a slot, bounded by its per-peer
+  slot and 16 waiters node-wide, and is answered `server_capped` only if
+  none frees up.
+- **Membership index cap kept the wrong rows (C-W3).** The per-(channel,
+  wallet) cap of 8 join+leave rows kept the FIRST 8 and refused the
+  newest, but the newest row decides final membership: after four or more
+  genuine leave/rejoin cycles late nodes reached the wrong member set. The
+  cap is now 32 and evicts the oldest rows (deleting them from the index)
+  so the newest always survive; the junk-leave flood stays blocked (no-op
+  leaves are still held back, not indexed) and metadata paging stays
+  exactly-once (keyset cursor; an evicted row is never re-served).
+- **Ride-along priority (C-N4):** `ChannelLeave` ranks ahead of
+  `ChannelJoin` again in the bounded metadata ride-along / legacy first
+  page.
+- **Session backstop off-by-one (C-N7):** when the 500th metadata page, or
+  the chat page that reaches the page / unproductive-page backstop, was
+  the FINAL page, the private-channel-sync session ended incomplete instead
+  of moving on to chat / finishing. The backstops now only stop a session
+  that would need another page.
+
+### Known limitations
+
+- A malicious node operator (a member's home node or a backfill
+  responder) can still insert member rows locally, inject backdated
+  pre-activation joins via backfill, or serve a fake member list; clients
+  still trust the node's member list. Closing this needs client-side
+  verify-before-cover (Phase 2).
+- A node that has not yet learned a moderator's demotion keeps accepting
+  that moderator's invites until it does — at most `MAX_INVITE_TTL`
+  (14 days) per invite.
+- Revoked device keys: the inviter is resolved through the current
+  device→wallet mapping; invites signed by a since-revoked device are not
+  specially handled.
+- The `moderator_removed` watermark stores only the latest demotion (MAX).
+  On the sync path an invite issued during an EARLIER demotion gap with a
+  grant that predates that gap can verify if the moderator was later
+  re-granted and re-demoted.
+- `channel_role_watermarks` is node-local and not in snapshots: a node
+  bootstrapped from a snapshot learns past kicks/bans only via metadata
+  backfill.
+- Already-joined pre-gate intruders stay members; the creator must kick
+  them (which rotates the key).
+- **Late-federating / lagging nodes fail open on removals (audit W3,
+  deferred by decision).** A node only knows the kicks, bans and demotions
+  it has already received; until it has paged through the channel's
+  metadata via private-channel sync it can accept a join that a
+  fully-synced node would refuse. Bounded by the invite TTL (≤ 14 days)
+  until that metadata pass completes (a node that cannot complete one —
+  no reachable member peer, no fresh wallet claim — stays bounded only by
+  the TTL); closed properly by Phase 2 client-side proof verification.
+- Members switching home node: in this phase a member who moves to a new
+  home node needs a fresh invite to federate the channel there (their old
+  invite may have expired; membership on the old node is not portable).
+- The federation attempt limiter and fetch permits are in-memory and
+  node-local (reset on restart). Four or more client IPs together can
+  still keep all 8 fetch permits busy (503s for others), each permit for
+  at most ~15 s (5 s DNS + 10 s fetch). A timed-out DNS lookup's resolver
+  thread (`getaddrinfo`) keeps running in the background until the system
+  resolver gives up; this is bounded by tokio's blocking-thread pool, not
+  by the 5 s timeout.
+- Local (known-channel) re-federations are free of the federation limits;
+  each one triggers a private-channel-sync session, which spends the
+  responding peers' shared per-peer backfill budget. Bounded by those
+  responder-side caps and the requester's own session/page backstops.
+- **Metadata paging cost and limits (corrected).** Every private-channel-
+  sync session re-serves the channel's FULL metadata, then its chat, from
+  the start. A session completes only if it admitted at least one NEW
+  envelope, so a channel this node already holds in full (only duplicates
+  come back) never completes and stays due: the 30 s retry sweep re-walks
+  every such due (wallet, channel) pair on each rotation — not only every
+  `[private_channel_sync] channel_catchup_interval_hours` (6 h), as an
+  earlier draft of this entry said. The responder budget
+  (`TOTAL_ENVELOPES_CAP` = 20,000 units per requesting peer, all channels
+  and wallets together) is per responder PROCESS LIFETIME and never
+  refills until that responder restarts: a peer that has spent it gets
+  `server_capped` (and tries its other fanout peers). Consequently an
+  in-sync requester exhausts each responder's budget quickly and is then
+  refused by it until restart, a channel with more than ~20,000 metadata
+  rows can never be fully served by one responder process, and the
+  requester's metadata phase is bounded at 500 pages (100,000 rows).
+  **Next-version follow-up:** a rolling-window responder budget and a
+  requester-side attempt throttle.
+- **Recorded residuals from the round-5 audits.** Requests whose forwarding
+  headers fail closed (disagreeing `Forwarded`/`X-Forwarded-For`, an
+  unparseable entry, an over-long all-trusted chain) all share the `::`
+  rate-limit bucket, so one client can exhaust it for the others; Sybil
+  peers can hold the 8 responder build slots (and, with continuation
+  claims, the 16 waiter slots) since a cursor is unauthenticated, degrading
+  backfill for honest peers until their requests time out; a fast hostile
+  responder can still win the requester's race for a session against
+  slower honest ones; and a channel carrying many deleted/tombstoned index
+  entries makes RocksDB seeks in metadata paging walk tombstones (cost
+  theory only, not measured).
+- **Build-slot residual (C-W1), stated explicitly.** Because the
+  continuation claim is the requester's own, peers that keep all 16
+  continuation waiter slots queued (cursor-bearing requests waiting up to
+  5 s each, re-sent as each one times out) keep the 8 build slots
+  contended, so honest peers' session STARTS (first metadata / legacy /
+  reconcile pages) are answered `server_capped` for as long as that
+  pressure lasts. Bounded by the per-peer responder concurrency guards
+  (each waiter also holds its peer's slot), so it takes several peers;
+  the affected requesters retry on a later sweep.
+- **Out-of-order join/leave that S-W1 does not converge.** (i) A late
+  voluntary leave OLDER than a newer join that was already indexed or
+  re-applied (e.g. join@1, leave@4, join@5, then a late leave@3) still
+  removes the member locally, while a late node replaying in timestamp
+  order ends with them a member. This fails closed (a fresh invite
+  restores access), only the member's own genuine old leave can trigger
+  it, and a variant of it exists before 0.140.0. (ii) The join-side
+  mirror: a late OLD join after an indexed newer leave (join@5, leave@11,
+  late join@10) re-adds the member locally while late nodes say
+  non-member. In a private channel join@10 still needs a valid invite;
+  the join is user-signed only, so the impact is low.
+- Already-indexed no-op leaves/joins (written before this release, e.g. a
+  past leave flood) are not purged from `CHANNEL_META_MSGS`; they cost
+  paging work but can no longer starve anything (all rows are paged; the
+  bounded ride-along ranks Join/Leave last). A wallet's join/leave rows
+  older than its newest 32 are evicted from the index, so late nodes only
+  replay that wallet's newest 32 changes. A node that receives a rejoin
+  BEFORE the kick/ban it follows still ends with the member removed
+  locally (deliberately fail-closed; a backfilling requester replays the
+  true order). For a voluntary leave the rejoin is re-applied (see Fixed,
+  S-W1). Index state written by an earlier 0.140.0 development build
+  carried only a row count; those rows are not tracked for eviction.
+- `channel_membership_index` is node-local and not in snapshots; like
+  `channel_role_watermarks` it is a new CF that must be opened, so a
+  downgrade to 0.139.0 fails to open the database.
+- Behind a reverse proxy that reaches the node from a non-loopback
+  address (Docker bridge gateway, separate proxy host) with the default
+  `[api] trusted_proxies = []`, every client shares the proxy's IP for the
+  per-IP limits — including federation, where one client IP may hold at
+  most 2 of the node's 8 concurrent outbound fetch slots, so the whole
+  node is limited to 2 concurrent federations. Configure `trusted_proxies`
+  for the proxy (documented in `ogmara.example.toml`) so the limits key on
+  the real client.
+- `federate_channel` answers an UNKNOWN channel id at or below
+  `PRIVATE_CHANNEL_ID_FLOOR` with the 400 `only private channels need
+  federation` locally (no limiter budget, fetch permit or DNS); a legacy
+  pre-floor private channel can only be federated where it is already
+  known.
+- A pre-0.139 private channel without `id_derivation_ts` cannot be
+  federated onto a node that has never seen it, even by its creator:
+  `[channel_verify] require_private_id_derivation = false` no longer
+  relaxes the federation path (it only relaxes backfill first-sight).
+  Nodes that already hold the channel are unaffected.
+- Removal/demotion watermarks use the SENDER's signed timestamp (clamped
+  to at most 5 min ahead of this node's clock). Clock skew between
+  moderators and members can shift the cutoff by up to that window;
+  it converges as later envelopes arrive.
+- The one-time `_V3` metadata re-index scans every stored message once on
+  the first boot of 0.140.0; on a large node this lengthens that boot.
+- **Downgrade:** going back to 0.139.0 after running 0.140.0 fails to open
+  the database, because the new `channel_role_watermarks` column family
+  must be opened (RocksDB refuses unknown CFs). Upgrade is automatic.
+- Moderators added before 0.140.0 have no `grant_msg_id`; their invites
+  verify only on nodes that know them, until the creator re-issues the
+  grant.
+- The startup `localhost_bypass` posture check is heuristic (cosmetic: it
+  only decides whether a warning is logged). Container detection checks
+  only `/.dockerenv`, so Podman (`/run/.containerenv`) is not detected; a
+  hostname `listen_addr` (e.g. `localhost`) fails the IP parse and can log
+  a spurious "looks proxied or forwarded" warning.
+
 ## [0.139.0] - 2026-10-06
 
 ### Security

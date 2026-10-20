@@ -511,6 +511,19 @@ pub struct ChannelUpdatePayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelJoinPayload {
     pub channel_id: u64,
+    /// Private-channel join gate (l2-node 0.140.0): the raw, signed
+    /// `ChannelInvite` (0x1B) envelope bytes, exactly as the inviter
+    /// signed them, proving the joiner was invited. Required for a join
+    /// to a Private channel whose `ChannelJoin` timestamp is at or after
+    /// `[channel_verify] private_join_proof_activation_ms` (see
+    /// `MessageRouter::verify_private_join`). Ignored (but still
+    /// size-capped) for public channels. Omitted from the wire when absent
+    /// (`skip_serializing_if`, safe only because it is the LAST field) so a
+    /// proofless join encodes exactly like the pre-0.140.0 form, and a
+    /// 1-element positional array (sdk-rust) still decodes via
+    /// `#[serde(default)]`. Capped at `validation::MAX_JOIN_INVITE_BYTES`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invite: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -591,6 +604,26 @@ pub struct ChannelInvitePayload {
     /// Tells the invited user's home node where this private channel is hosted.
     #[serde(default)]
     pub anchor_node: Option<String>,
+    /// Private-channel join gate (l2-node 0.140.0): unix-ms expiry of this
+    /// invite. Absent = `envelope.timestamp + DEFAULT_INVITE_TTL_MS` (7d).
+    /// When present it must satisfy `ts < expires_at <= ts +
+    /// MAX_INVITE_TTL_MS` (14d) — enforced at ingest
+    /// (`validation::validate_channel_invite_expiry`) and again when the
+    /// invite is presented inside a `ChannelJoin`. Covered by the invite
+    /// envelope's signature (it is part of the signed payload bytes).
+    /// Deliberately NOT `skip_serializing_if`: it is a MIDDLE field, and
+    /// skipping it in the positional-array wire form would shift
+    /// `inviter_grant` into this slot. Clients (map form) omit it.
+    #[serde(default)]
+    pub expires_at: Option<u64>,
+    /// Private-channel join gate (l2-node 0.140.0): the raw, creator-signed
+    /// `ChannelAddModerator` (0x14) envelope that names the inviter as a
+    /// moderator of `channel_id`. Lets a node that has never learned the
+    /// inviter's moderator status verify a moderator-issued invite.
+    /// Omitted when the inviter is the channel creator. Capped at
+    /// `validation::MAX_INVITER_GRANT_BYTES`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inviter_grant: Option<Vec<u8>>,
 }
 
 /// Delete a channel (creator only). Signed + gossiped so every node that

@@ -247,6 +247,26 @@ fn ipv4_routable(ip: &std::net::Ipv4Addr) -> bool {
     if o[0] == 100 && (o[1] & 0xc0) == 0x40 {
         return false;
     }
+    // "This network" 0.0.0.0/8 (only 0.0.0.0 itself is `is_unspecified`).
+    if o[0] == 0 {
+        return false;
+    }
+    // Benchmarking 198.18.0.0/15 (RFC 2544) — commonly used internally.
+    if o[0] == 198 && (o[1] & 0xfe) == 18 {
+        return false;
+    }
+    // IETF protocol assignments 192.0.0.0/24 (RFC 6890).
+    if o[0] == 192 && o[1] == 0 && o[2] == 0 {
+        return false;
+    }
+    // 6to4 relay anycast 192.88.99.0/24 (RFC 7526, deprecated).
+    if o[0] == 192 && o[1] == 88 && o[2] == 99 {
+        return false;
+    }
+    // Reserved 240.0.0.0/4 (incl. broadcast).
+    if o[0] >= 240 {
+        return false;
+    }
     true
 }
 
@@ -271,8 +291,24 @@ fn ipv6_routable(ip: &std::net::Ipv6Addr) -> bool {
         return false; // documentation
     }
     if s[0] == 0x0064 && s[1] == 0xff9b {
-        return false; // NAT64 well-known prefix 64:ff9b::/96 (RFC 6052) — could
-                      // translate an embedded private IPv4 on a NAT64 deployment
+        return false; // NAT64 64:ff9b::/32 — covers the well-known /96 (RFC 6052)
+                      // and the local-use 64:ff9b:1::/48 (RFC 8215); could
+                      // translate an embedded private IPv4
+    }
+    if (s[0] & 0xffc0) == 0xfec0 {
+        return false; // deprecated site-local fec0::/10
+    }
+    if s[0..4].iter().all(|&x| x == 0) && s[4] == 0xffff && s[5] == 0 {
+        return false; // IPv4-translated ::ffff:0:a.b.c.d (RFC 2765)
+    }
+    if s[0] == 0x2002 {
+        return false; // 6to4 2002::/16 — embeds an IPv4 (possibly private)
+    }
+    if s[0] == 0x2001 && s[1] == 0x0000 {
+        return false; // Teredo 2001::/32 — embeds an IPv4
+    }
+    if s[0..6].iter().all(|&x| x == 0) {
+        return false; // deprecated IPv4-compatible ::a.b.c.d
     }
     true
 }
@@ -635,6 +671,44 @@ async fn fetch_one(
         buf.extend_from_slice(&chunk);
     }
     Ok(Bytes::from(buf))
+}
+
+#[cfg(test)]
+mod ssrf_range_tests {
+    //! Round-2 audit: extra non-routable ranges on the shared SSRF check.
+    use super::*;
+    use std::net::IpAddr;
+
+    fn routable(s: &str) -> bool {
+        ip_is_routable(s.parse::<IpAddr>().unwrap())
+    }
+
+    #[test]
+    fn newly_rejected_ranges() {
+        for bad in [
+            "198.18.0.1", "198.19.255.254", "240.0.0.1", "255.255.255.254", "0.1.2.3",
+            "64:ff9b::a00:1", "2002:a00:1::1", "2001:0:a00:1::1", "::a00:1",
+            "::ffff:10.0.0.1", "::ffff:127.0.0.1",
+            // round 3
+            "fec0::1", "feff::1", "::ffff:0:a00:1", "::ffff:0:808:808",
+            "192.0.0.8", "192.88.99.1", "64:ff9b:1::a00:1",
+        ] {
+            assert!(!routable(bad), "{bad} must be non-routable");
+        }
+    }
+
+    #[test]
+    fn public_addresses_still_routable() {
+        for good in [
+            "8.8.8.8", "198.17.255.1", "198.20.0.1", "1.1.1.1", "192.0.1.1", "192.88.98.1",
+            "2606:4700:4700::1111", "2a00:1450::1", "2001:4860::8888",
+        ] {
+            assert!(routable(good), "{good} must stay routable");
+        }
+        assert!(classify_api_endpoint("https://8.8.8.8/api").is_ok());
+        assert!(classify_api_endpoint("https://198.18.0.1/api").is_err());
+        assert!(classify_api_endpoint("https://[2002:a00:1::1]/api").is_err());
+    }
 }
 
 #[cfg(test)]
