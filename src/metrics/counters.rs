@@ -35,6 +35,26 @@ pub struct NetworkCounters {
     /// (usually spoofing/corruption) from the broader rejection bucket
     /// (rate limits, malformed payloads, policy denials, etc.).
     pub failed_signature_verifications: AtomicU64,
+    /// Channel-history backfill attempts actually dispatched by the
+    /// public reconcile requester (l2-node 0.141.0, after the attempt
+    /// throttle let them through).
+    pub reconcile_attempts_dispatched: AtomicU64,
+    /// Private-channel-sync attempts actually dispatched (l2-node 0.141.0).
+    pub private_sync_attempts_dispatched: AtomicU64,
+    /// Public reconcile comparisons that ended IN_SYNC (verified nothing
+    /// new — a throttle state, never a completion).
+    pub reconcile_in_sync_outcomes: AtomicU64,
+    /// Private-channel-sync sessions that ended IN_SYNC.
+    pub private_sync_in_sync_outcomes: AtomicU64,
+    /// Inbound reconcile requests refused by the rolling responder budget
+    /// (over budget or a full key map; concurrency refusals not counted).
+    pub reconcile_budget_refusals: AtomicU64,
+    /// Inbound private-channel-sync requests refused by the rolling
+    /// responder budget.
+    pub private_sync_budget_refusals: AtomicU64,
+    /// Budget refusals of a NEW key because the budget map was full (both
+    /// protocols) — a flood indicator.
+    pub backfill_budget_map_full_refusals: AtomicU64,
     /// Recent rejection reasons for dashboard display (last 50).
     pub recent_rejections: Mutex<VecDeque<RecentRejection>>,
 }
@@ -60,6 +80,13 @@ impl NetworkCounters {
             rate_limited_requests: AtomicU64::new(0),
             pow_required: AtomicU64::new(0),
             failed_signature_verifications: AtomicU64::new(0),
+            reconcile_attempts_dispatched: AtomicU64::new(0),
+            private_sync_attempts_dispatched: AtomicU64::new(0),
+            reconcile_in_sync_outcomes: AtomicU64::new(0),
+            private_sync_in_sync_outcomes: AtomicU64::new(0),
+            reconcile_budget_refusals: AtomicU64::new(0),
+            private_sync_budget_refusals: AtomicU64::new(0),
+            backfill_budget_map_full_refusals: AtomicU64::new(0),
             recent_rejections: Mutex::new(VecDeque::new()),
         }
     }
@@ -110,6 +137,41 @@ impl NetworkCounters {
         self.failed_signature_verifications.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Increment `reconcile_attempts_dispatched` (l2-node 0.141.0).
+    pub fn inc_reconcile_attempts_dispatched(&self) {
+        self.reconcile_attempts_dispatched.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment `private_sync_attempts_dispatched` (l2-node 0.141.0).
+    pub fn inc_private_sync_attempts_dispatched(&self) {
+        self.private_sync_attempts_dispatched.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment `reconcile_in_sync_outcomes` (l2-node 0.141.0).
+    pub fn inc_reconcile_in_sync_outcomes(&self) {
+        self.reconcile_in_sync_outcomes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment `private_sync_in_sync_outcomes` (l2-node 0.141.0).
+    pub fn inc_private_sync_in_sync_outcomes(&self) {
+        self.private_sync_in_sync_outcomes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment `reconcile_budget_refusals` (l2-node 0.141.0).
+    pub fn inc_reconcile_budget_refusals(&self) {
+        self.reconcile_budget_refusals.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment `private_sync_budget_refusals` (l2-node 0.141.0).
+    pub fn inc_private_sync_budget_refusals(&self) {
+        self.private_sync_budget_refusals.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment `backfill_budget_map_full_refusals` (l2-node 0.141.0).
+    pub fn inc_backfill_budget_map_full_refusals(&self) {
+        self.backfill_budget_map_full_refusals.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Record a rejection with reason for dashboard display.
     pub fn record_rejection(&self, reason: &str, author: &str) {
         let entry = RecentRejection {
@@ -148,6 +210,13 @@ impl NetworkCounters {
             rate_limited_requests: self.rate_limited_requests.load(Ordering::Relaxed),
             pow_required: self.pow_required.load(Ordering::Relaxed),
             failed_signature_verifications: self.failed_signature_verifications.load(Ordering::Relaxed),
+            reconcile_attempts_dispatched: self.reconcile_attempts_dispatched.load(Ordering::Relaxed),
+            private_sync_attempts_dispatched: self.private_sync_attempts_dispatched.load(Ordering::Relaxed),
+            reconcile_in_sync_outcomes: self.reconcile_in_sync_outcomes.load(Ordering::Relaxed),
+            private_sync_in_sync_outcomes: self.private_sync_in_sync_outcomes.load(Ordering::Relaxed),
+            reconcile_budget_refusals: self.reconcile_budget_refusals.load(Ordering::Relaxed),
+            private_sync_budget_refusals: self.private_sync_budget_refusals.load(Ordering::Relaxed),
+            backfill_budget_map_full_refusals: self.backfill_budget_map_full_refusals.load(Ordering::Relaxed),
         }
     }
 }
@@ -172,6 +241,13 @@ pub struct CounterSnapshot {
     pub rate_limited_requests: u64,
     pub pow_required: u64,
     pub failed_signature_verifications: u64,
+    pub reconcile_attempts_dispatched: u64,
+    pub private_sync_attempts_dispatched: u64,
+    pub reconcile_in_sync_outcomes: u64,
+    pub private_sync_in_sync_outcomes: u64,
+    pub reconcile_budget_refusals: u64,
+    pub private_sync_budget_refusals: u64,
+    pub backfill_budget_map_full_refusals: u64,
 }
 
 impl CounterSnapshot {

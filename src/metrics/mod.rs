@@ -102,6 +102,22 @@ pub struct MetricsSnapshot {
     /// computed by `AlertEngine` from the delta between snapshots).
     pub failed_signature_verifications_total: u64,
 
+    // Channel-history backfill (l2-node 0.141.0) — monotonic totals.
+    /// Public reconcile attempts dispatched (past the attempt throttle).
+    pub reconcile_attempts_dispatched_total: u64,
+    /// Private-channel-sync attempts dispatched.
+    pub private_sync_attempts_dispatched_total: u64,
+    /// Public reconcile comparisons verified in sync (throttle state).
+    pub reconcile_in_sync_total: u64,
+    /// Private-channel-sync sessions verified in sync (throttle state).
+    pub private_sync_in_sync_total: u64,
+    /// Inbound reconcile requests refused by the rolling budget.
+    pub reconcile_budget_refusals_total: u64,
+    /// Inbound private-channel-sync requests refused by the rolling budget.
+    pub private_sync_budget_refusals_total: u64,
+    /// Budget refusals of a new key because the key map was full.
+    pub backfill_budget_map_full_total: u64,
+
     // Anchoring
     pub last_anchor_height: u64,
     pub last_anchor_age_seconds: u64,
@@ -368,6 +384,13 @@ impl MetricsCollector {
             rate_limited_total: counter_snap.rate_limited_requests,
             pow_required_total: counter_snap.pow_required,
             failed_signature_verifications_total: counter_snap.failed_signature_verifications,
+            reconcile_attempts_dispatched_total: counter_snap.reconcile_attempts_dispatched,
+            private_sync_attempts_dispatched_total: counter_snap.private_sync_attempts_dispatched,
+            reconcile_in_sync_total: counter_snap.reconcile_in_sync_outcomes,
+            private_sync_in_sync_total: counter_snap.private_sync_in_sync_outcomes,
+            reconcile_budget_refusals_total: counter_snap.reconcile_budget_refusals,
+            private_sync_budget_refusals_total: counter_snap.private_sync_budget_refusals,
+            backfill_budget_map_full_total: counter_snap.backfill_budget_map_full_refusals,
             klever_rpc_last_success_ms: self.klever_health.load(Ordering::Relaxed),
             db_size_bytes: ss.db_size,
             messages_total: ss.messages_total,

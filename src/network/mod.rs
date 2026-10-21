@@ -8,6 +8,7 @@
 //! - Identify: peer identification and capability exchange
 
 pub mod behaviour;
+pub mod budget;
 pub mod dm_sync;
 pub mod gossip;
 pub mod hot_topics;
@@ -612,6 +613,15 @@ pub struct NetworkService {
     /// Bounded by `[backfill] server_max_concurrent_per_peer` and
     /// `server_max_concurrent_per_channel`.
     reconcile_limits: Arc<reconcile::ResponderLimits>,
+    /// Rolling responder budget per `(peer, channel)` (l2-node 0.141.0):
+    /// `[backfill] total_envelopes_cap` burst, refilled at
+    /// `total_envelopes_refill_per_hour`. Applied through
+    /// `reconcile_limits`.
+    reconcile_budget: budget::Gcra,
+    /// Requester-side attempt throttle per channel (l2-node 0.141.0) —
+    /// gates `maybe_trigger_backfill` together with `channel_backfill_due`.
+    /// In memory only (no entry == due). See `budget::AttemptThrottle`.
+    reconcile_throttle: budget::AttemptThrottle<u64>,
     /// Outstanding outbound reconciliation requests, keyed by
     /// libp2p `OutboundRequestId`. Resolves to a `(peer_id,
     /// channel_id)` pair so the response handler can route the
@@ -755,6 +765,13 @@ pub struct NetworkService {
     /// Server-side rate-limit state for inbound private-channel-sync
     /// requests (closes the F2 backfill gap, l2-node 0.138.0+).
     private_channel_sync_limits: Arc<private_channel_sync::PrivateChannelSyncResponderLimits>,
+    /// Rolling responder budget per peer (l2-node 0.141.0):
+    /// `[private_channel_sync] responder_budget_burst`, refilled at
+    /// `responder_budget_refill_per_hour`.
+    private_channel_sync_budget: budget::Gcra,
+    /// Requester-side attempt throttle per `(wallet, channel_id)` (l2-node
+    /// 0.141.0) — gates `maybe_trigger_private_channel_sync`.
+    private_channel_sync_throttle: budget::AttemptThrottle<(String, u64)>,
     /// Node-wide bound on backfill responses being built off the event
     /// loop (`MAX_CONCURRENT_RESPONDER_BUILDS`, round 4).
     responder_build_permits: Arc<tokio::sync::Semaphore>,
@@ -1000,6 +1017,10 @@ struct ReconcileComparison {
     /// `RECONCILE_COMPARE_WINDOW`, well under the protocol's 45s request
     /// timeout (`network::behaviour`).
     deadline: Instant,
+    /// Some candidate answered `server_capped` (l2-node 0.141.0): it may
+    /// hold content we lack, so the comparison can never conclude IN_SYNC
+    /// (`comparison_in_sync`).
+    any_capped: bool,
 }
 
 /// Per-peer reconcile completeness tracking (l2-node 0.137.0) — in-memory
@@ -1051,9 +1072,153 @@ struct PeerReconcileHealth {
 /// them all, release the dedup guard exactly once (releasing it after
 /// EVERY failed trial would let a later trial's dispatch race a
 /// concurrent re-trigger for the same channel).
+///
+/// `NoProgress { verified_in_sync }` (l2-node 0.141.0): `true` only for a
+/// comparison trial whose FIRST page ended the session (`has_more ==
+/// false`) and consisted entirely of byte-verified duplicates
+/// (`ReconcileTally::is_verified_in_sync_page`) — evidence that THIS peer
+/// offered nothing new, used only for the attempt throttle
+/// (`comparison_in_sync`), never for completion.
 enum ReconcileApplyOutcome {
     Handled,
-    NoProgress,
+    NoProgress { verified_in_sync: bool },
+}
+
+/// How one reconcile page fared when routed by the requester (l2-node
+/// 0.141.0, extracted from `apply_reconcile_response` so the in-sync
+/// evidence is unit-testable).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ReconcileTally {
+    /// `Accepted` + `Duplicate` (the "won the race" count).
+    admitted: usize,
+    /// Strictly `Accepted` — genuinely new, signature-verified content.
+    newly_accepted: usize,
+    /// `Duplicate`s byte-identical to the stored copy
+    /// (`duplicate_is_verified`).
+    verified_dups: usize,
+    /// Envelopes dropped by the cross-channel smuggling check.
+    cross_channel_dropped: usize,
+    /// Anything that is not clean evidence: a dropped, rejected, invalid
+    /// or PoW-gated envelope, a `Duplicate` that is NOT byte-identical (a
+    /// forged envelope reusing a known msg_id), or an oversized page.
+    tainted: bool,
+}
+
+impl ReconcileTally {
+    /// The page proves THIS responder offered nothing new: it is the whole
+    /// session (`has_more == false`), non-empty, untainted, and every
+    /// envelope on it is a byte-verified duplicate.
+    fn is_verified_in_sync_page(&self, env_count: usize, has_more: bool) -> bool {
+        !has_more
+            && env_count > 0
+            && !self.tainted
+            && self.newly_accepted == 0
+            && self.verified_dups == env_count
+    }
+}
+
+/// Route one reconcile page's envelopes through the requester's router,
+/// in order (l2-node 0.141.0 extraction — the logic is the 0.136/0.137
+/// loop plus the in-sync evidence). A page larger than `max_page_size` is
+/// not verified at all (tainted, unproductive).
+fn tally_reconcile_envelopes(
+    router: &MessageRouter,
+    storage: &Storage,
+    peer: &PeerId,
+    channel_id: u64,
+    envelopes: &[Vec<u8>],
+    max_page_size: usize,
+) -> ReconcileTally {
+    let mut t = ReconcileTally::default();
+    if envelopes.len() > max_page_size {
+        // Security-audit follow-up on W9: see identity-sync's arm for the
+        // full rationale — refuse to verify ANY envelope in a page that
+        // exceeds this node's OWN configured max page size, treating it as
+        // unproductive rather than paying the verification cost.
+        warn!(
+            peer = %peer,
+            channel_id,
+            received = envelopes.len(),
+            expected_max = max_page_size,
+            "reconcile: response exceeds this node's own max page size; refusing to verify, treating as unproductive"
+        );
+        t.tainted = true;
+        return t;
+    }
+    for env_bytes in envelopes {
+        // Security Audit W1 (0.47.0): cross-channel smuggling defense.
+        // The responder could otherwise stuff envelopes for channel B
+        // into a response we sent for channel A; signatures verify (the
+        // original authors really signed them) so the router would
+        // happily index them under B. Reject any envelope whose
+        // payload-extracted channel_id does not equal the channel we
+        // asked for, BEFORE handing it to the router.
+        if !envelope_targets_channel(env_bytes, channel_id) {
+            t.cross_channel_dropped += 1;
+            t.tainted = true;
+            continue;
+        }
+        match router.process_synced_message(env_bytes) {
+            RouteResult::Accepted { .. } => {
+                t.admitted += 1;
+                t.newly_accepted += 1;
+            }
+            RouteResult::Duplicate => {
+                // Counted toward `admitted` but deliberately NOT toward
+                // `newly_accepted`: the router's duplicate check runs
+                // before signature verification and is keyed globally by
+                // msg_id (security-audit 2026-09-30 round 2, see
+                // `ReconcilePending::total_accepted`). For the in-sync
+                // evidence it counts only when byte-identical to the
+                // stored, ingest-verified copy.
+                t.admitted += 1;
+                if duplicate_is_verified(storage, env_bytes) {
+                    t.verified_dups += 1;
+                } else {
+                    t.tainted = true;
+                }
+            }
+            RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
+                t.tainted = true;
+                warn!(
+                    peer = %peer,
+                    channel_id,
+                    reason = %reason,
+                    "reconcile: peer envelope rejected by router"
+                );
+            }
+            RouteResult::PowRequired { .. } => {
+                // Sync messages are PoW-exempt — should not fire.
+                t.tainted = true;
+            }
+        }
+    }
+    t
+}
+
+/// The IN_SYNC verdict for a comparison that found NO winner (l2-node
+/// 0.141.0). All must hold: no dispatched candidate is still outstanding
+/// at finalize (`all_answered` — not the deadline path; a candidate whose
+/// request FAILED also leaves `outstanding`, so an unreachable peer does
+/// not block IN_SYNC — it only delays a repair by one recheck); no candidate
+/// answered `server_capped` (it may hold what we lack); at least one
+/// candidate was tried; EVERY tried candidate proved a verified in-sync
+/// first page (so a trial rejected under the has-more/zero-progress rule,
+/// an oversized page, or a forged duplicate blocks it); and at least one
+/// such candidate is not flagged stale. IN_SYNC only moves the attempt
+/// throttle; it never writes the completion CF and never touches peer
+/// health.
+fn comparison_in_sync(
+    all_answered: bool,
+    any_capped: bool,
+    trials: &[(PeerId, bool)],
+    is_stale: impl Fn(&PeerId) -> bool,
+) -> bool {
+    all_answered
+        && !any_capped
+        && !trials.is_empty()
+        && trials.iter().all(|(_, in_sync)| *in_sync)
+        && trials.iter().any(|(p, _)| !is_stale(p))
 }
 
 /// Per-pending-outbound-identity-sync state (P-1).
@@ -1210,6 +1375,31 @@ fn split_reconcile_trial_results(trials: &[(PeerId, bool)]) -> (Vec<PeerId>, Vec
 fn is_peer_stale(consecutive_losses: u32, threshold: u32) -> bool {
     threshold > 0 && consecutive_losses >= threshold
 }
+
+/// `true` iff `env_bytes` (an envelope the router just answered
+/// `Duplicate` for) is BYTE-IDENTICAL to the copy stored locally under its
+/// `msg_id` (l2-node 0.141.0). The router's duplicate check runs before
+/// msg_id binding and signature verification and is keyed by msg_id alone,
+/// so `Duplicate` by itself proves nothing (recurring bug shape #19); but
+/// the stored bytes were fully verified at ingest, so byte identity is as
+/// strong as re-verifying the signature — a forged envelope reusing a known
+/// msg_id with a different payload/signature fails here. Only the top-level
+/// `Envelope` is decoded (for `msg_id`), never the payload. Used ONLY as
+/// in-sync evidence for the requester's attempt throttle, never for
+/// completion. Fails safe: stored bytes that were re-encoded at ingest
+/// (snapshot import, a router re-encode) simply do not count.
+pub(crate) fn duplicate_is_verified(storage: &Storage, env_bytes: &[u8]) -> bool {
+    let Ok(env) = rmp_serde::from_slice::<Envelope>(env_bytes) else {
+        return false;
+    };
+    matches!(storage.get_message(&env.msg_id), Ok(Some(stored)) if stored == env_bytes)
+}
+
+/// Generic sync-protocol responder budget per `(peer, channel)` (l2-node
+/// 0.141.0). `sync` shares `reconcile::ResponderLimits` with reconcile, so
+/// its former LIFETIME cap (`sync::TOTAL_ENVELOPES_CAP`, 5,000 per process)
+/// became a rolling window too: the same 5,000 burst, refilled at this rate.
+const SYNC_RESPONDER_REFILL_PER_HOUR: u64 = 5_000;
 
 fn envelope_targets_channel(env_bytes: &[u8], expected_channel: u64) -> bool {
     use crate::messages::envelope::Envelope;
@@ -2063,6 +2253,26 @@ impl NetworkService {
         // carries its build (or waiter) slot, released only after the loop
         // has sent the response.
         let (deferred_response_tx, deferred_response_rx) = tokio::sync::mpsc::unbounded_channel();
+        // l2-node 0.141.0: rolling responder budgets + requester attempt
+        // throttles (see `budget`'s module doc).
+        let reconcile_budget = budget::Gcra::new(
+            backfill_config.total_envelopes_cap as u64,
+            backfill_config.total_envelopes_refill_per_hour,
+        );
+        let reconcile_throttle = budget::AttemptThrottle::new(
+            budget::MAX_THROTTLE_KEYS,
+            Duration::from_secs(backfill_config.retry_backoff_max_minutes.saturating_mul(60)),
+            Duration::from_secs(backfill_config.in_sync_recheck_minutes.saturating_mul(60)),
+        );
+        let private_channel_sync_budget = budget::Gcra::new(
+            private_channel_sync_config.responder_budget_burst,
+            private_channel_sync_config.responder_budget_refill_per_hour,
+        );
+        let private_channel_sync_throttle = budget::AttemptThrottle::new(
+            budget::MAX_THROTTLE_KEYS,
+            Duration::from_secs(private_channel_sync_config.retry_backoff_max_minutes.saturating_mul(60)),
+            Duration::from_secs(private_channel_sync_config.in_sync_recheck_minutes.saturating_mul(60)),
+        );
 
         Ok(Self {
             swarm,
@@ -2094,6 +2304,8 @@ impl NetworkService {
             alert_event_tx,
             backfill_config,
             reconcile_limits: Arc::new(reconcile::ResponderLimits::default()),
+            reconcile_budget,
+            reconcile_throttle,
             pending_reconcile_requests: HashMap::new(),
             reconcile_triggered: HashSet::new(),
             pending_reconcile_comparisons: HashMap::new(),
@@ -2117,6 +2329,8 @@ impl NetworkService {
             local_dm_users_seen: HashMap::new(),
             private_channel_sync_config,
             private_channel_sync_limits: Arc::new(private_channel_sync::PrivateChannelSyncResponderLimits::default()),
+            private_channel_sync_budget,
+            private_channel_sync_throttle,
             responder_build_permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_RESPONDER_BUILDS)),
             continuation_wait_permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONTINUATION_BUILD_WAITERS)),
             deferred_response_tx,
@@ -2878,6 +3092,10 @@ impl NetworkService {
                     // history (F2 backfill gap) — see
                     // `retry_incomplete_private_channel_syncs`'s doc comment.
                     self.retry_incomplete_private_channel_syncs();
+                    // l2-node 0.141.0: drop refilled responder-budget
+                    // entries (never one in debt) and long-idle throttle
+                    // entries.
+                    self.prune_backfill_budgets(Instant::now());
                 }
                 _ = reconnect_interval.tick() => {
                     self.process_reconnect_queue();
@@ -4736,6 +4954,18 @@ impl NetworkService {
             self.private_channel_sync_triggered.remove(&key);
             return;
         }
+        // l2-node 0.141.0: attempt throttle (backoff after a dispatch, an
+        // hourly recheck after a verified in-sync session). A federate call
+        // carrying a fresh wallet claim may bypass it, but only once the
+        // last dispatch is `FEDERATE_BYPASS_FLOOR` (60 s) old.
+        let now_instant = Instant::now();
+        if !self
+            .private_channel_sync_throttle
+            .ready_or_bypass(&key, now_instant, wallet_claim.is_some())
+        {
+            self.private_channel_sync_triggered.remove(&key);
+            return;
+        }
 
         // W5-equivalent: resolve the freshest available wallet-signed
         // authorization — prefer one attached to THIS call, else fall
@@ -4844,6 +5074,14 @@ impl NetworkService {
         self.private_channel_sync_wallet_claims
             .insert(wallet.to_string(), claim.clone());
 
+        // l2-node 0.141.0: stamp the attempt HERE — after every early
+        // return above (no claim, stale claim, no candidates), right before
+        // the requests are actually sent. Stamping earlier would burn a
+        // backoff step on an attempt that never happened.
+        self.private_channel_sync_throttle
+            .on_dispatch(key.clone(), now_instant, budget::random_jitter());
+        self.counters.inc_private_sync_attempts_dispatched();
+
         for peer in candidates {
             let request = private_channel_sync::sign_request(
                 &self.signing_key,
@@ -4929,11 +5167,22 @@ impl NetworkService {
                     return;
                 }
 
-                let guard = self.private_channel_sync_limits.try_acquire(
+                // Per-peer concurrency + rolling budget (l2-node 0.141.0;
+                // refusals are never charged).
+                let budget = self.private_channel_sync_budget;
+                let guard = match self.private_channel_sync_limits.try_acquire(
                     peer,
                     private_channel_sync::SERVER_MAX_CONCURRENT_PER_PEER,
-                    private_channel_sync::TOTAL_ENVELOPES_CAP,
-                );
+                    &budget,
+                    Instant::now(),
+                ) {
+                    Ok(g) => Some(g),
+                    Err(refusal) => {
+                        self.count_budget_refusal(refusal, false);
+                        debug!(peer = %peer, channel_id = request.channel_id, ?refusal, "private-channel-sync: refused; responding server_capped");
+                        None
+                    }
+                };
                 let Some(guard) = guard else {
                     if let Err(e) = self
                         .swarm
@@ -5018,7 +5267,12 @@ impl NetworkService {
                         // 1 per request (empty / garbage-cursor pages are not
                         // free). Charged here, before the response is queued,
                         // so the peer's next request already sees it.
-                        limits.add_served(peer, reconcile::budget_charge(response.envelopes.len(), work));
+                        limits.charge(
+                            peer,
+                            reconcile::budget_charge(response.envelopes.len(), work),
+                            &budget,
+                            Instant::now(),
+                        );
                         // The loop may be shutting down (receiver gone): the
                         // response, guard and slot are simply dropped.
                         let _ = tx.send(DeferredResponse::PrivateChannelSync {
@@ -5058,10 +5312,15 @@ impl NetworkService {
                     self.release_private_channel_sync_trigger_if_no_siblings(&pending.wallet, pending.channel_id);
                     return;
                 }
-                // Nothing at all, and nothing earlier in this session: done,
-                // not complete. (An empty FINAL chat page after a productive
-                // metadata phase falls through so completion is recorded.)
-                if response.envelopes.is_empty() && !response.has_more && pending.session.accepted_total == 0 {
+                // An empty, finished FIRST response: this peer knows nothing
+                // about the pair — done, not complete, and no evidence of
+                // anything. l2-node 0.141.0: limited to the session's FIRST
+                // response (`session == default`) so an empty FINAL chat
+                // page — after a productive OR an all-duplicate metadata
+                // phase — reaches `advance` and records COMPLETE or
+                // IN_SYNC. (Siblings were already cancelled by this peer's
+                // first response, so this changes no cancellation.)
+                if private_channel_sync::is_empty_first_response(&response, &pending.session) {
                     self.release_private_channel_sync_trigger_if_no_siblings(&pending.wallet, pending.channel_id);
                     return;
                 }
@@ -5076,7 +5335,12 @@ impl NetworkService {
                 let mut admitted = 0usize;
                 let mut accepted = 0usize;
                 let mut dropped = 0usize;
+                // In-sync evidence (l2-node 0.141.0): byte-verified
+                // duplicates vs anything that is not clean evidence.
+                let mut verified_dups = 0usize;
+                let mut tainted = false;
                 if count > private_channel_sync::MAX_ENVELOPES_PER_RESPONSE {
+                    tainted = true;
                     warn!(
                         peer = %peer, %wallet, channel_id, received = count,
                         expected_max = private_channel_sync::MAX_ENVELOPES_PER_RESPONSE,
@@ -5088,6 +5352,7 @@ impl NetworkService {
                             || !envelope_targets_channel(env_bytes, channel_id)
                         {
                             dropped += 1;
+                            tainted = true;
                             continue;
                         }
                         match self.router.process_synced_message(env_bytes) {
@@ -5095,11 +5360,19 @@ impl NetworkService {
                                 admitted += 1;
                                 accepted += 1;
                             }
-                            RouteResult::Duplicate => admitted += 1,
+                            RouteResult::Duplicate => {
+                                admitted += 1;
+                                if duplicate_is_verified(&self.storage, env_bytes) {
+                                    verified_dups += 1;
+                                } else {
+                                    tainted = true;
+                                }
+                            }
                             RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
+                                tainted = true;
                                 warn!(peer = %peer, reason = %reason, "private-channel-sync: envelope rejected by router");
                             }
-                            RouteResult::PowRequired { .. } => {}
+                            RouteResult::PowRequired { .. } => tainted = true,
                         }
                     }
                 }
@@ -5110,8 +5383,9 @@ impl NetworkService {
                 // after the chat phase started; completion only after the
                 // chat phase ends with >= 1 `Accepted` in the session.
                 let mut session = pending.session;
+                session.record_evidence(verified_dups, tainted);
                 let step = session.advance(&response, admitted, accepted);
-                if step == (private_channel_sync::NextStep::Finish { complete: false })
+                if matches!(step, private_channel_sync::NextStep::Finish { complete: false, .. })
                     && (response.has_more || response.meta_phase)
                 {
                     warn!(
@@ -5129,7 +5403,31 @@ impl NetworkService {
                     private_channel_sync::NextStep::MetaPage(c) => Some((None, Some(c), false)),
                     private_channel_sync::NextStep::StartChat => Some((None, None, true)),
                     private_channel_sync::NextStep::ChatPage(c) => Some((Some(c), None, true)),
-                    private_channel_sync::NextStep::Finish { complete } => {
+                    private_channel_sync::NextStep::Finish { complete, in_sync } => {
+                        // Attempt throttle outcome (l2-node 0.141.0).
+                        // COMPLETE → forget the key (the persisted marker
+                        // and `channel_catchup_interval_hours` take over);
+                        // IN_SYNC (verified nothing new — a throttle state
+                        // only, NEVER written to the completion CF) →
+                        // recheck after `in_sync_recheck_minutes`; new
+                        // content but an early stop → retry in 30 s;
+                        // anything else keeps the backoff set at dispatch.
+                        let throttle_key = (wallet.clone(), channel_id);
+                        let now_instant = Instant::now();
+                        if complete {
+                            self.private_channel_sync_throttle.on_complete(&throttle_key);
+                        } else if in_sync {
+                            self.private_channel_sync_throttle.on_in_sync(
+                                throttle_key,
+                                now_instant,
+                                budget::random_jitter(),
+                            );
+                            self.counters.inc_private_sync_in_sync_outcomes();
+                            debug!(%wallet, channel_id, verified_dups = session.verified_dups, "private-channel-sync: verified in sync (nothing new); rechecking later");
+                        } else if session.accepted_total > 0 {
+                            self.private_channel_sync_throttle
+                                .on_accepted_incomplete(throttle_key, now_instant);
+                        }
                         // Completion only after BOTH phases ended and the
                         // session admitted at least one genuinely NEW,
                         // signature-verified envelope (`Accepted`, never
@@ -5350,7 +5648,14 @@ impl NetworkService {
             self.backfill_config.channel_catchup_interval_hours,
         );
         let need_backfill = is_skeleton || due;
-        if !need_backfill {
+        // l2-node 0.141.0: … AND the attempt throttle allows it (backoff
+        // after a dispatch, a recheck after a verified in-sync comparison;
+        // no entry == due, so a fresh process or a newly discovered channel
+        // is always attempted). Before this, a channel that never reached
+        // COMPLETE (every in-sync channel: all-`Duplicate` answers never
+        // complete) was re-walked on every 30 s sweep rotation.
+        let now_instant = Instant::now();
+        if !need_backfill || !self.reconcile_throttle.ready(&channel_id, now_instant) {
             // Not due — release immediately so a future resubscribe
             // (or the periodic retry sweep) re-evaluates fresh rather
             // than being blocked by this session's own dedup entry.
@@ -5507,6 +5812,13 @@ impl NetworkService {
             "backfill: triggering channel-history reconciliation"
         );
 
+        // l2-node 0.141.0: stamp the attempt HERE — after every early
+        // return above (not due, no candidates, the comparison cap), right
+        // before the requests are actually sent.
+        self.reconcile_throttle
+            .on_dispatch(channel_id, now_instant, budget::random_jitter());
+        self.counters.inc_reconcile_attempts_dispatched();
+
         // l2-node 0.137.0: every fresh trigger opens a comparison window
         // instead of racing to the first informative response — see
         // `ReconcileComparison`'s doc comment.
@@ -5535,6 +5847,7 @@ impl NetworkService {
                 outstanding,
                 candidates: Vec::new(),
                 deadline: Instant::now() + RECONCILE_COMPARE_WINDOW,
+                any_capped: false,
             },
         );
     }
@@ -5583,7 +5896,12 @@ impl NetworkService {
     /// point read once triggered — v0.47.0 always bulk-sends, so it pages
     /// through and deserializes real envelope batches every retry cycle.
     /// Bounded, not DoS-class, but a real recurring cost until spec-14
-    /// fingerprinting lands.
+    /// fingerprinting lands. l2-node 0.141.0 bounds how OFTEN it is paid:
+    /// `maybe_trigger_backfill` also requires `reconcile_throttle` to be
+    /// ready (exponential backoff after each dispatch, an
+    /// `in_sync_recheck_minutes` recheck after a verified in-sync
+    /// comparison), so such a channel is re-walked about hourly instead of
+    /// on every rotation.
     fn retry_incomplete_channel_backfills(&mut self) {
         if !self.backfill_config.enabled {
             return;
@@ -5635,6 +5953,36 @@ impl NetworkService {
         }
     }
 
+    /// Periodic prune (30 s tick, l2-node 0.141.0): drops responder-budget
+    /// entries whose bucket is full again — never one still in debt, which
+    /// would be a free refill — and throttle entries idle past their
+    /// `next_due + retry_backoff_max` (no entry == due).
+    fn prune_backfill_budgets(&mut self, now: Instant) {
+        self.reconcile_limits.prune(now);
+        self.sync_limits.prune(now);
+        self.private_channel_sync_limits.prune(now);
+        self.reconcile_throttle.prune(now);
+        self.private_channel_sync_throttle.prune(now);
+    }
+
+    /// Count a responder refusal caused by the rolling budget (l2-node
+    /// 0.141.0) — concurrency refusals are not budget refusals and are not
+    /// counted. `reconcile` selects the public-reconcile vs the
+    /// private-channel-sync counter; a full key map is also counted on its
+    /// own (a flood indicator).
+    fn count_budget_refusal(&self, refusal: budget::Refusal, reconcile: bool) {
+        match refusal {
+            budget::Refusal::Concurrency => return,
+            budget::Refusal::MapFull => self.counters.inc_backfill_budget_map_full_refusals(),
+            budget::Refusal::OverBudget => {}
+        }
+        if reconcile {
+            self.counters.inc_reconcile_budget_refusals();
+        } else {
+            self.counters.inc_private_sync_budget_refusals();
+        }
+    }
+
     /// Handle inbound + outbound reconcile request-response events.
     fn handle_reconcile_event(
         &mut self,
@@ -5650,21 +5998,28 @@ impl NetworkService {
                 message: Message::Request { request, channel, request_id: _ },
                 connection_id: _,
             } => {
-                // Server-side: rate-limit + cumulative cap, then
-                // build + respond. The Audit C2 cumulative-envelopes
-                // cap (`total_envelopes_cap`) is enforced through
-                // `try_acquire`; on success, we call `add_served`
-                // after `build_response` succeeded so the next
-                // paginated request from the same peer sees the
-                // updated total.
-                let total_cap = self.backfill_config.total_envelopes_cap as u64;
-                let guard = self.reconcile_limits.try_acquire(
+                // Server-side: rate-limit + rolling budget, then build +
+                // respond. The Audit C2 work budget (`total_envelopes_cap`
+                // burst, refilled at `total_envelopes_refill_per_hour`
+                // since 0.141.0) is enforced through `try_acquire`; on
+                // success the build is charged (`charge`) before the
+                // response is queued, so the next paginated request from
+                // the same peer sees the updated budget.
+                let budget = self.reconcile_budget;
+                let guard = match self.reconcile_limits.try_acquire(
                     peer,
                     request.channel_id,
                     self.backfill_config.server_max_concurrent_per_peer,
                     self.backfill_config.server_max_concurrent_per_channel,
-                    total_cap,
-                );
+                    &budget,
+                    Instant::now(),
+                ) {
+                    Ok(g) => Some(g),
+                    Err(refusal) => {
+                        self.count_budget_refusal(refusal, true);
+                        None
+                    }
+                };
                 // Round 4: the build runs OFF the swarm event loop under a
                 // node-wide build slot; a capped request (per-peer limits,
                 // session budget, or no free build slot for a
@@ -5729,10 +6084,12 @@ impl NetworkService {
                         // session budget for scan work as well as envelopes
                         // sent (minimum 1 — empty pages, including the
                         // private-channel refusal, are no longer free).
-                        limits.add_served(
+                        limits.charge(
                             peer,
                             request.channel_id,
                             reconcile::budget_charge(response.envelopes.len(), work),
+                            &budget,
+                            Instant::now(),
                         );
                         let _ = tx.send(DeferredResponse::Reconcile {
                             peer,
@@ -5867,6 +6224,7 @@ impl NetworkService {
         }
         let informative =
             !response.server_capped && !(response.envelopes.is_empty() && !response.has_more);
+        cmp.any_capped |= response.server_capped;
         if informative {
             cmp.candidates.push((peer, response));
         } else {
@@ -5960,6 +6318,11 @@ impl NetworkService {
         let Some(cmp) = self.pending_reconcile_comparisons.remove(&channel_id) else {
             return;
         };
+        // l2-node 0.141.0: IN_SYNC needs every dispatched candidate to have
+        // answered BEFORE this finalize (not the deadline path with a
+        // straggler still out) and none of them `server_capped`.
+        let all_answered = cmp.outstanding.is_empty();
+        let any_capped = cmp.any_capped;
         // Code-audit finding (2026-09-30, round 2): purge any still-
         // outstanding stragglers' `pending_reconcile_requests` entries
         // NOW, unconditionally, regardless of how this comparison
@@ -6002,6 +6365,10 @@ impl NetworkService {
         // in try order — fed to `split_reconcile_trial_results` once a
         // winner is found (or exhausted with none).
         let mut trials: Vec<(PeerId, bool)> = Vec::new();
+        // (peer, verified_in_sync) per tried candidate (l2-node 0.141.0) —
+        // the in-sync evidence for `comparison_in_sync`; never used for
+        // peer health.
+        let mut in_sync_trials: Vec<(PeerId, bool)> = Vec::new();
         for idx in order {
             let (peer, response) = slots[idx].take().expect("each index visited exactly once");
             let trial_pending = ReconcilePending {
@@ -6023,8 +6390,9 @@ impl NetworkService {
                     }
                     return;
                 }
-                ReconcileApplyOutcome::NoProgress => {
+                ReconcileApplyOutcome::NoProgress { verified_in_sync } => {
                     trials.push((peer, false));
+                    in_sync_trials.push((peer, verified_in_sync));
                     continue;
                 }
             }
@@ -6038,6 +6406,25 @@ impl NetworkService {
         // `ReconcileApplyOutcome::NoProgress`'s doc comment for why the
         // trials themselves don't release this). Stragglers were
         // already purged unconditionally above.
+        //
+        // l2-node 0.141.0: if every tried candidate proved a verified
+        // in-sync first page (`comparison_in_sync`), move the attempt
+        // throttle to its in-sync recheck instead of the dispatch backoff.
+        // A THROTTLE STATE ONLY: no completion marker, no peer-health
+        // update (0.137 semantics: no winner, no health change).
+        let threshold = self.backfill_config.stale_peer_threshold;
+        let in_sync = comparison_in_sync(all_answered, any_capped, &in_sync_trials, |p| {
+            is_peer_stale(
+                self.peer_reconcile_health.get(p).map(|h| h.consecutive_losses).unwrap_or(0),
+                threshold,
+            )
+        });
+        if in_sync {
+            self.reconcile_throttle
+                .on_in_sync(channel_id, Instant::now(), budget::random_jitter());
+            self.counters.inc_reconcile_in_sync_outcomes();
+            debug!(channel_id, candidates = in_sync_trials.len(), "reconcile: comparison verified in sync (nothing new); rechecking later");
+        }
         self.release_reconcile_trigger_if_no_siblings(channel_id);
     }
 
@@ -6124,7 +6511,7 @@ impl NetworkService {
             if release_on_no_progress {
                 self.release_reconcile_trigger_if_no_siblings(pending.channel_id);
             }
-            return ReconcileApplyOutcome::NoProgress;
+            return ReconcileApplyOutcome::NoProgress { verified_in_sync: false };
         }
         if response.envelopes.is_empty() && !response.has_more {
             debug!(
@@ -6143,87 +6530,19 @@ impl NetworkService {
             if release_on_no_progress {
                 self.release_reconcile_trigger_if_no_siblings(pending.channel_id);
             }
-            return ReconcileApplyOutcome::NoProgress;
+            return ReconcileApplyOutcome::NoProgress { verified_in_sync: false };
         }
 
         let env_count = response.envelopes.len();
-        let mut admitted = 0usize;
-        let mut newly_accepted = 0usize;
-        let mut cross_channel_dropped = 0usize;
-        // Security-audit follow-up on W9: see identity-sync's arm
-        // (earlier in this file) for the full rationale — refuse to
-        // verify ANY envelope in a page that exceeds this node's
-        // OWN configured max page size, treating it as unproductive
-        // rather than paying the verification cost. Config-driven
-        // (not a fixed constant like the other three protocols)
-        // since reconcile's page size is an operator knob.
-        let max_page_size = self.backfill_config.max_envelopes_per_response;
-        if env_count > max_page_size {
-            warn!(
-                peer = %peer,
-                channel_id = pending.channel_id,
-                received = env_count,
-                expected_max = max_page_size,
-                "reconcile: response exceeds this node's own max page size; refusing to verify, treating as unproductive"
-            );
-        } else {
-            for env_bytes in response.envelopes {
-                // Security Audit W1 (0.47.0): cross-channel
-                // smuggling defense. The responder could otherwise
-                // stuff envelopes for channel B into a response
-                // we sent for channel A; signatures verify (the
-                // original authors really signed them) so the
-                // router would happily index them under B in our
-                // local CHANNEL_MSGS. Reject any envelope whose
-                // payload-extracted channel_id does not equal the
-                // channel we asked for, BEFORE handing it to the
-                // router (which has no notion of "which channel was
-                // this reconcile for" to check against on its own).
-                if !envelope_targets_channel(
-                    &env_bytes,
-                    pending.channel_id,
-                ) {
-                    cross_channel_dropped += 1;
-                    continue;
-                }
-                match self.router.process_synced_message(&env_bytes) {
-                    crate::messages::router::RouteResult::Accepted { .. } => {
-                        admitted += 1;
-                        newly_accepted += 1;
-                    }
-                    crate::messages::router::RouteResult::Duplicate => {
-                        // Already had this envelope locally — counted
-                        // toward `admitted` ("won the race" — no
-                        // storage write needed) but deliberately NOT
-                        // toward `newly_accepted`. Security-audit
-                        // finding (2026-09-30, round 2): the router's
-                        // duplicate check runs before signature
-                        // verification and is keyed globally by
-                        // msg_id, not per-channel — see
-                        // `ReconcilePending::total_accepted`'s doc
-                        // comment for the exploit this would
-                        // otherwise reopen. Matches this file's
-                        // `sync` protocol handler, which already
-                        // excludes `Duplicate` from its own progress
-                        // counter for the same reason.
-                        admitted += 1;
-                    }
-                    crate::messages::router::RouteResult::Rejected(reason)
-                    | crate::messages::router::RouteResult::Invalid(reason) => {
-                        warn!(
-                            peer = %peer,
-                            channel_id = pending.channel_id,
-                            reason = %reason,
-                            "reconcile: peer envelope rejected by router"
-                        );
-                    }
-                    crate::messages::router::RouteResult::PowRequired { .. } => {
-                        // Sync messages are PoW-exempt — should
-                        // not fire. Skip if it does.
-                    }
-                }
-            }
-        }
+        let tally = tally_reconcile_envelopes(
+            &self.router,
+            &self.storage,
+            &peer,
+            pending.channel_id,
+            &response.envelopes,
+            self.backfill_config.max_envelopes_per_response,
+        );
+        let ReconcileTally { admitted, newly_accepted, cross_channel_dropped, .. } = tally;
         info!(
             peer = %peer,
             channel_id = pending.channel_id,
@@ -6293,17 +6612,19 @@ impl NetworkService {
             // stuck until process restart, but without piling a
             // redundant extra trigger on top of a still-pending
             // sibling.
+            self.note_reconcile_accepted_incomplete(pending.channel_id, total_accepted);
             if release_on_no_progress {
                 self.release_reconcile_trigger_if_no_siblings(pending.channel_id);
             }
-            return ReconcileApplyOutcome::NoProgress;
+            return ReconcileApplyOutcome::NoProgress { verified_in_sync: false };
         }
         if consecutive_unproductive_pages >= MAX_CONSECUTIVE_UNPRODUCTIVE_PAGES {
             warn!(peer = %peer, channel_id = pending.channel_id, consecutive_unproductive_pages, "reconcile: peer made no progress for too many consecutive pages; stopping this session");
+            self.note_reconcile_accepted_incomplete(pending.channel_id, total_accepted);
             if release_on_no_progress {
                 self.release_reconcile_trigger_if_no_siblings(pending.channel_id);
             }
-            return ReconcileApplyOutcome::NoProgress;
+            return ReconcileApplyOutcome::NoProgress { verified_in_sync: false };
         }
 
         // Security-audit finding (2026-09-30, round 2, CRITICAL): in a
@@ -6377,7 +6698,7 @@ impl NetworkService {
                 "reconcile: comparison trial claimed has_more with zero verified \
                  progress on its first page; treating as no-progress, not a win"
             );
-            return ReconcileApplyOutcome::NoProgress;
+            return ReconcileApplyOutcome::NoProgress { verified_in_sync: false };
         }
 
         // Continue paging from the winning peer if the
@@ -6427,10 +6748,11 @@ impl NetworkService {
                 // falling through and leaving the dedup entry
                 // (and any still-alive siblings' fate) stuck.
                 warn!(peer = %peer, channel_id = pending.channel_id, "reconcile: peer signalled has_more with no cursor; stopping this session");
+                self.note_reconcile_accepted_incomplete(pending.channel_id, total_accepted);
                 if release_on_no_progress {
                     self.release_reconcile_trigger_if_no_siblings(pending.channel_id);
                 }
-                ReconcileApplyOutcome::NoProgress
+                ReconcileApplyOutcome::NoProgress { verified_in_sync: false }
             }
         } else if total_accepted > 0 {
             // Natural completion: this session got at least one
@@ -6457,6 +6779,9 @@ impl NetworkService {
             {
                 warn!(channel_id = pending.channel_id, error = %e, "reconcile: failed to persist backfill completion");
             }
+            // l2-node 0.141.0: COMPLETE — forget the throttle entry; the
+            // persisted marker + `channel_catchup_interval_hours` take over.
+            self.reconcile_throttle.on_complete(&pending.channel_id);
             self.release_reconcile_trigger_if_no_siblings(pending.channel_id);
             ReconcileApplyOutcome::Handled
         } else {
@@ -6493,11 +6818,36 @@ impl NetworkService {
             // channel case. Bounded per-tick/per-session, so not
             // DoS-class, but worth tracking as a real cost that
             // only goes away once spec-14 fingerprinting lands.
-            warn!(peer = %peer, channel_id = pending.channel_id, "reconcile: session ended with has_more=false but zero newly-accepted envelopes; not marking complete");
+            //
+            // l2-node 0.141.0: that steady-state cost is now throttled
+            // requester-side (`reconcile_throttle`): a comparison whose
+            // candidates all prove a verified in-sync first page
+            // (`is_verified_in_sync_page`, judged by `comparison_in_sync`)
+            // is rechecked after `in_sync_recheck_minutes`; anything else
+            // backs off exponentially. Still never COMPLETE.
+            let verified_in_sync = !release_on_no_progress
+                && pending.pages_fetched == 0
+                && tally.is_verified_in_sync_page(env_count, response.has_more);
+            if verified_in_sync {
+                debug!(peer = %peer, channel_id = pending.channel_id, verified_dups = tally.verified_dups, "reconcile: first page is a verified in-sync page (nothing new); not marking complete");
+            } else {
+                warn!(peer = %peer, channel_id = pending.channel_id, "reconcile: session ended with has_more=false but zero newly-accepted envelopes; not marking complete");
+            }
             if release_on_no_progress {
                 self.release_reconcile_trigger_if_no_siblings(pending.channel_id);
             }
-            ReconcileApplyOutcome::NoProgress
+            ReconcileApplyOutcome::NoProgress { verified_in_sync }
+        }
+    }
+
+    /// Throttle outcome for a session that admitted new content
+    /// (`total_accepted > 0`) but stopped before the end (a backstop or a
+    /// protocol violation): retry in 30 s with the backoff reset (l2-node
+    /// 0.141.0). A session with nothing accepted keeps its dispatch backoff.
+    fn note_reconcile_accepted_incomplete(&mut self, channel_id: u64, total_accepted: u64) {
+        if total_accepted > 0 {
+            self.reconcile_throttle
+                .on_accepted_incomplete(channel_id, Instant::now());
         }
     }
 
@@ -6644,13 +6994,20 @@ impl NetworkService {
                 // stub-type spam and legitimate channel-0 traffic.
                 let request_type = request.request_type;
                 let channel_id = request.channel_id.unwrap_or(0);
-                let guard = self.sync_limits.try_acquire(
-                    peer,
-                    channel_id,
-                    sync::SERVER_MAX_CONCURRENT_PER_PEER,
-                    sync::SERVER_MAX_CONCURRENT_PER_CHANNEL,
-                    sync::TOTAL_ENVELOPES_CAP,
-                );
+                let sync_budget =
+                    budget::Gcra::new(sync::TOTAL_ENVELOPES_CAP, SYNC_RESPONDER_REFILL_PER_HOUR);
+                let now_instant = Instant::now();
+                let guard = self
+                    .sync_limits
+                    .try_acquire(
+                        peer,
+                        channel_id,
+                        sync::SERVER_MAX_CONCURRENT_PER_PEER,
+                        sync::SERVER_MAX_CONCURRENT_PER_CHANNEL,
+                        &sync_budget,
+                        now_instant,
+                    )
+                    .ok();
                 let response = if guard.is_none() {
                     debug!(
                         peer = %peer,
@@ -6672,10 +7029,12 @@ impl NetworkService {
                 );
 
                 if !response.messages.is_empty() {
-                    self.sync_limits.add_served(
+                    self.sync_limits.charge(
                         peer,
                         channel_id,
                         response.messages.len() as u64,
+                        &sync_budget,
+                        now_instant,
                     );
                 }
 
@@ -8241,5 +8600,551 @@ mod responder_build_slot_tests {
         drop(waiter);
         assert_eq!(wait.available_permits(), MAX_CONTINUATION_BUILD_WAITERS);
         assert!(CONTINUATION_BUILD_SLOT_WAIT < std::time::Duration::from_secs(45));
+    }
+}
+
+#[cfg(test)]
+mod backfill_throttle_tests {
+    //! l2-node 0.141.0: the requester attempt throttle, the IN_SYNC
+    //! verdict and `duplicate_is_verified`, exercised through a real
+    //! (unconnected) `NetworkService` where the wiring matters, and through
+    //! the pure helpers otherwise.
+    use super::*;
+    use crate::crypto::signing;
+    use crate::messages::types::MessageType;
+    use tempfile::TempDir;
+
+    const CID: u64 = 7;
+    const T0: u64 = 1_700_000_000_000; // ms
+
+    struct W {
+        sk: ed25519_dalek::SigningKey,
+        addr: String,
+    }
+    fn wallet() -> W {
+        let sk = crate::crypto::generate_keypair();
+        let addr = crate::crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        W { sk, addr }
+    }
+
+    fn config() -> Config {
+        let mut c: Config = toml::from_str(&Config::default_toml()).unwrap();
+        c.network.listen_port = 0;
+        c.network.enable_mdns = false;
+        c
+    }
+
+    async fn service() -> (NetworkService, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let config = config();
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let svc = NetworkService::new(
+            &config,
+            storage.clone(),
+            IdentityResolver::new(storage),
+            libp2p::identity::Keypair::generate_ed25519(),
+            None,
+            Arc::new(AtomicU32::new(0)),
+            crate::crypto::generate_keypair(),
+            "test-node".into(),
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(NetworkCounters::new()),
+            Arc::new(RwLock::new(None)),
+            rx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(RwLock::new(HashSet::new())),
+            mesh_stats::PublishFailureCounters::default(),
+            mesh_stats::shared_empty(),
+            None,
+            config.backfill.clone(),
+            config.dm.clone(),
+            config.identity_resync.clone(),
+            config.private_channel_sync.clone(),
+        )
+        .await
+        .unwrap();
+        (svc, dir)
+    }
+
+    /// A responder node (router + storage) on the same network id.
+    fn responder() -> (MessageRouter, Storage, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let r = MessageRouter::new(
+            storage.clone(),
+            IdentityResolver::new(storage.clone()),
+            None,
+            config().network_id().to_string(),
+            usize::MAX,
+            Arc::new(NetworkCounters::new()),
+            crate::config::RateLimitsConfig::default(),
+        );
+        (r, storage, dir)
+    }
+
+    fn setup_public_channel(s: &Storage, creator: &str) {
+        s.put_cf(
+            schema::cf::CHANNELS,
+            &CID.to_be_bytes(),
+            serde_json::json!({"channel_id": CID, "channel_type": 0, "creator": creator,
+                "member_count": 0}).to_string().as_bytes(),
+        )
+        .unwrap();
+        s.put_cf(
+            schema::cf::USERS,
+            creator.as_bytes(),
+            serde_json::json!({"address": creator, "registered_at": 1}).to_string().as_bytes(),
+        )
+        .unwrap();
+    }
+
+    fn chat(w: &W, ts: u64) -> Vec<u8> {
+        #[derive(serde::Serialize)]
+        struct C {
+            channel_id: u64,
+            content: String,
+        }
+        let net = config().network_id().to_string();
+        let payload = rmp_serde::to_vec_named(&C { channel_id: CID, content: format!("m{ts}") }).unwrap();
+        let pk: [u8; 32] = w.sk.verifying_key().to_bytes();
+        let msg_id = crate::crypto::compute_msg_id(&net, &pk, &payload, ts);
+        let sig = signing::sign_ogmara_message(
+            &w.sk,
+            &net,
+            crate::messages::envelope::PROTOCOL_VERSION,
+            MessageType::ChatMessage as u8,
+            &msg_id,
+            ts,
+            &payload,
+        );
+        rmp_serde::to_vec_named(&Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::ChatMessage,
+            msg_id,
+            author: w.addr.clone(),
+            timestamp: ts,
+            lamport_ts: 0,
+            payload,
+            signature: sig.to_bytes().to_vec(),
+            relay_path: vec![],
+        })
+        .unwrap()
+    }
+
+    fn feed(r: &MessageRouter, raw: &[u8]) {
+        let res = r.process_synced_message(raw);
+        assert!(matches!(res, RouteResult::Accepted { .. }), "fixture rejected: {res:?}");
+    }
+
+    fn page(s: &Storage, cap: usize) -> reconcile::ReconcileResponse {
+        let req = reconcile::ReconcileRequest {
+            channel_id: CID,
+            max_age_secs: u64::MAX,
+            cursor: None,
+            fingerprint: Vec::new(),
+            epoch_root_known: None,
+            round: 0,
+        };
+        reconcile::build_response(s, &req, cap, T0 / 1000 + 1_000)
+    }
+
+    /// Requester `svc` holds messages `0..have`; each responder holds
+    /// `0..n` for its own `n`. Returns the responders' first pages.
+    fn fixture(svc: &NetworkService, have: u64, responders: &[u64], cap: usize) -> Vec<reconcile::ReconcileResponse> {
+        let c = wallet();
+        setup_public_channel(&svc.storage, &c.addr);
+        let msgs: Vec<Vec<u8>> = (0..10).map(|i| chat(&c, T0 + i)).collect();
+        for m in &msgs[..have as usize] {
+            feed(&svc.router, m);
+        }
+        responders
+            .iter()
+            .map(|&n| {
+                let (r, s, d) = responder();
+                setup_public_channel(&s, &c.addr);
+                for m in &msgs[..n as usize] {
+                    feed(&r, m);
+                }
+                let p = page(&s, cap);
+                drop(d);
+                p
+            })
+            .collect()
+    }
+
+    fn open_comparison(
+        svc: &mut NetworkService,
+        candidates: Vec<(PeerId, reconcile::ReconcileResponse)>,
+        straggler: bool,
+        any_capped: bool,
+    ) -> Option<libp2p::request_response::OutboundRequestId> {
+        let mut outstanding = HashSet::new();
+        let mut straggler_id = None;
+        if straggler {
+            let id = svc.swarm.behaviour_mut().reconcile.send_request(
+                &PeerId::random(),
+                reconcile::ReconcileRequest {
+                    channel_id: CID,
+                    max_age_secs: 0,
+                    cursor: None,
+                    fingerprint: Vec::new(),
+                    epoch_root_known: None,
+                    round: 0,
+                },
+            );
+            outstanding.insert(id);
+            straggler_id = Some(id);
+        }
+        svc.reconcile_triggered.insert(CID);
+        svc.pending_reconcile_comparisons.insert(
+            CID,
+            ReconcileComparison {
+                outstanding,
+                candidates,
+                deadline: Instant::now(),
+                any_capped,
+            },
+        );
+        straggler_id
+    }
+
+    fn recheck_minutes(svc: &NetworkService) -> Option<u64> {
+        svc.reconcile_throttle
+            .entry(&CID)
+            .map(|e| e.next_due.saturating_duration_since(Instant::now()).as_secs() / 60)
+    }
+
+    #[tokio::test]
+    async fn all_in_sync_candidates_move_the_throttle_to_the_recheck_and_never_complete() {
+        let (mut svc, _d) = service().await;
+        let pages = fixture(&svc, 3, &[3, 3], 1_000);
+        svc.reconcile_throttle.on_dispatch(CID, Instant::now(), 0.0);
+        let (a, b) = (PeerId::random(), PeerId::random());
+        open_comparison(&mut svc, vec![(a, pages[0].clone()), (b, pages[1].clone())], false, false);
+        svc.finalize_reconcile_comparison(CID);
+        let m = recheck_minutes(&svc).expect("throttle entry");
+        assert!((47..=72).contains(&m), "in-sync recheck ≈ 60 min ± 20 %: {m}");
+        assert_eq!(svc.reconcile_throttle.entry(&CID).unwrap().failures, 0);
+        assert_eq!(svc.storage.channel_backfill_completed_at(CID), None, "IN_SYNC is never COMPLETE");
+        assert!(!svc.reconcile_triggered.contains(&CID), "dedup guard released");
+        assert_eq!(svc.counters.reconcile_in_sync_outcomes.load(Ordering::Relaxed), 1);
+        assert!(svc.peer_reconcile_health.is_empty(), "no winner: peer health untouched");
+    }
+
+    #[tokio::test]
+    async fn in_sync_negative_controls_keep_the_dispatch_backoff() {
+        // Each case: the dispatch stamp (30 s) must survive.
+        for case in ["straggler", "capped", "stale", "multi_page", "forged", "rejected"] {
+            let (mut svc, _d) = service().await;
+            let cap = if case == "multi_page" { 2 } else { 1_000 };
+            let mut pages = fixture(&svc, 3, &[3], cap);
+            let peer = PeerId::random();
+            match case {
+                "stale" => {
+                    svc.peer_reconcile_health.insert(
+                        peer,
+                        PeerReconcileHealth {
+                            consecutive_losses: svc.backfill_config.stale_peer_threshold,
+                            last_probed_at: None,
+                            last_touched: Instant::now(),
+                        },
+                    );
+                }
+                "forged" => {
+                    let mut e: Envelope = rmp_serde::from_slice(&pages[0].envelopes[0]).unwrap();
+                    e.signature = vec![0xAB; 64];
+                    pages[0].envelopes[0] = rmp_serde::to_vec_named(&e).unwrap();
+                }
+                "rejected" => pages[0].envelopes.push(vec![0xFF, 0x00]),
+                _ => {}
+            }
+            svc.reconcile_throttle.on_dispatch(CID, Instant::now(), 0.0);
+            open_comparison(&mut svc, vec![(peer, pages[0].clone())], case == "straggler", case == "capped");
+            svc.finalize_reconcile_comparison(CID);
+            let m = recheck_minutes(&svc).expect("throttle entry kept");
+            assert!(m < 1, "{case}: kept the 30 s dispatch backoff, got {m} min");
+            assert_eq!(svc.storage.channel_backfill_completed_at(CID), None, "{case}");
+            assert_eq!(svc.counters.reconcile_in_sync_outcomes.load(Ordering::Relaxed), 0, "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn ghost_with_a_verified_subset_cannot_hide_the_honest_peers_new_message() {
+        for ghost_first in [false, true] {
+            let (mut svc, _d) = service().await;
+            let mut pages = fixture(&svc, 3, &[3, 4], 1_000);
+            if ghost_first {
+                // Pad the ghost's page with repeats so it ranks first.
+                let extra = pages[0].envelopes.clone();
+                pages[0].envelopes.extend(extra.iter().cloned());
+                pages[0].envelopes.extend(extra);
+            }
+            svc.reconcile_throttle.on_dispatch(CID, Instant::now(), 0.0);
+            let (ghost, honest) = (PeerId::random(), PeerId::random());
+            open_comparison(&mut svc, vec![(ghost, pages[0].clone()), (honest, pages[1].clone())], false, false);
+            svc.finalize_reconcile_comparison(CID);
+            assert!(svc.storage.channel_backfill_completed_at(CID).is_some(), "honest peer won → COMPLETE");
+            assert!(svc.reconcile_throttle.entry(&CID).is_none(), "COMPLETE clears the throttle");
+            assert_eq!(svc.counters.reconcile_in_sync_outcomes.load(Ordering::Relaxed), 0);
+            let ghost_losses = svc.peer_reconcile_health.get(&ghost).map(|h| h.consecutive_losses);
+            assert_eq!(ghost_losses, if ghost_first { Some(1) } else { None }, "ghost_first={ghost_first}");
+        }
+    }
+
+    #[tokio::test]
+    async fn no_stamp_on_early_returns_and_the_gate_holds() {
+        let (mut svc, _d) = service().await;
+        let c = wallet();
+        setup_public_channel(&svc.storage, &c.addr);
+        // No connected peers → no candidates → no stamp.
+        svc.maybe_trigger_backfill(CID);
+        assert!(svc.reconcile_throttle.entry(&CID).is_none(), "no stamp without candidates");
+        assert!(!svc.reconcile_triggered.contains(&CID));
+        assert_eq!(svc.counters.reconcile_attempts_dispatched.load(Ordering::Relaxed), 0);
+        // A not-ready entry is left untouched by the gate.
+        svc.reconcile_throttle.on_dispatch(CID, Instant::now(), 0.0);
+        svc.maybe_trigger_backfill(CID);
+        assert_eq!(svc.reconcile_throttle.entry(&CID).unwrap().failures, 1);
+        assert!(!svc.reconcile_triggered.contains(&CID));
+
+        // Private channel: no claim, and (with a fresh claim) no candidates.
+        let pcid = (1u64 << 40) + 9;
+        svc.storage
+            .put_cf(schema::cf::CHANNELS, &pcid.to_be_bytes(), br#"{"channel_type":2,"history_visibility":1}"#)
+            .unwrap();
+        let w = wallet();
+        svc.maybe_trigger_private_channel_sync(pcid, &w.addr, None);
+        let key = (w.addr.clone(), pcid);
+        assert!(svc.private_channel_sync_throttle.entry(&key).is_none(), "no stamp without a claim");
+        let claim = private_channel_sync::WalletAuthClaim { timestamp: now_ms(), signature: vec![0; 64] };
+        svc.maybe_trigger_private_channel_sync(pcid, &w.addr, Some(claim));
+        assert!(svc.private_channel_sync_throttle.entry(&key).is_none(), "no stamp without candidates");
+        assert!(!svc.private_channel_sync_triggered.contains(&key));
+        assert_eq!(svc.counters.private_sync_attempts_dispatched.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn a_server_capped_answer_recorded_into_the_comparison_blocks_in_sync() {
+        for capped in [false, true] {
+            let (mut svc, _d) = service().await;
+            let pages = fixture(&svc, 3, &[3], 1_000);
+            svc.reconcile_throttle.on_dispatch(CID, Instant::now(), 0.0);
+            let id = open_comparison(&mut svc, vec![(PeerId::random(), pages[0].clone())], true, false)
+                .expect("straggler id");
+            // The last outstanding candidate answers: capped, or (control)
+            // uninformative-empty. Either way it finalizes the comparison.
+            let mut answer = reconcile::capped_response(&reconcile::ReconcileRequest {
+                channel_id: CID,
+                max_age_secs: 0,
+                cursor: None,
+                fingerprint: Vec::new(),
+                epoch_root_known: None,
+                round: 0,
+            });
+            answer.server_capped = capped;
+            svc.record_reconcile_comparison_response(CID, id, PeerId::random(), answer);
+            assert!(!svc.pending_reconcile_comparisons.contains_key(&CID), "finalized");
+            let in_sync = svc.counters.reconcile_in_sync_outcomes.load(Ordering::Relaxed);
+            assert_eq!(in_sync, if capped { 0 } else { 1 }, "capped={capped}");
+        }
+    }
+
+    /// Two unrelated services connected over loopback TCP, so the trigger
+    /// has a real candidate peer. Only the swarms are polled (no event
+    /// handling) — the connection itself is all the trigger needs.
+    async fn connected_pair() -> (NetworkService, TempDir, NetworkService, TempDir) {
+        let (mut a, da) = service().await;
+        let (mut b, db) = service().await;
+        let b_id = *b.swarm.local_peer_id();
+        let addr = loop {
+            if let SwarmEvent::NewListenAddr { address, .. } = b.swarm.select_next_some().await {
+                let s = address.to_string();
+                if s.starts_with("/ip4/127.0.0.1/tcp/") {
+                    break address;
+                }
+            }
+        };
+        a.swarm.dial(addr).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while !a.swarm.is_connected(&b_id) {
+            assert!(tokio::time::Instant::now() < deadline, "loopback connection timed out");
+            tokio::select! {
+                _ = a.swarm.select_next_some() => {}
+                _ = b.swarm.select_next_some() => {}
+            }
+        }
+        (a, da, b, db)
+    }
+
+    #[tokio::test]
+    async fn the_throttle_gate_holds_back_a_dispatch_to_a_real_candidate() {
+        let (mut a, _da, _b, _db) = connected_pair().await;
+        let c = wallet();
+        setup_public_channel(&a.storage, &c.addr);
+        // Gate closed: a not-ready entry → nothing is sent, entry untouched.
+        a.reconcile_throttle.on_dispatch(CID, Instant::now(), 0.0);
+        a.maybe_trigger_backfill(CID);
+        assert!(a.pending_reconcile_requests.is_empty(), "throttle gate must hold back the dispatch");
+        assert!(a.pending_reconcile_comparisons.is_empty());
+        assert_eq!(a.reconcile_throttle.entry(&CID).unwrap().failures, 1);
+        assert!(!a.reconcile_triggered.contains(&CID));
+        // Positive control: gate open (entry cleared) → dispatched + stamped.
+        a.reconcile_throttle.on_complete(&CID);
+        a.maybe_trigger_backfill(CID);
+        assert_eq!(a.pending_reconcile_requests.len(), 1, "dispatched to the connected peer");
+        assert_eq!(a.reconcile_throttle.entry(&CID).unwrap().failures, 1, "stamped at dispatch");
+        assert_eq!(a.counters.reconcile_attempts_dispatched.load(Ordering::Relaxed), 1);
+        // A second trigger right after is held back by the fresh stamp.
+        a.reconcile_triggered.clear();
+        a.pending_reconcile_requests.clear();
+        a.pending_reconcile_comparisons.clear();
+        a.maybe_trigger_backfill(CID);
+        assert!(a.pending_reconcile_requests.is_empty(), "fresh dispatch backoff holds");
+    }
+
+    #[tokio::test]
+    async fn the_private_gate_and_federate_floor_hold_back_redispatch() {
+        let (mut a, _da, _b, _db) = connected_pair().await;
+        let pcid = (1u64 << 40) + 9;
+        a.storage
+            .put_cf(schema::cf::CHANNELS, &pcid.to_be_bytes(), br#"{"channel_type":2,"history_visibility":1}"#)
+            .unwrap();
+        let w = wallet();
+        let key = (w.addr.clone(), pcid);
+        let claim = || private_channel_sync::WalletAuthClaim { timestamp: now_ms(), signature: vec![0; 64] };
+        let sent = |a: &NetworkService| a.pending_private_channel_sync_requests.len();
+        // First federate call: dispatched and stamped.
+        a.maybe_trigger_private_channel_sync(pcid, &w.addr, Some(claim()));
+        assert_eq!(sent(&a), 1);
+        assert_eq!(a.private_channel_sync_throttle.entry(&key).unwrap().failures, 1);
+        a.pending_private_channel_sync_requests.clear();
+        a.private_channel_sync_triggered.clear();
+        // A sweep (cached claim, no bypass) is held back by the gate…
+        a.maybe_trigger_private_channel_sync(pcid, &w.addr, None);
+        assert_eq!(sent(&a), 0, "throttle gate holds the sweep");
+        // …and so is a fresh federate call inside the 60 s floor.
+        a.maybe_trigger_private_channel_sync(pcid, &w.addr, Some(claim()));
+        assert_eq!(sent(&a), 0, "federate bypass refused inside the floor");
+        assert_eq!(a.private_channel_sync_throttle.entry(&key).unwrap().failures, 1);
+        // Positive control: once the stamp is 60 s old, a fresh federate
+        // call bypasses the (still not-ready) gate.
+        let mut e = a.private_channel_sync_throttle.entry(&key).unwrap();
+        e.last_dispatch = e.last_dispatch.and_then(|t| t.checked_sub(Duration::from_secs(61)));
+        a.private_channel_sync_throttle.set_entry_for_test(key.clone(), e);
+        a.maybe_trigger_private_channel_sync(pcid, &w.addr, None);
+        assert_eq!(sent(&a), 0, "sweep still held: the bypass needs a fresh claim");
+        a.maybe_trigger_private_channel_sync(pcid, &w.addr, Some(claim()));
+        assert_eq!(sent(&a), 1, "fresh federate claim past the floor bypasses");
+        assert_eq!(a.private_channel_sync_throttle.entry(&key).unwrap().failures, 2);
+    }
+
+    #[tokio::test]
+    async fn only_a_comparison_first_page_can_be_in_sync_evidence() {
+        let (mut svc, _d) = service().await;
+        let pages = fixture(&svc, 3, &[3], 1_000);
+        let peer = PeerId::random();
+        let pending = |pages_fetched| ReconcilePending {
+            peer_id: peer,
+            channel_id: CID,
+            pages_fetched,
+            consecutive_unproductive_pages: 0,
+            total_accepted: 0,
+        };
+        // Positive control: a comparison trial's first page.
+        let out = svc.apply_reconcile_response(pending(0), peer, pages[0].clone(), false);
+        assert!(matches!(out, ReconcileApplyOutcome::NoProgress { verified_in_sync: true }));
+        // The same page on the direct (continuation) path is not evidence.
+        svc.reconcile_triggered.insert(CID);
+        let out = svc.apply_reconcile_response(pending(3), peer, pages[0].clone(), true);
+        assert!(matches!(out, ReconcileApplyOutcome::NoProgress { verified_in_sync: false }));
+    }
+
+    #[tokio::test]
+    async fn accepted_but_incomplete_session_resets_the_backoff() {
+        let (mut svc, _d) = service().await;
+        let pages = fixture(&svc, 0, &[3], 2); // 2 new messages, has_more
+        assert!(pages[0].has_more);
+        for _ in 0..3 {
+            svc.reconcile_throttle.on_dispatch(CID, Instant::now(), 0.0);
+        }
+        assert_eq!(svc.reconcile_throttle.entry(&CID).unwrap().failures, 3);
+        let peer = PeerId::random();
+        svc.reconcile_triggered.insert(CID);
+        // The page that hits the page-count backstop admits new content.
+        let pending = ReconcilePending {
+            peer_id: peer,
+            channel_id: CID,
+            pages_fetched: MAX_PAGES_PER_SESSION - 1,
+            consecutive_unproductive_pages: 0,
+            total_accepted: 0,
+        };
+        let out = svc.apply_reconcile_response(pending, peer, pages[0].clone(), true);
+        assert!(matches!(out, ReconcileApplyOutcome::NoProgress { verified_in_sync: false }));
+        let e = svc.reconcile_throttle.entry(&CID).unwrap();
+        assert_eq!(e.failures, 0, "backoff reset");
+        assert!(e.next_due.saturating_duration_since(Instant::now()) <= budget::BASE_RETRY);
+        assert_eq!(svc.storage.channel_backfill_completed_at(CID), None);
+        // Negative control: the same backstop with NOTHING accepted keeps
+        // the dispatch backoff.
+        let (mut svc, _d) = service().await;
+        let pages = fixture(&svc, 3, &[3], 2); // all duplicates, has_more
+        for _ in 0..3 {
+            svc.reconcile_throttle.on_dispatch(CID, Instant::now(), 0.0);
+        }
+        svc.reconcile_triggered.insert(CID);
+        let pending = ReconcilePending {
+            peer_id: peer,
+            channel_id: CID,
+            pages_fetched: MAX_PAGES_PER_SESSION - 1,
+            consecutive_unproductive_pages: 0,
+            total_accepted: 0,
+        };
+        svc.apply_reconcile_response(pending, peer, pages[0].clone(), true);
+        assert_eq!(svc.reconcile_throttle.entry(&CID).unwrap().failures, 3);
+    }
+
+    #[test]
+    fn comparison_in_sync_conditions() {
+        let (a, b) = (PeerId::random(), PeerId::random());
+        let never_stale = |_: &PeerId| false;
+        assert!(comparison_in_sync(true, false, &[(a, true), (b, true)], never_stale));
+        // Negative controls, one condition each.
+        assert!(!comparison_in_sync(false, false, &[(a, true)], never_stale), "straggler");
+        assert!(!comparison_in_sync(true, true, &[(a, true)], never_stale), "a capped candidate");
+        assert!(!comparison_in_sync(true, false, &[], never_stale), "nobody tried");
+        assert!(!comparison_in_sync(true, false, &[(a, true), (b, false)], never_stale), "one trial unverified");
+        assert!(!comparison_in_sync(true, false, &[(a, true)], |p| *p == a), "sole in-sync peer is stale");
+        assert!(comparison_in_sync(true, false, &[(a, true), (b, true)], |p| *p == a), "one healthy in-sync peer");
+    }
+
+    #[test]
+    fn verified_in_sync_page_conditions() {
+        let clean = ReconcileTally { admitted: 3, verified_dups: 3, ..Default::default() };
+        assert!(clean.is_verified_in_sync_page(3, false));
+        assert!(!clean.is_verified_in_sync_page(3, true), "has_more");
+        assert!(!clean.is_verified_in_sync_page(4, false), "an envelope not verified");
+        assert!(!ReconcileTally::default().is_verified_in_sync_page(0, false), "empty page");
+        assert!(!ReconcileTally { tainted: true, ..clean }.is_verified_in_sync_page(3, false), "tainted");
+        assert!(!ReconcileTally { newly_accepted: 1, ..clean }.is_verified_in_sync_page(3, false), "new content");
+    }
+
+    #[test]
+    fn duplicate_is_verified_compares_stored_bytes() {
+        let (r, s, _d) = responder();
+        let c = wallet();
+        setup_public_channel(&s, &c.addr);
+        let m = chat(&c, T0);
+        feed(&r, &m);
+        assert!(duplicate_is_verified(&s, &m), "identical bytes");
+        // Same msg_id, different bytes (forged signature) → false.
+        let mut e: Envelope = rmp_serde::from_slice(&m).unwrap();
+        e.signature = vec![0xAB; 64];
+        let forged = rmp_serde::to_vec_named(&e).unwrap();
+        assert!(matches!(r.process_synced_message(&forged), RouteResult::Duplicate), "router says Duplicate");
+        assert!(!duplicate_is_verified(&s, &forged), "forged duplicate");
+        // Missing and undecodable.
+        assert!(!duplicate_is_verified(&s, &chat(&c, T0 + 1)), "not stored");
+        assert!(!duplicate_is_verified(&s, &[0xFF, 0x00, 0x01]), "undecodable");
     }
 }

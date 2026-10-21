@@ -68,19 +68,29 @@
 //!   - Per peer: max 4 concurrent requests across all channels —
 //!     stops a single peer from monopolising the responder.
 //!
+//! Plus a rolling-window work budget per `(peer, channel)` (l2-node
+//! 0.141.0, `budget::Gcra`): `[backfill] total_envelopes_cap` units of
+//! burst, refilled at `[backfill] total_envelopes_refill_per_hour`, charged
+//! with `budget_charge` after each build. Before 0.141.0 this was a
+//! LIFETIME counter that only reset when the responder restarted.
+//!
 //! Excess requests get a response with `server_capped = true` and
 //! empty envelopes. The requester ends that session there (there is no
 //! in-session retry); the channel is tried again by a later backfill
-//! sweep, from the first page. The per-peer/per-channel limits never
+//! sweep, from the first page, once its attempt throttle allows
+//! (`budget::AttemptThrottle` — a refused attempt backs off). The per-peer/per-channel limits never
 //! queue or block. Only the node-wide build-slot bound lets a
 //! CONTINUATION page (cursor present) wait briefly for a slot instead of
 //! being refused (round-5 C-W1, `network::MAX_CONCURRENT_RESPONDER_BUILDS`).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
+
+use crate::network::budget::{BudgetMap, Gcra, Refusal};
 
 use crate::messages::envelope::Envelope;
 use crate::messages::types::MessageType;
@@ -178,62 +188,80 @@ pub struct ReconcileCursor {
     pub after_msg_id: [u8; 32],
 }
 
+/// Hard cap on `(peer, channel)` keys tracked by one responder's rolling
+/// budget (l2-node 0.141.0). The key includes a requester-chosen
+/// `channel_id` (an unknown channel still charges 1 unit), so the map must
+/// be bounded: past the cap NEW keys are refused (`server_capped`) until a
+/// prune frees room — see `budget::BudgetMap`.
+pub const MAX_TRACKED_BUDGET_KEYS: usize = 200_000;
+
 /// Server-side rate-limit state. One instance per `NetworkService`,
 /// keyed internally by `(peer_id, channel_id)` and `peer_id`.
 ///
 /// Uses `std::sync::Mutex` not tokio's because the critical section
-/// is sub-microsecond (increment / decrement counters) and the
-/// handler is on the swarm task — no `.await` while holding.
-#[derive(Debug, Default)]
+/// is short (counter updates, one map lookup; a prune walks at most
+/// `MAX_TRACKED_BUDGET_KEYS` entries every 30 s) and nothing awaits
+/// while holding it.
+#[derive(Debug)]
 pub struct ResponderLimits {
     inner: Mutex<ResponderLimitsInner>,
 }
 
-#[derive(Debug, Default)]
+impl Default for ResponderLimits {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::new(ResponderLimitsInner {
+                per_peer: HashMap::new(),
+                per_pair: HashMap::new(),
+                budget: BudgetMap::new(MAX_TRACKED_BUDGET_KEYS),
+            }),
+        }
+    }
+}
+
+#[derive(Debug)]
 struct ResponderLimitsInner {
     /// `peer_id` → number of active requests across all channels.
     per_peer: HashMap<libp2p::PeerId, usize>,
     /// `(peer_id, channel_id)` → number of active requests on that
     /// specific channel.
     per_pair: HashMap<(libp2p::PeerId, u64), usize>,
-    /// `(peer_id, channel_id)` → cumulative envelopes served across
-    /// all paginated requests in this process's lifetime. Used to
-    /// enforce `[backfill] total_envelopes_cap` per session
-    /// (Security Audit C2, 0.47.0). Per-process state — resets on
-    /// restart. A legitimate peer that genuinely needs to
-    /// re-backfill (e.g. after operator wiped the local db)
-    /// regains access after we restart, which is acceptable
-    /// behaviour for the threat surface.
-    served: HashMap<(libp2p::PeerId, u64), u64>,
+    /// `(peer_id, channel_id)` → rolling-window budget state (l2-node
+    /// 0.141.0; Security Audit C2, 0.47.0, introduced the budget as a
+    /// lifetime counter). Charged with `budget_charge` after each build;
+    /// refills at the configured rate (`[backfill]
+    /// total_envelopes_refill_per_hour`) up to the burst (`[backfill]
+    /// total_envelopes_cap`). Bounded (`MAX_TRACKED_BUDGET_KEYS`) and
+    /// pruned on the 30 s tick — only full buckets are dropped.
+    budget: BudgetMap<(libp2p::PeerId, u64)>,
 }
 
 impl ResponderLimits {
-    /// Try to reserve a slot. Returns the `Guard` on success;
-    /// returns `None` when either cap is exhausted — caller should
-    /// respond with `server_capped = true` and empty envelopes.
+    /// Try to reserve a slot. Returns the `Guard` on success, or the
+    /// reason for the refusal — caller responds with `server_capped =
+    /// true` and empty envelopes. Refusals are never charged.
     pub fn try_acquire(
         self: &Arc<Self>,
         peer: libp2p::PeerId,
         channel: u64,
         max_per_peer: usize,
         max_per_channel: usize,
-        total_envelopes_cap: u64,
-    ) -> Option<ResponderGuard> {
-        let mut inner = self.inner.lock().ok()?;
-        // Security Audit C2 (0.47.0): refuse if this (peer, channel)
-        // session has already received `total_envelopes_cap`
-        // envelopes — stops a malicious requester from inducing an
-        // unbounded scan via repeated cursor paging.
-        let served = inner.served.get(&(peer, channel)).copied().unwrap_or(0);
-        if served >= total_envelopes_cap {
-            return None;
-        }
+        budget: &Gcra,
+        now: Instant,
+    ) -> Result<ResponderGuard, Refusal> {
+        // A poisoned lock is treated like a busy slot (fail closed).
+        let mut inner = self.inner.lock().map_err(|_| Refusal::Concurrency)?;
+        // Security Audit C2 (0.47.0) / 0.141.0: refuse while this
+        // (peer, channel)'s rolling budget is spent — stops a malicious
+        // requester from inducing an unbounded scan via repeated paging,
+        // without locking an honest peer out until restart.
+        inner.budget.admit(&(peer, channel), budget, now)?;
         // Read both counts without holding entry()-mutable borrows,
         // so we can release the per_peer borrow before reaching for
         // per_pair (borrow checker — both maps live in `inner`).
         let pp_current = inner.per_peer.get(&peer).copied().unwrap_or(0);
         if pp_current >= max_per_peer {
-            return None;
+            return Err(Refusal::Concurrency);
         }
         let pc_current = inner
             .per_pair
@@ -241,25 +269,36 @@ impl ResponderLimits {
             .copied()
             .unwrap_or(0);
         if pc_current >= max_per_channel {
-            return None;
+            return Err(Refusal::Concurrency);
         }
         inner.per_peer.insert(peer, pp_current + 1);
         inner.per_pair.insert((peer, channel), pc_current + 1);
-        Some(ResponderGuard {
+        Ok(ResponderGuard {
             limits: Arc::clone(self),
             peer,
             channel,
         })
     }
 
-    /// Record envelopes served toward the (peer, channel) session
-    /// cap. Called after a successful `build_response` produced
-    /// `count` envelopes.
-    pub fn add_served(&self, peer: libp2p::PeerId, channel: u64, count: u64) {
+    /// Charge `units` (`budget_charge`) to the (peer, channel) budget.
+    /// Called after a successful build, before the response is queued, so
+    /// the peer's next request already sees it.
+    pub fn charge(&self, peer: libp2p::PeerId, channel: u64, units: u64, budget: &Gcra, now: Instant) {
         if let Ok(mut inner) = self.inner.lock() {
-            let e = inner.served.entry((peer, channel)).or_insert(0);
-            *e = e.saturating_add(count);
+            inner.budget.charge((peer, channel), units, budget, now);
         }
+    }
+
+    /// Drop every budget entry whose bucket is full again (never one in
+    /// debt). Run on the 30 s tick. Returns how many were removed.
+    pub fn prune(&self, now: Instant) -> usize {
+        self.inner.lock().map(|mut inner| inner.budget.prune(now)).unwrap_or(0)
+    }
+
+    /// Number of tracked budget keys (tests).
+    #[cfg(test)]
+    pub fn budget_len(&self) -> usize {
+        self.inner.lock().map(|inner| inner.budget.len()).unwrap_or(0)
     }
 }
 
@@ -1933,21 +1972,27 @@ mod tests {
         );
     }
 
+    /// A budget large enough to never bite (concurrency tests).
+    fn unlimited() -> Gcra {
+        Gcra::new(u64::MAX / 4, u64::MAX / 4)
+    }
+
     #[test]
     fn responder_limits_enforce_per_pair_cap() {
         let limits = Arc::new(ResponderLimits::default());
         let peer = fake_peer();
+        let now = Instant::now();
         let g1 = limits
-            .try_acquire(peer, 42, 4, 1, u64::MAX)
+            .try_acquire(peer, 42, 4, 1, &unlimited(), now)
             .expect("first acquire must succeed");
-        let g2 = limits.try_acquire(peer, 42, 4, 1, u64::MAX);
+        let g2 = limits.try_acquire(peer, 42, 4, 1, &unlimited(), now);
         assert!(
-            g2.is_none(),
+            matches!(g2, Err(Refusal::Concurrency)),
             "per-pair cap = 1 must reject second concurrent request"
         );
         drop(g1);
         let g3 = limits
-            .try_acquire(peer, 42, 4, 1, u64::MAX)
+            .try_acquire(peer, 42, 4, 1, &unlimited(), now)
             .expect("after drop, slot is free again");
         drop(g3);
     }
@@ -1956,15 +2001,17 @@ mod tests {
     fn responder_limits_enforce_per_peer_cap() {
         let limits = Arc::new(ResponderLimits::default());
         let peer = fake_peer();
+        let now = Instant::now();
+        let b = unlimited();
         // Four distinct channels under a per_peer cap of 4 + per_pair
         // cap of 1 — all four succeed.
-        let _g1 = limits.try_acquire(peer, 1, 4, 1, u64::MAX).expect("ch1");
-        let _g2 = limits.try_acquire(peer, 2, 4, 1, u64::MAX).expect("ch2");
-        let _g3 = limits.try_acquire(peer, 3, 4, 1, u64::MAX).expect("ch3");
-        let _g4 = limits.try_acquire(peer, 4, 4, 1, u64::MAX).expect("ch4");
+        let _g1 = limits.try_acquire(peer, 1, 4, 1, &b, now).expect("ch1");
+        let _g2 = limits.try_acquire(peer, 2, 4, 1, &b, now).expect("ch2");
+        let _g3 = limits.try_acquire(peer, 3, 4, 1, &b, now).expect("ch3");
+        let _g4 = limits.try_acquire(peer, 4, 4, 1, &b, now).expect("ch4");
         // Fifth channel is denied by the per-peer cap.
-        let g5 = limits.try_acquire(peer, 5, 4, 1, u64::MAX);
-        assert!(g5.is_none(), "per-peer cap = 4 must reject 5th channel");
+        let g5 = limits.try_acquire(peer, 5, 4, 1, &b, now);
+        assert!(g5.is_err(), "per-peer cap = 4 must reject 5th channel");
     }
 
     #[test]
@@ -1972,59 +2019,89 @@ mod tests {
         let limits = Arc::new(ResponderLimits::default());
         let alice = fake_peer();
         let bob = fake_peer();
+        let now = Instant::now();
         let _g1 = limits
-            .try_acquire(alice, 1, 1, 1, u64::MAX)
+            .try_acquire(alice, 1, 1, 1, &unlimited(), now)
             .expect("alice first");
         // Bob has his own per-peer budget.
-        let g2 = limits.try_acquire(bob, 1, 1, 1, u64::MAX);
+        let g2 = limits.try_acquire(bob, 1, 1, 1, &unlimited(), now);
         assert!(
-            g2.is_some(),
+            g2.is_ok(),
             "per-peer caps must NOT interfere across peers"
         );
     }
 
     #[test]
-    fn responder_limits_enforce_total_envelopes_cap() {
-        // Security Audit C2 (0.47.0): the cumulative envelopes-served
-        // per (peer, channel) is bounded by `total_envelopes_cap`
-        // across all paginated requests in this process, regardless
-        // of how the peer paces them.
+    fn responder_limits_enforce_the_rolling_budget_and_refill_it() {
+        // Security Audit C2 (0.47.0) + 0.141.0: the work served per
+        // (peer, channel) is bounded by the burst (`total_envelopes_cap`)
+        // regardless of how the peer paces its pages — but the budget
+        // REFILLS (here 3,600/h = 1 unit/s) instead of lasting until the
+        // responder restarts.
         let limits = Arc::new(ResponderLimits::default());
         let peer = fake_peer();
+        let budget = Gcra::new(100, 3_600);
+        let t0 = Instant::now();
         let g1 = limits
-            .try_acquire(peer, 7, 4, 1, 100)
+            .try_acquire(peer, 7, 4, 1, &budget, t0)
             .expect("first request must succeed");
-        limits.add_served(peer, 7, 50);
+        limits.charge(peer, 7, 50, &budget, t0);
         drop(g1);
-        // Second request — cumulative 50 < cap 100 — still succeeds,
-        // serves another 60. Cumulative jumps to 110, over the cap.
+        // 50 < 100 spent: the second request still succeeds, serves 60.
         let g2 = limits
-            .try_acquire(peer, 7, 4, 1, 100)
-            .expect("served 50 < cap 100, second request must succeed");
-        limits.add_served(peer, 7, 60);
+            .try_acquire(peer, 7, 4, 1, &budget, t0)
+            .expect("50 of 100 spent, second request must succeed");
+        limits.charge(peer, 7, 60, &budget, t0);
         drop(g2);
-        // Third request — cumulative 110 >= cap 100 — must be denied.
-        let g3 = limits.try_acquire(peer, 7, 4, 1, 100);
-        assert!(
-            g3.is_none(),
-            "served 110 >= cap 100 must refuse subsequent requests"
-        );
+        // 110 >= 100: refused…
+        let g3 = limits.try_acquire(peer, 7, 4, 1, &budget, t0);
+        assert!(matches!(g3, Err(Refusal::OverBudget)), "spent budget must refuse");
+        // …still refused 5 s later (debt 105 s), admitted once 11 units
+        // refilled (debt 99 s < tolerance 100 s).
+        assert!(limits.try_acquire(peer, 7, 4, 1, &budget, t0 + std::time::Duration::from_secs(5)).is_err());
+        assert!(limits.try_acquire(peer, 7, 4, 1, &budget, t0 + std::time::Duration::from_secs(11)).is_ok());
     }
 
     #[test]
-    fn responder_limits_per_pair_served_isolated() {
-        // The cumulative-envelopes cap is per (peer, channel) — a
-        // peer that exhausted channel A's budget can still backfill
-        // channel B.
+    fn responder_limits_per_pair_budget_isolated() {
+        // The budget is per (peer, channel) — a peer that exhausted
+        // channel A's budget can still backfill channel B.
         let limits = Arc::new(ResponderLimits::default());
         let peer = fake_peer();
-        limits.add_served(peer, 1, 200);
-        let g_a = limits.try_acquire(peer, 1, 4, 1, 100);
-        assert!(g_a.is_none(), "channel 1 exhausted");
+        let budget = Gcra::new(100, 1);
+        let now = Instant::now();
+        limits.charge(peer, 1, 200, &budget, now);
+        let g_a = limits.try_acquire(peer, 1, 4, 1, &budget, now);
+        assert!(g_a.is_err(), "channel 1 exhausted");
         let g_b = limits
-            .try_acquire(peer, 2, 4, 1, 100)
+            .try_acquire(peer, 2, 4, 1, &budget, now)
             .expect("channel 2 untouched");
         drop(g_b);
+    }
+
+    #[test]
+    fn responder_budget_map_is_bounded_and_pruned() {
+        // The key includes a requester-chosen channel_id: spraying ids is
+        // bounded by MAX_TRACKED_BUDGET_KEYS (new keys refused, existing
+        // ones unaffected) and cleared by the prune once refilled.
+        let limits = Arc::new(ResponderLimits::default());
+        let peer = fake_peer();
+        let budget = Gcra::new(200_000, 10_000);
+        let now = Instant::now();
+        limits.charge(peer, 0, 150_000, &budget, now); // a real key, in debt
+        for cid in 1..MAX_TRACKED_BUDGET_KEYS as u64 {
+            limits.charge(peer, cid, 1, &budget, now);
+        }
+        assert_eq!(limits.budget_len(), MAX_TRACKED_BUDGET_KEYS);
+        assert!(matches!(
+            limits.try_acquire(peer, u64::MAX, 4, 1, &budget, now),
+            Err(Refusal::MapFull)
+        ));
+        assert!(limits.try_acquire(peer, 0, 4, 1, &budget, now).is_ok(), "existing key unaffected");
+        let later = now + std::time::Duration::from_secs(5);
+        assert_eq!(limits.prune(later), MAX_TRACKED_BUDGET_KEYS - 1, "only refilled buckets dropped");
+        assert_eq!(limits.budget_len(), 1, "the key in debt survives");
+        assert!(limits.try_acquire(peer, u64::MAX, 4, 1, &budget, later).is_ok());
     }
 
     #[test]

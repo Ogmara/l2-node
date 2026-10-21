@@ -589,12 +589,34 @@ pub struct BackfillConfig {
     /// `has_more = false`.
     #[serde(default = "default_backfill_max_envelopes_per_response")]
     pub max_envelopes_per_response: usize,
-    /// Server-side: hard ceiling on total envelopes served per single
-    /// reconciliation pair (per client request stream). Default
-    /// 200_000 = enough for a year of an active channel; stops a
-    /// malicious client from inducing an unbounded scan.
+    /// Server-side: BURST of the rolling work budget per `(peer, channel)`
+    /// (default 200_000 units; one unit ≈ one envelope sent or index row
+    /// examined). **Meaning changed in l2-node 0.141.0** (name kept for
+    /// config compatibility): it used to be a LIFETIME ceiling that only
+    /// reset when this node restarted; it is now the bucket size of a
+    /// rolling window refilled at `total_envelopes_refill_per_hour`. Still
+    /// stops a malicious client from inducing an unbounded scan.
     #[serde(default = "default_backfill_total_envelopes_cap")]
     pub total_envelopes_cap: usize,
+    /// Server-side: refill rate of the per-`(peer, channel)` rolling budget
+    /// above, in units per hour (default 10_000; l2-node 0.141.0). A peer
+    /// that spent the whole burst is served again as the budget refills,
+    /// instead of being answered `server_capped` until restart.
+    #[serde(default = "default_backfill_total_envelopes_refill_per_hour")]
+    pub total_envelopes_refill_per_hour: u64,
+    /// Requester: after a reconcile comparison proved the channel IN SYNC
+    /// (every candidate answered with a first page of byte-verified
+    /// duplicates — a throttle state, never a completion), wait this many
+    /// minutes (±20 % jitter) before trying the channel again (default 60;
+    /// l2-node 0.141.0). In memory only.
+    #[serde(default = "default_backfill_in_sync_recheck_minutes")]
+    pub in_sync_recheck_minutes: u64,
+    /// Requester: cap of the exponential backoff (30 s, 60 s, 120 s, …)
+    /// between attempts on a channel whose attempts keep failing (no
+    /// candidates answering, `server_capped`, nothing verifiable), in
+    /// minutes (default 30; l2-node 0.141.0). In memory only.
+    #[serde(default = "default_backfill_retry_backoff_max_minutes")]
+    pub retry_backoff_max_minutes: u64,
     /// Global-news backfill window in days (P-3, l2-node 0.52.0+). A fresh
     /// node with an empty NEWS_FEED pulls only the last `news_max_age_days` of
     /// news (default 7) — never years of history. `0` = unlimited (archive
@@ -649,6 +671,9 @@ impl Default for BackfillConfig {
             max_envelopes_per_response:
                 default_backfill_max_envelopes_per_response(),
             total_envelopes_cap: default_backfill_total_envelopes_cap(),
+            total_envelopes_refill_per_hour: default_backfill_total_envelopes_refill_per_hour(),
+            in_sync_recheck_minutes: default_backfill_in_sync_recheck_minutes(),
+            retry_backoff_max_minutes: default_backfill_retry_backoff_max_minutes(),
             stale_peer_threshold: default_backfill_stale_peer_threshold(),
             stale_peer_reprobe_hours: default_backfill_stale_peer_reprobe_hours(),
             news_max_age_days: default_backfill_news_max_age_days(),
@@ -681,6 +706,15 @@ fn default_backfill_max_envelopes_per_response() -> usize {
 }
 fn default_backfill_total_envelopes_cap() -> usize {
     200_000
+}
+fn default_backfill_total_envelopes_refill_per_hour() -> u64 {
+    10_000
+}
+fn default_backfill_in_sync_recheck_minutes() -> u64 {
+    60
+}
+fn default_backfill_retry_backoff_max_minutes() -> u64 {
+    30
 }
 fn default_backfill_channel_catchup_interval_hours() -> u64 {
     6
@@ -725,6 +759,28 @@ pub struct PrivateChannelSyncConfig {
     /// of how many channels have been federated locally.
     #[serde(default = "default_private_channel_sync_catchup_batch_size")]
     pub catchup_batch_size: usize,
+    /// Responder: burst of the rolling work budget per requesting PEER
+    /// (all channels and wallets together), in units (≈ envelopes sent or
+    /// rows examined). Default 20_000 (l2-node 0.141.0; replaces the
+    /// former fixed per-process lifetime cap of 20,000).
+    #[serde(default = "default_private_channel_sync_responder_budget_burst")]
+    pub responder_budget_burst: u64,
+    /// Responder: refill rate of that budget, in units per hour (default
+    /// 5_000; l2-node 0.141.0).
+    #[serde(default = "default_private_channel_sync_responder_budget_refill_per_hour")]
+    pub responder_budget_refill_per_hour: u64,
+    /// Requester: after a session proved a `(wallet, channel)` pair IN
+    /// SYNC (nothing new, every envelope a byte-verified duplicate — a
+    /// throttle state, never a completion), wait this many minutes (±20 %
+    /// jitter) before trying it again (default 60; l2-node 0.141.0).
+    #[serde(default = "default_private_channel_sync_in_sync_recheck_minutes")]
+    pub in_sync_recheck_minutes: u64,
+    /// Requester: cap of the exponential backoff between failing attempts
+    /// on a pair, in minutes (default 30; l2-node 0.141.0). A federate call
+    /// carrying a fresh wallet claim may bypass the throttle once the last
+    /// attempt is at least 60 s old.
+    #[serde(default = "default_private_channel_sync_retry_backoff_max_minutes")]
+    pub retry_backoff_max_minutes: u64,
 }
 
 impl Default for PrivateChannelSyncConfig {
@@ -735,6 +791,11 @@ impl Default for PrivateChannelSyncConfig {
             channel_catchup_interval_hours:
                 default_private_channel_sync_channel_catchup_interval_hours(),
             catchup_batch_size: default_private_channel_sync_catchup_batch_size(),
+            responder_budget_burst: default_private_channel_sync_responder_budget_burst(),
+            responder_budget_refill_per_hour:
+                default_private_channel_sync_responder_budget_refill_per_hour(),
+            in_sync_recheck_minutes: default_private_channel_sync_in_sync_recheck_minutes(),
+            retry_backoff_max_minutes: default_private_channel_sync_retry_backoff_max_minutes(),
         }
     }
 }
@@ -747,6 +808,89 @@ fn default_private_channel_sync_channel_catchup_interval_hours() -> u64 {
 }
 fn default_private_channel_sync_catchup_batch_size() -> usize {
     25
+}
+fn default_private_channel_sync_responder_budget_burst() -> u64 {
+    20_000
+}
+fn default_private_channel_sync_responder_budget_refill_per_hour() -> u64 {
+    5_000
+}
+fn default_private_channel_sync_in_sync_recheck_minutes() -> u64 {
+    60
+}
+fn default_private_channel_sync_retry_backoff_max_minutes() -> u64 {
+    30
+}
+
+/// Ceilings for the l2-node 0.141.0 rolling responder budgets and the
+/// requester attempt throttle (`Config::validate`).
+const MAX_BUDGET_BURST: u64 = 100_000_000;
+const MAX_BUDGET_REFILL_PER_HOUR: u64 = 1_000_000_000;
+/// A full burst must refill within a year (longer is a lifetime cap in
+/// disguise — the behaviour 0.141.0 removed).
+const MAX_BUDGET_FULL_REFILL_HOURS: u64 = 365 * 24;
+const MAX_IN_SYNC_RECHECK_MINUTES: u64 = 7 * 24 * 60;
+const MAX_RETRY_BACKOFF_MAX_MINUTES: u64 = 24 * 60;
+/// Rough upper bound of one public reconcile page's budget charge beyond
+/// its chat rows: metadata ride-along (≤ 256 rows + per-type seeks) and the
+/// edit/delete ride-along (≤ 2,000 markers + probe). Only drives a warning.
+const RECONCILE_RIDE_ALONG_CHARGE_ESTIMATE: u64 = 2_300;
+/// Rough upper bound of one private-channel-sync page's budget charge
+/// (200-envelope pages plus metadata / ride-along work). Only drives a
+/// warning.
+const PRIVATE_SYNC_PAGE_CHARGE_ESTIMATE: u64 = 800;
+
+/// Validate one rolling budget + throttle block (l2-node 0.141.0). HARD
+/// rejects values that break the runtime (zero, absurd ceilings, a refill
+/// slower than a year); only WARNS (`eprintln!`, tracing is not up yet)
+/// when the burst is smaller than one page's charge — that still works,
+/// it just serves at most about one page per refill interval.
+#[allow(clippy::too_many_arguments)]
+fn validate_budget_block(
+    section: &str,
+    burst_key: &str,
+    burst: u64,
+    refill_key: &str,
+    refill_per_hour: u64,
+    in_sync_recheck_minutes: u64,
+    retry_backoff_max_minutes: u64,
+    page_charge_estimate: u64,
+) -> Result<()> {
+    if burst == 0 || burst > MAX_BUDGET_BURST {
+        anyhow::bail!("{section}.{burst_key} = {burst} must be in 1..={MAX_BUDGET_BURST}");
+    }
+    if refill_per_hour == 0 || refill_per_hour > MAX_BUDGET_REFILL_PER_HOUR {
+        anyhow::bail!(
+            "{section}.{refill_key} = {refill_per_hour} must be in 1..={MAX_BUDGET_REFILL_PER_HOUR}"
+        );
+    }
+    if burst / refill_per_hour > MAX_BUDGET_FULL_REFILL_HOURS {
+        anyhow::bail!(
+            "{section}.{burst_key} / {section}.{refill_key} = {} h exceeds {MAX_BUDGET_FULL_REFILL_HOURS} h \
+             (a full burst must refill within a year)",
+            burst / refill_per_hour
+        );
+    }
+    if in_sync_recheck_minutes == 0 || in_sync_recheck_minutes > MAX_IN_SYNC_RECHECK_MINUTES {
+        anyhow::bail!(
+            "{section}.in_sync_recheck_minutes = {in_sync_recheck_minutes} must be in \
+             1..={MAX_IN_SYNC_RECHECK_MINUTES}"
+        );
+    }
+    if retry_backoff_max_minutes == 0 || retry_backoff_max_minutes > MAX_RETRY_BACKOFF_MAX_MINUTES {
+        anyhow::bail!(
+            "{section}.retry_backoff_max_minutes = {retry_backoff_max_minutes} must be in \
+             1..={MAX_RETRY_BACKOFF_MAX_MINUTES}"
+        );
+    }
+    if burst < page_charge_estimate {
+        eprintln!(
+            "WARNING: {section}.{burst_key} = {burst} is below one page's estimated budget \
+             charge (~{page_charge_estimate}); peers will be served about one page per \
+             refill interval"
+        );
+    }
+    Ok(())
 }
 
 /// Direct-message offline store-and-forward policy (spec 3
@@ -2959,7 +3103,36 @@ impl Config {
                     MAX_CATCHUP_BATCH_SIZE
                 );
             }
+            // l2-node 0.141.0: rolling responder budget + requester
+            // attempt throttle. Inside `enabled` like every other
+            // `[backfill]` check (a disabled section may carry zeros — an
+            // existing, tested contract); `budget::Gcra::new` clamps a 0
+            // burst/refill to 1 so such a config cannot divide by zero.
+            validate_budget_block(
+                "backfill",
+                "total_envelopes_cap",
+                u64::try_from(self.backfill.total_envelopes_cap).unwrap_or(u64::MAX),
+                "total_envelopes_refill_per_hour",
+                self.backfill.total_envelopes_refill_per_hour,
+                self.backfill.in_sync_recheck_minutes,
+                self.backfill.retry_backoff_max_minutes,
+                (self.backfill.max_envelopes_per_response as u64)
+                    .saturating_add(RECONCILE_RIDE_ALONG_CHARGE_ESTIMATE),
+            )?;
         }
+        // `[private_channel_sync]` budget + throttle (l2-node 0.141.0) —
+        // validated regardless of `enabled`: the responder side serves
+        // peers even when this node's own private sync is off.
+        validate_budget_block(
+            "private_channel_sync",
+            "responder_budget_burst",
+            self.private_channel_sync.responder_budget_burst,
+            "responder_budget_refill_per_hour",
+            self.private_channel_sync.responder_budget_refill_per_hour,
+            self.private_channel_sync.in_sync_recheck_minutes,
+            self.private_channel_sync.retry_backoff_max_minutes,
+            PRIVATE_SYNC_PAGE_CHARGE_ESTIMATE,
+        )?;
         // Spec 13 §6.4 (l2-node 0.46.9+) — onion-transport surface.
         // We only check the operator-controlled inputs here; the
         // SOCKS5 dialer module enforces the runtime properties (DNS
@@ -3827,10 +4000,20 @@ server_max_concurrent_per_channel = 1
 # bigger cap — clients page via the cursor — but smaller batches
 # cut worst-case latency.
 max_envelopes_per_response = 1000
-# Hard ceiling on total envelopes served per single client stream.
-# 200k = roughly one year of an active channel; stops a malicious
+# Rolling work budget per (peer, channel), in units (~ one envelope
+# sent or index row examined). Since l2-node 0.141.0 this is the BURST
+# of a budget that refills at total_envelopes_refill_per_hour (before,
+# it was a lifetime cap that only reset on restart). Stops a malicious
 # client from inducing an unbounded scan.
 total_envelopes_cap = 200000
+# Refill rate of that budget, units per hour.
+total_envelopes_refill_per_hour = 10000
+# Requester: minutes to wait (+/-20% jitter) before re-checking a channel
+# that every peer proved in sync (nothing new; never marked complete).
+in_sync_recheck_minutes = 60
+# Requester: cap (minutes) of the exponential backoff between failing
+# attempts on one channel (30s, 60s, 120s, ...).
+retry_backoff_max_minutes = 30
 # How often (hours) to re-check a channel whose backfill already
 # completed. 0 disables re-checking completed channels (a
 # never-completed channel is always retried regardless).
@@ -3864,6 +4047,15 @@ channel_catchup_interval_hours = 6
 # 30s). Bounds the sweep's cost to a fixed batch regardless of how many
 # channels have been federated locally.
 catchup_batch_size = 25
+# Responder: rolling work budget per requesting peer (all channels and
+# wallets together): burst in units, refilled per hour.
+responder_budget_burst = 20000
+responder_budget_refill_per_hour = 5000
+# Requester: minutes to wait (+/-20% jitter) before re-checking a
+# (wallet, channel) pair proven in sync, and the backoff cap (minutes)
+# between failing attempts.
+in_sync_recheck_minutes = 60
+retry_backoff_max_minutes = 30
 
 [api]
 # Set to "0.0.0.0" to accept connections from all interfaces
@@ -4660,6 +4852,97 @@ mod tests {
     }
 
     // --- 0.47.0 channel-history backfill (spec 1) -------------------
+
+    // --- 0.141.0 rolling budgets + attempt throttle -------------------
+
+    #[test]
+    fn validate_passes_default_budget_and_throttle_keys() {
+        let c = baseline_config();
+        assert_eq!(c.backfill.total_envelopes_cap, 200_000);
+        assert_eq!(c.backfill.total_envelopes_refill_per_hour, 10_000);
+        assert_eq!(c.backfill.in_sync_recheck_minutes, 60);
+        assert_eq!(c.backfill.retry_backoff_max_minutes, 30);
+        assert_eq!(c.private_channel_sync.responder_budget_burst, 20_000);
+        assert_eq!(c.private_channel_sync.responder_budget_refill_per_hour, 5_000);
+        assert_eq!(c.private_channel_sync.in_sync_recheck_minutes, 60);
+        assert_eq!(c.private_channel_sync.retry_backoff_max_minutes, 30);
+        let mut c = c;
+        c.validate().expect("defaults validate");
+        // A pre-0.141 config without the new keys gets the same defaults.
+        let old: Config = toml::from_str(
+            &Config::default_toml()
+                .lines()
+                .filter(|l| {
+                    !l.starts_with("total_envelopes_refill_per_hour")
+                        && !l.starts_with("in_sync_recheck_minutes")
+                        && !l.starts_with("retry_backoff_max_minutes")
+                        && !l.starts_with("responder_budget_")
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        assert_eq!(old.backfill.total_envelopes_refill_per_hour, 10_000);
+        assert_eq!(old.private_channel_sync.responder_budget_burst, 20_000);
+    }
+
+    #[test]
+    fn validate_rejects_bad_budget_and_throttle_values() {
+        type Set = fn(&mut Config);
+        let cases: [(Set, &str); 12] = [
+            (|c| c.backfill.total_envelopes_cap = 0, "backfill.total_envelopes_cap"),
+            (|c| c.backfill.total_envelopes_refill_per_hour = 0, "backfill.total_envelopes_refill_per_hour"),
+            (|c| c.backfill.total_envelopes_refill_per_hour = 1_000_000_001, "backfill.total_envelopes_refill_per_hour"),
+            (|c| c.backfill.in_sync_recheck_minutes = 0, "backfill.in_sync_recheck_minutes"),
+            (|c| c.backfill.retry_backoff_max_minutes = 24 * 60 + 1, "backfill.retry_backoff_max_minutes"),
+            (|c| c.private_channel_sync.responder_budget_burst = 0, "private_channel_sync.responder_budget_burst"),
+            (
+                |c| {
+                    // Fast refill so only the burst ceiling (not the year rule) can fire.
+                    c.private_channel_sync.responder_budget_burst = 100_000_001;
+                    c.private_channel_sync.responder_budget_refill_per_hour = 1_000_000_000;
+                },
+                "responder_budget_burst = 100000001 must be in 1..=100000000",
+            ),
+            (|c| c.private_channel_sync.responder_budget_refill_per_hour = 0, "private_channel_sync.responder_budget_refill_per_hour"),
+            (|c| c.private_channel_sync.in_sync_recheck_minutes = 7 * 24 * 60 + 1, "private_channel_sync.in_sync_recheck_minutes"),
+            (|c| c.private_channel_sync.retry_backoff_max_minutes = 0, "private_channel_sync.retry_backoff_max_minutes"),
+            // A full burst must refill within a year.
+            (
+                |c| {
+                    c.private_channel_sync.responder_budget_burst = 10_000_000;
+                    c.private_channel_sync.responder_budget_refill_per_hour = 1;
+                },
+                "within a year",
+            ),
+            // Private keys are checked even when private sync is disabled.
+            (
+                |c| {
+                    c.private_channel_sync.enabled = false;
+                    c.private_channel_sync.responder_budget_refill_per_hour = 0;
+                },
+                "private_channel_sync.responder_budget_refill_per_hour",
+            ),
+        ];
+        for (set, want) in cases {
+            let mut c = baseline_config();
+            set(&mut c);
+            let err = c.validate().expect_err(want);
+            assert!(format!("{err}").contains(want), "{want}: {err}");
+        }
+        // Positive controls at the edges.
+        let mut c = baseline_config();
+        c.backfill.total_envelopes_refill_per_hour = 1_000_000_000;
+        c.backfill.in_sync_recheck_minutes = 7 * 24 * 60;
+        c.backfill.retry_backoff_max_minutes = 24 * 60;
+        c.private_channel_sync.responder_budget_burst = 8_760;
+        c.private_channel_sync.responder_budget_refill_per_hour = 1;
+        c.validate().expect("edge values are accepted");
+        // A burst below one page's charge only warns.
+        let mut c = baseline_config();
+        c.backfill.total_envelopes_cap = 10;
+        c.validate().expect("small burst warns, does not fail");
+    }
 
     #[test]
     fn validate_passes_disabled_backfill_with_zeros() {

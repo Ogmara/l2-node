@@ -178,10 +178,20 @@ server_max_concurrent_per_channel = 1
 # bigger cap — clients page via the cursor — but smaller batches
 # cut worst-case latency.
 max_envelopes_per_response = 1000
-# Hard ceiling on total envelopes served per single client stream.
-# 200k = roughly one year of an active channel; stops a malicious
+# Rolling work budget per (peer, channel), in units (~ one envelope
+# sent or index row examined). Since l2-node 0.141.0 this is the BURST
+# of a budget that refills at total_envelopes_refill_per_hour (before,
+# it was a lifetime cap that only reset on restart). Stops a malicious
 # client from inducing an unbounded scan.
 total_envelopes_cap = 200000
+# Refill rate of that budget, units per hour.
+total_envelopes_refill_per_hour = 10000
+# Requester: minutes to wait (+/-20% jitter) before re-checking a channel
+# that every peer proved in sync (nothing new; never marked complete).
+in_sync_recheck_minutes = 60
+# Requester: cap (minutes) of the exponential backoff between failing
+# attempts on one channel (30s, 60s, 120s, ...).
+retry_backoff_max_minutes = 30
 # How often (hours) to re-check a channel whose backfill already
 # completed. 0 disables re-checking completed channels (a
 # never-completed channel is always retried regardless).
@@ -215,6 +225,15 @@ channel_catchup_interval_hours = 6
 # 30s). Bounds the sweep's cost to a fixed batch regardless of how many
 # channels have been federated locally.
 catchup_batch_size = 25
+# Responder: rolling work budget per requesting peer (all channels and
+# wallets together): burst in units, refilled per hour.
+responder_budget_burst = 20000
+responder_budget_refill_per_hour = 5000
+# Requester: minutes to wait (+/-20% jitter) before re-checking a
+# (wallet, channel) pair proven in sync, and the backoff cap (minutes)
+# between failing attempts.
+in_sync_recheck_minutes = 60
+retry_backoff_max_minutes = 30
 
 [api]
 # Set to "0.0.0.0" to accept connections from all interfaces

@@ -5,6 +5,152 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.141.0] - 2026-10-21
+
+Rolling-window responder budgets and a requester-side attempt throttle for
+channel-history backfill (public `reconcile` and `private-channel-sync`).
+No wire change; older and newer nodes interoperate in both directions.
+
+### Security
+
+- **Dependency (runtime, Rust):** `rustls-webpki` 0.103.15 → 0.103.16
+  (RUSTSEC-2026-0382) and `webpki-root-certs` 1.0.6 → 1.0.10
+  (RUSTSEC-2026-0383) via `cargo update` (lockfile only). Shipped code: TLS
+  certificate verification under libp2p-quic and every outbound HTTPS
+  connection. `cargo audit` reports 0 vulnerabilities (only the existing
+  unmaintained/yanked-crate warnings remain); the full test suite passes.
+
+### Fixed
+
+- **Backfill responder budgets never refilled until restart (shipped
+  code, DoS-adjacent).** Both responders kept a LIFETIME counter of work
+  served: private-channel-sync 20,000 units per requesting peer,
+  `reconcile` `[backfill] total_envelopes_cap` (200,000) per
+  `(peer, channel)`. A requester re-walking an in-sync channel every 30 s
+  spent it within hours and was then answered `server_capped` until the
+  responder restarted. Both are now rolling GCRA budgets: a bucket of
+  `burst` units refilled at `refill_per_hour`, charged after each build
+  with the existing `budget_charge` (max of envelopes sent and rows
+  examined, minimum 1). A request is admitted while at least one whole
+  unit remains; debt is clamped at two bursts. Refusals are never
+  charged.
+- **Private responder budget could be reset by cycling identities.** Past
+  100,000 tracked peers the oldest entry was evicted FIFO, handing a Sybil
+  that cycles identities its budget back. The budget map now prunes ONLY
+  entries whose bucket is full again (never one in debt) on the 30 s tick
+  AND on demand (at most once per second) when a new key meets a full map,
+  so a one-unit key flood cannot keep honest newcomers locked out between
+  ticks; when still full it refuses NEW peers (`server_capped`, fail closed);
+  existing peers are unaffected.
+- **Reconcile responder budget map grew without bound.** Its key includes
+  a requester-chosen `channel_id` (an unknown channel still charges 1
+  unit) and the map was never pruned. Now capped at 200,000 keys with the
+  same prune/refuse rule. The generic `sync` responder shares this type: its
+  former lifetime cap (5,000 per `(peer, channel)`) is now the same rolling
+  budget (5,000 burst, 5,000/h).
+- **Requesters re-walked in-sync channels on every 30 s sweep.** A
+  channel completes only when a session admits new content, so every
+  in-sync channel stayed due forever (about 1,800 "triggering
+  channel-history reconciliation" INFO lines per hour, and 600-1,500
+  budget units per 30 s per responder). A new in-memory attempt throttle
+  per channel (public) and per `(wallet, channel)` (private) gates the
+  trigger together with the existing due check. It is stamped only when
+  requests are actually sent (after every early return): each dispatch
+  backs off `min(30 s x 2^(failures-1), retry_backoff_max) +/-20 %`;
+  COMPLETE clears the entry; a session that admitted new content but
+  stopped early retries in 30 s; a verified IN_SYNC result rechecks after
+  `in_sync_recheck_minutes +/-20 %`. No entry means due (restart = one
+  attempt per channel, exactly the old behaviour; nothing is persisted, so
+  downgrade is safe). Peer connects do not reset it.
+
+### Changed
+
+- **IN_SYNC — a throttle state, never a completion.** Duplicates prove
+  only that a responder offered nothing new, not that nothing new exists
+  (a stale peer with a subset gives the same evidence), so IN_SYNC never
+  writes `CHANNEL_BACKFILL_STATE` / the private completion CF, never
+  changes peer health, and only moves the attempt throttle. A `Duplicate`
+  counts as evidence only when its received bytes equal the locally
+  stored, ingest-verified bytes for that msg_id (a forged envelope that
+  reuses a known msg_id fails; a re-encoded stored copy fails safe).
+  - Private: the session ended naturally (`has_more == false`), the
+    responder walked metadata with us (>= 1 metadata page, so never a
+    pre-0.140 responder), nothing was accepted, >= 1 byte-verified
+    duplicate, and nothing tainted it (a dropped, rejected, invalid,
+    PoW-gated or oversized page, or an unverified duplicate).
+    `NextStep::Finish` now carries `{ complete, in_sync }`.
+  - Public: the comparison found no winner; no dispatched candidate is
+    still outstanding at finalize (not the 3 s deadline path; a candidate
+    whose request failed also leaves the set); none answered
+    `server_capped`; at least one candidate was tried and EVERY tried
+    candidate's first page ended the session and consisted only of
+    byte-verified duplicates (so a has-more/zero-progress rejection, an
+    oversized page or a forged duplicate blocks it); at least one of them
+    is not flagged stale. The 0.136/0.137 rules (Accepted >= 1 for
+    completion, peer comparison, uninformative answers excluded,
+    unproductive-page counter, no health update without a winner) are
+    unchanged.
+- Private-channel sync: the early return for an empty, finished response
+  now applies only to a session's FIRST response, so an empty final chat
+  page after an all-duplicate metadata phase reaches the session state
+  machine and can be recorded IN_SYNC (COMPLETE was already reachable).
+- A private-channel federate call that carries a fresh wallet claim may
+  bypass the throttle, but only when the pair's last dispatch is >= 60 s
+  old.
+- **`[backfill] total_envelopes_cap` changes meaning: it is now the BURST
+  of a rolling per-`(peer, channel)` budget, no longer a lifetime ceiling**
+  (name and default 200,000 unchanged). New keys (all additive, defaults
+  shown): `[backfill] total_envelopes_refill_per_hour = 10000`,
+  `in_sync_recheck_minutes = 60`, `retry_backoff_max_minutes = 30`;
+  `[private_channel_sync] responder_budget_burst = 20000`,
+  `responder_budget_refill_per_hour = 5000`, `in_sync_recheck_minutes =
+  60`, `retry_backoff_max_minutes = 30`. Validation: burst 1..=100,000,000,
+  refill 1..=1,000,000,000 per hour, a full burst must refill within a
+  year, recheck 1..=10,080 min, backoff cap 1..=1,440 min; a burst below
+  one page's estimated charge only warns. The `[backfill]` keys are
+  validated when `[backfill] enabled = true` (like the rest of that
+  section); the `[private_channel_sync]` keys always.
+- The "session ended with has_more=false but zero newly-accepted
+  envelopes" WARN is logged at DEBUG for a verified in-sync first page.
+- New dashboard metrics (monotonic totals in `MetricsSnapshot`):
+  `reconcile_attempts_dispatched_total`,
+  `private_sync_attempts_dispatched_total`, `reconcile_in_sync_total`,
+  `private_sync_in_sync_total`, `reconcile_budget_refusals_total`,
+  `private_sync_budget_refusals_total`, `backfill_budget_map_full_total`.
+
+### Known limitations
+
+- **A real gap can wait up to one in-sync recheck (60 min +/-20 %).** When
+  every reachable peer that answers proves the channel in sync but a peer
+  that holds new content did not take part (unreachable, or only a
+  continuation page would show it), the next attempt is the recheck. A
+  restart, a newly discovered channel and (private) a fresh federate call
+  after 60 s all attempt immediately.
+- **A `server_capped` candidate blocks public IN_SYNC.** While any fanout
+  peer answers `server_capped` — e.g. a not-yet-upgraded responder that
+  spent its old lifetime budget — the channel never reaches the in-sync
+  recheck and is retried on the dispatch backoff instead (at most every
+  `retry_backoff_max_minutes`, 30 min).
+- **Private sync still cancels siblings on the first answer.** A fast
+  stale peer whose answer is a verified subset can therefore delay a
+  private pair's repair by one recheck (public reconcile compares all
+  candidates). Unchanged from 0.138-0.140 apart from the delay.
+- **No "nothing changed" fast path.** An in-sync check still re-serves the
+  first page (public) or the full metadata and chat (private); the
+  throttle bounds how often. A cheaper check needs the reserved
+  fingerprint / epoch-root fields (spec 01 §8.3.3).
+- **A channel whose single session costs more than the responder's burst
+  still cannot complete against that responder** (no persisted cursor
+  across sessions); the requester tries its other fanout peers. The
+  private metadata phase stays bounded at 500 pages (100,000 rows).
+- **Fairness is per identity.** Total responder throughput is bounded by
+  the 8 node-wide build slots and the page caps; there is no global
+  budget, and a full budget map refuses newcomers during a key flood.
+- **Out of scope here:** the news/dm/identity sync responders keep their
+  lifetime caps; private-channel sync still never starts in production
+  because no client sends the wallet claim header
+  (`x-ogmara-pchansync-auth`) — tracked separately.
+
 ## [0.140.0] - 2026-10-20
 
 ### Security
@@ -441,24 +587,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   each one triggers a private-channel-sync session, which spends the
   responding peers' shared per-peer backfill budget. Bounded by those
   responder-side caps and the requester's own session/page backstops.
-- **Metadata paging cost and limits (corrected).** Every private-channel-
-  sync session re-serves the channel's FULL metadata, then its chat, from
-  the start. A session completes only if it admitted at least one NEW
-  envelope, so a channel this node already holds in full (only duplicates
-  come back) never completes and stays due: the 30 s retry sweep re-walks
-  every such due (wallet, channel) pair on each rotation — not only every
-  `[private_channel_sync] channel_catchup_interval_hours` (6 h), as an
-  earlier draft of this entry said. The responder budget
-  (`TOTAL_ENVELOPES_CAP` = 20,000 units per requesting peer, all channels
-  and wallets together) is per responder PROCESS LIFETIME and never
-  refills until that responder restarts: a peer that has spent it gets
-  `server_capped` (and tries its other fanout peers). Consequently an
-  in-sync requester exhausts each responder's budget quickly and is then
-  refused by it until restart, a channel with more than ~20,000 metadata
-  rows can never be fully served by one responder process, and the
-  requester's metadata phase is bounded at 500 pages (100,000 rows).
-  **Next-version follow-up:** a rolling-window responder budget and a
-  requester-side attempt throttle.
+- **Metadata paging cost and limits (superseded by 0.141.0).** In this
+  version every private-channel-sync session re-served the channel's full
+  metadata and chat; an in-sync (wallet, channel) pair never completed and
+  was re-walked on every 30 s sweep rotation, against a responder budget
+  (20,000 units per requesting peer) that never refilled until the
+  responder restarted. 0.141.0 replaces the lifetime budget with a rolling
+  window and throttles the requester's attempts — see the 0.141.0 entry.
+  The 500-page (100,000-row) metadata backstop is unchanged.
 - **Recorded residuals from the round-5 audits.** Requests whose forwarding
   headers fail closed (disagreeing `Forwarded`/`X-Forwarded-For`, an
   unparseable entry, an over-long all-trusted chain) all share the `::`

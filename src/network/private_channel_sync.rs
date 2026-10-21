@@ -84,9 +84,11 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use tracing::warn;
 
 use crate::crypto::signing;
+use crate::network::budget::{BudgetMap, Gcra, Refusal};
 use crate::network::reconcile::{self, is_channel_member, is_private_channel, MetaCursor};
 use crate::storage::rocks::Storage;
 use crate::storage::schema;
@@ -172,37 +174,40 @@ pub const MAX_ENVELOPES_PER_RESPONSE: usize = 200;
 /// metadata pages instead (round-3 audit R3-1, raw keyset paging since
 /// round 4).
 pub const META_RESERVE: usize = 64;
-/// Hard ceiling on the cumulative budget one peer may spend on this
-/// responder per process lifetime (all channels and wallets together).
-/// Charged per request with `reconcile::budget_charge` — the larger of
-/// envelopes sent and storage rows examined, minimum 1 — so metadata rows
-/// count like chat rows and empty / garbage-cursor pages are not free
-/// (round 4). Higher than `dm_sync::TOTAL_ENVELOPES_CAP` (5,000): one node
-/// can host multiple local wallets, each independently catching up on
-/// multiple private channels. Kept well below `reconcile`'s 200,000
-/// public-channel ceiling since this serves E2E ciphertext + membership
-/// metadata, not already-public content.
-///
-/// **Lifetime interplay (recorded limitation):** every session re-serves
-/// the channel's FULL metadata and then its chat from the start, and the
-/// budget never refills until the responder restarts. A session completes
-/// only if it admitted at least one NEW envelope, so a channel the
-/// requester already holds in full (only `Duplicate`s come back) never
-/// completes and stays due: the 30 s retry sweep re-walks every such
-/// (wallet, channel) pair on each rotation, not only every
-/// `[private_channel_sync] channel_catchup_interval_hours`. A requesting
-/// node whose wallets re-sync channels with N metadata + M chat rows spends
-/// about N + M per session; once it has spent 20,000 this responder answers
-/// it `server_capped` until restart (the requester then tries its other
-/// fanout peers). A single channel with more than ~20,000 metadata rows can
-/// therefore never be fully served by one responder process. Planned
-/// follow-up: a rolling-window budget and a requester-side attempt
-/// throttle.
-pub const TOTAL_ENVELOPES_CAP: u64 = 20_000;
+// Responder budget (l2-node 0.141.0, replaces the 0.138-0.140 lifetime
+// `TOTAL_ENVELOPES_CAP = 20,000`): one rolling-window GCRA bucket per
+// requesting PEER (all channels and wallets together), `[private_channel_
+// sync] responder_budget_burst` units (default 20,000) refilled at
+// `responder_budget_refill_per_hour` (default 5,000/h) — see
+// `budget::Gcra`. Charged per request with `reconcile::budget_charge` —
+// the larger of envelopes sent and storage rows examined, minimum 1 — so
+// metadata rows count like chat rows and empty / garbage-cursor pages are
+// not free (round 4). Refusals (auth, membership, concurrency, budget,
+// build slot) are never charged. Keys are bounded by
+// `MAX_TRACKED_SERVED_PEERS`; only full buckets are pruned and a full map
+// refuses NEW peers, so cycling identities no longer buys a refill (the
+// old FIFO eviction did).
+//
+// Before 0.141.0 the budget never refilled until the responder
+// restarted, and a requester re-walked every already-in-sync (wallet,
+// channel) pair on every 30 s sweep — burning the budget in hours. The
+// requester side now also throttles its attempts (`budget::
+// AttemptThrottle`): exponential backoff after a dispatch, an hourly
+// recheck after a verified in-sync session (`SyncSession::advance`'s
+// `in_sync`).
+//
+// **Recorded limitation (unchanged):** a channel whose single session
+// costs more than the burst (≈ 20,000 metadata + chat rows) still cannot
+// complete against one responder — every session restarts from the first
+// page (no persisted cursor), so it hits the same wall each time; the
+// requester then tries its other fanout peers.
+//
+// (No constant: the burst and refill are config, `PrivateChannelSyncConfig`.)
+
 /// Requester backstop on METADATA pages per session, separate from the
 /// chat-phase `MAX_PAGES_PER_SESSION` so a large metadata history cannot
 /// eat the chat budget: 500 pages × 200 rows = 100,000 rows (more than one
-/// responder's `TOTAL_ENVELOPES_CAP` can serve anyway). With a strictly
+/// responder's default burst can serve in one go anyway). With a strictly
 /// increasing cursor check (`SyncSession::advance`) a hostile responder
 /// cannot loop the requester; at most it spends this many pages.
 pub const MAX_META_PAGES_PER_SESSION: u32 = 500;
@@ -437,7 +442,12 @@ pub enum NextStep {
     /// Ask for the next chat page from this cursor.
     ChatPage(PrivateChannelSyncCursor),
     /// Session over. `complete` = persist the completion marker.
-    Finish { complete: bool },
+    /// `in_sync` (l2-node 0.141.0, never together with `complete`) = the
+    /// session ended naturally with nothing new and every envelope it saw a
+    /// byte-verified duplicate — a requester THROTTLE state only (recheck
+    /// after `[private_channel_sync] in_sync_recheck_minutes`); it is never
+    /// persisted and never written to the completion CF.
+    Finish { complete: bool, in_sync: bool },
 }
 
 /// Requester-side state of ONE private-channel-sync session with one peer
@@ -462,6 +472,17 @@ pub struct SyncSession {
     pub last_meta_cursor: Option<MetaCursor>,
     /// Last chat cursor followed — the next must be strictly greater.
     pub last_chat_cursor: Option<PrivateChannelSyncCursor>,
+    /// Session-cumulative count of `Duplicate` envelopes whose received
+    /// bytes are byte-identical to the locally stored (ingest-verified)
+    /// copy (`network::duplicate_is_verified`, l2-node 0.141.0).
+    pub verified_dups: usize,
+    /// Set once any page of this session carried something that is not
+    /// clean evidence: an envelope dropped by the type/channel checks, one
+    /// rejected/invalid/PoW-gated by the router, an oversized page, or a
+    /// `Duplicate` whose bytes do NOT match the stored copy (a forged
+    /// envelope reusing a known msg_id). A tainted session can still be
+    /// COMPLETE (that only needs `Accepted`) but never `in_sync`.
+    pub tainted: bool,
 }
 
 impl SyncSession {
@@ -487,13 +508,18 @@ impl SyncSession {
     ///   when another page would be needed: a final page (metadata or chat)
     ///   that lands exactly on a backstop still moves on / finishes
     ///   normally (round-5 C-N7).
+    /// * **In sync** (l2-node 0.141.0): a natural end that is not complete
+    ///   is reported `in_sync` iff `is_in_sync_end` holds — a throttle
+    ///   hint for the requester, never a completion.
+    ///
+    /// Call `record_evidence` for the page BEFORE `advance`.
     pub fn advance(
         &mut self,
         resp: &PrivateChannelSyncResponse,
         admitted: usize,
         accepted: usize,
     ) -> NextStep {
-        const INCOMPLETE: NextStep = NextStep::Finish { complete: false };
+        const INCOMPLETE: NextStep = NextStep::Finish { complete: false, in_sync: false };
         self.accepted_total += accepted;
         if resp.meta_phase {
             if self.in_chat {
@@ -531,7 +557,8 @@ impl SyncSession {
         // reaches a backstop (round-5 C-N7); the backstops only refuse to
         // ask for ANOTHER page.
         let Some(c) = resp.next_cursor.as_ref().filter(|_| resp.has_more) else {
-            return NextStep::Finish { complete: self.accepted_total > 0 };
+            let complete = self.accepted_total > 0;
+            return NextStep::Finish { complete, in_sync: !complete && self.is_in_sync_end(resp) };
         };
         if self.chat_pages >= super::MAX_PAGES_PER_SESSION
             || self.consecutive_unproductive_pages >= super::MAX_CONSECUTIVE_UNPRODUCTIVE_PAGES
@@ -544,6 +571,42 @@ impl SyncSession {
         self.last_chat_cursor = Some(c.clone());
         NextStep::ChatPage(c.clone())
     }
+
+    /// Record one applied page's evidence for the in-sync decision:
+    /// `verified_dups` byte-verified duplicates, `tainted` if the page had
+    /// anything that is not clean evidence (see the field docs).
+    pub fn record_evidence(&mut self, verified_dups: usize, tainted: bool) {
+        self.verified_dups += verified_dups;
+        self.tainted |= tainted;
+    }
+
+    /// The in-sync conditions, checked at a natural end of the chat phase
+    /// (`resp` is the final chat page): the chat phase really ended
+    /// (`has_more == false` — a `has_more` page without a cursor does not
+    /// count); the responder walked metadata with us (`meta_pages >= 1`, so
+    /// a legacy pre-0.140 responder never qualifies); nothing new was
+    /// admitted; at least one byte-verified duplicate was seen; and the
+    /// session is not tainted. Backstop / cursor-violation endings never
+    /// reach this (they return `INCOMPLETE`).
+    fn is_in_sync_end(&self, resp: &PrivateChannelSyncResponse) -> bool {
+        !resp.has_more
+            && self.meta_pages >= 1
+            && self.accepted_total == 0
+            && self.verified_dups >= 1
+            && !self.tainted
+    }
+}
+
+/// `true` for an empty, finished response that is the FIRST of its
+/// session (`session` still at its default): the responder knows nothing
+/// about the pair, so the requester ends the session without completion or
+/// evidence (l2-node 0.141.0). Any later empty final page — after a
+/// productive or an all-duplicate metadata phase — must instead reach
+/// `SyncSession::advance`, which records COMPLETE or IN_SYNC. (Before
+/// 0.141.0 the condition was `accepted_total == 0`, which also cut off the
+/// empty final chat page of an all-duplicate session.)
+pub fn is_empty_first_response(resp: &PrivateChannelSyncResponse, session: &SyncSession) -> bool {
+    resp.envelopes.is_empty() && !resp.has_more && *session == SyncSession::default()
 }
 
 /// Sign a private-channel-sync request as the requesting node.
@@ -948,61 +1011,74 @@ pub fn build_response_metered(
 
 // --- Responder rate limiting (per peer) ---
 
-/// Bounds how much one peer can pull, byte-for-byte mirroring
-/// `dm_sync::DmResponderLimits` (including the bounded-eviction fix for the
-/// "Sybil clear-all" class of bug: the single oldest `served` entry is
-/// evicted on overflow, not the whole map).
-#[derive(Debug, Default)]
+/// Bounds how much one peer can pull: per-peer concurrency plus a
+/// rolling-window budget per peer (l2-node 0.141.0, `budget::Gcra` — see
+/// the "Responder budget" doc above `MAX_META_PAGES_PER_SESSION`). The
+/// pre-0.141.0 lifetime counter evicted its oldest entry FIFO past
+/// `MAX_TRACKED_SERVED_PEERS`, which handed a Sybil cycling identities its
+/// budget back; the budget map instead prunes only refilled buckets and
+/// refuses NEW peers when full.
+#[derive(Debug)]
 pub struct PrivateChannelSyncResponderLimits {
     inner: Mutex<LimitsInner>,
 }
 
+impl Default for PrivateChannelSyncResponderLimits {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::new(LimitsInner {
+                per_peer: HashMap::new(),
+                budget: BudgetMap::new(MAX_TRACKED_SERVED_PEERS),
+            }),
+        }
+    }
+}
+
+/// Hard cap on peers tracked by the responder budget.
 pub(crate) const MAX_TRACKED_SERVED_PEERS: usize = 100_000;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct LimitsInner {
     per_peer: HashMap<libp2p::PeerId, usize>,
-    served: HashMap<libp2p::PeerId, u64>,
-    served_order: std::collections::VecDeque<libp2p::PeerId>,
+    budget: BudgetMap<libp2p::PeerId>,
 }
 
 impl PrivateChannelSyncResponderLimits {
-    /// Admit one inbound request, or `None` if over a cap (→
-    /// `capped_response`).
+    /// Admit one inbound request, or the reason it is refused (→
+    /// `capped_response`). Refusals are never charged.
     pub fn try_acquire(
         self: &Arc<Self>,
         peer: libp2p::PeerId,
         max_concurrent_per_peer: usize,
-        total_envelopes_cap: u64,
-    ) -> Option<PrivateChannelSyncResponderGuard> {
-        let mut inner = self.inner.lock().ok()?;
+        budget: &Gcra,
+        now: Instant,
+    ) -> Result<PrivateChannelSyncResponderGuard, Refusal> {
+        // A poisoned lock is treated like a busy slot (fail closed).
+        let mut inner = self.inner.lock().map_err(|_| Refusal::Concurrency)?;
         let in_flight = inner.per_peer.get(&peer).copied().unwrap_or(0);
         if in_flight >= max_concurrent_per_peer {
-            return None;
+            return Err(Refusal::Concurrency);
         }
-        if inner.served.get(&peer).copied().unwrap_or(0) >= total_envelopes_cap {
-            return None;
-        }
+        inner.budget.admit(&peer, budget, now)?;
         inner.per_peer.insert(peer, in_flight + 1);
-        Some(PrivateChannelSyncResponderGuard {
+        Ok(PrivateChannelSyncResponderGuard {
             limits: Arc::clone(self),
             peer,
         })
     }
 
-    pub fn add_served(&self, peer: libp2p::PeerId, count: u64) {
+    /// Charge `units` (`reconcile::budget_charge`) to `peer`'s budget after
+    /// a build, before the response is queued.
+    pub fn charge(&self, peer: libp2p::PeerId, units: u64, budget: &Gcra, now: Instant) {
         if let Ok(mut inner) = self.inner.lock() {
-            let is_new = !inner.served.contains_key(&peer);
-            if is_new {
-                if inner.served.len() >= MAX_TRACKED_SERVED_PEERS {
-                    if let Some(oldest) = inner.served_order.pop_front() {
-                        inner.served.remove(&oldest);
-                    }
-                }
-                inner.served_order.push_back(peer);
-            }
-            *inner.served.entry(peer).or_insert(0) += count;
+            inner.budget.charge(peer, units, budget, now);
         }
+    }
+
+    /// Drop every budget entry whose bucket is full again (never one in
+    /// debt). Run on the 30 s tick. Returns how many were removed.
+    pub fn prune(&self, now: Instant) -> usize {
+        self.inner.lock().map(|mut inner| inner.budget.prune(now)).unwrap_or(0)
     }
 }
 
@@ -1485,26 +1561,57 @@ mod tests {
         );
     }
 
-    // --- responder limits eviction ---
+    // --- responder budget (l2-node 0.141.0) ---
+
+    /// Replaces the pre-0.141.0 `add_served_evicts_oldest_not_everyone`:
+    /// the FIFO eviction is gone. A peer that spent its budget keeps its
+    /// debt however many other peers arrive; a full map refuses NEW peers
+    /// instead, and only refilled buckets are pruned.
+    #[test]
+    fn budget_never_evicts_a_peer_in_debt_and_refuses_new_peers_when_full() {
+        let limits = Arc::new(PrivateChannelSyncResponderLimits::default());
+        let budget = Gcra::new(20_000, 5_000);
+        let now = std::time::Instant::now();
+        let first_peer = libp2p::PeerId::random();
+        // Overspent (two requests admitted together): 30,000 units of debt.
+        limits.charge(first_peer, 30_000, &budget, now);
+        for _ in 1..MAX_TRACKED_SERVED_PEERS {
+            limits.charge(libp2p::PeerId::random(), 1, &budget, now);
+        }
+        let overflow_peer = libp2p::PeerId::random();
+        assert!(matches!(
+            limits.try_acquire(overflow_peer, SERVER_MAX_CONCURRENT_PER_PEER, &budget, now),
+            Err(Refusal::MapFull)
+        ));
+        assert!(
+            matches!(
+                limits.try_acquire(first_peer, SERVER_MAX_CONCURRENT_PER_PEER, &budget, now),
+                Err(Refusal::OverBudget)
+            ),
+            "the spent peer was not evicted and got no free refill"
+        );
+        // One unit refills in 0.72 s: the prune drops the Sybils only.
+        let later = now + std::time::Duration::from_secs(1);
+        assert_eq!(limits.prune(later), MAX_TRACKED_SERVED_PEERS - 1);
+        assert!(limits.try_acquire(overflow_peer, SERVER_MAX_CONCURRENT_PER_PEER, &budget, later).is_ok());
+        assert!(limits.try_acquire(first_peer, SERVER_MAX_CONCURRENT_PER_PEER, &budget, later).is_err());
+        // …and the spent peer is admitted again once its budget refilled
+        // (10,001 units at 5,000/h ≈ 2 h), not only after a restart.
+        let refilled = now + std::time::Duration::from_secs(3 * 3_600);
+        assert!(limits.try_acquire(first_peer, SERVER_MAX_CONCURRENT_PER_PEER, &budget, refilled).is_ok());
+    }
 
     #[test]
-    fn add_served_evicts_oldest_not_everyone() {
-        let limits = PrivateChannelSyncResponderLimits::default();
-        let first_peer = libp2p::PeerId::random();
-        limits.add_served(first_peer, 1);
-        for _ in 1..MAX_TRACKED_SERVED_PEERS - 1 {
-            limits.add_served(libp2p::PeerId::random(), 1);
-        }
-        let last_peer = libp2p::PeerId::random();
-        limits.add_served(last_peer, 1);
-        let overflow_peer = libp2p::PeerId::random();
-        limits.add_served(overflow_peer, 1);
-
-        let inner = limits.inner.lock().unwrap();
-        assert_eq!(inner.served.len(), MAX_TRACKED_SERVED_PEERS);
-        assert!(!inner.served.contains_key(&first_peer));
-        assert!(inner.served.contains_key(&last_peer));
-        assert!(inner.served.contains_key(&overflow_peer));
+    fn concurrency_cap_is_checked_and_released() {
+        let limits = Arc::new(PrivateChannelSyncResponderLimits::default());
+        let budget = Gcra::new(20_000, 5_000);
+        let now = std::time::Instant::now();
+        let peer = libp2p::PeerId::random();
+        let g1 = limits.try_acquire(peer, 2, &budget, now).unwrap();
+        let _g2 = limits.try_acquire(peer, 2, &budget, now).unwrap();
+        assert!(matches!(limits.try_acquire(peer, 2, &budget, now), Err(Refusal::Concurrency)));
+        drop(g1);
+        assert!(limits.try_acquire(peer, 2, &budget, now).is_ok());
     }
 }
 
@@ -1872,12 +1979,23 @@ mod meta_paging_tests {
         meta_served: Vec<[u8; 32]>,
     }
 
-    fn msg_id_of(raw: &[u8]) -> [u8; 32] {
-        rmp_serde::from_slice::<Envelope>(raw).unwrap().msg_id
+    /// Drive the requester loop to the end, exactly like the network loop.
+    fn sync(resp_store: &Storage, requester: &MessageRouter, req_store: &Storage, wallet: &str, paging: bool) -> SyncRun {
+        sync_with(resp_store, requester, req_store, wallet, paging, |_| {})
     }
 
-    /// Drive the requester loop to the end, exactly like the network loop.
-    fn sync(resp_store: &Storage, requester: &MessageRouter, wallet: &str, paging: bool) -> SyncRun {
+    /// `sync`, with `tamper` applied to every response before the
+    /// requester sees it (a hostile responder). Records the in-sync
+    /// evidence exactly like the network loop (`record_evidence` before
+    /// `advance`; a `Duplicate` counts only when byte-verified).
+    fn sync_with(
+        resp_store: &Storage,
+        requester: &MessageRouter,
+        req_store: &Storage,
+        wallet: &str,
+        paging: bool,
+        tamper: impl Fn(&mut PrivateChannelSyncResponse),
+    ) -> SyncRun {
         let mut req = PrivateChannelSyncRequest {
             channel_id: CID,
             wallet: wallet.into(),
@@ -1894,22 +2012,33 @@ mod meta_paging_tests {
         let mut session = SyncSession::default();
         let mut meta_served = Vec::new();
         for page in 1..=2000 {
-            let resp = build_response(resp_store, &req, MAX_ENVELOPES_PER_RESPONSE, T0 / 1000 + 10_000_000, u64::MAX);
+            let mut resp = build_response(resp_store, &req, MAX_ENVELOPES_PER_RESPONSE, T0 / 1000 + 10_000_000, u64::MAX);
             assert!(resp.envelopes.len() <= MAX_ENVELOPES_PER_RESPONSE);
-            let (mut admitted, mut accepted) = (0, 0);
+            tamper(&mut resp);
+            let (mut admitted, mut accepted, mut verified_dups, mut tainted) = (0, 0, 0, false);
             for env in &resp.envelopes {
                 if resp.meta_phase {
-                    meta_served.push(msg_id_of(env));
+                    if let Ok(e) = rmp_serde::from_slice::<Envelope>(env) {
+                        meta_served.push(e.msg_id);
+                    }
                 }
                 match requester.process_synced_message(env) {
                     RouteResult::Accepted { .. } => {
                         admitted += 1;
                         accepted += 1;
                     }
-                    RouteResult::Duplicate => admitted += 1,
-                    _ => {}
+                    RouteResult::Duplicate => {
+                        admitted += 1;
+                        if crate::network::duplicate_is_verified(req_store, env) {
+                            verified_dups += 1;
+                        } else {
+                            tainted = true;
+                        }
+                    }
+                    _ => tainted = true,
                 }
             }
+            session.record_evidence(verified_dups, tainted);
             let step = session.advance(&resp, admitted, accepted);
             match step.clone() {
                 NextStep::MetaPage(c) => req.meta_cursor = Some(c),
@@ -1964,8 +2093,8 @@ mod meta_paging_tests {
         for i in 0..5 {
             feed(&resp, &chat(&c, T0 + 5_000 + i));
         }
-        let run = sync(&rs, &reqr, &c.addr, true);
-        assert_eq!(run.last, NextStep::Finish { complete: true });
+        let run = sync(&rs, &reqr, &qs, &c.addr, true);
+        assert_eq!(run.last, NextStep::Finish { complete: true, in_sync: false });
         assert_eq!(run.pages, 2, "one metadata page (191 rows) + one chat page");
         assert_eq!(run.meta_served.len(), 191);
         assert_exactly_once(&rs, &run);
@@ -1999,8 +2128,8 @@ mod meta_paging_tests {
             feed(&resp, &add_mod(&c, &m.addr, T0 + 4));
         }
         assert_eq!(rows(&rs, schema::cf::CHANNEL_BANS).len(), 1);
-        let run = sync(&rs, &reqr, &c.addr, true);
-        assert_eq!(run.last, NextStep::Finish { complete: true });
+        let run = sync(&rs, &reqr, &qs, &c.addr, true);
+        assert_eq!(run.last, NextStep::Finish { complete: true, in_sync: false });
         assert_exactly_once(&rs, &run);
         assert_converged(&rs, &qs);
         assert_eq!(rows(&qs, schema::cf::CHANNEL_BANS).len(), 1, "the re-granted moderator's ban survives");
@@ -2046,8 +2175,8 @@ mod meta_paging_tests {
         let inv = invite(&m, &z.addr, T0 + 5);
         feed(&resp, &join_with(&z, Some(inv), T0 + 6));
         assert_eq!(rows(&rs, schema::cf::CHANNEL_MEMBERS).len(), 2);
-        let run = sync(&rs, &reqr, &c.addr, true);
-        assert_eq!(run.last, NextStep::Finish { complete: true });
+        let run = sync(&rs, &reqr, &qs, &c.addr, true);
+        assert_eq!(run.last, NextStep::Finish { complete: true, in_sync: false });
         assert_exactly_once(&rs, &run);
         assert_converged(&rs, &qs);
         assert!(rows(&qs, schema::cf::CHANNEL_BANS).is_empty(), "the moderator's unban survived");
@@ -2081,8 +2210,8 @@ mod meta_paging_tests {
             5,
             "the index holds the 5 joins only — no junk leave was indexed"
         );
-        let run = sync(&rs, &reqr, &c.addr, true);
-        assert_eq!(run.last, NextStep::Finish { complete: true });
+        let run = sync(&rs, &reqr, &qs, &c.addr, true);
+        assert_eq!(run.last, NextStep::Finish { complete: true, in_sync: false });
         assert_exactly_once(&rs, &run);
         assert_converged(&rs, &qs);
         assert_eq!(rows(&qs, schema::cf::CHANNEL_MEMBERS).len(), 6);
@@ -2114,7 +2243,7 @@ mod meta_paging_tests {
         feed(&resp, &join(&b, T0 + 30));
         feed(&resp, &kick(&c, &b.addr, T0 + 20));
         assert_eq!(rows(&rs, schema::cf::CHANNEL_META_MSGS).len(), 2 + 3, "a: join+leave, b: join, kick, rejoin");
-        sync(&rs, &reqr, &c.addr, true);
+        sync(&rs, &reqr, &qs, &c.addr, true);
         // The requester replays in true order: a left; b rejoined after
         // the kick. (The responder applied b's rejoin before the kick it
         // follows — a pre-existing apply-order limitation, recorded — so
@@ -2138,8 +2267,8 @@ mod meta_paging_tests {
         for i in 0..1000u64 {
             feed(&resp, &kick(&c, &format!("klv1target{i:05}"), T0 + 10 + i));
         }
-        let run = sync(&rs, &reqr, &c.addr, true);
-        assert_eq!(run.last, NextStep::Finish { complete: true });
+        let run = sync(&rs, &reqr, &qs, &c.addr, true);
+        assert_eq!(run.last, NextStep::Finish { complete: true, in_sync: false });
         assert_exactly_once(&rs, &run);
         assert_eq!(rows(&qs, schema::cf::CHANNEL_ROLE_WATERMARKS).len(), 1001);
         assert_eq!(rows(&qs, schema::cf::CHANNEL_BANS).len(), 1, "a ban is never starved by kicks");
@@ -2168,7 +2297,7 @@ mod meta_paging_tests {
             feed(&resp, &join(&wallet(), T0 + 7));
         }
         assert_eq!(rows(&rs, schema::cf::CHANNEL_META_MSGS).len(), 650);
-        let run = sync(&rs, &reqr, &c.addr, true);
+        let run = sync(&rs, &reqr, &qs, &c.addr, true);
         assert_eq!(run.meta_served.len(), 650, "650 rows over 4 pages, none twice, none skipped");
         assert_exactly_once(&rs, &run);
         assert_converged(&rs, &qs);
@@ -2284,15 +2413,15 @@ mod meta_paging_tests {
         assert_eq!(s.advance(&meta_resp(true, Some(mc(5))), 3, 3), NextStep::MetaPage(mc(5)));
         assert_eq!(s.advance(&meta_resp(false, None), 3, 3), NextStep::StartChat);
         assert_eq!(s.advance(&chat_resp(true, Some(cc(1))), 1, 0), NextStep::ChatPage(cc(1)));
-        assert_eq!(s.advance(&chat_resp(false, None), 1, 0), NextStep::Finish { complete: true });
+        assert_eq!(s.advance(&chat_resp(false, None), 1, 0), NextStep::Finish { complete: true, in_sync: false });
         // Nothing Accepted in the whole session → not complete.
         let mut s = SyncSession::default();
         s.advance(&meta_resp(false, None), 0, 0);
-        assert_eq!(s.advance(&chat_resp(false, None), 0, 0), NextStep::Finish { complete: false });
+        assert_eq!(s.advance(&chat_resp(false, None), 0, 0), NextStep::Finish { complete: false, in_sync: false });
         // Duplicates alone never complete.
         let mut s = SyncSession::default();
         s.advance(&meta_resp(false, None), 50, 0);
-        assert_eq!(s.advance(&chat_resp(false, None), 9, 0), NextStep::Finish { complete: false });
+        assert_eq!(s.advance(&chat_resp(false, None), 9, 0), NextStep::Finish { complete: false, in_sync: false });
     }
 
     #[test]
@@ -2300,31 +2429,31 @@ mod meta_paging_tests {
         // Non-advancing metadata cursor → incomplete stop.
         let mut s = SyncSession::default();
         assert_eq!(s.advance(&meta_resp(true, Some(mc(5))), 1, 1), NextStep::MetaPage(mc(5)));
-        assert_eq!(s.advance(&meta_resp(true, Some(mc(5))), 1, 1), NextStep::Finish { complete: false });
+        assert_eq!(s.advance(&meta_resp(true, Some(mc(5))), 1, 1), NextStep::Finish { complete: false, in_sync: false });
         let mut s = SyncSession::default();
         s.advance(&meta_resp(true, Some(mc(5))), 1, 1);
-        assert_eq!(s.advance(&meta_resp(true, Some(mc(4))), 1, 1), NextStep::Finish { complete: false });
+        assert_eq!(s.advance(&meta_resp(true, Some(mc(4))), 1, 1), NextStep::Finish { complete: false, in_sync: false });
         // `meta_has_more` without a cursor → incomplete stop.
         let mut s = SyncSession::default();
-        assert_eq!(s.advance(&meta_resp(true, None), 1, 1), NextStep::Finish { complete: false });
+        assert_eq!(s.advance(&meta_resp(true, None), 1, 1), NextStep::Finish { complete: false, in_sync: false });
         // A metadata page once chat started → incomplete stop.
         let mut s = SyncSession::default();
         s.advance(&meta_resp(false, None), 1, 1);
-        assert_eq!(s.advance(&meta_resp(true, Some(mc(9))), 1, 1), NextStep::Finish { complete: false });
+        assert_eq!(s.advance(&meta_resp(true, Some(mc(9))), 1, 1), NextStep::Finish { complete: false, in_sync: false });
         // Non-advancing chat cursor → incomplete stop.
         let mut s = SyncSession::default();
         s.advance(&chat_resp(true, Some(cc(3))), 1, 1);
-        assert_eq!(s.advance(&chat_resp(true, Some(cc(3))), 1, 1), NextStep::Finish { complete: false });
+        assert_eq!(s.advance(&chat_resp(true, Some(cc(3))), 1, 1), NextStep::Finish { complete: false, in_sync: false });
         // Metadata page budget.
         let mut s = SyncSession::default();
         let mut last = NextStep::StartChat;
         for i in 1..=MAX_META_PAGES_PER_SESSION as u64 {
             last = s.advance(&meta_resp(true, Some(mc(i))), 1, 1);
-            if last == (NextStep::Finish { complete: false }) {
+            if last == (NextStep::Finish { complete: false, in_sync: false }) {
                 break;
             }
         }
-        assert_eq!(last, NextStep::Finish { complete: false });
+        assert_eq!(last, NextStep::Finish { complete: false, in_sync: false });
         assert_eq!(s.meta_pages, MAX_META_PAGES_PER_SESSION);
         // Chat backstop: unproductive pages.
         let mut s = SyncSession::default();
@@ -2335,7 +2464,7 @@ mod meta_paging_tests {
                 break;
             }
         }
-        assert_eq!(last, NextStep::Finish { complete: false });
+        assert_eq!(last, NextStep::Finish { complete: false, in_sync: false });
         assert_eq!(s.chat_pages, crate::network::MAX_CONSECUTIVE_UNPRODUCTIVE_PAGES);
     }
 
@@ -2375,7 +2504,7 @@ mod meta_paging_tests {
         }
         assert_eq!(
             s.advance(&meta_resp(true, Some(mc(10_000))), 1, 1),
-            NextStep::Finish { complete: false }
+            NextStep::Finish { complete: false, in_sync: false }
         );
         // Chat: the MAX_PAGES_PER_SESSION-th page is the final one.
         let max = crate::network::MAX_PAGES_PER_SESSION;
@@ -2383,7 +2512,7 @@ mod meta_paging_tests {
         for i in 1..max as u64 {
             assert_eq!(s.advance(&chat_resp(true, Some(cc(i))), 1, 1), NextStep::ChatPage(cc(i)));
         }
-        assert_eq!(s.advance(&chat_resp(false, None), 1, 1), NextStep::Finish { complete: true });
+        assert_eq!(s.advance(&chat_resp(false, None), 1, 1), NextStep::Finish { complete: true, in_sync: false });
         // ...and one that still has more is cut off.
         let mut s = SyncSession::default();
         for i in 1..max as u64 {
@@ -2391,7 +2520,7 @@ mod meta_paging_tests {
         }
         assert_eq!(
             s.advance(&chat_resp(true, Some(cc(1_000_000))), 1, 1),
-            NextStep::Finish { complete: false }
+            NextStep::Finish { complete: false, in_sync: false }
         );
         // Unproductive backstop reached on the final page: finishes by the
         // session's own merit (an earlier Accepted → complete).
@@ -2401,7 +2530,7 @@ mod meta_paging_tests {
         for i in 1..unprod as u64 {
             assert_eq!(s.advance(&chat_resp(true, Some(cc(i))), 0, 0), NextStep::ChatPage(cc(i)));
         }
-        assert_eq!(s.advance(&chat_resp(false, None), 0, 0), NextStep::Finish { complete: true });
+        assert_eq!(s.advance(&chat_resp(false, None), 0, 0), NextStep::Finish { complete: true, in_sync: false });
     }
 
     #[test]
@@ -2423,11 +2552,149 @@ mod meta_paging_tests {
         for i in 0..1_100u64 {
             feed(&resp, &kick(&c, &format!("klv1r{i:05}"), T0 + i));
         }
-        assert_eq!(sync(&rs, &reqr, &c.addr, true).last, NextStep::Finish { complete: true });
-        let again = sync(&rs, &reqr, &c.addr, true);
+        assert_eq!(sync(&rs, &reqr, &qs, &c.addr, true).last, NextStep::Finish { complete: true, in_sync: false });
+        let again = sync(&rs, &reqr, &qs, &c.addr, true);
         assert_eq!(again.meta_served.len(), 1_100, "all 6 duplicate metadata pages walked");
-        assert_eq!(again.last, NextStep::Finish { complete: false }, "nothing new: not re-marked complete");
+        assert_eq!(
+            again.last,
+            NextStep::Finish { complete: false, in_sync: true },
+            "nothing new: not re-marked complete, but verified in sync (a throttle state)"
+        );
         assert_converged(&rs, &qs);
+    }
+
+    // ---------------------------------------------------------------
+    // In-sync evidence (l2-node 0.141.0): a throttle state, never COMPLETE.
+    // ---------------------------------------------------------------
+    const IN_SYNC: NextStep = NextStep::Finish { complete: false, in_sync: true };
+    const NOT_IN_SYNC: NextStep = NextStep::Finish { complete: false, in_sync: false };
+
+    /// A clean walk: one metadata page and one final chat page, every
+    /// envelope a byte-verified duplicate.
+    fn clean_walk(s: &mut SyncSession, final_chat: &PrivateChannelSyncResponse) -> NextStep {
+        s.record_evidence(4, false);
+        assert_eq!(s.advance(&meta_resp(false, None), 4, 0), NextStep::StartChat);
+        s.record_evidence(2, false);
+        s.advance(final_chat, 2, 0)
+    }
+
+    #[test]
+    fn clean_all_duplicate_walk_is_in_sync() {
+        let mut s = SyncSession::default();
+        assert_eq!(clean_walk(&mut s, &chat_resp(false, None)), IN_SYNC);
+        // Also over several chat pages, and with an EMPTY final chat page.
+        let mut s = SyncSession::default();
+        s.record_evidence(4, false);
+        s.advance(&meta_resp(false, None), 4, 0);
+        s.record_evidence(3, false);
+        assert_eq!(s.advance(&chat_resp(true, Some(cc(1))), 3, 0), NextStep::ChatPage(cc(1)));
+        s.record_evidence(0, false);
+        assert_eq!(s.advance(&chat_resp(false, None), 0, 0), IN_SYNC);
+    }
+
+    #[test]
+    fn in_sync_negative_controls() {
+        // Forged duplicate (same msg_id, different bytes) on any page.
+        let mut s = SyncSession::default();
+        s.record_evidence(3, true);
+        s.advance(&meta_resp(false, None), 4, 0);
+        s.record_evidence(2, false);
+        assert_eq!(s.advance(&chat_resp(false, None), 2, 0), NOT_IN_SYNC, "forged duplicate");
+        // A dropped / rejected envelope on the final page.
+        let mut s = SyncSession::default();
+        s.record_evidence(4, false);
+        s.advance(&meta_resp(false, None), 4, 0);
+        s.record_evidence(1, true);
+        assert_eq!(s.advance(&chat_resp(false, None), 1, 0), NOT_IN_SYNC, "dropped/rejected");
+        // Backstop end (unproductive chat pages) — never in sync.
+        let mut s = SyncSession::default();
+        s.record_evidence(4, false);
+        s.advance(&meta_resp(false, None), 4, 0);
+        let mut last = NextStep::StartChat;
+        for i in 1..=10 {
+            s.record_evidence(0, false);
+            last = s.advance(&chat_resp(true, Some(cc(i))), 0, 0);
+            if matches!(last, NextStep::Finish { .. }) {
+                break;
+            }
+        }
+        assert_eq!(last, NOT_IN_SYNC, "backstop end");
+        // A non-advancing chat cursor — never in sync.
+        let mut s = SyncSession::default();
+        s.record_evidence(4, false);
+        s.advance(&meta_resp(false, None), 4, 0);
+        s.advance(&chat_resp(true, Some(cc(3))), 1, 0);
+        assert_eq!(s.advance(&chat_resp(true, Some(cc(3))), 1, 0), NOT_IN_SYNC, "cursor violation");
+        // `has_more` without a cursor ends the session, but not in sync.
+        let mut s = SyncSession::default();
+        assert_eq!(clean_walk(&mut s, &chat_resp(true, None)), NOT_IN_SYNC, "has_more without cursor");
+        // Empty session: no verified duplicate at all.
+        let mut s = SyncSession::default();
+        s.advance(&meta_resp(false, None), 0, 0);
+        assert_eq!(s.advance(&chat_resp(false, None), 0, 0), NOT_IN_SYNC, "empty session");
+        // Legacy responder: no metadata page.
+        let mut s = SyncSession::default();
+        s.record_evidence(5, false);
+        assert_eq!(s.advance(&chat_resp(false, None), 5, 0), NOT_IN_SYNC, "legacy responder");
+        // Accepted content wins over taint: COMPLETE, never in sync.
+        let mut s = SyncSession::default();
+        s.record_evidence(1, true);
+        s.advance(&meta_resp(false, None), 2, 1);
+        assert_eq!(
+            s.advance(&chat_resp(false, None), 0, 0),
+            NextStep::Finish { complete: true, in_sync: false },
+            "Accepted + taint is still COMPLETE"
+        );
+    }
+
+    #[test]
+    fn only_the_first_empty_response_short_circuits() {
+        let empty_final = chat_resp(false, None);
+        assert!(is_empty_first_response(&empty_final, &SyncSession::default()));
+        // After an all-duplicate metadata page (nothing accepted) the empty
+        // final chat page must reach `advance` (→ IN_SYNC), not end early.
+        let mut s = SyncSession::default();
+        s.record_evidence(3, false);
+        s.advance(&meta_resp(false, None), 3, 0);
+        assert!(!is_empty_first_response(&empty_final, &s));
+        assert_eq!(s.advance(&empty_final, 0, 0), IN_SYNC);
+        // A non-empty or has_more first response is never short-circuited.
+        assert!(!is_empty_first_response(&chat_resp(true, Some(cc(1))), &SyncSession::default()));
+        let mut one = chat_resp(false, None);
+        one.envelopes.push(vec![1]);
+        assert!(!is_empty_first_response(&one, &SyncSession::default()));
+    }
+
+    #[test]
+    fn hostile_responder_serving_forged_duplicates_is_neither_complete_nor_in_sync() {
+        let (resp, rs, _d1) = node();
+        let (reqr, qs, _d2) = node();
+        let c = wallet();
+        setup_channel(&rs, &c.addr);
+        setup_channel(&qs, &c.addr);
+        for i in 0..20u64 {
+            feed(&resp, &kick(&c, &format!("klv1f{i:04}"), T0 + i));
+        }
+        for i in 0..5 {
+            feed(&resp, &chat(&c, T0 + 1_000 + i));
+        }
+        assert_eq!(sync(&rs, &reqr, &qs, &c.addr, true).last.clone(), NextStep::Finish { complete: true, in_sync: false });
+        // Positive control: an honest re-walk is verified in sync.
+        assert_eq!(sync(&rs, &reqr, &qs, &c.addr, true).last, IN_SYNC);
+        // Hostile: every envelope keeps its msg_id (so the router answers
+        // `Duplicate` before any signature check) but its bytes differ.
+        let forge = |r: &mut PrivateChannelSyncResponse| {
+            for env in r.envelopes.iter_mut() {
+                let mut e: Envelope = rmp_serde::from_slice(env).unwrap();
+                e.signature = vec![0xAB; 64];
+                *env = rmp_serde::to_vec_named(&e).unwrap();
+            }
+        };
+        let run = sync_with(&rs, &reqr, &qs, &c.addr, true, forge);
+        assert_eq!(run.last, NOT_IN_SYNC, "forged duplicates prove nothing");
+        // A legacy (non-paging) walk of the same in-sync channel: no
+        // metadata phase → never in sync.
+        assert_eq!(sync(&rs, &reqr, &qs, &c.addr, false).last, NOT_IN_SYNC);
     }
 
     #[test]
@@ -2438,7 +2705,7 @@ mod meta_paging_tests {
         setup_channel(&rs, &c.addr);
         setup_channel(&qs, &c.addr);
         feed(&resp, &join(&wallet(), T0));
-        assert_eq!(sync(&rs, &reqr, &c.addr, true).last, NextStep::Finish { complete: true });
+        assert_eq!(sync(&rs, &reqr, &qs, &c.addr, true).last, NextStep::Finish { complete: true, in_sync: false });
     }
 
     #[test]
@@ -2488,6 +2755,6 @@ mod meta_paging_tests {
         assert!(!decoded.meta_paging && !decoded.meta_done && decoded.meta_cursor.is_none());
         // And a new requester reading a legacy response treats it as chat.
         let mut s = SyncSession::default();
-        assert_eq!(s.advance(&r, 1, 1), NextStep::Finish { complete: true });
+        assert_eq!(s.advance(&r, 1, 1), NextStep::Finish { complete: true, in_sync: false });
     }
 }
