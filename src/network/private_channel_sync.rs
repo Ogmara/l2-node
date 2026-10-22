@@ -259,10 +259,48 @@ pub fn build_wallet_auth_claim(network: &str, node_id: &str, wallet: &str, times
     format!("ogmara-private-channel-sync-auth:{network}:{node_id}:{wallet}:{timestamp_ms}")
 }
 
+/// Build the DEVICE-SIGNED private-channel-sync claim string (l2-node
+/// 0.142.0): proves the delegated device key `device_pubkey_hex` (64
+/// lowercase hex chars) authorized `node_id` to backfill the private
+/// channels of `wallet`, the wallet that device is delegated to. Signed by
+/// the DEVICE key (Klever message format). A distinct domain-separation
+/// prefix from `build_wallet_auth_claim`, and it binds the device key
+/// itself, so a wallet-direct claim can never verify as a device claim or
+/// the reverse. Only half of the proof: the wallet's own authorization of
+/// the device is carried separately in [`DeviceAuthProof`].
+pub fn build_device_auth_claim(
+    network: &str,
+    node_id: &str,
+    wallet: &str,
+    device_pubkey_hex: &str,
+    timestamp_ms: u64,
+) -> String {
+    format!("ogmara-private-channel-sync-device-auth:{network}:{node_id}:{wallet}:{device_pubkey_hex}:{timestamp_ms}")
+}
+
+/// The canonical device-delegation claim string a wallet signs to delegate
+/// a device key — byte-identical to the one `router::
+/// verify_device_delegation_claim` and `POST /devices/register` verify.
+pub fn device_delegation_claim_string(
+    network: &str,
+    device_pubkey_hex: &str,
+    wallet: &str,
+    timestamp_ms: u64,
+) -> String {
+    format!("ogmara-device-claim:{network}:{device_pubkey_hex}:{wallet}:{timestamp_ms}")
+}
+
 /// Verify a wallet's private-channel-sync authorization claim against a
-/// SPECIFIC `node_id`. Pure function, zero local-state dependency — mirrors
-/// `dm_sync::verify_wallet_claim` exactly (same structure, different domain
-/// separation string via `build_wallet_auth_claim` above).
+/// SPECIFIC `node_id`. Pure function, zero local-state dependency.
+///
+/// * `claim.device == None` — the WALLET signed
+///   `build_wallet_auth_claim(...)` directly (mirrors
+///   `dm_sync::verify_wallet_claim` with a distinct domain prefix).
+/// * `claim.device == Some(proof)` (l2-node 0.142.0) — the DEVICE signed
+///   `build_device_auth_claim(...)`, AND the wallet signed the device's
+///   delegation claim (`device_delegation_claim_string`). Both signatures
+///   are verified here; device revocation is a storage question and is
+///   checked separately (`device_claim_unrevoked`).
 pub fn verify_wallet_claim(
     claim: &WalletAuthClaim,
     network: &str,
@@ -276,14 +314,364 @@ pub fn verify_wallet_claim(
     if now_ms.abs_diff(claim.timestamp) > WALLET_AUTH_MAX_AGE_SECS.saturating_mul(1000) {
         return false;
     }
-    let Ok(vk) = crate::crypto::address_to_verifying_key(wallet) else {
+    let Ok(wallet_vk) = crate::crypto::address_to_verifying_key(wallet) else {
         return false;
     };
     let Ok(sig) = ed25519_dalek::Signature::from_slice(&claim.signature) else {
         return false;
     };
-    let claim_string = build_wallet_auth_claim(network, node_id, wallet, claim.timestamp);
-    signing::verify_klever_message(&vk, claim_string.as_bytes(), &sig).is_ok()
+    let Some(device) = claim.device.as_ref() else {
+        let claim_string = build_wallet_auth_claim(network, node_id, wallet, claim.timestamp);
+        return signing::verify_klever_message(&wallet_vk, claim_string.as_bytes(), &sig).is_ok();
+    };
+    let Ok(device_pk) = <[u8; 32]>::try_from(device.device_pubkey.as_slice()) else {
+        return false;
+    };
+    let Ok(device_vk) = ed25519_dalek::VerifyingKey::from_bytes(&device_pk) else {
+        return false;
+    };
+    // A wallet cannot "delegate" to itself through this path.
+    if device_vk == wallet_vk {
+        return false;
+    }
+    let Ok(delegation_sig) = ed25519_dalek::Signature::from_slice(&device.delegation_signature) else {
+        return false;
+    };
+    let device_hex = hex::encode(device_pk);
+    let device_claim = build_device_auth_claim(network, node_id, wallet, &device_hex, claim.timestamp);
+    if signing::verify_klever_message(&device_vk, device_claim.as_bytes(), &sig).is_err() {
+        return false;
+    }
+    let delegation = device_delegation_claim_string(network, &device_hex, wallet, device.delegation_timestamp);
+    signing::verify_klever_message(&wallet_vk, delegation.as_bytes(), &delegation_sig).is_ok()
+}
+
+/// Storage half of the device-claim check (l2-node 0.142.0): `true` for a
+/// wallet-direct claim (or none), and for a device claim whose device has
+/// no revocation tombstone at or after the delegation it presents. A
+/// storage error fails CLOSED. Run by a responder only after the per-peer
+/// slot was granted (it touches storage).
+pub fn device_claim_unrevoked(storage: &Storage, claim: Option<&WalletAuthClaim>) -> bool {
+    let Some(device) = claim.and_then(|c| c.device.as_ref()) else {
+        return true;
+    };
+    let Some(device_address) = <[u8; 32]>::try_from(device.device_pubkey.as_slice())
+        .ok()
+        .and_then(|pk| ed25519_dalek::VerifyingKey::from_bytes(&pk).ok())
+        .and_then(|vk| crate::crypto::device_pubkey_to_address(&vk).ok())
+    else {
+        return false;
+    };
+    match storage.get_device_revoked_at(&device_address) {
+        Ok(Some(revoked_at)) => revoked_at < device.delegation_timestamp,
+        Ok(None) => true,
+        Err(_) => false,
+    }
+}
+
+/// Max `IDENTITY_ENVELOPES` DeviceDelegation / DeviceRevocation rows
+/// examined per lookup.
+const DELEGATION_PROOF_SCAN_CAP: usize = 64;
+
+/// One stored, dual-signed `DeviceDelegation` of a device under a wallet:
+/// the wallet's AND the device's Klever-message signature over
+/// `device_delegation_claim_string(network, device_hex, wallet, timestamp)`
+/// (the device signature is its proof-of-possession).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PopDelegation {
+    /// Delegation (envelope) timestamp.
+    pub timestamp: u64,
+    /// Wallet signature (64 bytes).
+    pub wallet_signature: Vec<u8>,
+    /// Device proof-of-possession signature (64 bytes).
+    pub device_signature: Vec<u8>,
+}
+
+/// Newest-first `IDENTITY_ENVELOPES` envelopes of `msg_type` for `wallet`
+/// whose payload names `device_hex` (≤ `DELEGATION_PROOF_SCAN_CAP` rows
+/// examined). Returns `(raw, envelope)` pairs; only envelopes authored by
+/// the wallet itself for `DeviceDelegation`.
+fn wallet_device_envelopes(
+    storage: &Storage,
+    wallet: &str,
+    msg_type: crate::messages::types::MessageType,
+    device_hex: &str,
+) -> Vec<(Vec<u8>, crate::messages::envelope::Envelope)> {
+    use crate::messages::types::{DeviceDelegationPayload, DeviceRevocationPayload, MessageType};
+    let mut prefix = schema::identity_envelope_prefix(wallet);
+    prefix.push(msg_type as u8);
+    let mut start = prefix.clone();
+    start.extend_from_slice(&[0xFF; 40]);
+    let Ok(rows) = storage.reverse_iter_cf(schema::cf::IDENTITY_ENVELOPES, &start, &prefix, DELEGATION_PROOF_SCAN_CAP)
+    else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (key, _) in rows {
+        let Some(msg_id) = key.len().checked_sub(32).and_then(|at| <[u8; 32]>::try_from(&key[at..]).ok()) else {
+            continue;
+        };
+        let Some(raw) = storage.get_message(&msg_id).ok().flatten() else { continue };
+        let Ok(env) = rmp_serde::from_slice::<crate::messages::envelope::Envelope>(&raw) else { continue };
+        if env.msg_type != msg_type {
+            continue;
+        }
+        let named = match msg_type {
+            MessageType::DeviceDelegation => {
+                env.author == wallet
+                    && rmp_serde::from_slice::<DeviceDelegationPayload>(&env.payload)
+                        .is_ok_and(|p| p.device_pub_key.to_ascii_lowercase() == device_hex)
+            }
+            MessageType::DeviceRevocation => rmp_serde::from_slice::<DeviceRevocationPayload>(&env.payload)
+                .is_ok_and(|p| p.device_pub_key.to_ascii_lowercase() == device_hex),
+            _ => false,
+        };
+        if named {
+            out.push((raw, env));
+        }
+    }
+    out
+}
+
+/// `true` when `wallet`'s identity envelopes hold ANY stored
+/// `DeviceDelegation` naming `device_hex` (lowercase), signatures not
+/// re-checked — used only as a KEEP reason by the startup purge, where
+/// older claim formats would fail today's verification.
+///
+/// Relies on an invariant of the router: a `DeviceDelegation` envelope is
+/// only stored in `MESSAGES` / indexed in `IDENTITY_ENVELOPES` after
+/// `verify_device_delegation_claim` accepted both signatures (ingest order
+/// verify → store → index), so an unverified 0x31 envelope never reaches
+/// this index. Do not use it anywhere that must itself prove a delegation —
+/// use `lookup_pop_delegations` there.
+pub fn has_stored_delegation_envelope(storage: &Storage, wallet: &str, device_hex: &str) -> bool {
+    !wallet_device_envelopes(storage, wallet, crate::messages::types::MessageType::DeviceDelegation, device_hex)
+        .is_empty()
+}
+
+/// Stored dual-signed (proof-of-possession) delegations of `device_address`
+/// under `wallet`, newest first, BOTH signatures re-verified. Revocation is
+/// deliberately NOT applied here — callers decide the time window
+/// (`member-proofs` serves historical delegations for envelopes signed
+/// before a revocation, l2-node 0.142.0 W4). Wallet-only sources (a
+/// `/devices/register` row, a chain mapping) never appear: a wallet can
+/// register a device pubkey it does not control, so only a device
+/// co-signature proves the device side.
+pub fn lookup_pop_delegations(
+    storage: &Storage,
+    network: &str,
+    device_address: &str,
+    wallet: &str,
+) -> Vec<PopDelegation> {
+    use crate::messages::types::{DeviceDelegationPayload, MessageType};
+    if !crate::crypto::is_device_address(device_address) {
+        return Vec::new();
+    }
+    let (Ok(device_pk), Ok(wallet_vk)) = (
+        crate::crypto::address_to_pubkey_bytes(device_address),
+        crate::crypto::address_to_verifying_key(wallet),
+    ) else {
+        return Vec::new();
+    };
+    let Ok(device_vk) = ed25519_dalek::VerifyingKey::from_bytes(&device_pk) else {
+        return Vec::new();
+    };
+    let device_hex = hex::encode(device_pk);
+    let mut out = Vec::new();
+    for (_, env) in wallet_device_envelopes(storage, wallet, MessageType::DeviceDelegation, &device_hex) {
+        let Ok(p) = rmp_serde::from_slice::<DeviceDelegationPayload>(&env.payload) else { continue };
+        let Ok(dsig) = hex::decode(&p.device_signature) else { continue };
+        let msg = device_delegation_claim_string(network, &device_hex, wallet, env.timestamp);
+        let ok = |vk: &ed25519_dalek::VerifyingKey, sig: &[u8]| {
+            ed25519_dalek::Signature::from_slice(sig)
+                .is_ok_and(|s| signing::verify_klever_message(vk, msg.as_bytes(), &s).is_ok())
+        };
+        if ok(&wallet_vk, &env.signature) && ok(&device_vk, &dsig) {
+            out.push(PopDelegation {
+                timestamp: env.timestamp,
+                wallet_signature: env.signature.clone(),
+                device_signature: dsig,
+            });
+        }
+    }
+    out
+}
+
+/// Raw stored `DeviceRevocation` envelopes naming `device_address` among
+/// `wallet`'s identity envelopes, newest first (≤ 64 rows examined).
+pub fn lookup_device_revocations(storage: &Storage, device_address: &str, wallet: &str) -> Vec<Vec<u8>> {
+    let Ok(device_pk) = crate::crypto::address_to_pubkey_bytes(device_address) else {
+        return Vec::new();
+    };
+    wallet_device_envelopes(
+        storage,
+        wallet,
+        crate::messages::types::MessageType::DeviceRevocation,
+        &hex::encode(device_pk),
+    )
+    .into_iter()
+    .map(|(raw, _)| raw)
+    .collect()
+}
+
+/// `true` when `device_address` was a delegated device of `wallet` AT
+/// `at_ts`: a proof-of-possession delegation with `ts <= at_ts` exists and
+/// the device's revocation tombstone does not fall in `[ts, at_ts]`
+/// (l2-node 0.142.0 W4 — a member whose join was signed by a since-revoked
+/// device stays verifiable).
+pub fn device_delegated_at(storage: &Storage, network: &str, device_address: &str, wallet: &str, at_ts: u64) -> bool {
+    let revoked_at = match storage.get_device_revoked_at(device_address) {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    lookup_pop_delegations(storage, network, device_address, wallet)
+        .iter()
+        .any(|d| d.timestamp <= at_ts && !revoked_at.is_some_and(|r| r >= d.timestamp && r <= at_ts))
+}
+
+/// Find a wallet-signed delegation proof for device `device_address`
+/// (ogd1…) under `wallet` in this node's storage, for a device-signed
+/// PCHANSYNC claim (whose own device signature already proves possession).
+/// Sources, in order (the plan's "Claim wire format" §1):
+///
+/// 1. the newest stored dual-signed `DeviceDelegation` envelope
+///    (`lookup_pop_delegations`);
+/// 2. the `WALLET_DEVICES` registration row for the device, if its
+///    `wallet_signature` verifies as the WALLET's signature.
+///
+/// Chain-only (`delegateDevice` TX) mappings carry no off-chain signature
+/// and never yield a proof. A device with a revocation tombstone at or
+/// after the candidate's timestamp is skipped. Bounded: ≤ 64 point reads +
+/// decodes and ≤ 129 signature verifications.
+pub fn lookup_device_delegation_proof(
+    storage: &Storage,
+    network: &str,
+    device_address: &str,
+    wallet: &str,
+) -> Option<DeviceAuthProof> {
+    if !crate::crypto::is_device_address(device_address) {
+        return None;
+    }
+    let device_pk = crate::crypto::address_to_pubkey_bytes(device_address).ok()?;
+    let wallet_vk = crate::crypto::address_to_verifying_key(wallet).ok()?;
+    let device_hex = hex::encode(device_pk);
+    let revoked_at = storage.get_device_revoked_at(device_address).ok()?;
+    let live = |ts: u64| revoked_at.is_none_or(|r| r < ts);
+    let proof = |ts: u64, sig: Vec<u8>| DeviceAuthProof {
+        device_pubkey: device_pk.to_vec(),
+        delegation_timestamp: ts,
+        delegation_signature: sig,
+    };
+
+    // 1. Stored dual-signed DeviceDelegation envelopes, newest first.
+    if let Some(d) = lookup_pop_delegations(storage, network, device_address, wallet)
+        .into_iter()
+        .find(|d| live(d.timestamp))
+    {
+        return Some(proof(d.timestamp, d.wallet_signature));
+    }
+
+    // 2. A local registration whose stored signature is the WALLET's.
+    let key = schema::encode_wallet_device_key(wallet, device_address);
+    let claim = storage
+        .get_cf(schema::cf::WALLET_DEVICES, &key)
+        .ok()
+        .flatten()
+        .and_then(|b| rmp_serde::from_slice::<crate::storage::rocks::DeviceClaim>(&b).ok())?;
+    if claim.device_pubkey_hex.to_ascii_lowercase() != device_hex
+        || claim.wallet_address != wallet
+        || !live(claim.registered_at)
+    {
+        return None;
+    }
+    let sig = hex::decode(&claim.wallet_signature).ok().filter(|s| s.len() == 64)?;
+    let s = ed25519_dalek::Signature::from_slice(&sig).ok()?;
+    let msg = device_delegation_claim_string(network, &device_hex, wallet, claim.registered_at);
+    signing::verify_klever_message(&wallet_vk, msg.as_bytes(), &s).ok()?;
+    Some(proof(claim.registered_at, sig))
+}
+
+/// Outcome of [`resolve_client_claim`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClientClaimOutcome {
+    /// A usable claim (wallet-direct, or device-signed with its wallet's
+    /// delegation proof attached).
+    Verified(WalletAuthClaim),
+    /// The device-signed form's own signature verified, but this node has
+    /// no wallet-signed delegation proof for the device (chain-only or K5
+    /// device-signed registration, or a pre-0.142 gossip-only mapping whose
+    /// envelope is gone). Not usable.
+    NoDelegationProof,
+    /// Neither form verified (bad signature, stale, wrong node, malformed).
+    Invalid,
+}
+
+/// Turn a client-supplied pchansync claim (`x-ogmara-pchansync-auth*`
+/// headers / WS `pchansync_*` fields) into a verified, P2P-ready
+/// [`WalletAuthClaim`] for `wallet` (the request's RESOLVED wallet),
+/// signed into THIS node (`node_id`). `signing_address` is the address
+/// that signed the request itself.
+///
+/// Tries the wallet-direct form first; if that fails and the request was
+/// signed by a delegated device (`signing_address` an ogd1 address
+/// resolving to a different `wallet`), tries the device-signed form —
+/// cheap signature check FIRST, storage lookup only after — and attaches
+/// the wallet's delegation proof (`lookup_device_delegation_proof`).
+/// Never an error: an absent/invalid claim only means no backfill is
+/// authorized.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_client_claim(
+    storage: &Storage,
+    network: &str,
+    node_id: &str,
+    wallet: &str,
+    signing_address: &str,
+    timestamp: u64,
+    signature: Vec<u8>,
+    now_ms: u64,
+) -> ClientClaimOutcome {
+    if signature.len() != 64 {
+        return ClientClaimOutcome::Invalid;
+    }
+    let direct = WalletAuthClaim { timestamp, signature, device: None };
+    if verify_wallet_claim(&direct, network, node_id, wallet, now_ms) {
+        return ClientClaimOutcome::Verified(direct);
+    }
+    if signing_address == wallet || !crate::crypto::is_device_address(signing_address) {
+        return ClientClaimOutcome::Invalid;
+    }
+    if now_ms.abs_diff(timestamp) > WALLET_AUTH_MAX_AGE_SECS.saturating_mul(1000) {
+        return ClientClaimOutcome::Invalid;
+    }
+    let Ok(device_vk) = crate::crypto::address_to_verifying_key(signing_address) else {
+        return ClientClaimOutcome::Invalid;
+    };
+    let Ok(sig) = ed25519_dalek::Signature::from_slice(&direct.signature) else {
+        return ClientClaimOutcome::Invalid;
+    };
+    let device_hex = hex::encode(device_vk.to_bytes());
+    let msg = build_device_auth_claim(network, node_id, wallet, &device_hex, timestamp);
+    if signing::verify_klever_message(&device_vk, msg.as_bytes(), &sig).is_err() {
+        return ClientClaimOutcome::Invalid;
+    }
+    let Some(proof) = lookup_device_delegation_proof(storage, network, signing_address, wallet) else {
+        return ClientClaimOutcome::NoDelegationProof;
+    };
+    let claim = WalletAuthClaim { device: Some(proof), ..direct };
+    // Full pure re-check of the assembled claim (both signatures).
+    if verify_wallet_claim(&claim, network, node_id, wallet, now_ms) {
+        ClientClaimOutcome::Verified(claim)
+    } else {
+        ClientClaimOutcome::Invalid
+    }
+}
+
+/// Keep the fresher (larger `timestamp`) of two optional claims.
+pub fn freshest_claim(a: Option<WalletAuthClaim>, b: Option<WalletAuthClaim>) -> Option<WalletAuthClaim> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(if b.timestamp > a.timestamp { b } else { a }),
+        (a, b) => a.or(b),
+    }
 }
 
 // --- Wire types ---
@@ -294,10 +682,36 @@ pub fn verify_wallet_claim(
 /// responder must reject either way (fail closed). Identical shape to
 /// `dm_sync::WalletAuthClaim`; kept as a separate type (not re-exported)
 /// so the two protocols' wire formats never implicitly couple.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WalletAuthClaim {
+    /// Unix-ms timestamp the claim was signed at (freshness, ±300 s).
     pub timestamp: u64,
+    /// Ed25519 signature (64 bytes, Klever message format) — by the WALLET
+    /// over `build_wallet_auth_claim`, or (when `device` is set) by the
+    /// DEVICE over `build_device_auth_claim`.
     pub signature: Vec<u8>,
+    /// Device-signed form (l2-node 0.142.0, additive): the delegated device
+    /// key that produced `signature` plus the wallet's delegation of it.
+    /// `#[serde(default)]` keeps pre-0.142 CBOR decodable (`None`); a
+    /// pre-0.142 responder ignores the field and fails a device claim
+    /// closed (its wallet-direct check cannot pass).
+    #[serde(default)]
+    pub device: Option<DeviceAuthProof>,
+}
+
+/// The wallet's authorization of a device key, carried inside a
+/// device-signed [`WalletAuthClaim`] so any responder can verify it
+/// without trusting (or having) the requester's identity store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceAuthProof {
+    /// The device's Ed25519 public key (32 bytes).
+    pub device_pubkey: Vec<u8>,
+    /// Timestamp of the wallet's delegation claim.
+    pub delegation_timestamp: u64,
+    /// The WALLET's Klever-message signature (64 bytes) over
+    /// `device_delegation_claim_string(network, hex(device_pubkey), wallet,
+    /// delegation_timestamp)`.
+    pub delegation_signature: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1148,7 +1562,7 @@ mod tests {
         let node_id = crate::crypto::compute_node_id(&node_sk.verifying_key());
         let claim_string = build_wallet_auth_claim(network, &node_id, wallet, timestamp_ms);
         let sig = signing::sign_klever_message(wallet_sk, claim_string.as_bytes());
-        WalletAuthClaim { timestamp: timestamp_ms, signature: sig.to_bytes().to_vec() }
+        WalletAuthClaim { timestamp: timestamp_ms, signature: sig.to_bytes().to_vec(), device: None }
     }
 
     /// Open a fresh store and register `wallet` as a member of a genuinely
@@ -2756,5 +3170,348 @@ mod meta_paging_tests {
         // And a new requester reading a legacy response treats it as chat.
         let mut s = SyncSession::default();
         assert_eq!(s.advance(&r, 1, 1), NextStep::Finish { complete: true, in_sync: false });
+    }
+}
+
+#[cfg(test)]
+mod device_claim_tests {
+    //! Device-signed pchansync claims (l2-node 0.142.0): the pure verifier,
+    //! the storage-backed delegation-proof lookup and client-claim
+    //! resolution, and the responder-side revocation check.
+    use super::*;
+    use crate::messages::envelope::{Envelope, PROTOCOL_VERSION};
+    use crate::messages::types::{DelegationPermissions, DeviceDelegationPayload, MessageType};
+    use ed25519_dalek::SigningKey;
+    use tempfile::TempDir;
+
+    const NET: &str = "testnet";
+
+    struct K {
+        sk: SigningKey,
+        addr: String,
+    }
+
+    fn wallet(seed: u8) -> K {
+        let sk = SigningKey::from_bytes(&[seed; 32]);
+        let addr = crate::crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        K { sk, addr }
+    }
+
+    fn device(seed: u8) -> K {
+        let sk = SigningKey::from_bytes(&[seed; 32]);
+        let addr = crate::crypto::device_pubkey_to_address(&sk.verifying_key()).unwrap();
+        K { sk, addr }
+    }
+
+    fn hex_pub(k: &K) -> String {
+        hex::encode(k.sk.verifying_key().to_bytes())
+    }
+
+    fn now() -> u64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64
+    }
+
+    fn node_id() -> String {
+        crate::crypto::compute_node_id(&SigningKey::from_bytes(&[200u8; 32]).verifying_key())
+    }
+
+    fn storage() -> (TempDir, Storage) {
+        let dir = TempDir::new().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        (dir, s)
+    }
+
+    fn device_sig(dev: &K, w: &K, node: &str, ts: u64) -> Vec<u8> {
+        let msg = build_device_auth_claim(NET, node, &w.addr, &hex_pub(dev), ts);
+        signing::sign_klever_message(&dev.sk, msg.as_bytes()).to_bytes().to_vec()
+    }
+
+    fn proof(dev: &K, signer: &K, wallet: &K, dts: u64) -> DeviceAuthProof {
+        let msg = device_delegation_claim_string(NET, &hex_pub(dev), &wallet.addr, dts);
+        DeviceAuthProof {
+            device_pubkey: dev.sk.verifying_key().to_bytes().to_vec(),
+            delegation_timestamp: dts,
+            delegation_signature: signing::sign_klever_message(&signer.sk, msg.as_bytes()).to_bytes().to_vec(),
+        }
+    }
+
+    /// Store a genuine dual-signed DeviceDelegation envelope the way the
+    /// router does (MESSAGES + IDENTITY_ENVELOPES).
+    fn store_delegation(s: &Storage, w: &K, dev: &K, ts: u64) {
+        let claim = device_delegation_claim_string(NET, &hex_pub(dev), &w.addr, ts);
+        let payload = rmp_serde::to_vec_named(&DeviceDelegationPayload {
+            device_pub_key: hex_pub(dev),
+            permissions: DelegationPermissions {
+                can_send_messages: true,
+                can_create_channels: true,
+                can_update_profile: true,
+            },
+            expires_at: None,
+            device_signature: hex::encode(signing::sign_klever_message(&dev.sk, claim.as_bytes()).to_bytes()),
+        })
+        .unwrap();
+        let msg_id = crate::crypto::compute_msg_id(NET, &w.sk.verifying_key().to_bytes(), &payload, ts);
+        let env = Envelope {
+            version: PROTOCOL_VERSION,
+            msg_type: MessageType::DeviceDelegation,
+            msg_id,
+            author: w.addr.clone(),
+            timestamp: ts,
+            lamport_ts: 0,
+            payload,
+            signature: signing::sign_klever_message(&w.sk, claim.as_bytes()).to_bytes().to_vec(),
+            relay_path: vec![],
+        };
+        s.store_message(&msg_id, &rmp_serde::to_vec_named(&env).unwrap()).unwrap();
+        s.put_cf(
+            schema::cf::IDENTITY_ENVELOPES,
+            &schema::encode_identity_envelope_key(&w.addr, MessageType::DeviceDelegation as u8, ts, &msg_id),
+            &[],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn device_claim_verifies_and_every_binding_is_enforced() {
+        let (w, d, x) = (wallet(1), device(2), wallet(3));
+        let node = node_id();
+        let ts = now();
+        let good = WalletAuthClaim {
+            timestamp: ts,
+            signature: device_sig(&d, &w, &node, ts),
+            device: Some(proof(&d, &w, &w, ts - 10_000)),
+        };
+        assert!(verify_wallet_claim(&good, NET, &node, &w.addr, ts));
+        // Bound to the node.
+        assert!(!verify_wallet_claim(&good, NET, "otherNode", &w.addr, ts));
+        // Bound to the network.
+        assert!(!verify_wallet_claim(&good, "mainnet", &node, &w.addr, ts));
+        // Bound to the wallet.
+        assert!(!verify_wallet_claim(&good, NET, &node, &x.addr, ts));
+        // Fresh only.
+        assert!(!verify_wallet_claim(&good, NET, &node, &w.addr, ts + 301_000));
+        // Delegation signed by someone else (forged).
+        let forged = WalletAuthClaim { device: Some(proof(&d, &x, &w, ts - 10_000)), ..good.clone() };
+        assert!(!verify_wallet_claim(&forged, NET, &node, &w.addr, ts));
+        // Another device's key in the proof.
+        let swapped = WalletAuthClaim { device: Some(proof(&device(9), &w, &w, ts - 10_000)), ..good.clone() };
+        assert!(!verify_wallet_claim(&swapped, NET, &node, &w.addr, ts));
+        // A device signature is not a wallet-direct claim, and vice versa.
+        let as_direct = WalletAuthClaim { device: None, ..good.clone() };
+        assert!(!verify_wallet_claim(&as_direct, NET, &node, &w.addr, ts));
+        let wmsg = build_wallet_auth_claim(NET, &node, &w.addr, ts);
+        let wsig = signing::sign_klever_message(&w.sk, wmsg.as_bytes()).to_bytes().to_vec();
+        let direct_with_device = WalletAuthClaim { signature: wsig, ..good.clone() };
+        assert!(!verify_wallet_claim(&direct_with_device, NET, &node, &w.addr, ts));
+        // Malformed lengths.
+        let mut short = good.clone();
+        short.device.as_mut().unwrap().device_pubkey.truncate(31);
+        assert!(!verify_wallet_claim(&short, NET, &node, &w.addr, ts));
+        // The wallet "delegating" to itself is refused.
+        let selfdel = WalletAuthClaim {
+            timestamp: ts,
+            signature: {
+                let msg = build_device_auth_claim(NET, &node, &w.addr, &hex_pub(&w), ts);
+                signing::sign_klever_message(&w.sk, msg.as_bytes()).to_bytes().to_vec()
+            },
+            device: Some(proof(&w, &w, &w, ts)),
+        };
+        assert!(!verify_wallet_claim(&selfdel, NET, &node, &w.addr, ts));
+    }
+
+    #[test]
+    fn old_shape_claims_decode_with_no_device() {
+        #[derive(serde::Serialize)]
+        struct Old {
+            timestamp: u64,
+            signature: Vec<u8>,
+        }
+        let bytes = serde_json::to_vec(&Old { timestamp: 5, signature: vec![1; 64] }).unwrap();
+        let c: WalletAuthClaim = serde_json::from_slice(&bytes).unwrap();
+        assert!(c.device.is_none());
+    }
+
+    #[test]
+    fn resolve_client_claim_wallet_direct_and_device_forms() {
+        let (_dir, s) = storage();
+        let (w, d) = (wallet(11), device(12));
+        let node = node_id();
+        let ts = now();
+        // Wallet-direct.
+        let wmsg = build_wallet_auth_claim(NET, &node, &w.addr, ts);
+        let wsig = signing::sign_klever_message(&w.sk, wmsg.as_bytes()).to_bytes().to_vec();
+        assert!(matches!(
+            resolve_client_claim(&s, NET, &node, &w.addr, &w.addr, ts, wsig, ts),
+            ClientClaimOutcome::Verified(WalletAuthClaim { device: None, .. })
+        ));
+        // Device-signed without any stored delegation → NoDelegationProof.
+        let dsig = device_sig(&d, &w, &node, ts);
+        assert_eq!(
+            resolve_client_claim(&s, NET, &node, &w.addr, &d.addr, ts, dsig.clone(), ts),
+            ClientClaimOutcome::NoDelegationProof
+        );
+        // A device signature over the wrong node → Invalid (cheap reject).
+        let bad = device_sig(&d, &w, "otherNode", ts);
+        assert_eq!(
+            resolve_client_claim(&s, NET, &node, &w.addr, &d.addr, ts, bad, ts),
+            ClientClaimOutcome::Invalid
+        );
+        // With a stored dual-signed delegation → Verified with the proof.
+        store_delegation(&s, &w, &d, ts - 60_000);
+        match resolve_client_claim(&s, NET, &node, &w.addr, &d.addr, ts, dsig.clone(), ts) {
+            ClientClaimOutcome::Verified(c) => {
+                let p = c.device.as_ref().expect("device proof attached");
+                assert_eq!(p.delegation_timestamp, ts - 60_000);
+                assert!(device_claim_unrevoked(&s, Some(&c)));
+            }
+            other => panic!("expected Verified, got {other:?}"),
+        }
+        // Revoked at/after the delegation → no proof any more.
+        s.put_cf(schema::cf::DEVICE_REVOCATIONS, d.addr.as_bytes(), &(ts - 60_000).to_be_bytes()).unwrap();
+        assert_eq!(
+            resolve_client_claim(&s, NET, &node, &w.addr, &d.addr, ts, dsig, ts),
+            ClientClaimOutcome::NoDelegationProof
+        );
+    }
+
+    #[test]
+    fn registration_rows_count_only_with_a_wallet_signature() {
+        let (_dir, s) = storage();
+        let (w, d) = (wallet(21), device(22));
+        let ts = now();
+        let claim = device_delegation_claim_string(NET, &hex_pub(&d), &w.addr, ts);
+        // K5 fallback: the DEVICE signed the claim — not a wallet proof.
+        let mut row = crate::storage::rocks::DeviceClaim {
+            device_address: d.addr.clone(),
+            wallet_address: w.addr.clone(),
+            device_pubkey_hex: hex_pub(&d),
+            wallet_signature: hex::encode(signing::sign_klever_message(&d.sk, claim.as_bytes()).to_bytes()),
+            registered_at: ts,
+        };
+        s.register_device(&row).unwrap();
+        assert!(lookup_device_delegation_proof(&s, NET, &d.addr, &w.addr).is_none());
+        // Gossip-applied rows carry an empty signature.
+        row.wallet_signature = String::new();
+        s.register_device(&row).unwrap();
+        assert!(lookup_device_delegation_proof(&s, NET, &d.addr, &w.addr).is_none());
+        // A genuine wallet-signed registration counts.
+        row.wallet_signature = hex::encode(signing::sign_klever_message(&w.sk, claim.as_bytes()).to_bytes());
+        s.register_device(&row).unwrap();
+        let p = lookup_device_delegation_proof(&s, NET, &d.addr, &w.addr).expect("wallet-signed row");
+        assert_eq!(p.delegation_timestamp, ts);
+        // Never for a wallet address or for another wallet.
+        assert!(lookup_device_delegation_proof(&s, NET, &w.addr, &w.addr).is_none());
+        assert!(lookup_device_delegation_proof(&s, NET, &d.addr, &wallet(23).addr).is_none());
+    }
+
+    #[test]
+    fn freshest_claim_keeps_the_newer() {
+        let c = |ts| WalletAuthClaim { timestamp: ts, signature: vec![0; 64], device: None };
+        assert_eq!(freshest_claim(Some(c(1)), Some(c(2))).unwrap().timestamp, 2);
+        assert_eq!(freshest_claim(Some(c(3)), Some(c(2))).unwrap().timestamp, 3);
+        assert_eq!(freshest_claim(None, Some(c(2))).unwrap().timestamp, 2);
+        assert!(freshest_claim(None, None).is_none());
+    }
+
+    #[test]
+    fn responder_revocation_boundary() {
+        let (_dir, s) = storage();
+        let (w, d) = (wallet(31), device(32));
+        let dts = 1_000_000u64;
+        let claim = WalletAuthClaim { timestamp: dts, signature: vec![0; 64], device: Some(proof(&d, &w, &w, dts)) };
+        assert!(device_claim_unrevoked(&s, Some(&claim)), "no tombstone");
+        assert!(device_claim_unrevoked(&s, None), "no claim");
+        let direct = WalletAuthClaim { device: None, ..claim.clone() };
+        let tomb = |at: u64| s.put_cf(schema::cf::DEVICE_REVOCATIONS, d.addr.as_bytes(), &at.to_be_bytes()).unwrap();
+        tomb(dts - 1);
+        assert!(device_claim_unrevoked(&s, Some(&claim)), "revoked before the delegation (re-delegated)");
+        tomb(dts);
+        assert!(!device_claim_unrevoked(&s, Some(&claim)), "revoked AT the delegation ts");
+        tomb(dts + 1);
+        assert!(!device_claim_unrevoked(&s, Some(&claim)), "revoked after the delegation");
+        assert!(device_claim_unrevoked(&s, Some(&direct)), "wallet-direct claims are unaffected");
+    }
+
+    #[test]
+    fn pop_delegations_require_both_signatures() {
+        let (_dir, s) = storage();
+        let (w, d, x) = (wallet(41), device(42), wallet(43));
+        let ts = now();
+        let store = |wallet_signer: &SigningKey, device_signer: &SigningKey, at: u64| {
+            let claim = device_delegation_claim_string(NET, &hex_pub(&d), &w.addr, at);
+            let payload = rmp_serde::to_vec_named(&DeviceDelegationPayload {
+                device_pub_key: hex_pub(&d),
+                permissions: DelegationPermissions {
+                    can_send_messages: true,
+                    can_create_channels: true,
+                    can_update_profile: true,
+                },
+                expires_at: None,
+                device_signature: hex::encode(signing::sign_klever_message(device_signer, claim.as_bytes()).to_bytes()),
+            })
+            .unwrap();
+            let msg_id = crate::crypto::compute_msg_id(NET, &w.sk.verifying_key().to_bytes(), &payload, at);
+            let env = Envelope {
+                version: PROTOCOL_VERSION,
+                msg_type: MessageType::DeviceDelegation,
+                msg_id,
+                author: w.addr.clone(),
+                timestamp: at,
+                lamport_ts: 0,
+                payload,
+                signature: signing::sign_klever_message(wallet_signer, claim.as_bytes()).to_bytes().to_vec(),
+                relay_path: vec![],
+            };
+            s.store_message(&msg_id, &rmp_serde::to_vec_named(&env).unwrap()).unwrap();
+            s.put_cf(
+                schema::cf::IDENTITY_ENVELOPES,
+                &schema::encode_identity_envelope_key(&w.addr, MessageType::DeviceDelegation as u8, at, &msg_id),
+                &[],
+            )
+            .unwrap();
+        };
+        // Bad DEVICE signature (signed by another key) → excluded.
+        store(&w.sk, &x.sk, ts - 3);
+        // Bad WALLET signature → excluded.
+        store(&x.sk, &d.sk, ts - 2);
+        assert!(lookup_pop_delegations(&s, NET, &d.addr, &w.addr).is_empty());
+        assert!(lookup_device_delegation_proof(&s, NET, &d.addr, &w.addr).is_none());
+        assert!(has_stored_delegation_envelope(&s, &w.addr, &hex_pub(&d)), "existence only, for the purge");
+        // Control: both genuine → included.
+        store(&w.sk, &d.sk, ts - 1);
+        let got = lookup_pop_delegations(&s, NET, &d.addr, &w.addr);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].timestamp, ts - 1);
+    }
+
+    #[test]
+    fn resolve_client_claim_final_recheck_rejects_a_self_delegation() {
+        // The device key IS the wallet key (ogd1 form of the same key): its
+        // own signature and a "delegation" both verify individually and the
+        // proof lookup succeeds, but the final `verify_wallet_claim` re-check
+        // refuses a wallet delegating to itself.
+        let (_dir, s) = storage();
+        let w = wallet(51);
+        let d = K {
+            sk: SigningKey::from_bytes(&[51; 32]),
+            addr: crate::crypto::device_pubkey_to_address(&w.sk.verifying_key()).unwrap(),
+        };
+        let node = node_id();
+        let ts = now();
+        let claim = device_delegation_claim_string(NET, &hex_pub(&d), &w.addr, ts - 1_000);
+        s.register_device(&crate::storage::rocks::DeviceClaim {
+            device_address: d.addr.clone(),
+            wallet_address: w.addr.clone(),
+            device_pubkey_hex: hex_pub(&d),
+            wallet_signature: hex::encode(signing::sign_klever_message(&w.sk, claim.as_bytes()).to_bytes()),
+            registered_at: ts - 1_000,
+        })
+        .unwrap();
+        assert!(lookup_device_delegation_proof(&s, NET, &d.addr, &w.addr).is_some(), "lookup alone accepts");
+        let sig = device_sig(&d, &w, &node, ts);
+        assert_eq!(
+            resolve_client_claim(&s, NET, &node, &w.addr, &d.addr, ts, sig, ts),
+            ClientClaimOutcome::Invalid
+        );
     }
 }

@@ -12,6 +12,9 @@ pub mod auth;
 pub mod dashboard;
 pub mod media_fallback;
 pub mod media_limiter;
+pub mod member_proofs;
+#[cfg(test)]
+mod phase2_fixtures;
 pub mod rate_limit_key;
 pub mod routes;
 pub mod state;
@@ -251,6 +254,12 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
         .route(
             "/api/v1/channels/{channel_id}/federate",
             post(routes::federate_channel),
+        )
+        // Phase-2 "verify before cover" (l2-node 0.142.0): raw signed
+        // membership evidence for up to 100 members, verified client-side.
+        .route(
+            "/api/v1/channels/{channel_id}/member-proofs",
+            post(member_proofs::get_member_proofs),
         )
         // Private channel key distribution
         .route(

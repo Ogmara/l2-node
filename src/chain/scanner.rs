@@ -1153,34 +1153,50 @@ impl ChainScanner {
                 let bytes = serde_json::to_vec(&record)?;
                 self.storage.put_cf(cf::DELEGATIONS, &key, &bytes)?;
 
-                // Also write DEVICE_WALLET_MAP so identity resolution works.
-                // Convert hex pubkey → ogd1 device address for the map key.
-                if let Ok(pubkey_bytes) = hex::decode(&device_key) {
-                    if pubkey_bytes.len() == 32 {
-                        if let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(
-                            &<[u8; 32]>::try_from(pubkey_bytes.as_slice()).unwrap(),
-                        ) {
-                            if let Ok(device_address) = crate::crypto::device_pubkey_to_address(&vk) {
-                                let _ = self.storage.put_cf(
-                                    cf::DEVICE_WALLET_MAP,
-                                    device_address.as_bytes(),
-                                    user.as_bytes(),
-                                );
-                                // Also write reverse mapping
-                                let wd_key = crate::storage::schema::encode_wallet_device_key(
-                                    &user, &device_address,
-                                );
-                                let claim = serde_json::json!({
-                                    "device_address": device_address,
-                                    "wallet_address": user,
-                                    "created_at": timestamp,
-                                });
-                                if let Ok(claim_bytes) = serde_json::to_vec(&claim) {
-                                    let _ = self.storage.put_cf(
-                                        cf::WALLET_DEVICES, &wd_key, &claim_bytes,
-                                    );
-                                }
-                            }
+                // Also map the device so identity resolution works — through
+                // `IdentityResolver::register_device` (l2-node 0.142.0, W3), so
+                // the cross-wallet hijack guard applies to chain delegations
+                // too, and never for a device whose revocation tombstone is at
+                // or after this delegation (chain timestamps are SECONDS,
+                // tombstones milliseconds). The row carries no off-chain
+                // signature (`wallet_signature` empty): it is never a portable
+                // delegation proof.
+                let device = hex::decode(&device_key)
+                    .ok()
+                    .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+                    .and_then(|pk| ed25519_dalek::VerifyingKey::from_bytes(&pk).ok())
+                    .and_then(|vk| crate::crypto::device_pubkey_to_address(&vk).ok());
+                if let Some(device_address) = device {
+                    let ts_ms = timestamp.saturating_mul(1000);
+                    let revoked = self
+                        .storage
+                        .get_device_revoked_at(&device_address)?
+                        .is_some_and(|r| r >= ts_ms);
+                    // Never downgrade an existing wallet-signed
+                    // `/devices/register` row (same wallet) to an empty
+                    // signature — the mapping already exists.
+                    let has_signed_row = self
+                        .storage
+                        .get_cf(cf::WALLET_DEVICES, &crate::storage::schema::encode_wallet_device_key(&user, &device_address))?
+                        .and_then(|b| rmp_serde::from_slice::<crate::storage::rocks::DeviceClaim>(&b).ok())
+                        .is_some_and(|c| !c.wallet_signature.is_empty() && c.wallet_address == user)
+                        && self.storage.resolve_wallet(&device_address)?.as_deref() == Some(user.as_str());
+                    if revoked {
+                        warn!(user = %user, device = %device_address, "on-chain delegation predates a revocation; mapping not written");
+                    } else if has_signed_row {
+                        debug!(user = %user, device = %device_address, "on-chain delegation: signed registration row kept");
+                    } else {
+                        let claim = crate::storage::rocks::DeviceClaim {
+                            device_address: device_address.clone(),
+                            wallet_address: user.clone(),
+                            device_pubkey_hex: device_key.to_ascii_lowercase(),
+                            wallet_signature: String::new(),
+                            registered_at: ts_ms,
+                        };
+                        if let Err(e) = crate::storage::identity::IdentityResolver::new(self.storage.clone())
+                            .register_device(&claim)
+                        {
+                            warn!(user = %user, device = %device_address, error = %e, "on-chain delegation mapping refused");
                         }
                     }
                 }
@@ -3370,5 +3386,93 @@ mod channel_verification_tests {
         assert_eq!(row["creator"], serde_json::json!("klv1squatter"));
         let vstate = storage.read_channel_verification_state(55);
         assert_eq!(vstate.creator_verified_at, None);
+    }
+}
+
+#[cfg(test)]
+mod device_delegation_event_tests {
+    //! l2-node 0.142.0 (W3): on-chain `delegateDevice` goes through the
+    //! hijack guard and honours revocation tombstones.
+    use super::*;
+
+    fn scanner(storage: Storage) -> ChainScanner {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        ChainScanner::new(
+            KleverConfig::default(),
+            storage,
+            tx,
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            crate::config::ChannelVerifyConfig::default(),
+        )
+        .unwrap()
+    }
+
+    fn event(user: &str, device_hex: &str, ts_secs: u64) -> ScEvent {
+        ScEvent::DeviceDelegated {
+            user: user.to_string(),
+            device_key: device_hex.to_string(),
+            permissions: 7,
+            expires_at: 0,
+            timestamp: ts_secs,
+        }
+    }
+
+    #[tokio::test]
+    async fn chain_delegation_respects_hijack_guard_and_revocation() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let sc = scanner(storage.clone());
+        let addr = |seed: u8| {
+            let sk = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+            crate::crypto::pubkey_to_address(&sk.verifying_key()).unwrap()
+        };
+        let dev = |seed: u8| {
+            let vk = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]).verifying_key();
+            (hex::encode(vk.to_bytes()), crate::crypto::device_pubkey_to_address(&vk).unwrap())
+        };
+        let (a, b) = (addr(1), addr(2));
+        let (h1, d1) = dev(10);
+        sc.handle_event(event(&a, &h1, 1_000)).await.unwrap();
+        assert_eq!(storage.resolve_wallet(&d1).unwrap().as_deref(), Some(a.as_str()));
+        assert_eq!(storage.list_devices(&a).unwrap().len(), 1, "msgpack DeviceClaim row");
+        // Another wallet cannot take the device over via the chain.
+        sc.handle_event(event(&b, &h1, 2_000)).await.unwrap();
+        assert_eq!(storage.resolve_wallet(&d1).unwrap().as_deref(), Some(a.as_str()));
+        // A delegation at/before a revocation tombstone is not mapped.
+        let (h2, d2) = dev(11);
+        storage.put_cf(cf::DEVICE_REVOCATIONS, d2.as_bytes(), &5_000_000u64.to_be_bytes()).unwrap();
+        sc.handle_event(event(&a, &h2, 5_000)).await.unwrap();
+        assert_eq!(storage.resolve_wallet(&d2).unwrap(), None);
+        sc.handle_event(event(&a, &h2, 5_001)).await.unwrap();
+        assert_eq!(storage.resolve_wallet(&d2).unwrap().as_deref(), Some(a.as_str()), "newer re-delegation");
+        // A wallet-signed registration row is not downgraded by the chain.
+        let (h3, d3) = dev(12);
+        let signed = crate::storage::rocks::DeviceClaim {
+            device_address: d3.clone(),
+            wallet_address: a.clone(),
+            device_pubkey_hex: h3.clone(),
+            wallet_signature: "ab".repeat(64),
+            registered_at: 7,
+        };
+        storage.register_device(&signed).unwrap();
+        sc.handle_event(event(&a, &h3, 6_000)).await.unwrap();
+        let rows = storage.list_devices(&a).unwrap();
+        let row = rows.iter().find(|c| c.device_address == d3).unwrap();
+        assert_eq!(row.wallet_signature, "ab".repeat(64));
+        assert_eq!(row.registered_at, 7);
+        // An existing EMPTY-signature (chain/gossip) row is still refreshed.
+        let (h4, d4) = dev(13);
+        storage
+            .register_device(&crate::storage::rocks::DeviceClaim {
+                device_address: d4.clone(),
+                wallet_address: a.clone(),
+                device_pubkey_hex: h4.clone(),
+                wallet_signature: String::new(),
+                registered_at: 7,
+            })
+            .unwrap();
+        sc.handle_event(event(&a, &h4, 8_000)).await.unwrap();
+        let rows = storage.list_devices(&a).unwrap();
+        assert_eq!(rows.iter().find(|c| c.device_address == d4).unwrap().registered_at, 8_000_000);
     }
 }

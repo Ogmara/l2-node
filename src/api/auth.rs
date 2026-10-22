@@ -29,6 +29,20 @@
 //! THIS node to backfill its DM history. Absent/malformed headers never
 //! reject the request; they only gate whether dm-sync backfill can fire for
 //! it. See `network::dm_sync` for the full design.
+//!
+//! And two more OPTIONAL headers (l2-node 0.142.0, private-channel-sync
+//! backfill authorization):
+//!   X-Ogmara-PchanSync-Auth-Timestamp: unix timestamp in milliseconds
+//!   X-Ogmara-PchanSync-Auth:           base64(Ed25519 signature)
+//! Either the WALLET's signature over
+//! `private_channel_sync::build_wallet_auth_claim(...)`, or — for a request
+//! signed by a delegated device key (extension/K5 accounts) — that DEVICE's
+//! signature over `private_channel_sync::build_device_auth_claim(...)`, which
+//! the node pairs with a wallet-signed delegation proof from its own storage
+//! (`private_channel_sync::resolve_client_claim`). At most one verified claim
+//! per wallet per `PCHANSYNC_CLAIM_MIN_INTERVAL_SECS` reaches the network
+//! task, which caches it and re-evaluates the wallet's federated private
+//! channels for backfill. Like dm-sync, never rejects the request.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -58,6 +72,120 @@ pub const MAX_AUTH_FUTURE_SKEW_MS: u64 = 5_000;
 /// bloat the replay cache key.
 const MIN_NONCE_LEN: usize = 16;
 const MAX_NONCE_LEN: usize = 128;
+
+/// Minimum interval between two pchansync claims of the same wallet that
+/// are verified and forwarded to the network task (l2-node 0.142.0).
+pub const PCHANSYNC_CLAIM_MIN_INTERVAL_SECS: u64 = 60;
+
+/// A client-supplied, not yet verified private-channel-sync claim.
+#[derive(Debug, Clone)]
+pub struct RawPchanSyncClaim {
+    /// Signed timestamp (unix ms).
+    pub timestamp: u64,
+    /// Decoded signature bytes (length checked by the verifier).
+    pub signature: Vec<u8>,
+}
+
+/// Decode a pchansync claim from its two transport fields (REST header
+/// values or WS frame fields). `None` when either is absent or malformed.
+/// The base64 input is length-capped before decoding (a 64-byte signature
+/// is 88 chars).
+pub fn decode_pchansync_claim(timestamp: Option<u64>, sig_b64: Option<&str>) -> Option<RawPchanSyncClaim> {
+    let (timestamp, sig_b64) = timestamp.zip(sig_b64)?;
+    if sig_b64.len() > 128 {
+        return None;
+    }
+    let signature =
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, sig_b64).ok()?;
+    Some(RawPchanSyncClaim { timestamp, signature })
+}
+
+/// Read `x-ogmara-pchansync-auth-timestamp` + `x-ogmara-pchansync-auth`.
+pub fn pchansync_claim_from_headers(headers: &axum::http::HeaderMap) -> Option<RawPchanSyncClaim> {
+    decode_pchansync_claim(
+        headers
+            .get("x-ogmara-pchansync-auth-timestamp")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok()),
+        headers.get("x-ogmara-pchansync-auth").and_then(|v| v.to_str().ok()),
+    )
+}
+
+/// Verify a raw pchansync claim for an authenticated caller and, when it
+/// verifies, forward it to the network task (`channel_id: None` — cache +
+/// re-evaluate the wallet's federated private channels).
+///
+/// * Nothing happens for a wallet with no `LOCAL_CHANNEL_FED` row on this
+///   node (nothing to backfill; one prefix seek, before any signature work).
+/// * `AppState::pchansync_claim_gate` (per wallet, 60 s) is set ONLY by a
+///   fully verified, forwarded claim; while it holds, claims are skipped.
+/// * A device-signed claim whose own signature verified but has no
+///   wallet-signed delegation proof here is remembered per (wallet,
+///   device) in `AppState::pchansync_no_proof` (60 s), so the storage
+///   lookup is not repeated on every request — without gating the wallet's
+///   other devices or its wallet-direct claims.
+///
+/// Owned values only across the awaits. The storage reads are synchronous
+/// and bounded (≤ 64 delegation rows).
+pub async fn process_pchansync_claim(
+    state: &AppState,
+    wallet: &str,
+    signing_address: &str,
+    raw: Option<RawPchanSyncClaim>,
+) {
+    use crate::network::private_channel_sync::{resolve_client_claim, ClientClaimOutcome};
+    let Some(raw) = raw else { return };
+    let mut fed_prefix = wallet.as_bytes().to_vec();
+    fed_prefix.push(0xFF);
+    let has_federated = state
+        .storage
+        .count_prefix_cf(crate::storage::schema::cf::LOCAL_CHANNEL_FED, &fed_prefix, 1)
+        .is_ok_and(|n| n > 0);
+    if !has_federated {
+        return;
+    }
+    if state.pchansync_claim_gate.get(wallet).await.is_some() {
+        return;
+    }
+    let negative_key = format!("{wallet}|{signing_address}");
+    if signing_address != wallet && state.pchansync_no_proof.get(&negative_key).await.is_some() {
+        return;
+    }
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+    let outcome = resolve_client_claim(
+        &state.storage,
+        &state.klever_network,
+        &state.node_id,
+        wallet,
+        signing_address,
+        raw.timestamp,
+        raw.signature,
+        now,
+    );
+    match outcome {
+        ClientClaimOutcome::Verified(claim) => {
+            state.pchansync_claim_gate.insert(wallet.to_string(), ()).await;
+            let _ = state
+                .private_channel_sync_tx
+                .send(crate::network::PrivateChannelSyncTrigger {
+                    channel_id: None,
+                    wallet: wallet.to_string(),
+                    wallet_claim: Some(claim),
+                });
+        }
+        ClientClaimOutcome::NoDelegationProof => {
+            state.pchansync_no_proof.insert(negative_key, ()).await;
+            tracing::debug!(
+                address = %wallet,
+                device = %signing_address,
+                "device-signed pchansync claim: no wallet-signed delegation proof on this node; ignoring"
+            );
+        }
+        ClientClaimOutcome::Invalid => {
+            tracing::debug!(address = %wallet, "pchansync claim present but failed verification; ignoring");
+        }
+    }
+}
 
 /// Authenticated user info extracted from headers and identity resolution.
 #[derive(Debug, Clone)]
@@ -91,6 +219,8 @@ pub async fn auth_middleware(mut req: Request, next: Next) -> Response {
             if let Err(msg) = claim_nonce(&app_state, &user.signing_address, &nonce).await {
                 return (StatusCode::UNAUTHORIZED, msg).into_response();
             }
+            let pchansync = pchansync_claim_from_headers(req.headers());
+            process_pchansync_claim(&app_state, &user.address, &user.signing_address, pchansync).await;
             req.extensions_mut().insert(user);
             next.run(req).await
         }
@@ -112,6 +242,8 @@ pub async fn optional_auth_middleware(mut req: Request, next: Next) -> Response 
     // authenticated. Owned-values-only across the await keeps the future Send.
     if let Ok((user, nonce)) = extract_and_verify(&req, &app_state) {
         if claim_nonce(&app_state, &user.signing_address, &nonce).await.is_ok() {
+            let pchansync = pchansync_claim_from_headers(req.headers());
+            process_pchansync_claim(&app_state, &user.address, &user.signing_address, pchansync).await;
             req.extensions_mut().insert(user);
         }
     }

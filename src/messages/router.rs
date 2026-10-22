@@ -565,6 +565,18 @@ impl MessageRouter {
         self
     }
 
+    /// Test access to the router's storage handle.
+    #[cfg(test)]
+    pub(crate) fn storage(&self) -> &Storage {
+        &self.storage
+    }
+
+    /// Test access to the router's identity resolver.
+    #[cfg(test)]
+    pub(crate) fn identity(&self) -> &IdentityResolver {
+        &self.identity
+    }
+
     /// Process a raw message through the full pipeline.
     ///
     /// Returns the routing result indicating whether the message was
@@ -2699,7 +2711,7 @@ impl MessageRouter {
     /// resolves to. An unknown device key resolves to itself, so an
     /// unresolvable signer can never match a creator/moderator wallet —
     /// the callers' identity comparisons fail closed.
-    fn verify_embedded_envelope(
+    pub(crate) fn verify_embedded_envelope(
         &self,
         raw: &[u8],
         expected: MessageType,
@@ -4835,12 +4847,23 @@ impl MessageRouter {
                                         tomb.to_string().as_bytes(),
                                     )?;
                                 }
+                                // l2-node 0.142.0: keep the wallet's binding
+                                // signature (verified at `verify_device_enc_claim`
+                                // over `ogmara-enc-bind:{network}:{enc_pub}:
+                                // {device_id}:{wallet}:{ts}`) so `GET enc-keys`
+                                // can serve it and clients can verify the key is
+                                // wallet-bound without trusting this node.
+                                // Additive JSON field: older rows simply lack it.
                                 let record = serde_json::json!({
                                     "enc_pub": enc_pub,
                                     "device_id": device_id,
                                     "created_at": envelope.timestamp,
                                     "ts": envelope.timestamp,
                                     "revoked": false,
+                                    "wallet_signature": base64::Engine::encode(
+                                        &base64::engine::general_purpose::STANDARD,
+                                        &envelope.signature,
+                                    ),
                                 });
                                 self.storage.put_cf(
                                     schema::cf::DEVICE_ENC_KEYS,

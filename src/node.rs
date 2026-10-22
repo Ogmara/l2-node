@@ -155,6 +155,295 @@ fn reap_expired_notifications(storage: &Storage, retention_days: u64) {
     }
 }
 
+/// Rows examined per page by `purge_unauthorized_device_registrations`.
+const DEVICE_PURGE_PAGE: usize = 5_000;
+
+/// Every claim string a `/devices/register` signature may have been made
+/// over, across protocol history: the current network-bound form
+/// (`ogmara-device-claim:{network}:{hex}:{wallet}:{ts}`, 0.86.0+) and the
+/// older form without `{network}`, each with the lowercase hex (0.52.1+),
+/// the ALL-UPPERCASE hex, and the hex exactly as stored. Before 0.52.1 the
+/// node verified the claim over the client's original-case hex but STORED
+/// it lowercased, so the original case is lost: uppercase covers clients
+/// that sent uppercase; a MIXED-case original cannot be reconstructed —
+/// such rows verify neither way and are kept (and counted) by the purge.
+fn historical_device_claim_strings(network: &str, hex: &str, wallet: &str, ts: u64) -> Vec<String> {
+    let mut hexes = vec![hex.to_ascii_lowercase(), hex.to_ascii_uppercase()];
+    if !hexes.iter().any(|h| h == hex) {
+        hexes.push(hex.to_string());
+    }
+    let mut out = Vec::with_capacity(hexes.len() * 2);
+    for h in &hexes {
+        out.push(format!("ogmara-device-claim:{network}:{h}:{wallet}:{ts}"));
+        out.push(format!("ogmara-device-claim:{h}:{wallet}:{ts}"));
+    }
+    out
+}
+
+/// One-time migration (l2-node 0.142.0, B1): purge device→wallet mappings
+/// that only the removed K5 fallback of `POST /devices/register` could have
+/// created. That fallback accepted a claim signed by the DEVICE itself, so
+/// any fresh key could map itself to any wallet and then authenticate as it.
+///
+/// Deliberately NARROW (round-2 B1-R2-1): a row is purged ONLY when its
+/// stored `wallet_signature` POSITIVELY verifies as the DEVICE key signing
+/// its own claim — in any historical claim format
+/// (`historical_device_claim_strings`) — AND it does not also verify as the
+/// wallet in any format, AND the device has no stored `DeviceDelegation`
+/// (0x31) envelope from the wallet and no on-chain `DELEGATIONS` row
+/// (active or not — kept conservatively). A row that verifies neither way
+/// (an unknown/older format) is KEPT: a purge must never delete a mapping
+/// it cannot prove came from the fallback. Rows with an empty signature
+/// (gossip/chain) and non-`DeviceClaim` (JSON chain) rows are left alone.
+///
+/// The reverse row is deleted by the key actually iterated; the forward
+/// `DEVICE_WALLET_MAP` entry only while it still points at that wallet.
+/// Runs in `Node::init` after the `IDENTITY_ENVELOPES` backfill and before
+/// any `IdentityResolver` (and its cache) exists. Returns the number of
+/// purged rows and sets the sentinel once the whole CF was walked.
+pub(crate) fn purge_unauthorized_device_registrations(storage: &Storage, network: &str) -> Result<usize> {
+    use crate::storage::schema::{cf, encode_delegation_key};
+    let verifies = |vk: &ed25519_dalek::VerifyingKey, sig: &ed25519_dalek::Signature, msgs: &[String]| {
+        msgs.iter().any(|m| crypto::signing::verify_klever_message(vk, m.as_bytes(), sig).is_ok())
+    };
+    let mut purge: Vec<(Vec<u8>, String, String)> = Vec::new();
+    // Rows whose signature verifies NEITHER as the device nor as the
+    // wallet in any known format (e.g. a pre-0.52.1 mixed-case claim):
+    // kept, but counted so the residual is visible in the boot log.
+    let mut unprovable = 0usize;
+    let mut after: Option<Vec<u8>> = None;
+    loop {
+        let page = match &after {
+            None => storage.prefix_iter_cf(cf::WALLET_DEVICES, &[], DEVICE_PURGE_PAGE)?,
+            Some(k) => storage.prefix_iter_cf_after(cf::WALLET_DEVICES, k, &[], DEVICE_PURGE_PAGE)?,
+        };
+        let done = page.len() < DEVICE_PURGE_PAGE;
+        for (key, value) in &page {
+            let Ok(claim) = rmp_serde::from_slice::<crate::storage::rocks::DeviceClaim>(value) else {
+                continue; // JSON chain-scanner row or undecodable: leave alone
+            };
+            if claim.wallet_signature.is_empty() {
+                continue; // gossip/chain-applied: no client signature to judge
+            }
+            let Some(sig) = hex::decode(&claim.wallet_signature)
+                .ok()
+                .and_then(|b| ed25519_dalek::Signature::from_slice(&b).ok())
+            else {
+                continue; // malformed: cannot PROVE it is device-signed — keep
+            };
+            let msgs = historical_device_claim_strings(
+                network,
+                &claim.device_pubkey_hex,
+                &claim.wallet_address,
+                claim.registered_at,
+            );
+            let device_signed = crypto::address_to_verifying_key(&claim.device_address)
+                .is_ok_and(|vk| verifies(&vk, &sig, &msgs));
+            let wallet_signed = crypto::address_to_verifying_key(&claim.wallet_address)
+                .is_ok_and(|vk| verifies(&vk, &sig, &msgs));
+            if !device_signed && !wallet_signed {
+                unprovable += 1;
+                continue;
+            }
+            if !device_signed || wallet_signed {
+                continue;
+            }
+            let hex_lc = claim.device_pubkey_hex.to_ascii_lowercase();
+            let has_envelope = crate::network::private_channel_sync::has_stored_delegation_envelope(
+                storage,
+                &claim.wallet_address,
+                &hex_lc,
+            );
+            let has_chain = [hex_lc.clone(), claim.device_pubkey_hex.clone()].iter().any(|h| {
+                storage
+                    .get_cf(cf::DELEGATIONS, &encode_delegation_key(&claim.wallet_address, h))
+                    .ok()
+                    .flatten()
+                    .is_some()
+            });
+            if has_envelope || has_chain {
+                continue;
+            }
+            purge.push((key.clone(), claim.device_address, claim.wallet_address));
+        }
+        if done {
+            break;
+        }
+        after = page.last().map(|(k, _)| k.clone());
+    }
+    for (key, device, wallet) in &purge {
+        if storage.resolve_wallet(device)?.as_deref() == Some(wallet.as_str()) {
+            storage.delete_cf(cf::DEVICE_WALLET_MAP, device.as_bytes())?;
+        }
+        storage.delete_cf(cf::WALLET_DEVICES, key)?;
+        warn!(%device, %wallet, "purged device mapping registered by a device-signed claim (removed K5 fallback)");
+    }
+    if unprovable > 0 {
+        warn!(
+            unprovable,
+            "device-registration purge: rows whose signature verifies in no known claim format were KEPT \
+             (e.g. pre-0.52.1 mixed-case hex); they cannot be proven fallback-created"
+        );
+    }
+    storage.put_cf(cf::NODE_STATE, state_keys::DEVICE_REGISTRATIONS_PURGED_V1, &1u64.to_be_bytes())?;
+    Ok(purge.len())
+}
+
+#[cfg(test)]
+mod device_purge_tests {
+    use super::*;
+    use crate::storage::rocks::DeviceClaim;
+    use crate::storage::schema::cf;
+
+    struct K {
+        sk: ed25519_dalek::SigningKey,
+        wallet: String,
+        device: String,
+        hex: String,
+    }
+
+    fn key(seed: u8) -> K {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        K {
+            wallet: crypto::pubkey_to_address(&sk.verifying_key()).unwrap(),
+            device: crypto::device_pubkey_to_address(&sk.verifying_key()).unwrap(),
+            hex: hex::encode(sk.verifying_key().to_bytes()),
+            sk,
+        }
+    }
+
+    /// A row for device `d` under wallet `w`, signed by `signer` over `msg`.
+    fn row(d: &K, w: &K, signer: &ed25519_dalek::SigningKey, msg: &str, hex: &str) -> DeviceClaim {
+        DeviceClaim {
+            device_address: d.device.clone(),
+            wallet_address: w.wallet.clone(),
+            device_pubkey_hex: hex.to_string(),
+            wallet_signature: hex::encode(crypto::signing::sign_klever_message(signer, msg.as_bytes()).to_bytes()),
+            registered_at: 1000,
+        }
+    }
+
+    fn current(d: &K, w: &K) -> String {
+        format!("ogmara-device-claim:testnet:{}:{}:1000", d.hex, w.wallet)
+    }
+
+    fn old(d: &K, w: &K) -> String {
+        format!("ogmara-device-claim:{}:{}:1000", d.hex, w.wallet)
+    }
+
+    fn mapped(s: &Storage, d: &K) -> Option<String> {
+        s.resolve_wallet(&d.device).unwrap()
+    }
+
+    #[test]
+    fn purges_only_rows_provably_signed_by_the_device_itself() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let w = key(1);
+        let devs: Vec<K> = (2..=10).map(key).collect();
+        // Kept: wallet-signed, current format.
+        s.register_device(&row(&devs[0], &w, &w.sk, &current(&devs[0], &w), &devs[0].hex)).unwrap();
+        // Kept: wallet-signed, OLD no-network format (pre-0.86.0).
+        s.register_device(&row(&devs[1], &w, &w.sk, &old(&devs[1], &w), &devs[1].hex)).unwrap();
+        // Kept: pre-0.52.1 state — the wallet signed over UPPERCASE hex but
+        // the node stored the hex lowercased.
+        let upper = devs[2].hex.to_ascii_uppercase();
+        let old_upper = format!("ogmara-device-claim:{upper}:{}:1000", w.wallet);
+        s.register_device(&row(&devs[2], &w, &w.sk, &old_upper, &devs[2].hex)).unwrap();
+        // Purged: device-signed, current format.
+        s.register_device(&row(&devs[3], &w, &devs[3].sk, &current(&devs[3], &w), &devs[3].hex)).unwrap();
+        // Purged: device-signed, old format.
+        s.register_device(&row(&devs[4], &w, &devs[4].sk, &old(&devs[4], &w), &devs[4].hex)).unwrap();
+        // Kept: unknown signature (verifies neither way).
+        s.register_device(&row(&devs[5], &w, &key(99).sk, &current(&devs[5], &w), &devs[5].hex)).unwrap();
+        // Kept: gossip row (empty signature).
+        let mut g = row(&devs[6], &w, &devs[6].sk, &current(&devs[6], &w), &devs[6].hex);
+        g.wallet_signature.clear();
+        s.register_device(&g).unwrap();
+        // Kept: device-signed but an on-chain delegation exists.
+        s.register_device(&row(&devs[7], &w, &devs[7].sk, &current(&devs[7], &w), &devs[7].hex)).unwrap();
+        s.put_cf(cf::DELEGATIONS, &crate::storage::schema::encode_delegation_key(&w.wallet, &devs[7].hex), b"{}")
+            .unwrap();
+        // Kept: device-signed but a stored DeviceDelegation envelope exists.
+        s.register_device(&row(&devs[8], &w, &devs[8].sk, &current(&devs[8], &w), &devs[8].hex)).unwrap();
+        let payload = rmp_serde::to_vec_named(&crate::messages::types::DeviceDelegationPayload {
+            device_pub_key: devs[8].hex.clone(),
+            permissions: crate::messages::types::DelegationPermissions {
+                can_send_messages: true,
+                can_create_channels: true,
+                can_update_profile: true,
+            },
+            expires_at: None,
+            device_signature: String::new(),
+        })
+        .unwrap();
+        let msg_id = crypto::compute_msg_id("testnet", &w.sk.verifying_key().to_bytes(), &payload, 900);
+        let env = crate::messages::envelope::Envelope {
+            version: 2,
+            msg_type: crate::messages::types::MessageType::DeviceDelegation,
+            msg_id,
+            author: w.wallet.clone(),
+            timestamp: 900,
+            lamport_ts: 0,
+            payload,
+            signature: vec![0; 64],
+            relay_path: vec![],
+        };
+        s.store_message(&msg_id, &rmp_serde::to_vec_named(&env).unwrap()).unwrap();
+        s.put_cf(
+            cf::IDENTITY_ENVELOPES,
+            &crate::storage::schema::encode_identity_envelope_key(&w.wallet, 0x31, 900, &msg_id),
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(purge_unauthorized_device_registrations(&s, "testnet").unwrap(), 2);
+        for (i, d) in devs.iter().enumerate().take(9) {
+            let want = if i == 3 || i == 4 { None } else { Some(w.wallet.clone()) };
+            assert_eq!(mapped(&s, d), want, "device {i}");
+        }
+        assert_eq!(s.list_devices(&w.wallet).unwrap().len(), 7);
+        assert!(s.get_stat(state_keys::DEVICE_REGISTRATIONS_PURGED_V1).unwrap() > 0, "sentinel set");
+    }
+
+    #[test]
+    fn uppercase_pre_0_52_1_rows_are_judged_and_mixed_case_rows_are_kept() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let (w, d1, d2) = (key(1), key(2), key(3));
+        // Device-signed over UPPERCASE hex, stored lowercase → purged.
+        let up = d1.hex.to_ascii_uppercase();
+        s.register_device(&row(&d1, &w, &d1.sk, &format!("ogmara-device-claim:{up}:{}:1000", w.wallet), &d1.hex))
+            .unwrap();
+        // Wallet-signed over MIXED-case hex, stored lowercase → unprovable
+        // (original case lost), KEPT.
+        let mixed: String = d2
+            .hex
+            .chars()
+            .enumerate()
+            .map(|(i, c)| if i % 2 == 0 { c.to_ascii_uppercase() } else { c })
+            .collect();
+        s.register_device(&row(&d2, &w, &w.sk, &format!("ogmara-device-claim:{mixed}:{}:1000", w.wallet), &d2.hex))
+            .unwrap();
+        assert_eq!(purge_unauthorized_device_registrations(&s, "testnet").unwrap(), 1);
+        assert_eq!(mapped(&s, &d1), None);
+        assert_eq!(mapped(&s, &d2), Some(w.wallet.clone()));
+    }
+
+    #[test]
+    fn forward_map_is_deleted_only_when_it_points_at_the_same_wallet() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let (w, other, d) = (key(1), key(2), key(3));
+        s.register_device(&row(&d, &w, &d.sk, &current(&d, &w), &d.hex)).unwrap();
+        // The forward map has since moved to another wallet (stale reverse row).
+        s.put_cf(cf::DEVICE_WALLET_MAP, d.device.as_bytes(), other.wallet.as_bytes()).unwrap();
+        assert_eq!(purge_unauthorized_device_registrations(&s, "testnet").unwrap(), 1);
+        assert_eq!(mapped(&s, &d), Some(other.wallet.clone()), "other wallet's mapping untouched");
+        assert!(s.list_devices(&w.wallet).unwrap().is_empty(), "stale reverse row deleted by its own key");
+    }
+}
+
 /// Pure planning step for the device-enc-key tombstone reaper (audit final
 /// pre-mainnet W15): given a batch of `DEVICE_ENC_KEYS` rows and a cutoff,
 /// returns the keys to delete (capped at `batch_limit`) and the next cursor
@@ -661,6 +950,22 @@ impl Node {
                 warn!(error = %e, "Failed to backfill IDENTITY_ENVELOPES index");
             }
         }
+
+        // l2-node 0.142.0 (B1): purge device mappings only the removed K5
+        // device-signed registration fallback could have created. Runs
+        // after the IDENTITY_ENVELOPES backfill (its dual-signed envelopes keep a row)
+        // and before any IdentityResolver exists (no cache to invalidate).
+        // Skipped (sentinel NOT set) until the IDENTITY_ENVELOPES index
+        // exists — its envelopes are one of the purge's keep-reasons.
+        if storage.get_stat(state_keys::DEVICE_REGISTRATIONS_PURGED_V1)? == 0
+            && storage.get_stat(state_keys::IDENTITY_ENVELOPES_INDEXED)? > 0
+        {
+            match purge_unauthorized_device_registrations(&storage, config.network_id()) {
+                Ok(n) => info!(purged = n, "Device-registration purge (removed K5 fallback) complete"),
+                Err(e) => warn!(error = %e, "Device-registration purge failed; will retry next start"),
+            }
+        }
+
 
         // Backfill CHANNEL_META_MSGS from MESSAGES (one-time, P-3b channel
         // metadata) so the channel-history reconcile can serve channel

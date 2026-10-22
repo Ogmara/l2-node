@@ -552,6 +552,11 @@ pub mod state_keys {
     /// is capped per boot; the sentinel is only written when a pass finds
     /// nothing left, so a large CF drains across restarts.
     pub const CHANNEL_INVITES_PURGED: &[u8] = b"migration_channel_invites_purged";
+    /// Sentinel: set to 1 after the one-time purge of device mappings that
+    /// only the removed K5 device-signed `/devices/register` fallback could
+    /// have created (l2-node 0.142.0, `node::purge_unauthorized_device_
+    /// registrations`).
+    pub const DEVICE_REGISTRATIONS_PURGED_V1: &[u8] = b"migration_device_registrations_purged_v1";
     /// Sentinel: set to 1 after CHANNEL_EDIT_DELETE_MSGS/DM_EDIT_DELETE_MSGS/
     /// NEWS_EDIT_DELETE are backfilled from existing MESSAGES (audit final
     /// pre-mainnet W6, l2-node 0.95.0+).

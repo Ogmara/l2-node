@@ -493,6 +493,21 @@ pub struct AppState {
     /// budget; self-expires so a later, genuinely-new action with the
     /// same encoded arguments isn't blocked forever.
     pub governance_inflight: Cache<String, ()>,
+    /// pchansync claim gate (l2-node 0.142.0): key = RESOLVED wallet. Set
+    /// ONLY once a client-supplied private-channel-sync claim fully
+    /// VERIFIED (and was forwarded) on an authenticated REST request or WS
+    /// connect; while present (60 s TTL) further claims from that wallet
+    /// are not even signature-checked, so at most one claim per wallet per
+    /// minute reaches the network task. The key is the authenticated
+    /// caller's own wallet — nobody can gate someone else's claims.
+    pub pchansync_claim_gate: Cache<String, ()>,
+    /// Negative cache for device-signed pchansync claims whose device
+    /// signature verified but for which this node holds no wallet-signed
+    /// delegation proof (l2-node 0.142.0, W1). Key = `"{wallet}|{signing
+    /// device}"`, 60 s TTL, 100k entries: skips the storage lookup for that
+    /// exact (wallet, device) pair without gating the wallet's other
+    /// devices or its wallet-direct claims.
+    pub pchansync_no_proof: Cache<String, ()>,
 }
 
 /// Cached `registration/info` body + age tracking (v0.126.0).
@@ -723,6 +738,18 @@ impl AppState {
             .time_to_live(std::time::Duration::from_secs(60))
             .max_capacity(1_000)
             .build();
+        let pchansync_claim_gate: Cache<String, ()> = Cache::builder()
+            .time_to_live(std::time::Duration::from_secs(
+                crate::api::auth::PCHANSYNC_CLAIM_MIN_INTERVAL_SECS,
+            ))
+            .max_capacity(100_000)
+            .build();
+        let pchansync_no_proof: Cache<String, ()> = Cache::builder()
+            .time_to_live(std::time::Duration::from_secs(
+                crate::api::auth::PCHANSYNC_CLAIM_MIN_INTERVAL_SECS,
+            ))
+            .max_capacity(100_000)
+            .build();
         Self {
             storage,
             router,
@@ -781,6 +808,8 @@ impl AppState {
             governance_submit,
             anchor_wallet_address,
             governance_inflight,
+            pchansync_claim_gate,
+            pchansync_no_proof,
             alerts_config,
             bots_config,
             alert_test_tx,

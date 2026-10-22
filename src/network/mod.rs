@@ -1294,12 +1294,31 @@ pub struct DmSubscribeEvent {
 /// THIS node. Sent over `private_channel_sync_tx`. Closes the F2 backfill
 /// gap (l2-node 0.138.0+) — see `network::private_channel_sync`'s module
 /// doc for the full design.
+///
+/// l2-node 0.142.0: also sent by the REST auth middleware and the WS auth
+/// frame when a request carries a valid pchansync claim (`channel_id:
+/// None`, at most once per wallet per 60 s — `api::auth`): the network task
+/// then caches the claim and re-evaluates every private channel the wallet
+/// federated here, through the normal attempt throttle (no bypass).
 #[derive(Debug, Clone)]
 pub struct PrivateChannelSyncTrigger {
-    pub channel_id: u64,
+    /// `Some` = one federated channel (federate call; a fresh claim may
+    /// bypass the attempt throttle down to its 60 s floor). `None` = every
+    /// private channel in `LOCAL_CHANNEL_FED` for `wallet`, never bypassing.
+    pub channel_id: Option<u64>,
+    /// The wallet whose membership/backfill this concerns.
     pub wallet: String,
+    /// The verified claim, if any (wallet-direct or device-signed).
     pub wallet_claim: Option<private_channel_sync::WalletAuthClaim>,
 }
+
+/// Max private channels re-evaluated for one wallet per claim refresh
+/// (`PrivateChannelSyncTrigger { channel_id: None, .. }`).
+pub const MAX_CLAIM_REFRESH_CHANNELS: usize = 256;
+
+/// Max wallets with a cached private-channel-sync claim (oldest/expired
+/// evicted first when full).
+pub const MAX_CACHED_PCHANSYNC_CLAIMS: usize = 100_000;
 
 /// Cross-channel smuggling defense (Security Audit W1, 0.47.0).
 /// Returns `true` iff the envelope's payload claims the same
@@ -3011,7 +3030,13 @@ impl NetworkService {
                     // A wallet federated a private channel here — lazily
                     // backfill its missed history (gated on a wallet-signed
                     // authorization, mirroring dm-sync's audit-W5 gate).
-                    self.maybe_trigger_private_channel_sync(event.channel_id, &event.wallet, event.wallet_claim);
+                    match event.channel_id {
+                        Some(channel_id) => {
+                            let bypass = event.wallet_claim.is_some();
+                            self.maybe_trigger_private_channel_sync(channel_id, &event.wallet, event.wallet_claim, bypass);
+                        }
+                        None => self.refresh_private_channel_sync_claim(&event.wallet, event.wallet_claim),
+                    }
                 }
                 Some(channel_id) = channel_rx.recv() => {
                     // Code Audit W2 (0.47.0): route chain-discovered
@@ -4905,6 +4930,93 @@ impl NetworkService {
         }
     }
 
+    /// Cache `claim` as `wallet`'s private-channel-sync claim unless a
+    /// FRESHER one is already cached (l2-node 0.142.0 — "freshest per
+    /// wallet"). Bounded at `MAX_CACHED_PCHANSYNC_CLAIMS`: when full, claims
+    /// already past `WALLET_AUTH_MAX_AGE_SECS` (useless anyway) are dropped
+    /// first, then the single oldest one — never the whole map (N3).
+    fn cache_private_channel_sync_claim(&mut self, wallet: &str, claim: private_channel_sync::WalletAuthClaim) {
+        if let Some(existing) = self.private_channel_sync_wallet_claims.get(wallet) {
+            if existing.timestamp >= claim.timestamp {
+                return;
+            }
+        } else if self.private_channel_sync_wallet_claims.len() >= MAX_CACHED_PCHANSYNC_CLAIMS {
+            let now = now_ms();
+            let max_age = private_channel_sync::WALLET_AUTH_MAX_AGE_SECS.saturating_mul(1000);
+            self.private_channel_sync_wallet_claims
+                .retain(|_, c| now.abs_diff(c.timestamp) <= max_age);
+            if self.private_channel_sync_wallet_claims.len() >= MAX_CACHED_PCHANSYNC_CLAIMS {
+                if let Some(oldest) = self
+                    .private_channel_sync_wallet_claims
+                    .iter()
+                    .min_by_key(|(_, c)| c.timestamp)
+                    .map(|(k, _)| k.clone())
+                {
+                    self.private_channel_sync_wallet_claims.remove(&oldest);
+                }
+            }
+        }
+        self.private_channel_sync_wallet_claims.insert(wallet.to_string(), claim);
+    }
+
+    /// `true` when `claim` is still usable now: inside the freshness window
+    /// and (for a device-signed claim) its device not revoked at or after
+    /// the presented delegation (N5).
+    fn private_channel_sync_claim_usable(&self, claim: &private_channel_sync::WalletAuthClaim) -> bool {
+        now_ms().abs_diff(claim.timestamp)
+            <= private_channel_sync::WALLET_AUTH_MAX_AGE_SECS.saturating_mul(1000)
+            && private_channel_sync::device_claim_unrevoked(&self.storage, Some(claim))
+    }
+
+    /// A wallet presented a fresh, verified pchansync claim on an
+    /// authenticated REST request or WS connect (l2-node 0.142.0, at most
+    /// once per wallet per 60 s — gated in the API layer). Cache it and
+    /// re-evaluate every private channel the wallet federated here
+    /// (`LOCAL_CHANNEL_FED`, at most `MAX_CLAIM_REFRESH_CHANNELS`) through
+    /// the normal attempt throttle and completion due-gate — never the
+    /// federate bypass, so an active client cannot defeat the 0.141.0
+    /// in-sync recheck interval.
+    fn refresh_private_channel_sync_claim(
+        &mut self,
+        wallet: &str,
+        claim: Option<private_channel_sync::WalletAuthClaim>,
+    ) {
+        let Some(claim) = claim else { return };
+        if !self.private_channel_sync_config.enabled {
+            return;
+        }
+        let mut prefix = wallet.as_bytes().to_vec();
+        prefix.push(0xFF);
+        let rows = match self.storage.prefix_iter_cf(
+            crate::storage::schema::cf::LOCAL_CHANNEL_FED,
+            &prefix,
+            MAX_CLAIM_REFRESH_CHANNELS,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(error = %e, %wallet, "private-channel-sync claim refresh: LOCAL_CHANNEL_FED read failed");
+                return;
+            }
+        };
+        // N3: a wallet with nothing federated here has nothing to backfill —
+        // its claim is not cached at all.
+        if rows.is_empty() {
+            return;
+        }
+        self.cache_private_channel_sync_claim(wallet, claim);
+        for (key, _) in rows {
+            let Some(cid) = key
+                .get(prefix.len()..)
+                .and_then(|b| <[u8; 8]>::try_from(b).ok())
+                .map(u64::from_be_bytes)
+            else {
+                continue;
+            };
+            // `None`: the cached (freshest) claim is picked up inside.
+            self.maybe_trigger_private_channel_sync(cid, wallet, None, false);
+        }
+    }
+
     /// One-time-per-due-window bounded backfill of a single private
     /// channel's missed history for `wallet` (closes the F2 backfill gap,
     /// l2-node 0.138.0+). Fires when a wallet federates a channel here
@@ -4915,11 +5027,16 @@ impl NetworkService {
     /// (`private_channel_sync::sign_request`), AND carries a wallet-signed
     /// claim proving the wallet authorized THIS node — without one, no
     /// responder will serve anything (mirrors dm-sync's audit-W5 gate).
+    ///
+    /// `bypass` (l2-node 0.142.0): only a `federate_channel` call carrying a
+    /// fresh claim passes `true` (the 60 s-floored throttle bypass); the
+    /// periodic sweep and the auth-path claim refresh pass `false`.
     fn maybe_trigger_private_channel_sync(
         &mut self,
         channel_id: u64,
         wallet: &str,
         wallet_claim: Option<private_channel_sync::WalletAuthClaim>,
+        bypass: bool,
     ) {
         if !self.private_channel_sync_config.enabled {
             return;
@@ -4961,7 +5078,7 @@ impl NetworkService {
         let now_instant = Instant::now();
         if !self
             .private_channel_sync_throttle
-            .ready_or_bypass(&key, now_instant, wallet_claim.is_some())
+            .ready_or_bypass(&key, now_instant, bypass && wallet_claim.is_some())
         {
             self.private_channel_sync_triggered.remove(&key);
             return;
@@ -4971,9 +5088,17 @@ impl NetworkService {
         // authorization — prefer one attached to THIS call, else fall
         // back to one cached from an earlier federation this session.
         // Without one, retry on a later federation call once one arrives.
-        let Some(claim) = wallet_claim.or_else(|| {
-            self.private_channel_sync_wallet_claims.get(wallet).cloned()
-        }) else {
+        // (l2-node 0.142.0: the FRESHER of the two — an older attached
+        // claim must not shadow a newer cached one.)
+        // N5: only USABLE claims compete (fresh, device not revoked), so a
+        // fresher claim of a since-revoked device never shadows a valid one.
+        let attached = wallet_claim.filter(|c| self.private_channel_sync_claim_usable(c));
+        let cached = self
+            .private_channel_sync_wallet_claims
+            .get(wallet)
+            .filter(|c| self.private_channel_sync_claim_usable(c))
+            .cloned();
+        let Some(claim) = private_channel_sync::freshest_claim(attached, cached) else {
             self.private_channel_sync_triggered.remove(&key);
             return;
         };
@@ -5068,11 +5193,7 @@ impl NetworkService {
         // response/failure path, so it self-limits to roughly the number
         // of in-flight (wallet, channel) pairs rather than growing
         // unboundedly over the process lifetime.
-        if self.private_channel_sync_wallet_claims.len() >= 100_000 {
-            self.private_channel_sync_wallet_claims.clear();
-        }
-        self.private_channel_sync_wallet_claims
-            .insert(wallet.to_string(), claim.clone());
+        self.cache_private_channel_sync_claim(wallet, claim.clone());
 
         // l2-node 0.141.0: stamp the attempt HERE — after every early
         // return above (no claim, stale claim, no candidates), right before
@@ -5198,10 +5319,15 @@ impl NetworkService {
                 // Gate 5 (membership + genuinely-private-channel), the one
                 // storage-touching check — re-verified fresh on every
                 // request, never cached.
+                // l2-node 0.142.0: a device-signed claim's device must not
+                // be revoked on this node (storage half of the claim check).
                 if !private_channel_sync::verify_request_membership(
                     &self.storage,
                     request.channel_id,
                     &request.wallet,
+                ) || !private_channel_sync::device_claim_unrevoked(
+                    &self.storage,
+                    request.wallet_claim.as_ref(),
                 ) {
                     warn!(peer = %peer, channel_id = request.channel_id, wallet = %request.wallet, "private-channel-sync: membership check failed");
                     if let Err(e) = self
@@ -5551,7 +5677,7 @@ impl NetworkService {
                         <[u8; 8]>::try_from(&key[sep + 1..]),
                     ) {
                         let channel_id = u64::from_be_bytes(channel_id_bytes);
-                        self.maybe_trigger_private_channel_sync(channel_id, wallet, None);
+                        self.maybe_trigger_private_channel_sync(channel_id, wallet, None, false);
                     }
                 }
             }
@@ -8914,11 +9040,11 @@ mod backfill_throttle_tests {
             .put_cf(schema::cf::CHANNELS, &pcid.to_be_bytes(), br#"{"channel_type":2,"history_visibility":1}"#)
             .unwrap();
         let w = wallet();
-        svc.maybe_trigger_private_channel_sync(pcid, &w.addr, None);
+        svc.maybe_trigger_private_channel_sync(pcid, &w.addr, None, false);
         let key = (w.addr.clone(), pcid);
         assert!(svc.private_channel_sync_throttle.entry(&key).is_none(), "no stamp without a claim");
-        let claim = private_channel_sync::WalletAuthClaim { timestamp: now_ms(), signature: vec![0; 64] };
-        svc.maybe_trigger_private_channel_sync(pcid, &w.addr, Some(claim));
+        let claim = private_channel_sync::WalletAuthClaim { timestamp: now_ms(), signature: vec![0; 64], device: None };
+        svc.maybe_trigger_private_channel_sync(pcid, &w.addr, Some(claim), true);
         assert!(svc.private_channel_sync_throttle.entry(&key).is_none(), "no stamp without candidates");
         assert!(!svc.private_channel_sync_triggered.contains(&key));
         assert_eq!(svc.counters.private_sync_attempts_dispatched.load(Ordering::Relaxed), 0);
@@ -9012,19 +9138,19 @@ mod backfill_throttle_tests {
             .unwrap();
         let w = wallet();
         let key = (w.addr.clone(), pcid);
-        let claim = || private_channel_sync::WalletAuthClaim { timestamp: now_ms(), signature: vec![0; 64] };
+        let claim = || private_channel_sync::WalletAuthClaim { timestamp: now_ms(), signature: vec![0; 64], device: None };
         let sent = |a: &NetworkService| a.pending_private_channel_sync_requests.len();
         // First federate call: dispatched and stamped.
-        a.maybe_trigger_private_channel_sync(pcid, &w.addr, Some(claim()));
+        a.maybe_trigger_private_channel_sync(pcid, &w.addr, Some(claim()), true);
         assert_eq!(sent(&a), 1);
         assert_eq!(a.private_channel_sync_throttle.entry(&key).unwrap().failures, 1);
         a.pending_private_channel_sync_requests.clear();
         a.private_channel_sync_triggered.clear();
         // A sweep (cached claim, no bypass) is held back by the gate…
-        a.maybe_trigger_private_channel_sync(pcid, &w.addr, None);
+        a.maybe_trigger_private_channel_sync(pcid, &w.addr, None, false);
         assert_eq!(sent(&a), 0, "throttle gate holds the sweep");
         // …and so is a fresh federate call inside the 60 s floor.
-        a.maybe_trigger_private_channel_sync(pcid, &w.addr, Some(claim()));
+        a.maybe_trigger_private_channel_sync(pcid, &w.addr, Some(claim()), true);
         assert_eq!(sent(&a), 0, "federate bypass refused inside the floor");
         assert_eq!(a.private_channel_sync_throttle.entry(&key).unwrap().failures, 1);
         // Positive control: once the stamp is 60 s old, a fresh federate
@@ -9032,11 +9158,78 @@ mod backfill_throttle_tests {
         let mut e = a.private_channel_sync_throttle.entry(&key).unwrap();
         e.last_dispatch = e.last_dispatch.and_then(|t| t.checked_sub(Duration::from_secs(61)));
         a.private_channel_sync_throttle.set_entry_for_test(key.clone(), e);
-        a.maybe_trigger_private_channel_sync(pcid, &w.addr, None);
+        a.maybe_trigger_private_channel_sync(pcid, &w.addr, None, false);
         assert_eq!(sent(&a), 0, "sweep still held: the bypass needs a fresh claim");
-        a.maybe_trigger_private_channel_sync(pcid, &w.addr, Some(claim()));
+        // l2-node 0.142.0: an auth-path claim refresh never bypasses, even
+        // with a fresh claim and the floor passed.
+        a.storage
+            .put_cf(
+                schema::cf::LOCAL_CHANNEL_FED,
+                &schema::encode_local_channel_fed_key(&w.addr, pcid),
+                &now_ms().to_be_bytes(),
+            )
+            .unwrap();
+        a.refresh_private_channel_sync_claim(&w.addr, Some(claim()));
+        assert_eq!(sent(&a), 0, "claim refresh is throttled, never a bypass");
+        assert!(a.private_channel_sync_wallet_claims.contains_key(&w.addr), "claim cached");
+        a.maybe_trigger_private_channel_sync(pcid, &w.addr, Some(claim()), true);
         assert_eq!(sent(&a), 1, "fresh federate claim past the floor bypasses");
         assert_eq!(a.private_channel_sync_throttle.entry(&key).unwrap().failures, 2);
+    }
+
+    #[tokio::test]
+    async fn revoked_or_expired_claims_are_not_usable() {
+        let (svc, _d) = service().await;
+        let dev_sk = ed25519_dalek::SigningKey::from_bytes(&[77u8; 32]);
+        let dev_addr = crate::crypto::device_pubkey_to_address(&dev_sk.verifying_key()).unwrap();
+        let now = now_ms();
+        let device_claim = private_channel_sync::WalletAuthClaim {
+            timestamp: now,
+            signature: vec![0; 64],
+            device: Some(private_channel_sync::DeviceAuthProof {
+                device_pubkey: dev_sk.verifying_key().to_bytes().to_vec(),
+                delegation_timestamp: now - 10_000,
+                delegation_signature: vec![0; 64],
+            }),
+        };
+        let direct = private_channel_sync::WalletAuthClaim { device: None, ..device_claim.clone() };
+        assert!(svc.private_channel_sync_claim_usable(&device_claim));
+        svc.storage
+            .put_cf(schema::cf::DEVICE_REVOCATIONS, dev_addr.as_bytes(), &(now - 5_000).to_be_bytes())
+            .unwrap();
+        assert!(!svc.private_channel_sync_claim_usable(&device_claim), "device revoked after its delegation");
+        assert!(svc.private_channel_sync_claim_usable(&direct));
+        let stale = private_channel_sync::WalletAuthClaim { timestamp: now - 400_000, ..direct };
+        assert!(!svc.private_channel_sync_claim_usable(&stale), "expired");
+    }
+
+    #[tokio::test]
+    async fn claim_refresh_dispatches_when_the_gate_is_open_and_keeps_the_freshest() {
+        let (mut a, _da, _b, _db) = connected_pair().await;
+        let pcid = (1u64 << 40) + 11;
+        a.storage
+            .put_cf(schema::cf::CHANNELS, &pcid.to_be_bytes(), br#"{"channel_type":2,"history_visibility":1}"#)
+            .unwrap();
+        let w = wallet();
+        a.storage
+            .put_cf(
+                schema::cf::LOCAL_CHANNEL_FED,
+                &schema::encode_local_channel_fed_key(&w.addr, pcid),
+                &now_ms().to_be_bytes(),
+            )
+            .unwrap();
+        let at = |ts| private_channel_sync::WalletAuthClaim { timestamp: ts, signature: vec![0; 64], device: None };
+        let now = now_ms();
+        a.refresh_private_channel_sync_claim(&w.addr, Some(at(now)));
+        assert_eq!(a.pending_private_channel_sync_requests.len(), 1, "open gate: dispatched");
+        // An OLDER claim never replaces the cached fresher one.
+        a.refresh_private_channel_sync_claim(&w.addr, Some(at(now - 10_000)));
+        assert_eq!(a.private_channel_sync_wallet_claims[&w.addr].timestamp, now);
+        // No claim → nothing happens.
+        a.pending_private_channel_sync_requests.clear();
+        a.private_channel_sync_triggered.clear();
+        a.refresh_private_channel_sync_claim(&w.addr, None);
+        assert_eq!(a.pending_private_channel_sync_requests.len(), 0);
     }
 
     #[tokio::test]

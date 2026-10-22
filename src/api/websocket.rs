@@ -35,6 +35,23 @@ struct WsAuthMessage {
     dm_sync_timestamp: Option<u64>,
     #[serde(default)]
     dm_sync_signature: Option<String>, // base64-encoded
+    /// Private-channel-sync backfill authorization (l2-node 0.142.0,
+    /// optional): wallet-direct, or device-signed by the frame's `address`
+    /// when that is a delegated device — see `api::auth`'s module doc.
+    #[serde(default)]
+    pchansync_timestamp: Option<u64>,
+    #[serde(default)]
+    pchansync_signature: Option<String>, // base64-encoded
+}
+
+/// What a verified WS auth frame yields.
+struct WsAuthResult {
+    /// The address that signed the frame (wallet or device).
+    address: String,
+    /// Raw dm-sync claim (verified later against the resolved wallet).
+    dm_sync_claim: Option<crate::network::dm_sync::WalletAuthClaim>,
+    /// Raw pchansync claim (verified later against the resolved wallet).
+    pchansync_claim: Option<super::auth::RawPchanSyncClaim>,
 }
 
 /// The fixed path the WS auth signature is bound to.
@@ -45,10 +62,7 @@ const WS_AUTH_PATH: &str = "/api/v1/ws";
 /// Binds `network` + `node_id` (this node's own) and a single-use `nonce`
 /// exactly like the REST verifier (audit 2026-06-07 host-binding), so a
 /// captured WS-auth frame is neither fleet-portable nor same-node replayable.
-async fn verify_ws_auth(
-    text: &str,
-    state: &AppState,
-) -> Result<(String, Option<crate::network::dm_sync::WalletAuthClaim>), String> {
+async fn verify_ws_auth(text: &str, state: &AppState) -> Result<WsAuthResult, String> {
     let auth: WsAuthMessage =
         serde_json::from_str(text).map_err(|e| format!("invalid auth JSON: {}", e))?;
 
@@ -97,7 +111,16 @@ async fn verify_ws_auth(
         },
     );
 
-    Ok((auth.address, wallet_claim_raw))
+    let pchansync_claim = super::auth::decode_pchansync_claim(
+        auth.pchansync_timestamp,
+        auth.pchansync_signature.as_deref(),
+    );
+
+    Ok(WsAuthResult {
+        address: auth.address,
+        dm_sync_claim: wallet_claim_raw,
+        pchansync_claim,
+    })
 }
 
 // --- WebSocket message types ---
@@ -161,10 +184,10 @@ async fn handle_authenticated_ws(socket: WebSocket, state: Arc<AppState>) {
 
     // Parse and verify auth message
     let auth_result = verify_ws_auth(&auth_text, &state).await;
-    let (auth_address, wallet_claim_raw) = match auth_result {
-        Ok((addr, claim)) => {
-            debug!(address = %addr, "WebSocket client authenticated");
-            (addr, claim)
+    let (auth_address, wallet_claim_raw, pchansync_raw) = match auth_result {
+        Ok(r) => {
+            debug!(address = %r.address, "WebSocket client authenticated");
+            (r.address, r.dm_sync_claim, r.pchansync_claim)
         }
         Err(e) => {
             let _ = sender
@@ -214,6 +237,10 @@ async fn handle_authenticated_ws(socket: WebSocket, state: Arc<AppState>) {
             wallet_claim,
         });
     }
+
+    // l2-node 0.142.0: private-channel-sync claim (wallet-direct or
+    // device-signed by `auth_address`), same handling as the REST path.
+    super::auth::process_pchansync_claim(&state, &wallet_address, &auth_address, pchansync_raw).await;
 
     // Register this user with the notification engine for mention detection
     if let Some(ref engine) = state.notification_engine {
@@ -420,4 +447,50 @@ async fn handle_public_ws(socket: WebSocket, state: Arc<AppState>) {
     }
 
     debug!("Public WebSocket client disconnected");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn ws_auth_frame_carries_the_pchansync_claim() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = crate::storage::rocks::Storage::open(dir.path()).unwrap();
+        let identity = crate::storage::identity::IdentityResolver::new(storage.clone());
+        let router = crate::messages::router::MessageRouter::new(
+            storage.clone(),
+            identity.clone(),
+            None,
+            "testnet".into(),
+            usize::MAX,
+            Arc::new(crate::metrics::counters::NetworkCounters::new()),
+            crate::config::RateLimitsConfig::default(),
+        );
+        let state = AppState::new(
+            storage, router, "wsNode".into(), "testnet".into(), String::new(), String::new(), None, identity,
+            None, None, None,
+        );
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+        let addr = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+        let nonce = "00112233445566778899aabbccddeeff";
+        let sig = signing::sign_auth_header(&sk, "testnet", "wsNode", nonce, ts, "GET", WS_AUTH_PATH);
+        let b64 = |b: &[u8]| base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b);
+        let frame = serde_json::json!({
+            "address": addr,
+            "timestamp": ts,
+            "signature": b64(&sig.to_bytes()),
+            "nonce": nonce,
+            "pchansync_timestamp": ts,
+            "pchansync_signature": b64(&[7u8; 64]),
+        });
+        let r = verify_ws_auth(&frame.to_string(), &state).await.unwrap();
+        assert_eq!(r.address, addr);
+        let c = r.pchansync_claim.expect("claim parsed");
+        assert_eq!((c.timestamp, c.signature.len()), (ts, 64));
+        // Absent fields → no claim; an over-long signature field is ignored.
+        assert!(crate::api::auth::decode_pchansync_claim(Some(1), None).is_none());
+        assert!(crate::api::auth::decode_pchansync_claim(Some(1), Some(&"A".repeat(200))).is_none());
+    }
 }

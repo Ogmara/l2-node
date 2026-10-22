@@ -2886,6 +2886,13 @@ pub async fn get_user(
 /// fetch a recipient's keys to wrap message keys to each of the recipient's devices
 /// (multi-device E2E). Wrapped key material itself lives in the `channel_keys` CF,
 /// never here.
+///
+/// l2-node 0.142.0: every served key carries `"bound"`. `true` = the row
+/// holds the wallet's `wallet_signature` (std base64, 64 bytes) over
+/// `ogmara-enc-bind:{network}:{enc_pub}:{device_id}:{wallet}:{ts}` (Klever
+/// message format) — verifiable by any client without trusting this node.
+/// `false` = a binding stored before 0.142.0 (no signature retained); still
+/// served, clients decide how far to trust it until the device re-binds.
 pub async fn get_enc_keys(
     Extension(state): Extension<Arc<AppState>>,
     Path(address): Path<String>,
@@ -2906,6 +2913,7 @@ pub async fn get_enc_keys(
                 .into_iter()
                 .filter_map(|(_, v)| serde_json::from_slice::<serde_json::Value>(&v).ok())
                 .filter(|r| !r.get("revoked").and_then(|b| b.as_bool()).unwrap_or(false))
+                .map(mark_enc_key_binding)
                 .collect();
             Json(serde_json::json!({ "address": wallet, "keys": keys })).into_response()
         }
@@ -2914,6 +2922,24 @@ pub async fn get_enc_keys(
             (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
         }
     }
+}
+
+/// Annotate one served enc-key row with `"bound"` (l2-node 0.142.0): `true`
+/// iff it carries a well-formed `wallet_signature` (std base64 of 64 bytes).
+/// A malformed signature field is dropped and the row served unbound.
+fn mark_enc_key_binding(mut row: serde_json::Value) -> serde_json::Value {
+    let bound = row
+        .get("wallet_signature")
+        .and_then(|v| v.as_str())
+        .and_then(|s| base64::Engine::decode(&base64::engine::general_purpose::STANDARD, s).ok())
+        .is_some_and(|b| b.len() == 64);
+    if let serde_json::Value::Object(ref mut map) = row {
+        if !bound {
+            map.remove("wallet_signature");
+        }
+        map.insert("bound".into(), serde_json::json!(bound));
+    }
+    row
 }
 
 /// Load, visibility-check (audit W37) and engagement-enrich a single news
@@ -4788,34 +4814,33 @@ pub async fn federate_channel(
     // same shape as dm-sync's W5 self-verify in `auth.rs`. Absent/malformed
     // → no claim attached; this NEVER rejects the request itself, it only
     // gates whether the backfill can fire.
-    let wallet_claim_raw = headers
-        .get("x-ogmara-pchansync-auth-timestamp")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok())
-        .zip(headers.get("x-ogmara-pchansync-auth").and_then(|v| v.to_str().ok()))
-        .and_then(|(timestamp, sig_b64)| {
-            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, sig_b64)
-                .ok()
-                .map(|signature| crate::network::private_channel_sync::WalletAuthClaim { timestamp, signature })
-        });
-    let had_raw_claim = wallet_claim_raw.is_some();
-    let wallet_claim = wallet_claim_raw.filter(|c| {
-        crate::network::private_channel_sync::verify_wallet_claim(
-            c,
+    // l2-node 0.142.0: wallet-direct OR device-signed (by the request's
+    // own signing device, paired with a stored wallet delegation proof).
+    let wallet_claim = match super::auth::pchansync_claim_from_headers(&headers) {
+        None => None,
+        Some(raw) => match crate::network::private_channel_sync::resolve_client_claim(
+            &state.storage,
             &state.klever_network,
             &state.node_id,
             &caller,
+            &auth_user.signing_address,
+            raw.timestamp,
+            raw.signature,
             now_ms,
-        )
-    });
-    if had_raw_claim && wallet_claim.is_none() {
-        tracing::debug!(
-            address = %caller,
-            "private-channel-sync wallet claim present but failed self-verification; ignoring"
-        );
-    }
+        ) {
+            crate::network::private_channel_sync::ClientClaimOutcome::Verified(c) => Some(c),
+            outcome => {
+                tracing::debug!(
+                    address = %caller,
+                    ?outcome,
+                    "private-channel-sync claim present but not usable; ignoring"
+                );
+                None
+            }
+        },
+    };
     let _ = state.private_channel_sync_tx.send(crate::network::PrivateChannelSyncTrigger {
-        channel_id,
+        channel_id: Some(channel_id),
         wallet: caller.clone(),
         wallet_claim,
     });
@@ -7369,34 +7394,17 @@ pub async fn register_device(
     ).is_ok();
 
     if !wallet_sig_valid {
-        // Fallback: accept device-signed claim (K5 mobile browser flow).
-        // The device signs the claim instead of the wallet. Security:
-        // caller must be the device itself (proven by auth headers).
-        let device_sig_valid = crate::crypto::signing::verify_klever_message(
-            &device_verifying_key,
-            claim_string.as_bytes(),
-            &signature,
-        ).is_ok();
-
-        if !device_sig_valid {
-            tracing::warn!(
-                device = %device_address,
-                wallet = %body.wallet_address,
-                "Device registration failed: neither wallet nor device signature valid"
-            );
-            return (StatusCode::UNAUTHORIZED, "signature verification failed").into_response();
-        }
-
-        // Device-signed: caller MUST be the device itself (not a relay)
-        if auth_user.signing_address != device_address {
-            return (StatusCode::FORBIDDEN, "device-signed claims must come from the device itself").into_response();
-        }
-
-        tracing::info!(
+        // A device-signed claim is NOT accepted (removed in 0.142.0): the
+        // device key is exactly what is being authorised, so its own
+        // signature proves nothing about the wallet. Accepting it let any
+        // fresh device key map itself to ANY wallet and then be resolved
+        // as that wallet on every authenticated request.
+        tracing::warn!(
             device = %device_address,
             wallet = %body.wallet_address,
-            "Device registered via device-signed claim (K5 fallback)"
+            "Device registration failed: wallet signature invalid"
         );
+        return (StatusCode::UNAUTHORIZED, "wallet signature verification failed").into_response();
     }
 
     // Check device limit per wallet.
@@ -11635,5 +11643,24 @@ mod federate_limiter_tests {
             StatusCode::BAD_REQUEST,
             "substring match must not turn a policy verdict into a 500"
         );
+    }
+}
+
+#[cfg(test)]
+mod enc_key_binding_tests {
+    use super::mark_enc_key_binding;
+    use base64::Engine as _;
+
+    #[test]
+    fn rows_are_marked_bound_only_with_a_well_formed_signature() {
+        let sig = base64::engine::general_purpose::STANDARD.encode([1u8; 64]);
+        let bound = mark_enc_key_binding(serde_json::json!({ "enc_pub": "aa", "wallet_signature": sig }));
+        assert_eq!(bound["bound"], true);
+        assert_eq!(bound["wallet_signature"], sig);
+        let legacy = mark_enc_key_binding(serde_json::json!({ "enc_pub": "aa" }));
+        assert_eq!(legacy["bound"], false);
+        let bad = mark_enc_key_binding(serde_json::json!({ "enc_pub": "aa", "wallet_signature": "AAAA" }));
+        assert_eq!(bad["bound"], false);
+        assert!(bad.get("wallet_signature").is_none(), "malformed signature dropped");
     }
 }
