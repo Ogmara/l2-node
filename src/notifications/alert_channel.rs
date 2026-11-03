@@ -311,6 +311,8 @@ pub async fn dispatch_ogmara_channel_alert(
             warn!(channel_id = dispatcher.channel_id, "ogmara_channel alert unexpectedly required PoW");
             false
         }
+        // Alerts are never key envelopes; arm required by exhaustiveness.
+        RouteResult::KeyConflict(_) => false,
     }
 }
 

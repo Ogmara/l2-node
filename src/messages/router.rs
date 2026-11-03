@@ -193,6 +193,7 @@ enum RateCategory {
     ChannelMembership, // 20 per hour (join/leave — audit final pre-mainnet Code Audit CRITICAL #1)
     ChannelCreate,     // 20 per hour (audit 2026-09-29 — see limits() doc comment)
     ProfileUpdate,     // 20/hour unverified, 60/hour registered (spec 01 §6.1)
+    KeyEnvelope,       // 240 per minute (0x61, l2-node 0.143.0)
     Other,             // fallback: 100 per minute
 }
 
@@ -284,6 +285,15 @@ impl RateCategory {
             // deliberate action) while cutting the injection ceiling
             // ~300x.
             Self::ChannelCreate => RateLimits::flat(20, 3_600_000),
+            // l2-node 0.143.0: `ChannelKeyEnvelope` (0x61) split out of
+            // `Other` (100/min, shared with everything uncategorised). One
+            // epoch establishment wraps the key to every member device, so a
+            // 100-member channel legitimately needs a few hundred envelopes in
+            // a burst; 240/min is that burst while still bounding the
+            // per-wallet write rate into the capped `channel_keys` scope. The
+            // API answers THIS category with 429 + `retry_after_ms` so the SDK
+            // can pace instead of failing (other categories stay 400).
+            Self::KeyEnvelope => RateLimits::flat(240, 60_000),
             Self::Other => RateLimits::flat(100, 60_000),
         }
     }
@@ -311,6 +321,7 @@ impl RateCategory {
             MessageType::DeviceEncBinding | MessageType::DeviceEncRevoke => Self::DeviceEnc,
             MessageType::ChannelJoin | MessageType::ChannelLeave => Self::ChannelMembership,
             MessageType::ChannelCreate => Self::ChannelCreate,
+            MessageType::ChannelKeyEnvelope => Self::KeyEnvelope,
             _ => Self::Other,
         }
     }
@@ -363,14 +374,134 @@ const MAX_ENC_KEYS_PER_WALLET: usize = 10;
 /// history epochs for a DM or channel.
 const MAX_CHANNEL_KEY_ENVELOPES_PER_SCOPE: usize = 4096;
 
-/// Max epochs a `ChannelKeyEnvelope` may sit AHEAD of a scope's current highest
-/// epoch (P2d hardening). Rotation only ever needs `current_max + 1`; this headroom
-/// covers concurrent rotators and cross-node lag. Without a ceiling, a member could
-/// publish a key at a near-`u64::MAX` epoch, saturating the rotation floor (and
-/// blowing past JS's safe-integer range) so the channel becomes permanently
-/// unsendable. Generous enough that legitimate lag never trips it (an epoch jump
-/// this large would require hundreds of un-propagated removals).
-const CHANNEL_KEY_EPOCH_MAX_JUMP: u64 = 256;
+
+/// Where an envelope entered this node — selects which per-node budgets
+/// apply (see `process_gossip_message`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ingress {
+    /// This node's own clients (REST / WebSocket / local subsystems).
+    Local,
+    /// Relayed by a peer over gossipsub (live semantics).
+    Gossip,
+    /// Sync / backfill (no drift check, no rate limits).
+    Sync,
+}
+
+/// Node wall clock (ms since the Unix epoch).
+fn wall_clock_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+}
+
+/// What happened to a key envelope that reached arbitration without being
+/// stored (see `UnstoredKeyCache`).
+#[derive(Debug, Clone)]
+enum UnstoredOutcome {
+    /// Its slot already held a wrap.
+    AlreadyPresent,
+    /// It lost arbitration.
+    Conflict(Box<KeyConflictInfo>),
+    /// Step 7h refused it (a `key_envelope_rejected:` reason).
+    Rejected(String),
+}
+
+/// Max entries of the unstored-key-envelope seen-cache. Worst case (every
+/// entry a conflict with a 62-char author), per entry: a HashMap slot of
+/// about 74 B (32-byte key, 8-byte timestamp, 24-byte outcome, at 0.875
+/// load), a VecDeque slot of 40 B, the boxed `KeyConflictInfo` (~150 B)
+/// and the author string (62 B) — about 330 B, i.e. ~33 MB at 100,000
+/// entries; ~12 MB if all are already-present. Pinned by
+/// `unstored_cache_entry_sizes`.
+const UNSTORED_KEY_CACHE_MAX: usize = 100_000;
+/// Seen-cache TTL: 10 min, twice the ±5 min drift window, so a live replay
+/// of a cached envelope is always answered from the cache.
+const UNSTORED_KEY_CACHE_TTL_MS: u64 = 600_000;
+
+/// Bounded, oldest-first seen-cache of unstored key envelopes (round-5
+/// audit B1). FIFO insertion order doubles as age order, so expiry and
+/// overflow both pop from the front.
+#[derive(Default)]
+struct UnstoredKeyCache {
+    map: std::collections::HashMap<[u8; 32], (u64, UnstoredOutcome)>,
+    order: std::collections::VecDeque<([u8; 32], u64)>,
+}
+
+impl UnstoredKeyCache {
+    fn expire(&mut self, now_ms: u64) {
+        while let Some((id, at)) = self.order.front().copied() {
+            if now_ms.saturating_sub(at) <= UNSTORED_KEY_CACHE_TTL_MS && self.order.len() <= UNSTORED_KEY_CACHE_MAX {
+                break;
+            }
+            self.order.pop_front();
+            // Only drop the map entry if it is this very insertion.
+            if self.map.get(&id).is_some_and(|(t, _)| *t == at) {
+                self.map.remove(&id);
+            }
+        }
+    }
+
+    fn lookup(&mut self, id: &[u8; 32], now_ms: u64) -> Option<UnstoredOutcome> {
+        self.expire(now_ms);
+        self.map.get(id).map(|(_, o)| o.clone())
+    }
+
+    fn insert(&mut self, id: [u8; 32], outcome: UnstoredOutcome, now_ms: u64) {
+        if self.map.contains_key(&id) {
+            return;
+        }
+        self.map.insert(id, (now_ms, outcome));
+        self.order.push_back((id, now_ms));
+        self.expire(now_ms);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+}
+
+/// A token bucket (gossip-ingress key-envelope limits).
+#[derive(Debug, Clone, Copy)]
+struct TokenBucket {
+    tokens: f64,
+    last_ms: u64,
+}
+
+/// Capacity and refill rate of a [`TokenBucket`].
+#[derive(Debug, Clone, Copy)]
+struct BucketSpec {
+    capacity: f64,
+    refill_per_ms: f64,
+}
+
+impl BucketSpec {
+    /// Token level of `b` at `now_ms` (refilled, capped).
+    fn level(self, b: TokenBucket, now_ms: u64) -> f64 {
+        let elapsed = now_ms.saturating_sub(b.last_ms) as f64;
+        (b.tokens + elapsed * self.refill_per_ms).min(self.capacity)
+    }
+}
+
+/// Gossip key envelopes per wallet: capacity 720, +4/s.
+const GOSSIP_KEY_WALLET_BUCKET: BucketSpec = BucketSpec { capacity: 720.0, refill_per_ms: 4.0 / 1000.0 };
+/// Gossip key envelopes per (wallet, channel scope): capacity 180, +1/s.
+const GOSSIP_KEY_SCOPE_BUCKET: BucketSpec = BucketSpec { capacity: 180.0, refill_per_ms: 1.0 / 1000.0 };
+/// Max tracked gossip key-envelope buckets (≈ 100k active wallets).
+const GOSSIP_KEY_BUCKETS_MAX: usize = 200_000;
+/// Rejection reason for a gossip key envelope over its token bucket (maps to
+/// gossipsub `Ignore`; never reaches an HTTP client).
+pub(crate) const GOSSIP_KEY_RATE_LIMITED_REASON: &str = "rate limited (KeyEnvelope gossip bucket)";
+
+/// The channel scope of a channel-scope `ChannelKeyEnvelope`, else `None`.
+fn channel_key_scope(envelope: &Envelope) -> Option<[u8; 32]> {
+    rmp_serde::from_slice::<ChannelKeyEnvelopePayload>(&envelope.payload)
+        .ok()
+        .filter(|p| p.scope_kind == crate::messages::types::key_scope_kind::CHANNEL)
+        .map(|p| p.key_scope)
+}
+
+/// Per-(wallet, channel scope) budget for `ChannelKeyEnvelope`s (l2-node
+/// 0.143.0, round-2 audit W-D) — see `arbitrate_channel_key`.
+const KEY_ENVELOPE_SCOPE_LIMITS: RateLimits = RateLimits::flat(60, 60_000);
 
 /// The message router processes incoming messages through the full pipeline.
 pub struct MessageRouter {
@@ -413,6 +544,21 @@ pub struct MessageRouter {
     /// happens in Step 8, after the reservation), so contention cost is
     /// negligible relative to the rest of the pipeline.
     dm_recipient_cap_lock: std::sync::Mutex<()>,
+    /// Local-ingress per-(wallet, channel scope) key-envelope windows
+    /// (60/min), separate from `rate_limits` so they can be pruned on their
+    /// own 60 s schedule.
+    local_key_scope_windows: DashMap<String, RateLimitEntry>,
+    /// Gossip-ingress key-envelope token buckets (per wallet, and per
+    /// wallet:scope), bounded by `GOSSIP_KEY_BUCKETS_MAX`.
+    gossip_key_buckets: DashMap<String, TokenBucket>,
+    /// Last prune of the two maps above (node clock ms).
+    key_bucket_last_prune_ms: std::sync::atomic::AtomicU64,
+    /// Last FORCED prune of `gossip_key_buckets` at its size cap.
+    gossip_forced_prune_ms: std::sync::atomic::AtomicU64,
+    /// Seen-cache of key envelopes that reached arbitration but were not
+    /// stored (Step 3b). In memory only: a restart forgets it (replays are
+    /// then evaluated, and rate-limited, normally again).
+    unstored_key_envelopes: std::sync::Mutex<UnstoredKeyCache>,
     /// Shared with `NetworkService`/`MetricsCollector`/`AppState` (audit
     /// final pre-mainnet W35) — used here only to increment
     /// `failed_signature_verifications` on a Step 4b rejection, feeding the
@@ -466,6 +612,74 @@ fn wrap_rejection(prefix: &str, e: String) -> String {
 pub const REGISTRATION_REQUIRED_REASON: &str =
     "on-chain registration required: verify your wallet to use this feature";
 
+/// Prefix of every Step-7h (key-epoch arbitration) rejection reason:
+/// `"key_envelope_rejected:<code>: <detail>"`. The API answers these with a
+/// 400 JSON body `{"error": "<code>", "message": "<detail>"}` (see
+/// [`parse_key_envelope_rejection`]); codes are stable for SDK matching.
+pub const KEY_ENVELOPE_REJECT_PREFIX: &str = "key_envelope_rejected:";
+
+/// Build a Step-7h rejection reason (see [`KEY_ENVELOPE_REJECT_PREFIX`]).
+pub fn key_envelope_rejection(code: &str, detail: &str) -> String {
+    format!("{KEY_ENVELOPE_REJECT_PREFIX}{code}: {detail}")
+}
+
+/// Split a Step-7h rejection reason into `(code, detail)`; `None` for any
+/// other reason.
+pub fn parse_key_envelope_rejection(reason: &str) -> Option<(&str, &str)> {
+    let rest = reason.strip_prefix(KEY_ENVELOPE_REJECT_PREFIX)?;
+    Some(match rest.split_once(": ") {
+        Some((c, d)) => (c, d),
+        None => (rest, ""),
+    })
+}
+
+/// Prefix of the Step-6 rejection reason for the `KeyEnvelope` rate
+/// category; the decimal `retry_after_ms` follows. The API turns exactly
+/// this into `429 {"error":"rate_limited","retry_after_ms":N}` (every other
+/// category keeps the plain 400 "rate limited (…)").
+pub const KEY_ENVELOPE_RATE_LIMITED_PREFIX: &str = "rate limited (KeyEnvelope); retry_after_ms=";
+
+/// `retry_after_ms` of a `KeyEnvelope` rate-limit rejection, else `None`.
+pub fn parse_key_envelope_retry_after(reason: &str) -> Option<u64> {
+    reason.strip_prefix(KEY_ENVELOPE_RATE_LIMITED_PREFIX)?.parse().ok()
+}
+
+/// What happened to the wrap of an accepted channel-scope
+/// `ChannelKeyEnvelope` (POST `key_status`, l2-node 0.143.0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyStatus {
+    /// The wrap was stored for its `(target, device, epoch)`.
+    Stored,
+    /// A wrap of the same winning key already existed for that slot (kept).
+    AlreadyPresent,
+}
+
+impl KeyStatus {
+    /// Wire string (`"stored"` / `"already_present"`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stored => "stored",
+            Self::AlreadyPresent => "already_present",
+        }
+    }
+}
+
+/// A channel-scope `ChannelKeyEnvelope` lost key-epoch arbitration
+/// (l2-node 0.143.0): a different commitment is recorded for its
+/// `(scope, epoch)` and this one either ranks worse or arrived after the
+/// finality horizon. Carried by [`RouteResult::KeyConflict`].
+#[derive(Debug, Clone)]
+pub struct KeyConflictInfo {
+    /// Channel of the conflicting envelope.
+    pub channel_id: u64,
+    /// Epoch of the conflicting envelope.
+    pub epoch: u64,
+    /// Arbitration state of the epoch (always `"arbitrated"` today).
+    pub state: &'static str,
+    /// The recorded winner.
+    pub winner: crate::storage::key_commits::KeyCommitWinner,
+}
+
 /// Result of processing a message through the router.
 #[derive(Debug)]
 pub enum RouteResult {
@@ -495,9 +709,20 @@ pub enum RouteResult {
         /// design, is prevented from triggering a broadcast storm during
         /// backfill that no rate limit could bound.
         bot_commands_changed: Option<String>,
+        /// `Some` only for a channel-scope `ChannelKeyEnvelope`: whether its
+        /// wrap was stored or the slot already held the winning key
+        /// (POST `key_status`, l2-node 0.143.0).
+        key_status: Option<KeyStatus>,
     },
     /// Message is a duplicate (already stored).
     Duplicate,
+    /// A channel-scope `ChannelKeyEnvelope` lost key-epoch arbitration
+    /// (l2-node 0.143.0). Policy, not invalidity: over gossip this maps to
+    /// `Ignore` (a losing-but-honest concurrent establisher's wraps are
+    /// still relayed by peers that saw them first); the API answers 409
+    /// with a JSON body naming the winner; sync/backfill treat it like
+    /// `Rejected`. Nothing was stored.
+    KeyConflict(Box<KeyConflictInfo>),
     /// Message rejected on a POLICY/authz/local basis (e.g. banned user,
     /// unknown channel, storage error). The envelope is structurally sound and
     /// an honest peer may legitimately relay it, so over gossip this maps to
@@ -531,6 +756,11 @@ impl MessageRouter {
             storage,
             identity,
             rate_limits: DashMap::new(),
+            local_key_scope_windows: DashMap::new(),
+            gossip_key_buckets: DashMap::new(),
+            key_bucket_last_prune_ms: std::sync::atomic::AtomicU64::new(0),
+            gossip_forced_prune_ms: std::sync::atomic::AtomicU64::new(0),
+            unstored_key_envelopes: std::sync::Mutex::new(UnstoredKeyCache::default()),
             rate_limits_config,
             registration_cache: DashMap::new(),
             pow,
@@ -582,7 +812,21 @@ impl MessageRouter {
     /// Returns the routing result indicating whether the message was
     /// accepted, is a duplicate, or was rejected.
     pub fn process_message(&self, raw_bytes: &[u8]) -> RouteResult {
-        self.process_message_inner(raw_bytes, false)
+        self.process_message_inner(raw_bytes, Ingress::Local, None)
+    }
+
+    /// Process a message received over GOSSIP. Identical to
+    /// [`Self::process_message`] (live semantics: drift check, signature,
+    /// arbitration, size limits, per-wallet rate limits for every other
+    /// type) except that `ChannelKeyEnvelope`s are exempt from ALL
+    /// per-wallet budgets (240/min and the per-(wallet, scope) 60/min).
+    /// Those are per-node fixed windows: a cover burst the home node
+    /// accepted could be refused by a peer, and key envelopes are never
+    /// backfilled, so the wrap would be lost for good (round-3 audit W2 and
+    /// the sdk-js audit). They are enforced where the client is: at the
+    /// home node's API / WebSocket ingress.
+    pub fn process_gossip_message(&self, raw_bytes: &[u8]) -> RouteResult {
+        self.process_message_inner(raw_bytes, Ingress::Gossip, None)
     }
 
     /// Process a synced historical message — skips timestamp drift and rate limiting.
@@ -591,10 +835,25 @@ impl MessageRouter {
     /// older than the 5-minute drift window. All other validation (signature,
     /// identity, payload, dedup) still applies.
     pub fn process_synced_message(&self, raw_bytes: &[u8]) -> RouteResult {
-        self.process_message_inner(raw_bytes, true)
+        self.process_message_inner(raw_bytes, Ingress::Sync, None)
     }
 
-    fn process_message_inner(&self, raw_bytes: &[u8], is_sync: bool) -> RouteResult {
+    /// Test-only: the LIVE pipeline evaluated at a fixed node clock, so
+    /// deterministic fixtures with fixed timestamps can exercise live-only
+    /// rules (drift window, establishing a key epoch) without wall-clock time.
+    #[cfg(test)]
+    pub(crate) fn process_message_at(&self, raw_bytes: &[u8], now_ms: u64) -> RouteResult {
+        self.process_message_inner(raw_bytes, Ingress::Local, Some(now_ms))
+    }
+
+    /// Test-only: the GOSSIP pipeline at a fixed node clock.
+    #[cfg(test)]
+    pub(crate) fn process_gossip_message_at(&self, raw_bytes: &[u8], now_ms: u64) -> RouteResult {
+        self.process_message_inner(raw_bytes, Ingress::Gossip, Some(now_ms))
+    }
+
+    fn process_message_inner(&self, raw_bytes: &[u8], ingress: Ingress, now_override: Option<u64>) -> RouteResult {
+        let is_sync = ingress == Ingress::Sync;
         // Step 1: Deserialize
         let envelope: Envelope = match rmp_serde::from_slice(raw_bytes) {
             Ok(env) => env,
@@ -643,6 +902,33 @@ impl MessageRouter {
             Ok(true) => return RouteResult::Duplicate,
             Ok(false) => {}
             Err(e) => return RouteResult::Rejected(internal_error("storage", e)),
+        }
+        // Step 3b (round-5 audit B1): key envelopes that reached arbitration
+        // but were NOT stored, with an outcome that can never change (see
+        // the caching rules at Step 7h), are remembered by msg_id for 10 min.
+        // A replay is answered here — BEFORE any rate window / token bucket
+        // is touched — so a third party re-submitting someone else's
+        // envelope can no longer burn that wallet's budget. Already-present
+        // → `Duplicate` (it IS effectively stored); conflict / refusal → the
+        // same answer as the first time (a `Duplicate` would read as success
+        // to a client). Like Step 3 this precedes the signature check: a
+        // forged envelope reusing a cached msg_id just gets the cached
+        // answer — never a trust signal. A cached conflict reports the
+        // winner as of its first evaluation, which may be outdated (the
+        // winner can only have improved since).
+        if envelope.msg_type == MessageType::ChannelKeyEnvelope {
+            let cached = self
+                .unstored_key_envelopes
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .lookup(&envelope.msg_id, now_override.unwrap_or_else(wall_clock_ms));
+            if let Some(outcome) = cached {
+                return match outcome {
+                    UnstoredOutcome::AlreadyPresent => RouteResult::Duplicate,
+                    UnstoredOutcome::Conflict(info) => RouteResult::KeyConflict(info),
+                    UnstoredOutcome::Rejected(reason) => RouteResult::Rejected(reason),
+                };
+            }
         }
 
         // Step 4a: Verify msg_id computation
@@ -732,10 +1018,12 @@ impl MessageRouter {
             }
         }
 
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        let now_ms = now_override.unwrap_or_else(|| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64
+        });
 
         // Step 5: Verify timestamp (±5 min drift) — skipped for synced historical messages
         if !is_sync && !envelope.is_timestamp_valid(now_ms) {
@@ -745,11 +1033,37 @@ impl MessageRouter {
             ));
         }
 
+        // Step 6 for key envelopes: local ingress only, two buckets, refused
+        // attempts consume nothing (see `key_envelope_rate_limit`).
+        if envelope.msg_type == MessageType::ChannelKeyEnvelope {
+            match ingress {
+                Ingress::Local => {
+                    let registered = self.is_registered_cached(&resolved_author, now_ms);
+                    if let Some(retry_after_ms) =
+                        self.key_envelope_rate_limit(&envelope, &resolved_author, registered, now_ms)
+                    {
+                        self.counters.inc_rate_limited();
+                        return RouteResult::Rejected(format!("{KEY_ENVELOPE_RATE_LIMITED_PREFIX}{retry_after_ms}"));
+                    }
+                }
+                // Gossip: token buckets, checked AFTER authorization (just
+                // before Step 7h) so only members' envelopes ever create
+                // bucket entries — the gossip router has no PoW gate, and
+                // fresh keypairs must not be able to fill the bounded map.
+                // Sync: no rate limits; Step 7h accepts only wraps of the
+                // already recorded winner on that path (and no current sync
+                // protocol carries key envelopes at all).
+                Ingress::Gossip | Ingress::Sync => {}
+            }
+        }
         // Step 6: Rate limit by wallet address — skipped for synced messages
-        if !is_sync && envelope.msg_type.requires_registration() {
+        else if !is_sync && envelope.msg_type.requires_registration() {
             let category = RateCategory::from_msg_type(envelope.msg_type);
             let registered = self.is_registered_cached(&resolved_author, now_ms);
-            if self.is_rate_limited(&resolved_author, category, registered, now_ms) {
+            if self
+                .rate_limit_check(&resolved_author, category, registered, now_ms)
+                .is_some()
+            {
                 // Code Audit NOTE #6: `HighRateLimitTriggers` (W35) only
                 // observed HTTP-layer 429s (`GovernorLayer::error_handler`,
                 // W36) — this router-level, per-wallet-per-category limit is
@@ -822,8 +1136,71 @@ impl MessageRouter {
             return RouteResult::Rejected(wrap_rejection("dm_recipient_cap_exceeded", e));
         }
 
+        // Step 7h (l2-node 0.143.0): key-epoch arbitration for channel-scope
+        // `ChannelKeyEnvelope`s. Decides the envelope against the recorded
+        // winner of its `(scope, epoch)` and — when accepted — stores the
+        // commit row, any superseded-loser deletions, the wrap AND the raw
+        // envelope in ONE batch, so Step 8 below is skipped for it. DM-scope
+        // envelopes return `None` and take the generic path unchanged.
+        let mut key_status: Option<KeyStatus> = None;
+        if envelope.msg_type == MessageType::ChannelKeyEnvelope
+            && ingress == Ingress::Gossip
+            && !self.gossip_key_envelope_allowed(&envelope, &resolved_author, now_ms)
+        {
+            self.counters.inc_rate_limited();
+            return RouteResult::Rejected(GOSSIP_KEY_RATE_LIMITED_REASON.into());
+        }
+        if envelope.msg_type == MessageType::ChannelKeyEnvelope {
+            let res = self.arbitrate_channel_key(&envelope, &resolved_author, raw_bytes, now_ms, ingress);
+            // Remember unstored outcomes (Step 3b) — ONLY outcomes that can
+            // never change for this exact envelope, and never ones produced
+            // on the sync path (path-dependent: e.g. `key_sync_not_winner`
+            // must not shadow a later live delivery of the same bytes):
+            //  * already present — the slot is write-once (only eviction or a supersede can
+            //    free it; a 10 min `Duplicate` then is harmless);
+            //  * conflict — a worse pair stays worse (the winner only
+            //    improves) and a final epoch stays final;
+            //  * below floor / evicted — floor and horizon only rise;
+            //  * commitment invalid — content-only.
+            // NOT cached: `key_ts_stale` (the same pair may become the winner
+            // when its fresher establishing envelope arrives later, after
+            // which this cover is acceptable), `key_scope_full` (space can be
+            // freed), `key_epoch_too_far` (the known maximum grows),
+            // `key_commitment_required`, rate limits, authorization failures
+            // and internal errors.
+            let remember = if ingress == Ingress::Sync {
+                None
+            } else {
+                match &res {
+                    Ok(Some(KeyStatus::AlreadyPresent)) => Some(UnstoredOutcome::AlreadyPresent),
+                    Err(RouteResult::KeyConflict(info)) => Some(UnstoredOutcome::Conflict(info.clone())),
+                    Err(RouteResult::Rejected(r))
+                        if parse_key_envelope_rejection(r).is_some_and(|(code, _)| {
+                            matches!(code, "key_epoch_below_floor" | "key_epoch_evicted" | "key_commitment_invalid")
+                        }) =>
+                    {
+                        Some(UnstoredOutcome::Rejected(r.clone()))
+                    }
+                    _ => None,
+                }
+            };
+            if let Some(o) = remember {
+                self.unstored_key_envelopes
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .insert(envelope.msg_id, o, now_ms);
+            }
+            match res {
+                Ok(None) => {}
+                Ok(Some(status)) => key_status = Some(status),
+                Err(result) => return result,
+            }
+        }
+
         // Step 8: Store message (atomically increments total_messages counter)
-        if let Err(e) = self.storage.store_message(&envelope.msg_id, raw_bytes) {
+        if key_status.is_some() {
+            // Already persisted by Step 7h's batch.
+        } else if let Err(e) = self.storage.store_message(&envelope.msg_id, raw_bytes) {
             // Roll back the Step 7g reservation — the message was never
             // actually stored, so it must not count against the recipient's
             // cap (W11 Security Audit follow-up).
@@ -887,6 +1264,115 @@ impl MessageRouter {
             } else {
                 None
             },
+            key_status,
+        }
+    }
+
+    /// Step 7h body (l2-node 0.143.0) — see `storage::key_commits` for the
+    /// arbitration rules. `Ok(None)`: not a channel-scope envelope, continue
+    /// with the generic Step 8. `Ok(Some(_))`: accepted and fully persisted.
+    /// `Err(result)`: rejected / conflict, nothing written.
+    fn arbitrate_channel_key(
+        &self,
+        envelope: &Envelope,
+        resolved_author: &str,
+        raw_bytes: &[u8],
+        now_ms: u64,
+        ingress: Ingress,
+    ) -> Result<Option<KeyStatus>, RouteResult> {
+        let is_sync = ingress == Ingress::Sync;
+        // (Key-envelope rate limits live in Step 6 —
+        // `key_envelope_rate_limit` — so a refused attempt never consumes.)
+        use crate::storage::key_commits::{ChannelKeyArbInput, ChannelKeyArbOutcome};
+        let p = rmp_serde::from_slice::<ChannelKeyEnvelopePayload>(&envelope.payload)
+            .map_err(|e| RouteResult::Rejected(format!("invalid channel key envelope: {e}")))?;
+        if p.scope_kind != crate::messages::types::key_scope_kind::CHANNEL {
+            return Ok(None);
+        }
+        let reject = |code: &str, detail: &str| RouteResult::Rejected(key_envelope_rejection(code, detail));
+        // Structural commitment rules (channel scope only).
+        if p.key_commitment.is_some() != p.key_ts.is_some() {
+            return Err(reject(
+                "key_commitment_invalid",
+                "key_commitment and key_ts must be present together",
+            ));
+        }
+        if let Some(c) = p.key_commitment {
+            if c.iter().all(|&b| b == 0) {
+                return Err(reject("key_commitment_invalid", "key_commitment must not be all-zero"));
+            }
+        }
+        if let Some(kts) = p.key_ts {
+            if kts == 0 || kts > envelope.timestamp {
+                return Err(reject(
+                    "key_commitment_invalid",
+                    "key_ts must be > 0 and <= the envelope timestamp",
+                ));
+            }
+        }
+        let channel_id = p
+            .channel_id
+            .ok_or_else(|| RouteResult::Rejected("channel key envelope missing channel_id".into()))?;
+
+        let mut rec = serde_json::json!({
+            "eph_pub": hex::encode(p.eph_pub),
+            "nonce": hex::encode(p.nonce),
+            "wrapped": hex::encode(&p.wrapped),
+            "epoch": p.epoch,
+            "scope_kind": p.scope_kind,
+            "author": resolved_author,
+            "timestamp": envelope.timestamp,
+            "msg_id": hex::encode(envelope.msg_id),
+        });
+        if let (Some(c), Some(kts), Some(obj)) = (p.key_commitment, p.key_ts, rec.as_object_mut()) {
+            obj.insert("key_commitment".into(), serde_json::json!(hex::encode(c)));
+            obj.insert("key_ts".into(), serde_json::json!(kts));
+        }
+        let record = serde_json::to_vec(&rec)
+            .map_err(|e| RouteResult::Rejected(internal_error("serialize key record", e)))?;
+
+        let input = ChannelKeyArbInput {
+            key_scope: p.key_scope,
+            channel_id,
+            epoch: p.epoch,
+            target: &p.target,
+            device_id_hex: &p.device_id,
+            author: resolved_author,
+            key_commitment: p.key_commitment,
+            key_ts: p.key_ts,
+            envelope_ts: envelope.timestamp,
+            msg_id: envelope.msg_id,
+            record: &record,
+            raw_envelope: raw_bytes,
+            now_ms,
+            scope_cap: MAX_CHANNEL_KEY_ENVELOPES_PER_SCOPE,
+            sync: is_sync,
+        };
+        match self.storage.arbitrate_and_store_channel_key(&input) {
+            Ok(ChannelKeyArbOutcome::Stored) => Ok(Some(KeyStatus::Stored)),
+            Ok(ChannelKeyArbOutcome::AlreadyPresent) => Ok(Some(KeyStatus::AlreadyPresent)),
+            Ok(ChannelKeyArbOutcome::Conflict(winner)) => {
+                Err(RouteResult::KeyConflict(Box::new(KeyConflictInfo {
+                    channel_id,
+                    epoch: p.epoch,
+                    state: crate::storage::key_commits::STATE_ARBITRATED,
+                    winner,
+                })))
+            }
+            Ok(ChannelKeyArbOutcome::Rejected(r)) => {
+                use crate::storage::key_commits::KeyArbRejection as R;
+                let detail = match r {
+                    R::CommitmentRequired => "this epoch requires key_commitment and key_ts".to_string(),
+                    R::KeyTsStale => "key_ts is more than 15 minutes older than the envelope and is not the current winner".to_string(),
+                    R::EpochBelowFloor { floor } => format!("epoch is below the channel key_epoch_floor {floor}"),
+                    R::EpochEvicted { below } => format!("epochs below {below} are no longer accepted for this scope"),
+                    R::ScopeFull => "the key scope is full".to_string(),
+                    R::SyncNotWinner => "sync/backfill may only deliver wraps of the recorded winner or a fresh better-ranked pair".to_string(),
+                    R::EpochTooFarAhead { bound } => format!("new epochs above {bound} are not accepted yet"),
+                };
+                Err(reject(r.code(), &detail))
+            }
+            Err(e) => Err(RouteResult::Rejected(internal_error("channel key arbitration", e))),
         }
     }
 
@@ -1233,12 +1719,221 @@ impl MessageRouter {
         Ok(())
     }
 
-    /// Check if a user is rate-limited for a specific action category.
-    /// Applies both the burst and sustained windows (rate-limit rework,
-    /// l2-node 0.122.0) — a request is limited if EITHER window is already
-    /// at its cap. Does NOT increment the counters on a rejection, so a
-    /// retry storm against an exhausted budget cannot inflate the stored
-    /// count — only accepted messages consume budget.
+    /// Rate-limit check for one message of `author` in `category`. Applies
+    /// both the burst and sustained windows (rate-limit rework, l2-node
+    /// 0.122.0) — limited if EITHER window is already at its cap. Returns
+    /// `None` when allowed (and counts the message in both windows), or
+    /// `Some(retry_after_ms)` when limited: the ms until every exceeded
+    /// window resets (a window resets once `now - start > window_ms`, so the
+    /// value is `start + window_ms + 1 - now`, at least 1). A rejection does
+    /// NOT increment the counters, so a retry storm against an exhausted
+    /// budget cannot inflate the stored count.
+    fn rate_limit_check(
+        &self,
+        author: &str,
+        category: RateCategory,
+        registered: bool,
+        now_ms: u64,
+    ) -> Option<u64> {
+        let limits = category.limits(registered, &self.rate_limits_config);
+        self.rate_limit_check_key(format!("{}:{:?}", author, category), limits, now_ms)
+    }
+
+    /// The dual-window counter behind `rate_limit_check`, for an arbitrary
+    /// budget key (also used by the per-(wallet, scope) key-envelope budget).
+    fn rate_limit_check_key(&self, key: String, limits: RateLimits, now_ms: u64) -> Option<u64> {
+        self.rate_window(key, limits, now_ms, true)
+    }
+
+    /// Fixed dual-window counter on the shared `rate_limits` map. See
+    /// [`Self::window_check`] for the exact semantics.
+    fn rate_window(&self, key: String, limits: RateLimits, now_ms: u64, consume: bool) -> Option<u64> {
+        Self::window_check(&self.rate_limits, key, limits, now_ms, consume)
+    }
+
+    /// Fixed dual-window counter. A window resets when `now - start >
+    /// window_ms` (strictly greater). When a window is at its cap the call
+    /// is REFUSED with `Some(retry_after_ms)` = `start + window_ms + 1 -
+    /// now` (≥ 1) and nothing is counted — a refused attempt never consumes
+    /// a slot. Otherwise `None`; the message is counted only if `consume`
+    /// (so a caller can check several buckets first and count all of them
+    /// only when every one allows it). Peeks (`consume == false`) and
+    /// refusals only READ the map (round-4 audit N4): an attacker's refused
+    /// or merely checked attempts never create entries.
+    fn window_check(
+        map: &DashMap<String, RateLimitEntry>,
+        key: String,
+        limits: RateLimits,
+        now_ms: u64,
+        consume: bool,
+    ) -> Option<u64> {
+        // Effective (burst_count, burst_start, sustained_count, sustained_start)
+        // after expiring windows, computed without mutating.
+        let view = map.get(&key).map(|e| {
+            let (bc, bs) = if now_ms.saturating_sub(e.burst_window_start) > limits.burst_window_ms {
+                (0, now_ms)
+            } else {
+                (e.burst_count, e.burst_window_start)
+            };
+            let (sc, ss) = if now_ms.saturating_sub(e.sustained_window_start) > limits.sustained_window_ms {
+                (0, now_ms)
+            } else {
+                (e.sustained_count, e.sustained_window_start)
+            };
+            (bc, bs, sc, ss)
+        });
+        let (bc, bs, sc, ss) = view.unwrap_or((0, now_ms, 0, now_ms));
+        let burst_hit = bc >= limits.burst_max;
+        let sustained_hit = sc >= limits.sustained_max;
+        if burst_hit || sustained_hit {
+            let wait = |start: u64, window: u64| {
+                start.saturating_add(window).saturating_add(1).saturating_sub(now_ms)
+            };
+            let mut retry = 0u64;
+            if burst_hit {
+                retry = retry.max(wait(bs, limits.burst_window_ms));
+            }
+            if sustained_hit {
+                retry = retry.max(wait(ss, limits.sustained_window_ms));
+            }
+            return Some(retry.max(1));
+        }
+        if consume {
+            // Re-apply the expiry under the entry lock (another request may
+            // have touched it since the read above), then count.
+            let mut entry = map.entry(key).or_insert(RateLimitEntry {
+                burst_count: 0,
+                burst_window_start: now_ms,
+                sustained_count: 0,
+                sustained_window_start: now_ms,
+            });
+            if now_ms.saturating_sub(entry.burst_window_start) > limits.burst_window_ms {
+                entry.burst_count = 0;
+                entry.burst_window_start = now_ms;
+            }
+            if now_ms.saturating_sub(entry.sustained_window_start) > limits.sustained_window_ms {
+                entry.sustained_count = 0;
+                entry.sustained_window_start = now_ms;
+            }
+            entry.burst_count += 1;
+            entry.sustained_count += 1;
+        }
+        None
+    }
+
+    /// Step 6 for `ChannelKeyEnvelope` at LOCAL ingress (API / WebSocket).
+    /// Two fixed-window buckets, both checked before either is counted so a
+    /// refused attempt consumes nothing: per wallet (240/min, both scopes)
+    /// and, for channel scope, per (wallet, scope) (60/min, its own map,
+    /// pruned every 60 s). Concurrent requests may overshoot by their
+    /// concurrency (two independent map entries; bounded, self-correcting).
+    fn key_envelope_rate_limit(&self, envelope: &Envelope, author: &str, registered: bool, now_ms: u64) -> Option<u64> {
+        self.prune_key_envelope_buckets(now_ms);
+        let wallet_key = format!("{}:{:?}", author, RateCategory::KeyEnvelope);
+        let wallet_limits = RateCategory::KeyEnvelope.limits(registered, &self.rate_limits_config);
+        let scope_key = channel_key_scope(envelope).map(|s| format!("{}:{}", author, hex::encode(s)));
+        let mut retry = self.rate_window(wallet_key.clone(), wallet_limits, now_ms, false);
+        if let Some(k) = &scope_key {
+            if let Some(r) = Self::window_check(&self.local_key_scope_windows, k.clone(), KEY_ENVELOPE_SCOPE_LIMITS, now_ms, false) {
+                retry = Some(retry.unwrap_or(0).max(r));
+            }
+        }
+        if retry.is_some() {
+            return retry;
+        }
+        self.rate_window(wallet_key, wallet_limits, now_ms, true);
+        if let Some(k) = scope_key {
+            Self::window_check(&self.local_key_scope_windows, k, KEY_ENVELOPE_SCOPE_LIMITS, now_ms, true);
+        }
+        None
+    }
+
+    /// Step 6 for `ChannelKeyEnvelope` relayed by GOSSIP (round-4 audit W1):
+    /// TOKEN buckets, not fixed windows, sized so they never refuse what an
+    /// honest home node admitted — a home node's fixed 60 s window admits
+    /// at most 2x its limit in any 60 s span (end of one window + start of
+    /// the next): per wallet capacity 720 refilling 4/s (≥ 2 x 240), per
+    /// (wallet, channel scope) capacity 180 refilling 1/s (≥ 2 x 60). They
+    /// exist only to bound floods by a member that bypasses its home node's
+    /// limits (direct gossip publishing). Both buckets are checked before
+    /// either is consumed; a refused envelope consumes nothing and creates
+    /// no entry. Returns `false` when refused.
+    fn gossip_key_envelope_allowed(&self, envelope: &Envelope, author: &str, now_ms: u64) -> bool {
+        self.prune_key_envelope_buckets(now_ms);
+        let wallet_key = author.to_string();
+        let scope_key = channel_key_scope(envelope).map(|s| format!("{}:{}", author, hex::encode(s)));
+        let level = |key: &str, spec: BucketSpec| -> f64 {
+            match self.gossip_key_buckets.get(key) {
+                Some(b) => spec.level(*b, now_ms),
+                None => spec.capacity,
+            }
+        };
+        let w = level(&wallet_key, GOSSIP_KEY_WALLET_BUCKET);
+        let sc = scope_key.as_deref().map(|k| level(k, GOSSIP_KEY_SCOPE_BUCKET));
+        if w < 1.0 || sc.is_some_and(|t| t < 1.0) {
+            return false;
+        }
+        // Hard bound on the map. Entries are only created by ADMITTED
+        // envelopes of authorized members; keys that already exist never
+        // count against it (round-5 audit N1: a full map must not lock out
+        // the very wallets it is tracking). When new keys would overflow,
+        // force a prune — at most once per second, so a churn of new
+        // wallets cannot turn every envelope into a full-map scan.
+        let new_entries = usize::from(!self.gossip_key_buckets.contains_key(&wallet_key))
+            + scope_key.as_deref().map_or(0, |k| usize::from(!self.gossip_key_buckets.contains_key(k)));
+        if new_entries > 0 && self.gossip_key_buckets.len() + new_entries > GOSSIP_KEY_BUCKETS_MAX {
+            let last = self.gossip_forced_prune_ms.load(std::sync::atomic::Ordering::Relaxed);
+            if now_ms.saturating_sub(last) >= 1_000
+                && self
+                    .gossip_forced_prune_ms
+                    .compare_exchange(last, now_ms, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Relaxed)
+                    .is_ok()
+            {
+                self.prune_key_envelope_buckets_now(now_ms);
+            }
+            if self.gossip_key_buckets.len() + new_entries > GOSSIP_KEY_BUCKETS_MAX {
+                return false;
+            }
+        }
+        self.gossip_key_buckets.insert(wallet_key, TokenBucket { tokens: w - 1.0, last_ms: now_ms });
+        if let (Some(k), Some(t)) = (scope_key, sc) {
+            self.gossip_key_buckets.insert(k, TokenBucket { tokens: t - 1.0, last_ms: now_ms });
+        }
+        true
+    }
+
+    /// Prune the key-envelope bucket maps at most once per 60 s (round-4
+    /// audit N6 — the per-scope windows live exactly their 60 s window).
+    fn prune_key_envelope_buckets(&self, now_ms: u64) {
+        let last = self.key_bucket_last_prune_ms.load(std::sync::atomic::Ordering::Relaxed);
+        if now_ms.saturating_sub(last) < KEY_ENVELOPE_SCOPE_LIMITS.burst_window_ms {
+            return;
+        }
+        if self
+            .key_bucket_last_prune_ms
+            .compare_exchange(last, now_ms, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Relaxed)
+            .is_ok()
+        {
+            self.prune_key_envelope_buckets_now(now_ms);
+        }
+    }
+
+    /// Unconditional prune: expired local per-scope windows, and gossip token
+    /// buckets that have refilled to capacity (indistinguishable from absent).
+    fn prune_key_envelope_buckets_now(&self, now_ms: u64) {
+        let window = KEY_ENVELOPE_SCOPE_LIMITS.burst_window_ms;
+        self.local_key_scope_windows
+            .retain(|_, e| now_ms.saturating_sub(e.burst_window_start) <= window);
+        self.gossip_key_buckets.retain(|k, b| {
+            // Scope keys contain a ':' (wallet:scope); wallet keys do not.
+            let spec = if k.contains(':') { GOSSIP_KEY_SCOPE_BUCKET } else { GOSSIP_KEY_WALLET_BUCKET };
+            spec.level(*b, now_ms) < spec.capacity
+        });
+    }
+
+    /// Whether `author` is rate limited for `category` (counts the message
+    /// when allowed). Thin wrapper over `rate_limit_check`.
+    #[cfg(test)]
     fn is_rate_limited(
         &self,
         author: &str,
@@ -1246,33 +1941,7 @@ impl MessageRouter {
         registered: bool,
         now_ms: u64,
     ) -> bool {
-        let limits = category.limits(registered, &self.rate_limits_config);
-        let key = format!("{}:{:?}", author, category);
-
-        let mut entry = self.rate_limits.entry(key).or_insert(RateLimitEntry {
-            burst_count: 0,
-            burst_window_start: now_ms,
-            sustained_count: 0,
-            sustained_window_start: now_ms,
-        });
-
-        // Reset each window independently if expired.
-        if now_ms.saturating_sub(entry.burst_window_start) > limits.burst_window_ms {
-            entry.burst_count = 0;
-            entry.burst_window_start = now_ms;
-        }
-        if now_ms.saturating_sub(entry.sustained_window_start) > limits.sustained_window_ms {
-            entry.sustained_count = 0;
-            entry.sustained_window_start = now_ms;
-        }
-
-        if entry.burst_count >= limits.burst_max || entry.sustained_count >= limits.sustained_max {
-            return true;
-        }
-
-        entry.burst_count += 1;
-        entry.sustained_count += 1;
-        false
+        self.rate_limit_check(author, category, registered, now_ms).is_some()
     }
 
     /// Whether `author` (a wallet address) is on-chain registered
@@ -1332,6 +2001,9 @@ impl MessageRouter {
             now_ms.saturating_sub(entry.burst_window_start) < MAX_WINDOW_MS
                 || now_ms.saturating_sub(entry.sustained_window_start) < MAX_WINDOW_MS
         });
+        // Key-envelope buckets have their own (60 s) pruning; run it here too
+        // so an idle node still frees them.
+        self.prune_key_envelope_buckets_now(now_ms);
         self.registration_cache
             .retain(|_, (_, cached_at)| now_ms.saturating_sub(*cached_at) < MAX_WINDOW_MS);
     }
@@ -2077,17 +2749,13 @@ impl MessageRouter {
                         if !self.is_channel_member(channel_id, &p.target)? {
                             return Err("channel key target must be a channel member".into());
                         }
-                        // P2d hardening (C1): cap how far ahead of the current max epoch
-                        // a key may be published, so a member can't wedge the channel by
-                        // publishing at a near-u64::MAX epoch (which would saturate the
-                        // rotation floor → permanently unsendable).
-                        let max_epoch = self
-                            .storage
-                            .max_channel_key_epoch(&expected)
-                            .map_err(|e| internal_error("channel key epoch", e))?;
-                        if p.epoch > max_epoch.saturating_add(CHANNEL_KEY_EPOCH_MAX_JUMP) {
-                            return Err("channel key epoch too far ahead of the current epoch".into());
-                        }
+                        // The epoch-ahead bound (P2d C1: no near-u64::MAX epochs that
+                        // saturate the rotation floor) is enforced in Step 7h instead
+                        // (l2-node 0.143.0, `CHANNEL_KEY_EPOCH_MAX_AHEAD`, the same
+                        // +256 as before): there it runs under the key lock against the
+                        // arbitration state (no TOCTOU), and without the 8192-row
+                        // `max_channel_key_epoch` scan this check paid on EVERY
+                        // key envelope (round-2 audit W-D/W-E).
                         Ok(())
                     }
                     other => Err(format!("invalid scope_kind: {}", other)),
@@ -5242,8 +5910,13 @@ impl MessageRouter {
                 }
             }
             MessageType::ChannelKeyEnvelope => {
-                if let Ok(p) =
+                // l2-node 0.143.0: channel-scope envelopes are fully
+                // arbitrated AND stored by Step 7h (`arbitrate_channel_key`) —
+                // nothing left to apply here. Only DM scope continues.
+                if let Some(p) =
                     rmp_serde::from_slice::<ChannelKeyEnvelopePayload>(&envelope.payload)
+                        .ok()
+                        .filter(|p| p.scope_kind != crate::messages::types::key_scope_kind::CHANNEL)
                 {
                     // Store the opaque per-device wrapped key (first-write-wins). The
                     // node never decrypts it; the recipient device unwraps with its own
@@ -5256,23 +5929,15 @@ impl MessageRouter {
                         "scope_kind": p.scope_kind,
                         "author": resolved_author,
                         "timestamp": envelope.timestamp,
+                        // l2-node 0.143.0: lets `GET /keys/{scope}?proof=1`
+                        // serve the original signed envelope.
+                        "msg_id": hex::encode(envelope.msg_id),
                     }))
                     .context("serializing channel key envelope")?;
                     // DM keys are PER-SENDER (keyed by the publishing author so each
-                    // participant's conv_key coexists). A channel epoch key is a SINGLE
-                    // GROUP key shared by all members, so it's stored author-agnostically
-                    // (canonical empty author) — any member fetches their wrapped copy by
-                    // (channel_scope, target=self, device, epoch) without knowing which
-                    // member published it. First-write-wins per device still yields one
-                    // key per (target, device, epoch); the actual publisher is preserved
-                    // in the record's `author` field for traceability.
-                    let store_author = if p.scope_kind
-                        == crate::messages::types::key_scope_kind::CHANNEL
-                    {
-                        ""
-                    } else {
-                        resolved_author
-                    };
+                    // participant's conv_key coexists). (Channel epoch keys are a single
+                    // group key stored author-agnostically by Step 7h.)
+                    let store_author = resolved_author;
                     match self.storage.put_channel_key_envelope_fww(
                         &p.key_scope,
                         &p.target,
@@ -5824,6 +6489,8 @@ mod enc_supersede_tests {
             eph_pub: [0u8; 32],
             nonce: [0u8; 24],
             wrapped: vec![0u8; 48],
+            key_commitment: None,
+            key_ts: None,
         };
         Envelope {
             version: 1,
@@ -11265,5 +11932,255 @@ mod internal_error_reason_tests {
             wrap_rejection("unauthorized", "only the channel creator can manage moderators".into()),
             "unauthorized: only the channel creator can manage moderators"
         );
+    }
+}
+
+#[cfg(test)]
+mod key_envelope_rate_limit_tests {
+    //! l2-node 0.143.0: `retry_after_ms` arithmetic of `rate_limit_check`.
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn retry_after_is_window_end_plus_one() {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let identity = IdentityResolver::new(storage.clone());
+        let r = MessageRouter::new(
+            storage,
+            identity,
+            None,
+            "testnet".into(),
+            usize::MAX,
+            Arc::new(crate::metrics::counters::NetworkCounters::new()),
+            crate::config::RateLimitsConfig::default(),
+        );
+        let t0 = 1_000_000u64;
+        for _ in 0..240 {
+            assert_eq!(r.rate_limit_check("klv1a", RateCategory::KeyEnvelope, false, t0), None);
+        }
+        // Window [t0, t0+60000] resets only once now - t0 > 60000.
+        assert_eq!(r.rate_limit_check("klv1a", RateCategory::KeyEnvelope, false, t0), Some(60_001));
+        assert_eq!(r.rate_limit_check("klv1a", RateCategory::KeyEnvelope, false, t0 + 60_000), Some(1));
+        assert_eq!(r.rate_limit_check("klv1a", RateCategory::KeyEnvelope, false, t0 + 60_001), None);
+        // DM-scope 0x61 shares the category (it moved off `Other`).
+        assert_eq!(RateCategory::from_msg_type(MessageType::ChannelKeyEnvelope), RateCategory::KeyEnvelope);
+    }
+
+    fn test_router() -> (MessageRouter, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let identity = IdentityResolver::new(storage.clone());
+        (
+            MessageRouter::new(
+                storage,
+                identity,
+                None,
+                "testnet".into(),
+                usize::MAX,
+                Arc::new(crate::metrics::counters::NetworkCounters::new()),
+                crate::config::RateLimitsConfig::default(),
+            ),
+            dir,
+        )
+    }
+
+    /// Round-3 N-b / round-4 N6: per-(wallet, scope) windows live exactly
+    /// their 60 s window and are pruned on a 60 s schedule; ordinary buckets
+    /// keep the 1-day retention.
+    #[test]
+    fn scope_buckets_expire_after_their_own_window() {
+        let (r, _d) = test_router();
+        let now = 10_000_000u64;
+        let old = || RateLimitEntry {
+            burst_count: 1,
+            burst_window_start: now - 61_000,
+            sustained_count: 1,
+            sustained_window_start: now - 61_000,
+        };
+        r.local_key_scope_windows.insert("klv1a:00".into(), old());
+        r.local_key_scope_windows.insert("klv1b:00".into(), RateLimitEntry {
+            burst_count: 1,
+            burst_window_start: now - 1_000,
+            sustained_count: 1,
+            sustained_window_start: now - 1_000,
+        });
+        r.rate_limits.insert("klv1a:KeyEnvelope".into(), old());
+        r.prune_key_envelope_buckets(now);
+        assert!(!r.local_key_scope_windows.contains_key("klv1a:00"), "expired scope window pruned");
+        assert!(r.local_key_scope_windows.contains_key("klv1b:00"), "live window kept");
+        assert!(r.rate_limits.contains_key("klv1a:KeyEnvelope"), "wallet bucket untouched");
+        // A second prune within 60 s is skipped (schedule), the next one runs.
+        r.local_key_scope_windows.insert("klv1c:00".into(), old());
+        r.prune_key_envelope_buckets(now + 1_000);
+        assert!(r.local_key_scope_windows.contains_key("klv1c:00"));
+        r.prune_key_envelope_buckets(now + 61_000);
+        assert!(!r.local_key_scope_windows.contains_key("klv1c:00"));
+    }
+
+    /// Round-5 B1: the unstored-key seen-cache is bounded (oldest first)
+    /// and expires after its TTL.
+    #[test]
+    fn unstored_key_cache_is_bounded_and_expires() {
+        let mut c = UnstoredKeyCache::default();
+        let id = |n: u32| {
+            let mut a = [0u8; 32];
+            a[..4].copy_from_slice(&n.to_be_bytes());
+            a
+        };
+        for n in 0..(UNSTORED_KEY_CACHE_MAX as u32 + 10) {
+            c.insert(id(n), UnstoredOutcome::AlreadyPresent, 1_000);
+        }
+        assert_eq!(c.len(), UNSTORED_KEY_CACHE_MAX);
+        assert!(c.lookup(&id(0), 1_000).is_none(), "oldest evicted first");
+        assert!(c.lookup(&id(UNSTORED_KEY_CACHE_MAX as u32 + 9), 1_000).is_some());
+        // TTL: still there at exactly the TTL, gone after it.
+        assert!(c.lookup(&id(50), 1_000 + UNSTORED_KEY_CACHE_TTL_MS).is_some());
+        assert!(c.lookup(&id(50), 1_001 + UNSTORED_KEY_CACHE_TTL_MS).is_none());
+        assert_eq!(c.len(), 0);
+    }
+
+    /// Round-5 N1: a full gossip-bucket map still admits wallets it already
+    /// tracks; only NEW keys are refused.
+    #[test]
+    fn full_gossip_bucket_map_still_admits_known_keys() {
+        let (r, _d) = test_router();
+        let now = 5_000_000u64;
+        // Fill to the cap with non-prunable (drained) buckets.
+        for n in 0..GOSSIP_KEY_BUCKETS_MAX {
+            r.gossip_key_buckets.insert(format!("klv1fill{n}"), TokenBucket { tokens: 0.0, last_ms: now });
+        }
+        r.gossip_key_buckets.insert("klv1known".into(), TokenBucket { tokens: 10.0, last_ms: now });
+        r.gossip_key_buckets.remove("klv1fill0");
+        let env = Envelope {
+            version: 1,
+            msg_type: MessageType::ChannelKeyEnvelope,
+            msg_id: [0; 32],
+            author: "x".into(),
+            timestamp: 1,
+            lamport_ts: 0,
+            payload: vec![],
+            signature: vec![0; 64],
+            relay_path: vec![],
+        };
+        assert!(r.gossip_key_envelope_allowed(&env, "klv1known", now), "known key admitted at the cap");
+        assert!(!r.gossip_key_envelope_allowed(&env, "klv1new", now), "new key refused at the cap");
+    }
+
+    /// Round-6 F6: pin the sizes behind the seen-cache memory estimate.
+    #[test]
+    fn unstored_cache_entry_sizes() {
+        assert!(std::mem::size_of::<UnstoredOutcome>() <= 24, "{}", std::mem::size_of::<UnstoredOutcome>());
+        assert!(std::mem::size_of::<KeyConflictInfo>() <= 160, "{}", std::mem::size_of::<KeyConflictInfo>());
+        assert!(std::mem::size_of::<([u8; 32], u64)>() <= 40);
+    }
+
+    /// Round-6 M9: the forced prune at the bucket-map cap runs at most once
+    /// per second.
+    #[test]
+    fn forced_bucket_prune_is_gated_to_once_per_second() {
+        let (r, _d) = test_router();
+        let now = 9_000_000u64;
+        // Suppress the 60 s lazy prune so only the forced one can run.
+        r.key_bucket_last_prune_ms.store(now, std::sync::atomic::Ordering::Relaxed);
+        let fill = |r: &MessageRouter, at: u64| {
+            r.gossip_key_buckets.clear();
+            // Fully refilled buckets: prunable.
+            for n in 0..GOSSIP_KEY_BUCKETS_MAX {
+                r.gossip_key_buckets.insert(format!("klv1f{n}"), TokenBucket { tokens: 720.0, last_ms: at });
+            }
+        };
+        let env = Envelope {
+            version: 1,
+            msg_type: MessageType::ChannelKeyEnvelope,
+            msg_id: [0; 32],
+            author: "x".into(),
+            timestamp: 1,
+            lamport_ts: 0,
+            payload: vec![],
+            signature: vec![0; 64],
+            relay_path: vec![],
+        };
+        fill(&r, now);
+        assert!(r.gossip_key_envelope_allowed(&env, "klv1new1", now), "forced prune made room");
+        fill(&r, now);
+        assert!(!r.gossip_key_envelope_allowed(&env, "klv1new2", now + 500), "second forced prune within 1 s is skipped");
+        assert!(r.gossip_key_envelope_allowed(&env, "klv1new2", now + 1_000), "allowed again after 1 s");
+    }
+
+    /// Round-4 N4: peeks and refusals never create entries.
+    #[test]
+    fn refused_and_peeked_checks_create_no_entries() {
+        let (r, _d) = test_router();
+        let limits = RateLimits::flat(1, 60_000);
+        assert_eq!(MessageRouter::window_check(&r.rate_limits, "k".into(), limits, 1, false), None);
+        assert!(r.rate_limits.is_empty(), "peek creates nothing");
+        assert_eq!(MessageRouter::window_check(&r.rate_limits, "k".into(), limits, 1, true), None);
+        assert_eq!(MessageRouter::window_check(&r.rate_limits, "k".into(), limits, 2, true), Some(60_000));
+        assert_eq!(r.rate_limits.get("k").map(|e| e.burst_count), Some(1), "refusal did not count");
+        assert_eq!(MessageRouter::window_check(&r.rate_limits, "k".into(), limits, 60_002, true), None, "reset after > window");
+    }
+
+    /// Round-4 audit W1a: gossip token buckets admit a home node's maximum
+    /// (2 x its fixed-window limit in a 60 s span) and refuse a flood.
+    #[test]
+    fn gossip_token_buckets_admit_two_windows_and_refuse_floods() {
+        let (r, _d) = test_router();
+        let scope = [7u8; 32];
+        let env = |i: u32| {
+            let p = ChannelKeyEnvelopePayload {
+                key_scope: scope,
+                scope_kind: crate::messages::types::key_scope_kind::CHANNEL,
+                epoch: 1,
+                target: "klv1t".into(),
+                device_id: format!("{:064x}", i),
+                peer: None,
+                channel_id: Some(1),
+                eph_pub: [1; 32],
+                nonce: [1; 24],
+                wrapped: vec![1; 48],
+                key_commitment: Some([1; 32]),
+                key_ts: Some(1),
+            };
+            Envelope {
+                version: 1,
+                msg_type: MessageType::ChannelKeyEnvelope,
+                msg_id: [0; 32],
+                author: "klv1a".into(),
+                timestamp: 1,
+                lamport_ts: 0,
+                payload: rmp_serde::to_vec_named(&p).unwrap(),
+                signature: vec![0; 64],
+                relay_path: vec![],
+            }
+        };
+        let t0 = 1_000_000u64;
+        // Home node: 60 at the end of one window + 60 at the start of the
+        // next, all within ~1 s on the wire → 120 per scope must pass.
+        for i in 0..120u32 {
+            assert!(r.gossip_key_envelope_allowed(&env(i), "klv1a", t0 + i as u64), "#{i}");
+        }
+        // 180 burst capacity: 60 more pass, then the scope bucket refuses.
+        for i in 120..180u32 {
+            assert!(r.gossip_key_envelope_allowed(&env(i), "klv1a", t0 + 200));
+        }
+        assert!(!r.gossip_key_envelope_allowed(&env(999), "klv1a", t0 + 200), "flood refused");
+        // Refill 1/s.
+        assert!(r.gossip_key_envelope_allowed(&env(1000), "klv1a", t0 + 1_300));
+        // Per wallet: 720 burst across scopes, then refused.
+        let (r, _d) = test_router();
+        let mut ok = 0;
+        for i in 0..800u32 {
+            let mut e = env(i);
+            let mut p: ChannelKeyEnvelopePayload = rmp_serde::from_slice(&e.payload).unwrap();
+            p.key_scope = [(i % 8) as u8; 32];
+            e.payload = rmp_serde::to_vec_named(&p).unwrap();
+            if r.gossip_key_envelope_allowed(&e, "klv1a", t0) {
+                ok += 1;
+            }
+        }
+        assert_eq!(ok, 720);
+        // Refused attempts created no extra entries: 1 wallet + 8 scopes.
+        assert_eq!(r.gossip_key_buckets.len(), 9);
     }
 }

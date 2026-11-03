@@ -115,6 +115,34 @@ enum Commands {
         #[arg(long)]
         yes: bool,
     },
+    /// Offline database maintenance (the node must be stopped).
+    Db {
+        #[command(subcommand)]
+        action: DbCommand,
+    },
+}
+
+/// `ogmara-node db …` subcommands.
+#[derive(Subcommand)]
+enum DbCommand {
+    /// Drop one derived column family so an OLDER release can open the
+    /// database (rollback runbook, l2-node 0.143.0).
+    ///
+    /// Only `channel_key_commits` is allowed. Uses this binary's own RocksDB
+    /// (distro `ldb` builds are older than the bundled RocksDB), refuses to
+    /// run while the node holds the database lock, and also clears the
+    /// key-commit migration sentinels so a later re-upgrade re-runs the
+    /// migration. Run it as the node's service user (e.g.
+    /// `sudo -u ogmara ogmara-node -c /etc/ogmara/ogmara.toml db drop-cf
+    /// channel_key_commits`), never as bare root: root-owned database files
+    /// would stop the service from starting.
+    DropCf {
+        /// Column family to drop (only `channel_key_commits`).
+        name: String,
+        /// Skip the confirmation prompt. Use only in automation.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[tokio::main]
@@ -281,6 +309,40 @@ async fn main() -> Result<()> {
             println!("New address:      {}", imported_address);
             println!();
             println!("Restart the node for the new identity to take effect.");
+            Ok(())
+        }
+
+        Commands::Db { action: DbCommand::DropCf { name, yes } } => {
+            let config_path = resolve_config(&cli.config);
+            let cfg = config::Config::load(&config_path)?;
+            let db_path = cfg.node.data_dir.join("db");
+            if !storage::rocks::Storage::DROPPABLE_CFS.contains(&name.as_str()) {
+                anyhow::bail!(
+                    "refusing to drop '{}': only {:?} may be dropped",
+                    name,
+                    storage::rocks::Storage::DROPPABLE_CFS
+                );
+            }
+            if !yes {
+                println!("About to drop column family '{}' in {}.", name, db_path.display());
+                println!("This removes key-epoch arbitration state so a pre-0.143 release can open the database.");
+                print!("Continue? [y/N]: ");
+                use std::io::Write;
+                std::io::stdout().flush().ok();
+                let mut line = String::new();
+                std::io::stdin().read_line(&mut line)?;
+                let answer = line.trim().to_ascii_lowercase();
+                if answer != "y" && answer != "yes" {
+                    println!("Aborted.");
+                    return Ok(());
+                }
+            }
+            if storage::rocks::Storage::drop_column_family_offline(&db_path, &name)? {
+                println!("Dropped column family '{}' in {}.", name, db_path.display());
+                println!("Cleared the key-commit migration sentinels (it re-runs on the next 0.143+ start).");
+            } else {
+                println!("Column family '{}' does not exist in {} — nothing to do.", name, db_path.display());
+            }
             Ok(())
         }
 

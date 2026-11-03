@@ -535,7 +535,7 @@ fn join_has_invite(join_raw: &[u8]) -> bool {
 /// W2) plus ≤ `MAX_DEVICE_ITEMS` stored `DeviceRevocation` envelopes naming
 /// the device. `Err(())` when a revocation is oversized (the caller fails
 /// the member closed); `Ok(None)` when no PoP delegation is stored.
-fn device_claim_json(
+pub(crate) fn device_claim_json(
     storage: &Storage,
     network: &str,
     device_address: &str,

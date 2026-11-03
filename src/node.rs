@@ -834,6 +834,10 @@ fn supervise_handle(
     abort_handle
 }
 
+/// Max `MESSAGES` rows the key-commit migration's `msg_id` back-fill scans
+/// per boot (l2-node 0.143.0); larger databases resume on the next start.
+const KEY_COMMITS_MIGRATION_BUDGET: usize = 5_000_000;
+
 /// The running L2 node instance.
 pub struct Node {
     /// Node configuration.
@@ -966,6 +970,26 @@ impl Node {
             }
         }
 
+
+        // Key-epoch arbitration migration (l2-node 0.143.0): `legacy` commit
+        // rows for pre-existing channel key epochs + msg_id back-fill into
+        // CHANNEL_KEYS records. NEVER fatal: every error is logged and boot
+        // continues (Step 7h detects legacy epochs lazily, so correctness does
+        // not depend on it); the sentinel is set only on full success, and a
+        // budget-capped pass resumes from its cursor on the next start.
+        match storage.get_stat(state_keys::KEY_COMMITS_MIGRATED_V1) {
+            Ok(0) => {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                if let Err(e) = storage.migrate_channel_key_commits(KEY_COMMITS_MIGRATION_BUDGET, now_ms) {
+                    warn!(error = %e, "Key-commit migration failed; will retry next start (node continues)");
+                }
+            }
+            Ok(_) => {}
+            Err(e) => warn!(error = %e, "Key-commit migration: sentinel read failed; skipping this start"),
+        }
 
         // Backfill CHANNEL_META_MSGS from MESSAGES (one-time, P-3b channel
         // metadata) so the channel-history reconcile can serve channel
@@ -2669,7 +2693,11 @@ impl Node {
 
         // Persist final Lamport counter
         let val = self.lamport_counter.load(Ordering::SeqCst);
-        self.storage.set_lamport_counter(val)?;
+        // Never skip the final flush below because of this write (round-4
+        // audit N3): log and continue.
+        if let Err(e) = self.storage.set_lamport_counter(val) {
+            warn!(error = %e, "Failed to persist the Lamport counter on shutdown");
+        }
 
         // Give the anchor task a bounded window to broadcast its
         // graceful `pauseNode` (v0.45.0 spec 13 §6.3) before we abort.
@@ -2702,6 +2730,14 @@ impl Node {
         network_task.abort();
         chain_task.abort();
         api_task.abort();
+
+        // Leave no state that exists only in the WAL (round-3 audit B1): a
+        // later offline tool or an older binary opening this DB with other
+        // per-CF options could not replay it. Best effort — on failure the
+        // WAL is still there for this binary's next start.
+        if let Err(e) = self.storage.flush_all() {
+            warn!(error = %e, "Failed to flush the database on shutdown (WAL replay recovers it on the next start)");
+        }
 
         info!("Node stopped");
         // W17: an unexpected critical-task death must produce a non-zero

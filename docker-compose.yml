@@ -29,6 +29,10 @@ services:
     image: ogmara/ogmara:l2-node-latest
     container_name: ogmara-node
     restart: unless-stopped
+    # Graceful stop needs up to ~45 s for the anchor-pause broadcast plus the
+    # final database flush (l2-node 0.143.0); Docker's default 10 s would
+    # SIGKILL the node before the flush and leave state only in the WAL.
+    stop_grace_period: 60s
     depends_on:
       - ipfs
     volumes:

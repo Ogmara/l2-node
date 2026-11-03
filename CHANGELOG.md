@@ -5,6 +5,479 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.143.0] - 2026-11-02
+
+Node-side **key-epoch arbitration** for channel-scope `ChannelKeyEnvelope`s
+(0x61). Until now every `(scope, target, device, epoch)` wrap was
+first-write-wins **per device**, so two members establishing the same
+epoch concurrently each won some devices and the channel was permanently
+forked for that epoch (reproduced by the Phase-2 client audits with all
+three client protocols). The node now records ONE winning key commitment
+per channel `(scope, epoch)` and refuses or supersedes everything else.
+This is a coordinated, ONE-WAY change: the new clients (sdk-js 0.67.0 and
+the held web/desktop/mobile releases) require it, and rolling back to 0.142
+needs an operator step and loses arbitration (see Deploy notes and Known
+limitations).
+
+### Added
+
+- **`key_commitment` / `key_ts` on `ChannelKeyEnvelopePayload`**, appended
+  at the END of the struct (`#[serde(default, skip_serializing_if)]`) so the
+  positional (array) form of pre-0.143 envelopes still decodes. Clients
+  compute `key_commitment = keccak256("ogmara-chankey-commit-v1" ||
+  key_scope || epoch_be8 || key_ts_be8 || channel_key)`; `key_ts` is the
+  per-key constant establishment time (ms). `key_ts` is bound into the hash
+  so a candidate key is identified by the PAIR `(key_ts, key_commitment)`
+  and cannot be re-ranked by editing `key_ts` alone (audit B2: without it,
+  re-publishing a known commitment with an earlier `key_ts` could supersede
+  the real wraps of that very key — silent message loss). Channel scope
+  only: both or neither, commitment
+  not all-zero, `0 < key_ts <= envelope.timestamp` (else `400
+  key_commitment_invalid`). Ignored for DM scope.
+- **Arbitration (router Step 7h)**, per channel `(scope, epoch)` state
+  `none | legacy | arbitrated(pair)`. Rank = `(key_ts, key_commitment
+  bytes)`, LOWEST wins:
+  - **freshness (content-only, uniform at create AND supersede):** an
+    envelope with `envelope.timestamp - key_ts > 15 min` → `400
+    key_ts_stale`, UNLESS its pair is exactly the current winner (late
+    covers of an established key may still join). It depends only on the
+    envelope, so every node reaches the same verdict (audit B1: the draft
+    applied it only to supersedes, so one node could record a back-dated
+    pair as first winner while another refused it — a cross-node fork);
+  - none + pair → record `arbitrated(pair)`, store the wrap. A NEW epoch
+    must be at most `max(highest known epoch, private key_epoch_floor) +
+    256` (`400 key_epoch_too_far`) — the same wide sanity bound as before
+    0.143 (no near-`u64::MAX` epochs), now checked under the key lock in
+    Step 7h. A tight `+2` bound was tried in round 2 and REVERTED (round-3
+    audit B2): its inputs are node-local and key envelopes are never
+    backfilled, so a node that federated a channel late or missed two
+    rotations refused every later honest rotation forever — and it did not
+    even stop pre-squatting (a member can ratchet one epoch at a time);
+  - the winning pair → store the wrap (another target of the same key).
+    Every `(target, device, epoch)` slot is **write-once** (first write
+    wins) — also against the winner's own author. (A "winner's author may
+    replace a squatted slot" rule was tried in round 1 and REVERTED: on a
+    lagging node the recorded winner author is whoever first delivered the
+    public pair there, so the rule let a copier overwrite honest wraps.)
+  - any other pair (including the same `C` with a different `key_ts`) →
+    SUPERSEDE only if it ranks strictly better AND `now < recorded_at +
+    120 s` (finality horizon; `recorded_at` is when this node first
+    arbitrated the epoch and is never extended by a supersede). Nothing
+    else influences the outcome — an earlier round-1 rule that refused a
+    commitment superseded before was REMOVED because it made the winner
+    depend on which envelopes a node happened to see (round-2 audit W-A);
+    `superseded` is kept for forensics only. Every wrap at that epoch whose
+    `(key_commitment, key_ts)` differs is deleted (status-checked scan; if
+    the scope holds more rows than its cap the supersede fails closed
+    instead of under-deleting). Otherwise → **409 conflict**. The winner
+    only ever moves to a strictly better pair (no oscillation); every wrap
+    carries the full rank, so the outcome is independent of gossip order
+    (pinned by an exhaustive all-orders test).
+  - **sync / backfill ingestion** (no drift check, no rate limit) accepts
+    ONLY wraps of the already recorded winner; everything else →
+    `key_sync_not_winner` (round-2 audit W-C: a responder must not replay
+    an old pair onto victim nodes). In practice no sync protocol carries key
+    envelopes at all: reconcile refuses them in its pre-check, the
+    identity / news / DM / private-channel syncs allow-list their own
+    types, and federation replays only `ChannelCreate`/`ChannelUpdate`.
+    (A round-5 "sync may supersede" rule was unreachable for exactly that
+    reason — and would have allowed unbounded supersedes if ever wired — so
+    it was removed in round 6.)
+  - `legacy` (an epoch whose `CHANNEL_KEYS` rows predate 0.143) → the old
+    first-write-wins, nothing arbitrated. **STRICT policy:** a
+    commitment-less envelope is accepted ONLY at a legacy epoch; at
+    none/arbitrated it gets `400 key_commitment_required`.
+  Hot-path cost under the node-wide `channel_key_envelope_lock` (round-2
+  audit W-D): cheap point reads and content checks run first; legacy
+  detection and the cap check iterate KEYS only (values are copied only on
+  a supersede); once the migration's Phase A has run, legacy detection and
+  the max-epoch lookup need no scan at all; the old 8192-row
+  `max_channel_key_epoch` scan in Step 7c is gone. Measured on a scope
+  with ~4000 rows (release build, before → after): new slot 853 µs →
+  623 µs, already-present 10 µs → 9 µs, conflict 5.1 µs → 4.2 µs; with
+  Phase A complete the new-slot path no longer scans for legacy rows.
+  The whole decision runs under `channel_key_envelope_lock` and commits ONE
+  `WriteBatch`: commit row + supersede/eviction deletions + `CHANNEL_KEYS`
+  put + `MESSAGES` put + `TOTAL_MESSAGES` merge (the generic Step 8 store
+  and the Step 8b apply arm are skipped for channel scope; DM scope is
+  unchanged). Legacy epochs are also detected lazily (rows at an epoch with
+  no commit row), so correctness never depends on the migration below.
+- **New column family `channel_key_commits`** (`key_scope ++ epoch_be8` →
+  `{c, key_ts, author, msg_id, recorded_at, state, superseded[≤4]}`), plus
+  a per-scope meta row (`{evicted_below}`). Node-local derived state, NOT in
+  snapshot `DOMAIN_CFS`. At most **512 epoch rows per scope**; past that the
+  lowest epoch is evicted and every epoch at or below it is refused from
+  then on (`400 key_epoch_evicted`) so an evicted epoch can never fall back
+  to first-write-wins.
+- **`CHANNEL_KEYS` records** gain `key_commitment`, `key_ts` (channel
+  scope) and `msg_id` (both scopes).
+- **`RouteResult::KeyConflict`** with every exhaustive match updated:
+  gossip → `Ignore` (policy, no peer penalty; the verdict mapping is now the
+  pure, unit-tested `network::gossip_acceptance_for`), sync / backfill /
+  identity-, news-, dm- and private-channel-sync → treated like `Rejected`.
+- **409 JSON body** `{"error":"key_commitment_conflict","channel_id",
+  "epoch","state","winner":{"key_commitment","key_ts","author","msg_id",
+  "final"}}` on every message-submitting endpoint — deliberately distinct
+  from the plain-text duplicate 409 `"message already exists"` (which still
+  means "stored").
+- **`key_status`** (`"stored"` | `"already_present"`) on the `POST
+  /api/v1/messages` success body for channel-scope key envelopes.
+- **`GET /api/v1/channels/{id}/key-commitment?epoch=N`** (authenticated,
+  member-only, 404 otherwise; `epoch` omitted = highest known):
+  `{channel_id, epoch, state: "none"|"legacy"|"arbitrated", key_commitment,
+  key_ts, author, msg_id, recorded_at, final, finality_ms: 120000}`.
+- **`GET /api/v1/keys/{scope}?…&proof=1`**: the record additionally
+  carries `signed_envelope` (base64 of the original signed envelope from
+  `MESSAGES`) and `device_claim` (the dual-signed delegation evidence, same
+  shape as `member-proofs`) when it was signed by a delegated device, so a
+  client can verify WHO published a wrap instead of trusting the node's
+  derived record. `null` for rows with no recoverable `msg_id`.
+- **`/api/v1/health` `features: ["key_commitment_v1"]`** — clients refuse to
+  establish private-channel epochs on nodes without it.
+- **`ogmara-node db drop-cf channel_key_commits`** — offline maintenance
+  for the rollback runbook (see Deploy notes).
+- **Boot migration** (sentinel `migration_key_commits_v1`; Phase A sets
+  `migration_key_commits_legacy_rows_v1`; Phase B logs progress with an
+  ETA every 500,000 `MESSAGES` rows): writes `legacy`
+  commit rows for every existing channel `(scope, epoch)` (re-checked under
+  the key lock — never overwrites an arbitrated row, never re-creates an
+  epoch the per-scope cap evicted) and back-fills `msg_id` into existing
+  channel-scope `CHANNEL_KEYS` records by streaming `MESSAGES`. A match
+  needs the same wrap (`eph_pub`/`nonce`/`wrapped`) AND the same
+  `timestamp` AND the envelope author (device resolved to its wallet) equal
+  to the record's `author` (audit W1: matching the wrap alone let anyone
+  re-sign a copy of a public wrap and have THEIR envelope served as the
+  record's `proof=1` evidence). At most 5,000,000 `MESSAGES` rows
+  per boot with a persisted resume cursor; any error is logged and boot
+  continues; the sentinel is set only on full success.
+- **Cross-implementation fixtures** `tests/fixtures/epoch-arbitration/`
+  (`vectors.json` + README): commitment KATs (the sdk-js / spec §8.1
+  vectors `8016166a…a5d4` and `bcd39e59…8d32`), the rank constants, and signed winner / rival /
+  commitment-less envelopes whose payload bytes reproduce sdk-js's
+  `@msgpack/msgpack` map encoding, each outcome asserted against the router.
+- Tests: arbitration state machine, superseded-history cap, commit-row cap
+  and eviction horizon, scope-full, private floor, DB reopen persistence,
+  a 12-thread hammering test converging on exactly one commitment,
+  migration incl. budget-capped resume and idempotence, full-pipeline
+  key_status / conflict / validation codes, DM-scope passthrough, 409 JSON
+  vs plain duplicate 409, 400 JSON codes, 429 `retry_after_ms`, the
+  key-commitment membership gate, `proof=1` with a device-signed wrap,
+  `/health` features, JS map + legacy/full array-form decoding, gossip
+  verdict mapping.
+  Round 6 added: sync outcomes never cached (sync-then-live of the same
+  envelope is evaluated normally), `key_ts_stale` not cached, a cached
+  refusal replays the same code without consuming budget, the forced
+  bucket prune is gated to once per second, seen-cache entry sizes pinned,
+  and sync accepts winner wraps only.
+  Round 5 added: replayed already-present / conflicting wraps no longer
+  burn the victim's gossip bucket or local window (auditor reproductions,
+  inverted), seen-cache bound + TTL, REST does not relay already-present
+  wraps, a full gossip-bucket map still admits tracked wallets — and a
+  third mutation pass including the auditor's surviving mutants.
+  Round 4 added: gossip token buckets (2x-window burst admitted, flood
+  refused, refused checks create no entries), already-present wraps not
+  stored or relayed, unclean-DB drop-cf message, default-options open
+  after drop-cf, peek/refusal map hygiene and 60 s scope-window pruning.
+  Round 3 added: `db drop-cf` keeps every row with WAL-resident merges
+  (counters, all messages, all key rows), wide epoch bound never wedging a
+  fresh / lagging node, lowest-epoch-first eviction letting rotation fit
+  past junk at the current epoch, gossip key envelopes bypassing every
+  per-wallet budget, refused attempts consuming no slot, short TTL of
+  per-scope buckets — and a mutation pass (13 mutations of the round-2/3
+  guards, all killed by the suite).
+  Round 2 added: exhaustive all-arrival-orders winner test (120 orders),
+  late cover at `none`, sync-path winner-only (storage + router + reconcile
+  pre-check), floor rotation, corrupt scope meta fails closed, incomplete
+  supersede fails closed, write-once slots against a different author,
+  `db drop-cf` (allow-list, lock, sentinels cleared), per-(wallet, scope)
+  budget, and an ignored lock-hold benchmark
+  (`cargo test --release lock_hold_bench -- --ignored --nocapture`).
+  Audit round 1 added: uniform `key_ts_stale` incl. late winner wraps,
+  pair identity (same C / different `key_ts`), forged-copy-proof msg_id
+  back-fill, eviction horizon vs Phase-A re-creation, legacy
+  `final: true`, `retry_after_ms` = window end + 1, opening a DB with an
+  unknown column family, and the new KATs (cross-checked against
+  `@noble/hashes`).
+
+### Changed
+
+- **Rate limit for key envelopes (0x61), exact semantics:**
+  - LOCAL ingress (this node's API / WebSocket) uses the fixed windows
+    below. GOSSIP uses wider TOKEN buckets instead (round-4 audit W1 — a
+    round-3 full exemption let one member fill every node's scope within
+    seconds): per wallet capacity **720, refilling 4/s**; per (wallet,
+    channel scope) capacity **180, refilling 1/s**. A home node's fixed
+    60 s window admits at most 2x its limit in any 60 s span (480 / 120),
+    so an honest burst a home node accepted is never refused by a peer;
+    they only bound floods from a member that bypasses its home node.
+    Checked after authorization (only members' envelopes create bucket
+    entries; ≤ 200,000 tracked, buckets that have refilled are pruned at
+    least every 60 s); both checked before either is consumed; a refused
+    envelope consumes nothing and is simply not accepted or relayed
+    (gossipsub `Ignore`). SYNC / backfill stays exempt (it only accepts
+    wraps of the recorded winner). A full map still admits wallets it
+    already tracks; only new keys are refused, after a forced prune that
+    runs at most once per second. A wallet whose clients use
+    SEVERAL home nodes at once can exceed a peer's gossip bucket — wraps
+    beyond it are lost on that peer.
+  - Local fixed-window buckets: **240 per minute per wallet** (new `RateCategory::
+    KeyEnvelope`, ALL 0x61 — channel and DM scope; both were in the shared
+    `Other` 100/min) and, for channel scope, **60 per minute per (wallet,
+    channel scope)**, so one wallet cannot spend its whole budget on a
+    single channel's lock-protected scope.
+  - Fixed windows: a window starts at the first counted message and resets
+    once `now - start > window_ms` (strictly greater). Both buckets are
+    checked before either is counted, and a refused (429) attempt consumes
+    NOTHING. Every other outcome after Step 6 (accepted, 400, 409) has
+    consumed one slot in each applicable bucket.
+  - Refused → `429 {"error":"rate_limited","retry_after_ms":N}` with
+    `N = start + window_ms + 1 - now` (≥ 1) of the latest-resetting
+    exceeded bucket. Every other category keeps its plain-text 400
+    `rate limited (…)`.
+  - Per-scope windows live in their own map and are pruned every 60 s
+    (exactly their window), bounding the per-(wallet, scope) map. Checks
+    that only peek or are refused never create map entries.
+- **Already-present wraps are neither stored nor relayed** (round-4 audit
+  W1b): a key envelope whose `(target, device, epoch)` slot already holds a
+  wrap is answered `key_status: "already_present"` (local) / ignored
+  (gossip) without writing its envelope to `MESSAGES` or the message
+  counter, and it is not re-published — replays of such wraps can no
+  longer grow the database.
+- **Seen-cache for unstored key envelopes** (round-5 audit B1, rules
+  tightened in round 6): a key envelope that reached arbitration on LIVE
+  ingestion (API / WebSocket / gossip) but was NOT stored, with an outcome
+  that can never change for those exact bytes, is remembered by msg_id in
+  memory — ≤ 100,000 entries, oldest evicted first, TTL 10 min (twice the
+  ±5 min drift window); worst case ~33 MB (all conflicts), ~12 MB if all
+  already-present. Cached: already present (slots are write-once),
+  conflict (a worse pair stays worse, a final epoch stays final),
+  `key_epoch_below_floor` / `key_epoch_evicted` (floor and horizon only
+  rise), `key_commitment_invalid` (content-only). NOT cached:
+  `key_ts_stale` (the same pair may become the winner once its fresher
+  establishing envelope arrives), `key_scope_full`, `key_epoch_too_far`,
+  `key_commitment_required`, rate limits, authorization failures, internal
+  errors, and ANY outcome on the sync path (path-dependent: a sync refusal
+  must not shadow a later live delivery of the same bytes). A replay is
+  answered at Step 3b — BEFORE any rate window or token bucket is touched
+  — so a third party re-submitting someone else's envelope cannot burn
+  that wallet's budget: already-present → `Duplicate` (plain 409 locally,
+  gossip `Ignore`); conflict / refusal → the SAME answer as the first time
+  (409 JSON / 400 code), never a `Duplicate` a client would read as
+  success. A cached conflict reports the winner as of its first
+  evaluation, which may be outdated (the winner can only have improved).
+  Like Step 3, the cached answer precedes the signature check: a forged
+  envelope reusing a cached msg_id just gets the cached answer — never a
+  trust signal. In memory only: after a restart, replays are evaluated
+  (and rate-limited) normally again.
+- **Scope full is no longer a silent 200** for channel scope: `400
+  {"error":"key_scope_full"}` and nothing is stored (DM scope unchanged).
+- **Private channels:** a channel-scope 0x61 with `epoch <
+  key_epoch_floor` is refused (`400 key_epoch_below_floor`) on every
+  ingest path (checked under the key lock).
+- Step-7h rejections answer `400 {"error":"<code>","message":…}`
+  (`key_commitment_required`, `key_commitment_invalid`, `key_ts_stale`,
+  `key_epoch_below_floor`, `key_epoch_evicted`, `key_epoch_too_far`,
+  `key_scope_full`, `key_sync_not_winner`).
+- `Storage::open` now opens (and ignores) column families it does not know,
+  with auto-compaction disabled and a warning per CF, instead of failing: RocksDB refuses to open a database
+  holding an unlisted CF, so without this any rollback past a release that
+  added a CF bricks the node at boot (audit B3). Applies to rollbacks TO
+  0.143.0 or later; see Deploy notes for 0.142.
+- The gossip-topic selection for 0x61 decodes the full payload instead of
+  a 2-field probe struct, which could not decode the positional (array)
+  wire form (recurring shape #20) and left such envelopes un-gossiped.
+
+### Security
+
+- Closes the per-device first-write-wins **key fork**: concurrent epoch
+  establishment can no longer leave members of one channel holding
+  different keys for the same epoch (within the finality horizon).
+- `proof=1` lets clients authenticate a wrap's publisher (signature +
+  device delegation) — the pre-existing hole where a hostile node could
+  inject a key wrap into a member's slot becomes detectable client-side
+  (clients must verify; sdk-js 0.67.0 `verifyChannelKeyWrap`).
+- **Dependencies** (advisories published 2026-10/11, all pre-existing in the
+  lockfile, none introduced by this change):
+  - `zstd` 0.13 → **0.14.3** (direct dependency; pulls `zstd-safe` 8.2.0 and
+    `zstd-sys` 2.1.x): fixes RUSTSEC-2026-0391 (abandoned stream data leaks
+    into the next stream), RUSTSEC-2026-0403 / -0398 (uninitialised memory /
+    bad `Vec` length) and RUSTSEC-2026-0410, plus the `zstd-safe` unsound
+    notices -0395..-0406. **Runtime**: zstd decodes peer-supplied snapshot
+    chunks and HLL digests. The zstd frame format is unchanged, so snapshots
+    and digests stay compatible across nodes.
+  - `ctutils` 0.4.2 → 0.4.7 (RUSTSEC-2026-0385, non-constant-time masks;
+    runtime, transitive via `digest` in libp2p's ed25519 stack).
+  - `libz-sys` 1.1.25 → 1.1.31 (RUSTSEC-2026-0418, build script leaks env
+    vars into the build dir; **build-time only**, via rocksdb).
+  - `tokio` 1.53.1 → 1.54.1 (RUSTSEC-2026-0386, `AsyncFd` I/O-safety
+    unsoundness notice; runtime).
+  `cargo audit` now reports 0 vulnerabilities. The two existing
+  unmaintained-crate warnings (`core2` RUSTSEC-2026-0105, `paste`
+  RUSTSEC-2024-0436) and the yanked `spin` 0.9.8 notice are unchanged: all
+  are transitive with no maintained drop-in reachable without upstream
+  releases.
+
+### Deploy notes (operators + client release)
+
+- **Hard cutover; all currently released clients are refused on new
+  epochs.** STRICT policy: every client released before sdk-js 0.67.0 sends
+  commitment-less key envelopes and gets `400 key_commitment_required` both
+  when establishing a NEW epoch and when covering a member at an epoch that
+  is already arbitrated. Only legacy epochs (keys that existed before the
+  upgrade) keep working first-write-wins. Ship the node to all operator
+  nodes, then sdk-js 0.67.0 and the held clients, as close together as
+  possible.
+- **Legacy rows may have no proof.** Rows whose original envelope could not
+  be matched by the migration return `signed_envelope: null` (and
+  `device_claim: null`) under `proof=1`. Clients that verify wraps must
+  special-case legacy epochs (accept with the legacy trust model, or rotate
+  to a fresh arbitrated epoch after the upgrade).
+- **Rollback to 0.142 needs an operator step.** A 0.142 binary cannot open
+  a database that contains `channel_key_commits` (RocksDB: "Column families
+  not opened") and will fail at boot. Before downgrading, stop the node and
+  run, WITH THE 0.143 BINARY and as the node's service user (never bare
+  `sudo` — root-owned DB files stop the service from starting):
+  `sudo -u ogmara ogmara-node -c /etc/ogmara/ogmara.toml db drop-cf
+  channel_key_commits` (add `--yes` in automation). The new `db drop-cf`
+  subcommand uses the node's own RocksDB 10.4.2 (distro `ldb` builds are
+  older and are not installed by default), refuses to run while the node
+  holds the DB lock, only accepts this one CF name, prints what it did, and
+  clears the key-commit migration sentinels so a later re-upgrade re-runs
+  the migration. It also refuses unless it runs as the uid that owns the
+  database directory. It opens every known CF with exactly the node's
+  options (incl. the `NODE_STATE` merge operator — round-3 audit B1: the
+  first version did not, WAL replay stopped at the first counter merge
+  record and every later write was silently lost), uses WAL recovery
+  mode "absolute consistency" so any replay problem aborts instead of
+  truncating, writes the sentinel deletes as a synced batch, then syncs the
+  WAL and flushes every CF before dropping. 0.142 then starts, but without
+  arbitration: epochs arbitrated meanwhile can fork again.
+  The node now also flushes every CF on graceful shutdown, so nothing lives
+  only in the WAL when an older binary or an offline tool opens the DB.
+  The flush runs AFTER the up-to-45 s anchor-pause wait: give the service
+  at least 60 s to stop — `docker-compose.yml` now sets
+  `stop_grace_period: 60s`; for systemd use `TimeoutStopSec=60` (or more)
+  in the unit. If `db drop-cf` reports that the database "was not shut down
+  cleanly" (WAL corruption / torn tail), start this 0.143 node once, stop
+  it gracefully, then rerun; a lock error means the node is still running.
+  For plain `docker run` deployments use `--stop-timeout 60` (or stop with
+  `docker stop -t 60`). Even a graceful stop does not GUARANTEE an empty
+  WAL: background tasks are aborted without being awaited and can still
+  write after the final flush; those records replay normally on the next
+  start of a 0.143+ node. (A round-4 boot refusal for "unknown CF + non-
+  empty WAL" was removed in round 5 — it also fired after an ordinary crash
+  of this release and could stop a node from starting.)
+  From 0.143.0 on unknown CFs are tolerated (opened with default options,
+  auto-compaction off, one warning per CF), so later rollbacks need no
+  step — caveat for a
+  FUTURE release: a CF that needs a merge operator is only safe to open
+  with default options once its WAL is flushed; the shutdown flush covers
+  a graceful stop, a crash-then-rollback does not.
+- **Late subscribers / fresh nodes can't take late covers.** Key envelopes
+  are not backfilled. A node that never saw an epoch (state `none`)
+  refuses a cover whose `key_ts` is more than 15 minutes old with `400
+  key_ts_stale` — even when it is the network's winner — because accepting
+  stale pairs at `none` would let back-dated keys open epochs. This is a
+  regression vs 0.142 for members whose home node subscribes late; the SDK
+  recovers by rotating to a new epoch when its home node reports `none` /
+  no wrap.
+
+### Known limitations
+
+- **Late covers are refused at nodes in state `none`.** A node that never
+  saw an epoch (new/late subscriber, wiped node) answers a cover made more
+  than 15 minutes after the key's `key_ts` with `400 key_ts_stale`; see
+  the Deploy notes ("Late subscribers / fresh nodes can't take late
+  covers"). Recovery is a rotation.
+- **Partition split of an epoch's key — OPEN.** A partition of ANY length
+  can split an epoch if the establishing envelopes are dropped on one side
+  and nothing re-delivers them: only wraps that still arrive LIVE inside
+  the 120 s finality horizon converge the epoch afterwards. Each side
+  then finalizes its own winner. Key envelopes are never backfilled (no sync protocol carries
+  them), so the node does NOT heal this: members on the two sides can keep
+  DIFFERENT keys for the same epoch until the next rotation. Mitigations
+  are client-side: compare the commitment reported by peers / other nodes
+  before confirming (`split` detection), and treat undecryptable messages
+  at a confirmed epoch as a heal trigger → rotate. A real key-envelope
+  backfill (signed envelopes, sync-path supersede with proper bounds) is a
+  possible future design; it is not built.
+- **The 120 s boundary is per node.** `recorded_at` is each node's own
+  wall clock at its first arrival of the epoch, so a better pair arriving
+  right around `recorded_at + 120 s` — or on a node whose clock jumped —
+  can be accepted by one node and refused by another (the same split as a
+  partition, at the boundary). Mitigation is client-side: the SDK discards
+  a pending key older than `finality / 2` before its first publish, so
+  honest competitors stay far from the boundary.
+- **Old nodes don't arbitrate.** A < 0.143 node in the mesh stores whatever
+  arrives first per device and relays it; members homed there can still
+  fork. Clients must refuse to establish on nodes without
+  `key_commitment_v1`.
+- **Member wedge / squat.** Any member may publish a commitment with an
+  early `key_ts` and the lowest bytes and win a fresh epoch (within the
+  15-minute `key_ts` window), or publish a commitment to a key it never
+  distributes. This is attributable (signed, `author` recorded, `proof=1`)
+  and recoverable by rotating past it, but not preventable by the node.
+- **Slot squat under the winning pair.** The winning `(key_ts, C)` is
+  public, so any member can wrap garbage under it into a member's empty
+  slot first; slots are write-once, so nothing on the node repairs it.
+  Detectable (clients verify `H(scope, epoch, key_ts, K) == C` on every
+  adopted wrap and fail safe) and attributable (signed, `proof=1`), not
+  preventable. Recovery: kick the squatter and rotate.
+- **Squatting, ratcheting and slot floods (attributable, not
+  preventable).** Eviction is plain lowest-epoch-first for wraps and for
+  commit rows; no epoch is protected. A member can therefore:
+  - mint junk epochs above the current one (up to +256, or one at a
+    time) and fill wrap slots with fabricated `device_id`s — at the local
+    limit that is ~4,096 envelopes in ~68 min per wallet (60/min per
+    scope), over gossip ~1/s per (wallet, scope) after the 180 burst, more
+    with several wallets — until the 4,096-row scope is full; new wraps at
+    those higher epochs then evict the LOWEST epochs first, eventually
+    including the current epoch's wraps;
+  - mint 512 thin epochs above the current one, so the commit-row cap
+    evicts the current epoch's commit row and raises the eviction horizon
+    past it: late covers of the current epoch are then refused
+    (`key_epoch_evicted`) — a squatter CAN strand late covers of the
+    current epoch;
+  - occupy free space so a late cover of the current epoch gets
+    `key_scope_full` until something lower is evictable.
+  Honest rotation always fits (a new epoch evicts lower ones). Every junk
+  envelope is signed and attributable (`proof=1`). Recovery: kick the
+  member (raises the private floor; rows below it go first) and rotate.
+  (Rounds 2 and 4 tried to protect the "current" epoch — newest-K window,
+  registered-device gate, best-covered-epoch protection with a forget
+  path. All were removed: none can tell an honest rotation from a
+  squatter's, and each introduced cross-node divergence or wedged honest
+  rotation.)
+- **Node-local inputs can desynchronise nodes.** Besides `recorded_at`,
+  several arbitration inputs are per node: the highest known epoch, the
+  private floor (applied when each node sees the removal), the eviction
+  horizon `evicted_below`, `CHANNEL_KEYS` row counts (scope-full and
+  eviction) and rate-limit windows (now local ingress only). Two nodes can
+  therefore accept / refuse the same envelope differently near those
+  edges; the pair-rank rule itself is order-independent.
+- **Fresh-node variant of the boundary race.** A node that first sees an
+  epoch late records its own `recorded_at` then, so a better pair it gets
+  afterwards can still supersede there while every other node already
+  treats the epoch as final.
+- **Hostile home node.** A node can lie in its 409 / key-commitment
+  answers or withhold wraps, partitioning its own users; clients verify
+  wraps (`proof=1`) but cannot force a dishonest node to serve them.
+- **Duplicate ≠ live after a supersede.** A loser's raw envelope is
+  deliberately KEPT in `MESSAGES` (it keeps the cheap Step-3 duplicate check
+  that drops re-gossiped losers before signature verification);
+  re-submitting it returns the plain duplicate 409 although its wrap was
+  deleted. Clients must confirm via `key-commitment` (the sdk settle step),
+  and when their own slot lacks a verifying wrap they must re-sign the wrap
+  with a NEW envelope timestamp (a new msg_id) instead of re-posting the
+  same bytes.
+- DM scope keeps its previous first-write-wins behaviour, carries no
+  `key_status`, and still drops a scope-full envelope silently.
+- No WebSocket `channel_key_commitment` event yet (optional in the
+  contract); clients poll `key-commitment`.
+- The Step-7h write sits on the hottest key path under one node-wide lock
+  (pre-existing `channel_key_envelope_lock`); the bounded scope scan is now
+  loaded lazily (conflicts and already-present wraps skip it).
+
 ## [0.142.0] - 2026-10-21
 
 Phase 2 of the private-channel join gate ("verify before cover"): the node

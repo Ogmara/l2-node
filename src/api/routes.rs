@@ -824,6 +824,12 @@ pub struct HealthResponse {
     /// Klever network name ("testnet" / "mainnet"). The other half of the
     /// auth binding — a signature is valid only for this network + node_id.
     pub network: String,
+    /// Protocol capabilities this node implements (l2-node 0.143.0+).
+    /// `"key_commitment_v1"` = node-side key-epoch arbitration
+    /// (`key_commitment`/`key_ts`, 409 conflicts, `GET
+    /// /channels/{id}/key-commitment`, `GET /keys/{scope}?proof=1`).
+    /// Clients refuse to establish private-channel epochs on nodes without it.
+    pub features: &'static [&'static str],
     // NOTE: the node operator's Klever wallet is deliberately NOT exposed
     // here. It lives on `GET /api/v1/registration/info` as `operator_address`,
     // which is the endpoint a client actually calls before registering.
@@ -881,6 +887,12 @@ pub struct MessageResponse {
     /// see no change. Advisory only — the message is always persisted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delivery: Option<&'static str>,
+    /// Channel-scope `ChannelKeyEnvelope` only (l2-node 0.143.0):
+    /// `"stored"` = the wrap was stored for its `(target, device, epoch)`;
+    /// `"already_present"` = that slot already held the epoch's winning key
+    /// (kept, first-write-wins). Omitted for every other message.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_status: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -889,6 +901,9 @@ pub struct OkResponse {
 }
 
 // --- Public endpoint handlers ---
+
+/// Feature flags advertised on `/health` (see `HealthResponse::features`).
+pub const NODE_FEATURES: &[&str] = &["key_commitment_v1"];
 
 /// GET /api/v1/health
 pub async fn health(Extension(state): Extension<Arc<AppState>>) -> Json<HealthResponse> {
@@ -905,6 +920,7 @@ pub async fn health(Extension(state): Extension<Arc<AppState>>) -> Json<HealthRe
         media_uploads,
         node_id: state.node_id.clone(),
         network: state.klever_network.clone(),
+        features: NODE_FEATURES,
     })
 }
 
@@ -2014,16 +2030,6 @@ struct RecipientExtract {
     recipient: String,
 }
 
-/// Minimal extractor to route a `ChannelKeyEnvelope` (0x61) for cross-node gossip:
-/// a DM-scope envelope (no `channel_id`) goes to the target's DM topic so the
-/// recipient's node receives the wrapped key; a channel-scope envelope (P2) goes
-/// to the channel topic.
-#[derive(serde::Deserialize)]
-struct KeyEnvelopeRouteExtract {
-    target: String,
-    #[serde(default)]
-    channel_id: Option<u64>,
-}
 
 /// `pub(crate)` (audit final pre-mainnet W34) so the Ogmara-channel alert
 /// dispatcher (`notifications::alerts`) can reuse the exact same topic
@@ -2184,7 +2190,11 @@ pub(crate) fn gossip_topic_for_envelope(
             // recipient's node so a cross-node DM/channel member can fetch + unwrap
             // it. DM scope → the target's DM topic (same place the DM content goes);
             // channel scope (P2) → the channel topic.
-            let p: KeyEnvelopeRouteExtract = rmp_serde::from_slice(&envelope.payload).ok()?;
+            // Full payload decode (l2-node 0.143.0): a narrow 2-field probe
+            // struct cannot decode the positional (array) wire form, which
+            // left array-encoded key envelopes un-gossiped.
+            let p: crate::messages::types::ChannelKeyEnvelopePayload =
+                rmp_serde::from_slice(&envelope.payload).ok()?;
             match p.channel_id {
                 Some(cid) => Some(gossip::channel_topic(network_id, cid)),
                 None => Some(gossip::dm_topic(network_id, &p.target)),
@@ -3577,6 +3587,7 @@ pub async fn post_message(
             // such auth-time trigger exists for a message's author.
             author: _,
             bot_commands_changed,
+            key_status,
         } => {
             state.counters.inc_messages_stored();
 
@@ -3590,7 +3601,10 @@ pub async fn post_message(
             if let Ok(envelope) =
                 rmp_serde::from_slice::<crate::messages::envelope::Envelope>(&raw_bytes)
             {
-                if let Some(topic) = gossip_topic_for_envelope(&envelope, &state.klever_network) {
+                // An already-present key wrap was not stored, so it is not
+                // relayed either (round-4 audit W1b).
+                let relay = key_status != Some(crate::messages::router::KeyStatus::AlreadyPresent);
+                if let Some(topic) = gossip_topic_for_envelope(&envelope, &state.klever_network).filter(|_| relay) {
                     let (tx, rx) = tokio::sync::oneshot::channel();
                     let sent = state
                         .gossip_tx
@@ -3659,11 +3673,16 @@ pub async fn post_message(
             Json(MessageResponse {
                 msg_id: hex::encode(msg_id),
                 delivery,
+                key_status: key_status.map(|k| k.as_str()),
             })
             .into_response()
         }
         RouteResult::Duplicate => {
             (StatusCode::CONFLICT, "message already exists").into_response()
+        }
+        RouteResult::KeyConflict(info) => {
+            state.counters.inc_failed_validations();
+            key_conflict_response(&info)
         }
         RouteResult::PowRequired { address } => {
             state.counters.inc_pow_required();
@@ -3723,6 +3742,7 @@ pub async fn create_channel(
             (StatusCode::CONFLICT, "message already exists").into_response()
         }
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
+        RouteResult::KeyConflict(info) => key_conflict_response(&info),
         RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
             rejection_response(reason)
         }
@@ -3856,6 +3876,7 @@ pub async fn update_profile(
             (StatusCode::CONFLICT, "already processed").into_response()
         }
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
+        RouteResult::KeyConflict(info) => key_conflict_response(&info),
         RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
             rejection_response(reason)
         }
@@ -4037,12 +4058,62 @@ mod federate_channel_envelope_guard_tests {
 /// the phrase become a 500. Every other reason is a policy/validation
 /// verdict and is returned as-is with 400 (clients match on some of these,
 /// e.g. the private-join reason).
+///
+/// Two key-envelope reasons get JSON bodies (l2-node 0.143.0): a
+/// `KeyEnvelope` rate-limit rejection → `429 {"error":"rate_limited",
+/// "retry_after_ms":N}` (every other category stays a plain-text 400), and a
+/// Step-7h arbitration rejection → `400 {"error":"<code>","message":…}`
+/// (`key_commitment_required`, `key_commitment_invalid`, `key_ts_stale`,
+/// `key_epoch_below_floor`, `key_epoch_evicted`, `key_epoch_too_far`,
+/// `key_scope_full`, `key_sync_not_winner`). Both the per-wallet (240/min)
+/// and the per-(wallet, scope) (60/min) key-envelope budgets answer 429.
 fn rejection_response(reason: String) -> axum::response::Response {
-    if reason == crate::messages::router::INTERNAL_ERROR_REASON {
+    use crate::messages::router as r;
+    if reason == r::INTERNAL_ERROR_REASON {
         tracing::error!("router rejected a message on an internal error (detail logged by the router)");
         return (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response();
     }
+    if let Some(retry_after_ms) = r::parse_key_envelope_retry_after(&reason) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({ "error": "rate_limited", "retry_after_ms": retry_after_ms })),
+        )
+            .into_response();
+    }
+    if let Some((code, message)) = r::parse_key_envelope_rejection(&reason) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": code, "message": message })),
+        )
+            .into_response();
+    }
     (StatusCode::BAD_REQUEST, reason).into_response()
+}
+
+/// JSON body of a key-epoch arbitration conflict (l2-node 0.143.0).
+/// Deliberately distinct from the plain-text duplicate 409 ("message
+/// already exists"): a duplicate means the envelope IS stored; this means
+/// it was NOT, because a different key holds the epoch.
+pub(crate) fn key_conflict_body(info: &crate::messages::router::KeyConflictInfo) -> serde_json::Value {
+    let w = &info.winner;
+    serde_json::json!({
+        "error": "key_commitment_conflict",
+        "channel_id": info.channel_id,
+        "epoch": info.epoch,
+        "state": info.state,
+        "winner": {
+            "key_commitment": hex::encode(w.key_commitment),
+            "key_ts": w.key_ts,
+            "author": w.author,
+            "msg_id": w.msg_id.map(hex::encode),
+            "final": w.is_final,
+        },
+    })
+}
+
+/// `409` + [`key_conflict_body`].
+fn key_conflict_response(info: &crate::messages::router::KeyConflictInfo) -> axum::response::Response {
+    (StatusCode::CONFLICT, Json(key_conflict_body(info))).into_response()
 }
 
 /// Current unix time in ms (0 if the clock is before the epoch).
@@ -4891,6 +4962,7 @@ pub async fn send_dm(
             Json(MessageResponse {
                 msg_id: hex::encode(msg_id),
                 delivery,
+                key_status: None,
             })
             .into_response()
         }
@@ -4898,6 +4970,7 @@ pub async fn send_dm(
             (StatusCode::CONFLICT, "message already exists").into_response()
         }
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
+        RouteResult::KeyConflict(info) => key_conflict_response(&info),
         RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
             rejection_response(reason)
         }
@@ -5320,6 +5393,7 @@ pub async fn follow_user(
         }
         RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
+        RouteResult::KeyConflict(info) => key_conflict_response(&info),
         RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
             rejection_response(reason)
         }
@@ -5343,6 +5417,7 @@ pub async fn unfollow_user(
         }
         RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
+        RouteResult::KeyConflict(info) => key_conflict_response(&info),
         RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
             rejection_response(reason)
         }
@@ -5419,6 +5494,7 @@ pub async fn react_to_news(
         }
         RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
+        RouteResult::KeyConflict(info) => key_conflict_response(&info),
         RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
             rejection_response(reason)
         }
@@ -5445,6 +5521,7 @@ pub async fn repost_news(
             Json(MessageResponse {
                 msg_id: hex::encode(msg_id),
                 delivery: None,
+                key_status: None,
             })
             .into_response()
         }
@@ -5452,6 +5529,7 @@ pub async fn repost_news(
             (StatusCode::CONFLICT, "already reposted").into_response()
         }
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
+        RouteResult::KeyConflict(info) => key_conflict_response(&info),
         RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
             rejection_response(reason)
         }
@@ -6009,6 +6087,7 @@ pub async fn add_moderator(
         }
         RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
+        RouteResult::KeyConflict(info) => key_conflict_response(&info),
         RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
             rejection_response(reason)
         }
@@ -6107,6 +6186,7 @@ pub async fn remove_moderator(
         }
         RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
+        RouteResult::KeyConflict(info) => key_conflict_response(&info),
         RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
             rejection_response(reason)
         }
@@ -6129,6 +6209,7 @@ pub async fn kick_user(
             Json(OkResponse { ok: true }).into_response()
         }
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
+        RouteResult::KeyConflict(info) => key_conflict_response(&info),
         RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
             rejection_response(reason)
         }
@@ -6152,6 +6233,7 @@ pub async fn ban_user(
             Json(OkResponse { ok: true }).into_response()
         }
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
+        RouteResult::KeyConflict(info) => key_conflict_response(&info),
         RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
             rejection_response(reason)
         }
@@ -6175,6 +6257,7 @@ pub async fn unban_user(
             Json(OkResponse { ok: true }).into_response()
         }
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
+        RouteResult::KeyConflict(info) => key_conflict_response(&info),
         RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
             rejection_response(reason)
         }
@@ -6207,6 +6290,7 @@ pub async fn mute_user(
             Json(OkResponse { ok: true }).into_response()
         }
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
+        RouteResult::KeyConflict(info) => key_conflict_response(&info),
         RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
             rejection_response(reason)
         }
@@ -6235,6 +6319,7 @@ pub async fn unmute_user(
             Json(OkResponse { ok: true }).into_response()
         }
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
+        RouteResult::KeyConflict(info) => key_conflict_response(&info),
         RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
             rejection_response(reason)
         }
@@ -6258,6 +6343,7 @@ pub async fn pin_message(
             Json(OkResponse { ok: true }).into_response()
         }
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
+        RouteResult::KeyConflict(info) => key_conflict_response(&info),
         RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
             rejection_response(reason)
         }
@@ -6281,6 +6367,7 @@ pub async fn unpin_message(
             Json(OkResponse { ok: true }).into_response()
         }
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
+        RouteResult::KeyConflict(info) => key_conflict_response(&info),
         RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
             rejection_response(reason)
         }
@@ -6304,6 +6391,7 @@ pub async fn invite_user(
             Json(OkResponse { ok: true }).into_response()
         }
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
+        RouteResult::KeyConflict(info) => key_conflict_response(&info),
         RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
             rejection_response(reason)
         }
@@ -7674,6 +7762,7 @@ async fn build_and_gossip_dual_delegation(
                 "Router rejected constructed DeviceDelegation; not propagating");
             false
         }
+        RouteResult::KeyConflict(_) => false,
         RouteResult::PowRequired { .. } => {
             tracing::warn!(wallet = %wallet_address,
                 "DeviceDelegation unexpectedly required PoW; not propagating");
@@ -8904,6 +8993,127 @@ pub struct KeyEnvelopeParams {
     /// (§8.2): to decrypt a message from author X, fetch X's key. Defaults to the
     /// caller's own wallet (fetch your own sending key).
     pub author: Option<String>,
+    /// `1`/`true` (l2-node 0.143.0): also return the ORIGINAL signed envelope
+    /// (`signed_envelope`, base64 of the raw `MESSAGES` bytes) and — when it
+    /// was signed by a delegated device — that device's `device_claim`, so
+    /// the client can verify WHO published the wrap instead of trusting the
+    /// node's derived record.
+    pub proof: Option<String>,
+}
+
+/// Attach `signed_envelope` / `device_claim` to a key-envelope record
+/// (`GET /keys/{scope}?proof=1`, l2-node 0.143.0). Both are `null` when the
+/// record carries no `msg_id` (rows stored before 0.143.0 whose migration
+/// back-fill found no match) or the stored envelope does not match it.
+fn attach_key_envelope_proof(state: &AppState, data: &mut serde_json::Value) {
+    use base64::Engine as _;
+    use crate::messages::envelope::Envelope;
+    use crate::messages::types::MessageType;
+    let mut signed: Option<String> = None;
+    let mut claim = serde_json::Value::Null;
+    let msg_id = data
+        .get("msg_id")
+        .and_then(|v| v.as_str())
+        .and_then(|h| hex::decode(h).ok())
+        .and_then(|b| <[u8; 32]>::try_from(b).ok());
+    let wallet = data.get("author").and_then(|v| v.as_str()).map(str::to_string);
+    if let (Some(id), Some(wallet)) = (msg_id, wallet) {
+        if let Ok(Some(raw)) = state.storage.get_message(&id) {
+            if let Ok(env) = rmp_serde::from_slice::<Envelope>(&raw) {
+                if env.msg_type == MessageType::ChannelKeyEnvelope && env.msg_id == id {
+                    signed = Some(base64::engine::general_purpose::STANDARD.encode(&raw));
+                    if env.author != wallet {
+                        // Device-signed: serve the dual-signed delegation
+                        // evidence binding the device to the wallet.
+                        if let Ok(Some(c)) = super::member_proofs::device_claim_json(
+                            &state.storage,
+                            &state.klever_network,
+                            &env.author,
+                            &wallet,
+                        ) {
+                            claim = c;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(obj) = data.as_object_mut() {
+        obj.insert("signed_envelope".into(), serde_json::json!(signed));
+        obj.insert("device_claim".into(), claim);
+    }
+}
+
+/// Query params for `GET /api/v1/channels/{id}/key-commitment`.
+#[derive(Debug, serde::Deserialize)]
+pub struct KeyCommitmentParams {
+    /// Epoch to report; omitted = the highest epoch known for the channel.
+    pub epoch: Option<u64>,
+}
+
+/// GET /api/v1/channels/{channel_id}/key-commitment?epoch=N (l2-node
+/// 0.143.0) — this node's key-epoch arbitration state for one channel epoch.
+/// Authenticated, member-only: 404 for a missing channel or a non-member
+/// (no existence leak, like `get_channel_keys`).
+///
+/// Body: `{channel_id, epoch, state: "none"|"legacy"|"arbitrated",
+/// key_commitment, key_ts, author, msg_id, recorded_at, final,
+/// finality_ms}`. `final` = the winner can no longer be superseded on this
+/// node (always `true` for `legacy`, `false` for `none`).
+pub async fn get_key_commitment(
+    Extension(state): Extension<Arc<AppState>>,
+    Extension(auth_user): Extension<AuthUser>,
+    Path(channel_id): Path<u64>,
+    Query(params): Query<KeyCommitmentParams>,
+) -> impl IntoResponse {
+    use crate::storage::key_commits::{KEY_FINALITY_MS, STATE_ARBITRATED, STATE_LEGACY};
+    match state.storage.exists_cf(cf::CHANNELS, &channel_id.to_be_bytes()) {
+        Ok(true) => {}
+        _ => return (StatusCode::NOT_FOUND, "not found").into_response(),
+    }
+    let member_key = crate::storage::schema::encode_channel_member_key(channel_id, &auth_user.address);
+    match state.storage.exists_cf(cf::CHANNEL_MEMBERS, &member_key) {
+        Ok(true) => {}
+        _ => return (StatusCode::NOT_FOUND, "not found").into_response(),
+    }
+    let scope = crate::crypto::compute_channel_scope(channel_id);
+    let epoch = match params.epoch {
+        Some(e) => e,
+        None => match state.storage.max_known_key_epoch(&scope) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::error!(error = %e, channel_id, "key-commitment: max epoch lookup failed");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response();
+            }
+        },
+    };
+    let view = match state.storage.key_commit_view(&scope, epoch) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(error = %e, channel_id, epoch, "key-commitment: lookup failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response();
+        }
+    };
+    let now = now_unix_ms();
+    let rec = view.record.as_ref();
+    let is_final = match view.state {
+        s if s == STATE_ARBITRATED => rec.map(|r| r.is_final(now)).unwrap_or(false),
+        s if s == STATE_LEGACY => true,
+        _ => false,
+    };
+    Json(serde_json::json!({
+        "channel_id": channel_id,
+        "epoch": epoch,
+        "state": view.state,
+        "key_commitment": rec.and_then(|r| r.c.clone()),
+        "key_ts": rec.and_then(|r| r.key_ts),
+        "author": rec.and_then(|r| r.author.clone()),
+        "msg_id": rec.and_then(|r| r.msg_id.clone()),
+        "recorded_at": rec.map(|r| r.recorded_at),
+        "final": is_final,
+        "finality_ms": KEY_FINALITY_MS,
+    }))
+    .into_response()
 }
 
 /// GET /api/v1/keys/:key_scope — fetch THIS wallet's per-device wrapped key
@@ -8943,12 +9153,17 @@ pub async fn get_key_envelope(
     };
     match result {
         Ok(Some((epoch, record))) => match serde_json::from_slice::<serde_json::Value>(&record) {
-            Ok(data) => Json(serde_json::json!({
-                "key_scope": key_scope_hex,
-                "epoch": epoch,
-                "envelope": data,
-            }))
-            .into_response(),
+            Ok(mut data) => {
+                if matches!(params.proof.as_deref(), Some("1") | Some("true")) {
+                    attach_key_envelope_proof(&state, &mut data);
+                }
+                Json(serde_json::json!({
+                    "key_scope": key_scope_hex,
+                    "epoch": epoch,
+                    "envelope": data,
+                }))
+                .into_response()
+            }
             Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "corrupt key data").into_response(),
         },
         Ok(None) => Json(serde_json::json!({
@@ -9015,6 +9230,7 @@ pub async fn distribute_channel_keys(
             })).into_response()
         }
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
+        RouteResult::KeyConflict(info) => key_conflict_response(&info),
         RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
             rejection_response(reason)
         }

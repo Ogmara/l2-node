@@ -1104,6 +1104,25 @@ pub struct ChannelKeyEnvelopePayload {
     pub nonce: [u8; 24],
     /// ECIES-wrapped key bytes (`KEY_LEN + tag` = 48 bytes), opaque to the node.
     pub wrapped: Vec<u8>,
+    /// Channel scope only (l2-node 0.143.0, key-epoch arbitration):
+    /// `keccak256("ogmara-chankey-commit-v1" || key_scope || epoch_be8 ||
+    /// key_ts_be8 || channel_key)`, computed by the establishing client.
+    /// `key_ts` is bound into the hash so a pair cannot be re-ranked by
+    /// editing `key_ts` alone (audit B2). The node never sees the key; it
+    /// arbitrates competing keys for one `(scope, epoch)` by the PAIR
+    /// `(key_ts, key_commitment)` (lowest wins). Must be present together
+    /// with `key_ts` and non-zero; ignored for DM scope.
+    ///
+    /// Appended at the END of the struct (with `key_ts`) so the positional
+    /// (array) wire form of a pre-0.143 envelope still decodes — missing
+    /// trailing elements fall back to `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_commitment: Option<[u8; 32]>,
+    /// Channel scope only: per-key constant ms timestamp chosen by the
+    /// establisher (first half of the arbitration rank). `0 < key_ts <=
+    /// envelope.timestamp`. Ignored for DM scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_ts: Option<u64>,
 }
 
 // Audit final pre-mainnet W8: this used to be a "Content Request/Response

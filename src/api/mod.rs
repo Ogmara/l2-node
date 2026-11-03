@@ -10,6 +10,8 @@ pub mod admin;
 pub mod admin_auth;
 pub mod auth;
 pub mod dashboard;
+#[cfg(test)]
+mod epoch_arbitration_tests;
 pub mod media_fallback;
 pub mod media_limiter;
 pub mod member_proofs;
@@ -268,6 +270,11 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
         )
         // Per-device E2E key envelopes (DMs + channels), generalized by key_scope.
         // Publishing flows through the generic message-ingestion path (0x61).
+        // Key-epoch arbitration state (l2-node 0.143.0), member-only.
+        .route(
+            "/api/v1/channels/{channel_id}/key-commitment",
+            get(routes::get_key_commitment),
+        )
         .route("/api/v1/keys/{key_scope}", get(routes::get_key_envelope))
         .route("/api/v1/media/upload", post(routes::upload_media))
         // Device identity management

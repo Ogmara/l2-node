@@ -297,6 +297,26 @@ pub mod cf {
     /// `device_enc_keys` / `private_channel_keys`).
     pub const CHANNEL_KEYS: &str = "channel_keys";
 
+    /// (key_scope:32, epoch_be8) → KeyCommitRecord JSON
+    /// `{c, key_ts, author, msg_id, recorded_at, state, superseded}` — the
+    /// node's key-epoch arbitration state for one channel `(scope, epoch)`
+    /// (l2-node 0.143.0, protocol §8.1.2). `state` is `"arbitrated"` (a
+    /// winning `key_commitment` is recorded) or `"legacy"` (the epoch's
+    /// `CHANNEL_KEYS` rows predate arbitration → first-write-wins as before).
+    /// A 32-byte key (the bare `key_scope`) holds the per-scope meta row
+    /// `{evicted_below}` written when the per-scope row cap evicts the
+    /// lowest epoch (see `encode_key_commit_scope_meta_key`).
+    ///
+    /// NODE-LOCAL DERIVED state: EXCLUDED from snapshot `DOMAIN_CFS`. Written
+    /// atomically with the `CHANNEL_KEYS` row(s) it governs. ONE-WAY schema
+    /// change: a pre-0.143 binary cannot even OPEN a database containing this
+    /// CF (RocksDB refuses unlisted column families) until an operator drops
+    /// it (`ldb --db=<path> drop_column_family channel_key_commits`); after
+    /// that it runs, but without arbitration (forks possible again). From
+    /// 0.143.0 on, `Storage::open` tolerates unknown CFs, so later
+    /// downgrades need no such step. See CHANGELOG 0.143.0.
+    pub const CHANNEL_KEY_COMMITS: &str = "channel_key_commits";
+
     // --- Cross-Device Sync ---
 
     /// wallet_address bytes → encrypted settings blob (SettingsSyncPayload serialized)
@@ -483,6 +503,7 @@ pub mod cf {
         PRIVATE_CHANNEL_KEYS,
         PRIVATE_CHANNEL_ANCHORS,
         CHANNEL_KEYS,
+        CHANNEL_KEY_COMMITS,
         KNOWN_WALLETS,
         IDENTITY_ENVELOPES,
         DEVICE_REVOCATIONS,
@@ -723,6 +744,21 @@ pub mod state_keys {
     /// sweeps progress independently. Empty means "start from the
     /// beginning".
     pub const PRIVATE_CHANNEL_SYNC_RETRY_CURSOR: &[u8] = b"private_channel_sync_retry_cursor";
+    /// Sentinel: set to 1 once the key-epoch arbitration migration
+    /// (`Storage::migrate_channel_key_commits`, l2-node 0.143.0) has written
+    /// `legacy` `CHANNEL_KEY_COMMITS` rows for every pre-existing channel
+    /// `(scope, epoch)` and back-filled `msg_id` into existing channel-scope
+    /// `CHANNEL_KEYS` records. Only set on full success.
+    pub const KEY_COMMITS_MIGRATED_V1: &[u8] = b"migration_key_commits_v1";
+    /// Sentinel: set to 1 once Phase A of the key-commit migration wrote a
+    /// `legacy` commit row for every pre-existing channel `(scope, epoch)`.
+    /// From then on a missing commit row means "none" (no scan needed).
+    /// Cleared by `ogmara-node db drop-cf channel_key_commits`.
+    pub const KEY_COMMITS_LEGACY_ROWS_V1: &[u8] = b"migration_key_commits_legacy_rows_v1";
+    /// Resume cursor (raw `MESSAGES` key = msg_id) for the `msg_id`
+    /// back-fill phase of the key-commit migration, so an interrupted or
+    /// budget-capped pass resumes instead of restarting. Deleted on success.
+    pub const KEY_COMMITS_MIGRATION_CURSOR: &[u8] = b"migration_key_commits_v1_cursor";
 }
 
 /// Snapshot bootstrap (spec 11-snapshot-sync.md).
@@ -1379,6 +1415,23 @@ pub fn encode_channel_key(
     key.extend_from_slice(d);
     key.extend_from_slice(&epoch.to_be_bytes());
     key
+}
+
+/// Encode a `channel_key_commits` CF key: `key_scope(32) ++ epoch_be8`
+/// (l2-node 0.143.0 key-epoch arbitration). Big-endian epoch so a forward
+/// scan over the scope prefix visits epochs in ascending order.
+pub fn encode_key_commit_key(key_scope: &[u8; 32], epoch: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(40);
+    key.extend_from_slice(key_scope);
+    key.extend_from_slice(&epoch.to_be_bytes());
+    key
+}
+
+/// The per-scope meta row of `channel_key_commits`: the bare 32-byte
+/// `key_scope`. Sorts before every `(scope, epoch)` row of the same scope and
+/// is distinguished from them by its length (32 vs 40 bytes).
+pub fn encode_key_commit_scope_meta_key(key_scope: &[u8; 32]) -> Vec<u8> {
+    key_scope.to_vec()
 }
 
 /// Prefix selecting every epoch of a `channel_keys` entry for one `(scope, target,

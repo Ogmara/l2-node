@@ -1469,6 +1469,8 @@ mod tests {
             eph_pub: [2u8; 32],
             nonce: [3u8; 24],
             wrapped: vec![0u8; WRAPPED_KEY_LEN],
+            key_commitment: None,
+            key_ts: None,
         }
     }
 

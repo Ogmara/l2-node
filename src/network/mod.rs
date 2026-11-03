@@ -1191,6 +1191,12 @@ fn tally_reconcile_envelopes(
                 // Sync messages are PoW-exempt — should not fire.
                 t.tainted = true;
             }
+            // Key-epoch arbitration loss (l2-node 0.143.0) — treated like a
+            // policy rejection on the sync path.
+            RouteResult::KeyConflict(info) => {
+                t.tainted = true;
+                debug!(peer = %peer, channel_id, epoch = info.epoch, "reconcile: key envelope lost arbitration");
+            }
         }
     }
     t
@@ -1541,11 +1547,27 @@ fn envelope_targets_channel(env_bytes: &[u8], expected_channel: u64) -> bool {
         // airtight regardless of what this field says, deferring
         // unconditionally costs nothing and removes a real harm.
         MessageType::ChatEdit | MessageType::ChatDelete | MessageType::ChatReaction => true,
+        // l2-node 0.143.0 (round-2 audit W-C): channel key envelopes are never
+        // served by reconcile (they are not in CHANNEL_MSGS), so one arriving
+        // here is a responder injecting it. Sync ingestion skips the drift
+        // check and rate limits, which would let a back-dated `key_ts` reach
+        // a victim node's arbitration. Refuse it outright. (The other sync
+        // protocols allow-list their own types and never carry key envelopes;
+        // as defence in depth the router's Step 7h accepts sync-path key
+        // envelopes only when they wrap the already recorded winner.)
+        MessageType::ChannelKeyEnvelope => false,
         // Non-channel message types should not appear in
         // CHANNEL_MSGS, but be conservative — accept them and let
         // the router decide.
         _ => true,
     }
+}
+
+/// Test hook for `envelope_targets_channel` (used by the key-arbitration
+/// tests in `api::epoch_arbitration_tests`).
+#[cfg(test)]
+pub(crate) fn envelope_targets_channel_for_tests(env_bytes: &[u8], expected_channel: u64) -> bool {
+    envelope_targets_channel(env_bytes, expected_channel)
 }
 
 #[cfg(test)]
@@ -4277,6 +4299,8 @@ impl NetworkService {
                             RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
                                 warn!(peer = %peer, wallet = %pending.wallet, reason = %reason, "identity-sync: envelope rejected by router");
                             }
+                            // Key-epoch arbitration loss (0.143.0): a sync-path rejection.
+                            RouteResult::KeyConflict(_) => {}
                             RouteResult::PowRequired { .. } => {}
                         }
                     }
@@ -4527,6 +4551,8 @@ impl NetworkService {
                             RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
                                 warn!(peer = %peer, reason = %reason, "news-sync: envelope rejected by router");
                             }
+                            // Key-epoch arbitration loss (0.143.0): a sync-path rejection.
+                            RouteResult::KeyConflict(_) => {}
                             RouteResult::PowRequired { .. } => {}
                         }
                     }
@@ -4848,6 +4874,8 @@ impl NetworkService {
                             RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
                                 warn!(peer = %peer, reason = %reason, "dm-sync: envelope rejected by router");
                             }
+                            // Key-epoch arbitration loss (0.143.0): a sync-path rejection.
+                            RouteResult::KeyConflict(_) => {}
                             RouteResult::PowRequired { .. } => {}
                         }
                     }
@@ -5499,6 +5527,8 @@ impl NetworkService {
                                 warn!(peer = %peer, reason = %reason, "private-channel-sync: envelope rejected by router");
                             }
                             RouteResult::PowRequired { .. } => tainted = true,
+                            // Key-epoch arbitration loss (0.143.0): a sync-path rejection.
+                            RouteResult::KeyConflict(_) => tainted = true,
                         }
                     }
                 }
@@ -7244,6 +7274,8 @@ impl NetworkService {
                             // PoW not enforced for synced messages
                             rejected += 1;
                         }
+                        // Key-epoch arbitration loss (0.143.0): a sync-path rejection.
+                        RouteResult::KeyConflict(_) => rejected += 1,
                     }
                 }
                 if cross_channel_dropped > 0 {
@@ -7961,19 +7993,30 @@ impl NetworkService {
         propagation_source: PeerId,
         data: &[u8],
     ) -> libp2p::gossipsub::MessageAcceptance {
-        use libp2p::gossipsub::MessageAcceptance;
         // Track incoming bytes and messages for dashboard metrics
         self.counters.add_bytes_in(data.len() as u64);
         self.counters.inc_messages_received();
 
-        match self.router.process_message(data) {
+        let result = self.router.process_gossip_message(data);
+        // The gossipsub verdict is a pure function of the router result
+        // (`gossip_acceptance_for`, unit-tested); the arms below only add
+        // logging/metrics/side effects.
+        let verdict = gossip_acceptance_for(&result);
+        match result {
             RouteResult::Accepted {
                 msg_id,
                 msg_type,
                 raw_bytes,
                 author,
                 bot_commands_changed,
+                key_status,
             } => {
+                if key_status == Some(crate::messages::router::KeyStatus::AlreadyPresent) {
+                    // Nothing was stored (the slot already held a wrap): no
+                    // stats, no local push, no relay (round-4 audit W1b).
+                    debug!(msg_id = %hex::encode(msg_id), "Key wrap for an already-filled slot from gossip; ignored");
+                    return verdict;
+                }
                 debug!(
                     msg_id = %hex::encode(msg_id),
                     msg_type = ?msg_type,
@@ -8076,18 +8119,18 @@ impl NetworkService {
                     });
                 }
 
-                MessageAcceptance::Accept
+                verdict
             }
             RouteResult::Duplicate => {
                 debug!("Duplicate message from gossip, skipping");
                 // Already have it — valid, but no need to re-propagate from us.
-                MessageAcceptance::Ignore
+                verdict
             }
             RouteResult::Invalid(reason) => {
                 self.counters.inc_failed_validations();
                 warn!(reason = %reason, "Invalid message from gossip — rejecting (penalize peer)");
                 self.adjust_gossip_app_score(propagation_source, -INVALID_MESSAGE_SCORE_PENALTY);
-                MessageAcceptance::Reject
+                verdict
             }
             RouteResult::Rejected(reason) => {
                 self.counters.inc_failed_validations();
@@ -8107,13 +8150,50 @@ impl NetworkService {
                 } else {
                     debug!(reason = %reason, "Message not accepted locally — ignoring (no penalty)");
                 }
-                MessageAcceptance::Ignore
+                verdict
             }
             RouteResult::PowRequired { address } => {
                 debug!(address = %address, "PoW required for gossip message (ignoring)");
-                MessageAcceptance::Ignore
+                verdict
+            }
+            // Key-epoch arbitration (l2-node 0.143.0): a losing or post-
+            // finality commitment is a POLICY outcome, not invalidity — an
+            // honest concurrent establisher produces it. Don't relay it from
+            // us, don't penalize the peer.
+            RouteResult::KeyConflict(info) => {
+                debug!(
+                    channel_id = info.channel_id,
+                    epoch = info.epoch,
+                    "Key envelope lost epoch arbitration — ignoring (no penalty)"
+                );
+                verdict
             }
         }
+    }
+}
+
+/// Gossipsub verdict for a router result received over gossip:
+/// `Accepted` → `Accept` (relay) — except an already-present key wrap
+/// (not stored, not relayed) → `Ignore`; `Invalid` → `Reject` (penalize the source
+/// — no honest peer relays it); every POLICY outcome → `Ignore` (don't relay
+/// from us, don't penalize): `Duplicate`, `Rejected`, `PowRequired` and —
+/// l2-node 0.143.0 — `KeyConflict` (a losing-but-honest concurrent key
+/// establisher's envelope).
+pub(crate) fn gossip_acceptance_for(result: &RouteResult) -> libp2p::gossipsub::MessageAcceptance {
+    use libp2p::gossipsub::MessageAcceptance;
+    match result {
+        // A key wrap for an already-filled slot was not stored: relaying it
+        // would only amplify replays (round-4 audit W1b).
+        RouteResult::Accepted {
+            key_status: Some(crate::messages::router::KeyStatus::AlreadyPresent),
+            ..
+        } => MessageAcceptance::Ignore,
+        RouteResult::Accepted { .. } => MessageAcceptance::Accept,
+        RouteResult::Invalid(_) => MessageAcceptance::Reject,
+        RouteResult::Duplicate
+        | RouteResult::Rejected(_)
+        | RouteResult::PowRequired { .. }
+        | RouteResult::KeyConflict(_) => MessageAcceptance::Ignore,
     }
 }
 

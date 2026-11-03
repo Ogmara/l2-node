@@ -317,9 +317,12 @@ async fn handle_ws_client_message(
                 if let crate::messages::router::RouteResult::Accepted {
                     raw_bytes,
                     bot_commands_changed,
+                    key_status,
                     ..
                 } = result
                 {
+                    // An already-present key wrap was not stored: no relay.
+                    let relay = key_status != Some(crate::messages::router::KeyStatus::AlreadyPresent);
                     // Same reason as the REST submit path: gossip does not loop
                     // back to the publisher, so without this the node a bot
                     // submits through is the only one that never tells its own
@@ -339,7 +342,9 @@ async fn handle_ws_client_message(
                     // locally notified but never gossip-published, unlike
                     // the identical envelope sent via POST /api/v1/messages
                     // — so WS-submitted content silently never federated.
-                    super::routes::gossip_if_applicable(state, &raw_bytes).await;
+                    if relay {
+                        super::routes::gossip_if_applicable(state, &raw_bytes).await;
+                    }
                     if let Some(ref engine) = state.notification_engine {
                         let engine = engine.clone();
                         tokio::spawn(async move {
@@ -360,10 +365,15 @@ async fn handle_ws_client_message(
                 if let crate::messages::router::RouteResult::Accepted {
                     raw_bytes,
                     bot_commands_changed,
+                    key_status,
                     ..
                 } = result
                 {
-                    super::routes::gossip_if_applicable(state, &raw_bytes).await;
+                    // An already-present key wrap was not stored: no relay.
+                    let relay = key_status != Some(crate::messages::router::KeyStatus::AlreadyPresent);
+                    if relay {
+                        super::routes::gossip_if_applicable(state, &raw_bytes).await;
+                    }
                     // Handled here too, because the frame variant does not
                     // constrain `msg_type`: a client can submit a ProfileUpdate
                     // through `Dm` and the router will accept it. Relying on "a

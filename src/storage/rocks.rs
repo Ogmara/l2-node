@@ -363,6 +363,12 @@ pub struct Storage {
     /// (called from router.rs/scanner.rs, which don't hold
     /// `channel_membership_lock`) only ever acquires this one.
     pending_channel_member_removal_lock: Arc<std::sync::Mutex<()>>,
+    /// Cached `KEY_COMMITS_LEGACY_ROWS_V1` sentinel (l2-node 0.143.0): once
+    /// the key-commit migration's Phase A has written a `legacy` commit row
+    /// for every pre-existing channel epoch, a missing commit row means
+    /// "none" and the key-arbitration hot path can skip its legacy-detection
+    /// and max-epoch scans. `Arc` so every `Storage` clone sees the flip.
+    key_commit_legacy_rows_done: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Storage {
@@ -402,6 +408,50 @@ impl Storage {
         }
     }
 
+    /// Column-family options for a KNOWN column family — the single source
+    /// for `Storage::open` and `drop_column_family_offline`. Anything that
+    /// changes how a CF's data must be read back (merge operator, prefix
+    /// extractor) MUST live here: a process that opens the DB with different
+    /// options for a CF whose WAL still holds e.g. merge records cannot
+    /// replay them (round-3 audit B1). Unknown CFs (from a newer release) get
+    /// `Options::default()` with auto-compaction disabled; see `open`.
+    pub(crate) fn cf_options(name: &str) -> Options {
+        let mut cf_opts = Options::default();
+        // Use prefix bloom filters for index CFs
+        if name == cf::CHANNEL_MSGS || name == cf::CHANNEL_EDIT_DELETE_MSGS {
+            // Key: (channel_id:8, lamport_ts:8, msg_id:32) — prefix by channel_id
+            cf_opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(8));
+        }
+        if name == cf::DM_MESSAGES
+            || name == cf::NEWS_COMMENTS
+            || name == cf::DM_EDIT_DELETE_MSGS
+        {
+            // DM_MESSAGES key: (conversation_id:32, timestamp:8, msg_id:32)
+            // NEWS_COMMENTS key: (post_id:32, timestamp:8, msg_id:32)
+            cf_opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(32));
+        }
+        if name == cf::DM_CONVERSATIONS {
+            // Key: (wallet_address:62, !timestamp:8, conversation_id:32)
+            // klv1 bech32 addresses with 32-byte Ed25519 keys are 62 characters
+            cf_opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(62));
+        }
+        if name == cf::HOT_TOPICS_LOCAL || name == cf::HOT_TOPICS_MERGED {
+            // Key: (bucket_hour:8 BE, tag) — prefix by the bucket hour so
+            // per-bucket scans (digest build, eviction, query fold) stay
+            // in one SST prefix range.
+            cf_opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(8));
+        }
+        if name == cf::NODE_STATE {
+            // Audit final pre-mainnet W19b: lock-free counter accumulation
+            // for the `stat_*`/`TOTAL_*` keys (see `stat_counter_merge`'s
+            // doc comment). Only invoked for keys actually written via
+            // `merge_cf`; every other NODE_STATE key (chain cursor,
+            // migration sentinels, etc.) is unaffected, still a plain put/get.
+            cf_opts.set_merge_operator_associative("stat_counter_merge", stat_counter_merge);
+        }
+        cf_opts
+    }
+
     /// Open or create the RocksDB database at the given path.
     ///
     /// Creates all column families defined in the schema if they don't exist.
@@ -423,59 +473,207 @@ impl Storage {
         db_opts.set_max_log_file_size(64 * 1024 * 1024); // 64MB
         db_opts.set_log_file_time_to_roll(7 * 24 * 60 * 60); // 7 days, whichever comes first
         db_opts.set_keep_log_file_num(20);
+        // WAL recovery mode stays RocksDB's default (point-in-time) HERE on
+        // purpose: after a crash or power loss the WAL tail is routinely
+        // torn, and `AbsoluteConsistency` would then refuse to open — a node
+        // that cannot boot. The data-loss case of round-3 audit B1 came from
+        // opening NODE_STATE without its merge operator, which `cf_options`
+        // now rules out; the offline `db drop-cf` tool (which must never
+        // silently lose writes, and can simply abort) uses
+        // `AbsoluteConsistency`.
 
-        // Create column family descriptors with default options
+        // Per-CF options come from ONE place (`cf_options`), shared with the
+        // offline `db drop-cf` tool: opening a CF without its merge operator
+        // makes WAL replay of merge records fail (round-3 audit B1).
         let cf_descriptors: Vec<ColumnFamilyDescriptor> = cf::ALL
             .iter()
-            .map(|name| {
-                let mut cf_opts = Options::default();
-                // Use prefix bloom filters for index CFs
-                if *name == cf::CHANNEL_MSGS || *name == cf::CHANNEL_EDIT_DELETE_MSGS {
-                    // Key: (channel_id:8, lamport_ts:8, msg_id:32) — prefix by channel_id
-                    cf_opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(8));
-                }
-                if *name == cf::DM_MESSAGES
-                    || *name == cf::NEWS_COMMENTS
-                    || *name == cf::DM_EDIT_DELETE_MSGS
-                {
-                    // DM_MESSAGES key: (conversation_id:32, timestamp:8, msg_id:32)
-                    // NEWS_COMMENTS key: (post_id:32, timestamp:8, msg_id:32)
-                    cf_opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(32));
-                }
-                if *name == cf::DM_CONVERSATIONS {
-                    // Key: (wallet_address:62, !timestamp:8, conversation_id:32)
-                    // klv1 bech32 addresses with 32-byte Ed25519 keys are 62 characters
-                    cf_opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(62));
-                }
-                if *name == cf::HOT_TOPICS_LOCAL || *name == cf::HOT_TOPICS_MERGED {
-                    // Key: (bucket_hour:8 BE, tag) — prefix by the bucket hour so
-                    // per-bucket scans (digest build, eviction, query fold) stay
-                    // in one SST prefix range.
-                    cf_opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(8));
-                }
-                if *name == cf::NODE_STATE {
-                    // Audit final pre-mainnet W19b: lock-free counter accumulation
-                    // for the `stat_*`/`TOTAL_*` keys (see `stat_counter_merge`'s
-                    // doc comment). Only invoked for keys actually written via
-                    // `merge_cf`; every other NODE_STATE key (chain cursor,
-                    // migration sentinels, etc.) is unaffected, still a plain put/get.
-                    cf_opts.set_merge_operator_associative("stat_counter_merge", stat_counter_merge);
-                }
-                ColumnFamilyDescriptor::new(*name, cf_opts)
-            })
+            .map(|name| ColumnFamilyDescriptor::new(*name, Self::cf_options(name)))
             .collect();
+
+        // Downgrade tolerance (l2-node 0.143.0): RocksDB refuses to open a
+        // database that holds a column family the caller does not list
+        // ("Column families not opened"). Open every CF already on disk that
+        // this release does not know (written by a NEWER release) with
+        // default options and simply never touch it, so rolling back to this
+        // binary — or any later one — cannot brick the node at boot. (A
+        // release BEFORE 0.143.0 lacks this and cannot start on a 0.143 DB
+        // until the newer CF is dropped; see the CHANGELOG operator note.)
+        let mut cf_descriptors = cf_descriptors;
+        if let Ok(existing) = RocksDb::list_cf(&db_opts, path) {
+            // Unknown CFs are opened with DEFAULT options. A FUTURE release
+            // that adds a column family needing e.g. a merge operator owns
+            // its own rollback safety (flush that CF eagerly / on exit): if
+            // its WAL records survive a crash and an older binary opens the
+            // DB, replay of those records may fail. A boot refusal here was
+            // tried (round 4) and removed: it also fired after an ordinary
+            // crash of THIS release whenever an unknown CF was present,
+            // i.e. it could stop a node from starting (round-5 audit B4).
+            for name in existing {
+                if name != "default" && !cf::ALL.contains(&name.as_str()) {
+                    tracing::warn!(cf = %name, "opening unknown column family (written by a newer release); it is ignored");
+                    // No auto-compaction (round-2 audit N1): this release does
+                    // not know the CF's merge operator / comparator settings,
+                    // so it must never rewrite its files — only keep them.
+                    let mut unknown_opts = Options::default();
+                    unknown_opts.set_disable_auto_compactions(true);
+                    cf_descriptors.push(ColumnFamilyDescriptor::new(name, unknown_opts));
+                }
+            }
+        }
 
         let db = RocksDb::open_cf_descriptors(&db_opts, path, cf_descriptors)
             .with_context(|| format!("opening RocksDB at {}", path.display()))?;
 
-        Ok(Self {
+        let storage = Self {
             db: Arc::new(db),
             pending_channel_delete_lock: Arc::new(std::sync::Mutex::new(())),
             channel_membership_lock: Arc::new(std::sync::Mutex::new(())),
             channel_key_envelope_lock: Arc::new(std::sync::Mutex::new(())),
             social_counters_lock: Arc::new(std::sync::Mutex::new(())),
             pending_channel_member_removal_lock: Arc::new(std::sync::Mutex::new(())),
-        })
+            key_commit_legacy_rows_done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        // A read error leaves the flag false — the slower, scan-based path is
+        // always correct, so failing towards it is safe.
+        if storage
+            .get_stat(super::schema::state_keys::KEY_COMMITS_LEGACY_ROWS_V1)
+            .unwrap_or(0)
+            > 0
+        {
+            storage.set_key_commit_legacy_rows_done();
+        }
+        Ok(storage)
+    }
+
+    /// Whether the key-commit migration's Phase A has completed on this DB
+    /// (see the `key_commit_legacy_rows_done` field).
+    pub(crate) fn key_commit_legacy_rows_done(&self) -> bool {
+        self.key_commit_legacy_rows_done.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Record that Phase A completed (after its sentinel was persisted).
+    pub(crate) fn set_key_commit_legacy_rows_done(&self) {
+        self.key_commit_legacy_rows_done.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Flush every column family's memtable to SST and sync the WAL — called
+    /// on graceful shutdown (round-3 audit B1). Without it the newest writes
+    /// live only in the WAL, and any tool or older binary that opens the DB
+    /// with different per-CF options (a missing merge operator) cannot
+    /// replay them. Covers unknown CFs too (they are open, see `open`).
+    pub fn flush_all(&self) -> Result<()> {
+        self.db.flush_wal(true).context("syncing the WAL")?;
+        let names = RocksDb::list_cf(&Options::default(), self.db.path())
+            .context("listing column families for flush")?;
+        for n in names {
+            if let Some(h) = self.db.cf_handle(&n) {
+                self.db.flush_cf(&h).with_context(|| format!("flushing column family '{n}'"))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// RocksDB's key-count estimate for a column family (progress logging).
+    pub fn estimate_num_keys(&self, cf_name: &str) -> Result<u64> {
+        let handle = self.cf_handle(cf_name)?;
+        Ok(self
+            .db
+            .property_int_value_cf(&handle, "rocksdb.estimate-num-keys")
+            .context("reading rocksdb.estimate-num-keys")?
+            .unwrap_or(0))
+    }
+
+    /// Column families `drop_column_family_offline` may drop: ONLY derived,
+    /// node-local state whose loss is recoverable, so an operator typo can
+    /// never delete user data.
+    pub const DROPPABLE_CFS: &'static [&'static str] = &[cf::CHANNEL_KEY_COMMITS];
+
+    /// Offline maintenance for `ogmara-node db drop-cf` (l2-node 0.143.0
+    /// rollback runbook): drop one allow-listed column family from a STOPPED
+    /// node's database, using this binary's own RocksDB (distro `ldb` builds
+    /// are older than the bundled RocksDB and may refuse or mis-handle the
+    /// files). RocksDB's LOCK file makes the open fail while the node runs,
+    /// so it can never race a live node.
+    ///
+    /// Dropping `channel_key_commits` also clears the key-commit migration
+    /// sentinels and cursor in `NODE_STATE`: if the operator later upgrades
+    /// again, the migration must re-run, or the hot path would treat epochs
+    /// written while rolled back as "none" instead of `legacy`.
+    ///
+    /// Opens every KNOWN CF with exactly the node's options
+    /// (`Storage::cf_options`, incl. merge operators) and unknown ones with
+    /// defaults, all with auto-compaction disabled, in WAL recovery mode
+    /// "absolute consistency"; writes the sentinel deletes as a synced
+    /// batch, syncs the WAL and flushes every CF, then drops. Refuses unless
+    /// run as the database directory's owner. Returns `Ok(false)` when the
+    /// CF did not exist (nothing to do).
+    pub fn drop_column_family_offline(path: &Path, name: &str) -> Result<bool> {
+        if !Self::DROPPABLE_CFS.contains(&name) {
+            anyhow::bail!(
+                "refusing to drop column family '{name}': only {:?} may be dropped",
+                Self::DROPPABLE_CFS
+            );
+        }
+        ensure_runs_as_db_owner(path)?;
+        let mut db_opts = Options::default();
+        db_opts.create_if_missing(false);
+        // Fail LOUDLY on any WAL replay problem instead of silently dropping
+        // the tail of the log: an aborted maintenance run changes nothing,
+        // a silently truncated replay loses every later write (round-3 audit
+        // B1). (The node itself keeps point-in-time recovery; see `open`.)
+        db_opts.set_wal_recovery_mode(rocksdb::DBRecoveryMode::AbsoluteConsistency);
+        let existing = RocksDb::list_cf(&db_opts, path)
+            .with_context(|| format!("listing column families in {}", path.display()))?;
+        if !existing.iter().any(|n| n == name) {
+            return Ok(false);
+        }
+        // Known CFs get EXACTLY the node's options (merge operators!) so the
+        // WAL — the node may not have flushed its memtables — replays
+        // completely; unknown ones are only kept, never compacted.
+        let descriptors: Vec<ColumnFamilyDescriptor> = existing
+            .iter()
+            .map(|n| {
+                let mut o = if cf::ALL.contains(&n.as_str()) {
+                    Self::cf_options(n)
+                } else {
+                    Options::default()
+                };
+                o.set_disable_auto_compactions(true);
+                ColumnFamilyDescriptor::new(n.as_str(), o)
+            })
+            .collect();
+        let db = RocksDb::open_cf_descriptors(&db_opts, path, descriptors)
+            .map_err(|e| anyhow::anyhow!(open_failure_hint(path, &e)))?;
+        if name == cf::CHANNEL_KEY_COMMITS {
+            if let Some(state) = db.cf_handle(cf::NODE_STATE) {
+                // One SYNCED batch, durable BEFORE the drop reaches the
+                // MANIFEST (round-3 audit W4): a power loss in between must
+                // never leave LEGACY_ROWS_V1 = 1 next to an empty commit CF
+                // (the hot path would then treat legacy epochs as "none").
+                let mut batch = WriteBatch::default();
+                for k in [
+                    super::schema::state_keys::KEY_COMMITS_MIGRATED_V1,
+                    super::schema::state_keys::KEY_COMMITS_LEGACY_ROWS_V1,
+                    super::schema::state_keys::KEY_COMMITS_MIGRATION_CURSOR,
+                ] {
+                    batch.delete_cf(&state, k);
+                }
+                let mut wo = rocksdb::WriteOptions::default();
+                wo.set_sync(true);
+                db.write_opt(batch, &wo).context("clearing key-commit migration sentinels")?;
+            }
+        }
+        // Persist everything replayed from the WAL into SST files before the
+        // schema change, so the next open (by an OLDER binary that may not
+        // know some CF's merge operator) has no WAL left to replay.
+        db.flush_wal(true).context("syncing the WAL")?;
+        for n in &existing {
+            if let Some(h) = db.cf_handle(n) {
+                db.flush_cf(&h).with_context(|| format!("flushing column family '{n}'"))?;
+            }
+        }
+        db.drop_cf(name).with_context(|| format!("dropping column family '{name}'"))?;
+        Ok(true)
     }
 
     /// Get a value from a column family.
@@ -1908,6 +2106,30 @@ impl Storage {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         f()
+    }
+
+    /// Run `f` while holding `channel_key_envelope_lock` (the lock that
+    /// serializes every `CHANNEL_KEYS` first-write-wins decision). Used by
+    /// the key-epoch arbitration path (`storage::key_commits`, l2-node
+    /// 0.143.0) so its read-decide-write of `CHANNEL_KEY_COMMITS` +
+    /// `CHANNEL_KEYS` is one critical section with every other key-envelope
+    /// writer. Never call `put_channel_key_envelope_fww` from inside `f`
+    /// (the mutex is not reentrant).
+    pub(crate) fn with_channel_key_envelope_lock<T>(&self, f: impl FnOnce() -> T) -> T {
+        let _guard = self
+            .channel_key_envelope_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        f()
+    }
+
+    /// Raw RocksDB iterator over a column family (streaming migrations in
+    /// sibling storage modules, e.g. `key_commits`).
+    pub(crate) fn raw_iterator<'a>(
+        &'a self,
+        cf: &Arc<BoundColumnFamily<'a>>,
+    ) -> rocksdb::DBRawIteratorWithThreadMode<'a, RocksDb> {
+        self.db.raw_iterator_cf(cf)
     }
 
     /// Get a column family handle for use in WriteBatch operations.
@@ -5283,6 +5505,64 @@ impl Storage {
 
         Ok(claims)
     }
+}
+
+/// Refuse offline maintenance unless this process's EFFECTIVE uid owns the
+/// database directory (round-3 audit N-c): run as root, RocksDB would create
+/// root-owned SST/WAL/MANIFEST files that the node's service user can no
+/// longer open, so the node fails to start after the "fix". Fails closed
+/// when the uid cannot be determined (the tool is Linux-only by design).
+fn ensure_runs_as_db_owner(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let owner = std::fs::metadata(path)
+            .with_context(|| format!("reading {}", path.display()))?
+            .uid();
+        let euid = effective_uid()
+            .context("cannot determine the effective uid (expected Linux /proc/self/status); refusing")?;
+        if owner != euid {
+            anyhow::bail!(
+                "refusing to modify {} as uid {euid}: the database is owned by uid {owner}. \
+                 Run this command as the node's service user, e.g. `sudo -u ogmara ogmara-node …` \
+                 (never bare sudo/root — root-owned files would stop the node from starting).",
+                path.display()
+            );
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        anyhow::bail!("offline database maintenance is only supported on Linux")
+    }
+}
+
+/// Actionable message for a failed offline open (round-4 audit W2): match
+/// the RocksDB error KIND instead of always blaming the lock.
+fn open_failure_hint(path: &Path, e: &rocksdb::Error) -> String {
+    match e.kind() {
+        rocksdb::ErrorKind::Corruption => format!(
+            "{}: {e}. The database was not shut down cleanly (its WAL cannot be replayed \
+             with absolute consistency). Start this 0.143 node once, stop it gracefully, \
+             then rerun this command.",
+            path.display()
+        ),
+        rocksdb::ErrorKind::IOError if e.to_string().to_ascii_lowercase().contains("lock") => format!(
+            "{}: {e}. The node is still running (it holds the database lock); stop it first.",
+            path.display()
+        ),
+        _ => format!("opening {}: {e}", path.display()),
+    }
+}
+
+/// Effective uid from `/proc/self/status` (`Uid: real effective saved fs`),
+/// read without `unsafe` / an extra libc dependency.
+#[cfg(unix)]
+fn effective_uid() -> Option<u32> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find(|l| l.starts_with("Uid:"))?;
+    line.split_whitespace().nth(2)?.parse().ok()
 }
 
 /// Get number of CPUs for RocksDB parallelism.
