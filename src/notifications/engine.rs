@@ -15,6 +15,7 @@ use crate::messages::envelope::Envelope;
 use crate::messages::types::{
     ChannelInvitePayload, ChatMessagePayload, DeletePayload, DirectMessagePayload, EditPayload,
     MessageType, NewsCommentPayload, ReactionPayload, SettingsSyncPayload,
+    PRIVATE_CHANNEL_ID_FLOOR,
 };
 use crate::api::state::{WsAudience, WsOutbound};
 use crate::storage::rocks::Storage;
@@ -1173,49 +1174,41 @@ impl NotificationEngine {
             }
         }
 
-        // WebSocket broadcast. This fans out to ALL connected WS clients (they
-        // filter by recipient client-side), so for PRIVATE channels redact the
-        // preview — otherwise a private channel's plaintext would leak to every
-        // client. The full preview is still delivered privately to the recipient
-        // via the per-recipient persisted notification above (authenticated
-        // GET /api/v1/notifications). Public-channel previews are world-readable.
-        // (Follow-up: per-recipient WS delivery would also hide the mention
-        // metadata — author/channel — not just the preview.)
+        // WebSocket delivery: recipient-only (see below). The full preview is
+        // also available privately via the per-recipient persisted
+        // notification above (authenticated GET /api/v1/notifications).
         //
-        // A ChannelInvite to a non-public channel skips this broadcast
-        // entirely rather than redacting just the preview, unlike a mention:
-        // preview-only redaction still leaves channel_id/channel_name/author
-        // in the Everyone-audience frame, which for a mention just says "an
-        // already-visible channel had activity" but for an invite says "wallet
-        // X was just invited to private channel Y" — a fact about someone
-        // else's private-channel membership with no legitimate audience
-        // beyond the invitee, who already gets it in full via the persisted,
-        // per-recipient GET /api/v1/notifications path above. This only skips
-        // the ALL-CLIENTS broadcast below — the per-recipient push-gateway
-        // delivery further down still fires, since that one is not public.
+        // A ChannelInvite to a non-public channel skips the WS frame
+        // entirely: the invitee already gets it in full via the persisted,
+        // per-recipient GET /api/v1/notifications path above, and the
+        // per-recipient push-gateway delivery further down still fires.
         let suppress_broadcast = matches!(notification.notification_type, NotificationType::ChannelInvite)
             && notification.channel_id.is_some_and(|cid| !self.channel_is_public(cid));
         if !suppress_broadcast {
-            let broadcast_notification = match notification.channel_id {
-                Some(cid) if !self.channel_is_public(cid) => {
-                    let mut redacted = notification.clone();
-                    redacted.preview = String::new();
-                    redacted
-                }
-                _ => notification.clone(),
+            // The frame carries no recipient field, so nothing could filter it
+            // client-side: it goes ONLY to the mentioned wallet's own
+            // authenticated connections, whatever the context. An Everyone
+            // frame would tell every socket (anonymous ones included) who was
+            // mentioned and where; for a private channel it would also expose
+            // the channel name, for a news comment on a Followers-only post
+            // the comment text. The preview is additionally blanked for
+            // non-public channels as defence in depth (metadata that cannot
+            // be read counts as non-public: fails closed).
+            let non_public = notification.channel_id.is_some_and(|cid| !self.channel_is_public(cid));
+            let broadcast_notification = if non_public {
+                let mut redacted = notification.clone();
+                redacted.preview = String::new();
+                redacted
+            } else {
+                notification.clone()
             };
+            let audience = WsAudience::Wallets(vec![target_address.to_string()]);
             let ws_msg = serde_json::json!({
                 "type": "notification",
                 "mention": broadcast_notification,
             });
             if let Ok(json) = serde_json::to_string(&ws_msg) {
-                // Mention notifications keep the legacy all-clients fan-out (clients
-                // filter to the mentioned wallet; private-channel previews are
-                // redacted above). See the follow-up note re: per-recipient delivery.
-                let _ = self.ws_broadcast.send(Arc::new(WsOutbound {
-                    audience: WsAudience::Everyone,
-                    json,
-                }));
+                let _ = self.ws_broadcast.send(Arc::new(WsOutbound { audience, json }));
             }
         }
 
@@ -1224,6 +1217,51 @@ impl NotificationEngine {
             self.send_to_push_gateway(base_url, target_address, &notification)
                 .await;
         }
+    }
+
+    /// Build the JSON body posted to the push gateway for one notification.
+    ///
+    /// The gateway turns this into text rendered by FCM/APNs, i.e. by a third
+    /// party, so `channel_name` is included only when it is safe to show
+    /// there: a mention/reply in a channel that is PUBLIC or READ-PUBLIC
+    /// (`channel_is_public`, which fails closed on missing metadata) AND whose
+    /// id is below `PRIVATE_CHANNEL_ID_FLOOR`. Everything else sends `null`
+    /// (private channels, channels with unknown metadata, invites, news
+    /// comments); the gateway then shows generic text. The id floor is checked
+    /// as well as the stored type because the gateway applies the same floor.
+    fn push_trigger_body(
+        &self,
+        target_address: &str,
+        notification: &Notification,
+    ) -> serde_json::Value {
+        let notification_type = match notification.notification_type {
+            NotificationType::Mention => "mention",
+            NotificationType::Reply => "reply",
+            NotificationType::Dm => "dm",
+            NotificationType::ChannelInvite => "channel_invite",
+        };
+
+        let name_is_shareable = matches!(
+            notification.notification_type,
+            NotificationType::Mention | NotificationType::Reply
+        ) && notification.channel_id.is_some_and(|cid| {
+            cid < PRIVATE_CHANNEL_ID_FLOOR && self.channel_is_public(cid)
+        });
+        let channel_name = if name_is_shareable {
+            notification.channel_name.clone()
+        } else {
+            None
+        };
+
+        serde_json::json!({
+            "address": target_address,
+            "type": notification_type,
+            "channel_id": notification.channel_id,
+            "channel_name": channel_name,
+            "msg_id": notification.msg_id,
+            "sender": notification.author,
+            "timestamp": notification.timestamp,
+        })
     }
 
     /// Send a notification to the push gateway.
@@ -1238,22 +1276,7 @@ impl NotificationEngine {
     ) {
         let url = format!("{}/push", base_url.trim_end_matches('/'));
 
-        let notification_type = match notification.notification_type {
-            NotificationType::Mention => "mention",
-            NotificationType::Reply => "reply",
-            NotificationType::Dm => "dm",
-            NotificationType::ChannelInvite => "channel_invite",
-        };
-
-        let body = serde_json::json!({
-            "address": target_address,
-            "type": notification_type,
-            "channel_id": notification.channel_id,
-            "channel_name": notification.channel_name,
-            "msg_id": notification.msg_id,
-            "sender": notification.author,
-            "timestamp": notification.timestamp,
-        });
+        let body = self.push_trigger_body(target_address, notification);
 
         let mut req = self.http.post(&url).json(&body);
 
@@ -1561,7 +1584,9 @@ mod tests {
         engine.process(&e).await;
 
         let frame = rx.try_recv().expect("an invite to a PUBLIC channel must produce a WS frame");
-        assert!(matches!(frame.audience, WsAudience::Everyone));
+        // Recipient-only like every notification frame (no recipient field to
+        // filter on client-side, so Everyone would tell every socket who was invited).
+        assert!(matches!(&frame.audience, WsAudience::Wallets(w) if w == &vec!["klv1invitee".to_string()]));
         assert!(frame.json.contains("channel_invite"));
     }
 
@@ -1615,6 +1640,116 @@ mod tests {
             .get_notifications("klv1invitee", None, 50, None)
             .unwrap();
         assert_eq!(stored.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn mention_ws_frame_is_always_recipient_only() {
+        // A mention names its channel and author; for a private channel that
+        // must reach only the mentioned wallet, never an Everyone broadcast.
+        let (engine, _dir) = engine_with_storage();
+        put_channel(&engine, 7, 0); // public
+        put_channel(&engine, 9, 2); // private
+        let mut rx = engine.ws_broadcast.subscribe();
+        let mk = |cid: u64| Notification {
+            notification_type: NotificationType::Mention,
+            msg_id: "ab".repeat(32),
+            author: "klv1author".into(),
+            channel_id: Some(cid),
+            channel_name: Some("Chan Name".into()),
+            preview: "secret text".into(),
+            timestamp: 1,
+            anchor_node: None,
+        };
+        for cid in [7u64, 9, 12345 /* unknown metadata fails closed */] {
+            engine.deliver("klv1target", &[2u8; 32], mk(cid)).await;
+            let f = rx.try_recv().expect("private mention frame");
+            match &f.audience {
+                WsAudience::Wallets(w) => assert_eq!(w, &vec!["klv1target".to_string()]),
+                other => panic!("channel {cid}: non-public mention must be recipient-only, got {other:?}"),
+            }
+            assert_eq!(!f.json.contains("secret text"), cid != 7, "preview redacted unless public");
+            assert!(!f.audience.allows(""), "anonymous socket must not receive it");
+            assert!(!f.audience.allows("klv1other"), "foreign socket must not receive it");
+        }
+        // News-comment mention (no channel id): preview must not go to everyone.
+        let mut n = mk(7);
+        n.channel_id = None;
+        engine.deliver("klv1target", &[3u8; 32], n).await;
+        let f = rx.try_recv().expect("news mention frame");
+        assert!(!f.audience.allows("") && f.audience.allows("klv1target"));
+    }
+
+    fn push_body_for(
+        engine: &NotificationEngine,
+        ntype: NotificationType,
+        channel_id: Option<u64>,
+    ) -> serde_json::Value {
+        let n = Notification {
+            notification_type: ntype,
+            msg_id: "ab".repeat(32),
+            author: "klv1author".into(),
+            channel_id,
+            channel_name: Some("Chan Name".into()),
+            preview: String::new(),
+            timestamp: 1,
+            anchor_node: None,
+        };
+        engine.push_trigger_body("klv1target", &n)
+    }
+
+    fn put_channel(engine: &NotificationEngine, id: u64, channel_type: u64) {
+        engine
+            .storage
+            .as_ref()
+            .unwrap()
+            .put_cf(
+                cf::CHANNELS,
+                &id.to_be_bytes(),
+                &serde_json::to_vec(&serde_json::json!({"channel_type": channel_type, "name": "Chan Name"}))
+                    .unwrap(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn push_trigger_sends_channel_name_only_for_public_channels() {
+        // The gateway text is rendered by FCM/APNs: a private channel's name
+        // must never be in the trigger body.
+        let (engine, _dir) = engine_with_storage();
+        put_channel(&engine, 7, 0); // public
+        put_channel(&engine, 8, 1); // read-public
+        put_channel(&engine, 9, 2); // legacy private below the id floor
+        let private_id = PRIVATE_CHANNEL_ID_FLOOR + 5;
+        put_channel(&engine, private_id, 2);
+
+        for id in [7u64, 8] {
+            let b = push_body_for(&engine, NotificationType::Mention, Some(id));
+            assert_eq!(b["channel_name"], "Chan Name", "public channel {id}");
+        }
+        let b = push_body_for(&engine, NotificationType::Reply, Some(7));
+        assert_eq!(b["channel_name"], "Chan Name");
+
+        for id in [9u64, private_id, 12345 /* no metadata stored */] {
+            let b = push_body_for(&engine, NotificationType::Mention, Some(id));
+            assert!(b["channel_name"].is_null(), "channel {id} must not leak a name");
+            assert!(!b.to_string().contains("Chan Name"));
+        }
+    }
+
+    #[test]
+    fn push_trigger_never_sends_a_name_for_invites_or_news_comments() {
+        let (engine, _dir) = engine_with_storage();
+        put_channel(&engine, 7, 0);
+        let b = push_body_for(&engine, NotificationType::ChannelInvite, Some(7));
+        assert!(b["channel_name"].is_null());
+        let b = push_body_for(&engine, NotificationType::Mention, None);
+        assert!(b["channel_name"].is_null());
+        // A name above the id floor is dropped even if the stored type says
+        // public (floor mismatch = treat as private).
+        let id = PRIVATE_CHANNEL_ID_FLOOR + 1;
+        put_channel(&engine, id, 0);
+        let b = push_body_for(&engine, NotificationType::Mention, Some(id));
+        assert!(b["channel_name"].is_null());
     }
 }
 

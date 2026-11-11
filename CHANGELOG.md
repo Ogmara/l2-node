@@ -5,6 +5,33 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.144.0] - 2026-11-11
+
+### Security
+
+- **Private channel names no longer reach the push provider.** A mention or
+  reply push text is rendered by FCM/APNs, but the node sent the channel name
+  to the push gateway for every channel type, so a private channel's name
+  appeared as "New mention in #name" on Google/Apple servers. The node now
+  includes `channel_name` in the gateway trigger only for mention/reply in a
+  PUBLIC or READ-PUBLIC channel with an id below `PRIVATE_CHANNEL_ID_FLOOR`
+  (checked against stored metadata, failing closed when it is missing); every
+  other case sends `null` and the gateway shows generic text. The in-app
+  notification record is unchanged. Run push-gateway 0.9.0+ first; an older
+  gateway shows "New mention in #unknown" for these.
+- **Notification WebSocket frames are recipient-only** (mentions, news-comment
+  mentions and public-channel invites). The `notification` frame
+  for a mention went to every connected socket, including anonymous ones,
+  with the channel id/name and author (only a private channel's preview was
+  redacted), revealing that a wallet was mentioned and, for a private channel,
+  its name; a news-comment mention (no channel id) additionally leaked the
+  comment preview, even for a Followers-only post. The frame has no recipient
+  field, so nothing could filter it client-side. It is now delivered only to
+  the mentioned wallet's authenticated connections for every channel type
+  (previews stay blanked for non-public channels). No shipped client reads
+  these frames (they use the persisted notifications API), so nothing
+  user-visible changes.
+
 ## [0.143.0] - 2026-11-02
 
 Node-side **key-epoch arbitration** for channel-scope `ChannelKeyEnvelope`s
