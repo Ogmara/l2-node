@@ -125,10 +125,12 @@ enum Commands {
 /// `ogmara-node db …` subcommands.
 #[derive(Subcommand)]
 enum DbCommand {
-    /// Drop one derived column family so an OLDER release can open the
-    /// database (rollback runbook, l2-node 0.143.0).
+    /// Drop one derived column family so a release BEFORE 0.143.0 can open
+    /// the database (rollback runbook, l2-node 0.143.0). 0.143.0+ opens
+    /// column families written by newer releases on its own.
     ///
-    /// Only `channel_key_commits` is allowed. Uses this binary's own RocksDB
+    /// Only `channel_key_commits` (0.143.0+) and `state_checkpoints`
+    /// (0.147.0+) are allowed. Uses this binary's own RocksDB
     /// (distro `ldb` builds are older than the bundled RocksDB), refuses to
     /// run while the node holds the database lock, and also clears the
     /// key-commit migration sentinels so a later re-upgrade re-runs the
@@ -137,7 +139,7 @@ enum DbCommand {
     /// channel_key_commits`), never as bare root: root-owned database files
     /// would stop the service from starting.
     DropCf {
-        /// Column family to drop (only `channel_key_commits`).
+        /// Column family to drop (`channel_key_commits` or `state_checkpoints`).
         name: String,
         /// Skip the confirmation prompt. Use only in automation.
         #[arg(long)]
@@ -325,7 +327,11 @@ async fn main() -> Result<()> {
             }
             if !yes {
                 println!("About to drop column family '{}' in {}.", name, db_path.display());
-                println!("This removes key-epoch arbitration state so a pre-0.143 release can open the database.");
+                if name == storage::schema::cf::STATE_CHECKPOINTS {
+                    println!("This removes anchored state checkpoints (state proofs resume after the next anchor) so a pre-0.143 release can open the database.");
+                } else {
+                    println!("This removes key-epoch arbitration state so a pre-0.143 release can open the database.");
+                }
                 print!("Continue? [y/N]: ");
                 use std::io::Write;
                 std::io::stdout().flush().ok();
@@ -339,7 +345,9 @@ async fn main() -> Result<()> {
             }
             if storage::rocks::Storage::drop_column_family_offline(&db_path, &name)? {
                 println!("Dropped column family '{}' in {}.", name, db_path.display());
-                println!("Cleared the key-commit migration sentinels (it re-runs on the next 0.143+ start).");
+                if name == storage::schema::cf::CHANNEL_KEY_COMMITS {
+                    println!("Cleared the key-commit migration sentinels (it re-runs on the next 0.143+ start).");
+                }
             } else {
                 println!("Column family '{}' does not exist in {} — nothing to do.", name, db_path.display());
             }

@@ -158,6 +158,12 @@ pub mod cf {
     /// Prevents chain scanner from re-creating channels that were intentionally deleted.
     pub const DELETED_CHANNELS: &str = "deleted_channels";
 
+    /// Anchored state checkpoints: the ordered keys + leaf hashes the
+    /// anchored root commits to, for `GET /api/v1/state/proof` (l2-node
+    /// 0.147.0+, `storage::state_checkpoints`). Node-local, derived, NOT in
+    /// snapshot `DOMAIN_CFS`; droppable by `ogmara-node db drop-cf`.
+    pub const STATE_CHECKPOINTS: &str = "state_checkpoints";
+
     /// channel_id (8 bytes BE) → JSON `{creator_verified_at, creator_verification_failed}`
     /// — `ChainScanner::sweep_channel_verification`'s bookkeeping (audit 2026-09-29).
     /// Deliberately a SEPARATE CF from `CHANNELS`, not a field on that row: `CHANNELS`
@@ -516,6 +522,7 @@ pub mod cf {
         NEWS_EDIT_DELETE,
         NEWS_REACTION_MSGS,
         DM_RECIPIENT_MSG_COUNTS,
+        STATE_CHECKPOINTS,
     ];
 }
 

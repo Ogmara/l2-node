@@ -1,50 +1,20 @@
-//! Sparse Merkle tree for L2 state anchoring.
+//! Merkle tree for L2 state anchoring.
 //!
-//! Constructs a Merkle tree from L2 state (users, channels, messages,
-//! delegations, channel members) and generates state roots for on-chain
-//! anchoring. Uses SHA-256 hashing (spec 02-onchain.md section 7).
+//! Constructs a Merkle tree from L2 state (users, channel metadata,
+//! delegations, channel members), generates state roots for on-chain
+//! anchoring, and builds/verifies record inclusion proofs against them.
+//! Uses SHA-256 hashing (spec 02-onchain.md section 7). Messages are not
+//! part of the anchored state: nodes legitimately hold different message
+//! sets, so a message commitment would stop anchorers from agreeing.
 //!
 //! Tree structure:
 //!   State Root
 //!   ├── Users Subtree
-//!   ├── Channels Subtree (each channel has metadata + messages subtree)
+//!   ├── Channels Subtree (channel metadata records)
 //!   ├── Delegations Subtree
 //!   └── Channel Members Subtree (added v3, audit final pre-mainnet C2)
 
 use sha2::{Digest, Sha256};
-
-/// A Merkle proof path for verifying inclusion of a leaf.
-///
-/// Spec 03 lists per-message inclusion proofs as a node capability; no API
-/// serves them yet, so the proof builder/verifier is exercised by tests only.
-#[allow(dead_code, reason = "spec 03 inclusion proofs, not yet served by any endpoint")]
-#[derive(Debug, Clone)]
-pub struct MerkleProof {
-    /// Leaf hash being proven.
-    pub leaf_hash: [u8; 32],
-    /// Sibling hashes from leaf to root, with position (true = left sibling).
-    pub path: Vec<(bool, [u8; 32])>,
-    /// Expected root hash.
-    pub root: [u8; 32],
-}
-
-#[allow(dead_code, reason = "spec 03 inclusion proofs, not yet served by any endpoint")]
-impl MerkleProof {
-    /// Verify the proof by recomputing the root from the leaf.
-    pub fn verify(&self) -> bool {
-        let mut current = self.leaf_hash;
-
-        for (is_left, sibling) in &self.path {
-            current = if *is_left {
-                hash_pair(sibling, &current)
-            } else {
-                hash_pair(&current, sibling)
-            };
-        }
-
-        current == self.root
-    }
-}
 
 /// Compute SHA-256 hash of data.
 #[cfg(test)]
@@ -155,61 +125,109 @@ pub fn compute_root(leaves: &[[u8; 32]]) -> [u8; 32] {
     current_level[0]
 }
 
-/// Build a Merkle proof for a leaf at the given index.
-///
-/// Returns None if the index is out of range.
-#[allow(dead_code, reason = "spec 03 inclusion proofs, not yet served by any endpoint")]
-pub fn build_proof(leaves: &[[u8; 32]], index: usize) -> Option<MerkleProof> {
-    if index >= leaves.len() || leaves.is_empty() {
+/// Every level of the tree [`compute_root`] builds, leaves first and the
+/// root last. Built once per checkpoint subtree so inclusion paths can be
+/// read off in O(log n) instead of rehashing the subtree per request.
+/// Empty input yields no levels.
+pub fn tree_levels(leaves: &[[u8; 32]]) -> Vec<Vec<[u8; 32]>> {
+    if leaves.is_empty() {
+        return Vec::new();
+    }
+    let mut levels = vec![leaves.to_vec()];
+    while levels.last().map_or(0, Vec::len) > 1 {
+        let level = levels.last().expect("non-empty");
+        let next = level
+            .chunks(2)
+            .map(|c| hash_pair(&c[0], c.get(1).unwrap_or(&c[0])))
+            .collect();
+        levels.push(next);
+    }
+    levels
+}
+
+/// Sibling hashes from leaf `index` up to the root of the tree in `levels`.
+/// A node that is the odd last one on its level is paired with itself by
+/// [`compute_root`], so it contributes no sibling entry — the verifier
+/// derives that case from `index` and the leaf count.
+pub fn inclusion_path(levels: &[Vec<[u8; 32]>], index: usize) -> Option<Vec<[u8; 32]>> {
+    if index >= levels.first()?.len() {
         return None;
     }
-
-    let root = compute_root(leaves);
     let mut path = Vec::new();
-    let mut current_level: Vec<[u8; 32]> = leaves.to_vec();
-    let mut current_index = index;
-
-    while current_level.len() > 1 {
-        // Pad to even length
-        if current_level.len() % 2 != 0 {
-            let last = *current_level.last().unwrap();
-            current_level.push(last);
+    let mut idx = index;
+    for level in &levels[..levels.len() - 1] {
+        let sibling = idx ^ 1;
+        if sibling < level.len() {
+            path.push(level[sibling]);
         }
-
-        let sibling_index = if current_index % 2 == 0 {
-            current_index + 1
-        } else {
-            current_index - 1
-        };
-
-        let is_left = current_index % 2 != 0; // sibling is on the left
-        path.push((is_left, current_level[sibling_index]));
-
-        // Build next level
-        let mut next_level = Vec::with_capacity(current_level.len() / 2);
-        for chunk in current_level.chunks(2) {
-            next_level.push(hash_pair(&chunk[0], &chunk[1]));
-        }
-
-        current_level = next_level;
-        current_index /= 2;
+        idx /= 2;
     }
+    Some(path)
+}
 
-    Some(MerkleProof {
-        leaf_hash: leaves[index],
-        path,
-        root,
-    })
+/// Recompute a subtree root from a leaf, its `index`, the subtree's
+/// `leaf_count` and the sibling path from [`inclusion_path`]. Directions
+/// come from the index, not from the proof, so a path cannot be replayed
+/// at a different position. Returns `None` on a malformed proof (index out
+/// of range, too few or too many siblings).
+///
+/// The node only builds proofs; this is the reference verifier its tests
+/// check them with. Clients verify with sdk-js `verifyStateProof`, which
+/// implements the same algorithm.
+#[cfg(test)]
+pub fn root_from_path(
+    leaf: [u8; 32],
+    index: u64,
+    leaf_count: u64,
+    siblings: &[[u8; 32]],
+) -> Option<[u8; 32]> {
+    if index >= leaf_count {
+        return None;
+    }
+    let mut hash = leaf;
+    let mut idx = index;
+    let mut n = leaf_count;
+    let mut sibs = siblings.iter();
+    while n > 1 {
+        hash = if idx % 2 == 1 {
+            hash_pair(sibs.next()?, &hash)
+        } else if idx + 1 < n {
+            hash_pair(&hash, sibs.next()?)
+        } else {
+            hash_pair(&hash, &hash)
+        };
+        idx /= 2;
+        n = n.div_ceil(2);
+    }
+    if sibs.next().is_some() {
+        return None;
+    }
+    Some(hash)
+}
+
+/// Frame the four subtree `(leaf_count, root)` pairs — users, channels,
+/// delegations, channel members, in that order — into the anchored state
+/// root. The single definition used by [`StateManager::compute_state_root`]
+/// and by state-proof verification.
+pub fn frame_state_root(subtrees: &[(u64, [u8; 32]); 4]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(STATE_ROOT_DOMAIN);
+    for (count, root) in subtrees {
+        hasher.update(count.to_be_bytes());
+        hasher.update(root);
+    }
+    hasher.finalize().into()
 }
 
 /// The state manager that builds and maintains the L2 state Merkle tree.
 ///
-/// Composed of four subtrees: users, channels (with messages), delegations,
+/// Composed of four subtrees: users, channels (metadata only — messages
+/// are not part of the anchored state, see spec 02 §7), delegations,
 /// channel members.
 pub struct StateManager {
     /// Hashes of user states.
     user_hashes: Vec<[u8; 32]>,
-    /// Hashes of channel states (metadata + message subtree roots).
+    /// Hashes of channel metadata records.
     channel_hashes: Vec<[u8; 32]>,
     /// Hashes of delegation records.
     delegation_hashes: Vec<[u8; 32]>,
@@ -237,7 +255,7 @@ impl StateManager {
         self.user_hashes.push(hash_leaf(user_data));
     }
 
-    /// Add a channel state hash (metadata + message subtree root).
+    /// Add a channel metadata record hash.
     pub fn add_channel(&mut self, channel_data: &[u8]) {
         self.channel_hashes.push(hash_leaf(channel_data));
     }
@@ -291,17 +309,39 @@ impl StateManager {
         let delegations_root = compute_root(&self.delegation_hashes);
         let channel_members_root = compute_root(&self.channel_member_hashes);
 
-        let mut hasher = Sha256::new();
-        hasher.update(STATE_ROOT_DOMAIN);
-        hasher.update((self.user_hashes.len() as u64).to_be_bytes());
-        hasher.update(users_root);
-        hasher.update((self.channel_hashes.len() as u64).to_be_bytes());
-        hasher.update(channels_root);
-        hasher.update((self.delegation_hashes.len() as u64).to_be_bytes());
-        hasher.update(delegations_root);
-        hasher.update((self.channel_member_hashes.len() as u64).to_be_bytes());
-        hasher.update(channel_members_root);
-        hasher.finalize().into()
+        frame_state_root(&[
+            (self.user_hashes.len() as u64, users_root),
+            (self.channel_hashes.len() as u64, channels_root),
+            (self.delegation_hashes.len() as u64, delegations_root),
+            (self.channel_member_hashes.len() as u64, channel_members_root),
+        ])
+    }
+
+    /// The leaf hashes of the four subtrees, in [`frame_state_root`] order
+    /// — exactly what [`Self::compute_state_root`] hashed, so a state
+    /// checkpoint stores the same leaves the anchored root commits to.
+    #[cfg(test)]
+    pub fn subtree_leaves(&self) -> [&[[u8; 32]]; 4] {
+        [
+            &self.user_hashes,
+            &self.channel_hashes,
+            &self.delegation_hashes,
+            &self.channel_member_hashes,
+        ]
+    }
+
+    /// The state root and the four subtrees' leaves, moved out (no copy).
+    pub fn into_root_and_leaves(self) -> ([u8; 32], [Vec<[u8; 32]>; 4]) {
+        let root = self.compute_state_root();
+        (
+            root,
+            [
+                self.user_hashes,
+                self.channel_hashes,
+                self.delegation_hashes,
+                self.channel_member_hashes,
+            ],
+        )
     }
 }
 
@@ -343,20 +383,60 @@ mod tests {
     }
 
     #[test]
-    fn test_proof_verify() {
-        let leaves: Vec<[u8; 32]> = (0..8u8).map(|i| sha256(&[i])).collect();
-        for i in 0..leaves.len() {
-            let proof = build_proof(&leaves, i).unwrap();
-            assert!(proof.verify(), "proof failed for leaf {}", i);
+    fn inclusion_paths_rebuild_the_root_for_every_leaf_and_size() {
+        for n in 1..=33u64 {
+            let leaves: Vec<[u8; 32]> = (0..n).map(|i| sha256(&i.to_be_bytes())).collect();
+            let root = compute_root(&leaves);
+            let levels = tree_levels(&leaves);
+            assert_eq!(levels.last().unwrap()[0], root, "n={n}");
+            for i in 0..n {
+                let path = inclusion_path(&levels, i as usize).unwrap();
+                assert_eq!(
+                    root_from_path(leaves[i as usize], i, n, &path),
+                    Some(root),
+                    "n={n} i={i}"
+                );
+            }
         }
     }
 
     #[test]
-    fn test_proof_wrong_leaf_fails() {
-        let leaves: Vec<[u8; 32]> = (0..4u8).map(|i| sha256(&[i])).collect();
-        let mut proof = build_proof(&leaves, 0).unwrap();
-        proof.leaf_hash = sha256(b"tampered");
-        assert!(!proof.verify());
+    fn tampered_or_misplaced_proofs_fail() {
+        let leaves: Vec<[u8; 32]> = (0..7u8).map(|i| sha256(&[i])).collect();
+        let root = compute_root(&leaves);
+        let levels = tree_levels(&leaves);
+        let path = inclusion_path(&levels, 2).unwrap();
+        // Wrong leaf.
+        assert_ne!(root_from_path(sha256(b"x"), 2, 7, &path), Some(root));
+        // Same path claimed at another index.
+        assert_ne!(root_from_path(leaves[2], 3, 7, &path), Some(root));
+        // A different leaf count can rebuild the same SUBTREE root for an
+        // interior leaf (the duplicate-last-node shape); counts are bound
+        // one level up, by `frame_state_root`, which hashes each count in.
+        // Index out of range, extra or missing siblings.
+        assert_eq!(root_from_path(leaves[2], 7, 7, &path), None);
+        let mut longer = path.clone();
+        longer.push([0u8; 32]);
+        assert_eq!(root_from_path(leaves[2], 2, 7, &longer), None);
+        assert_eq!(root_from_path(leaves[2], 2, 7, &path[..path.len() - 1]), None);
+        assert_eq!(inclusion_path(&levels, 7), None);
+    }
+
+    #[test]
+    fn frame_state_root_matches_state_manager() {
+        let mut sm = StateManager::new();
+        sm.add_user(b"u1");
+        sm.add_user(b"u2");
+        sm.add_channel(b"c1");
+        sm.add_channel_member(b"k", b"v");
+        let [u, c, d, m] = sm.subtree_leaves();
+        let framed = frame_state_root(&[
+            (u.len() as u64, compute_root(u)),
+            (c.len() as u64, compute_root(c)),
+            (d.len() as u64, compute_root(d)),
+            (m.len() as u64, compute_root(m)),
+        ]);
+        assert_eq!(framed, sm.compute_state_root());
     }
 
     #[test]

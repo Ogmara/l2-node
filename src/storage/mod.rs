@@ -7,3 +7,4 @@ pub mod key_commits;
 pub mod rocks;
 pub mod schema;
 pub mod snapshot;
+pub mod state_checkpoints;

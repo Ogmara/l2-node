@@ -5,6 +5,54 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.147.0] - 2026-11-14
+
+### Added
+
+- **State inclusion proofs: `GET /api/v1/state/proof` (spec 03 §3.6,
+  spec 02 §7).** Proves that a user, channel, delegation or
+  channel-membership record is part of the state root this node anchored
+  on-chain. The response carries the record's value, its index, the
+  sibling path and the four subtree `(count, root)` pairs; a client checks
+  the proof is about the record it asked for, rebuilds the anchored root
+  and compares it with the canonical root on-chain (sdk-js 0.69.0
+  `verifyStateProofOnChain`), so the node is not trusted. Public; served by
+  nodes with `[anchoring] enabled`.
+- **Anchored state checkpoints.** After each successful anchor broadcast
+  the node stores the keys and leaf hashes the root commits to in the new
+  `state_checkpoints` column family (newest 4 heights, plus the newest one
+  whose root the divergence watcher saw match the canonical root;
+  node-local, not in snapshots). Proofs default to that canonical-confirmed
+  height (`canonical_confirmed` in the response is a hint only).
+- `ogmara-node db drop-cf state_checkpoints` for rolling back to a release
+  before 0.143.0 (0.143.0+ opens column families from newer releases).
+
+### Changed
+
+- The state root is computed in one place (`Storage::compute_state_checkpoint`,
+  keys collected only when a checkpoint is stored); the anchorer and
+  `/admin/state/latest` both use it. The root format is unchanged (v3); an
+  independent recomputation test still matches, and a known-answer test
+  now pins the format going forward.
+- `crypto::merkle`: the unused `MerkleProof`/`build_proof` (which stopped at a
+  subtree root and could not reach the framed state root) are replaced by
+  `tree_levels`, `inclusion_path`, `frame_state_root` and a reference
+  verifier. Docs no longer claim a per-channel message subtree.
+
+### Security
+
+- Proofs for private channels and their memberships are refused (403
+  `private_channel`), and unknown or deleted channels fail closed: a public
+  membership proof would reveal who is in a private channel.
+- A record that changed after the checkpoint is refused (409
+  `record_changed`) instead of being "proven" with a value the node no
+  longer holds.
+- Proof trees are built one at a time node-wide; a request that needs a build
+  while another runs gets 503 `busy` instead of parking a blocking thread,
+  so rotating heights and subtrees cannot tie up the blocking pool. The
+  default height's trees are evicted from the proof cache last, so clients
+  cycling explicit heights cannot push them out.
+
 ## [0.146.0] - 2026-11-14
 
 ### Added

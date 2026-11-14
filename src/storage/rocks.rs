@@ -586,7 +586,8 @@ impl Storage {
     /// Column families `drop_column_family_offline` may drop: ONLY derived,
     /// node-local state whose loss is recoverable, so an operator typo can
     /// never delete user data.
-    pub const DROPPABLE_CFS: &'static [&'static str] = &[cf::CHANNEL_KEY_COMMITS];
+    pub const DROPPABLE_CFS: &'static [&'static str] =
+        &[cf::CHANNEL_KEY_COMMITS, cf::STATE_CHECKPOINTS];
 
     /// Offline maintenance for `ogmara-node db drop-cf` (l2-node 0.143.0
     /// rollback runbook): drop one allow-listed column family from a STOPPED
@@ -2906,71 +2907,69 @@ impl Storage {
     /// Returns `(state_root, message_count, channel_count, user_count)`.
     /// Should be called from `spawn_blocking` to avoid blocking the async runtime.
     pub fn compute_current_state_root(&self) -> Result<([u8; 32], u64, u32, u32)> {
+        // Keys are only needed for proofs; don't hold them for a plain root.
+        let cp = self.build_state_checkpoint(false)?;
+        let message_count = self.get_stat(super::schema::state_keys::TOTAL_MESSAGES)?;
+        let channel_count = cp.subtrees[1].leaves.len() as u32;
+        let user_count = cp.subtrees[0].leaves.len() as u32;
+        Ok((cp.state_root, message_count, channel_count, user_count))
+    }
+
+    /// The state root plus everything it commits to: per subtree, the
+    /// RocksDB keys in iteration order and the leaf hashes `StateManager`
+    /// hashed (`storage::state_checkpoints`). Should be called from
+    /// `spawn_blocking`.
+    pub fn compute_state_checkpoint(&self) -> Result<super::state_checkpoints::StateCheckpoint> {
+        self.build_state_checkpoint(true)
+    }
+
+    /// The single place the anchored root is computed. With
+    /// `collect_keys = false` the returned subtrees carry leaves only.
+    fn build_state_checkpoint(
+        &self,
+        collect_keys: bool,
+    ) -> Result<super::state_checkpoints::StateCheckpoint> {
+        use super::state_checkpoints::{StateCheckpoint, Subtree, SubtreeCheckpoint};
         use crate::crypto::merkle::StateManager;
-        use super::schema::state_keys;
 
         let mut state_mgr = StateManager::new();
-
-        // Iterate USERS
-        let user_cf = self.db.cf_handle(cf::USERS)
-            .context("USERS cf not found")?;
-        let mut user_count = 0u32;
-        let mut iter = self.db.raw_iterator_cf(&user_cf);
-        iter.seek_to_first();
-        while iter.valid() {
-            if let Some(value) = iter.value() {
-                state_mgr.add_user(value);
-                user_count += 1;
+        let mut keys: [Vec<Vec<u8>>; 4] = Default::default();
+        for subtree in Subtree::ALL {
+            let handle = self
+                .db
+                .cf_handle(subtree.cf())
+                .with_context(|| format!("{} cf not found", subtree.cf()))?;
+            let mut iter = self.db.raw_iterator_cf(&handle);
+            iter.seek_to_first();
+            while iter.valid() {
+                if let (Some(key), Some(value)) = (iter.key(), iter.value()) {
+                    match subtree {
+                        Subtree::Users => state_mgr.add_user(value),
+                        Subtree::Channels => state_mgr.add_channel(value),
+                        Subtree::Delegations => state_mgr.add_delegation(value),
+                        // CHANNEL_MEMBERS values don't redundantly encode
+                        // their key (channel_id + address) the way the
+                        // other three do — the key is hashed in too (see
+                        // `StateManager::add_channel_member`; audit C2).
+                        Subtree::ChannelMembers => state_mgr.add_channel_member(key, value),
+                    }
+                    if collect_keys {
+                        keys[subtree.index()].push(key.to_vec());
+                    }
+                }
+                iter.next();
             }
-            iter.next();
+            iter.status().with_context(|| format!("iterating {}", subtree.cf()))?;
         }
 
-        // Iterate CHANNELS
-        let chan_cf = self.db.cf_handle(cf::CHANNELS)
-            .context("CHANNELS cf not found")?;
-        let mut channel_count = 0u32;
-        let mut iter = self.db.raw_iterator_cf(&chan_cf);
-        iter.seek_to_first();
-        while iter.valid() {
-            if let Some(value) = iter.value() {
-                state_mgr.add_channel(value);
-                channel_count += 1;
-            }
-            iter.next();
-        }
-
-        // Iterate DELEGATIONS
-        let deleg_cf = self.db.cf_handle(cf::DELEGATIONS)
-            .context("DELEGATIONS cf not found")?;
-        let mut iter = self.db.raw_iterator_cf(&deleg_cf);
-        iter.seek_to_first();
-        while iter.valid() {
-            if let Some(value) = iter.value() {
-                state_mgr.add_delegation(value);
-            }
-            iter.next();
-        }
-
-        // Iterate CHANNEL_MEMBERS (v3, audit C2 — was transferred by
-        // snapshot bootstrap but not covered by the anchored commitment).
-        let members_cf = self.db.cf_handle(cf::CHANNEL_MEMBERS)
-            .context("CHANNEL_MEMBERS cf not found")?;
-        let mut iter = self.db.raw_iterator_cf(&members_cf);
-        iter.seek_to_first();
-        while iter.valid() {
-            // CHANNEL_MEMBERS values don't redundantly encode their key
-            // (channel_id + address) the way USERS/DELEGATIONS values do —
-            // the key must be hashed in too (see `add_channel_member` doc).
-            if let (Some(key), Some(value)) = (iter.key(), iter.value()) {
-                state_mgr.add_channel_member(key, value);
-            }
-            iter.next();
-        }
-
-        let state_root = state_mgr.compute_state_root();
-        let message_count = self.get_stat(state_keys::TOTAL_MESSAGES)?;
-
-        Ok((state_root, message_count, channel_count, user_count))
+        let (state_root, leaves) = state_mgr.into_root_and_leaves();
+        let mut keys = keys.into_iter();
+        let mut leaves = leaves.into_iter();
+        let subtrees = std::array::from_fn(|_| SubtreeCheckpoint {
+            keys: keys.next().expect("four subtrees"),
+            leaves: leaves.next().expect("four subtrees"),
+        });
+        Ok(StateCheckpoint { state_root, subtrees })
     }
 
     // --- Snapshot Bootstrap (spec 11-snapshot-sync.md) ---

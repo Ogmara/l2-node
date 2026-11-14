@@ -385,6 +385,14 @@ impl StateAnchorer {
                         // the lifetime canonical counter.
                         self.divergence_counter.store(0, Ordering::Relaxed);
                         self.canonical_counter.fetch_add(1, Ordering::Relaxed);
+                        // State proofs default to canonical-confirmed
+                        // checkpoints (clients verify against this root).
+                        if let Err(e) = self
+                            .storage
+                            .mark_state_checkpoint_canonical(sub.block_height, &canonical)
+                        {
+                            warn!(block_height = sub.block_height, error = %e, "Failed to mark state checkpoint canonical");
+                        }
                         info!(
                             block_height = sub.block_height,
                             "Anchor canonicalized — our root matches"
@@ -714,13 +722,23 @@ impl StateAnchorer {
     /// `pending_submissions` so the divergence watcher can later
     /// resolve it against the on-chain canonical anchor.
     async fn perform_anchor(&mut self) -> Result<String> {
-        // Step 1: Compute state root (blocking operation — iterate RocksDB)
+        // Step 1: Compute the state checkpoint (blocking — iterates RocksDB).
+        // It carries the root plus the leaves it commits to, stored below
+        // once the anchor is broadcast so `/api/v1/state/proof` can serve
+        // inclusion proofs against this height.
         let storage = self.storage.clone();
-        let (state_root, message_count, channel_count, user_count) =
-            tokio::task::spawn_blocking(move || storage.compute_current_state_root())
+        let checkpoint =
+            tokio::task::spawn_blocking(move || storage.compute_state_checkpoint())
                 .await
                 .context("spawn_blocking panicked")?
                 .context("computing state root")?;
+        let state_root = checkpoint.state_root;
+        let message_count = self
+            .storage
+            .get_stat(state_keys::TOTAL_MESSAGES)
+            .context("reading message count")?;
+        let channel_count = checkpoint.subtrees[1].leaves.len() as u32;
+        let user_count = checkpoint.subtrees[0].leaves.len() as u32;
 
         let state_root_hex = hex::encode(state_root);
         let block_height = self.storage.get_chain_cursor()
@@ -747,6 +765,19 @@ impl StateAnchorer {
         // Steps 3–6: nonce + raw TX build + send + decode + sign + broadcast.
         // Shared with the SIGTERM `pauseNode` path (`submit_pause_for_shutdown`).
         let tx_hash_hex = self.submit_signed_sc_invoke(&call_data).await?;
+
+        // Keep the leaves this anchored root commits to (proof serving). A
+        // failure here costs only proofs for this height, never the anchor.
+        let storage = self.storage.clone();
+        match tokio::task::spawn_blocking(move || {
+            storage.store_state_checkpoint(block_height, &checkpoint)
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => warn!(block_height, error = %e, "Failed to store state checkpoint"),
+            Err(e) => warn!(block_height, error = %e, "State checkpoint task panicked"),
+        }
 
         // Store last anchor timestamp locally
         let now = SystemTime::now()

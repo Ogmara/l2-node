@@ -15,6 +15,7 @@ mod epoch_arbitration_tests;
 pub mod media_fallback;
 pub mod media_limiter;
 pub mod member_proofs;
+pub mod state_proofs;
 #[cfg(test)]
 mod phase2_fixtures;
 pub mod rate_limit_key;
@@ -90,6 +91,10 @@ fn build_router(config: &Config, app_state: Arc<AppState>) -> Router {
         // this node's operator address to credit. Public (a client needs it
         // BEFORE it has an identity), 60-second cache.
         .route("/api/v1/registration/info", get(routes::registration_info))
+        // v0.147.0 — spec 03 §3.6: inclusion proofs for user / channel /
+        // delegation / membership records against this node's anchored
+        // state checkpoints. Public; private channels are refused.
+        .route("/api/v1/state/proof", get(state_proofs::get_state_proof))
         // v0.45.0 — spec 13 §4.5: SC-derived bootstrap discovery for
         // SDK clients and new nodes. Public, 5-min cache.
         .route(
