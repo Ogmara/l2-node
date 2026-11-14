@@ -83,7 +83,12 @@ pub fn build_swarm(config: &Config, keypair: Keypair) -> Result<Swarm<OgmaraBeha
         libp2p::connection_limits::ConnectionLimits::default()
             .with_max_established(Some(config.network.max_peers))
             .with_max_established_incoming(Some(config.network.max_peers / 2))
-            .with_max_established_per_peer(Some(2)),  // prevent per-peer connection exhaustion
+            .with_max_established_per_peer(Some(2))  // prevent per-peer connection exhaustion
+            // Bound in-flight outbound dials. Addresses learned from peers
+            // (Identify, Kademlia) are attacker-influenced, and an onion dial
+            // holds a Tor circuit for up to `ONION_DIAL_TIMEOUT`; 128 leaves
+            // room for the 64-peer persisted-book redial plus Kademlia.
+            .with_max_pending_outgoing(Some(128)),
     );
 
     // GossipSub configuration — mesh parameters tuned for small networks.
@@ -361,6 +366,28 @@ pub fn build_swarm(config: &Config, keypair: Keypair) -> Result<Swarm<OgmaraBeha
         private_channel_sync,
     };
 
+    // Outbound onion dialing (spec 13 §6.4.1, onion Phase 2). Always
+    // registered so the builder type doesn't depend on config; with Tor
+    // disabled it refuses every address. `Config::validate` already
+    // guarantees a loopback `socks_proxy` when enabled, and
+    // `Socks5Dialer::new` re-checks.
+    let onion_dialer = if config.network.tor.enabled {
+        let proxy: std::net::SocketAddr = config
+            .network
+            .tor
+            .socks_proxy
+            .trim()
+            .parse()
+            .context("parsing network.tor.socks_proxy")?;
+        let dialer = super::tor::Socks5Dialer::new(proxy)
+            .context("constructing the Tor SOCKS5 dialer")?
+            .with_handshake_timeout(super::onion_transport::ONION_HANDSHAKE_TIMEOUT);
+        tracing::info!(socks_proxy = %proxy, "Outbound onion dialing enabled via Tor");
+        Some(dialer)
+    } else {
+        None
+    };
+
     let swarm = SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
         .with_tcp(
@@ -370,6 +397,16 @@ pub fn build_swarm(config: &Config, keypair: Keypair) -> Result<Swarm<OgmaraBeha
         )
         .context("configuring TCP transport")?
         .with_quic()
+        .with_other_transport(|keypair| {
+            use libp2p::core::Transport;
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(
+                super::onion_transport::OnionTransport::new(onion_dialer)
+                    .upgrade(libp2p::core::upgrade::Version::V1Lazy)
+                    .authenticate(libp2p::noise::Config::new(keypair)?)
+                    .multiplex(libp2p::yamux::Config::default()),
+            )
+        })
+        .context("configuring onion transport")?
         .with_dns()
         .context("configuring DNS transport")?
         .with_behaviour(|_| Ok(behaviour))

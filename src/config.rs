@@ -134,8 +134,8 @@ pub struct NetworkConfig {
     pub sc_discovery: ScDiscoveryConfig,
     /// Onion transport — external Tor daemon + SOCKS5 wrapper (spec
     /// 13 §6.4, l2-node 0.46.9+). Operator-facing knobs for hosting
-    /// a hidden service and (in a future release) dialling onion peers
-    /// through a local Tor SOCKS proxy. Disabled by default —
+    /// a hidden service and dialling `/onion3` peers through a local
+    /// Tor SOCKS proxy. Disabled by default —
     /// operators with regulatory-resilience requirements opt in.
     #[serde(default)]
     pub tor: TorConfig,
@@ -259,20 +259,17 @@ fn default_sc_max_candidates() -> u32 {
 /// focused on the small hand-rolled SOCKS5 module
 /// ([`crate::network::tor`]).
 ///
-/// **v0.46.9 scope (this release):**
-/// - Config surface fully wired.
-/// - SOCKS5 dialer module shipped with security-critical properties
+/// **Scope:**
+/// - SOCKS5 dialer module with security-critical properties
 ///   (DNS-leak prevention, no IP-fallthrough, RFC 1928 compliance).
-/// - **Inbound onion support**: when `listen_onion_hostname` is set
-///   AND `listen_onion_port` is non-zero, the swarm listens on
+/// - **Inbound onion support** (0.46.9+): when `listen_onion_hostname`
+///   is set AND `listen_onion_port` is non-zero, the swarm listens on
 ///   `/ip4/127.0.0.1/tcp/listen_onion_port` so the operator's Tor
 ///   hidden-service can forward traffic to it.
-/// - Outbound onion multiaddrs are still refused by the libp2p
-///   dialer — the SOCKS5-backed libp2p `Transport` integration is
-///   deferred to a future release (onion Phase 2; not a mainnet
-///   blocker). Peers that publish onion-only addresses are not
-///   yet dialable, but ARE discoverable (their multiaddrs appear in
-///   `bootstrap-candidates` with `transport: "onion"`).
+/// - **Outbound onion support** (onion Phase 2, 0.146.0+): `/onion3`
+///   multiaddrs are dialed through the SOCKS proxy by
+///   `network::onion_transport`, then upgraded with Noise + yamux like
+///   TCP. With `enabled = false` they stay undialable.
 ///
 /// **Operator workflow:** see spec 13 §6.4.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -280,8 +277,8 @@ pub struct TorConfig {
     /// Master switch. Default `false` — onion support is opt-in.
     /// Enabling this:
     /// 1. Validates `socks_proxy` parses cleanly.
-    /// 2. (future release) Registers the SOCKS5-backed libp2p Transport
-    ///    for outbound `/onion3/...` dials.
+    /// 2. Arms the SOCKS5-backed libp2p transport for outbound
+    ///    `/onion3/...` dials (`network::onion_transport`, 0.146.0+).
     /// 3. Configures inbound listen on the loopback TCP port that
     ///    the operator's external Tor service forwards the hidden
     ///    service to.
@@ -3856,9 +3853,9 @@ max_peer_staleness_days = 7
 #
 # When enabled = true, the operator MUST already run a Tor daemon
 # (apt install tor / brew install tor / etc.). The L2 node uses the
-# daemon's local SOCKS proxy for outbound onion dials (deferred to a
-# future release) and accepts inbound connections forwarded by the
-# daemon's hidden-service definition for the loopback port below.
+# daemon's local SOCKS proxy for outbound /onion3 dials (0.146.0+)
+# and accepts inbound connections forwarded by the daemon's
+# hidden-service definition for the loopback port below.
 enabled = false
 # Local Tor SOCKS5 proxy. Must be a loopback host (validator refuses
 # non-loopback to prevent operators from unwittingly routing onion

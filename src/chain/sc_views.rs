@@ -1233,8 +1233,8 @@ impl TransportKind {
 /// internal targets (Security Audit W1, 0.46.5).
 ///
 /// Rules (first match wins, scanned left-to-right):
-/// - Contains `/onion3/` or `/onion/` → [`TransportKind::Onion`]
-/// - Contains `/garlic/` → [`TransportKind::I2p`]
+/// - Starts with `/onion3/` or `/onion/` → [`TransportKind::Onion`]
+/// - Starts with `/garlic` → [`TransportKind::I2p`]
 /// - `/ip4/<addr>/...` or `/ip6/<addr>/...` with `<addr>` in any
 ///   non-routable range (loopback, RFC1918, link-local + AWS/Azure
 ///   metadata endpoint at 169.254.169.254, ULA, unspecified,
@@ -1252,12 +1252,13 @@ impl TransportKind {
 /// handling. SDK consumers filtering on `clearnet` therefore see only
 /// TCP / QUIC, which is the v0.46.5 deployment surface.
 pub fn classify_transport(multiaddr_str: &str) -> TransportKind {
-    // Onion check first — onion multiaddrs may also include /tcp/, but
-    // they should classify as Onion regardless.
-    if multiaddr_str.contains("/onion3/") || multiaddr_str.contains("/onion/") {
+    // Overlay addresses classify by their FIRST protocol only. A substring
+    // match would let `/ip4/<private>/tcp/80/onion3/...` pass the SSRF
+    // guard as "onion" and rely on every transport rejecting it.
+    if multiaddr_str.starts_with("/onion3/") || multiaddr_str.starts_with("/onion/") {
         return TransportKind::Onion;
     }
-    if multiaddr_str.contains("/garlic/") {
+    if multiaddr_str.starts_with("/garlic") {
         return TransportKind::I2p;
     }
 
@@ -1648,6 +1649,23 @@ mod tests {
         assert_eq!(
             classify_transport("/onion3/abc123/tcp/41720/p2p/12D3KooW..."),
             TransportKind::Onion
+        );
+    }
+
+    #[test]
+    fn classify_real_garlic64_form() {
+        // rust-multiaddr prints I2P as /garlic64 or /garlic32, never /garlic/.
+        assert_eq!(
+            classify_transport("/garlic64/AAAA/p2p/12D3KooW..."),
+            TransportKind::I2p
+        );
+    }
+
+    #[test]
+    fn embedded_onion_segment_does_not_bypass_the_ip_check() {
+        assert_eq!(
+            classify_transport("/ip4/10.0.0.1/tcp/80/onion3/abc123:41720/p2p/12D3KooW..."),
+            TransportKind::Unknown
         );
     }
 

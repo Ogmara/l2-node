@@ -555,8 +555,14 @@ impl ScDiscovery {
             }
         }
 
+        // `PEER_DIRECTORY` holds ONE address per peer (`pa:<peer_id>`), so
+        // persist only the preferred one. Writing every published address
+        // made the last one win and the stored value flip on every refresh
+        // (tcp → quic → tcp…), re-triggering a redial each time; with an
+        // onion address published last, Tor-less nodes could no longer
+        // reach a dual-stack peer at all.
         for (addr_str, multiaddrs) in &new_addresses {
-            for multiaddr in multiaddrs {
+            if let Some(multiaddr) = preferred_multiaddr(multiaddrs) {
                 if self.persist_multiaddr(addr_str, multiaddr) {
                     persisted_count += 1;
                 }
@@ -682,7 +688,11 @@ impl ScDiscovery {
         //   * missing   → insert (subject to the cap check below)
         // Discovered during the Odroid testnet bake-in 2026-05-31.
         match self.storage.get_cf(cf, &key) {
-            Ok(Some(existing)) if existing == new_value_bytes => {
+            Ok(Some(existing))
+                if existing == new_value_bytes
+                    || std::str::from_utf8(&existing)
+                        .is_ok_and(|e| without_p2p(e) == without_p2p(&new_value)) =>
+            {
                 // Identical — already up-to-date.
                 return false;
             }
@@ -763,5 +773,109 @@ impl ScDiscovery {
         if let Err(e) = tx.try_send(event) {
             debug!(error = %e, "Alert event channel full or closed; dropping event");
         }
+    }
+}
+
+/// Pick the one multiaddr to persist for a peer from its published list:
+/// the first clearnet address (publish order), else the first overlay
+/// (onion/i2p) address. Addresses without `/p2p/<peer_id>` or that fail
+/// the SSRF classification are never chosen. Clearnet wins because every
+/// node can dial it; an onion-only peer still gets its onion address,
+/// which Tor-enabled nodes dial and other nodes simply fail on.
+fn preferred_multiaddr(multiaddrs: &[Multiaddr]) -> Option<&Multiaddr> {
+    multiaddrs
+        .iter()
+        .filter(|m| {
+            m.iter()
+                .any(|p| matches!(p, libp2p::multiaddr::Protocol::P2p(_)))
+        })
+        .filter_map(|m| persist_rank(m).map(|rank| (rank, m)))
+        .min_by_key(|(rank, _)| *rank)
+        .map(|(_, m)| m)
+}
+
+/// Ranking for the single address the peer book keeps per peer, shared
+/// by SC discovery and the Identify path: clearnet `0`, overlay
+/// (onion/i2p) `1`, non-routable `None` (never stored).
+pub(crate) fn persist_rank(addr: &Multiaddr) -> Option<u8> {
+    use crate::chain::sc_views::{classify_transport, TransportKind};
+    match classify_transport(&addr.to_string()) {
+        TransportKind::Clearnet => Some(0),
+        TransportKind::Onion | TransportKind::I2p => Some(1),
+        TransportKind::Unknown => None,
+    }
+}
+
+/// `addr` as a string without any `/p2p/<peer_id>` segment. Identify-learned
+/// rows are stored without it and SC rows with it, so comparisons go
+/// through this to treat the two forms of one address as equal.
+fn without_p2p(addr: &str) -> String {
+    match addr.parse::<Multiaddr>() {
+        Ok(m) => m
+            .iter()
+            .filter(|p| !matches!(p, libp2p::multiaddr::Protocol::P2p(_)))
+            .collect::<Multiaddr>()
+            .to_string(),
+        Err(_) => addr.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ONION: &str = "2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid";
+
+    fn addrs(peer: &PeerId, list: &[&str]) -> Vec<Multiaddr> {
+        list.iter()
+            .map(|s| format!("{s}/p2p/{peer}").parse().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn prefers_first_clearnet_over_a_later_onion() {
+        let peer = PeerId::random();
+        let list = addrs(
+            &peer,
+            &[
+                "/dns4/node.example.org/tcp/41720",
+                "/dns4/node.example.org/udp/41720/quic-v1",
+                &format!("/onion3/{ONION}:41720"),
+            ],
+        );
+        assert_eq!(preferred_multiaddr(&list), Some(&list[0]));
+    }
+
+    #[test]
+    fn prefers_clearnet_even_when_onion_is_listed_first() {
+        let peer = PeerId::random();
+        let list = addrs(
+            &peer,
+            &[&format!("/onion3/{ONION}:41720"), "/dns4/node.example.org/tcp/41720"],
+        );
+        assert_eq!(preferred_multiaddr(&list), Some(&list[1]));
+    }
+
+    #[test]
+    fn onion_only_peer_keeps_its_onion_address() {
+        let peer = PeerId::random();
+        let list = addrs(&peer, &[&format!("/onion3/{ONION}:41720")]);
+        assert_eq!(preferred_multiaddr(&list), Some(&list[0]));
+    }
+
+    #[test]
+    fn p2p_suffix_does_not_make_an_address_differ() {
+        let peer = PeerId::random();
+        let bare = "/dns4/node.example.org/tcp/41720";
+        assert_eq!(without_p2p(&format!("{bare}/p2p/{peer}")), without_p2p(bare));
+        assert_ne!(without_p2p(bare), without_p2p("/dns4/node.example.org/tcp/41721"));
+    }
+
+    #[test]
+    fn skips_private_targets_and_addresses_without_peer_id() {
+        let peer = PeerId::random();
+        let mut list = addrs(&peer, &["/ip4/169.254.169.254/tcp/80"]);
+        list.push("/dns4/node.example.org/tcp/41720".parse().unwrap());
+        assert_eq!(preferred_multiaddr(&list), None);
     }
 }

@@ -5,6 +5,80 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.146.0] - 2026-11-14
+
+### Added
+
+- **Outbound onion dialing (onion Phase 2, spec 13 §6.4.1).** With
+  `[network.tor] enabled = true` the node now dials `/onion3/...`
+  multiaddrs from the SC registry, the peer book and `bootstrap_nodes`
+  through the local Tor SOCKS proxy. The new
+  `network::onion_transport::OnionTransport` wraps the existing SOCKS5
+  dialer as a libp2p transport, and the stream is upgraded with Noise +
+  yamux exactly like TCP, so the remote peer is authenticated by its
+  libp2p identity (a wrong `/p2p` id fails with `WrongPeerId`). Before
+  this, onion addresses were discovered and persisted but every dial
+  failed with "multiaddr not supported". Startup logs
+  `Outbound onion dialing enabled via Tor` when armed.
+
+### Changed
+
+- `network::tor` no longer carries a module-wide `allow(dead_code)`;
+  `with_connect_timeout` is test-only.
+
+### Removed
+
+- `Socks5Dialer::proxy_addr` (no callers).
+
+### Fixed
+
+- **SC discovery stored a different address for multi-address peers on
+  every refresh.** The peer book keeps one address per peer, but discovery
+  wrote each published multiaddr in turn, so the last one won and the value
+  flipped on each hourly refresh (tcp → quic → tcp…), re-triggering a
+  redial of the whole book every time. With an onion address published
+  last, nodes without Tor could no longer reach a dual-stack peer through
+  the SC tier. Discovery now stores the first clearnet address and falls
+  back to onion/i2p only for peers that publish no usable clearnet one.
+  The Identify path uses the same ranking (it previously kept whichever
+  address the peer's unordered set listed first, which could be its
+  onion address), and an address that differs from the stored row only by
+  its `/p2p` suffix no longer counts as a change. A connected peer whose
+  Identify address differs from its published one (e.g. IP vs DNS form)
+  can still have its row rewritten once per hourly SC refresh; the
+  follow-up redial skips it because it is connected.
+- **Peer-book redials re-dialed connected peers.** `dial_persisted_peers`
+  used a bare `dial(Multiaddr)` (`PeerCondition::Always`); it now dials by
+  the peer id from the row key and skips peers that are connected or
+  already being dialed. The comment claiming libp2p dropped those dials was
+  wrong.
+- The SOCKS5 handshake timeout for onion dials is now 60 s per round trip
+  instead of the dialer's 5 s default (Tor answers CONNECT only after the
+  rendezvous circuit is built, typically 5-30 s), and a whole onion dial is
+  capped at 90 s.
+
+### Security
+
+- The onion transport accepts only `/onion3/<addr>` optionally followed by
+  one `/p2p/<peer_id>`; anything else is left to the clearnet transports,
+  which never accept `/onion3`. Onion targets can therefore leave only
+  through the loopback SOCKS proxy, are never resolved locally, and never
+  fall back to a direct connection. With Tor disabled the transport refuses
+  every address (the previous behaviour).
+- In-flight outbound dials are capped at 128 (`max_pending_outgoing`), so
+  addresses advertised by hostile peers cannot pile up unbounded dials or
+  Tor circuits. A reconnect dial refused by that cap is retried after 30 s
+  without counting toward the 10-attempt limit, so saturation cannot evict
+  healthy peers from the peer book.
+- `classify_transport` recognises onion/i2p only as the first protocol. A
+  substring match let `/ip4/<private>/tcp/80/onion3/...` pass the SSRF guard
+  as "onion". Real I2P addresses (`/garlic64`, `/garlic32`) now classify as
+  `i2p`; the old `/garlic/` check never matched them, so they showed as
+  `unknown` in `bootstrap-candidates`.
+- Tor is used only for onion addresses. Dials to clearnet multiaddrs stay
+  direct, so enabling Tor does not hide the node's IP from clearnet peers
+  (now stated in the docs).
+
 ## [0.145.0] - 2026-11-14
 
 ### Security

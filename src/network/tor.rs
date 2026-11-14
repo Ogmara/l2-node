@@ -36,13 +36,14 @@
 //!    wrapped in a `tokio::time::timeout` so a stalled proxy cannot
 //!    pin a caller task indefinitely.
 //!
-//! # Out of scope for v0.46.9
+//! # Use
 //!
-//! - Outbound libp2p `Transport` integration (deferred to a future
-//!   release; onion Phase 2, not a mainnet blocker).
-//!   The dialer is shipped now so the SOCKS5 security boundary can
-//!   be reviewed independently of the libp2p Transport-trait
-//!   composition work.
+//! [`super::onion_transport::OnionTransport`] (onion Phase 2, l2-node
+//! 0.146.0+) wraps this dialer as the libp2p transport for outbound
+//! `/onion3/...` dials.
+//!
+//! # Out of scope
+//!
 //! - GSSAPI / username-password SOCKS auth. Tor's local SOCKS port
 //!   accepts no-auth; remote authenticated proxies are out of scope.
 //! - SOCKS5 BIND / UDP ASSOCIATE commands.
@@ -112,6 +113,7 @@ impl Socks5Dialer {
         })
     }
 
+    #[cfg(test)]
     pub fn with_connect_timeout(mut self, t: Duration) -> Self {
         self.connect_timeout = t;
         self
@@ -120,12 +122,6 @@ impl Socks5Dialer {
     pub fn with_handshake_timeout(mut self, t: Duration) -> Self {
         self.handshake_timeout = t;
         self
-    }
-
-    /// The configured SOCKS proxy address — exposed for diagnostic
-    /// logging; the dialer never re-parses it.
-    pub fn proxy_addr(&self) -> SocketAddr {
-        self.proxy_addr
     }
 
     /// CONNECT to `target_host:target_port` through the SOCKS5 proxy

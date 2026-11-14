@@ -22,10 +22,7 @@ pub mod sc_discovery;
 pub mod snapshot;
 pub mod snapshot_client;
 pub mod sync;
-// SOCKS5 dialer shipped ahead of its libp2p transport wiring (onion
-// Phase 2, spec 13 §6.4) so the security boundary could be audited on its
-// own; only its tests use it until that integration lands.
-#[allow(dead_code, reason = "onion Phase 2 transport not wired yet")]
+pub mod onion_transport;
 pub mod tor;
 
 use std::collections::{HashMap, HashSet};
@@ -3142,8 +3139,8 @@ impl NetworkService {
                 Some(_) = sc_reconnect_rx.recv() => {
                     // sc_discovery persisted new multiaddrs from the
                     // on-chain registry — dial them now. dial_persisted_peers
-                    // is already deduplication-aware (libp2p drops dial
-                    // attempts to peers we're already connected to).
+                    // skips peers that are already connected or being
+                    // dialed (`PeerCondition::DisconnectedAndNotDialing`).
                     debug!("sc_discovery signaled new peers; dialing from book out-of-cycle");
                     self.dial_persisted_peers();
                 }
@@ -3474,17 +3471,22 @@ impl NetworkService {
                 // `classify_transport` guard the SC-discovery path already uses
                 // (audit C2): keep only Clearnet/Onion/I2p, drop `Unknown`
                 // (loopback / private / CGNAT / link-local).
-                use crate::chain::sc_views::{classify_transport, TransportKind};
-                let mut first_addr = None;
+                // The address kept for reconnection uses the same ranking
+                // as SC discovery (clearnet before onion/i2p): Identify's
+                // address order is arbitrary (a HashSet upstream), and an
+                // onion address stored here would be undialable for nodes
+                // without Tor and eventually evict the peer.
+                let mut first_addr: Option<(u8, Multiaddr)> = None;
                 for addr in info.listen_addrs.into_iter().take(16) {
-                    if classify_transport(&addr.to_string()) == TransportKind::Unknown {
+                    let Some(rank) = sc_discovery::persist_rank(&addr) else {
                         continue; // non-routable — never dial or persist it
-                    }
-                    if first_addr.is_none() {
-                        first_addr = Some(addr.clone());
+                    };
+                    if first_addr.as_ref().is_none_or(|(best, _)| rank < *best) {
+                        first_addr = Some((rank, addr.clone()));
                     }
                     self.swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
                 }
+                let first_addr = first_addr.map(|(_, addr)| addr);
                 // Store address for reconnection (capped to prevent unbounded growth)
                 if let Some(ref addr) = first_addr {
                     if self.known_peer_addrs.len() < 2048 || self.known_peer_addrs.contains_key(&peer_id) {
@@ -3801,7 +3803,7 @@ impl NetworkService {
         }
 
         let mut dialed = 0u32;
-        for (_key, value) in &entries {
+        for (key, value) in &entries {
             let addr_str = match std::str::from_utf8(value) {
                 Ok(s) => s,
                 Err(_) => continue,
@@ -3811,10 +3813,33 @@ impl NetworkService {
                 Err(_) => continue,
             };
 
-            if let Err(e) = self.swarm.dial(addr.clone()) {
-                debug!(addr = %addr, error = %e, "Failed to dial persisted peer");
-            } else {
-                dialed += 1;
+            // A bare `dial(Multiaddr)` uses `PeerCondition::Always`, so it
+            // would redial peers we are already connected to — for onion
+            // peers that is a fresh Tor circuit refused only after Noise.
+            // With a known peer id, skip connected or in-flight peers.
+            // The row key is `pa:<peer_id>`; Identify-written rows carry no
+            // `/p2p` segment, so take the id from the key first.
+            let peer_id = key
+                .strip_prefix(Self::PEER_ADDR_PREFIX)
+                .and_then(|k| std::str::from_utf8(k).ok())
+                .and_then(|k| k.parse::<PeerId>().ok())
+                .or_else(|| {
+                    addr.iter().find_map(|p| match p {
+                        libp2p::multiaddr::Protocol::P2p(id) => Some(id),
+                        _ => None,
+                    })
+                });
+            let opts = match peer_id {
+                Some(id) => libp2p::swarm::dial_opts::DialOpts::peer_id(id)
+                    .addresses(vec![addr.clone()])
+                    .condition(libp2p::swarm::dial_opts::PeerCondition::DisconnectedAndNotDialing)
+                    .build(),
+                None => addr.clone().into(),
+            };
+            match self.swarm.dial(opts) {
+                Ok(()) => dialed += 1,
+                Err(libp2p::swarm::DialError::DialPeerConditionFalse(_)) => {}
+                Err(e) => debug!(addr = %addr, error = %e, "Failed to dial persisted peer"),
             }
         }
 
@@ -7045,6 +7070,16 @@ impl NetworkService {
                         next_backoff = new_backoff,
                         "Reconnection attempt"
                     );
+                }
+                // Refused locally by the pending-dial cap (the only limit
+                // checked synchronously in `dial`): says nothing about the
+                // peer, so retry
+                // soon without counting an attempt — otherwise a burst of
+                // in-flight dials could evict healthy peers from the book.
+                Err(libp2p::swarm::DialError::Denied { .. }) => {
+                    self.reconnect_queue[i].next_attempt = now + Duration::from_secs(30);
+                    i += 1;
+                    continue;
                 }
                 Err(e) => {
                     debug!(
