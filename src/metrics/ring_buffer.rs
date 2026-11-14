@@ -39,6 +39,7 @@ impl<T: Copy + Default> RingBuffer<T> {
     }
 
     /// Get the most recent data point, if any.
+    #[cfg(test)]
     pub fn latest(&self) -> Option<&T> {
         if self.count == 0 {
             return None;
@@ -78,11 +79,13 @@ impl<T: Copy + Default> RingBuffer<T> {
     }
 
     /// Number of data points currently stored.
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.count
     }
 
     /// Whether the buffer is empty.
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.count == 0
     }

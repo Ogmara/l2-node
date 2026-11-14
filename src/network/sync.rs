@@ -70,9 +70,6 @@ pub struct SyncResponse {
     pub server_capped: bool,
 }
 
-/// Codec type alias for the sync protocol.
-pub type SyncCodec = libp2p::request_response::cbor::Behaviour<SyncRequest, SyncResponse>;
-
 /// Build a sync response from local storage for an incoming request.
 pub fn build_sync_response(request: SyncRequest, storage: &Storage) -> SyncResponse {
     let limit = request.limit.min(500) as usize;

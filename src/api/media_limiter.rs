@@ -377,6 +377,7 @@ impl PerIpSemaphore {
 
     /// Available global permits — equal to the Tokio semaphore's
     /// current free count.
+    #[cfg(test)]
     pub fn available_global(&self) -> usize {
         self.global.available_permits()
     }

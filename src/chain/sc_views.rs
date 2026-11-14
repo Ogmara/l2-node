@@ -625,32 +625,6 @@ pub async fn is_node_paused(
     Ok(matches!(resp.data.as_str(), "01"))
 }
 
-/// Returns the `block_timestamp` of the address's most recent
-/// successful `anchorState` call (unix seconds), or 0 if they have
-/// never anchored. Drives client-side staleness filtering (spec 13 §7
-/// — default cutoff 7 days).
-pub async fn get_node_last_anchor_at(
-    http: &reqwest::Client,
-    klever_node_url: &str,
-    contract_address: &str,
-    klv_address: &str,
-) -> Result<u64> {
-    let address_hex = encode_address_hex(klv_address)
-        .with_context(|| format!("invalid klv address: {}", klv_address))?;
-    let resp = vm_hex_call(
-        http,
-        klever_node_url,
-        contract_address,
-        "getNodeLastAnchorAt",
-        &[address_hex],
-    )
-    .await?;
-    if resp.is_require_failure() {
-        return Ok(0);
-    }
-    Ok(decode_u64_be(&resp.data))
-}
-
 /// Returns the published multiaddr list for `address`. Empty result
 /// means the operator has not published (the registration may still
 /// be active; this view answers `getNodeMetadata`, not "is registered").
@@ -831,6 +805,7 @@ pub struct ProposalSummary {
 /// The `MultiValue5<u64, u64, u64, bool, bool>` tally shape shared by
 /// `getProposalTally`/`getNodeProposalTally` — also exactly the trailing
 /// 5 fields of [`ProposalSummary`].
+#[allow(dead_code, reason = "governance tally views: tested against the SC wire shape, no node caller yet")]
 #[derive(Debug, Clone)]
 pub struct ProposalTally {
     pub vote_count: u64,
@@ -918,6 +893,7 @@ fn decode_proposal_summary(func_name: &str, items: &[Vec<u8>]) -> Result<Proposa
 }
 
 /// Decode a 5-item `MultiValue5<u64, u64, u64, bool, bool>` tally.
+#[allow(dead_code, reason = "governance tally views: tested against the SC wire shape, no node caller yet")]
 fn decode_proposal_tally(func_name: &str, items: &[Vec<u8>]) -> Result<ProposalTally> {
     if items.len() != 5 {
         anyhow::bail!(
@@ -1023,6 +999,7 @@ async fn get_proposal_count_generic(
 /// Shared tally fetch+decode. `Ok(None)` for a nonexistent proposal ID
 /// (the SC's `require!(!proposal(id).is_empty(), "Proposal not
 /// found")`) — a benign, expected case, not a transport error.
+#[allow(dead_code, reason = "governance tally views: tested against the SC wire shape, no node caller yet")]
 async fn get_proposal_tally_generic(
     http: &reqwest::Client,
     klever_node_url: &str,
@@ -1101,6 +1078,7 @@ pub async fn list_proposals(
     .await
 }
 
+#[allow(dead_code, reason = "governance tally views: tested against the SC wire shape, no node caller yet")]
 pub async fn get_proposal_tally(
     http: &reqwest::Client,
     klever_node_url: &str,
@@ -1117,6 +1095,7 @@ pub async fn get_proposal_tally(
     .await
 }
 
+#[allow(dead_code, reason = "governance tally views: tested against the SC wire shape, no node caller yet")]
 pub async fn get_user_vote(
     http: &reqwest::Client,
     klever_node_url: &str,
@@ -1169,6 +1148,7 @@ pub async fn list_node_proposals(
     .await
 }
 
+#[allow(dead_code, reason = "governance tally views: tested against the SC wire shape, no node caller yet")]
 pub async fn get_node_proposal_tally(
     http: &reqwest::Client,
     klever_node_url: &str,
@@ -1387,29 +1367,6 @@ fn ipv6_is_publicly_routable(ip: &std::net::Ipv6Addr) -> bool {
 // and doesn't round-trip to Klever RPC. They exist here as the on-chain
 // source-of-truth reads for reconciliation / verification tooling and
 // for SDK consumers who query the chain directly without running a node.
-
-/// Registration timestamp for a registered user, or `0` if not registered.
-pub async fn get_user_registered_at(
-    http: &reqwest::Client,
-    klever_node_url: &str,
-    contract_address: &str,
-    klv_address: &str,
-) -> Result<u64> {
-    let address_hex = encode_address_hex(klv_address)
-        .with_context(|| format!("invalid klv address: {}", klv_address))?;
-    let resp = vm_hex_call(
-        http,
-        klever_node_url,
-        contract_address,
-        "getUserRegisteredAt",
-        &[address_hex],
-    )
-    .await?;
-    if resp.is_require_failure() {
-        return Ok(0);
-    }
-    Ok(decode_u64_be(&resp.data))
-}
 
 /// Returns a channel's on-chain-verified creator address, or `None` if the
 /// channel does not exist on-chain (never created there, or `channel_id`

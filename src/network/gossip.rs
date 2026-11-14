@@ -46,6 +46,7 @@ pub fn dm_topic(network_id: &str, address: &str) -> String {
 }
 
 /// Build a news tag topic string.
+#[allow(dead_code, reason = "spec 01 per-tag news topic; the node does not publish to it yet")]
 pub fn news_tag_topic(network_id: &str, tag: &str) -> String {
     format!("/ogmara/{}/v1/news/tag/{}", network_id, tag)
 }
@@ -148,10 +149,9 @@ impl TopicManager {
     }
 
     /// Get the set of subscribed channel IDs — public AND private.
-    /// Prefer `subscribed_public_channels()` for anything that crosses a
-    /// trust boundary (gossip, REST, a sync request to an arbitrary
-    /// peer); this raw accessor exists for internal uses that are
-    /// genuinely type-agnostic (e.g. total-subscription counts).
+    /// Test-only: production code goes through `subscribed_public_channels()`
+    /// so nothing that crosses a trust boundary sees private channel IDs.
+    #[cfg(test)]
     pub fn subscribed_channels(&self) -> &HashSet<u64> {
         &self.subscribed_channels
     }
@@ -162,9 +162,8 @@ impl TopicManager {
     /// `sync_channels_with_peer`) after two separate private-channel-id
     /// leaks were found and fixed there — a caller forgetting to apply
     /// it is exactly how the next one would happen. Centralizing the
-    /// filter here makes "leaks the full list" opt-in (callers must
-    /// explicitly reach for the raw `subscribed_channels()` instead)
-    /// rather than opt-out.
+    /// filter here makes "leaks the full list" impossible to do by
+    /// accident: the raw `subscribed_channels()` accessor is test-only.
     pub fn subscribed_public_channels(&self) -> Vec<u64> {
         self.subscribed_channels
             .iter()

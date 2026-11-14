@@ -173,8 +173,6 @@ pub enum PresenceError {
     InvalidPeerId(String),
     #[error("peer_id is on the operator denylist")]
     Denylisted,
-    #[error("record peer_id does not match the originating gossip peer")]
-    PeerIdMismatch,
     #[error("peer_id does not embed an Ed25519 public key (libp2p inline-hash protobuf required)")]
     UnsupportedPeerIdHash,
     #[error("signature failed Ed25519 verification")]
@@ -404,6 +402,7 @@ impl PresenceCache {
     }
 
     /// Return the current number of cached records.
+    #[cfg(test)]
     pub async fn len(&self) -> usize {
         self.inner.read().await.len()
     }
@@ -674,14 +673,6 @@ impl PresenceManager {
 
     pub fn self_peer_id(&self) -> &str {
         &self.self_peer_id
-    }
-
-    pub fn public_url(&self) -> Option<&str> {
-        self.public_url.as_deref()
-    }
-
-    pub fn record_ttl_secs(&self) -> u64 {
-        self.record_ttl_secs
     }
 
     pub fn rebroadcast_interval_secs(&self) -> u64 {

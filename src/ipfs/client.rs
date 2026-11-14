@@ -100,8 +100,6 @@ async fn read_body_capped(
 pub struct IpfsClient {
     /// Base URL for the IPFS HTTP API (e.g., "http://127.0.0.1:5001").
     api_url: String,
-    /// Base URL for the IPFS gateway (e.g., "http://127.0.0.1:8080").
-    gateway_url: String,
     /// Maximum upload size in bytes.
     max_upload_bytes: u64,
     /// HTTP client.
@@ -121,10 +119,6 @@ pub struct IpfsClient {
 struct IpfsAddResponse {
     #[serde(rename = "Hash")]
     hash: String,
-    #[serde(rename = "Size")]
-    size: String,
-    #[serde(rename = "Name")]
-    name: String,
 }
 
 /// Result of a successful media upload.
@@ -136,8 +130,6 @@ pub struct UploadResult {
     pub size: u64,
     /// Detected MIME type.
     pub mime_type: String,
-    /// Original filename.
-    pub filename: Option<String>,
 }
 
 impl IpfsClient {
@@ -150,7 +142,6 @@ impl IpfsClient {
 
         Ok(Self {
             api_url: config.api_url.clone(),
-            gateway_url: config.gateway_url.clone(),
             max_upload_bytes: config.max_upload_size_mb * 1024 * 1024,
             http,
             available: Arc::new(AtomicBool::new(true)),
@@ -252,7 +243,7 @@ impl IpfsClient {
         let url = format!("{}/api/v0/add?pin=true&cid-version=1", self.api_url);
 
         let part = reqwest::multipart::Part::bytes(data)
-            .file_name(filename.clone().unwrap_or_else(|| "upload".to_string()));
+            .file_name(filename.unwrap_or_else(|| "upload".to_string()));
 
         let form = reqwest::multipart::Form::new().part("file", part);
 
@@ -273,7 +264,6 @@ impl IpfsClient {
             cid: resp.hash,
             size,
             mime_type: mime_type.to_string(),
-            filename,
         })
     }
 
@@ -711,12 +701,6 @@ impl IpfsClient {
         let num_objects = resp["NumObjects"].as_u64().unwrap_or(0);
 
         Ok((repo_size, num_objects))
-    }
-
-    /// Get the gateway URL for a CID (for serving to clients).
-    pub fn gateway_url_for(&self, cid: &str) -> Result<String> {
-        validate_cid(cid)?;
-        Ok(format!("{}/ipfs/{}", self.gateway_url, cid))
     }
 }
 

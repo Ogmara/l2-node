@@ -4995,8 +4995,8 @@ impl MessageRouter {
                     rmp_serde::from_slice::<ChannelPinMessagePayload>(&envelope.payload)
                 {
                     let pin_count = self.storage.get_pin_count(payload.channel_id)?;
-                    // If max 10 pins, FIFO — remove oldest if at limit
-                    if pin_count >= 10 {
+                    // At the per-channel cap, FIFO — remove the oldest pin
+                    if pin_count as usize >= validation::MAX_PINS_PER_CHANNEL {
                         let prefix = payload.channel_id.to_be_bytes();
                         if let Ok(entries) = self.storage.prefix_iter_cf(
                             schema::cf::CHANNEL_PINS,
@@ -5036,7 +5036,7 @@ impl MessageRouter {
                     if let Ok(entries) = self.storage.prefix_iter_cf(
                         schema::cf::CHANNEL_PINS,
                         &prefix,
-                        10,
+                        validation::MAX_PINS_PER_CHANNEL,
                     ) {
                         for (key, _) in entries {
                             if key.len() >= 44 {
@@ -7886,7 +7886,7 @@ mod channel_create_encryption_merge_tests {
     }
 
     #[test]
-    fn skeleton_then_real_create_by_the_SAME_creator_merges_encryption_enabled() {
+    fn skeleton_then_real_create_by_the_same_creator_merges_encryption_enabled() {
         let (r, _d) = router();
         let sk = crypto::generate_keypair();
         let creator = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
@@ -7917,7 +7917,7 @@ mod channel_create_encryption_merge_tests {
     }
 
     #[test]
-    fn real_create_arriving_FIRST_then_a_late_chain_scan_does_not_clobber_encryption_enabled() {
+    fn real_create_arriving_first_then_a_late_chain_scan_does_not_clobber_encryption_enabled() {
         // The reverse ordering: the L2 envelope wins the race and creates the
         // full record correctly; a LATER chain-scan of the same on-chain
         // event must not downgrade it back to unencrypted.

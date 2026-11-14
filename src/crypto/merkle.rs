@@ -13,32 +13,11 @@
 
 use sha2::{Digest, Sha256};
 
-/// A node in the Merkle tree.
-#[derive(Debug, Clone)]
-enum MerkleNode {
-    /// Leaf node containing a SHA-256 hash of data.
-    Leaf([u8; 32]),
-    /// Internal node with left and right children.
-    Internal {
-        hash: [u8; 32],
-        left: Box<MerkleNode>,
-        right: Box<MerkleNode>,
-    },
-    /// Empty placeholder for sparse tree positions.
-    Empty,
-}
-
-impl MerkleNode {
-    fn hash(&self) -> [u8; 32] {
-        match self {
-            MerkleNode::Leaf(h) => *h,
-            MerkleNode::Internal { hash, .. } => *hash,
-            MerkleNode::Empty => [0u8; 32],
-        }
-    }
-}
-
 /// A Merkle proof path for verifying inclusion of a leaf.
+///
+/// Spec 03 lists per-message inclusion proofs as a node capability; no API
+/// serves them yet, so the proof builder/verifier is exercised by tests only.
+#[allow(dead_code, reason = "spec 03 inclusion proofs, not yet served by any endpoint")]
 #[derive(Debug, Clone)]
 pub struct MerkleProof {
     /// Leaf hash being proven.
@@ -49,6 +28,7 @@ pub struct MerkleProof {
     pub root: [u8; 32],
 }
 
+#[allow(dead_code, reason = "spec 03 inclusion proofs, not yet served by any endpoint")]
 impl MerkleProof {
     /// Verify the proof by recomputing the root from the leaf.
     pub fn verify(&self) -> bool {
@@ -67,6 +47,7 @@ impl MerkleProof {
 }
 
 /// Compute SHA-256 hash of data.
+#[cfg(test)]
 pub fn sha256(data: &[u8]) -> [u8; 32] {
     Sha256::digest(data).into()
 }
@@ -177,6 +158,7 @@ pub fn compute_root(leaves: &[[u8; 32]]) -> [u8; 32] {
 /// Build a Merkle proof for a leaf at the given index.
 ///
 /// Returns None if the index is out of range.
+#[allow(dead_code, reason = "spec 03 inclusion proofs, not yet served by any endpoint")]
 pub fn build_proof(leaves: &[[u8; 32]], index: usize) -> Option<MerkleProof> {
     if index >= leaves.len() || leaves.is_empty() {
         return None;
@@ -320,20 +302,6 @@ impl StateManager {
         hasher.update((self.channel_member_hashes.len() as u64).to_be_bytes());
         hasher.update(channel_members_root);
         hasher.finalize().into()
-    }
-
-    /// Get counts for the state anchor event.
-    pub fn counts(&self) -> (u64, u32, u32) {
-        // (message_count is tracked separately, not in hashes)
-        (0, self.channel_hashes.len() as u32, self.user_hashes.len() as u32)
-    }
-
-    /// Reset the state manager for a fresh computation.
-    pub fn reset(&mut self) {
-        self.user_hashes.clear();
-        self.channel_hashes.clear();
-        self.delegation_hashes.clear();
-        self.channel_member_hashes.clear();
     }
 }
 

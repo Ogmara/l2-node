@@ -264,8 +264,6 @@ impl CounterSnapshot {
                 as f64 / elapsed_secs,
             messages_relayed_per_sec: (self.messages_relayed.saturating_sub(prev.messages_relayed))
                 as f64 / elapsed_secs,
-            messages_stored_per_sec: (self.messages_stored.saturating_sub(prev.messages_stored))
-                as f64 / elapsed_secs,
         }
     }
 }
@@ -277,5 +275,4 @@ pub struct CounterRates {
     pub bytes_out_per_sec: f64,
     pub messages_received_per_sec: f64,
     pub messages_relayed_per_sec: f64,
-    pub messages_stored_per_sec: f64,
 }

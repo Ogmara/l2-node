@@ -2621,18 +2621,6 @@ impl Storage {
         }
     }
 
-    fn set_follower_counts(
-        &self,
-        address: &str,
-        following: u64,
-        followers: u64,
-    ) -> Result<()> {
-        let mut bytes = Vec::with_capacity(16);
-        bytes.extend_from_slice(&following.to_be_bytes());
-        bytes.extend_from_slice(&followers.to_be_bytes());
-        self.put_cf(cf::FOLLOWER_COUNTS, address.as_bytes(), &bytes)
-    }
-
     /// Get list of addresses that `address` follows.
     pub fn get_following(&self, address: &str, limit: usize) -> Result<Vec<String>> {
         let mut prefix = Vec::with_capacity(address.len() + 1);
@@ -2904,7 +2892,9 @@ impl Storage {
     /// Get pinned message count for a channel.
     pub fn get_pin_count(&self, channel_id: u64) -> Result<u32> {
         let prefix = channel_id.to_be_bytes();
-        let entries = self.prefix_iter_cf(cf::CHANNEL_PINS, &prefix, 11)?;
+        // Cap + 1 so the router's FIFO check can still see "at the cap".
+        let limit = crate::messages::validation::MAX_PINS_PER_CHANNEL + 1;
+        let entries = self.prefix_iter_cf(cf::CHANNEL_PINS, &prefix, limit)?;
         Ok(entries.len() as u32)
     }
 
@@ -4756,6 +4746,7 @@ impl Storage {
     }
 
     /// The stored LWW timestamp for a user's key-vault blob (`0` if none / legacy).
+    #[cfg(test)]
     pub fn get_key_vault_ts(&self, wallet_address: &str) -> Result<u64> {
         Ok(self
             .get_cf(cf::KEY_VAULT, wallet_address.as_bytes())?
@@ -4941,34 +4932,6 @@ impl Storage {
             })
             .take(limit)
             .collect())
-    }
-
-    /// Delete notifications older than a given timestamp (for 30-day TTL cleanup).
-    ///
-    /// Returns the number of deleted notifications.
-    pub fn cleanup_old_notifications(&self, address: &str, older_than: u64) -> Result<u64> {
-        let mut prefix = Vec::with_capacity(address.len() + 1);
-        prefix.extend_from_slice(address.as_bytes());
-        prefix.push(0xFF);
-
-        let entries = self.prefix_iter_cf(cf::NOTIFICATIONS, &prefix, 10_000)?;
-        let mut deleted = 0u64;
-
-        for (key, _) in &entries {
-            let ts_start = prefix.len();
-            if key.len() < ts_start + 8 + 32 {
-                continue;
-            }
-            let neg_ts = u64::from_be_bytes(key[ts_start..ts_start + 8].try_into().unwrap_or([0; 8]));
-            let timestamp = !neg_ts;
-
-            if timestamp < older_than {
-                self.delete_cf(cf::NOTIFICATIONS, key)?;
-                deleted += 1;
-            }
-        }
-
-        Ok(deleted)
     }
 
     // --- Anchor Verification ---
@@ -5444,43 +5407,6 @@ impl Storage {
         use super::schema;
         let key = schema::encode_channel_key(key_scope, target, author, device_id_hex, epoch);
         self.get_cf(cf::CHANNEL_KEYS, &key)
-    }
-
-    /// Store anchor node info for a remote private channel.
-    pub fn store_private_channel_anchor(
-        &self,
-        channel_id: u64,
-        anchor_data: &[u8],
-    ) -> Result<()> {
-        use super::schema;
-        let key = schema::encode_private_channel_anchor_key(channel_id);
-        self.put_cf(cf::PRIVATE_CHANNEL_ANCHORS, &key, anchor_data)
-    }
-
-    /// Get the anchor node info for a private channel.
-    pub fn get_private_channel_anchor(&self, channel_id: u64) -> Result<Option<Vec<u8>>> {
-        use super::schema;
-        let key = schema::encode_private_channel_anchor_key(channel_id);
-        self.get_cf(cf::PRIVATE_CHANNEL_ANCHORS, &key)
-    }
-
-    /// Check if this node is the anchor for a given private channel.
-    ///
-    /// A channel is locally anchored if it exists in the CHANNELS CF with type Private
-    /// and there is no entry in PRIVATE_CHANNEL_ANCHORS (which stores remote anchors).
-    pub fn is_local_anchor(&self, channel_id: u64) -> Result<bool> {
-        use super::schema;
-        let key = channel_id.to_be_bytes();
-        if let Some(meta_bytes) = self.get_cf(cf::CHANNELS, &key)? {
-            let meta: serde_json::Value = serde_json::from_slice(&meta_bytes)
-                .context("deserializing channel metadata")?;
-            if meta.get("channel_type").and_then(|v| v.as_u64()) == Some(2) {
-                // It's a private channel and we have its metadata — we're the anchor
-                let anchor_key = schema::encode_private_channel_anchor_key(channel_id);
-                return Ok(!self.exists_cf(cf::PRIVATE_CHANNEL_ANCHORS, &anchor_key)?);
-            }
-        }
-        Ok(false)
     }
 
     /// List all devices registered to a wallet address.

@@ -78,13 +78,6 @@ pub const BOOTSTRAP_SC_REFRESH_INTERVAL: Duration = Duration::from_secs(3600);
 /// book can hold.
 pub const MAX_SC_DISCOVERY_TOTAL: usize = 256;
 
-/// Filter cutoff for `lastAnchorAt` when no operator config is supplied —
-/// addresses that haven't anchored within this window are skipped.
-/// Matches spec 13 §7 default. Production callers should always pass
-/// `[network.discovery] max_peer_staleness_days` through to
-/// `ScDiscovery::new` so operators can tune it.
-pub const DEFAULT_PEER_STALENESS_THRESHOLD: Duration = Duration::from_secs(7 * 24 * 3600);
-
 /// Page size for `getActiveNodes` — must match the SC's
 /// `GET_ACTIVE_NODES_MAX_LIMIT = 64`.
 const PAGE_SIZE: u32 = 64;

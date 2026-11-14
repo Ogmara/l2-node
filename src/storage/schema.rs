@@ -282,8 +282,10 @@ pub mod cf {
     /// (channel_id:8, epoch:8) → KeyDistribution JSON (member_keys map)
     /// Encrypted group key material per epoch, stored on the anchor node.
     pub const PRIVATE_CHANNEL_KEYS: &str = "private_channel_keys";
-    /// channel_id:8 → AnchorRecord JSON (anchor_url, channel_id, creator)
-    /// Maps private channels to their anchor node URL (for remote private channels).
+    /// DEAD — leftover of the never-built anchor-node design (spec 03).
+    /// Nothing reads or writes it; it stays declared only because RocksDB
+    /// refuses to open a database whose existing column families aren't
+    /// all listed.
     pub const PRIVATE_CHANNEL_ANCHORS: &str = "private_channel_anchors";
 
     /// (key_scope:32, target_wallet, 0xFF, device_id_hex, epoch_be8)
@@ -1377,11 +1379,6 @@ pub fn encode_private_channel_key(channel_id: u64, epoch: u64) -> Vec<u8> {
     key.extend_from_slice(&channel_id.to_be_bytes());
     key.extend_from_slice(&epoch.to_be_bytes());
     key
-}
-
-/// Encode a private channel anchor key: channel_id (8 bytes BE).
-pub fn encode_private_channel_anchor_key(channel_id: u64) -> Vec<u8> {
-    channel_id.to_be_bytes().to_vec()
 }
 
 /// Encode a `channel_keys` CF key:

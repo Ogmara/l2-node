@@ -5,6 +5,52 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.145.0] - 2026-11-14
+
+### Security
+
+- **libp2p-gossipsub 0.50.0 → 0.50.1** (RUSTSEC-2026-0534, runtime): a peer
+  could grow the gossipsub backoff table without bound by sending PRUNE
+  messages for topics the node never joined. Reachable by any mesh peer.
+- **quinn-udp 0.5.14 → 0.5.16** (RUSTSEC-2026-0538, runtime): the QUIC
+  receive loop could spin on a truncated datagram.
+- **rustix 1.1.4 → 1.1.6** (RUSTSEC-2026-0486, unsound xattr helpers,
+  transitive). All three are lockfile-only, semver-compatible
+  updates; `cargo audit` reports 0 vulnerabilities. The remaining
+  unmaintained/yanked notices (`core2`, `paste`, `pin-utils`, `spin`) are
+  transitive and have no replacement upstream yet.
+
+### Changed
+
+- The node now builds with **zero compiler warnings** (previously ~60, nearly
+  all dead code). Unused code was removed; code that is deliberately staged
+  ahead of its wiring is now marked with an explicit `allow(dead_code,
+  reason = …)`: the SOCKS5 Tor dialer (onion Phase 2), Merkle inclusion
+  proofs (spec 03), the governance tally SC views, the spec'd per-tag news
+  topic and the `reply`/`dm` notification types. Helpers only tests use are
+  now `#[cfg(test)]`.
+- The channel pin cap uses `MAX_PINS_PER_CHANNEL` instead of literal `10`/`11`
+  in the router and `Storage::get_pin_count` (behavior unchanged, spec 07
+  "max 10").
+- The reconcile protocol name is built by `reconcile::protocol_string` in one
+  place instead of being duplicated in the swarm setup (same string).
+- Snapshot bootstrap logs how many anchors were checked once the anchor
+  verifies against Klever.
+- `[ipfs] gateway_url` is documented as currently unused (media is fetched
+  through `api_url`); the key is still accepted so existing configs load.
+
+### Removed
+
+- Dead code with no callers: `Storage::cleanup_old_notifications` (the
+  retention reaper replaced it), the private-channel-anchor accessors (the
+  `private_channel_anchors` column family stays declared so existing
+  databases open), `set_follower_counts`, `NetworkService::publish`,
+  `IpfsClient::gateway_url_for`, the `getNodeLastAnchorAt` /
+  `getUserRegisteredAt` view wrappers, `PresenceError::PeerIdMismatch`,
+  unused WebSocket server frame variants, the unused Merkle tree node type,
+  and SC event fields that were parsed but never read (including a
+  `ChannelCreated.channel_id` that was always a placeholder `0`).
+
 ## [0.144.0] - 2026-11-11
 
 ### Security

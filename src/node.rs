@@ -91,12 +91,9 @@ fn plan_notification_reap(
 /// Notification retention reaper (audit final pre-mainnet W31, l2-node
 /// 0.104.0+): sweeps `NOTIFICATIONS` for rows older than
 /// `[notifications] retention_days`, deleting them. Before this,
-/// `Storage::cleanup_old_notifications` (still present, unused — kept as
-/// a possible building block for a future self-service "clear my
-/// notifications" endpoint, a genuinely different per-address shape than
-/// this whole-CF sweep needs) had zero callers, and nothing ever
-/// enforced the "30-day TTL" the schema comment has long documented as
-/// policy.
+/// nothing ever enforced the "30-day TTL" the schema comment has long
+/// documented as policy (the old per-address `cleanup_old_notifications`
+/// helper had zero callers and was removed in 0.145.0).
 ///
 /// Batch-capped (mirrors the DM retention reaper, W11) with a persisted
 /// cursor so a large post-upgrade backlog drains incrementally across

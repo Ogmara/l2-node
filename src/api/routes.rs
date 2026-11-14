@@ -1495,7 +1495,6 @@ pub async fn network_bootstrap_candidates(
     async fn cache_and_respond(
         state: &Arc<AppState>,
         payload: serde_json::Value,
-        now_unix: u64,
         ttl_for_freshness: std::time::Duration,
         max_age_header: String,
     ) -> axum::response::Response {
@@ -1512,7 +1511,6 @@ pub async fn network_bootstrap_candidates(
             generated_at: std::time::Instant::now()
                 .checked_sub(backdate)
                 .unwrap_or_else(std::time::Instant::now),
-            generated_at_unix: now_unix,
         });
         drop(write);
         (
@@ -1591,7 +1589,7 @@ pub async fn network_bootstrap_candidates(
     if let Some(note) = sc_failure_note {
         payload["source_note"] = serde_json::Value::String(note);
     }
-    cache_and_respond(&state, payload, now_unix, ttl, max_age_header).await
+    cache_and_respond(&state, payload, ttl, max_age_header).await
 }
 
 /// Internal candidate type carried through the merge pipeline. Built

@@ -247,11 +247,6 @@ impl PowManager {
             debug!(evicted, remaining = self.pending.len(), "Cleaned up expired PoW challenges");
         }
     }
-
-    /// Whether PoW is enabled in config.
-    pub fn is_enabled(&self) -> bool {
-        self.config.enabled
-    }
 }
 
 /// Check if a hash has at least `n` leading zero bits.

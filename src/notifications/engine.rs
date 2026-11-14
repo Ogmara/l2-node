@@ -48,7 +48,10 @@ pub struct Notification {
 #[serde(rename_all = "snake_case")]
 pub enum NotificationType {
     Mention,
+    /// Spec'd notification types the engine does not generate yet.
+    #[allow(dead_code, reason = "reply notifications not generated yet")]
     Reply,
+    #[allow(dead_code, reason = "DM notifications not generated yet")]
     Dm,
     /// Someone (channel creator or moderator) invited this wallet to a
     /// channel. The only notification type NOT gated on the recipient being
@@ -1807,7 +1810,7 @@ mod channel_bots_cache_tests {
     }
 
     #[tokio::test]
-    async fn a_descriptor_change_does_NOT_flush_the_cache() {
+    async fn a_descriptor_change_does_not_flush_the_cache() {
         // Deliberate: the cache holds addresses, not commands, so a descriptor
         // change needs no eviction — and a flush reachable over gossip from any
         // wallet on any node would be a remotely-triggerable off-switch for the

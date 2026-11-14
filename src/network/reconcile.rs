@@ -101,8 +101,8 @@ use crate::storage::schema;
 pub type ReconcileCodec =
     libp2p::request_response::cbor::Behaviour<ReconcileRequest, ReconcileResponse>;
 
-/// Protocol-string builder. Mirrors the existing pattern from
-/// [`crate::network::sync`] and [`crate::network::snapshot`].
+/// Protocol-string builder — the single source for the reconcile
+/// protocol name registered in `network::behaviour`.
 pub fn protocol_string(network_id: &str) -> String {
     format!("/ogmara/{}/channel-reconcile/1.0.0", network_id)
 }
@@ -1163,8 +1163,7 @@ pub(crate) fn channel_edit_delete_envelopes_metered(
 /// normal scan, but `CHANNEL_MSGS` will be empty for them anyway so
 /// the response is empty regardless.
 ///
-/// Mirrors `crate::messages::router::is_private_channel_meta` and
-/// the inline check at `crate::storage::rocks::Storage::is_local_anchor`.
+/// Mirrors `crate::messages::router::is_private_channel_meta`.
 ///
 /// `pub(crate)` (not private) so `NetworkService::maybe_trigger_backfill`
 /// can skip triggering reconciliation for a known-private channel at all

@@ -258,10 +258,7 @@ pub fn build_swarm(config: &Config, keypair: Keypair) -> Result<Swarm<OgmaraBeha
     // `snapshot`. Inbound is gated on `[backfill] enabled` so
     // operators who disabled backfill don't serve requests; outbound
     // stays available regardless.
-    let reconcile_protocol = format!(
-        "/ogmara/{}/channel-reconcile/1.0.0",
-        config.network_id()
-    );
+    let reconcile_protocol = super::reconcile::protocol_string(config.network_id());
     let reconcile_support = if config.backfill.enabled {
         libp2p::request_response::ProtocolSupport::Full
     } else {

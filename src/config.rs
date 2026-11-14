@@ -1654,7 +1654,8 @@ pub struct IpfsConfig {
     /// IPFS HTTP API URL.
     #[serde(default = "default_ipfs_api")]
     pub api_url: String,
-    /// IPFS gateway URL.
+    /// IPFS gateway URL. Currently unused: the node serves media by
+    /// fetching through `api_url`. Still accepted so existing configs load.
     #[serde(default = "default_ipfs_gateway")]
     pub gateway_url: String,
     /// Max upload size in MB.
@@ -3941,7 +3942,7 @@ start_block = 0
 
 [ipfs]
 api_url = "http://127.0.0.1:5001"
-gateway_url = "http://127.0.0.1:8080"
+gateway_url = "http://127.0.0.1:8080"  # currently unused; media is fetched via api_url
 max_upload_size_mb = 50
 auto_thumbnail = true
 # Media handler tuning (v0.39+). All optional with sensible defaults

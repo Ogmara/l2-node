@@ -1286,7 +1286,11 @@ pub enum DeserializedPayload {
     KeyVaultSync(KeyVaultSyncPayload),
     Follow(FollowPayload),
     Unfollow(UnfollowPayload),
+    // Decoded only so malformed payloads are rejected; the router
+    // re-reads these types itself and never inspects the decoded value.
+    #[allow(dead_code, reason = "decoded for well-formedness only")]
     DeviceEncBinding(DeviceEncBindingPayload),
+    #[allow(dead_code, reason = "decoded for well-formedness only")]
     DeviceEncRevoke(DeviceEncRevokePayload),
     Report(ReportPayload),
     CounterVote(CounterVotePayload),
@@ -1295,6 +1299,8 @@ pub enum DeserializedPayload {
     DeletionRequest(DeletionRequestPayload),
     PrivateChannelKeyDistribution(PrivateChannelKeyDistributionPayload),
     ChannelKeyEnvelope(ChannelKeyEnvelopePayload),
+    #[allow(dead_code, reason = "decoded for well-formedness only")]
     NodeAnnouncement(NodeAnnouncementPayload),
+    #[allow(dead_code, reason = "opaque payload, never inspected")]
     Raw(Vec<u8>),
 }

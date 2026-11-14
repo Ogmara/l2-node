@@ -525,10 +525,9 @@ pub struct CachedRegistrationInfo {
 
 /// Cached bootstrap-candidates response (spec 13 §4.5).
 ///
-/// Wraps the rendered JSON and the wall-clock generation timestamp.
-/// TTL check in the handler uses tokio's monotonic `Instant` for
-/// drift-immunity; the `generated_at_unix` field is the body's own
-/// timestamp so consumers can compute cache-age.
+/// Wraps the rendered JSON (which carries its own `generated_at` unix
+/// timestamp so consumers can compute cache-age). The TTL check in the
+/// handler uses the monotonic `Instant` for drift-immunity.
 #[derive(Clone)]
 pub struct CachedBootstrapCandidates {
     /// Body of the cached response — already rendered. Cloned on
@@ -536,8 +535,6 @@ pub struct CachedBootstrapCandidates {
     pub payload: serde_json::Value,
     /// `Instant` at generation — used for TTL comparison.
     pub generated_at: Instant,
-    /// Unix-seconds at generation — embedded in `payload.generated_at`.
-    pub generated_at_unix: u64,
 }
 
 impl AppState {
@@ -548,6 +545,7 @@ impl AppState {
     /// process-local to the returned AppState — writers (StateAnchorer,
     /// not constructed by this fn) won't share them, so the dashboard
     /// will always read 0. Fine for tests; do not use in production.
+    #[cfg(test)]
     pub fn new(
         storage: Storage,
         router: MessageRouter,
@@ -819,10 +817,6 @@ impl AppState {
 
     pub fn peer_count(&self) -> u32 {
         self.peers.load(Ordering::Relaxed)
-    }
-
-    pub fn set_peer_count(&self, count: u32) {
-        self.peers.store(count, Ordering::Relaxed);
     }
 }
 

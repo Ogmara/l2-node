@@ -345,11 +345,6 @@ impl AlertEngine {
         }
     }
 
-    /// Get a shared handle to the alert history (for dashboard API).
-    pub fn history_handle(&self) -> SharedAlertHistory {
-        self.history.clone()
-    }
-
     /// Set an externally created shared history (for sharing with AppState).
     pub fn set_history(&mut self, history: SharedAlertHistory) {
         self.history = history;

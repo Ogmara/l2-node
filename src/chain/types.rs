@@ -19,8 +19,9 @@ pub enum ScEvent {
         address: String,
         public_key: String,
     },
+    /// The SC assigns the channel_id; the call data doesn't carry it, so
+    /// the scanner resolves it from the slug via `getChannelBySlug`.
     ChannelCreated {
-        channel_id: u64,
         creator: String,
         slug: String,
         channel_type: u8,
@@ -28,7 +29,6 @@ pub enum ScEvent {
     },
     ChannelTransferred {
         channel_id: u64,
-        from: String,
         to: String,
     },
     DeviceDelegated {
@@ -41,7 +41,6 @@ pub enum ScEvent {
     DeviceRevoked {
         user: String,
         device_key: String,
-        timestamp: u64,
     },
     StateAnchored {
         block_height: u64,
@@ -64,8 +63,6 @@ pub enum ScEvent {
         amount: u64,
         msg_id: String,
         channel_id: u64,
-        note: String,
-        timestamp: u64,
     },
 }
 
@@ -261,9 +258,6 @@ pub struct KleverTransaction {
 /// A contract call entry within a Klever transaction.
 #[derive(Debug, Clone, Deserialize)]
 pub struct KleverContractCall {
-    /// Transaction type (63 = SmartContract).
-    #[serde(default, rename = "type")]
-    pub tx_type: u32,
     #[serde(default)]
     pub parameter: KleverContractParam,
 }
@@ -274,7 +268,4 @@ pub struct KleverContractParam {
     /// Target contract address (klv1...).
     #[serde(default)]
     pub address: String,
-    /// "SCDeploy", "SCInvoke", etc.
-    #[serde(default, rename = "type")]
-    pub call_type: String,
 }

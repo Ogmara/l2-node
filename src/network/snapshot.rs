@@ -373,7 +373,7 @@ pub enum SnapshotErrorCode {
     UnsupportedVersion = 0x05,
 }
 
-/// Codec type alias for the snapshot protocol — mirrors `SyncCodec`.
+/// Codec type alias for the snapshot protocol.
 pub type SnapshotCodec = libp2p::request_response::cbor::Behaviour<SnapshotRequest, SnapshotResponse>;
 
 // --- Cache --------------------------------------------------------------

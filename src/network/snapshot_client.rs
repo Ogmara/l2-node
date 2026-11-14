@@ -1238,6 +1238,12 @@ pub async fn run_bootstrap(
             );
             return Ok(None);
         }
+        info!(
+            cutoff_height = anchor_result.cutoff_height,
+            checked = anchor_result.checked,
+            total = anchor_result.total,
+            "Snapshot anchor verified against Klever"
+        );
 
         anchor_result.cutoff_height
     };

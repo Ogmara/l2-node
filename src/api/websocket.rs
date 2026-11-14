@@ -140,9 +140,6 @@ enum WsClientMessage {
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
 enum WsServerMessage {
-    Message { envelope: serde_json::Value },
-    Dm { envelope: serde_json::Value },
-    Notification { mention: serde_json::Value },
     Error { code: u16, message: String },
 }
 

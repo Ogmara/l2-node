@@ -862,7 +862,6 @@ impl ChainScanner {
             }
 
             ScEvent::ChannelCreated {
-                channel_id: _,
                 creator,
                 slug,
                 channel_type,
@@ -1075,7 +1074,6 @@ impl ChainScanner {
 
             ScEvent::ChannelTransferred {
                 channel_id,
-                from: _,
                 to,
             } => {
                 if let Some(existing) =
@@ -1204,11 +1202,7 @@ impl ChainScanner {
                 info!(user = %user, "Device delegated (on-chain)");
             }
 
-            ScEvent::DeviceRevoked {
-                user,
-                device_key,
-                timestamp: _,
-            } => {
+            ScEvent::DeviceRevoked { user, device_key } => {
                 let key = crate::storage::schema::encode_delegation_key(&user, &device_key);
                 if let Some(existing) = self.storage.get_cf(cf::DELEGATIONS, &key)? {
                     let mut record: DelegationRecord = serde_json::from_slice(&existing)?;
@@ -1258,12 +1252,18 @@ impl ChainScanner {
             }
 
             ScEvent::TipSent {
-                sender, recipient, amount, ..
+                sender,
+                recipient,
+                amount,
+                msg_id,
+                channel_id,
             } => {
                 debug!(
                     sender = %sender,
                     recipient = %recipient,
                     amount,
+                    msg_id = %msg_id,
+                    channel_id,
                     "Tip sent (on-chain)"
                 );
                 // Tip notifications are handled by the notification engine

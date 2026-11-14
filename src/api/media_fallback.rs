@@ -103,9 +103,6 @@ pub struct CandidateSnapshot {
     /// Instant at refresh — TTL is measured against this. `Instant`
     /// (monotonic) avoids wall-clock-drift bugs at TTL boundaries.
     pub generated_at: Instant,
-    /// Unix-seconds at refresh, for human-readable freshness on any
-    /// debug surface.
-    pub generated_at_unix: u64,
     /// Resolved candidates: each has the klv1 address (for
     /// diagnostic logging), the api_endpoint we will dial, and the
     /// classified transport (so callers can skip onion entries
@@ -507,7 +504,6 @@ async fn ensure_snapshot(
     let mut write = state.candidates.write().await;
     *write = Some(CandidateSnapshot {
         generated_at: Instant::now(),
-        generated_at_unix: now_unix,
         entries: entries.clone(),
     });
     entries

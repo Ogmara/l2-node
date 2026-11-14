@@ -24,11 +24,11 @@ pub fn parse_sc_call(call_data: &str, sender: &str, timestamp: u64) -> Option<Sc
         "register" => parse_register(args, sender, timestamp),
         "updatePublicKey" => parse_update_public_key(args, sender),
         "createChannel" => parse_create_channel(args, sender, timestamp),
-        "transferChannel" => parse_transfer_channel(args, sender),
+        "transferChannel" => parse_transfer_channel(args),
         "delegateDevice" => parse_delegate_device(args, sender, timestamp),
-        "revokeDevice" => parse_revoke_device(args, sender, timestamp),
+        "revokeDevice" => parse_revoke_device(args, sender),
         "anchorState" => parse_anchor_state(args, sender, timestamp),
-        "tip" => parse_tip(args, sender, timestamp),
+        "tip" => parse_tip(args, sender),
         // init, upgrade, admin endpoints — not events we need to track
         _ => None,
     }
@@ -71,16 +71,9 @@ fn parse_create_channel(args: &[&str], sender: &str, timestamp: u64) -> Option<S
     let slug = decode_hex_string(args[0])?;
     let channel_type = decode_hex_u8(args[1])?;
 
-    // We don't know the channel_id from the call alone — it's assigned by the SC.
-    // We can query it from the SC view endpoint, or derive it from the next_channel_id
-    // counter at the time. For now, we query the SC to get the actual channel_id.
-    // Since we can't do async here, we'll store with a placeholder and resolve later,
-    // or we can look at the return data.
-    //
-    // Simpler approach: query getChannelBySlug after seeing a createChannel call.
-    // For now, emit with channel_id=0 — the scanner's handle_event can resolve it.
+    // The channel_id is assigned by the SC and not part of the call data;
+    // the scanner's handle_event resolves it via getChannelBySlug.
     Some(ScEvent::ChannelCreated {
-        channel_id: 0, // resolved by scanner via SC view query
         creator: sender.to_string(),
         slug,
         channel_type,
@@ -88,7 +81,7 @@ fn parse_create_channel(args: &[&str], sender: &str, timestamp: u64) -> Option<S
     })
 }
 
-fn parse_transfer_channel(args: &[&str], _sender: &str) -> Option<ScEvent> {
+fn parse_transfer_channel(args: &[&str]) -> Option<ScEvent> {
     // transferChannel(channel_id: u64, new_owner: Address)
     if args.len() < 2 {
         return None;
@@ -97,7 +90,6 @@ fn parse_transfer_channel(args: &[&str], _sender: &str) -> Option<ScEvent> {
     let new_owner = decode_hex_address(args[1])?;
     Some(ScEvent::ChannelTransferred {
         channel_id,
-        from: _sender.to_string(),
         to: new_owner,
     })
 }
@@ -119,7 +111,7 @@ fn parse_delegate_device(args: &[&str], sender: &str, timestamp: u64) -> Option<
     })
 }
 
-fn parse_revoke_device(args: &[&str], sender: &str, timestamp: u64) -> Option<ScEvent> {
+fn parse_revoke_device(args: &[&str], sender: &str) -> Option<ScEvent> {
     // revokeDevice(device_pub_key: hex64)
     if args.is_empty() {
         return None;
@@ -128,7 +120,6 @@ fn parse_revoke_device(args: &[&str], sender: &str, timestamp: u64) -> Option<Sc
     Some(ScEvent::DeviceRevoked {
         user: sender.to_string(),
         device_key,
-        timestamp,
     })
 }
 
@@ -172,7 +163,7 @@ fn parse_anchor_state(args: &[&str], sender: &str, timestamp: u64) -> Option<ScE
     })
 }
 
-fn parse_tip(args: &[&str], sender: &str, timestamp: u64) -> Option<ScEvent> {
+fn parse_tip(args: &[&str], sender: &str) -> Option<ScEvent> {
     // tip(recipient: Address, msg_id: String, channel_id: u64, note: String)
     if args.len() < 4 {
         return None;
@@ -183,8 +174,6 @@ fn parse_tip(args: &[&str], sender: &str, timestamp: u64) -> Option<ScEvent> {
         amount: 0, // Amount comes from the KLV payment, not an argument
         msg_id: decode_hex_string(args[1])?,
         channel_id: decode_hex_u64(args[2])?,
-        note: decode_hex_string(args[3]).unwrap_or_default(),
-        timestamp,
     })
 }
 

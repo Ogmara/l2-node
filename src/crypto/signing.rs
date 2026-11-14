@@ -121,6 +121,7 @@ pub fn sign_tx_hash(signing_key: &SigningKey, tx_hash: &[u8; 32]) -> Signature {
 }
 
 /// Verify a transaction hash signature.
+#[cfg(test)]
 pub fn verify_tx_hash(
     verifying_key: &VerifyingKey,
     tx_hash: &[u8; 32],
@@ -154,7 +155,9 @@ pub fn build_auth_string(
     format!("ogmara-auth:{network}:{node_id}:{nonce}:{timestamp}:{method}:{path}")
 }
 
-/// Sign an auth header using Klever message format.
+/// Sign an auth header using Klever message format (clients do this;
+/// the node only verifies, so this is the tests' counterpart).
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub fn sign_auth_header(
     signing_key: &SigningKey,

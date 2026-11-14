@@ -202,6 +202,7 @@ impl IdentityResolver {
     }
 
     /// Number of cached entries (for diagnostics).
+    #[cfg(test)]
     pub fn cache_size(&self) -> usize {
         self.cache.len()
     }

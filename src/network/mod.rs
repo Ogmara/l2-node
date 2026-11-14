@@ -22,6 +22,10 @@ pub mod sc_discovery;
 pub mod snapshot;
 pub mod snapshot_client;
 pub mod sync;
+// SOCKS5 dialer shipped ahead of its libp2p transport wiring (onion
+// Phase 2, spec 13 §6.4) so the security boundary could be audited on its
+// own; only its tests use it until that integration lands.
+#[allow(dead_code, reason = "onion Phase 2 transport not wired yet")]
 pub mod tor;
 
 use std::collections::{HashMap, HashSet};
@@ -2859,21 +2863,6 @@ impl NetworkService {
             self.identity_sync_triggered_remove(&wallet);
             self.maybe_trigger_identity_sync(wallet, identity_sync::SCOPE_ALL);
         }
-    }
-
-    /// Publish a raw message to a GossipSub topic.
-    pub fn publish(
-        &mut self,
-        topic: &str,
-        data: Vec<u8>,
-    ) -> Result<()> {
-        let topic_hash = gossip::topic_hash(topic);
-        self.swarm
-            .behaviour_mut()
-            .gossipsub
-            .publish(topic_hash, data)
-            .map_err(|e| anyhow::anyhow!("publish error: {}", e))?;
-        Ok(())
     }
 
     /// Run the network event loop. Call this from a spawned task.
@@ -7547,7 +7536,6 @@ impl NetworkService {
     fn publish_node_announcement(&mut self) {
         use crate::messages::envelope::{Envelope, PROTOCOL_VERSION};
         use crate::messages::types::{Capability, MessageType, NodeAnnouncementPayload};
-        use ed25519_dalek::Signer;
 
         // Security-audit follow-up (2026-10-06, found while fixing the
         // `/api/v1/network/nodes` enumeration leak): `subscribed_channels`
