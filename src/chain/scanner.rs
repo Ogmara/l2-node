@@ -66,7 +66,11 @@ const CATCHUP_BATCH_SIZE: u64 = 200;
 const TIP_BATCH_SIZE: u64 = 50;
 /// If we're more than this many blocks behind, we're in catch-up mode.
 const CATCHUP_THRESHOLD: u64 = 5_000;
-
+/// Blocks behind the reported tip the scanner stops at. `block/list` can
+/// report a block whose transactions `transaction/list` has not indexed yet;
+/// scanning right up to the tip would advance the cursor past an event that
+/// was simply not visible yet, losing it for good. 10 blocks ≈ 40 s.
+const CONFIRM_BLOCKS: u64 = 10;
 /// Self-imposed minimum spacing between outbound Klever API requests (ms).
 ///
 /// Audit 2026-09-28: the old 100ms inter-page sleep in `process_range_paged`
@@ -81,7 +85,7 @@ const CATCHUP_THRESHOLD: u64 = 5_000;
 /// req/min, leaving margin under 15/min for network/response latency.
 /// Applied uniformly to every Klever HTTP call this scanner makes
 /// (`get_latest_block_height`, `process_range_paged`,
-/// `query_channel_id_by_slug`) via `throttle_klever_request` — the 429's
+/// `query_created_channel_id`) via `throttle_klever_request` — the 429's
 /// error text says "for this endpoint", which may mean independent
 /// per-endpoint budgets, but sharing one conservative budget across all of
 /// them is the safe assumption absent confirmation either way.
@@ -136,12 +140,14 @@ pub struct ChainScanner {
     /// Channel to notify the network layer about new channel discoveries.
     /// The network service subscribes to the corresponding GossipSub topic.
     channel_tx: tokio::sync::mpsc::UnboundedSender<u64>,
-    /// In-memory cache of resolved `slug → channel_id`. Avoids re-querying the
-    /// `getChannelBySlug` SC view (a Klever RPC call) for the same channel
-    /// every time a 429-stalled cursor re-scans a block range — the main
-    /// source of chain-scan rate-limit amplification. `Mutex` for interior
-    /// mutability (resolution runs on `&self`).
-    slug_cache: std::sync::Mutex<std::collections::HashMap<String, u64>>,
+    /// In-memory cache of resolved `createChannel` tx hash → channel id
+    /// (`None` = the call created no channel). Avoids re-fetching the same
+    /// transaction (a Klever RPC call) every time a 429-stalled cursor
+    /// re-scans a block range — the main source of chain-scan rate-limit
+    /// amplification. Keyed by transaction, never by slug: a reverted
+    /// duplicate-slug `createChannel` must not inherit the original's id.
+    /// `Mutex` for interior mutability (resolution runs on `&self`).
+    created_channel_cache: std::sync::Mutex<std::collections::HashMap<String, Option<u64>>>,
     /// Timestamp of the last outbound Klever API call, for
     /// `throttle_klever_request`'s self-imposed pacing. `tokio::sync::Mutex`
     /// since the throttle is held across an `.await` (the sleep itself).
@@ -205,7 +211,7 @@ impl ChainScanner {
             backoff: Duration::ZERO,
             consecutive_429s: 0,
             channel_tx,
-            slug_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+            created_channel_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             last_klever_request: tokio::sync::Mutex::new(None),
             channel_verify_config,
             klever_health,
@@ -290,8 +296,7 @@ impl ChainScanner {
                             self.klever_health.store(now_ms, std::sync::atomic::Ordering::Relaxed);
                         }
                         Err(e) => {
-                            let err_str = e.to_string();
-                            if err_str.contains("429") || err_str.contains("Too Many Requests") {
+                            if is_rate_limited(&e) {
                                 self.consecutive_429s += 1;
                                 let backoff_ms = (BACKOFF_BASE_MS * 2u64.saturating_pow(self.consecutive_429s.saturating_sub(1)))
                                     .min(BACKOFF_MAX_MS);
@@ -321,14 +326,15 @@ impl ChainScanner {
         &mut self,
         shutdown_rx: &mut tokio::sync::broadcast::Receiver<()>,
     ) -> Result<()> {
-        let latest = self.get_latest_block_height().await?;
+        let tip = self.get_latest_block_height().await?;
 
         // Store chain tip for dashboard sync lag calculation (spec 10-dashboard.md §6)
         let _ = self.storage.put_cf(
             cf::NODE_STATE,
             crate::storage::schema::state_keys::CHAIN_TIP,
-            &latest.to_be_bytes(),
+            &tip.to_be_bytes(),
         );
+        let latest = tip.saturating_sub(CONFIRM_BLOCKS);
 
         if latest <= self.last_block {
             return Ok(());
@@ -433,6 +439,7 @@ impl ChainScanner {
             .context("fetching block list")?;
 
         let status = response.status();
+        check_rate_limit(status)?;
         let text = response.text().await.context("reading block list body")?;
 
         if !status.is_success() {
@@ -458,6 +465,10 @@ impl ChainScanner {
     ///
     /// Paginates through the transaction list to ensure all transactions are captured
     /// even in busy block ranges. Capped at 50 pages to prevent infinite loops.
+    ///
+    /// Events are collected per sub-range and applied oldest-first (see
+    /// `order_events_for_apply`) once the sub-range's outcome is known; see
+    /// `apply_events` for how a failing event is handled.
     async fn process_block_range(&self, start: u64, end: u64) -> Result<()> {
         // W17 (audit 2026-06-07): a range with more SC txs than the page cap
         // used to `break` and let the caller advance the cursor PAST it →
@@ -465,15 +476,24 @@ impl ChainScanner {
         // (work stack) so every block is fully covered before the cursor moves.
         let mut stack = vec![(start, end)];
         while let Some((s, e)) = stack.pop() {
-            match self.process_range_paged(s, e).await? {
-                PageOutcome::Complete => {}
+            let mut events = Vec::new();
+            match self.process_range_paged(s, e, &mut events).await? {
+                PageOutcome::Complete => {
+                    self.apply_events(events).await?;
+                }
                 PageOutcome::CapExceededDense => {
                     if s >= e {
                         // A single block exceeding the cap is pathological (one block
                         // with >MAX_PAGES*100 SC txs to our contract) — can't split
-                        // further; warn rather than loop forever.
+                        // further; apply what was reached and record the block as a
+                        // gap rather than loop forever.
                         warn!(block = s, "single block exceeds pagination cap — some SC txs may be missed");
+                        self.apply_events(events).await?;
+                        self.record_chain_scan_gap(s, e);
                     } else {
+                        // The collected events are dropped: both halves
+                        // re-collect their own, so applying them here would
+                        // apply the upper half's events before the lower half's.
                         let mid = s + (e - s) / 2;
                         // Push high half first so the low half is processed first.
                         stack.push((mid + 1, e));
@@ -481,6 +501,9 @@ impl ChainScanner {
                     }
                 }
                 PageOutcome::CapExceededTooDeep => {
+                    // Whatever was reached is still applied (in order); the
+                    // range is recorded as a gap below.
+                    self.apply_events(events).await?;
                     // Subdividing would not help — see `PageOutcome` doc comment.
                     // Every sub-range would independently re-walk the same
                     // newest-first pages and hit the same cap, multiplying
@@ -555,9 +578,12 @@ impl ChainScanner {
         let mut gaps = read_chain_scan_gaps(&self.storage);
         // Dedup: a mid-batch error can cause `process_block_range` to
         // discard progress and the SAME range to be reprocessed (and
-        // re-recorded) on a later tick — skip an exact repeat of the
-        // immediately preceding record rather than inflating the count.
-        if gaps.last().map(|g| (g.start, g.end)) == Some((start, end)) {
+        // re-recorded) on a later tick — possibly after other gaps were
+        // recorded in between (a permanent event error records its gap
+        // before a later failure ends the attempt). Skip any range already listed
+        // rather than inflating the monotonic total. The list is capped at
+        // `MAX_CHAIN_SCAN_GAPS`, so the scan is bounded.
+        if gaps.iter().any(|g| (g.start, g.end) == (start, end)) {
             return;
         }
         let recorded_at = now_unix_secs();
@@ -599,6 +625,37 @@ impl ChainScanner {
         }
     }
 
+    /// Apply one sub-range's collected events oldest-first.
+    ///
+    /// A failing event fails the range — the cursor does not move and the
+    /// next tick retries it, for as long as it takes. That covers every
+    /// environmental fault (rate limit, Klever outage or lag, storage error):
+    /// a long one pauses the scanner, which the sync-lag alert reports, but
+    /// never loses the event. Only an error tagged `PermanentEventError` at
+    /// its source — a condition retrying cannot change — records the event's
+    /// block as a scan gap and moves on. None of those can be produced by a
+    /// crafted transaction, so no transaction can stall the scanner.
+    /// Re-applying the events that succeeded before a failure is safe:
+    /// `handle_event` is idempotent per event.
+    async fn apply_events(&self, events: Vec<CollectedEvent>) -> Result<()> {
+        for ev in order_events_for_apply(events) {
+            if let Err(e) = self.handle_event(ev.event, &ev.hash).await {
+                if !is_permanent_event_error(&e) {
+                    warn!(block = ev.block_num, tx = %ev.hash, error = %e, "Failed to handle SC event — range will be retried");
+                    return Err(e);
+                }
+                warn!(
+                    block = ev.block_num,
+                    tx = %ev.hash,
+                    error = %e,
+                    "SC event can never apply — recording its block as a scan gap"
+                );
+                self.record_chain_scan_gap(ev.block_num, ev.block_num);
+            }
+        }
+        Ok(())
+    }
+
     /// Page through type-63 SC transactions for `[start, end]`.
     ///
     /// Returns `PageOutcome::Complete` when the range was fully processed (a
@@ -624,7 +681,16 @@ impl ChainScanner {
     /// termination once results walk past `start` (safe given the
     /// newest-first ordering — every subsequent page can only be older
     /// still, so there is nothing further to find in-range).
-    async fn process_range_paged(&self, start: u64, end: u64) -> Result<PageOutcome> {
+    ///
+    /// Parsed events are pushed onto `events` rather than applied: the API
+    /// returns transactions newest-first, and applying in that order lost a
+    /// key update that shared a range with its registration.
+    async fn process_range_paged(
+        &self,
+        start: u64,
+        end: u64,
+        events: &mut Vec<CollectedEvent>,
+    ) -> Result<PageOutcome> {
         let mut page = 1u64;
         const MAX_PAGES: u64 = 50;
         // Set once a transaction older than `start` is seen — newest-first
@@ -668,6 +734,7 @@ impl ChainScanner {
                 .context("fetching block transactions")?;
 
             let status = response.status();
+            check_rate_limit(status)?;
             let text = response.text().await.context("reading transactions body")?;
 
             if !status.is_success() {
@@ -682,6 +749,11 @@ impl ChainScanner {
                 serde_json::from_str(&text).context("parsing block transactions JSON")?;
 
             // Extract transactions array
+            // A 200 can still carry an API error; treating it as an empty
+            // page would end the range and move the cursor past it.
+            if let Some(err) = resp.get("error").and_then(|v| v.as_str()).filter(|e| !e.is_empty()) {
+                anyhow::bail!("transaction list error: {}", crate::util::truncate_str(err, 200));
+            }
             let txs = match resp.pointer("/data/transactions") {
                 Some(serde_json::Value::Array(arr)) if !arr.is_empty() => arr,
                 _ => return Ok(PageOutcome::Complete), // No (more) transactions — range complete
@@ -699,6 +771,11 @@ impl ChainScanner {
                 };
 
                 if tx.status != "success" {
+                    continue;
+                }
+                // Defensive: a reverted SC call must never change state, even
+                // if the listing marks it "success". Absent field = old API.
+                if !tx.result_code.is_empty() && tx.result_code != "Ok" {
                     continue;
                 }
 
@@ -749,14 +826,16 @@ impl ChainScanner {
                 };
 
                 if let Some(event) = parser::parse_sc_call(&call_data, &tx.sender, tx.timestamp) {
-                    if let Err(e) = self.handle_event(event).await {
-                        warn!(
-                            block = start,
-                            tx = %tx.hash,
-                            error = %e,
-                            "Failed to handle SC event"
-                        );
-                    }
+                    events.push(CollectedEvent {
+                        block_num: tx.block_num,
+                        // Listing position, newest = 0: pages are walked
+                        // newest-first and appended in order.
+                        seq: events.len(),
+                        sender: tx.sender,
+                        nonce: tx.nonce,
+                        hash: tx.hash,
+                        event,
+                    });
                 }
             }
 
@@ -775,7 +854,10 @@ impl ChainScanner {
     }
 
     /// Handle a parsed SC event — update local state in RocksDB.
-    async fn handle_event(&self, event: ScEvent) -> Result<()> {
+    ///
+    /// `tx_hash` is the transaction that emitted the event (used to read
+    /// `createChannel`'s own event log).
+    async fn handle_event(&self, event: ScEvent, tx_hash: &str) -> Result<()> {
         match event {
             ScEvent::UserRegistered {
                 address,
@@ -867,12 +949,21 @@ impl ChainScanner {
                 channel_type,
                 timestamp,
             } => {
-                // Resolve the actual channel_id from the SC via getChannelBySlug view query
-                let channel_id = match self.query_channel_id_by_slug(&slug).await {
-                    Ok(id) => id,
-                    Err(e) => {
-                        warn!(slug = %slug, error = %e, "Failed to resolve channel_id — skipping");
+                // Resolve the channel_id from this transaction's own
+                // `channelCreated` event log.
+                // A failed lookup fails the event (and so the range, which is
+                // retried) — skipping it here used to lose the channel for good.
+                let channel_id = match self.query_created_channel_id(tx_hash, &slug).await {
+                    Ok(Some(id)) => id,
+                    Ok(None) => {
+                        // The listing said success but the node says failed —
+                        // anomalous, so make it visible.
+                        warn!(slug = %slug, tx = %tx_hash, "createChannel listed as success but the node reports it failed — no channel created, skipping");
                         return Ok(());
+                    }
+                    Err(e) => {
+                        warn!(slug = %slug, error = %e, "Failed to resolve channel_id");
+                        return Err(e);
                     }
                 };
 
@@ -1178,7 +1269,10 @@ impl ChainScanner {
                         .get_cf(cf::WALLET_DEVICES, &crate::storage::schema::encode_wallet_device_key(&user, &device_address))?
                         .and_then(|b| rmp_serde::from_slice::<crate::storage::rocks::DeviceClaim>(&b).ok())
                         .is_some_and(|c| !c.wallet_signature.is_empty() && c.wallet_address == user)
-                        && self.storage.resolve_wallet(&device_address)?.as_deref() == Some(user.as_str());
+                        // A corrupt local mapping reads as "no signed row" (the
+                        // registration below then reports its own error) — it
+                        // must not fail the event, which would retry forever.
+                        && self.storage.resolve_wallet(&device_address).ok().flatten().as_deref() == Some(user.as_str());
                     if revoked {
                         warn!(user = %user, device = %device_address, "on-chain delegation predates a revocation; mapping not written");
                     } else if has_signed_row {
@@ -1205,7 +1299,20 @@ impl ChainScanner {
             ScEvent::DeviceRevoked { user, device_key } => {
                 let key = crate::storage::schema::encode_delegation_key(&user, &device_key);
                 if let Some(existing) = self.storage.get_cf(cf::DELEGATIONS, &key)? {
-                    let mut record: DelegationRecord = serde_json::from_slice(&existing)?;
+                    // A corrupt local row must not block a revocation (and
+                    // retrying would not repair it): rebuild a minimal,
+                    // inactive record — revocation always wins.
+                    let mut record: DelegationRecord = serde_json::from_slice(&existing).unwrap_or_else(|e| {
+                        warn!(user = %user, error = %e, "corrupt delegation row on revoke — rebuilding it as inactive");
+                        DelegationRecord {
+                            user_address: user.clone(),
+                            device_pub_key: device_key.clone(),
+                            permissions: 0,
+                            expires_at: 0,
+                            created_at: 0,
+                            active: false,
+                        }
+                    });
                     record.active = false;
                     let bytes = serde_json::to_vec(&record)?;
                     self.storage.put_cf(cf::DELEGATIONS, &key, &bytes)?;
@@ -1273,68 +1380,58 @@ impl ChainScanner {
         Ok(())
     }
 
-    /// Query the SC for a channel's ID by its slug via the VM hex endpoint.
-    async fn query_channel_id_by_slug(&self, slug: &str) -> Result<u64> {
-        // Cache hit → skip the SC view query entirely. A channel_id is
-        // immutable once assigned, so a cached resolution is always valid; this
-        // is what stops a re-scanned block range from re-hammering Klever's RPC.
-        if let Ok(cache) = self.slug_cache.lock() {
-            if let Some(&id) = cache.get(slug) {
+    /// The channel id a `createChannel` transaction assigned, read from the
+    /// transaction's own `channelCreated` event log on the Klever node
+    /// (see `created_channel_id_from_tx`).
+    ///
+    /// `Ok(None)` means the call created no channel (it reverted): the event
+    /// is skipped — nothing happened on chain, so there is nothing to lose
+    /// and no gap to record. A transaction the node does not know yet, and
+    /// any HTTP failure, are plain errors: retried. Requires a `node_url`
+    /// that serves transaction history.
+    async fn query_created_channel_id(&self, tx_hash: &str, slug: &str) -> Result<Option<u64>> {
+        // Cache hit → no RPC. A transaction's outcome is final, so a cached
+        // resolution is always valid for that same transaction.
+        if let Ok(cache) = self.created_channel_cache.lock() {
+            if let Some(&id) = cache.get(tx_hash) {
                 return Ok(id);
             }
         }
 
-        let slug_hex = hex::encode(slug);
-        let url = format!("{}/vm/hex", self.config.node_url);
-
-        let body = serde_json::json!({
-            "scAddress": self.config.contract_address,
-            "funcName": "getChannelBySlug",
-            "args": [slug_hex]
-        });
+        // The hash comes from the Klever API listing; validate it before it
+        // goes into a URL path.
+        if tx_hash.len() != 64 || !tx_hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(PermanentEventError(format!("malformed tx hash {tx_hash:?}")).into());
+        }
+        let url = format!("{}/transaction/{}?withResults=true", self.config.node_url, tx_hash);
 
         self.throttle_klever_request().await;
-        let resp: serde_json::Value = self
-            .http
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .context("querying getChannelBySlug")?
-            .json()
-            .await
-            .context("parsing getChannelBySlug response")?;
+        let response = self.http.get(&url).send().await.context("fetching createChannel tx")?;
+        let status = response.status();
+        check_rate_limit(status)?;
+        if !status.is_success() {
+            anyhow::bail!("createChannel tx HTTP {status}");
+        }
+        let resp: serde_json::Value = response.json().await.context("parsing createChannel tx")?;
 
-        let hex_data = resp
-            .pointer("/data/data")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-
-        if hex_data.is_empty() {
-            anyhow::bail!("getChannelBySlug returned empty for slug '{}'", slug);
+        // A transaction the node does not know keeps this range retrying;
+        // say why, since the usual cause is configuration.
+        if resp.get("error").and_then(|v| v.as_str()).is_some_and(|e| e.contains("not found")) {
+            warn!(tx = %tx_hash, "createChannel tx not found on [klever] node_url — retrying; node_url must serve transaction history");
         }
 
-        // Decode variable-length big-endian u64
-        let bytes = hex::decode(hex_data)
-            .context("decoding channel ID hex")?;
-        if bytes.len() > 8 {
-            anyhow::bail!("channel ID too large: {} bytes", bytes.len());
-        }
-        let mut padded = [0u8; 8];
-        padded[8 - bytes.len()..].copy_from_slice(&bytes);
-        let channel_id = u64::from_be_bytes(padded);
+        let channel_id = created_channel_id_from_tx(&resp, slug, &self.config.contract_address)?;
 
-        // Cache the resolution so future re-scans of this range don't re-query.
-        // Bounded (audit 2026-06-07 W18): slugs come from on-chain channel
-        // creates (permissionless), so an unbounded map is a slow memory-growth
-        // vector. channel_id is immutable, so clearing on overflow is safe — the
-        // worst case is a few re-queries after a flush.
-        if let Ok(mut cache) = self.slug_cache.lock() {
-            const SLUG_CACHE_CAP: usize = 10_000;
-            if cache.len() >= SLUG_CACHE_CAP {
+        // Bounded (audit 2026-06-07 W18): channel creates are permissionless,
+        // so an unbounded map is a slow memory-growth vector. Outcomes are
+        // final, so clearing on overflow is safe — the worst case is a few
+        // re-fetches after a flush.
+        if let Ok(mut cache) = self.created_channel_cache.lock() {
+            const CREATED_CHANNEL_CACHE_CAP: usize = 10_000;
+            if cache.len() >= CREATED_CHANNEL_CACHE_CAP {
                 cache.clear();
             }
-            cache.insert(slug.to_string(), channel_id);
+            cache.insert(tx_hash.to_string(), channel_id);
         }
         Ok(channel_id)
     }
@@ -2105,7 +2202,7 @@ enum ChannelFieldMergeOutcome {
 /// — a fresh row is built separately by the caller as a plain
 /// `ChannelRecord`). Pure so this can be unit-tested without the HTTP
 /// mocking this crate otherwise has no harness for (`ScEvent::
-/// ChannelCreated`'s handler needs a live `getChannelBySlug` call to
+/// ChannelCreated`'s handler needs a live Klever transaction fetch to
 /// resolve `channel_id` before it can even reach this point).
 ///
 /// Never writes `channel_type` when `meta` is NOT currently Private — the
@@ -2209,6 +2306,156 @@ fn classify_block_range_position(block_num: u64, start: u64, end: u64) -> RangeP
     } else {
         RangePosition::InRange
     }
+}
+
+/// A parsed SC event plus the transaction fields that order it.
+#[derive(Debug)]
+struct CollectedEvent {
+    block_num: u64,
+    /// Position in the API listing (0 = newest), across all pages.
+    seq: usize,
+    sender: String,
+    nonce: u64,
+    hash: String,
+    event: ScEvent,
+}
+
+/// Put events into chain order.
+///
+/// Blocks ascend. Inside a block the API's own (newest-first) order is
+/// reversed — the best available signal across senders, and the one that
+/// keeps a cross-sender chain (A transfers a channel to B, B to C) in
+/// execution order. On top of that, one sender's events are re-ordered by
+/// nonce within the positions they occupy: a sender's nonce is exact, while
+/// the API's in-block order is undocumented.
+fn order_events_for_apply(mut events: Vec<CollectedEvent>) -> Vec<CollectedEvent> {
+    events.sort_by(|a, b| (a.block_num, b.seq).cmp(&(b.block_num, a.seq)));
+    // `perm[slot]` = index of the event that ends up in `slot`.
+    let mut perm: Vec<usize> = (0..events.len()).collect();
+    let mut start = 0;
+    while start < events.len() {
+        let block = events[start].block_num;
+        let end = start + events[start..].iter().take_while(|e| e.block_num == block).count();
+        let mut by_sender: std::collections::BTreeMap<&str, Vec<usize>> = std::collections::BTreeMap::new();
+        for i in start..end {
+            by_sender.entry(events[i].sender.as_str()).or_default().push(i);
+        }
+        for slots in by_sender.values() {
+            let mut by_nonce = slots.clone();
+            by_nonce.sort_by_key(|&i| events[i].nonce);
+            for (&slot, &src) in slots.iter().zip(&by_nonce) {
+                perm[slot] = src;
+            }
+        }
+        start = end;
+    }
+    let mut taken: Vec<Option<CollectedEvent>> = events.into_iter().map(Some).collect();
+    perm.into_iter().filter_map(|i| taken[i].take()).collect()
+}
+
+/// The Klever API answered HTTP 429.
+///
+/// A typed marker, not a substring match on the message: error messages
+/// carry user-chosen data (a channel slug, an address), and a slug like
+/// `chan-429` must not make the scanner back off forever.
+#[derive(Debug, thiserror::Error)]
+#[error("Klever API rate limit (HTTP 429)")]
+struct RateLimited;
+
+/// An event that can never apply — retrying cannot change the outcome (e.g.
+/// the SC returned a channel id that does not decode). Tagged at its source;
+/// `apply_events` records the event's block as a scan gap instead of failing
+/// the range. Never use it for anything environmental (network, storage).
+#[derive(Debug, thiserror::Error)]
+#[error("permanent event error: {0}")]
+struct PermanentEventError(String);
+
+/// Whether an error is a Klever rate limit (backed off and retried).
+fn is_rate_limited(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.is::<RateLimited>())
+}
+
+/// Whether an event error is permanent (see `PermanentEventError`).
+fn is_permanent_event_error(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.is::<PermanentEventError>())
+}
+
+/// Bail with `RateLimited` on a 429, so callers can tell it apart.
+fn check_rate_limit(status: reqwest::StatusCode) -> Result<()> {
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Err(RateLimited.into());
+    }
+    Ok(())
+}
+
+/// Interpret a Klever node `/transaction/{hash}?withResults=true` response
+/// for a `createChannel` call — see `ChainScanner::query_created_channel_id`.
+///
+/// Verified against testnet: a failed SC call carries `Result` 1 and a
+/// non-zero `ResultCode` (and may or may not carry logs, e.g. an
+/// `internalVMErrors` event on out-of-gas); a successful one carries neither
+/// field, and its logs hold the contract's `channelCreated` event (topics:
+/// name, id, creator, slug, type, timestamp).
+///
+/// - an API error (e.g. "transaction not found") → `Err`, retried: the node
+///   has not caught up;
+/// - non-zero `Result` / `ResultCode` → `Ok(None)`: the call reverted and
+///   created no channel;
+/// - executed, but no `logs` → `Err`, retried (should not happen; never
+///   guessed as "reverted");
+/// - a `channelCreated` event from `contract` → `Ok(Some(id))`, after
+///   checking its slug topic matches the call's slug;
+/// - executed successfully but no such event → `PermanentEventError` (the SC
+///   always emits it on success, so the event changed shape — make it a
+///   visible gap, never a silent skip);
+/// - an event whose id or slug topic is malformed or inconsistent →
+///   `PermanentEventError` (retrying reads the same log).
+fn created_channel_id_from_tx(resp: &serde_json::Value, slug: &str, contract: &str) -> Result<Option<u64>> {
+    if let Some(err) = resp.get("error").and_then(|v| v.as_str()).filter(|e| !e.is_empty()) {
+        anyhow::bail!("createChannel tx: {}", crate::util::truncate_str(err, 200));
+    }
+    let Some(tx) = resp.pointer("/data/transaction") else {
+        anyhow::bail!("createChannel tx: no transaction in response");
+    };
+    // Present and anything but the number 0 counts as failed (verified as
+    // numbers on testnet; a changed type must not read as "succeeded").
+    let failed = |field: &str| tx.get(field).is_some_and(|v| v.as_u64() != Some(0));
+    if failed("Result") || failed("ResultCode") {
+        return Ok(None);
+    }
+    let Some(events) = tx.pointer("/logs/events").and_then(|v| v.as_array()) else {
+        anyhow::bail!("createChannel tx has no execution logs yet");
+    };
+    let event_name = hex::encode("channelCreated");
+    let topic = |e: &serde_json::Value, i: usize| -> Option<String> {
+        e.pointer(&format!("/topics/{i}")).and_then(|v| v.as_str()).map(str::to_owned)
+    };
+    let Some(event) = events.iter().find(|e| {
+        e.get("address").and_then(|v| v.as_str()) == Some(contract)
+            && topic(e, 0).as_deref() == Some(event_name.as_str())
+    }) else {
+        // Executed successfully (no failure fields) yet no event: the SC
+        // always emits it on success, so this means the event changed shape
+        // (e.g. an SC upgrade). Surface it as a gap rather than silently
+        // dropping every new channel.
+        return Err(PermanentEventError("successful createChannel tx has no channelCreated event from the contract".into()).into());
+    };
+    if topic(event, 3).as_deref() != Some(hex::encode(slug).as_str()) {
+        return Err(PermanentEventError(format!("channelCreated slug topic does not match slug {slug:?}")).into());
+    }
+    let id_hex = topic(event, 1).unwrap_or_default();
+    let bytes = hex::decode(&id_hex)
+        .map_err(|e| PermanentEventError(format!("decoding channel id topic: {e}")))?;
+    if bytes.is_empty() || bytes.len() > 8 {
+        return Err(PermanentEventError(format!("channel id topic has {} bytes", bytes.len())).into());
+    }
+    let mut padded = [0u8; 8];
+    padded[8 - bytes.len()..].copy_from_slice(&bytes);
+    let id = u64::from_be_bytes(padded);
+    if id == 0 {
+        return Err(PermanentEventError("channel id topic is 0".into()).into());
+    }
+    Ok(Some(id))
 }
 
 /// Outcome of `process_range_paged` for one `[start, end]` attempt.
@@ -2660,6 +2907,159 @@ mod user_record_merge_tests {
             assert_eq!(merged["public_key"], serde_json::json!("pk"));
             assert_eq!(merged["address"], serde_json::json!("klv1y"));
         }
+    }
+}
+
+#[cfg(test)]
+mod event_order_tests {
+    use super::*;
+
+    /// Build events in API listing order (newest first): `seq` = position.
+    fn listing(items: &[(u64, &str, u64)]) -> Vec<CollectedEvent> {
+        items
+            .iter()
+            .enumerate()
+            .map(|(seq, &(block_num, sender, nonce))| CollectedEvent {
+                block_num,
+                seq,
+                sender: sender.into(),
+                nonce,
+                hash: format!("{block_num}-{sender}-{nonce}"),
+                event: ScEvent::PublicKeyUpdated { address: "x".into(), public_key: String::new() },
+            })
+            .collect()
+    }
+
+    fn order(events: Vec<CollectedEvent>) -> Vec<String> {
+        order_events_for_apply(events).into_iter().map(|e| e.hash).collect()
+    }
+
+    // REGRESSION: the API returns newest-first, and events used to be applied
+    // in that order — a key update applied before its own registration hit
+    // "unknown user" and was dropped.
+    #[test]
+    fn newest_first_listing_is_applied_oldest_first() {
+        let ev = listing(&[(30, "b", 1), (20, "a", 2), (10, "a", 1)]);
+        assert_eq!(order(ev), ["10-a-1", "20-a-2", "30-b-1"]);
+    }
+
+    // Audit W4: a cross-sender chain in one block (A transfers to B, B to C)
+    // must follow the listing, not an alphabetical sender order.
+    #[test]
+    fn same_block_cross_sender_follows_reversed_listing() {
+        let ev = listing(&[(5, "a", 1), (5, "z", 1)]); // z executed first
+        assert_eq!(order(ev), ["5-z-1", "5-a-1"]);
+    }
+
+    #[test]
+    fn same_block_same_sender_is_ordered_by_nonce_within_its_slots() {
+        // Listing (newest first): a#7, b#1, a#9, a#8. Reversed: a#8, a#9, b#1, a#7.
+        // a's slots are 0, 1, 3 → filled by nonce 7, 8, 9; b keeps slot 2.
+        let ev = listing(&[(5, "a", 7), (5, "b", 1), (5, "a", 9), (5, "a", 8)]);
+        assert_eq!(order(ev), ["5-a-7", "5-a-8", "5-b-1", "5-a-9"]);
+    }
+
+    #[test]
+    fn nothing_is_lost_or_duplicated() {
+        let ev = listing(&[(2, "a", 3), (2, "b", 1), (1, "a", 2), (1, "c", 5), (1, "a", 1)]);
+        let mut got = order(ev);
+        got.sort();
+        assert_eq!(got, ["1-a-1", "1-a-2", "1-c-5", "2-a-3", "2-b-1"]);
+    }
+
+    #[test]
+    fn rate_limit_is_typed_not_a_substring() {
+        let e = anyhow::Error::from(RateLimited).context("fetching");
+        assert!(is_rate_limited(&e));
+        // Audit W1: a user-chosen slug containing "429" is not a rate limit.
+        let slug = anyhow::anyhow!("getChannelBySlug returned empty for slug 'chan-429'");
+        assert!(!is_rate_limited(&slug));
+        assert!(!is_rate_limited(&anyhow::anyhow!("HTTP 429 Too Many Requests")));
+    }
+
+    const SC: &str = "klv1qqqqqqqqqqqqqpgq0ja2j7xwz843ryfsk9vlz6xzsaak590h6pgq7nwr02";
+
+    /// A node response shaped like the live testnet one (tx d631c63d…).
+    fn tx_with_events(events: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"data": {"transaction": {"status": "onChain", "logs": {"events": events}}}, "error": "", "code": "successful"})
+    }
+
+    fn created(id_hex: &str, slug_hex: &str) -> serde_json::Value {
+        serde_json::json!({"address": SC, "identifier": "createChannel",
+            "topics": ["6368616e6e656c43726561746564", id_hex, "bcd4", slug_hex, "", "6abcecb4"], "data": [""]})
+    }
+
+    #[test]
+    fn channel_id_comes_from_the_txs_own_event() {
+        // Live testnet: createChannel("testnet") → topic 1 = 0x14.
+        let resp = tx_with_events(serde_json::json!([created("14", "746573746e6574"),
+            {"address": SC, "identifier": "completedTxEvent", "topics": ["d631"]}]));
+        assert_eq!(created_channel_id_from_tx(&resp, "testnet", SC).unwrap(), Some(20));
+    }
+
+    // Round 6: live testnet shape of a failed SC call (tx 52e7e3df…):
+    // Result 1, non-zero ResultCode, no logs at all.
+    #[test]
+    fn a_reverted_call_created_no_channel() {
+        let resp = serde_json::json!({"data": {"transaction": {"Result": 1, "ResultCode": 4, "status": "onChain"}}, "error": ""});
+        assert_eq!(created_channel_id_from_tx(&resp, "testnet", SC).unwrap(), None);
+    }
+
+    // Round 7: a successful tx without our contract's event is a visible
+    // gap (an event from another address does not count), never a skip.
+    #[test]
+    fn success_without_our_event_is_permanent() {
+        let mut ev = created("14", "746573746e6574");
+        ev["address"] = serde_json::json!("klv1other");
+        let resp = tx_with_events(serde_json::json!([ev]));
+        let e = created_channel_id_from_tx(&resp, "testnet", SC).unwrap_err();
+        assert!(is_permanent_event_error(&e));
+    }
+
+    #[test]
+    fn a_numeric_zero_result_is_not_a_failure() {
+        let resp = tx_with_events(serde_json::json!([created("14", "746573746e6574")]));
+        let mut resp = resp;
+        resp["data"]["transaction"]["Result"] = serde_json::json!(0);
+        resp["data"]["transaction"]["ResultCode"] = serde_json::json!(0);
+        assert_eq!(created_channel_id_from_tx(&resp, "testnet", SC).unwrap(), Some(20));
+    }
+
+    #[test]
+    fn a_non_numeric_failure_field_counts_as_failed() {
+        let resp = serde_json::json!({"data": {"transaction": {"Result": "1", "status": "onChain"}}, "error": ""});
+        assert_eq!(created_channel_id_from_tx(&resp, "testnet", SC).unwrap(), None);
+    }
+
+    #[test]
+    fn not_found_or_no_logs_is_retried_not_permanent() {
+        let missing = serde_json::json!({"data": null, "error": "getting transaction failed: transaction not found", "code": "internal_issue"});
+        let e = created_channel_id_from_tx(&missing, "testnet", SC).unwrap_err();
+        assert!(!is_permanent_event_error(&e));
+        let no_logs = serde_json::json!({"data": {"transaction": {"status": "onChain"}}, "error": ""});
+        let e = created_channel_id_from_tx(&no_logs, "testnet", SC).unwrap_err();
+        assert!(!is_permanent_event_error(&e));
+    }
+
+    #[test]
+    fn malformed_or_inconsistent_event_is_permanent() {
+        for (id, slug) in [("zz", "746573746e6574"), ("", "746573746e6574"), ("00", "746573746e6574"),
+                           ("010203040506070809", "746573746e6574"), ("14", "6f74686572")] {
+            let resp = tx_with_events(serde_json::json!([created(id, slug)]));
+            let e = created_channel_id_from_tx(&resp, "testnet", SC).unwrap_err();
+            assert!(is_permanent_event_error(&e), "id {id:?} slug {slug:?}");
+        }
+    }
+
+    // Round 4: only an error tagged permanent at its source turns into a
+    // gap; everything environmental (outage, lag, storage) is retried.
+    #[test]
+    fn only_tagged_errors_are_permanent() {
+        let tagged = anyhow::Error::from(PermanentEventError("bad id".into())).context("handling");
+        assert!(is_permanent_event_error(&tagged));
+        assert!(!is_permanent_event_error(&anyhow::anyhow!("getChannelBySlug returned empty for slug 'x'")));
+        assert!(!is_permanent_event_error(&anyhow::anyhow!("getChannelBySlug HTTP 503")));
+        assert!(!is_permanent_event_error(&RateLimited.into()));
     }
 }
 
@@ -3432,18 +3832,18 @@ mod device_delegation_event_tests {
         };
         let (a, b) = (addr(1), addr(2));
         let (h1, d1) = dev(10);
-        sc.handle_event(event(&a, &h1, 1_000)).await.unwrap();
+        sc.handle_event(event(&a, &h1, 1_000), "").await.unwrap();
         assert_eq!(storage.resolve_wallet(&d1).unwrap().as_deref(), Some(a.as_str()));
         assert_eq!(storage.list_devices(&a).unwrap().len(), 1, "msgpack DeviceClaim row");
         // Another wallet cannot take the device over via the chain.
-        sc.handle_event(event(&b, &h1, 2_000)).await.unwrap();
+        sc.handle_event(event(&b, &h1, 2_000), "").await.unwrap();
         assert_eq!(storage.resolve_wallet(&d1).unwrap().as_deref(), Some(a.as_str()));
         // A delegation at/before a revocation tombstone is not mapped.
         let (h2, d2) = dev(11);
         storage.put_cf(cf::DEVICE_REVOCATIONS, d2.as_bytes(), &5_000_000u64.to_be_bytes()).unwrap();
-        sc.handle_event(event(&a, &h2, 5_000)).await.unwrap();
+        sc.handle_event(event(&a, &h2, 5_000), "").await.unwrap();
         assert_eq!(storage.resolve_wallet(&d2).unwrap(), None);
-        sc.handle_event(event(&a, &h2, 5_001)).await.unwrap();
+        sc.handle_event(event(&a, &h2, 5_001), "").await.unwrap();
         assert_eq!(storage.resolve_wallet(&d2).unwrap().as_deref(), Some(a.as_str()), "newer re-delegation");
         // A wallet-signed registration row is not downgraded by the chain.
         let (h3, d3) = dev(12);
@@ -3455,7 +3855,7 @@ mod device_delegation_event_tests {
             registered_at: 7,
         };
         storage.register_device(&signed).unwrap();
-        sc.handle_event(event(&a, &h3, 6_000)).await.unwrap();
+        sc.handle_event(event(&a, &h3, 6_000), "").await.unwrap();
         let rows = storage.list_devices(&a).unwrap();
         let row = rows.iter().find(|c| c.device_address == d3).unwrap();
         assert_eq!(row.wallet_signature, "ab".repeat(64));
@@ -3471,7 +3871,7 @@ mod device_delegation_event_tests {
                 registered_at: 7,
             })
             .unwrap();
-        sc.handle_event(event(&a, &h4, 8_000)).await.unwrap();
+        sc.handle_event(event(&a, &h4, 8_000), "").await.unwrap();
         let rows = storage.list_devices(&a).unwrap();
         assert_eq!(rows.iter().find(|c| c.device_address == d4).unwrap().registered_at, 8_000_000);
     }

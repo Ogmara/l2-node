@@ -72,7 +72,8 @@ fn parse_create_channel(args: &[&str], sender: &str, timestamp: u64) -> Option<S
     let channel_type = decode_hex_u8(args[1])?;
 
     // The channel_id is assigned by the SC and not part of the call data;
-    // the scanner's handle_event resolves it via getChannelBySlug.
+    // the scanner's handle_event reads it from the transaction's own
+    // `channelCreated` event log.
     Some(ScEvent::ChannelCreated {
         creator: sender.to_string(),
         slug,

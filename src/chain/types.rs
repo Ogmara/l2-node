@@ -20,7 +20,7 @@ pub enum ScEvent {
         public_key: String,
     },
     /// The SC assigns the channel_id; the call data doesn't carry it, so
-    /// the scanner resolves it from the slug via `getChannelBySlug`.
+    /// the scanner reads it from the transaction's `channelCreated` event log.
     ChannelCreated {
         creator: String,
         slug: String,
@@ -247,6 +247,15 @@ pub struct KleverTransaction {
     pub block_num: u64,
     #[serde(default)]
     pub timestamp: u64,
+    /// Sender account nonce. Strictly increasing per sender, so it orders two
+    /// transactions from one sender inside the same block (the API's own
+    /// in-block order is not documented).
+    #[serde(default)]
+    pub nonce: u64,
+    /// Execution result (`"Ok"` on success). Checked in addition to
+    /// `status` so a reverted SC call can never change local state.
+    #[serde(default, rename = "resultCode")]
+    pub result_code: String,
     /// SC call data: hex-encoded "functionName@arg1@arg2".
     #[serde(default)]
     pub data: Vec<String>,

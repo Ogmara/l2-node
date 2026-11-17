@@ -5,6 +5,67 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.147.1] - 2026-11-17
+
+### Fixed
+
+- **Chain scanner applied events newest-first.** The Klever API lists
+  transactions newest-first and the scanner applied them in that order, so a
+  key update sharing a scan range with its registration ran first, hit
+  "unknown user" and was dropped. Events of a range are now collected and
+  applied in chain order: blocks ascending; inside a block the listing order
+  reversed, with one sender's events re-ordered by their nonce (exact for a
+  sender, while the API's in-block order is undocumented). When a dense
+  range is subdivided, its collected events are dropped and re-collected per
+  half.
+- **Chain events no longer lost silently.** A failed `getChannelBySlug`
+  lookup skipped the `ChannelCreated` event for good, and any other event
+  error was only logged while the cursor moved on. A failing event now fails
+  its range, which is retried until it succeeds: rate limits, Klever outages
+  or lag, and storage errors. A long fault pauses the scanner, which the
+  sync-lag alert reports, but loses nothing. Only conditions retrying cannot
+  change (a malformed `channelCreated` event log) are recorded as a scan gap
+  right away. Scan gaps are deduplicated by range, so retries no longer
+  inflate the lifetime gap-blocks counter.
+- **`ChannelCreated` reads its channel id from the transaction's own
+  `channelCreated` event log** (Klever node
+  `/transaction/{hash}?withResults=true`) instead of the `getChannelBySlug`
+  view. A call the node reports as failed (non-zero `Result`/`ResultCode`)
+  created no channel and is skipped; a transaction the node does not have
+  yet is retried; only events emitted by the Ogmara contract count, and a
+  successful call without one is recorded as a scan gap (never silently
+  skipped). The resolution cache is keyed by transaction, not by slug, so
+  a reverted duplicate-slug `createChannel` can never inherit the original
+  channel's id (and overwrite its creator). `[klever] node_url` must point at a node
+  that serves transaction history (node.testnet / node.mainnet do).
+- **A Klever API error inside a 200 response no longer reads as an empty
+  page.** It ended the range and moved the cursor past it. The scanner also
+  skips any listed transaction whose `resultCode` is present and not `Ok`.
+- **Corrupt local rows no longer fail chain events (which would now retry
+  forever).** `DeviceRevoked` on a corrupt delegation row rebuilds it as an
+  inactive record — revocation always wins; `DeviceDelegated` treats a
+  corrupt device→wallet mapping as "no signed row".
+- **Rate limits are detected by HTTP status, not by message text.** The
+  scanner matched "429" anywhere in an error message, and messages carry
+  user-chosen data — a channel slug like `chan-429` could have made it back
+  off forever. The former `getChannelBySlug` lookup also never checked the
+  HTTP status, so a 429 surfaced as a JSON parse error.
+- **Scanner stops 10 blocks short of the tip.** `block/list` can report a
+  block whose transactions `transaction/list` has not indexed yet; scanning
+  right up to it advanced the cursor past events that were not visible yet.
+  The dashboard's sync lag now shows at least 10 blocks (alert threshold
+  default: 100).
+- **Reputation `account_age_days` was ~56 years for every registered
+  account.** `registered_at` is unix seconds but was subtracted from a
+  millisecond clock, which also maxed the age part of every trust score.
+
+### Security
+
+- **`libz-sys` 1.1.31 → 1.1.33 (RUSTSEC-2026-0544, heap buffer
+  overflow).** Shipped runtime code: it is the zlib binding `librocksdb-sys`
+  links for compression. Lockfile-only bump via `--precise`; no other
+  dependency moved.
+
 ## [0.147.0] - 2026-11-14
 
 ### Added

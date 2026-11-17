@@ -8809,12 +8809,14 @@ pub async fn get_user_moderation(
                     .or_else(|| profile.get("created_at").and_then(|v| v.as_u64()))
                     .unwrap_or(0);
                 if registered_at > 0 {
-                    let now_ms = SystemTime::now()
+                    let now_secs = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .unwrap_or_default()
-                        .as_millis() as u64;
-                    // registered_at is in milliseconds
-                    now_ms.saturating_sub(registered_at) / (1000 * 60 * 60 * 24)
+                        .as_secs();
+                    // registered_at is unix SECONDS (the chain scanner writes
+                    // the tx timestamp). Treating it as milliseconds made
+                    // every registered account ~56 years old.
+                    now_secs.saturating_sub(registered_at) / (60 * 60 * 24)
                 } else {
                     0
                 }
