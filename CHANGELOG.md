@@ -5,6 +5,53 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.148.1] - 2026-11-18
+
+### Security
+- **Synced envelopes can no longer be dated in the future.** Sync skips the
+  drift check because history is old, but it also accepted envelopes dated
+  years ahead. Several records are last-writer-wins on the envelope's own
+  timestamp:
+  - a `DeviceDelegation`'s becomes the device claim time, which decides
+    against later L2 and on-chain revokes and the revocation tombstone;
+  - a `ProfileUpdate`'s becomes the profile watermark;
+  - a `DeviceRevocation`'s becomes the tombstone.
+
+  A wallet-signed far-future envelope therefore won against every later
+  write until that date (for example, a delegation planted by a compromised
+  device survived its revoke). Every sync path now rejects an envelope dated
+  more than `MAX_TIMESTAMP_DRIFT_MS` (5 min) ahead of the receiving node, the
+  same bound the live and gossip paths already apply. Old envelopes are
+  unaffected. In private-channel and channel sync, such a row marks the
+  session as unverified (tainted), as any rejected row does. Runtime code.
+- **Private-channel sync device claims are bounded the same way.** A device's
+  `WalletAuthClaim` presenting a delegation dated beyond the drift window is
+  refused. Before, `revoked_at < delegation_timestamp` let a revoked device
+  with such a wallet-signed delegation keep authorising sync. Runtime code.
+- **Rows stored before this release no longer outlast revokes.** A delegation
+  or device registration dated beyond the drift window is ignored when
+  building a private-channel sync proof. It also no longer counts as "newer"
+  than an on-chain `revokeDevice`. Runtime code.
+
+### Changed
+- A node whose clock runs more than 5 min BEHIND real time now also rejects
+  recent rows on sync, not only on the live path. Keep node clocks synced (NTP).
+
+### Known limitations
+- Rows dated in the future that were accepted through sync BEFORE this release
+  stay stored. A peer serving one makes the requester's channel session
+  "tainted", so the channel takes exponential backoff instead of the hourly
+  in-sync recheck; this clears once the date passes. A far-future
+  `DeviceRevocation` tombstone or delegation claim from that time keeps
+  blocking re-delegation of that one device key (a fresh key works). Both
+  need a wallet- or device-signed envelope, and new ingest is closed. Deferred:
+  a responder-side serve filter or a one-time sweep, if any such row is found
+  on a live node.
+- A delegation the wallet signs for a FUTURE date T, but within T's own drift
+  window at delivery, cannot be pre-revoked: once T arrives it is newer than
+  any revoke issued before T. Closing this needs a per-key permanent revoke
+  or a nonce in the claim.
+
 ## [0.148.0] - 2026-11-18
 
 Anchored state v4: nodes now agree on their anchored roots. Live check of

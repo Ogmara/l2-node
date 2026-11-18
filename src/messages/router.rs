@@ -833,9 +833,17 @@ impl MessageRouter {
     ///
     /// Used for messages received via the sync protocol, which are intentionally
     /// older than the 5-minute drift window. All other validation (signature,
-    /// identity, payload, dedup) still applies.
+    /// identity, payload, dedup) still applies. Only the PAST side of the drift
+    /// check is skipped: an envelope dated beyond the drift window into the
+    /// future is rejected (l2-node 0.148.1, see Step 5b).
     pub fn process_synced_message(&self, raw_bytes: &[u8]) -> RouteResult {
         self.process_message_inner(raw_bytes, Ingress::Sync, None)
+    }
+
+    /// Test-only: the SYNC pipeline at a fixed node clock.
+    #[cfg(test)]
+    pub(crate) fn process_synced_message_at(&self, raw_bytes: &[u8], now_ms: u64) -> RouteResult {
+        self.process_message_inner(raw_bytes, Ingress::Sync, Some(now_ms))
     }
 
     /// Test-only: the LIVE pipeline evaluated at a fixed node clock, so
@@ -1029,6 +1037,20 @@ impl MessageRouter {
         if !is_sync && !envelope.is_timestamp_valid(now_ms) {
             return RouteResult::Rejected(format!(
                 "timestamp drift too large: {} vs now {}",
+                envelope.timestamp, now_ms
+            ));
+        }
+        // Step 5b: a synced envelope may be old but never from the future
+        // (l2-node 0.148.1). Timestamps decide last-writer-wins state: a
+        // DeviceDelegation's becomes the device claim time (vs later L2 and
+        // on-chain revokes, and the revocation tombstone), a ProfileUpdate's
+        // the profile watermark, a DeviceRevocation's the tombstone. A
+        // wallet-signed far-future one would win against every later write
+        // until that date. The live path already refuses these; no honest
+        // envelope is ahead of any receiver by more than the drift window.
+        if is_sync && envelope.timestamp > now_ms.saturating_add(super::envelope::MAX_TIMESTAMP_DRIFT_MS) {
+            return RouteResult::Rejected(format!(
+                "synced envelope timestamp in the future: {} vs now {}",
                 envelope.timestamp, now_ms
             ));
         }
@@ -12182,5 +12204,143 @@ mod key_envelope_rate_limit_tests {
         assert_eq!(ok, 720);
         // Refused attempts created no extra entries: 1 wallet + 8 scopes.
         assert_eq!(r.gossip_key_buckets.len(), 9);
+    }
+}
+
+#[cfg(test)]
+mod synced_delegation_future_ts_tests {
+    use super::*;
+    use crate::messages::types::{DelegationPermissions, DeviceDelegationPayload};
+    use tempfile::TempDir;
+
+    fn router() -> (MessageRouter, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let identity = IdentityResolver::new(storage.clone());
+        (
+            MessageRouter::new(storage, identity, None, "testnet".to_string(), usize::MAX, std::sync::Arc::new(crate::metrics::counters::NetworkCounters::new()), crate::config::RateLimitsConfig::default()),
+            dir,
+        )
+    }
+
+    fn now() -> u64 {
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
+    }
+
+    /// A dual-signed DeviceDelegation (wallet authorizes, device proves
+    /// possession), returning the raw envelope and the device address.
+    fn delegation(wallet: &ed25519_dalek::SigningKey, device: &ed25519_dalek::SigningKey, ts: u64) -> (Vec<u8>, String) {
+        let w_addr = crypto::pubkey_to_address(&wallet.verifying_key()).unwrap();
+        let dev_hex = hex::encode(device.verifying_key().to_bytes());
+        let claim = crate::network::private_channel_sync::device_delegation_claim_string("testnet", &dev_hex, &w_addr, ts);
+        let p = DeviceDelegationPayload {
+            device_pub_key: dev_hex,
+            permissions: DelegationPermissions {
+                can_send_messages: true,
+                can_create_channels: true,
+                can_update_profile: true,
+            },
+            expires_at: None,
+            device_signature: hex::encode(signing::sign_klever_message(device, claim.as_bytes()).to_bytes()),
+        };
+        let payload = rmp_serde::to_vec_named(&p).unwrap();
+        let msg_id = crypto::compute_msg_id("testnet", &wallet.verifying_key().to_bytes(), &payload, ts);
+        let e = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::DeviceDelegation,
+            msg_id,
+            author: w_addr,
+            timestamp: ts,
+            lamport_ts: 0,
+            payload,
+            signature: signing::sign_klever_message(wallet, claim.as_bytes()).to_bytes().to_vec(),
+            relay_path: vec![],
+        };
+        let dev_addr = crypto::device_pubkey_to_address(&device.verifying_key()).unwrap();
+        (rmp_serde::to_vec_named(&e).unwrap(), dev_addr)
+    }
+
+    // A far-future delegation would set a claim time that outlasts every
+    // later revoke, so sync rejects it before it is stored.
+    #[test]
+    fn a_synced_future_dated_delegation_is_rejected_and_maps_nothing() {
+        let (r, _d) = router();
+        let (wallet, device) = (crypto::generate_keypair(), crypto::generate_keypair());
+        let (raw, dev_addr) = delegation(&wallet, &device, now() + 365 * 24 * 3600 * 1000);
+        match r.process_synced_message(&raw) {
+            RouteResult::Rejected(reason) => assert!(reason.contains("future"), "{reason}"),
+            other => panic!("expected Rejected, got {:?}", other),
+        }
+        assert_eq!(r.storage.resolve_wallet(&dev_addr).unwrap(), None);
+    }
+
+    // Sync is for history: an old delegation still applies, and one inside
+    // the drift window is accepted like on the live path.
+    #[test]
+    fn a_synced_past_or_in_window_delegation_still_applies() {
+        let (r, _d) = router();
+        let wallet = crypto::generate_keypair();
+        let w_addr = crypto::pubkey_to_address(&wallet.verifying_key()).unwrap();
+        for ts in [now() - 30 * 24 * 3600 * 1000, now() + 60_000] {
+            let device = crypto::generate_keypair();
+            let (raw, dev_addr) = delegation(&wallet, &device, ts);
+            assert!(matches!(r.process_synced_message(&raw), RouteResult::Accepted { .. }));
+            assert_eq!(r.storage.resolve_wallet(&dev_addr).unwrap(), Some(w_addr.clone()));
+        }
+    }
+
+    // The bound is exactly the live drift window: now + drift is accepted,
+    // one millisecond more is not.
+    #[test]
+    fn the_sync_bound_is_the_drift_window() {
+        let (r, _d) = router();
+        let wallet = crypto::generate_keypair();
+        let ts = 1_800_000_000_000u64;
+        let (at_edge, _) = delegation(&wallet, &crypto::generate_keypair(), ts);
+        assert!(matches!(
+            r.process_synced_message_at(&at_edge, ts - crate::messages::envelope::MAX_TIMESTAMP_DRIFT_MS),
+            RouteResult::Accepted { .. }
+        ));
+        let (beyond, _) = delegation(&wallet, &crypto::generate_keypair(), ts);
+        assert!(matches!(
+            r.process_synced_message_at(&beyond, ts - crate::messages::envelope::MAX_TIMESTAMP_DRIFT_MS - 1),
+            RouteResult::Rejected(_)
+        ));
+    }
+
+    // Every synced type is bounded, not only delegations: a far-future
+    // ProfileUpdate would otherwise freeze the profile watermark.
+    #[test]
+    fn a_synced_future_dated_profile_update_is_rejected() {
+        let (r, _d) = router();
+        let sk = crypto::generate_keypair();
+        let author = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        let payload = rmp_serde::to_vec_named(&serde_json::json!({ "display_name": "x" })).unwrap();
+        let ts = now() + 365 * 24 * 3600 * 1000;
+        let msg_id = crypto::compute_msg_id("testnet", &sk.verifying_key().to_bytes(), &payload, ts);
+        let signature = signing::sign_ogmara_message(
+            &sk,
+            "testnet",
+            crate::messages::envelope::PROTOCOL_VERSION,
+            MessageType::ProfileUpdate as u8,
+            &msg_id,
+            ts,
+            &payload,
+        );
+        let e = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::ProfileUpdate,
+            msg_id,
+            author,
+            timestamp: ts,
+            lamport_ts: 0,
+            payload,
+            signature: signature.to_bytes().to_vec(),
+            relay_path: vec![],
+        };
+        match r.process_synced_message(&rmp_serde::to_vec_named(&e).unwrap()) {
+            RouteResult::Rejected(reason) => assert!(reason.contains("future"), "{reason}"),
+            other => panic!("expected Rejected, got {:?}", other),
+        }
     }
 }

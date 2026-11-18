@@ -175,7 +175,16 @@ impl IdentityResolver {
     pub fn revoke_device_from_chain(&self, device_address: &str, wallet_address: &str, revoked_at: u64) -> Result<bool> {
         let claim_key = super::schema::encode_wallet_device_key(wallet_address, device_address);
         if let Some(raw) = self.storage.get_cf(super::schema::cf::WALLET_DEVICES, &claim_key)? {
-            if rmp_serde::from_slice::<DeviceClaim>(&raw).is_ok_and(|c| c.registered_at > revoked_at) {
+            // A claim dated beyond the drift window (synced before l2-node
+            // 0.148.1 bounded it) is not "newer": it would outlast every revoke.
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let latest_ok = now_ms.saturating_add(crate::messages::envelope::MAX_TIMESTAMP_DRIFT_MS);
+            if rmp_serde::from_slice::<DeviceClaim>(&raw)
+                .is_ok_and(|c| c.registered_at > revoked_at && c.registered_at <= latest_ok)
+            {
                 return Ok(false);
             }
         }
@@ -484,5 +493,30 @@ mod tests {
 
         let devices = resolver.list_devices("klv1wallet777").unwrap();
         assert_eq!(devices.len(), 1);
+    }
+
+    // A claim stored with a far-future time (synced before 0.148.1 bounded
+    // it) must not outlast an on-chain revoke.
+    #[test]
+    fn a_far_future_claim_does_not_outlast_an_on_chain_revoke() {
+        let (storage, _dir) = test_storage();
+        let r = IdentityResolver::new(storage);
+        let mut claim = test_claim("klv1devicefuture", "klv1walletfuture");
+        claim.registered_at = 4_000_000_000_000;
+        r.register_device(&claim).unwrap();
+        assert!(r.revoke_device_from_chain("klv1devicefuture", "klv1walletfuture", 1_700_000_000_000).unwrap());
+    }
+
+    // A legitimate live claim is at most `MAX_TIMESTAMP_DRIFT_MS` ahead and
+    // still wins against an older on-chain revoke.
+    #[test]
+    fn a_claim_inside_the_drift_window_outlasts_an_older_on_chain_revoke() {
+        let (storage, _dir) = test_storage();
+        let r = IdentityResolver::new(storage);
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+        let mut claim = test_claim("klv1deviceedge", "klv1walletedge");
+        claim.registered_at = now + crate::messages::envelope::MAX_TIMESTAMP_DRIFT_MS - 60_000;
+        r.register_device(&claim).unwrap();
+        assert!(!r.revoke_device_from_chain("klv1deviceedge", "klv1walletedge", now - 1_000).unwrap());
     }
 }

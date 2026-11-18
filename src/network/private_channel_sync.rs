@@ -88,6 +88,7 @@ use std::time::Instant;
 use tracing::warn;
 
 use crate::crypto::signing;
+use crate::messages::envelope::MAX_TIMESTAMP_DRIFT_MS;
 use crate::network::budget::{BudgetMap, Gcra, Refusal};
 use crate::network::reconcile::{self, is_channel_member, is_private_channel, MetaCursor};
 use crate::storage::rocks::Storage;
@@ -337,6 +338,12 @@ pub fn verify_wallet_claim(
     let Ok(delegation_sig) = ed25519_dalek::Signature::from_slice(&device.delegation_signature) else {
         return false;
     };
+    // A delegation dated in the future would pass `device_claim_unrevoked`
+    // (`revoked_at < delegation_timestamp`) against every revoke until that
+    // date, so a revoked device could keep authorising sync with it.
+    if device.delegation_timestamp > now_ms.saturating_add(MAX_TIMESTAMP_DRIFT_MS) {
+        return false;
+    }
     let device_hex = hex::encode(device_pk);
     let device_claim = build_device_auth_claim(network, node_id, wallet, &device_hex, claim.timestamp);
     if signing::verify_klever_message(&device_vk, device_claim.as_bytes(), &sig).is_err() {
@@ -556,7 +563,14 @@ pub fn lookup_device_delegation_proof(
     let wallet_vk = crate::crypto::address_to_verifying_key(wallet).ok()?;
     let device_hex = hex::encode(device_pk);
     let revoked_at = storage.get_device_revoked_at(device_address).ok()?;
-    let live = |ts: u64| revoked_at.is_none_or(|r| r < ts);
+    // A row dated beyond the drift window (stored before l2-node 0.148.1,
+    // when sync did not bound it) would outlast every revoke; never use it.
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let latest_ok = now_ms.saturating_add(MAX_TIMESTAMP_DRIFT_MS);
+    let live = |ts: u64| ts <= latest_ok && revoked_at.is_none_or(|r| r < ts);
     let proof = |ts: u64, sig: Vec<u8>| DeviceAuthProof {
         device_pubkey: device_pk.to_vec(),
         delegation_timestamp: ts,
@@ -3290,6 +3304,13 @@ mod device_claim_tests {
         assert!(!verify_wallet_claim(&good, NET, &node, &x.addr, ts));
         // Fresh only.
         assert!(!verify_wallet_claim(&good, NET, &node, &w.addr, ts + 301_000));
+        // A delegation dated beyond the drift window would outlast every
+        // revoke (`device_claim_unrevoked`), so it is refused; at the edge
+        // of the window it is still accepted.
+        let edge = WalletAuthClaim { device: Some(proof(&d, &w, &w, ts + MAX_TIMESTAMP_DRIFT_MS)), ..good.clone() };
+        assert!(verify_wallet_claim(&edge, NET, &node, &w.addr, ts));
+        let future = WalletAuthClaim { device: Some(proof(&d, &w, &w, ts + MAX_TIMESTAMP_DRIFT_MS + 1)), ..good.clone() };
+        assert!(!verify_wallet_claim(&future, NET, &node, &w.addr, ts));
         // Delegation signed by someone else (forged).
         let forged = WalletAuthClaim { device: Some(proof(&d, &x, &w, ts - 10_000)), ..good.clone() };
         assert!(!verify_wallet_claim(&forged, NET, &node, &w.addr, ts));
