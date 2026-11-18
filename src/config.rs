@@ -2000,14 +2000,18 @@ impl Default for PushGatewayConfig {
 
 /// State anchoring configuration.
 ///
-/// When enabled, the node periodically computes a Merkle root of L2 state
-/// and submits it to the Klever blockchain via the Ogmara KApp smart contract.
+/// When enabled, the node submits the anchored state root (v4, its mirror
+/// of the Ogmara KApp's users, channels and delegations) sealed at each
+/// shared anchor boundary to the Klever blockchain (spec 02 §7, 03 §3.2).
 #[derive(Clone, Serialize, Deserialize)]
 pub struct AnchoringConfig {
     /// Enable periodic state anchoring to the Klever blockchain.
     #[serde(default)]
     pub enabled: bool,
     /// Anchoring interval in seconds (default: 3600 = ~24 anchors/day).
+    /// Rounded to the nearest divisor of 24 h (1, 2, 3, 4, 6, 8, 12 or
+    /// 24 h — see [`AnchoringConfig::interval_blocks`]) so nodes anchor
+    /// shared block heights; every node anchors every 24 h boundary.
     #[serde(default = "default_anchor_interval")]
     pub interval_seconds: u64,
     /// Optional: hex-encoded 32-byte Ed25519 private key for the anchor wallet.
@@ -2725,6 +2729,29 @@ fn default_cache_size() -> u64 {
 }
 fn default_anchor_interval() -> u64 {
     3600
+}
+
+/// Klever blocks per hour (4 s blocks, measured on testnet).
+pub const BLOCKS_PER_HOUR: u64 = 900;
+/// Anchor intervals a node may use, in hours: the divisors of 24, so any
+/// mix of nodes shares every 24 h boundary.
+pub const ANCHOR_INTERVAL_HOURS: [u64; 8] = [1, 2, 3, 4, 6, 8, 12, 24];
+
+impl AnchoringConfig {
+    /// The configured interval rounded to the nearest allowed one (ties go
+    /// to the shorter), in hours.
+    pub fn interval_hours(&self) -> u64 {
+        let wanted = self.interval_seconds;
+        ANCHOR_INTERVAL_HOURS
+            .into_iter()
+            .min_by_key(|h| (h * 3600).abs_diff(wanted))
+            .expect("non-empty")
+    }
+
+    /// Anchor heights are exactly the multiples of this many blocks.
+    pub fn interval_blocks(&self) -> u64 {
+        self.interval_hours() * BLOCKS_PER_HOUR
+    }
 }
 fn default_log_level() -> String {
     "info".to_string()
@@ -4284,6 +4311,8 @@ auth_token = ""
 
 [anchoring]
 enabled = false
+# Rounded to the nearest divisor of 24 h (1, 2, 3, 4, 6, 8, 12 or 24 h):
+# anchors are sealed at block heights every node shares.
 interval_seconds = 3600
 # wallet_key = ""  # optional, defaults to node identity key. Prefer
 # the OGMARA_ANCHOR_WALLET_KEY env var over putting the key in the
@@ -4466,6 +4495,28 @@ mod tests {
     /// cares about, then calls `validate()`.
     fn baseline_config() -> Config {
         toml::from_str(&Config::default_toml()).expect("default toml parses")
+    }
+
+    #[test]
+    fn anchor_interval_rounds_to_a_divisor_of_24h() {
+        let blocks = |secs: u64| AnchoringConfig { interval_seconds: secs, ..Default::default() };
+        for (secs, hours) in [
+            (60, 1),
+            (3600, 1),
+            (5 * 3600, 4), // tie between 4 and 6 → shorter
+            (6 * 3600, 6),
+            (7 * 3600, 6), // tie between 6 and 8 → shorter
+            (10 * 3600, 8),
+            (11 * 3600, 12),
+            (48 * 3600, 24),
+        ] {
+            assert_eq!(blocks(secs).interval_hours(), hours, "{secs}s");
+        }
+        assert_eq!(blocks(6 * 3600).interval_blocks(), 5_400);
+        // Every allowed interval divides the 24 h boundary.
+        for h in ANCHOR_INTERVAL_HOURS {
+            assert_eq!((24 * BLOCKS_PER_HOUR) % (h * BLOCKS_PER_HOUR), 0);
+        }
     }
 
     // --- Hard rejects ---------------------------------------------------

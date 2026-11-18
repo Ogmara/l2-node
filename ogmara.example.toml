@@ -464,6 +464,8 @@ auth_token = ""
 
 [anchoring]
 enabled = false
+# Rounded to the nearest divisor of 24 h (1, 2, 3, 4, 6, 8, 12 or 24 h):
+# anchors are sealed at block heights every node shares.
 interval_seconds = 3600
 # wallet_key = ""  # optional, defaults to node identity key. Prefer
 # the OGMARA_ANCHOR_WALLET_KEY env var over putting the key in the

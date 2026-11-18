@@ -2,6 +2,7 @@
 //!
 //! Uses column families (spec 3.5) for efficient namespaced key-value storage.
 
+pub mod anchored_state;
 pub mod identity;
 pub mod key_commits;
 pub mod rocks;

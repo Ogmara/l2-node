@@ -17,13 +17,19 @@
 //! `oneshot::Sender` so we can await responses without blocking the
 //! swarm event loop.
 //!
-//! ## What this module does NOT do (Phase 2)
+//! ## What is verified (manifest v2, l2-node 0.148.0)
 //!
-//! - **Anchor re-verification against Klever.** Phase 2 trusts the
-//!   producer's claim of `last_verified_anchor_height` if the operator
-//!   has set `experimental_skip_anchor_verify = true`. Without that flag,
-//!   bootstrap refuses to apply and the node falls back to full scan.
-//!   Phase 3 (v0.36) removes the flag and adds real anchor verification.
+//! A snapshot carries only the anchored chain mirror (`ANCHORED_STATE`) as
+//! sealed at the manifest's `block_height`. The receiver checks every row
+//! is canonical and filed under its own key, recomputes the anchored state
+//! root (v4) from the rows, and requires it to equal the FINAL canonical
+//! root on-chain at that height (`sc_views::get_final_canonical_anchor`)
+//! — unless the operator set `experimental_skip_anchor_verify`. Nothing
+//! that root does not cover is imported: profiles, channel metadata and
+//! memberships arrive later through the signed sync paths.
+//!
+//! ## What this module does NOT do
+//!
 //! - **Producer signature verification against libp2p PeerId.** We
 //!   structurally validate via `SnapshotManifest::validate()`, but
 //!   binding the signature to the peer's identity Ed25519 key is
@@ -47,22 +53,6 @@ use super::snapshot::{
     SnapshotErrorCode, SnapshotManifest, SnapshotRequest, SnapshotResponse,
 };
 use super::{SnapshotClientCommand, SnapshotClientError, SnapshotClientResult};
-
-/// Returns true if this snapshot-domain CF stores JSON-encoded values.
-///
-/// USERS, CHANNELS, CHANNEL_MEMBERS, DELEGATIONS, STATE_ANCHORS values
-/// are all `serde_json::from_slice`'d by API handlers and the chain
-/// scanner. ANCHOR_BY_NODE is excluded — its values are raw 8-byte
-/// big-endian `block_height` ints with no JSON layer to corrupt.
-/// The receiver pre-validates JSON for the json-valued CFs before the
-/// destructive apply — see audit finding Phase 2 Sec C3.
-fn cf_has_json_values(cf_name: &str) -> bool {
-    use crate::storage::schema::cf;
-    matches!(
-        cf_name,
-        cf::USERS | cf::CHANNELS | cf::CHANNEL_MEMBERS | cf::DELEGATIONS | cf::STATE_ANCHORS
-    )
-}
 
 // --- ClientHandle: thin wrapper over the command channel ---------------
 
@@ -120,7 +110,7 @@ impl ClientHandle {
     }
 
     /// Ask NetworkService for the current set of connected peer ids.
-    async fn connected_peers(&self) -> Result<Vec<PeerId>, SnapshotClientError> {
+    pub async fn connected_peers(&self) -> Result<Vec<PeerId>, SnapshotClientError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         if self
             .tx
@@ -323,6 +313,23 @@ async fn fetch_manifest(
         bail!(
             "manifest total_bytes ({}) exceeds max_total_bytes ({})",
             total,
+            max_total_bytes
+        );
+    }
+    // `total_bytes` is the producer's own claim about its rows; what is
+    // actually decoded into memory is each chunk's declared uncompressed
+    // size (the decoder enforces it). Bound THAT sum — otherwise a manifest
+    // claiming `total_bytes = 1` could list thousands of 128 MiB chunks.
+    let declared: u64 = manifest
+        .cfs
+        .iter()
+        .flat_map(|c| &c.chunks)
+        .map(|ch| u64::from(ch.uncompressed_bytes))
+        .sum();
+    if declared > max_total_bytes {
+        bail!(
+            "manifest chunks declare {} uncompressed bytes, exceeding max_total_bytes ({})",
+            declared,
             max_total_bytes
         );
     }
@@ -583,307 +590,125 @@ pub fn verify_merkle_consistency(
     Ok(())
 }
 
-// --- Anchor re-verification against Klever (Phase 3) -------------------
+// --- Peer mirror fetch (anchored-state repair) -------------------------
 
-/// Outcome of verifying the snapshot's `STATE_ANCHORS` against Klever.
-#[derive(Debug, Clone)]
-pub struct AnchorVerifyResult {
-    /// Highest block height where the snapshot's claimed `state_root`
-    /// matched what's on the Klever chain. This becomes the receiver's
-    /// new `chain_cursor` after apply — the chain scanner will replay
-    /// the (at most one anchor interval) of blocks between this height
-    /// and `manifest.block_height`.
-    pub cutoff_height: u64,
-    /// How many anchors were checked before reaching the verified one.
-    pub checked: usize,
-    /// Total anchors in the snapshot.
-    pub total: usize,
-    /// The verified `state_root` (hex) at `cutoff_height` — confirmed to
-    /// match Klever on-chain. Used by `verify_content_matches_anchor` to
-    /// bind the snapshot's actual USERS/CHANNELS/DELEGATIONS(/CHANNEL_MEMBERS)
-    /// content to this anchor (audit final pre-mainnet C2): a genuine
-    /// `STATE_ANCHORS` record proves an anchor value like this ONE existed
-    /// on-chain, but is public and copyable into a fabricated snapshot on
-    /// its own — it says nothing about the OTHER content bundled beside it.
-    pub state_root: String,
+/// Largest declared uncompressed chunk accepted from a repair peer. Honest
+/// producers chunk at `[snapshot] chunk_size_bytes` (4 MiB default; a chunk
+/// closes once it passes the target). Decoding inflates a hostile chunk
+/// (msgpack arrays of tiny entries) about 16× in memory, so this bounds the
+/// transient peak of one decode.
+pub const PEER_MIRROR_MAX_CHUNK_BYTES: u32 = 8 * 1024 * 1024;
+
+/// Stream `peer`'s served sealed mirror rows (manifest v2) for the
+/// anchored-state repair sweep: its advertised height, the signed manifest
+/// (size-capped at `max_total_bytes`), then ONE chunk at a time — fetched,
+/// hash-checked, decoded, each row checked for canonical form
+/// (`anchored_state::validate_row`) and handed to `on_row` in key order,
+/// then dropped. `on_row` returns `false` to stop early. NOT checked against
+/// a canonical root or the manifest's Merkle root: the repair sweep treats
+/// every row only as a candidate the SC must confirm, so a lying peer can
+/// only cost SC calls — and memory stays one capped chunk. Returns the
+/// height served.
+pub async fn stream_peer_mirror(
+    handle: &ClientHandle,
+    peer: PeerId,
+    network_id: &str,
+    max_total_bytes: u64,
+    retries: u32,
+    mut on_row: impl FnMut(&[u8], &[u8]) -> bool,
+) -> Result<u64> {
+    let (height, root) = match handle.send(peer, SnapshotRequest::Advertise, handle.manifest_timeout).await {
+        Ok(SnapshotResponse::Advertise {
+            latest_snapshot_height: Some(h),
+            latest_snapshot_root,
+            serve_enabled: true,
+            ..
+        }) => (h, latest_snapshot_root),
+        Ok(_) => bail!("peer serves no snapshot"),
+        Err(e) => bail!("advertise failed: {e}"),
+    };
+    let manifest = fetch_manifest(handle, peer, height, root, network_id, max_total_bytes).await?;
+    let cf = manifest
+        .cfs
+        .iter()
+        .find(|c| c.cf_name == crate::storage::schema::cf::ANCHORED_STATE)
+        .ok_or_else(|| anyhow!("peer snapshot carries no anchored_state"))?;
+    let mut headers: Vec<&ChunkHeader> = cf.chunks.iter().collect();
+    headers.sort_by_key(|h| h.seq);
+    let mut mirror_index = 0usize;
+    let mut previous: Option<Vec<u8>> = None;
+    for header in headers {
+        if header.uncompressed_bytes > PEER_MIRROR_MAX_CHUNK_BYTES {
+            bail!("peer chunk {} declares {} bytes, above the repair cap", header.seq, header.uncompressed_bytes);
+        }
+        let chunk = fetch_one_chunk(handle, &[peer], &mut mirror_index, height, &cf.cf_name, header, retries).await?;
+        for (k, v) in chunk.entries {
+            if previous.as_deref().is_some_and(|p| p >= k.as_slice()) {
+                bail!("peer mirror rows are not in ascending key order");
+            }
+            crate::storage::anchored_state::validate_row(&k, &v).context("invalid row in peer mirror")?;
+            if !on_row(&k, &v) {
+                return Ok(height);
+            }
+            previous = Some(k);
+        }
+    }
+    Ok(height)
 }
 
-/// Iterate the snapshot's `STATE_ANCHORS` rows from highest height down,
-/// re-checking each against the Klever SC's `getStateRoot(block_height)`
-/// view. Returns the highest `block_height` whose claim matched on-chain.
-///
-/// Rejection cases:
-/// - **Any anchor `Mismatch`** → snapshot is poisoned, abort with `Err`.
-/// - **All anchors `NotAnchored`** → snapshot has no on-chain backing,
-///   abort with `Err` (this also catches an attacker fabricating anchors).
-/// - **Klever RPC unreachable for every anchor** → abort with `Err` unless
-///   we've already accumulated ≥ 1 verified anchor at a higher height.
-///
-/// Spec 11-snapshot-sync.md §5a.5 (Phase 3 semantics).
-pub async fn verify_anchors_against_klever(
-    decoded_anchors: &[ChunkPayload],
-    http: &reqwest::Client,
-    klever_node_url: &str,
-    contract_address: &str,
-) -> Result<AnchorVerifyResult> {
-    use crate::chain::anchor_verify::{verify_anchor, AnchorVerifyOutcome};
-    use crate::chain::types::StateAnchorRecord;
+// --- Verification against the canonical anchored root ------------------
 
-    // Flatten all chunks and parse anchors.
-    let mut anchors: Vec<StateAnchorRecord> = Vec::new();
-    for chunk in decoded_anchors {
-        for (key, value) in &chunk.entries {
-            // Sanity: key is block_height_be (8 bytes); value is JSON.
-            let key_arr: [u8; 8] = key.as_slice().try_into().map_err(|_| {
-                anyhow!(
-                    "STATE_ANCHORS chunk has unexpected key length: got {}, expected 8",
-                    key.len()
-                )
-            })?;
-            let record: StateAnchorRecord = serde_json::from_slice(value)
-                .context("parsing StateAnchorRecord from snapshot")?;
-            // Cross-check: row key block_height matches the record.
-            let key_height = u64::from_be_bytes(key_arr);
-            if key_height != record.block_height {
-                bail!(
-                    "STATE_ANCHORS row key/value height mismatch: key={}, record={}",
-                    key_height,
-                    record.block_height
-                );
-            }
-            anchors.push(record);
-        }
-    }
-
-    let total = anchors.len();
-    if total == 0 {
-        bail!("snapshot has no STATE_ANCHORS — refusing to apply an unanchored snapshot");
-    }
-
-    // Sort by block_height descending so we check newest first.
-    anchors.sort_by(|a, b| b.block_height.cmp(&a.block_height));
-
-    // Anti-downgrade ratchet (audit Phase 3 Sec W1): if a peer pads the
-    // snapshot with newer-than-real anchors, every one comes back
-    // NotAnchored and the loop walks down to a much-older verified
-    // anchor — silently demoting the cutoff. We refuse if more than
-    // this many newer-than-cutoff claims fail with NotAnchored.
-    const MAX_NEWER_NOT_ANCHORED: usize = 2;
-
-    // Overall budget (audit Phase 3 Code W2): a malicious peer could
-    // stuff hundreds of anchors and slow Klever RPC to its 15s per-
-    // request limit. Cap the entire verification at 2 minutes — enough
-    // for ~10 anchors at the per-request timeout, far more in the
-    // common case.
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
-
-    let mut checked: usize = 0;
-    let mut rpc_failures: usize = 0;
-    let mut newer_not_anchored: usize = 0;
-    // (block_height, state_root) of the first (highest) verified match —
-    // a single Option so the two values can never desync.
-    let mut first_verified: Option<(u64, String)> = None;
-    // After we find the first match, we can stop — that's the highest
-    // verified anchor and therefore the cutoff.
-    for record in &anchors {
-        if tokio::time::Instant::now() >= deadline {
-            bail!(
-                "anchor verification exceeded total budget (checked {}/{}); aborting",
-                checked,
-                total
-            );
-        }
-        checked += 1;
-        let outcome = verify_anchor(
-            http,
-            klever_node_url,
-            contract_address,
-            record.block_height,
-            &record.state_root,
-        )
-        .await;
-
-        match outcome {
-            AnchorVerifyOutcome::Match => {
-                first_verified = Some((record.block_height, record.state_root.clone()));
-                break;
-            }
-            AnchorVerifyOutcome::Mismatch { on_chain, in_snapshot } => {
-                bail!(
-                    "POISONED SNAPSHOT — anchor at block {} on-chain root '{}' \
-                     differs from snapshot's claim '{}'. Refusing to apply.",
-                    record.block_height,
-                    on_chain,
-                    in_snapshot
-                );
-            }
-            AnchorVerifyOutcome::NotAnchored => {
-                // Newer anchors not yet on-chain — possible if the SC's
-                // anchoring is lagging, OR if the peer fabricated them.
-                // Tolerate a small number; refuse a large gap (downgrade attack).
-                newer_not_anchored += 1;
-                if newer_not_anchored > MAX_NEWER_NOT_ANCHORED {
-                    bail!(
-                        "snapshot reports too many newer anchors not present on Klever ({} > {}); \
-                         possible downgrade attack — refusing to apply",
-                        newer_not_anchored,
-                        MAX_NEWER_NOT_ANCHORED
-                    );
-                }
-                warn!(
-                    block_height = record.block_height,
-                    newer_not_anchored,
-                    "anchor not found on Klever — checking older anchors"
-                );
-                continue;
-            }
-            AnchorVerifyOutcome::RpcError(err) => {
-                rpc_failures += 1;
-                warn!(
-                    block_height = record.block_height,
-                    error = %err,
-                    "Klever RPC error verifying anchor — will retry next anchor"
-                );
-                // If RPC is broken for many anchors in a row, bail.
-                // Half the total is a reasonable threshold for "Klever down."
-                if rpc_failures > (total / 2).max(2) {
-                    bail!(
-                        "Klever RPC failed for {} of {} anchors — aborting verification",
-                        rpc_failures, total
-                    );
-                }
-                continue;
-            }
-        }
-    }
-
-    let (cutoff_height, state_root) = first_verified.ok_or_else(|| {
-        anyhow!(
-            "No snapshot anchors verified against Klever (checked {}/{}); refusing apply",
-            checked,
-            total
-        )
-    })?;
-
-    info!(
-        cutoff_height,
-        checked,
-        total,
-        rpc_failures,
-        "Anchor verification complete — snapshot trusted up to verified cutoff"
-    );
-
-    Ok(AnchorVerifyResult {
-        cutoff_height,
-        checked,
-        total,
-        state_root,
-    })
-}
-
-/// Recompute the anchored state root directly from the snapshot's OWN
-/// decoded `USERS`/`CHANNELS`/`DELEGATIONS`/`CHANNEL_MEMBERS` content
-/// (audit final pre-mainnet C2).
-///
-/// `verify_anchors_against_klever` only proves that a `STATE_ANCHORS`
-/// record bundled in the snapshot corresponds to a REAL historical
-/// on-chain anchor — but that record is a public, copyable JSON blob. It
-/// says nothing about whether the OTHER content sitting beside it in the
-/// same snapshot (device delegations, user registrations, channel
-/// metadata) is genuine. This closes that gap by rebuilding the exact
-/// same Merkle root `Storage::compute_current_state_root` would compute
-/// after writing this data to a fresh DB — entirely in memory, before any
-/// write happens.
-///
-/// Entries within each `ChunkPayload` are key-sorted (see
-/// `storage::snapshot::ChunkPayload` doc comment) and chunks are iterated
-/// in ascending `seq` order, exactly matching the `raw_iterator_cf` +
-/// `seek_to_first`/`next` traversal `Storage::build_snapshot_cf` used to
-/// produce them — so the reconstructed leaf order is byte-identical to
-/// live DB iteration order, which is required for the roots to match.
-pub fn recompute_content_state_root(chunks: &HashMap<String, DecodedChunks>) -> Result<[u8; 32]> {
+/// Recompute the anchored state root (v4) from the snapshot's decoded
+/// `ANCHORED_STATE` rows, validating each row on the way (canonical form,
+/// filed under its own key — `anchored_state::validate_row`). Rows arrive
+/// key-sorted across ascending chunk `seq`s, and the three subtrees are
+/// contiguous key ranges (`c` < `d` < `u`), so each subtree's leaves come
+/// out in the order `Storage::compute_state_checkpoint` reads them.
+pub fn recompute_anchored_root(chunks: &HashMap<String, DecodedChunks>) -> Result<[u8; 32]> {
     use crate::crypto::merkle::StateManager;
+    use crate::storage::anchored_state::validate_row;
     use crate::storage::schema::cf;
+    use crate::storage::state_checkpoints::Subtree;
 
+    let mut cf_chunks: Vec<&ChunkPayload> = chunks
+        .get(cf::ANCHORED_STATE)
+        .ok_or_else(|| anyhow!("missing decoded chunks for cf '{}'", cf::ANCHORED_STATE))?
+        .iter()
+        .collect();
+    cf_chunks.sort_by_key(|c| c.seq);
     let mut mgr = StateManager::new();
-
-    let mut cf_chunks: Vec<&ChunkPayload> = chunks
-        .get(cf::USERS)
-        .ok_or_else(|| anyhow!("missing decoded chunks for cf '{}'", cf::USERS))?
-        .iter()
-        .collect();
-    cf_chunks.sort_by_key(|c| c.seq);
-    for chunk in cf_chunks {
-        for (_, v) in &chunk.entries {
-            mgr.add_user(v);
-        }
-    }
-
-    let mut cf_chunks: Vec<&ChunkPayload> = chunks
-        .get(cf::CHANNELS)
-        .ok_or_else(|| anyhow!("missing decoded chunks for cf '{}'", cf::CHANNELS))?
-        .iter()
-        .collect();
-    cf_chunks.sort_by_key(|c| c.seq);
-    for chunk in cf_chunks {
-        for (_, v) in &chunk.entries {
-            mgr.add_channel(v);
-        }
-    }
-
-    let mut cf_chunks: Vec<&ChunkPayload> = chunks
-        .get(cf::DELEGATIONS)
-        .ok_or_else(|| anyhow!("missing decoded chunks for cf '{}'", cf::DELEGATIONS))?
-        .iter()
-        .collect();
-    cf_chunks.sort_by_key(|c| c.seq);
-    for chunk in cf_chunks {
-        for (_, v) in &chunk.entries {
-            mgr.add_delegation(v);
-        }
-    }
-
-    // CHANNEL_MEMBERS values don't redundantly encode their key (channel_id
-    // + address) the way USERS/DELEGATIONS values do — pass both (see
-    // `StateManager::add_channel_member` doc for why).
-    let mut cf_chunks: Vec<&ChunkPayload> = chunks
-        .get(cf::CHANNEL_MEMBERS)
-        .ok_or_else(|| anyhow!("missing decoded chunks for cf '{}'", cf::CHANNEL_MEMBERS))?
-        .iter()
-        .collect();
-    cf_chunks.sort_by_key(|c| c.seq);
+    let mut previous: Option<&[u8]> = None;
     for chunk in cf_chunks {
         for (k, v) in &chunk.entries {
-            mgr.add_channel_member(k, v);
+            if previous.is_some_and(|p| p >= k.as_slice()) {
+                bail!("snapshot anchored_state rows are not in ascending key order");
+            }
+            previous = Some(k);
+            validate_row(k, v).context("invalid anchored_state row in snapshot")?;
+            let subtree = Subtree::ALL
+                .into_iter()
+                .find(|s| k.first() == Some(&s.prefix()))
+                .expect("validate_row accepted the prefix");
+            mgr.add(subtree.index(), v);
         }
     }
-
     Ok(mgr.compute_state_root())
 }
 
-/// Verify the snapshot's decoded content hashes to the Klever-verified
-/// anchor's `state_root` (audit final pre-mainnet C2). Factored out of
-/// `run_bootstrap` so it's unit-testable without mocking Klever RPC or the
-/// full bootstrap pipeline.
-pub fn verify_content_matches_anchor(
-    chunks: &HashMap<String, DecodedChunks>,
-    anchor_result: &AnchorVerifyResult,
-) -> Result<()> {
-    let content_root = recompute_content_state_root(chunks)
-        .context("recomputing content state root from decoded snapshot chunks")?;
-    let content_root_hex = hex::encode(content_root);
-    if content_root_hex != anchor_result.state_root {
-        bail!(
-            "POISONED SNAPSHOT — recomputed USERS/CHANNELS/DELEGATIONS content root {} does \
-             not match the Klever-verified anchor's state_root {} (height {}). The snapshot's \
-             STATE_ANCHORS record is genuine, but the content bundled beside it is not — \
-             refusing to apply.",
-            content_root_hex,
-            anchor_result.state_root,
-            anchor_result.cutoff_height,
-        );
+/// Require the snapshot's recomputed root to equal the final canonical
+/// anchored root at its `block_height`. Factored out of `run_bootstrap` so
+/// the decision is unit-testable without Klever RPC.
+pub fn verify_root_against_canonical(content_root: [u8; 32], canonical: Option<&str>, height: u64) -> Result<()> {
+    let content_hex = hex::encode(content_root);
+    match canonical {
+        None => bail!(
+            "no final canonical anchored root on-chain at height {height} — the snapshot cannot be verified"
+        ),
+        Some(root) if root.eq_ignore_ascii_case(&content_hex) => Ok(()),
+        Some(root) => bail!(
+            "POISONED SNAPSHOT — anchored_state content root {content_hex} differs from the canonical root {root} at height {height}; refusing to apply"
+        ),
     }
-    Ok(())
 }
 
 // --- Apply path ---------------------------------------------------------
@@ -976,17 +801,14 @@ pub fn apply_snapshot(
     // events, so by accepting peer-supplied bytes here we'd bypass
     // that implicit validation. (Audit finding Phase 2 Sec C3.)
     for cf_name in DOMAIN_CFS {
-        if !cf_has_json_values(cf_name) {
-            continue;
-        }
         let cf_payloads = chunks
             .get(*cf_name)
             .ok_or_else(|| anyhow!("decoded chunks missing for cf '{}'", cf_name))?;
         for chunk in cf_payloads {
             for (k, v) in &chunk.entries {
-                if serde_json::from_slice::<serde_json::Value>(v).is_err() {
+                if let Err(e) = crate::storage::anchored_state::validate_row(k, v) {
                     bail!(
-                        "cf '{}' row {:?} contains invalid JSON — refusing apply (malicious peer or corrupt snapshot)",
+                        "cf '{}' row {:?} is invalid ({e}) — refusing apply (malicious peer or corrupt snapshot)",
                         cf_name,
                         hex::encode(&k[..k.len().min(16)])
                     );
@@ -1014,7 +836,22 @@ pub fn apply_snapshot(
         }
     }
 
-    // 5. Re-derive DEVICE_WALLET_MAP + WALLET_DEVICES from DELEGATIONS.
+    // 5. Derive the chain-owned USERS / CHANNELS / DELEGATIONS rows from
+    //    the verified mirror, then DEVICE_WALLET_MAP + WALLET_DEVICES from
+    //    DELEGATIONS. The mirror is complete as of the cutoff, so the
+    //    repair sweep's first-pass gate is satisfied.
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let (users, channels, delegations) = storage
+        .derive_rows_from_anchored_state(now_secs)
+        .context("deriving rows from the anchored mirror after apply")?;
+    info!(users, channels, delegations, "Derived chain rows from the snapshot's anchored mirror");
+    storage
+        .set_anchored_state_migrated()
+        .context("marking the anchored mirror complete after apply")?;
+    // Re-derive DEVICE_WALLET_MAP + WALLET_DEVICES from DELEGATIONS.
     //    These CFs are excluded from snapshot (privacy: §3.1 spec). The
     //    existing migration helper rebuilds them from DELEGATIONS rows.
     storage
@@ -1023,21 +860,14 @@ pub fn apply_snapshot(
 
     // 6. Cursor + counters.
     storage
-        .set_chain_cursor(cutoff_height)
+        .set_chain_cursor_with_mirror(cutoff_height)
         .context("setting chain_cursor after apply")?;
+    // Counters from the verified rows, not from the manifest's claim.
     storage
-        .put_cf(
-            cf::NODE_STATE,
-            state_keys::TOTAL_USERS,
-            &manifest.total_users.to_be_bytes(),
-        )
+        .put_cf(cf::NODE_STATE, state_keys::TOTAL_USERS, &users.to_be_bytes())
         .context("updating TOTAL_USERS")?;
     storage
-        .put_cf(
-            cf::NODE_STATE,
-            state_keys::TOTAL_CHANNELS,
-            &manifest.total_channels.to_be_bytes(),
-        )
+        .put_cf(cf::NODE_STATE, state_keys::TOTAL_CHANNELS, &channels.to_be_bytes())
         .context("updating TOTAL_CHANNELS")?;
 
     // 7. Commit point: sentinel written last.
@@ -1073,8 +903,9 @@ pub fn apply_snapshot(
 /// snapshot detected via anchor mismatch is in this last bucket).
 ///
 /// `data_dir` is where the rollback checkpoint will be written.
-/// `klever_node_url` and `contract_address` are used to re-verify each
-/// snapshot anchor against the Ogmara KApp's `getStateRoot` view.
+/// `klever_node_url` and `contract_address` are used to read the final
+/// canonical anchored root at the snapshot's height
+/// (`sc_views::get_final_canonical_anchor`).
 pub async fn run_bootstrap(
     handle: &ClientHandle,
     storage: Arc<Storage>,
@@ -1172,81 +1003,57 @@ pub async fn run_bootstrap(
     verify_merkle_consistency(&manifest, &chunks)
         .context("snapshot Merkle root verification failed")?;
 
-    // Phase 3: re-verify the snapshot's STATE_ANCHORS against Klever
-    // and find the highest matching anchor. The producer's claim of
-    // `last_verified_anchor_height` is NOT trusted any more — we always
-    // ask Klever directly. Any anchor whose state_root differs from
-    // on-chain truth is a *poisoned snapshot* — hard abort.
-    let anchor_chunks = chunks
-        .get(crate::storage::schema::cf::STATE_ANCHORS)
-        .ok_or_else(|| anyhow!("STATE_ANCHORS chunks missing from decoded fetch"))?;
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .context("building HTTP client for Klever anchor verify")?;
-    // Small-network escape hatch (re-introduced in v0.46.4). On a
-    // network with fewer than ANCHOR_QUORUM_MIN (=3) active anchorers,
-    // the SC's `getStateRoot` returns "Anchor not found" for every
-    // recent height — no quorum has been reached, so no
-    // canonical_anchor entry exists. The anti-downgrade ratchet then
-    // correctly refuses the snapshot. Operators who control all the
-    // anchorers (testnet, dev pair) can opt out of the Klever check
-    // explicitly. Quorum + Merkle + producer Ed25519 sig still apply.
-    let cutoff_height = if config.experimental_skip_anchor_verify {
+    // The rows must be exactly what the chain's final canonical anchored
+    // root at this height commits to. Checked BEFORE anything is written.
+    let content_root = match recompute_anchored_root(&chunks) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(error = %e, "Snapshot content is invalid — falling back to chain scan");
+            return Ok(None);
+        }
+    };
+    let cutoff_height = manifest.block_height;
+    if config.experimental_skip_anchor_verify {
+        // Small-network escape hatch: fewer than ANCHOR_QUORUM_MIN (=3)
+        // anchorers means no height ever goes canonical. Operators who
+        // control every anchorer may opt out explicitly; quorum, Merkle,
+        // row validation and the producer signature still apply.
         warn!(
-            block_height = manifest.block_height,
-            last_verified_anchor_height = manifest.last_verified_anchor_height,
-            "experimental_skip_anchor_verify=true — bypassing Klever anchor re-verification. \
-             Use ONLY when you control every anchorer and the SC quorum precondition can't \
-             be satisfied. Production deployments must leave this flag false."
+            block_height = cutoff_height,
+            content_root = %hex::encode(content_root),
+            "experimental_skip_anchor_verify=true — NOT checking the snapshot against the \
+             canonical anchored root. Use ONLY when you control every anchorer."
         );
-        // Without Klever verification, the safe cutoff is the
-        // manifest's block_height (where the snapshot was captured).
-        // The chain scanner picks up from there.
-        manifest.block_height
     } else {
-        let anchor_result = match verify_anchors_against_klever(
-            anchor_chunks,
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .context("building HTTP client for Klever anchor verify")?;
+        let canonical = match crate::chain::sc_views::get_final_canonical_anchor(
             &http,
             klever_node_url,
             contract_address,
+            cutoff_height,
         )
         .await
         {
-            Ok(r) => r,
+            Ok(c) => c,
             Err(e) => {
-                warn!(
-                    error = %e,
-                    "Anchor verification failed — falling back to chain scan. \
-                     If you're on a single-anchorer testnet, this is expected because \
-                     the SC requires 3+ distinct anchorers to canonicalize. Set \
-                     [snapshot] experimental_skip_anchor_verify = true to bypass."
-                );
+                warn!(error = %e, "Could not read the canonical anchored root — falling back to chain scan");
                 return Ok(None);
             }
         };
-
-        // Audit final pre-mainnet C2: the STATE_ANCHORS record just proved
-        // above is genuine and on-chain — but it's public and copyable on
-        // its own. Prove the OTHER content in this snapshot (delegations,
-        // users, channels) is genuine too, by recomputing the same root
-        // from what was actually received and requiring equality.
-        if let Err(e) = verify_content_matches_anchor(&chunks, &anchor_result) {
+        if let Err(e) = verify_root_against_canonical(content_root, canonical.as_deref(), cutoff_height) {
             warn!(
                 error = %e,
-                "Snapshot content does not match its verified anchor — falling back to chain scan."
+                "Snapshot not verified against the chain — falling back to chain scan. On a \
+                 network with fewer than 3 anchorers no height becomes canonical; set \
+                 [snapshot] experimental_skip_anchor_verify = true only if you control them all."
             );
             return Ok(None);
         }
-        info!(
-            cutoff_height = anchor_result.cutoff_height,
-            checked = anchor_result.checked,
-            total = anchor_result.total,
-            "Snapshot anchor verified against Klever"
-        );
-
-        anchor_result.cutoff_height
-    };
+        info!(cutoff_height, "Snapshot verified against the canonical anchored root");
+    }
 
     // Run apply in spawn_blocking — multi-CF clear+write is not async.
     let storage_for_apply = storage.clone();
@@ -1410,10 +1217,7 @@ mod tests {
         use rand::rngs::OsRng;
 
         let (storage, _dir) = fresh_storage();
-        storage
-            .put_cf(cf_names::USERS, b"klv1a", br#"{"display_name":"alice"}"#)
-            .unwrap();
-        storage.set_chain_cursor(50).unwrap();
+        seed_and_seal(&storage, 50);
 
         let key = SigningKey::generate(&mut OsRng);
         let cache = build_cache(&storage, "testnet", "node1", &key, 64 * 1024, codec::NONE).unwrap();
@@ -1448,10 +1252,7 @@ mod tests {
         use rand::rngs::OsRng;
 
         let (storage, _dir) = fresh_storage();
-        storage
-            .put_cf(cf_names::USERS, b"klv1a", br#"{"display_name":"alice"}"#)
-            .unwrap();
-        storage.set_chain_cursor(50).unwrap();
+        seed_and_seal(&storage, 50);
 
         let key = SigningKey::generate(&mut OsRng);
         let cache = build_cache(&storage, "testnet", "node1", &key, 64 * 1024, codec::NONE).unwrap();
@@ -1475,13 +1276,9 @@ mod tests {
         // malicious peer in the agreeing group. Real attacker would also
         // rewrite chunk_hash in the manifest, but the manifest's cf_root
         // would no longer match the actual rows — which is what we catch.
-        if let Some(users_chunks) = decoded.get_mut(cf_names::USERS) {
-            if let Some(c) = users_chunks.first_mut() {
-                if let Some((_, v)) = c.entries.first_mut() {
-                    *v = br#"{"display_name":"mallory","admin":true}"#.to_vec();
-                }
-            }
-        }
+        let chunks = decoded.get_mut(cf_names::ANCHORED_STATE).expect("anchored_state chunks");
+        let (_, v) = chunks[0].entries.first_mut().expect("a row");
+        *v = br#"{"channel_id":7,"creator":"klv1mallory","slug":"general"}"#.to_vec();
 
         let result = verify_merkle_consistency(&cache.manifest, &decoded);
         assert!(result.is_err(), "tampered row must fail Merkle verification");
@@ -1598,155 +1395,38 @@ mod tests {
         assert!(result.is_err(), "must refuse to overwrite existing path");
     }
 
-    /// End-to-end: populate the snapshot domain CFs, build a snapshot via
-    /// `build_cache`, wipe the DB, apply the snapshot, and verify state
-    /// matches the original.
-    #[test]
-    fn full_apply_roundtrip_against_real_rocksdb() {
-        use crate::network::snapshot::build_cache;
-        use crate::storage::schema::snapshot::codec;
-        use ed25519_dalek::SigningKey;
-        use rand::rngs::OsRng;
-
-        let (source_storage, source_dir) = fresh_storage();
-
-        // Populate every snapshot-domain CF with some data.
-        let users = vec![
-            (b"klv1a".as_ref(), br#"{"display_name":"alice"}"#.as_ref()),
-            (b"klv1b".as_ref(), br#"{"display_name":"bob"}"#.as_ref()),
-        ];
-        for (k, v) in &users {
-            source_storage.put_cf(cf_names::USERS, k, v).unwrap();
-        }
-        source_storage
-            .put_cf(cf_names::NODE_STATE, schema::state_keys::TOTAL_USERS, &2u64.to_be_bytes())
+    /// Seed the chain mirror, seal it at `height`, and return the root.
+    fn seed_and_seal(storage: &Storage, height: u64) -> [u8; 32] {
+        storage.anchored_register_user("klv1a", "aa").unwrap();
+        storage.anchored_register_user("klv1b", "bb").unwrap();
+        storage.anchored_create_channel(7, "general", "klv1a").unwrap();
+        storage
+            .anchored_delegate(&crate::storage::anchored_state::AnchoredDelegation {
+                created_at: 1_700_000_000,
+                device_key: "dd".repeat(32),
+                expires_at: 0,
+                permissions: 7,
+                revoked_at: 0,
+                user: "klv1a".into(),
+            })
             .unwrap();
-        source_storage
-            .put_cf(cf_names::CHANNELS, &7u64.to_be_bytes(), br#"{"name":"general"}"#)
-            .unwrap();
-        source_storage
-            .put_cf(cf_names::NODE_STATE, schema::state_keys::TOTAL_CHANNELS, &1u64.to_be_bytes())
-            .unwrap();
-        source_storage
-            .put_cf(
-                cf_names::CHANNEL_MEMBERS,
-                &crate::storage::schema::encode_channel_member_key(7, "klv1a"),
-                br#"{"joined_at":1700000000000,"role":"member"}"#,
-            )
-            .unwrap();
-        source_storage.set_chain_cursor(12345).unwrap();
-
-        // Build a snapshot from the source.
-        let signing_key = SigningKey::generate(&mut OsRng);
-        let cache = build_cache(
-            &source_storage,
-            "testnet",
-            "test_node",
-            &signing_key,
-            64 * 1024, // 64 KiB chunks — small so we exercise multi-chunk
-            codec::NONE,
-        )
-        .expect("build_cache");
-
-        // Decode every chunk back into payloads (mimics what fetch_all_chunks
-        // delivers to apply_snapshot).
-        let mut decoded: HashMap<String, Vec<ChunkPayload>> = HashMap::new();
-        for cf in &cache.manifest.cfs {
-            let mut by_cf: Vec<ChunkPayload> = Vec::with_capacity(cf.chunks.len());
-            for header in &cf.chunks {
-                let payload_arc = cache
-                    .chunks
-                    .get(&(cf.cf_name.clone(), header.seq))
-                    .expect("chunk in cache");
-                let payload = crate::storage::snapshot::decode_chunk(
-                    payload_arc.as_slice(),
-                    header.codec,
-                    &header.chunk_hash,
-                    header.uncompressed_bytes,
-                )
-                .expect("decode chunk");
-                by_cf.push(payload);
-            }
-            decoded.insert(cf.cf_name.clone(), by_cf);
-        }
-
-        // Apply onto a fresh (target) storage.
-        let (target_storage, target_dir) = fresh_storage();
-        let outcome = apply_snapshot(
-            &target_storage,
-            target_dir.path(),
-            &cache.manifest,
-            &decoded,
-            cache.manifest.block_height,
-        )
-        .expect("apply_snapshot");
-        assert_eq!(outcome.applied_at, cache.manifest.block_height);
-        assert_eq!(outcome.new_cursor, cache.manifest.block_height);
-
-        // Verify state matches.
-        for (k, v) in &users {
-            let got = target_storage.get_cf(cf_names::USERS, k).unwrap();
-            assert_eq!(got.as_deref(), Some(*v), "user {} should round-trip", String::from_utf8_lossy(k));
-        }
-        let chan = target_storage
-            .get_cf(cf_names::CHANNELS, &7u64.to_be_bytes())
-            .unwrap();
-        assert!(chan.is_some(), "channel 7 should round-trip");
-
-        // Sentinel + counters set.
-        let sentinel = target_storage
-            .get_cf(cf_names::NODE_STATE, schema::state_keys::SNAPSHOT_APPLIED_AT_HEIGHT)
-            .unwrap()
-            .expect("sentinel written");
-        assert_eq!(
-            u64::from_be_bytes(sentinel.try_into().unwrap()),
-            cache.manifest.block_height
-        );
-        let cursor = target_storage.get_chain_cursor().unwrap();
-        assert_eq!(cursor, cache.manifest.block_height);
-        let total_users = target_storage
-            .get_stat(schema::state_keys::TOTAL_USERS)
-            .unwrap();
-        assert_eq!(total_users, 2);
-
-        // Rollback dir was created and is openable.
-        assert!(outcome.rollback_dir.exists());
-        let restored = Storage::open(&outcome.rollback_dir).expect("open rollback");
-        // Restored storage is empty (target started fresh, checkpoint
-        // captured pre-apply state which had nothing in DOMAIN_CFS).
-        let restored_users = restored
-            .prefix_iter_cf(cf_names::USERS, &[], 10)
-            .unwrap();
-        assert!(restored_users.is_empty(), "rollback captured pre-apply (empty) state");
-
-        // C2: the anchored content root (now covering CHANNEL_MEMBERS too)
-        // must survive the snapshot round-trip byte-for-byte.
-        let (source_root, ..) = source_storage.compute_current_state_root().unwrap();
-        let (target_root, ..) = target_storage.compute_current_state_root().unwrap();
-        assert_eq!(
-            source_root, target_root,
-            "content state root must survive a full snapshot apply round-trip"
-        );
-
-        // Drop source so tempdir cleanup runs.
-        drop(source_storage);
-        drop(source_dir);
+        let cp = storage.compute_state_checkpoint().unwrap();
+        storage.store_state_checkpoint(height, &cp).unwrap();
+        cp.state_root
     }
 
-    // --- C2 fix: content-vs-anchor binding tests ---
-
     /// Build decoded chunks from `storage` via the real `build_cache` +
-    /// `decode_chunk` pipeline — mirrors `full_apply_roundtrip_against_real_rocksdb`.
-    fn build_decoded_chunks(storage: &Storage) -> HashMap<String, DecodedChunks> {
+    /// `decode_chunk` pipeline (what `fetch_all_chunks` delivers).
+    fn build_decoded(storage: &Storage) -> (SnapshotManifest, HashMap<String, DecodedChunks>) {
         use crate::network::snapshot::build_cache;
         use crate::storage::schema::snapshot::codec;
         use ed25519_dalek::SigningKey;
         use rand::rngs::OsRng;
 
         let signing_key = SigningKey::generate(&mut OsRng);
-        let cache = build_cache(storage, "testnet", "test_node", &signing_key, 64 * 1024, codec::NONE)
+        // 64-byte chunks: several chunks, so ordering across seqs is exercised.
+        let cache = build_cache(storage, "testnet", "test_node", &signing_key, 64, codec::NONE)
             .expect("build_cache");
-
         let mut decoded: HashMap<String, DecodedChunks> = HashMap::new();
         for cf in &cache.manifest.cfs {
             let mut by_cf: Vec<ChunkPayload> = Vec::with_capacity(cf.chunks.len());
@@ -1766,228 +1446,123 @@ mod tests {
             }
             decoded.insert(cf.cf_name.clone(), by_cf);
         }
-        decoded
+        (cache.manifest, decoded)
     }
 
-    fn seed_users_channels_delegations(storage: &Storage) {
-        storage.put_cf(cf_names::USERS, b"klv1a", br#"{"display_name":"alice"}"#).unwrap();
-        storage.put_cf(cf_names::USERS, b"klv1b", br#"{"display_name":"bob"}"#).unwrap();
-        storage
-            .put_cf(cf_names::CHANNELS, &7u64.to_be_bytes(), br#"{"name":"general"}"#)
-            .unwrap();
-        storage
-            .put_cf(
-                cf_names::DELEGATIONS,
-                b"ogd1device1",
-                br#"{"user_address":"klv1a","device_pub_key":"aa","active":true}"#,
-            )
-            .unwrap();
-        storage
-            .put_cf(
-                cf_names::CHANNEL_MEMBERS,
-                &crate::storage::schema::encode_channel_member_key(7, "klv1a"),
-                br#"{"joined_at":1700000000000,"role":"member"}"#,
-            )
-            .unwrap();
-    }
-
+    /// End-to-end: seal a chain mirror, change it afterwards, build a
+    /// snapshot, verify it, apply it to a fresh DB, and check the target
+    /// holds exactly the sealed state — and nothing gossip-derived.
     #[test]
-    fn recompute_content_state_root_matches_live_compute_current_state_root() {
-        // Load-bearing correctness proof: the order snapshot chunks are
-        // decoded in must exactly match live-DB iteration order, or the
-        // whole C2 fix silently always rejects genuine snapshots.
-        let (storage, _dir) = fresh_storage();
-        seed_users_channels_delegations(&storage);
-
-        let (live_root, _, _, _) = storage.compute_current_state_root().unwrap();
-        let decoded = build_decoded_chunks(&storage);
-        let recomputed_root = recompute_content_state_root(&decoded).unwrap();
-
-        assert_eq!(
-            live_root, recomputed_root,
-            "recompute_content_state_root must reproduce compute_current_state_root exactly"
-        );
-    }
-
-    #[test]
-    fn recompute_content_state_root_detects_channel_member_key_reassignment() {
-        // C2 attack shape specific to CHANNEL_MEMBERS: its value
-        // ({"joined_at","role"}) doesn't redundantly encode channel_id/
-        // address the way USERS/DELEGATIONS values do. An attacker who
-        // could reassign a genuine value to a different key (grant
-        // themselves membership in someone else's private channel) must
-        // NOT get away with an unchanged root.
-        let (genuine, _d1) = fresh_storage();
-        seed_users_channels_delegations(&genuine);
-        let (genuine_root, _, _, _) = genuine.compute_current_state_root().unwrap();
-
-        let (reassigned, _d2) = fresh_storage();
-        seed_users_channels_delegations(&reassigned);
-        // Overwrite with the SAME value bytes as seed_users_channels_delegations'
-        // membership row, but under a DIFFERENT (channel_id, address) key —
-        // remove the genuine row, add the attacker's.
-        reassigned
-            .delete_cf(
-                cf_names::CHANNEL_MEMBERS,
-                &crate::storage::schema::encode_channel_member_key(7, "klv1a"),
-            )
-            .unwrap();
-        reassigned
+    fn full_apply_roundtrip_against_real_rocksdb() {
+        let (source, _source_dir) = fresh_storage();
+        let sealed_root = seed_and_seal(&source, 12_600);
+        // After the seal: the snapshot must still serve the sealed state.
+        source.anchored_register_user("klv1late", "cc").unwrap();
+        source.set_chain_cursor(12_999).unwrap();
+        // Gossip rows must never travel.
+        source.put_cf(cf_names::USERS, b"klv1a", br#"{"display_name":"alice"}"#).unwrap();
+        source
             .put_cf(
                 cf_names::CHANNEL_MEMBERS,
-                &crate::storage::schema::encode_channel_member_key(99, "klv1mallory"),
-                br#"{"joined_at":1700000000000,"role":"member"}"#,
+                &crate::storage::schema::encode_channel_member_key(7, "klv1b"),
+                br#"{"joined_at":1,"role":"member"}"#,
             )
             .unwrap();
-        let (reassigned_root, _, _, _) = reassigned.compute_current_state_root().unwrap();
 
-        assert_ne!(
-            genuine_root, reassigned_root,
-            "reassigning a genuine membership value to a different (channel_id, address) \
-             key must change the anchored root"
-        );
+        let (manifest, decoded) = build_decoded(&source);
+        assert_eq!(manifest.block_height, 12_600);
+        assert_eq!((manifest.total_users, manifest.total_channels), (2, 1));
+        assert!(decoded[cf_names::ANCHORED_STATE].len() > 1, "multi-chunk");
+        let content_root = recompute_anchored_root(&decoded).unwrap();
+        assert_eq!(content_root, sealed_root);
+        verify_root_against_canonical(content_root, Some(&hex::encode(sealed_root)), 12_600).unwrap();
+
+        let (target, target_dir) = fresh_storage();
+        let outcome = apply_snapshot(&target, target_dir.path(), &manifest, &decoded, manifest.block_height)
+            .expect("apply_snapshot");
+        assert_eq!(outcome.new_cursor, 12_600);
+        assert_eq!(target.get_chain_cursor().unwrap(), 12_600);
+        let (target_root, ..) = target.compute_current_state_root().unwrap();
+        assert_eq!(target_root, sealed_root, "the target mirror is the sealed state");
+        assert!(target.anchored_user("klv1late").unwrap().is_none());
+        assert!(target.anchored_state_migrated().unwrap());
+
+        // Chain rows derived; gossip content absent.
+        let a: serde_json::Value =
+            serde_json::from_slice(&target.get_cf(cf_names::USERS, b"klv1a").unwrap().unwrap()).unwrap();
+        assert_eq!(a["public_key"], "aa");
+        assert_eq!(a["registered_at"], crate::storage::anchored_state::REGISTERED_AT_UNKNOWN);
+        assert!(a.get("display_name").map_or(true, |v| v.is_null()));
+        assert!(target.get_cf(cf_names::CHANNELS, &7u64.to_be_bytes()).unwrap().is_some());
+        assert!(target
+            .get_cf(cf_names::CHANNEL_MEMBERS, &crate::storage::schema::encode_channel_member_key(7, "klv1b"))
+            .unwrap()
+            .is_none());
+        assert_eq!(target.get_stat(schema::state_keys::TOTAL_USERS).unwrap(), 2);
+
+        // Rollback dir was created and is openable.
+        assert!(outcome.rollback_dir.exists());
+        Storage::open(&outcome.rollback_dir).expect("open rollback");
     }
 
     #[test]
-    fn verify_content_matches_anchor_accepts_genuine_snapshot() {
-        let (storage, _dir) = fresh_storage();
-        seed_users_channels_delegations(&storage);
-
-        let (live_root, _, _, _) = storage.compute_current_state_root().unwrap();
-        let decoded = build_decoded_chunks(&storage);
-        let anchor_result = AnchorVerifyResult {
-            cutoff_height: 100,
-            checked: 1,
-            total: 1,
-            state_root: hex::encode(live_root),
+    fn tampered_snapshot_rows_are_refused() {
+        let (source, _d) = fresh_storage();
+        seed_and_seal(&source, 900);
+        let (_, decoded) = build_decoded(&source);
+        let mutate = |f: &dyn Fn(&mut Vec<ChunkPayload>)| {
+            let mut d = decoded.clone();
+            f(d.get_mut(cf_names::ANCHORED_STATE).unwrap());
+            recompute_anchored_root(&d)
         };
-
-        assert!(verify_content_matches_anchor(&decoded, &anchor_result).is_ok());
+        // A user filed under another address.
+        assert!(mutate(&|c| {
+            let row = c.iter_mut().flat_map(|p| p.entries.iter_mut()).find(|(k, _)| k[0] == b'u').unwrap();
+            row.0 = crate::storage::anchored_state::user_key("klv1zzz");
+        })
+        .is_err());
+        // Rows out of order (chunks swapped).
+        assert!(mutate(&|c| {
+            let first = c.remove(0);
+            for p in c.iter_mut() {
+                p.seq -= 1;
+            }
+            let mut first = first;
+            first.seq = c.len() as u32;
+            c.push(first);
+        })
+        .is_err());
+        // An unknown prefix.
+        assert!(mutate(&|c| c[0].entries.insert(0, (b"a".to_vec(), b"{}".to_vec()))).is_err());
+        // A changed value under the right key still recomputes, but to a
+        // different root — which the canonical check refuses.
+        let changed = mutate(&|c| {
+            let row = c.iter_mut().flat_map(|p| p.entries.iter_mut()).find(|(k, _)| k[0] == b'u').unwrap();
+            row.1 = br#"{"address":"klv1a","public_key":"ff"}"#.to_vec();
+        })
+        .unwrap();
+        let genuine = recompute_anchored_root(&decoded).unwrap();
+        assert_ne!(changed, genuine);
+        assert!(verify_root_against_canonical(changed, Some(&hex::encode(genuine)), 900).is_err());
     }
 
     #[test]
-    fn verify_content_matches_anchor_rejects_fabricated_content() {
-        // The exact C2 attack shape: a genuine (copied) STATE_ANCHORS
-        // record's state_root, bundled beside fabricated DELEGATIONS/USERS
-        // content the attacker actually controls.
-        let (storage, _dir) = fresh_storage();
-        seed_users_channels_delegations(&storage);
-        let decoded = build_decoded_chunks(&storage);
-
-        let anchor_result = AnchorVerifyResult {
-            cutoff_height: 100,
-            checked: 1,
-            total: 1,
-            // A real-looking but WRONG root — simulates a genuine anchor
-            // record copied from a different, unrelated snapshot.
-            state_root: hex::encode([0xAAu8; 32]),
-        };
-
-        let err = verify_content_matches_anchor(&decoded, &anchor_result)
-            .expect_err("mismatched content must be rejected");
-        assert!(err.to_string().contains("POISONED SNAPSHOT"));
-    }
-
-    // --- Phase 3 anchor verification tests ---
-
-    use crate::chain::anchor_verify::AnchorVerifyOutcome;
-
-    fn anchor_chunk_payload(records: Vec<crate::chain::types::StateAnchorRecord>) -> ChunkPayload {
-        let entries: Vec<(Vec<u8>, Vec<u8>)> = records
-            .into_iter()
-            .map(|r| {
-                let key = r.block_height.to_be_bytes().to_vec();
-                let val = serde_json::to_vec(&r).unwrap();
-                (key, val)
-            })
-            .collect();
-        ChunkPayload {
-            cf_name: cf_names::STATE_ANCHORS.to_string(),
-            seq: 0,
-            entries,
-        }
-    }
-
-    fn anchor_record(block_height: u64, state_root: &str) -> crate::chain::types::StateAnchorRecord {
-        crate::chain::types::StateAnchorRecord {
-            block_height,
-            state_root: state_root.to_string(),
-            message_count: 0,
-            channel_count: 0,
-            user_count: 0,
-            node_id: "test".into(),
-            anchorer: String::new(),
-            anchored_at: 0,
-        }
-    }
-
-    /// Smoke test for the anchor verification iteration logic — the SC
-    /// query itself isn't unit-testable here (it requires Klever RPC),
-    /// so this test exercises the data extraction + sort + outcome
-    /// handling pieces by parsing chunks and inspecting the structures.
-    /// Full end-to-end verification is in the manual integration test.
-    #[test]
-    fn anchor_chunks_parse_and_sort_descending() {
-        use crate::chain::types::StateAnchorRecord;
-
-        let chunk = anchor_chunk_payload(vec![
-            anchor_record(100, "aa".repeat(32).as_str()),
-            anchor_record(300, "cc".repeat(32).as_str()),
-            anchor_record(200, "bb".repeat(32).as_str()),
-        ]);
-
-        // Re-parse like verify_anchors_against_klever would.
-        let mut parsed: Vec<StateAnchorRecord> = chunk
-            .entries
-            .iter()
-            .map(|(_, v)| serde_json::from_slice(v).unwrap())
-            .collect();
-        parsed.sort_by(|a, b| b.block_height.cmp(&a.block_height));
-
-        assert_eq!(parsed.len(), 3);
-        assert_eq!(parsed[0].block_height, 300);
-        assert_eq!(parsed[1].block_height, 200);
-        assert_eq!(parsed[2].block_height, 100);
+    fn the_canonical_root_decides() {
+        let root = [7u8; 32];
+        assert!(verify_root_against_canonical(root, Some(&hex::encode(root)), 1).is_ok());
+        assert!(verify_root_against_canonical(root, Some(&hex::encode(root).to_uppercase()), 1).is_ok());
+        assert!(verify_root_against_canonical(root, Some(&"00".repeat(32)), 1).is_err());
+        assert!(verify_root_against_canonical(root, None, 1).is_err(), "nothing canonical yet");
     }
 
     #[test]
-    fn anchor_outcome_variants_distinguish_correctly() {
-        let m = AnchorVerifyOutcome::Match;
-        let na = AnchorVerifyOutcome::NotAnchored;
-        let mm = AnchorVerifyOutcome::Mismatch {
-            on_chain: "aa".into(),
-            in_snapshot: "bb".into(),
-        };
-        assert_ne!(m, na);
-        assert_ne!(m, mm);
-        assert_ne!(na, mm);
-    }
-
-    #[test]
-    fn anchor_chunk_with_bad_key_length_is_rejected_pattern() {
-        // The verify_anchors_against_klever loop checks `key.len() != 8`.
-        // We can confirm the key-length invariant by inspecting a built
-        // chunk: every anchor key is exactly 8 bytes (block_height_be).
-        let chunk = anchor_chunk_payload(vec![anchor_record(100, &"aa".repeat(32))]);
-        for (k, _) in &chunk.entries {
-            assert_eq!(k.len(), 8, "every STATE_ANCHORS key must be 8 bytes");
-        }
-    }
-
-    #[test]
-    fn anchor_chunk_key_value_height_mismatch_is_detected() {
-        // Manual tamper: key says height=100 but record says height=999.
-        let mut chunk = anchor_chunk_payload(vec![anchor_record(999, &"aa".repeat(32))]);
-        // Overwrite key to 100 while value still says 999.
-        chunk.entries[0].0 = 100u64.to_be_bytes().to_vec();
-
-        let entry = &chunk.entries[0];
-        let key_height = u64::from_be_bytes(entry.0.as_slice().try_into().unwrap());
-        let record: crate::chain::types::StateAnchorRecord =
-            serde_json::from_slice(&entry.1).unwrap();
-        assert_eq!(key_height, 100);
-        assert_eq!(record.block_height, 999);
-        // verify_anchors_against_klever catches this with `bail!`.
+    fn a_node_without_a_sealed_checkpoint_serves_no_snapshot() {
+        use crate::network::snapshot::build_cache;
+        use crate::storage::schema::snapshot::codec;
+        let (s, _d) = fresh_storage();
+        s.anchored_register_user("klv1a", "aa").unwrap();
+        let key = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+        assert!(build_cache(&s, "testnet", "n", &key, 64, codec::NONE).is_err());
     }
 
     // --- Phase 3 rollback GC test ---
@@ -2054,12 +1629,7 @@ mod tests {
         use rand::rngs::OsRng;
 
         let (source, _src_dir) = fresh_storage();
-        // JSON-valued — USERS rows must parse as JSON per the receiver's
-        // per-row validation (audit fix Phase 2 Sec C3).
-        source
-            .put_cf(cf_names::USERS, b"klv1a", br#"{"display_name":"alpha"}"#)
-            .unwrap();
-        source.set_chain_cursor(100).unwrap();
+        seed_and_seal(&source, 100);
 
         let signing = SigningKey::generate(&mut OsRng);
         let cache = build_cache(&source, "testnet", "node1", &signing, 64 * 1024, codec::NONE)

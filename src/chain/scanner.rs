@@ -151,7 +151,22 @@ pub struct ChainScanner {
     /// Timestamp of the last outbound Klever API call, for
     /// `throttle_klever_request`'s self-imposed pacing. `tokio::sync::Mutex`
     /// since the throttle is held across an `.await` (the sleep itself).
-    last_klever_request: tokio::sync::Mutex<Option<tokio::time::Instant>>,
+    last_klever_request: super::anchored_repair::Throttle,
+    /// Anchor boundaries are the multiples of this many blocks
+    /// (`AnchoringConfig::interval_blocks`); the scanner seals the anchored
+    /// state at each one it crosses.
+    anchor_interval_blocks: u64,
+    /// Chain tip seen by the last poll (0 before the first).
+    last_tip: u64,
+    /// When `last_tip` was last refreshed by a successful poll.
+    last_tip_at: Option<tokio::time::Instant>,
+    /// Fills the anchored mirror from SC views (runs while at tip).
+    repair: super::anchored_repair::AnchoredRepair,
+    /// Mirror keys this scanner wrote since the last repair tick.
+    mirror_touched: super::anchored_repair::MirrorTouched,
+    /// The node's shared device→wallet resolver (one cache for every
+    /// component, so an on-chain revoke takes effect everywhere at once).
+    identity: crate::storage::identity::IdentityResolver,
     /// Periodic public-channel creator re-verification policy (audit
     /// 2026-09-28) — see `sweep_channel_verification`.
     channel_verify_config: crate::config::ChannelVerifyConfig,
@@ -178,11 +193,50 @@ impl ChainScanner {
         channel_tx: tokio::sync::mpsc::UnboundedSender<u64>,
         klever_health: std::sync::Arc<std::sync::atomic::AtomicU64>,
         channel_verify_config: crate::config::ChannelVerifyConfig,
+        anchor_interval_blocks: u64,
+        repair_peers: Option<super::anchored_repair::PeerSource>,
+        identity: crate::storage::identity::IdentityResolver,
     ) -> Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
             .build()
             .context("creating HTTP client")?;
+
+        // 0.147.0 checkpoints commit to the v3 root, which is no longer
+        // computed; drop them so nothing serves or anchors them.
+        match storage.purge_legacy_state_checkpoints() {
+            Ok(0) => {}
+            Ok(n) => info!(heights = n, "Purged pre-v4 state checkpoints"),
+            Err(e) => warn!(error = %e, "Could not purge pre-v4 state checkpoints"),
+        }
+        // A mirror that fell behind the cursor (an older release ran the
+        // scanner in between) may miss changes: re-verify before sealing.
+        let mirror_cursor = storage
+            .get_cf(cf::NODE_STATE, crate::storage::schema::state_keys::ANCHORED_MIRROR_CURSOR)?
+            .and_then(|raw| Some(u64::from_be_bytes(raw.as_slice().try_into().ok()?)));
+        let cursor = storage.get_chain_cursor()?;
+        if storage.anchored_state_migrated()? && mirror_cursor.is_none_or(|m| m < cursor) {
+            warn!(
+                cursor,
+                ?mirror_cursor,
+                "The anchored mirror is behind the chain cursor (a downgrade round-trip?) — re-verifying it before sealing again"
+            );
+            storage.delete_cf(cf::NODE_STATE, crate::storage::schema::state_keys::ANCHORED_STATE_MIGRATED_V1)?;
+        }
+        let last_klever_request: super::anchored_repair::Throttle =
+            std::sync::Arc::new(tokio::sync::Mutex::new(None));
+        let mirror_touched: super::anchored_repair::MirrorTouched = Default::default();
+        let repair = super::anchored_repair::AnchoredRepair::new(
+            storage.clone(),
+            http.clone(),
+            config.node_url.clone(),
+            config.contract_address.clone(),
+            last_klever_request.clone(),
+            Duration::from_millis(KLEVER_REQUEST_MIN_SPACING_MS),
+            repair_peers,
+            mirror_touched.clone(),
+            identity.clone(),
+        );
 
         let mut last_block = storage.get_chain_cursor()?;
 
@@ -212,7 +266,13 @@ impl ChainScanner {
             consecutive_429s: 0,
             channel_tx,
             created_channel_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
-            last_klever_request: tokio::sync::Mutex::new(None),
+            last_klever_request,
+            anchor_interval_blocks: anchor_interval_blocks.max(1),
+            last_tip: 0,
+            last_tip_at: None,
+            repair,
+            mirror_touched,
+            identity,
             channel_verify_config,
             klever_health,
         })
@@ -252,6 +312,9 @@ impl ChainScanner {
             None
         };
 
+        let mut repair_interval = tokio::time::interval(super::anchored_repair::REPAIR_TICK);
+        repair_interval.tick().await; // skip immediate tick
+
         loop {
             tokio::select! {
                 _ = async {
@@ -261,6 +324,12 @@ impl ChainScanner {
                     }
                 } => {
                     self.sweep_channel_verification(&mut shutdown_rx).await;
+                }
+                _ = repair_interval.tick() => {
+                    // Only at the tip: block polling always comes first.
+                    if self.at_tip() {
+                        self.repair.tick(self.last_block).await;
+                    }
                 }
                 _ = interval.tick() => {
                     // If we're in backoff, wait before trying
@@ -334,6 +403,8 @@ impl ChainScanner {
             crate::storage::schema::state_keys::CHAIN_TIP,
             &tip.to_be_bytes(),
         );
+        self.last_tip = tip;
+        self.last_tip_at = Some(tokio::time::Instant::now());
         let latest = tip.saturating_sub(CONFIRM_BLOCKS);
 
         if latest <= self.last_block {
@@ -363,13 +434,26 @@ impl ChainScanner {
         let mut current = self.last_block + 1;
 
         while current <= latest {
-            let end = (current + batch_size - 1).min(latest);
+            // Never run past an anchor boundary inside one batch: the
+            // anchored state is sealed exactly when the boundary block has
+            // been applied and nothing after it.
+            let boundary = next_anchor_boundary(current, self.anchor_interval_blocks);
+            let end = (current + batch_size - 1).min(latest).min(boundary);
 
             self.process_block_range(current, end).await?;
 
+            // Seal BEFORE the cursor moves past the boundary. A failed seal
+            // only costs this height its anchor — it must never stall the
+            // scanner (every chain event would stop).
+            if end == boundary && self.should_seal(end, tip) {
+                if let Err(e) = self.seal_anchor_checkpoint(end).await {
+                    warn!(height = end, error = %e, "Sealing the anchored state failed — this height gets no anchor");
+                }
+            }
+
             // Update cursor after successful batch
             self.last_block = end;
-            self.storage.set_chain_cursor(end)?;
+            self.storage.set_chain_cursor_with_mirror(end)?;
             // Snapshot-bootstrap GC: if a recent snapshot apply left a
             // rollback checkpoint on disk and we've now scanned far enough
             // past the cutoff to consider it safely committed, delete it.
@@ -403,6 +487,76 @@ impl ChainScanner {
             info!(cursor = self.last_block, "Catch-up scan complete");
         }
 
+        Ok(())
+    }
+
+    /// Record a mirror key this scanner wrote (see `MirrorTouched`).
+    fn touch(&self, key: Vec<u8>) {
+        match self.mirror_touched.lock() {
+            Ok(mut set) => {
+                set.insert(key);
+            }
+            Err(poisoned) => {
+                poisoned.into_inner().insert(key);
+            }
+        }
+    }
+
+    /// Whether the scanner is caught up with a recently polled chain tip.
+    /// A stale tip (the API down) does not count: the repair sweep must not
+    /// run ahead of a frozen cursor.
+    fn at_tip(&self) -> bool {
+        self.last_tip_at.is_some_and(|t| t.elapsed() < Duration::from_secs(120))
+            && self.last_block.saturating_add(CONFIRM_BLOCKS + 100) >= self.last_tip
+    }
+
+    /// Whether the boundary `height` gets a sealed checkpoint: the mirror
+    /// must have been filled once (migration), and the boundary must be
+    /// recent enough to anchor (a catching-up node skips older ones — the
+    /// SC would refuse them below its per-anchorer floor anyway).
+    fn should_seal(&self, height: u64, tip: u64) -> bool {
+        if height < tip.saturating_sub(2 * self.anchor_interval_blocks) {
+            return false;
+        }
+        match self.storage.anchored_state_migrated() {
+            Ok(true) => true,
+            Ok(false) => {
+                info!(height, "Anchor boundary reached but the anchored mirror is still being filled — not sealing yet");
+                false
+            }
+            Err(e) => {
+                warn!(height, error = %e, "Could not read the anchored-state migration flag — not sealing");
+                false
+            }
+        }
+    }
+
+    /// Seal the anchored state at boundary `height`: the exact rows the
+    /// chain mirror holds after applying every block up to `height`.
+    async fn seal_anchor_checkpoint(&self, height: u64) -> Result<()> {
+        // Never re-seal a height (a crash between seal and cursor write
+        // re-processes the batch): its root may already be submitted, and
+        // proofs must keep matching it.
+        if self.storage.load_state_checkpoint_header(height)?.is_some() {
+            return Ok(());
+        }
+        let storage = self.storage.clone();
+        let (root, counts) = tokio::task::spawn_blocking(move || -> Result<_> {
+            let cp = storage.compute_state_checkpoint()?;
+            let counts: Vec<usize> = cp.subtrees.iter().map(|st| st.keys.len()).collect();
+            storage.store_state_checkpoint(height, &cp)?;
+            Ok((cp.state_root, counts))
+        })
+        .await
+        .context("seal task panicked")??;
+        info!(
+            height,
+            state_root = %hex::encode(root),
+            users = counts[0],
+            channels = counts[1],
+            delegations = counts[2],
+            "Sealed anchored state checkpoint"
+        );
         Ok(())
     }
 
@@ -864,6 +1018,10 @@ impl ChainScanner {
                 public_key,
                 timestamp,
             } => {
+                // The anchored chain mirror first (state root v4) — it holds
+                // exactly what the chain says, independent of the gossip row.
+                self.storage.anchored_register_user(&address, &public_key)?;
+                self.touch(crate::storage::anchored_state::user_key(&address));
                 // Merge with existing record to preserve profile data.
                 // The chain scanner may re-process blocks, so this must be idempotent.
                 //
@@ -926,6 +1084,8 @@ impl ChainScanner {
                 address,
                 public_key,
             } => {
+                self.storage.anchored_update_user_key(&address, &public_key)?;
+                self.touch(crate::storage::anchored_state::user_key(&address));
                 if let Some(existing) = self.storage.get_cf(cf::USERS, address.as_bytes())? {
                     // Same helper as the UserRegistered arm — see its doc comment
                     // for why this must not go through `UserRecord`.
@@ -966,6 +1126,12 @@ impl ChainScanner {
                         return Err(e);
                     }
                 };
+
+                // The mirror records the chain's channel unconditionally —
+                // an L2 deletion or a local private-row collision below does
+                // not change what the chain says.
+                self.storage.anchored_create_channel(channel_id, &slug, &creator)?;
+                self.touch(crate::storage::anchored_state::channel_key(channel_id));
 
                 let channel_key = channel_id.to_be_bytes();
 
@@ -1167,6 +1333,8 @@ impl ChainScanner {
                 channel_id,
                 to,
             } => {
+                self.storage.anchored_transfer_channel(channel_id, &to)?;
+                self.touch(crate::storage::anchored_state::channel_key(channel_id));
                 if let Some(existing) =
                     self.storage
                         .get_cf(cf::CHANNELS, &channel_id.to_be_bytes())?
@@ -1230,6 +1398,15 @@ impl ChainScanner {
                 expires_at,
                 timestamp,
             } => {
+                self.storage.anchored_delegate(&crate::storage::anchored_state::AnchoredDelegation {
+                    created_at: timestamp,
+                    device_key: device_key.clone(),
+                    expires_at,
+                    permissions,
+                    revoked_at: 0,
+                    user: user.clone(),
+                })?;
+                self.touch(crate::storage::anchored_state::delegation_key(&user, &device_key));
                 let record = DelegationRecord {
                     user_address: user.clone(),
                     device_pub_key: device_key.clone(),
@@ -1250,33 +1427,39 @@ impl ChainScanner {
                 // tombstones milliseconds). The row carries no off-chain
                 // signature (`wallet_signature` empty): it is never a portable
                 // delegation proof.
-                let device = hex::decode(&device_key)
-                    .ok()
-                    .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
-                    .and_then(|pk| ed25519_dalek::VerifyingKey::from_bytes(&pk).ok())
-                    .and_then(|vk| crate::crypto::device_pubkey_to_address(&vk).ok());
+                let device = crate::storage::identity::device_address_from_hex_key(&device_key);
                 if let Some(device_address) = device {
                     let ts_ms = timestamp.saturating_mul(1000);
                     let revoked = self
                         .storage
                         .get_device_revoked_at(&device_address)?
-                        .is_some_and(|r| r >= ts_ms);
-                    // Never downgrade an existing wallet-signed
-                    // `/devices/register` row (same wallet) to an empty
-                    // signature — the mapping already exists.
-                    let has_signed_row = self
+                        // Strictly newer: a revoke and a re-delegation in the
+                        // same second (same block) apply in order, and the
+                        // revoke's tombstone (ts × 1000) must not drop the
+                        // re-delegation that follows it.
+                        .is_some_and(|r| r > ts_ms);
+                    // Never replace an existing same-wallet claim that is
+                    // wallet-signed (`/devices/register`) or at least as new
+                    // as this delegation (an L2 re-delegation a catching-up
+                    // node received before replaying this chain event) —
+                    // the mapping already exists, and lowering its
+                    // `registered_at` would let a replayed older revoke
+                    // unmap it (same rule as the router's L2 path).
+                    let has_newer_or_signed_row = self
                         .storage
                         .get_cf(cf::WALLET_DEVICES, &crate::storage::schema::encode_wallet_device_key(&user, &device_address))?
                         .and_then(|b| rmp_serde::from_slice::<crate::storage::rocks::DeviceClaim>(&b).ok())
-                        .is_some_and(|c| !c.wallet_signature.is_empty() && c.wallet_address == user)
+                        .is_some_and(|c| {
+                            c.wallet_address == user && (!c.wallet_signature.is_empty() || c.registered_at >= ts_ms)
+                        })
                         // A corrupt local mapping reads as "no signed row" (the
                         // registration below then reports its own error) — it
                         // must not fail the event, which would retry forever.
                         && self.storage.resolve_wallet(&device_address).ok().flatten().as_deref() == Some(user.as_str());
                     if revoked {
                         warn!(user = %user, device = %device_address, "on-chain delegation predates a revocation; mapping not written");
-                    } else if has_signed_row {
-                        debug!(user = %user, device = %device_address, "on-chain delegation: signed registration row kept");
+                    } else if has_newer_or_signed_row {
+                        debug!(user = %user, device = %device_address, "on-chain delegation: signed or newer registration row kept");
                     } else {
                         let claim = crate::storage::rocks::DeviceClaim {
                             device_address: device_address.clone(),
@@ -1285,9 +1468,7 @@ impl ChainScanner {
                             wallet_signature: String::new(),
                             registered_at: ts_ms,
                         };
-                        if let Err(e) = crate::storage::identity::IdentityResolver::new(self.storage.clone())
-                            .register_device(&claim)
-                        {
+                        if let Err(e) = self.identity.register_device(&claim) {
                             warn!(user = %user, device = %device_address, error = %e, "on-chain delegation mapping refused");
                         }
                     }
@@ -1296,7 +1477,9 @@ impl ChainScanner {
                 info!(user = %user, "Device delegated (on-chain)");
             }
 
-            ScEvent::DeviceRevoked { user, device_key } => {
+            ScEvent::DeviceRevoked { user, device_key, timestamp } => {
+                self.storage.anchored_revoke(&user, &device_key, timestamp)?;
+                self.touch(crate::storage::anchored_state::delegation_key(&user, &device_key));
                 let key = crate::storage::schema::encode_delegation_key(&user, &device_key);
                 if let Some(existing) = self.storage.get_cf(cf::DELEGATIONS, &key)? {
                     // A corrupt local row must not block a revocation (and
@@ -1317,6 +1500,17 @@ impl ChainScanner {
                     let bytes = serde_json::to_vec(&record)?;
                     self.storage.put_cf(cf::DELEGATIONS, &key, &bytes)?;
                     info!(user = %user, "Device revoked (on-chain)");
+                }
+                // Authentication resolves devices through the device→wallet
+                // map, not `DELEGATIONS`: remove the mapping (shared cache
+                // included) and write the revocation tombstone, so the device
+                // stops authenticating and a stale delegation cannot bring it
+                // back. Tombstones are milliseconds; chain time is seconds.
+                // Owner-checked: a device mapped to another wallet is left alone.
+                if let Some(device_address) = crate::storage::identity::device_address_from_hex_key(&device_key) {
+                    if self.identity.revoke_device_from_chain(&device_address, &user, timestamp.saturating_mul(1000))? {
+                        info!(user = %user, device = %device_address, "on-chain revoke: device mapping removed");
+                    }
                 }
             }
 
@@ -2320,6 +2514,11 @@ struct CollectedEvent {
     event: ScEvent,
 }
 
+/// The smallest multiple of `interval` that is `>= block` (`interval > 0`).
+fn next_anchor_boundary(block: u64, interval: u64) -> u64 {
+    block.div_ceil(interval).saturating_mul(interval)
+}
+
 /// Put events into chain order.
 ///
 /// Blocks ascend. Inside a block the API's own (newest-first) order is
@@ -2965,6 +3164,18 @@ mod event_order_tests {
         let mut got = order(ev);
         got.sort();
         assert_eq!(got, ["1-a-1", "1-a-2", "1-c-5", "2-a-3", "2-b-1"]);
+    }
+
+    #[test]
+    fn batches_stop_at_anchor_boundaries() {
+        assert_eq!(next_anchor_boundary(1, 900), 900);
+        assert_eq!(next_anchor_boundary(900, 900), 900);
+        assert_eq!(next_anchor_boundary(901, 900), 1800);
+        assert_eq!(next_anchor_boundary(13_945_673, 5_400), 13_948_200);
+        // A 6 h and a 4 h node both stop at every 12 h boundary.
+        let h12 = 12 * 900 * 1291;
+        assert_eq!(next_anchor_boundary(h12 - 5, 5_400), h12);
+        assert_eq!(next_anchor_boundary(h12 - 5, 3_600), h12);
     }
 
     #[test]
@@ -3797,12 +4008,16 @@ mod device_delegation_event_tests {
 
     fn scanner(storage: Storage) -> ChainScanner {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let storage_for_identity = storage.clone();
         ChainScanner::new(
             KleverConfig::default(),
             storage,
             tx,
             std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             crate::config::ChannelVerifyConfig::default(),
+            crate::config::BLOCKS_PER_HOUR,
+            None,
+            crate::storage::identity::IdentityResolver::new(storage_for_identity),
         )
         .unwrap()
     }
@@ -3838,13 +4053,48 @@ mod device_delegation_event_tests {
         // Another wallet cannot take the device over via the chain.
         sc.handle_event(event(&b, &h1, 2_000), "").await.unwrap();
         assert_eq!(storage.resolve_wallet(&d1).unwrap().as_deref(), Some(a.as_str()));
-        // A delegation at/before a revocation tombstone is not mapped.
+        // A delegation strictly before a revocation tombstone is not mapped.
         let (h2, d2) = dev(11);
-        storage.put_cf(cf::DEVICE_REVOCATIONS, d2.as_bytes(), &5_000_000u64.to_be_bytes()).unwrap();
+        storage.put_cf(cf::DEVICE_REVOCATIONS, d2.as_bytes(), &5_000_500u64.to_be_bytes()).unwrap();
         sc.handle_event(event(&a, &h2, 5_000), "").await.unwrap();
         assert_eq!(storage.resolve_wallet(&d2).unwrap(), None);
         sc.handle_event(event(&a, &h2, 5_001), "").await.unwrap();
         assert_eq!(storage.resolve_wallet(&d2).unwrap().as_deref(), Some(a.as_str()), "newer re-delegation");
+        // Round-8 W8-1: catching up, a newer L2 re-delegation arrived before
+        // the scanner replays an older chain delegate → revoke pair. The
+        // replayed delegation must not lower the claim's time, so the replayed
+        // revoke keeps the newer mapping.
+        let (h5, d5) = dev(14);
+        let l2_newer = crate::storage::rocks::DeviceClaim {
+            device_address: d5.clone(),
+            wallet_address: a.clone(),
+            device_pubkey_hex: h5.clone(),
+            wallet_signature: String::new(),
+            registered_at: 30_000_000,
+        };
+        storage.register_device(&l2_newer).unwrap();
+        sc.handle_event(event(&a, &h5, 10_000), "").await.unwrap();
+        sc.handle_event(
+            ScEvent::DeviceRevoked { user: a.clone(), device_key: h5.clone(), timestamp: 20_000 },
+            "",
+        )
+        .await
+        .unwrap();
+        assert_eq!(storage.resolve_wallet(&d5).unwrap().as_deref(), Some(a.as_str()), "newer L2 mapping kept");
+        // ...while a chain revoke LATER than that claim still unmaps it.
+        sc.handle_event(
+            ScEvent::DeviceRevoked { user: a.clone(), device_key: h5.clone(), timestamp: 40_000 },
+            "",
+        )
+        .await
+        .unwrap();
+        assert_eq!(storage.resolve_wallet(&d5).unwrap(), None, "a later chain revoke unmaps");
+        // Round-7 W3: revoke and re-delegation in the same block (equal
+        // seconds) — the re-delegation follows the revoke and is mapped.
+        let (h4, d4) = dev(13);
+        storage.put_cf(cf::DEVICE_REVOCATIONS, d4.as_bytes(), &8_000_000u64.to_be_bytes()).unwrap();
+        sc.handle_event(event(&a, &h4, 8_000), "").await.unwrap();
+        assert_eq!(storage.resolve_wallet(&d4).unwrap().as_deref(), Some(a.as_str()), "same-second re-delegation");
         // A wallet-signed registration row is not downgraded by the chain.
         let (h3, d3) = dev(12);
         let signed = crate::storage::rocks::DeviceClaim {

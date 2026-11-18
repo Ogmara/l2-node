@@ -31,16 +31,29 @@ const MAX_CACHE_ENTRIES: usize = 50_000;
 /// `None`.
 #[derive(Clone)]
 pub struct IdentityResolver {
-    /// In-memory cache: device_address → wallet_address (positive mappings only).
-    cache: DashMap<String, String>,
+    /// In-memory cache: device_address → wallet_address (positive mappings
+    /// only). Shared by every clone (`Arc`): the API, router, network and
+    /// chain scanner hold clones of one resolver, and a revoke through any of
+    /// them must evict the mapping for all — a per-clone copy kept a revoked
+    /// device authenticating elsewhere until restart (l2-node 0.148.0).
+    cache: std::sync::Arc<DashMap<String, String>>,
     storage: Storage,
+}
+
+/// The device address of a hex-encoded Ed25519 device public key (as the SC
+/// stores delegation keys), or `None` if it is not a valid key.
+pub fn device_address_from_hex_key(device_key: &str) -> Option<String> {
+    let bytes = hex::decode(device_key).ok()?;
+    let pk = <[u8; 32]>::try_from(bytes.as_slice()).ok()?;
+    let vk = ed25519_dalek::VerifyingKey::from_bytes(&pk).ok()?;
+    crate::crypto::device_pubkey_to_address(&vk).ok()
 }
 
 impl IdentityResolver {
     /// Create a new identity resolver backed by the given storage.
     pub fn new(storage: Storage) -> Self {
         Self {
-            cache: DashMap::new(),
+            cache: std::sync::Arc::new(DashMap::new()),
             storage,
         }
     }
@@ -151,6 +164,24 @@ impl IdentityResolver {
         Ok(revoked)
     }
 
+    /// An on-chain revoke (`revokeDevice`, from the chain scanner or the
+    /// anchored-state repair sweep) at `revoked_at` (ms). Last writer wins,
+    /// as for L2 revokes: a mapping registered AFTER the revoke (an L2
+    /// `DeviceDelegation` or `/devices/register` re-mapping the device later)
+    /// is newer than the chain event and is kept — otherwise replaying an old
+    /// on-chain revoke, or a node filling its mirror on upgrade, would lock
+    /// the user out of a legitimately re-registered device. Returns whether
+    /// the mapping was removed.
+    pub fn revoke_device_from_chain(&self, device_address: &str, wallet_address: &str, revoked_at: u64) -> Result<bool> {
+        let claim_key = super::schema::encode_wallet_device_key(wallet_address, device_address);
+        if let Some(raw) = self.storage.get_cf(super::schema::cf::WALLET_DEVICES, &claim_key)? {
+            if rmp_serde::from_slice::<DeviceClaim>(&raw).is_ok_and(|c| c.registered_at > revoked_at) {
+                return Ok(false);
+            }
+        }
+        self.revoke_device(device_address, wallet_address, revoked_at)
+    }
+
     /// Revocation-tombstone timestamp for a device, if any (P-2).
     pub fn get_device_revoked_at(&self, device_address: &str) -> Result<Option<u64>> {
         self.storage.get_device_revoked_at(device_address)
@@ -227,6 +258,48 @@ mod tests {
             wallet_signature: "cd".repeat(64),
             registered_at: 1_700_000_000_000,
         }
+    }
+
+    // A revoke through one clone must evict the mapping for every clone:
+    // the API, router, network and chain scanner each hold one.
+    #[test]
+    fn a_revoke_through_one_clone_evicts_the_mapping_everywhere() {
+        let (storage, _dir) = test_storage();
+        let api = IdentityResolver::new(storage);
+        let scanner = api.clone();
+        api.register_device(&test_claim("klv1device999", "klv1wallet999")).unwrap();
+        // Cached in the shared cache via the API clone.
+        assert_eq!(api.resolve("klv1device999").unwrap(), "klv1wallet999");
+        assert!(scanner.revoke_device("klv1device999", "klv1wallet999", 5_000).unwrap());
+        assert_eq!(api.resolve("klv1device999").unwrap(), "klv1device999");
+    }
+
+    // Round-7 W1: an on-chain revoke never removes a mapping registered
+    // after it (last writer wins), but does remove an older one.
+    #[test]
+    fn a_chain_revoke_keeps_a_newer_mapping() {
+        let (storage, _dir) = test_storage();
+        let r = IdentityResolver::new(storage);
+        let mut newer = test_claim("klv1deviceN", "klv1walletN");
+        newer.registered_at = 2_000;
+        r.register_device(&newer).unwrap();
+        assert!(!r.revoke_device_from_chain("klv1deviceN", "klv1walletN", 1_000).unwrap());
+        assert_eq!(r.resolve("klv1deviceN").unwrap(), "klv1walletN");
+
+        let mut older = test_claim("klv1deviceO", "klv1walletO");
+        older.registered_at = 500;
+        r.register_device(&older).unwrap();
+        assert!(r.revoke_device_from_chain("klv1deviceO", "klv1walletO", 1_000).unwrap());
+        assert_eq!(r.resolve("klv1deviceO").unwrap(), "klv1deviceO");
+    }
+
+    #[test]
+    fn device_addresses_derive_from_hex_keys() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]).verifying_key();
+        let addr = device_address_from_hex_key(&hex::encode(key.as_bytes())).unwrap();
+        assert_eq!(addr, crate::crypto::device_pubkey_to_address(&key).unwrap());
+        assert!(device_address_from_hex_key("zz").is_none());
+        assert!(device_address_from_hex_key("ab").is_none());
     }
 
     #[test]

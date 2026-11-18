@@ -41,6 +41,8 @@ pub enum ScEvent {
     DeviceRevoked {
         user: String,
         device_key: String,
+        /// Block timestamp (unix seconds) — the SC's `revoked_at`.
+        timestamp: u64,
     },
     StateAnchored {
         block_height: u64,
@@ -151,12 +153,11 @@ pub struct ChannelRecord {
 /// `chain::sc_views::get_channel_creator` re-verification bookkeeping for
 /// one channel — stored in `storage::schema::cf::CHANNEL_VERIFICATION`,
 /// NOT as a field on `ChannelRecord` (audit 2026-09-29). Deliberately kept
-/// out of the `CHANNELS` row: that CF is in `snapshot::DOMAIN_CFS` and its
-/// raw bytes feed the anchored state root, so a per-node wall-clock
-/// verification timestamp inside it would make every node's root for a
-/// public channel diverge PERMANENTLY (rewritten with a different value on
-/// every independent round-robin re-check), not just transiently — and
-/// nothing anchoring-relevant needs to read it anyway.
+/// out of the `CHANNELS` row: a per-node wall-clock verification timestamp
+/// inside a shared row would make nodes' copies diverge PERMANENTLY
+/// (rewritten with a different value on every independent round-robin
+/// re-check) — fatal while `CHANNELS` fed the v3 anchored root, and still
+/// pointless noise since v4 anchors only the chain mirror.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChannelVerificationState {
     /// Unix seconds when `creator` was last confirmed against the SC's

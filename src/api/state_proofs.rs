@@ -1,25 +1,25 @@
 //! `GET /api/v1/state/proof` — record inclusion proofs against an anchored
-//! state root (spec 03 §3.6 / §4.1, spec 02 §7, l2-node 0.147.0+).
+//! state root (spec 03 §3.6 / §4.1, spec 02 §7; l2-node 0.147.0+, root v4
+//! since 0.148.0).
 //!
-//! Proves that a user, channel, delegation or channel-membership record is
-//! part of the state root this node anchored at a block height. The node is
-//! not trusted: the client rebuilds the subtree root from the record's value,
-//! index and sibling path, frames it with the other three subtree
-//! `(count, root)` pairs into the state root, and compares that with the
-//! Klever SC's `getCanonicalAnchor(block_height)` (sdk `verifyStateProof`).
+//! Proves that an on-chain user, channel or device delegation is part of the
+//! state root this node sealed at a block height. The node is not trusted:
+//! the client rebuilds the subtree root from the record's value, index and
+//! sibling path, frames it with the other subtree `(count, root)` pairs into
+//! the state root, and compares that with the Klever SC's final canonical
+//! anchor at that height (sdk `verifyStateProofOnChain`).
 //!
-//! Scope and refusals:
-//! - Only nodes with `[anchoring] enabled` store checkpoints; others answer
-//!   `404 no_checkpoint`. The newest [`MAX_STATE_CHECKPOINTS`] heights are
-//!   kept, plus the newest one confirmed canonical. Without `height` the
-//!   newest canonical-confirmed checkpoint is used (else the newest); the
-//!   response's `canonical_confirmed` is a hint only — clients verify
-//!   against the chain.
-//! - The proof carries the record's CURRENT value. If it changed after the
-//!   checkpoint the node answers `409 record_changed` instead of proving a
-//!   value it no longer has; retry after the next anchor.
-//! - Private channels (and their memberships) are refused: a public
-//!   membership proof would reveal who is in a private channel.
+//! Scope:
+//! - Every node seals checkpoints at its anchor boundaries; the newest
+//!   [`MAX_STATE_CHECKPOINTS`] heights are kept, plus the newest one
+//!   confirmed canonical. Without `height` the newest canonical-confirmed
+//!   checkpoint is used (else the newest); the response's
+//!   `canonical_confirmed` is a hint only — clients verify against the
+//!   chain.
+//! - The proof carries the value SEALED at that height (the checkpoint
+//!   stores it), so a later change never makes a proof unservable.
+//! - Only chain records are anchored (v4): `channel_members` is refused with
+//!   `400` — memberships are gossip state, authenticated by signatures.
 //!
 //! Cost per request: one header read, a binary search and an O(log n) path
 //! read from a cached tree. Building a subtree's tree is O(n) hashing; it
@@ -39,9 +39,8 @@ use base64::Engine as _;
 use serde::Deserialize;
 
 use crate::crypto::merkle::{inclusion_path, tree_levels};
-use crate::messages::types::PRIVATE_CHANNEL_ID_FLOOR;
+use crate::storage::anchored_state;
 use crate::storage::rocks::Storage;
-use crate::storage::schema;
 use crate::storage::state_checkpoints::Subtree;
 
 use super::state::AppState;
@@ -56,7 +55,7 @@ const CACHE_ENTRIES: usize = 8;
 
 /// Query parameters. Which ones are required depends on `subtree`:
 /// `users` → `address`; `channels` → `channel_id`; `delegations` →
-/// `address` + `device_key`; `channel_members` → `channel_id` + `address`.
+/// `address` + `device_key`.
 #[derive(Debug, Deserialize)]
 pub struct StateProofQuery {
     pub subtree: String,
@@ -67,9 +66,11 @@ pub struct StateProofQuery {
     pub height: Option<u64>,
 }
 
-/// A subtree's keys plus every tree level, built once per checkpoint.
+/// A subtree's keys and sealed values plus every tree level, built once
+/// per checkpoint.
 struct CachedTree {
     keys: Vec<Vec<u8>>,
+    values: Vec<Vec<u8>>,
     levels: Vec<Vec<[u8; 32]>>,
 }
 
@@ -133,6 +134,7 @@ fn tree_for_with(
     let tree = Arc::new(CachedTree {
         levels: tree_levels(&st.leaves),
         keys: st.keys,
+        values: st.values,
     });
     let mut guard = cache().lock().unwrap_or_else(|p| p.into_inner());
     if guard.len() >= CACHE_ENTRIES {
@@ -171,28 +173,18 @@ fn valid_id(s: &str) -> bool {
     !s.is_empty() && s.len() <= MAX_ID_LEN && s.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
-/// Refuse private channels, failing closed on missing metadata.
-fn channel_is_public(storage: &Storage, channel_id: u64) -> bool {
-    if channel_id >= PRIVATE_CHANNEL_ID_FLOOR {
-        return false;
-    }
-    matches!(storage.get_cf(schema::cf::CHANNELS, &channel_id.to_be_bytes()), Ok(Some(_)))
-        && !crate::network::reconcile::is_private_channel(storage, channel_id)
-}
-
-/// The RocksDB key of the requested record, or an error response.
+/// The `ANCHORED_STATE` key of the requested record, or an error response.
 fn record_key(q: &StateProofQuery, subtree: Subtree) -> Result<Vec<u8>, Response> {
     let address = || match q.address.as_deref() {
         Some(a) if valid_id(a) => Ok(a),
         _ => Err(error(StatusCode::BAD_REQUEST, "bad_request", "missing or invalid address")),
     };
-    let channel_id = || {
-        q.channel_id
-            .ok_or_else(|| error(StatusCode::BAD_REQUEST, "bad_request", "missing channel_id"))
-    };
     Ok(match subtree {
-        Subtree::Users => address()?.as_bytes().to_vec(),
-        Subtree::Channels => channel_id()?.to_be_bytes().to_vec(),
+        Subtree::Users => anchored_state::user_key(address()?),
+        Subtree::Channels => match q.channel_id {
+            Some(id) => anchored_state::channel_key(id),
+            None => return Err(error(StatusCode::BAD_REQUEST, "bad_request", "missing channel_id")),
+        },
         Subtree::Delegations => {
             let device_key = match q.device_key.as_deref() {
                 Some(d) if valid_id(d) => d,
@@ -204,9 +196,20 @@ fn record_key(q: &StateProofQuery, subtree: Subtree) -> Result<Vec<u8>, Response
                     ))
                 }
             };
-            schema::encode_delegation_key(address()?, device_key)
+            anchored_state::delegation_key(address()?, device_key)
         }
-        Subtree::ChannelMembers => schema::encode_channel_member_key(channel_id()?, address()?),
+    })
+}
+
+/// The requested subtree, or a `400`.
+fn parse_subtree(name: &str) -> Result<Subtree, Response> {
+    Subtree::from_name(name).ok_or_else(|| {
+        let message = if name == "channel_members" {
+            "channel_members is not anchored (since root v4 only chain records are); memberships are authenticated by signatures"
+        } else {
+            "subtree must be users, channels or delegations"
+        };
+        error(StatusCode::BAD_REQUEST, "bad_request", message)
     })
 }
 
@@ -215,12 +218,9 @@ pub async fn get_state_proof(
     Extension(state): Extension<Arc<AppState>>,
     Query(q): Query<StateProofQuery>,
 ) -> Response {
-    let Some(subtree) = Subtree::ALL.into_iter().find(|s| s.name() == q.subtree) else {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "bad_request",
-            "subtree must be users, channels, delegations or channel_members",
-        );
+    let subtree = match parse_subtree(&q.subtree) {
+        Ok(s) => s,
+        Err(resp) => return resp,
     };
     let key = match record_key(&q, subtree) {
         Ok(k) => k,
@@ -228,38 +228,18 @@ pub async fn get_state_proof(
     };
     let storage = state.storage.clone();
     let height = q.height;
-    let channel_id = q.channel_id;
-    match tokio::task::spawn_blocking(move || build_proof(&storage, subtree, &key, height, channel_id))
-        .await
-    {
+    match tokio::task::spawn_blocking(move || build_proof(&storage, subtree, &key, height)).await {
         Ok(resp) => resp,
         Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "internal", "proof task failed"),
     }
 }
 
 /// Blocking body of [`get_state_proof`].
-fn build_proof(
-    storage: &Storage,
-    subtree: Subtree,
-    key: &[u8],
-    height: Option<u64>,
-    channel_id: Option<u64>,
-) -> Response {
+fn build_proof(storage: &Storage, subtree: Subtree, key: &[u8], height: Option<u64>) -> Response {
     let internal = |e: anyhow::Error| {
         tracing::warn!(error = %e, "state proof failed");
         error(StatusCode::INTERNAL_SERVER_ERROR, "internal", "could not read the state checkpoint")
     };
-    if matches!(subtree, Subtree::Channels | Subtree::ChannelMembers) {
-        if let Some(id) = channel_id {
-            if !channel_is_public(storage, id) {
-                return error(
-                    StatusCode::FORBIDDEN,
-                    "private_channel",
-                    "proofs are only served for existing public channels (private, unknown and deleted channels are refused)",
-                );
-            }
-        }
-    }
 
     let canonical = match storage.canonical_state_checkpoint_heights() {
         Ok(c) => c,
@@ -273,7 +253,7 @@ fn build_proof(
         return error(
             StatusCode::NOT_FOUND,
             "no_checkpoint",
-            "this node stores no anchored state checkpoint (anchoring disabled or no anchor yet)",
+            "this node has sealed no anchored state checkpoint yet",
         );
     };
     let header = match storage.load_state_checkpoint_header(height) {
@@ -321,18 +301,8 @@ fn build_proof(
             "the record is not part of the state at this checkpoint",
         );
     };
-    let value = match storage.get_cf(subtree.cf(), key) {
-        Ok(v) => v,
-        Err(e) => return internal(e),
-    };
     let leaf = tree.levels[0][index];
-    let Some(value) = value.filter(|v| subtree.leaf(key, v) == leaf) else {
-        return error(
-            StatusCode::CONFLICT,
-            "record_changed",
-            "the record changed after this checkpoint; retry after the next anchor",
-        );
-    };
+    let value = &tree.values[index];
     let Some(siblings) = inclusion_path(&tree.levels, index) else {
         return internal(anyhow::anyhow!("index {index} outside its own tree"));
     };
@@ -350,7 +320,7 @@ fn build_proof(
         "canonical_confirmed": canonical.contains(&header.block_height),
         "subtree": subtree.name(),
         "key": hex::encode(key),
-        "value": base64::engine::general_purpose::STANDARD.encode(&value),
+        "value": base64::engine::general_purpose::STANDARD.encode(value),
         "leaf": hex::encode(leaf),
         "leaf_index": index,
         "leaf_count": tree.keys.len(),
@@ -363,7 +333,8 @@ fn build_proof(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::merkle::{frame_state_root, root_from_path};
+    use crate::crypto::merkle::{frame_state_root, hash_leaf, root_from_path, SUBTREE_COUNT};
+    use crate::storage::anchored_state::AnchoredDelegation;
     use crate::storage::schema::cf;
 
     fn open() -> (Storage, tempfile::TempDir) {
@@ -384,15 +355,11 @@ mod tests {
     /// Verify a proof response the way a client does: value → leaf, path →
     /// subtree root, framing → state root.
     fn verify(p: &serde_json::Value) -> bool {
-        let subtree = Subtree::ALL
-            .into_iter()
-            .find(|s| s.name() == p["subtree"])
-            .unwrap();
-        let key = hex::decode(p["key"].as_str().unwrap()).unwrap();
+        let subtree = Subtree::from_name(p["subtree"].as_str().unwrap()).unwrap();
         let value = base64::engine::general_purpose::STANDARD
             .decode(p["value"].as_str().unwrap())
             .unwrap();
-        let leaf = subtree.leaf(&key, &value);
+        let leaf = hash_leaf(&value);
         let siblings: Vec<[u8; 32]> = p["siblings"].as_array().unwrap().iter().map(hex32).collect();
         let Some(sub_root) = root_from_path(
             leaf,
@@ -402,7 +369,7 @@ mod tests {
         ) else {
             return false;
         };
-        let mut framed = [(0u64, [0u8; 32]); 4];
+        let mut framed = [(0u64, [0u8; 32]); SUBTREE_COUNT];
         for (i, st) in p["subtrees"].as_array().unwrap().iter().enumerate() {
             framed[i] = (st["count"].as_u64().unwrap(), hex32(&st["root"]));
         }
@@ -413,22 +380,19 @@ mod tests {
 
     fn seed(s: &Storage) {
         for i in 0..5 {
-            let a = format!("klv1user{i}");
-            s.put_cf(cf::USERS, a.as_bytes(), format!(r#"{{"address":"{a}"}}"#).as_bytes())
-                .unwrap();
+            s.anchored_register_user(&format!("klv1user{i}"), &format!("{i:064x}")).unwrap();
         }
-        s.put_cf(cf::CHANNELS, &3u64.to_be_bytes(), br#"{"channel_id":3,"channel_type":0}"#)
-            .unwrap();
-        s.put_cf(cf::CHANNELS, &4u64.to_be_bytes(), br#"{"channel_id":4,"channel_type":2}"#)
-            .unwrap();
-        for (ch, who) in [(3u64, "klv1user1"), (4, "klv1user2")] {
-            s.put_cf(
-                cf::CHANNEL_MEMBERS,
-                &schema::encode_channel_member_key(ch, who),
-                br#"{"role":"member"}"#,
-            )
-            .unwrap();
-        }
+        s.anchored_create_channel(3, "news", "klv1user1").unwrap();
+        s.anchored_create_channel(4, "dev", "klv1user2").unwrap();
+        s.anchored_delegate(&AnchoredDelegation {
+            created_at: 1_790_000_000,
+            device_key: "ab".repeat(32),
+            expires_at: 0,
+            permissions: 7,
+            revoked_at: 0,
+            user: "klv1user2".into(),
+        })
+        .unwrap();
     }
 
     fn query(subtree: &str, address: Option<&str>, channel_id: Option<u64>) -> StateProofQuery {
@@ -442,9 +406,9 @@ mod tests {
     }
 
     fn proof(s: &Storage, q: &StateProofQuery) -> Response {
-        let subtree = Subtree::ALL.into_iter().find(|x| x.name() == q.subtree).unwrap();
+        let subtree = Subtree::from_name(&q.subtree).unwrap();
         let key = record_key(q, subtree).map_err(|_| ()).unwrap();
-        build_proof(s, subtree, &key, q.height, q.channel_id)
+        build_proof(s, subtree, &key, q.height)
     }
 
     #[tokio::test]
@@ -454,11 +418,13 @@ mod tests {
         let cp = s.compute_state_checkpoint().unwrap();
         s.store_state_checkpoint(500, &cp).unwrap();
 
+        let mut delegation = query("delegations", Some("klv1user2"), None);
+        delegation.device_key = Some("ab".repeat(32));
         for q in [
             query("users", Some("klv1user0"), None),
             query("users", Some("klv1user4"), None),
             query("channels", None, Some(3)),
-            query("channel_members", Some("klv1user1"), Some(3)),
+            delegation,
         ] {
             let (status, p) = body(proof(&s, &q)).await;
             assert_eq!(status, StatusCode::OK, "{p}");
@@ -469,35 +435,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn changed_missing_and_private_records_are_refused() {
+    async fn the_sealed_value_is_served_even_after_a_change() {
         let (s, _d) = open();
         seed(&s);
         let cp = s.compute_state_checkpoint().unwrap();
         s.store_state_checkpoint(500, &cp).unwrap();
-
+        s.anchored_update_user_key("klv1user0", "changed").unwrap();
+        // Gossip-side rows do not matter either.
         s.put_cf(cf::USERS, b"klv1user0", br#"{"address":"klv1user0","x":1}"#).unwrap();
+
         let (status, p) = body(proof(&s, &query("users", Some("klv1user0"), None))).await;
-        assert_eq!((status, p["error"].as_str()), (StatusCode::CONFLICT, Some("record_changed")));
+        assert_eq!(status, StatusCode::OK);
+        let value = base64::engine::general_purpose::STANDARD.decode(p["value"].as_str().unwrap()).unwrap();
+        assert_eq!(value, format!(r#"{{"address":"klv1user0","public_key":"{:064x}"}}"#, 0).as_bytes());
+        assert!(verify(&p));
 
         let (status, p) = body(proof(&s, &query("users", Some("klv1nobody"), None))).await;
         assert_eq!(
             (status, p["error"].as_str()),
             (StatusCode::NOT_FOUND, Some("not_in_checkpoint"))
         );
+    }
 
-        for q in [
-            query("channels", None, Some(4)),
-            query("channel_members", Some("klv1user2"), Some(4)),
-            query("channel_members", Some("klv1user1"), Some(99)),
-            query("channels", None, Some(PRIVATE_CHANNEL_ID_FLOOR)),
-        ] {
-            let (status, p) = body(proof(&s, &q)).await;
-            assert_eq!(
-                (status, p["error"].as_str()),
-                (StatusCode::FORBIDDEN, Some("private_channel")),
-                "{q:?}"
-            );
-        }
+    #[tokio::test]
+    async fn channel_members_are_not_anchored() {
+        let Err(resp) = parse_subtree("channel_members") else { panic!("must be refused") };
+        let (status, p) = body(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(p["message"].as_str().unwrap().contains("not anchored"));
+        assert!(parse_subtree("nope").is_err());
+        assert_eq!(parse_subtree("delegations").ok(), Some(Subtree::Delegations));
     }
 
     #[tokio::test]
@@ -522,7 +489,7 @@ mod tests {
         let (s, _d) = open();
         seed(&s);
         // A state no other test produces, so its tree is never cached.
-        s.put_cf(cf::USERS, b"klv1busy", br#"{"address":"klv1busy"}"#).unwrap();
+        s.anchored_register_user("klv1busy", "00").unwrap();
         let cp = s.compute_state_checkpoint().unwrap();
         s.store_state_checkpoint(7, &cp).unwrap();
         let lock = Mutex::new(());
@@ -545,29 +512,33 @@ mod tests {
 
     /// Known-answer vector shared with sdk-js `verifyStateProof` tests: the
     /// same fixed rows must always produce this root and proof (the SDK
-    /// test embeds this proof verbatim). If this changes, the anchored root format
-    /// changed — every node and the SDK fixture must move together.
+    /// test embeds these proofs verbatim). If this changes, the anchored
+    /// root format changed — every node and the SDK fixture must move
+    /// together.
     #[tokio::test]
     async fn known_answer_vector() {
         let (s, _d) = open();
         seed(&s);
         let cp = s.compute_state_checkpoint().unwrap();
         s.store_state_checkpoint(500, &cp).unwrap();
-        let (_, p) = body(proof(&s, &query("channel_members", Some("klv1user1"), Some(3)))).await;
-        assert!(verify(&p));
+        let (_, channel) = body(proof(&s, &query("channels", None, Some(3)))).await;
+        assert!(verify(&channel));
         // Odd-count subtree, last leaf (paired with itself at level 0).
         let (_, users) = body(proof(&s, &query("users", Some("klv1user4"), None))).await;
         assert!(verify(&users));
         assert_eq!(users["leaf_index"], 4);
+        let mut dq = query("delegations", Some("klv1user2"), None);
+        dq.device_key = Some("ab".repeat(32));
+        let (_, delegation) = body(proof(&s, &dq)).await;
+        assert!(verify(&delegation));
         if std::env::var_os("OGMARA_PRINT_VECTORS").is_some() {
-            println!("VECTOR {p}");
+            println!("VECTOR {channel}");
             println!("VECTOR {users}");
+            println!("VECTOR {delegation}");
+            println!("ROOT {}", hex::encode(cp.state_root));
         }
-        assert_eq!(p["leaf"], "04cc4282fbb9ef6dc1e69de83409e26eb8c361846fb6d037378ccded537fcad2");
-        assert_eq!(
-            hex::encode(cp.state_root),
-            "099064e5796505367550de365185ed7aed10e3fd80189299012012eb16a4eaef"
-        );
+        assert_eq!(channel["leaf"], "c45238dd6a6d83e9c4e5dd20663fa3a6fc85433e5d57fc127ceebf0bcbf7d921");
+        assert_eq!(hex::encode(cp.state_root), "6cb987a18c71bad25df6d0668029179f0fcdb64affb65db16e10acd9b5b3099c");
     }
 
     #[test]

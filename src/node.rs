@@ -1666,6 +1666,26 @@ impl Node {
         let chain_shutdown_rx = self.shutdown_rx();
         let chain_klever_health = klever_health.clone();
         let chain_channel_verify_config = self.config.channel_verify.clone();
+        let chain_anchor_interval_blocks = self.config.anchoring.interval_blocks();
+        // The node's shared device→wallet resolver: an on-chain revoke must
+        // evict the mapping for the API and router too.
+        let chain_identity = identity.clone();
+        // Other nodes' sealed mirrors, fetched over the snapshot protocol,
+        // propose records for the anchored-state repair sweep.
+        let chain_repair_peers = crate::chain::anchored_repair::PeerSource {
+            handle: crate::network::snapshot_client::ClientHandle::new(
+                snapshot_client_tx.clone(),
+                &self.config.snapshot,
+            ),
+            network_id: self.config.network_id().to_string(),
+            chunk_retries: self.config.snapshot.chunk_retries,
+        };
+        info!(
+            interval_hours = self.config.anchoring.interval_hours(),
+            interval_blocks = chain_anchor_interval_blocks,
+            configured_seconds = self.config.anchoring.interval_seconds,
+            "Anchor boundaries: every multiple of interval_blocks (interval rounded to a divisor of 24 h)"
+        );
         let mut chain_task = tokio::spawn(async move {
             match crate::chain::scanner::ChainScanner::new(
                 chain_config,
@@ -1673,6 +1693,9 @@ impl Node {
                 channel_tx,
                 chain_klever_health,
                 chain_channel_verify_config,
+                chain_anchor_interval_blocks,
+                Some(chain_repair_peers),
+                chain_identity,
             ) {
                 Ok(mut scanner) => scanner.run(chain_shutdown_rx).await,
                 Err(e) => warn!(error = %e, "Failed to start chain scanner"),
@@ -2127,7 +2150,8 @@ impl Node {
                     self.node_id.clone(),
                     alert_event_rx,
                     alert_test_rx,
-                    self.config.anchoring.interval_seconds,
+                    // The effective interval (rounded to a divisor of 24 h).
+                    self.config.anchoring.interval_hours() * 3600,
                     channel_dispatcher,
                     klever_configured,
                 );

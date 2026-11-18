@@ -329,6 +329,8 @@ async fn main() -> Result<()> {
                 println!("About to drop column family '{}' in {}.", name, db_path.display());
                 if name == storage::schema::cf::STATE_CHECKPOINTS {
                     println!("This removes anchored state checkpoints (state proofs resume after the next anchor) so a pre-0.143 release can open the database.");
+                } else if name == storage::schema::cf::ANCHORED_STATE || name == storage::schema::cf::ANCHORED_REPAIR {
+                    println!("This removes the anchored chain mirror / its repair bookkeeping; the node rebuilds it from the smart contract (anchoring waits for that) so a pre-0.148 release can open the database.");
                 } else {
                     println!("This removes key-epoch arbitration state so a pre-0.143 release can open the database.");
                 }

@@ -257,8 +257,9 @@ td { padding: 8px; border-bottom: 1px solid var(--border); }
       </h3>
       <div id="anchoring-info-body">
         <p style="color:var(--fg);line-height:1.5;margin-top:8px">
-          Every hour your node computes a Merkle root of its current L2 state
-          (users, channels, messages, anchors) and submits it to the Klever
+          At each anchor boundary (a block height every node shares) your node
+          seals a Merkle root of its mirror of the smart contract (registered
+          users, channels, device delegations) and submits it to the Klever
           blockchain. When at least <strong>three independent nodes</strong>
           submit the same root for the same block height, that root becomes
           the network's <strong>canonical truth</strong> — provable on-chain,

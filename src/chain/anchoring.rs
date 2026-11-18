@@ -1,8 +1,11 @@
-//! State anchoring — periodically submits L2 state roots to the Klever blockchain.
+//! State anchoring — submits sealed anchored-state roots to the Klever blockchain.
 //!
-//! Computes a Merkle root of L2 state (users, channels, delegations) and invokes
-//! the `anchorState` endpoint on the Ogmara KApp smart contract. This creates an
-//! on-chain trust anchor proving the L2 state at a point in time.
+//! The chain scanner seals the anchored state (root v4 over the chain
+//! mirror) at every anchor boundary — a multiple of
+//! `AnchoringConfig::interval_blocks`, shared by every node — and this task
+//! submits the newest sealed root it has not submitted yet via the KApp's
+//! `anchorState` endpoint. Nodes that have seen the same chain seal the same
+//! root at the same height, so their submissions reach the SC's quorum.
 //!
 //! TX flow (verified on Klever testnet):
 //! 1. Build TX via POST /transaction/send
@@ -80,6 +83,17 @@ pub type GovernanceSubmitSender = tokio::sync::mpsc::Sender<GovernanceSubmitRequ
 /// that the Klever RPC load is bounded (~12 walks/hour × ≤ 100
 /// entries = ≤ 1200 view calls/hour worst-case per node).
 const DIVERGENCE_CHECK_INTERVAL: Duration = Duration::from_secs(300);
+
+/// How often the anchoring loop looks for a newly sealed checkpoint.
+const SEAL_POLL_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Outcome of one anchoring attempt.
+enum AnchorOutcome {
+    /// Submitted; the broadcast tx hash.
+    Submitted(String),
+    /// No sealed checkpoint newer than the last submission.
+    NothingNew,
+}
 
 /// Background service that anchors L2 state to the Klever blockchain.
 pub struct StateAnchorer {
@@ -211,8 +225,10 @@ impl StateAnchorer {
             "State anchoring started"
         );
 
-        let mut interval =
-            tokio::time::interval(Duration::from_secs(self.config.interval_seconds));
+        // Poll for a newly sealed checkpoint; seals happen on the scanner's
+        // schedule (anchor boundaries), so a short poll keeps the submission
+        // close to the seal without anchoring more often than the interval.
+        let mut interval = tokio::time::interval(SEAL_POLL_INTERVAL);
         // Skip the first immediate tick — let the node settle before first anchor
         interval.tick().await;
 
@@ -633,11 +649,17 @@ impl StateAnchorer {
     /// starved.
     async fn handle_trigger(&mut self, reply_tx: tokio::sync::oneshot::Sender<Result<String, String>>) {
         info!("Manual anchor trigger received");
-        let result = self.perform_anchor().await;
-        match &result {
-            Ok(tx_hash) => {
+        // Same rule as the loop: only a sealed boundary height is ever
+        // submitted (never an off-grid one nobody else anchors).
+        match self.perform_anchor().await {
+            Ok(AnchorOutcome::Submitted(tx_hash)) => {
                 self.consecutive_failures = 0;
-                let _ = reply_tx.send(Ok(tx_hash.clone()));
+                let _ = reply_tx.send(Ok(tx_hash));
+            }
+            Ok(AnchorOutcome::NothingNew) => {
+                let _ = reply_tx.send(Err(
+                    "no sealed checkpoint newer than the last submission — the next one is sealed at the next anchor boundary".into(),
+                ));
             }
             Err(e) => {
                 let _ = reply_tx.send(Err(e.to_string()));
@@ -681,7 +703,11 @@ impl StateAnchorer {
         gov_rx: &mut tokio::sync::mpsc::Receiver<GovernanceSubmitRequest>,
     ) -> bool {
         match self.perform_anchor().await {
-            Ok(tx_hash) => {
+            Ok(AnchorOutcome::NothingNew) => {
+                self.consecutive_failures = 0;
+                false
+            }
+            Ok(AnchorOutcome::Submitted(tx_hash)) => {
                 self.consecutive_failures = 0;
                 info!(tx_hash = %tx_hash, "State anchor submitted successfully");
                 let now_ms = std::time::SystemTime::now()
@@ -717,32 +743,54 @@ impl StateAnchorer {
         }
     }
 
-    /// Perform a single state anchor: compute root, build TX, sign, broadcast.
-    /// On success the (block_height, our_root) tuple is pushed onto
-    /// `pending_submissions` so the divergence watcher can later
+    /// The last submitted height (persisted, so a restart never re-submits).
+    fn last_anchor_height(&self) -> u64 {
+        self.storage
+            .get_cf(crate::storage::schema::cf::NODE_STATE, state_keys::LAST_ANCHOR_HEIGHT)
+            .ok()
+            .flatten()
+            .and_then(|raw| Some(u64::from_be_bytes(raw.as_slice().try_into().ok()?)))
+            .unwrap_or(0)
+    }
+
+    fn set_last_anchor_height(&self, height: u64) {
+        if let Err(e) = self.storage.put_cf(
+            crate::storage::schema::cf::NODE_STATE,
+            state_keys::LAST_ANCHOR_HEIGHT,
+            &height.to_be_bytes(),
+        ) {
+            warn!(height, error = %e, "Failed to persist last anchor height");
+        }
+    }
+
+    /// Submit the newest sealed checkpoint above the last submission: build
+    /// TX, sign, broadcast. On success the (block_height, our_root) tuple is
+    /// pushed onto `pending_submissions` so the divergence watcher can later
     /// resolve it against the on-chain canonical anchor.
-    async fn perform_anchor(&mut self) -> Result<String> {
-        // Step 1: Compute the state checkpoint (blocking — iterates RocksDB).
-        // It carries the root plus the leaves it commits to, stored below
-        // once the anchor is broadcast so `/api/v1/state/proof` can serve
-        // inclusion proofs against this height.
-        let storage = self.storage.clone();
-        let checkpoint =
-            tokio::task::spawn_blocking(move || storage.compute_state_checkpoint())
-                .await
-                .context("spawn_blocking panicked")?
-                .context("computing state root")?;
-        let state_root = checkpoint.state_root;
+    async fn perform_anchor(&mut self) -> Result<AnchorOutcome> {
+        let last = self.last_anchor_height();
+        let Some(block_height) = self
+            .storage
+            .state_checkpoint_heights()
+            .context("listing sealed checkpoints")?
+            .into_iter()
+            .filter(|h| *h > last)
+            .max()
+        else {
+            return Ok(AnchorOutcome::NothingNew);
+        };
+        let header = self
+            .storage
+            .load_state_checkpoint_header(block_height)
+            .context("reading sealed checkpoint")?
+            .context("sealed checkpoint vanished")?;
+        let state_root_hex = hex::encode(header.state_root);
         let message_count = self
             .storage
             .get_stat(state_keys::TOTAL_MESSAGES)
             .context("reading message count")?;
-        let channel_count = checkpoint.subtrees[1].leaves.len() as u32;
-        let user_count = checkpoint.subtrees[0].leaves.len() as u32;
-
-        let state_root_hex = hex::encode(state_root);
-        let block_height = self.storage.get_chain_cursor()
-            .context("reading chain cursor for anchor block height")?;
+        let user_count = u32::try_from(header.subtrees[0].0).unwrap_or(u32::MAX);
+        let channel_count = u32::try_from(header.subtrees[1].0).unwrap_or(u32::MAX);
 
         debug!(
             block_height,
@@ -750,10 +798,10 @@ impl StateAnchorer {
             message_count,
             channel_count,
             user_count,
-            "State root computed for anchoring"
+            "Submitting sealed state root"
         );
 
-        // Step 2: Build SC call data (6 args — timestamp is generated by the SC)
+        // Build SC call data (6 args — timestamp is generated by the SC)
         let call_data = self.build_sc_call_data(
             block_height,
             &state_root_hex,
@@ -762,22 +810,25 @@ impl StateAnchorer {
             user_count,
         );
 
-        // Steps 3–6: nonce + raw TX build + send + decode + sign + broadcast.
-        // Shared with the SIGTERM `pauseNode` path (`submit_pause_for_shutdown`).
-        let tx_hash_hex = self.submit_signed_sc_invoke(&call_data).await?;
-
-        // Keep the leaves this anchored root commits to (proof serving). A
-        // failure here costs only proofs for this height, never the anchor.
-        let storage = self.storage.clone();
-        match tokio::task::spawn_blocking(move || {
-            storage.store_state_checkpoint(block_height, &checkpoint)
-        })
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => warn!(block_height, error = %e, "Failed to store state checkpoint"),
-            Err(e) => warn!(block_height, error = %e, "State checkpoint task panicked"),
-        }
+        // Nonce + raw TX build + send + decode + sign + broadcast. Shared
+        // with the SIGTERM `pauseNode` path (`submit_signed_sc_invoke`).
+        let tx_hash_hex = match self.submit_signed_sc_invoke(&call_data).await {
+            Ok(h) => h,
+            Err(e) => {
+                // The SC refuses a height at or below this anchorer's floor
+                // or one it already submitted (e.g. state lost across a
+                // restart): that height is done — move past it instead of
+                // retrying it forever.
+                let msg = format!("{e:#}");
+                if msg.contains("already submitted for this height") || msg.contains("must be greater than this anchorer") {
+                    warn!(block_height, error = %msg, "SC refuses this height for our anchorer — marking it done");
+                    self.set_last_anchor_height(block_height);
+                    return Ok(AnchorOutcome::NothingNew);
+                }
+                return Err(e);
+            }
+        };
+        self.set_last_anchor_height(block_height);
 
         // Store last anchor timestamp locally
         let now = SystemTime::now()
@@ -820,7 +871,7 @@ impl StateAnchorer {
             }
         }
 
-        Ok(tx_hash_hex)
+        Ok(AnchorOutcome::Submitted(tx_hash_hex))
     }
 
     /// Build + send + decode + sign + broadcast an SC-invoke TX whose

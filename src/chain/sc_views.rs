@@ -1,10 +1,9 @@
 //! Klever SC view-call clients for the v0.3.0+ Ogmara KApp surface.
 //!
-//! These are read-only `/vm/hex` queries against the Ogmara KApp. They
-//! complement [`anchor_verify`](crate::chain::anchor_verify), which has
-//! a narrower snapshot-bootstrap focus, by exposing the new
-//! permissionless-registration + quorum-anchor view surface introduced
-//! in spec 12.
+//! These are read-only `/vm/hex` queries against the Ogmara KApp: the
+//! permissionless-registration and quorum-anchor view surface introduced
+//! in spec 12, plus the user/channel/delegation views the anchored-state
+//! repair sweep confirms records with.
 //!
 //! Encoding rules (see feedback memory "Klever SC Call Data Encoding
 //! Patterns"): integer args are minimal big-endian even-length hex;
@@ -19,10 +18,9 @@
 use anyhow::{Context, Result};
 use tracing::warn;
 
-/// Minimal big-endian even-length hex encoding of a u64. Mirrors
-/// `chain::anchor_verify::encode_u64_minimal_hex` and the anchor TX
-/// builder so all SC call paths produce identical wire bytes for the
-/// same value. `0` → `"00"`, `1` → `"01"`, `256` → `"0100"`.
+/// Minimal big-endian even-length hex encoding of a u64. Mirrors the
+/// anchor TX builder so all SC call paths produce identical wire bytes for
+/// the same value. `0` → `"00"`, `1` → `"01"`, `256` → `"0100"`.
 fn encode_u64_minimal_hex(v: u64) -> String {
     if v == 0 {
         return "00".to_string();
@@ -437,12 +435,9 @@ pub async fn get_node_registered_at(
 
 /// Returns the canonical (quorum-confirmed) state root at `block_height`,
 /// or `None` if the height has not yet reached quorum (regardless of
-/// whether legacy anchors exist there).
-///
-/// Use `chain::anchor_verify::query_klever_state_root_at` instead if you
-/// need pre-v0.3 fallback behavior — that one consults the legacy
-/// `getStateRoot` shim which also returns canonical for post-upgrade
-/// heights.
+/// whether legacy anchors exist there). For an escalated height this may
+/// be the §2.9 tiebreak's provisional preview — use
+/// [`get_final_canonical_anchor`] when the answer must be final.
 pub async fn get_canonical_anchor(
     http: &reqwest::Client,
     klever_node_url: &str,
@@ -477,6 +472,31 @@ pub async fn get_canonical_anchor(
         );
     }
     Ok(Some(state_root))
+}
+
+/// The FINAL canonical anchored root at `block_height`, or `None` when
+/// there is none yet: a non-escalated height's `getCanonicalAnchor` answer
+/// (permanent once reached), or an escalated height's materialized
+/// resolution — never the §2.9 tiebreak's provisional preview. Escalation is
+/// re-checked after reading the root, so one that starts between the two
+/// reads cannot slip a provisional root through. Same rule as sdk-js
+/// `getFinalCanonicalAnchor`. Errors propagate (fail closed).
+pub async fn get_final_canonical_anchor(
+    http: &reqwest::Client,
+    klever_node_url: &str,
+    contract_address: &str,
+    block_height: u64,
+) -> Result<Option<String>> {
+    if is_divergence_escalated(http, klever_node_url, contract_address, block_height).await? {
+        return get_escalated_canonical(http, klever_node_url, contract_address, block_height).await;
+    }
+    let Some(root) = get_canonical_anchor(http, klever_node_url, contract_address, block_height).await? else {
+        return Ok(None);
+    };
+    if is_divergence_escalated(http, klever_node_url, contract_address, block_height).await? {
+        return get_escalated_canonical(http, klever_node_url, contract_address, block_height).await;
+    }
+    Ok(Some(root))
 }
 
 /// Returns the MATERIALIZED escalated-mode resolution for a height, or
@@ -1408,6 +1428,128 @@ pub async fn get_channel_creator(
     decode_address_bytes("getChannelCreator", &raw).map(Some)
 }
 
+// ── Anchored-state repair views (l2-node 0.148.0) ───────────────────
+//
+// The repair sweep confirms a candidate record against the SC before it
+// enters the anchored mirror. A wrong NEGATIVE would keep a real record out
+// of this node's root, so only a `require!` the view is known to raise for
+// "not found" maps to `None`; any other VM error is an `Err` (retried).
+
+/// Decode a `/vm/hex` ManagedBuffer payload that the SC stores as UTF-8.
+fn decode_utf8_buffer(func_name: &str, hex_data: &str) -> Result<String> {
+    let raw = hex::decode(hex_data).with_context(|| format!("hex-decoding {func_name} payload"))?;
+    String::from_utf8(raw).with_context(|| format!("{func_name} payload is not UTF-8"))
+}
+
+/// `getUserPubKey(address)` — the hex public key exactly as stored, or
+/// `None` for an unregistered address ("User not found").
+pub async fn get_user_pub_key(
+    http: &reqwest::Client,
+    klever_node_url: &str,
+    contract_address: &str,
+    klv_address: &str,
+) -> Result<Option<String>> {
+    let address_hex = encode_address_hex(klv_address)
+        .with_context(|| format!("invalid klv address: {}", klv_address))?;
+    let resp = vm_hex_call(http, klever_node_url, contract_address, "getUserPubKey", &[address_hex]).await?;
+    if resp.is_require_failure() {
+        if resp.error.contains("User not found") {
+            return Ok(None);
+        }
+        anyhow::bail!("getUserPubKey failed: {}", resp.error);
+    }
+    decode_utf8_buffer("getUserPubKey", &resp.data).map(Some)
+}
+
+/// `getChannelSlug(channel_id)`, or `None` for an unknown id ("Channel not
+/// found").
+pub async fn get_channel_slug(
+    http: &reqwest::Client,
+    klever_node_url: &str,
+    contract_address: &str,
+    channel_id: u64,
+) -> Result<Option<String>> {
+    let resp = vm_hex_call(
+        http,
+        klever_node_url,
+        contract_address,
+        "getChannelSlug",
+        &[encode_u64_minimal_hex(channel_id)],
+    )
+    .await?;
+    if resp.is_require_failure() {
+        if resp.error.contains("Channel not found") {
+            return Ok(None);
+        }
+        anyhow::bail!("getChannelSlug failed: {}", resp.error);
+    }
+    decode_utf8_buffer("getChannelSlug", &resp.data).map(Some)
+}
+
+/// The SC's `DelegationRecord` for a (user, device key).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScDelegation {
+    pub permissions: u8,
+    pub expires_at: u64,
+    pub created_at: u64,
+    pub revoked_at: u64,
+}
+
+/// Decode a top-encoded `DelegationRecord { u8, u64, u64, u64 }`: the
+/// fields' nested encodings back to back (1 + 3 × 8 bytes, big-endian).
+fn decode_delegation(raw: &[u8]) -> Result<ScDelegation> {
+    if raw.len() != 25 {
+        anyhow::bail!("getDelegation returned {} bytes (expected 25)", raw.len());
+    }
+    let u64_at = |at: usize| u64::from_be_bytes(raw[at..at + 8].try_into().expect("length checked"));
+    Ok(ScDelegation { permissions: raw[0], expires_at: u64_at(1), created_at: u64_at(9), revoked_at: u64_at(17) })
+}
+
+/// `getDelegation(user, device_key)`, or `None` when the SC has no record
+/// ("Delegation not found").
+pub async fn get_delegation(
+    http: &reqwest::Client,
+    klever_node_url: &str,
+    contract_address: &str,
+    user: &str,
+    device_key: &str,
+) -> Result<Option<ScDelegation>> {
+    let user_hex = encode_address_hex(user).with_context(|| format!("invalid klv address: {}", user))?;
+    let resp = vm_hex_call(
+        http,
+        klever_node_url,
+        contract_address,
+        "getDelegation",
+        &[user_hex, hex::encode(device_key.as_bytes())],
+    )
+    .await?;
+    if resp.is_require_failure() {
+        if resp.error.contains("Delegation not found") {
+            return Ok(None);
+        }
+        anyhow::bail!("getDelegation failed: {}", resp.error);
+    }
+    let raw = hex::decode(&resp.data).context("hex-decoding getDelegation payload")?;
+    decode_delegation(&raw).map(Some)
+}
+
+/// The Klever node's current block nonce (`GET /node/overview`). Read
+/// right after an SC view, it bounds the block that view's answer can come
+/// from — the anchored-state repair sweep's confirmation rule.
+pub async fn get_node_nonce(http: &reqwest::Client, klever_node_url: &str) -> Result<u64> {
+    let url = format!("{}/node/overview", klever_node_url.trim_end_matches('/'));
+    let resp = http.get(&url).send().await.context("GET /node/overview")?;
+    let status = resp.status();
+    if !status.is_success() {
+        anyhow::bail!("/node/overview HTTP {status}");
+    }
+    let body: serde_json::Value = resp.json().await.context("decoding /node/overview")?;
+    body.pointer("/data/overview/nonce")
+        .and_then(|v| v.as_u64())
+        .filter(|n| *n > 0)
+        .context("/node/overview has no nonce")
+}
+
 /// Platform stats: `(user_count, channel_count, protocol_version)`.
 /// `channel_count` is the current highest assigned channel_id (the SC's
 /// `next_channel_id() - 1`) — channel_ids are minted strictly sequentially
@@ -2255,5 +2397,23 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+}
+
+#[cfg(test)]
+mod repair_view_tests {
+    use super::*;
+
+    #[test]
+    fn delegation_record_decodes_field_by_field() {
+        let mut raw = vec![7u8];
+        raw.extend_from_slice(&0u64.to_be_bytes());
+        raw.extend_from_slice(&1_790_000_000u64.to_be_bytes());
+        raw.extend_from_slice(&1_790_000_500u64.to_be_bytes());
+        assert_eq!(
+            decode_delegation(&raw).unwrap(),
+            ScDelegation { permissions: 7, expires_at: 0, created_at: 1_790_000_000, revoked_at: 1_790_000_500 }
+        );
+        assert!(decode_delegation(&raw[..24]).is_err());
     }
 }

@@ -158,22 +158,35 @@ pub mod cf {
     /// Prevents chain scanner from re-creating channels that were intentionally deleted.
     pub const DELETED_CHANNELS: &str = "deleted_channels";
 
-    /// Anchored state checkpoints: the ordered keys + leaf hashes the
-    /// anchored root commits to, for `GET /api/v1/state/proof` (l2-node
-    /// 0.147.0+, `storage::state_checkpoints`). Node-local, derived, NOT in
-    /// snapshot `DOMAIN_CFS`; droppable by `ogmara-node db drop-cf`.
+    /// Anchored state checkpoints: the ordered keys + values the anchored
+    /// root commits to, sealed at each anchor height, for
+    /// `GET /api/v1/state/proof` and snapshot serving (l2-node 0.147.0+,
+    /// `storage::state_checkpoints`). Node-local, derived; droppable by
+    /// `ogmara-node db drop-cf`.
     pub const STATE_CHECKPOINTS: &str = "state_checkpoints";
+
+    /// The chain mirror the anchored state root (v4) covers — written ONLY by
+    /// the chain scanner and its SC-confirmed repair sweep, never by gossip,
+    /// the router or the API (l2-node 0.148.0, `storage::anchored_state`).
+    /// `b'u' ++ address` → user, `b'c' ++ channel_id_be8` → channel,
+    /// `b'd' ++ delegation key` → delegation; values are canonical JSON.
+    /// Rebuilt from the SC by the repair sweep when dropped.
+    pub const ANCHORED_STATE: &str = "anchored_state";
+
+    /// Repair-sweep bookkeeping for `ANCHORED_STATE`: `b'n' ++ address` →
+    /// unix seconds of the last "not registered" answer (negative cache).
+    /// Node-local, derived; droppable.
+    pub const ANCHORED_REPAIR: &str = "anchored_repair";
 
     /// channel_id (8 bytes BE) → JSON `{creator_verified_at, creator_verification_failed}`
     /// — `ChainScanner::sweep_channel_verification`'s bookkeeping (audit 2026-09-29).
-    /// Deliberately a SEPARATE CF from `CHANNELS`, not a field on that row: `CHANNELS`
-    /// is in `snapshot::DOMAIN_CFS` and its raw bytes feed the anchored state root
-    /// (`crypto::merkle::StateManager::add_channel`) — a per-node wall-clock
-    /// verification timestamp inside that blob would make every node's root for a
-    /// public channel diverge permanently (every round-robin re-check rewrites a
-    /// DIFFERENT timestamp on every node), not just transiently, and nothing
-    /// anchoring-relevant ever needs to read it. This CF is intentionally NOT in
-    /// `snapshot::DOMAIN_CFS` — node-local operational state only.
+    /// Deliberately a SEPARATE CF from `CHANNELS`, not a field on that row: a
+    /// per-node wall-clock verification timestamp inside a shared row would make
+    /// nodes' copies diverge permanently (every round-robin re-check rewrites a
+    /// DIFFERENT timestamp on every node). Under the v3 state root `CHANNELS`
+    /// was anchored, which made that fatal; since v4 (0.148.0) only the chain
+    /// mirror (`ANCHORED_STATE`) is. Node-local operational state only, never
+    /// in a snapshot.
     pub const CHANNEL_VERIFICATION: &str = "channel_verification";
 
     /// channel_id (8 bytes BE) → unix seconds (8 bytes BE) of the last time a
@@ -523,6 +536,8 @@ pub mod cf {
         NEWS_REACTION_MSGS,
         DM_RECIPIENT_MSG_COUNTS,
         STATE_CHECKPOINTS,
+        ANCHORED_STATE,
+        ANCHORED_REPAIR,
     ];
 }
 
@@ -530,6 +545,19 @@ pub mod cf {
 pub mod state_keys {
     /// Last processed Klever block height (u64 big-endian).
     pub const CHAIN_CURSOR: &[u8] = b"chain_cursor";
+    /// Sentinel: set to 1 once the first repair pass has filled
+    /// `ANCHORED_STATE` from the SC (l2-node 0.148.0). Sealing waits for it.
+    pub const ANCHORED_STATE_MIGRATED_V1: &[u8] = b"migration_anchored_state_v1";
+    /// Chain cursor up to which the scanner has written `ANCHORED_STATE`
+    /// (u64 BE). Behind `CHAIN_CURSOR` at startup means an older release ran
+    /// the scanner without the mirror (a downgrade round-trip): the mirror
+    /// may miss changes, so it is treated as unmigrated again.
+    pub const ANCHORED_MIRROR_CURSOR: &[u8] = b"anchored_mirror_cursor";
+    /// Repair-sweep cursors (last processed key / channel id) for
+    /// `ANCHORED_STATE`.
+    pub const ANCHORED_REPAIR_USER_CURSOR: &[u8] = b"anchored_repair_user_cursor";
+    pub const ANCHORED_REPAIR_CHANNEL_CURSOR: &[u8] = b"anchored_repair_channel_cursor";
+    pub const ANCHORED_REPAIR_DELEGATION_CURSOR: &[u8] = b"anchored_repair_delegation_cursor";
     /// Node's Ed25519 signing key (32 bytes).
     pub const NODE_PRIVATE_KEY: &[u8] = b"node_private_key";
     /// Local Lamport clock counter (u64 big-endian).
@@ -611,6 +639,9 @@ pub mod state_keys {
     pub const REACTION_COUNT_KEYV2: &[u8] = b"migration_reaction_count_keyv2";
     /// Unix timestamp of last successful state anchor submission (u64 big-endian).
     pub const LAST_ANCHOR_TS: &[u8] = b"last_anchor_ts";
+    /// Height of the last sealed checkpoint this node submitted (or found
+    /// already submitted) on-chain (u64 BE, l2-node 0.148.0).
+    pub const LAST_ANCHOR_HEIGHT: &[u8] = b"last_anchor_height";
     /// Latest known Klever chain tip block height (u64 big-endian).
     /// Updated by the chain scanner on every poll cycle for dashboard sync lag.
     pub const CHAIN_TIP: &[u8] = b"chain_tip";
@@ -792,17 +823,18 @@ pub mod snapshot {
     /// behind the same authentication boundary as `GET /api/v1/devices`
     /// rather than ship them in bulk to any peer that asks. Phase 2 apply
     /// path re-derives these CFs locally after receiving the snapshot.
-    pub const DOMAIN_CFS: &[&str] = &[
-        cf::USERS,
-        cf::CHANNELS,
-        cf::CHANNEL_MEMBERS,
-        cf::DELEGATIONS,
-        cf::STATE_ANCHORS,
-        cf::ANCHOR_BY_NODE,
-    ];
+    ///
+    /// Since manifest v2 (l2-node 0.148.0) only the anchored chain mirror:
+    /// its rows are served from a SEALED checkpoint (state at the manifest's
+    /// `block_height`) and verified by the receiver against the final
+    /// canonical anchored root on-chain. Gossip state (profiles, channel
+    /// metadata, memberships) cannot be verified that way and is no longer
+    /// shipped; a bootstrapped node gets it through the signed sync paths.
+    pub const DOMAIN_CFS: &[&str] = &[cf::ANCHORED_STATE];
 
     /// Snapshot manifest format version.
-    pub const MANIFEST_VERSION: u8 = 1;
+    /// v2 (0.148.0): chain-mirror-only content from a sealed checkpoint.
+    pub const MANIFEST_VERSION: u8 = 2;
 
     /// Domain-separation tag for the snapshot root hash.
     /// Prevents a snapshot root from being mistaken for a state root or message

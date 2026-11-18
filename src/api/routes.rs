@@ -8808,7 +8808,9 @@ pub async fn get_user_moderation(
                     .and_then(|v| v.as_u64())
                     .or_else(|| profile.get("created_at").and_then(|v| v.as_u64()))
                     .unwrap_or(0);
-                if registered_at > 0 {
+                // Below the threshold = registered, time unknown (a row
+                // derived from a snapshot's anchored mirror): no age credit.
+                if registered_at >= crate::storage::anchored_state::REGISTERED_AT_KNOWN_MIN {
                     let now_secs = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .unwrap_or_default()

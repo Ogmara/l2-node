@@ -1,18 +1,19 @@
 //! Merkle tree for L2 state anchoring.
 //!
-//! Constructs a Merkle tree from L2 state (users, channel metadata,
-//! delegations, channel members), generates state roots for on-chain
-//! anchoring, and builds/verifies record inclusion proofs against them.
-//! Uses SHA-256 hashing (spec 02-onchain.md section 7). Messages are not
-//! part of the anchored state: nodes legitimately hold different message
-//! sets, so a message commitment would stop anchorers from agreeing.
+//! Constructs a Merkle tree from the anchored state — the node's mirror of
+//! what the chain says (`storage::anchored_state`) — generates state roots
+//! for on-chain anchoring, and builds/verifies record inclusion proofs
+//! against them. Uses SHA-256 hashing (spec 02-onchain.md section 7).
+//! Nothing gossip-derived is anchored (messages, profiles, channel metadata,
+//! memberships): nodes legitimately hold different sets of it, so a
+//! commitment to it would stop anchorers from ever agreeing; those records
+//! are authenticated by their authors' signatures instead.
 //!
-//! Tree structure:
+//! Tree structure (v4):
 //!   State Root
-//!   ├── Users Subtree
-//!   ├── Channels Subtree (channel metadata records)
-//!   ├── Delegations Subtree
-//!   └── Channel Members Subtree (added v3, audit final pre-mainnet C2)
+//!   ├── Users Subtree        (on-chain registrations)
+//!   ├── Channels Subtree     (on-chain channels)
+//!   └── Delegations Subtree  (on-chain device delegations)
 
 use sha2::{Digest, Sha256};
 
@@ -35,7 +36,13 @@ const LEAF_PREFIX: u8 = 0x00;
 ///     CHANNEL_MEMBERS was transferred by snapshot bootstrap but not
 ///     covered by the anchored commitment, letting a Sybil quorum inject
 ///     arbitrary private-channel membership grants into a fresh node.
-const STATE_ROOT_DOMAIN: &[u8] = b"ogmara-state-root-v3";
+///   - v3 → v4 (2026-11-17, l2-node 0.148.0): chain-only. The root covers
+///     the scanner-owned chain mirror (users, channels, delegations) with
+///     fixed canonical leaves; gossip-derived state (profiles, channel
+///     metadata, members) left the root, and snapshots no longer import it.
+///     v3 roots were never reproducible across nodes, so none ever became
+///     canonical.
+const STATE_ROOT_DOMAIN: &[u8] = b"ogmara-state-root-v4";
 
 /// Hash two child nodes together: SHA-256(0x01 || left || right).
 /// The 0x01 prefix distinguishes internal nodes from leaf hashes,
@@ -205,11 +212,14 @@ pub fn root_from_path(
     Some(hash)
 }
 
-/// Frame the four subtree `(leaf_count, root)` pairs — users, channels,
-/// delegations, channel members, in that order — into the anchored state
-/// root. The single definition used by [`StateManager::compute_state_root`]
-/// and by state-proof verification.
-pub fn frame_state_root(subtrees: &[(u64, [u8; 32]); 4]) -> [u8; 32] {
+/// Number of anchored subtrees (users, channels, delegations).
+pub const SUBTREE_COUNT: usize = 3;
+
+/// Frame the subtree `(leaf_count, root)` pairs — users, channels,
+/// delegations, in that order — into the anchored state root. The single
+/// definition used by [`StateManager::compute_state_root`] and by
+/// state-proof verification.
+pub fn frame_state_root(subtrees: &[(u64, [u8; 32]); SUBTREE_COUNT]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(STATE_ROOT_DOMAIN);
     for (count, root) in subtrees {
@@ -219,129 +229,57 @@ pub fn frame_state_root(subtrees: &[(u64, [u8; 32]); 4]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-/// The state manager that builds and maintains the L2 state Merkle tree.
-///
-/// Composed of four subtrees: users, channels (metadata only — messages
-/// are not part of the anchored state, see spec 02 §7), delegations,
-/// channel members.
+/// The state manager that builds the anchored state Merkle tree from the
+/// canonical leaf values of the three subtrees. Every leaf is
+/// `hash_leaf(value)`: each canonical value re-encodes its own identifying
+/// fields (address, channel id, user + device key), so the value alone
+/// binds the record's identity.
 pub struct StateManager {
-    /// Hashes of user states.
-    user_hashes: Vec<[u8; 32]>,
-    /// Hashes of channel metadata records.
-    channel_hashes: Vec<[u8; 32]>,
-    /// Hashes of delegation records.
-    delegation_hashes: Vec<[u8; 32]>,
-    /// Hashes of channel-membership records (added v3, audit C2).
-    channel_member_hashes: Vec<[u8; 32]>,
+    /// Leaf hashes per subtree, in [`frame_state_root`] order.
+    leaves: [Vec<[u8; 32]>; SUBTREE_COUNT],
 }
 
 impl StateManager {
     pub fn new() -> Self {
-        Self {
-            user_hashes: Vec::new(),
-            channel_hashes: Vec::new(),
-            delegation_hashes: Vec::new(),
-            channel_member_hashes: Vec::new(),
-        }
+        Self { leaves: Default::default() }
     }
 
-    /// Add a user state hash.
+    /// Add a leaf to subtree `index` (0 users, 1 channels, 2 delegations).
     ///
     /// Leaves go through `hash_leaf` (0x00 domain prefix) so they can never be
     /// confused with an internal node (0x01) — second-preimage resistance
-    /// (audit 2026-06-07 W13). Previously these used bare `sha256`, bypassing
-    /// the domain separation that `hash_pair` relies on.
-    pub fn add_user(&mut self, user_data: &[u8]) {
-        self.user_hashes.push(hash_leaf(user_data));
+    /// (audit 2026-06-07 W13).
+    pub fn add(&mut self, index: usize, value: &[u8]) {
+        self.leaves[index].push(hash_leaf(value));
     }
 
-    /// Add a channel metadata record hash.
-    pub fn add_channel(&mut self, channel_data: &[u8]) {
-        self.channel_hashes.push(hash_leaf(channel_data));
-    }
-
-    /// Add a delegation record hash.
-    pub fn add_delegation(&mut self, delegation_data: &[u8]) {
-        self.delegation_hashes.push(hash_leaf(delegation_data));
-    }
-
-    /// Add a channel-membership record hash (v3, audit final pre-mainnet
-    /// C2). `CHANNEL_MEMBERS` is transferred by snapshot bootstrap like the
-    /// other three CFs, but was not covered by the anchored commitment
-    /// until this subtree was added — a Sybil quorum could inject arbitrary
-    /// private-channel membership grants into a fresh bootstrapping node.
-    ///
-    /// **Unlike `add_user`/`add_channel`/`add_delegation`, this hashes the
-    /// KEY together with the value (`hash_kv`, not bare `hash_leaf`).** The
-    /// other three CFs' values happen to redundantly re-encode their own
-    /// identifying key fields (e.g. a USERS value includes `"address"`), so
-    /// hashing the value alone still binds identity. `CHANNEL_MEMBERS`
-    /// values do NOT — the production write path
-    /// (`MessageRouter::add_channel_member`, router.rs) stores only
-    /// `{"joined_at": ..., "role": ...}`; `channel_id` and the member's
-    /// address live ONLY in the key (`encode_channel_member_key`). Hashing
-    /// the value alone would let an attacker reassign genuine
-    /// `(joined_at, role)` values to a completely different
-    /// `(channel_id, address)` key — same leaf multiset, same root, but
-    /// arbitrary membership grants. `hash_kv` (already used for per-CF
-    /// snapshot integrity in `Storage::build_snapshot_cf`) binds both.
-    pub fn add_channel_member(&mut self, key: &[u8], value: &[u8]) {
-        self.channel_member_hashes.push(hash_kv(key, value));
-    }
-
-    /// Compute the state root from all four subtrees.
+    /// Compute the state root from all subtrees.
     ///
     /// v2 (audit 2026-06-07 W14): the concatenation is framed with a domain
     /// constant and each subtree's leaf COUNT is mixed in, so the
     /// duplicate-last-node padding in `compute_root` (CVE-2012-2459 shape — a
     /// `[a,b,c]` tree and a `[a,b,c,c]` tree share a subtree root) can no longer
     /// forge the same *anchored* state root: the two differ by leaf count.
-    /// v3 (audit C2, 2026-08-17): added the channel-members subtree,
-    /// following the exact same framing.
     ///
     /// **Canonical cross-node value — changing this changes every node's
     /// anchored root.** All anchoring nodes must run a build with the same
-    /// `STATE_ROOT_DOMAIN` (v2: l2-node ≥0.62.0; v3: l2-node ≥0.86.0); a
-    /// mixed fleet would diverge.
+    /// `STATE_ROOT_DOMAIN` (v4: l2-node ≥0.148.0); a mixed fleet diverges.
     pub fn compute_state_root(&self) -> [u8; 32] {
-        let users_root = compute_root(&self.user_hashes);
-        let channels_root = compute_root(&self.channel_hashes);
-        let delegations_root = compute_root(&self.delegation_hashes);
-        let channel_members_root = compute_root(&self.channel_member_hashes);
-
-        frame_state_root(&[
-            (self.user_hashes.len() as u64, users_root),
-            (self.channel_hashes.len() as u64, channels_root),
-            (self.delegation_hashes.len() as u64, delegations_root),
-            (self.channel_member_hashes.len() as u64, channel_members_root),
-        ])
+        frame_state_root(&std::array::from_fn(|i| {
+            (self.leaves[i].len() as u64, compute_root(&self.leaves[i]))
+        }))
     }
 
-    /// The leaf hashes of the four subtrees, in [`frame_state_root`] order
-    /// — exactly what [`Self::compute_state_root`] hashed, so a state
-    /// checkpoint stores the same leaves the anchored root commits to.
+    /// The leaf hashes of the subtrees, in [`frame_state_root`] order.
     #[cfg(test)]
-    pub fn subtree_leaves(&self) -> [&[[u8; 32]]; 4] {
-        [
-            &self.user_hashes,
-            &self.channel_hashes,
-            &self.delegation_hashes,
-            &self.channel_member_hashes,
-        ]
+    pub fn subtree_leaves(&self) -> &[Vec<[u8; 32]>; SUBTREE_COUNT] {
+        &self.leaves
     }
 
-    /// The state root and the four subtrees' leaves, moved out (no copy).
-    pub fn into_root_and_leaves(self) -> ([u8; 32], [Vec<[u8; 32]>; 4]) {
+    /// The state root and the subtrees' leaves, moved out (no copy).
+    pub fn into_root_and_leaves(self) -> ([u8; 32], [Vec<[u8; 32]>; SUBTREE_COUNT]) {
         let root = self.compute_state_root();
-        (
-            root,
-            [
-                self.user_hashes,
-                self.channel_hashes,
-                self.delegation_hashes,
-                self.channel_member_hashes,
-            ],
-        )
+        (root, self.leaves)
     }
 }
 
@@ -425,70 +363,33 @@ mod tests {
     #[test]
     fn frame_state_root_matches_state_manager() {
         let mut sm = StateManager::new();
-        sm.add_user(b"u1");
-        sm.add_user(b"u2");
-        sm.add_channel(b"c1");
-        sm.add_channel_member(b"k", b"v");
-        let [u, c, d, m] = sm.subtree_leaves();
+        sm.add(0, b"u1");
+        sm.add(0, b"u2");
+        sm.add(1, b"c1");
+        let [u, c, d] = sm.subtree_leaves();
         let framed = frame_state_root(&[
             (u.len() as u64, compute_root(u)),
             (c.len() as u64, compute_root(c)),
             (d.len() as u64, compute_root(d)),
-            (m.len() as u64, compute_root(m)),
         ]);
         assert_eq!(framed, sm.compute_state_root());
     }
 
     #[test]
-    fn test_state_manager() {
-        let mut sm = StateManager::new();
-        sm.add_user(b"user1");
-        sm.add_user(b"user2");
-        sm.add_channel(b"channel1");
-        sm.add_delegation(b"delegation1");
-
-        let root = sm.compute_state_root();
-        assert_ne!(root, [0u8; 32]);
-
-        // Same data should produce the same root
-        let root2 = sm.compute_state_root();
-        assert_eq!(root, root2);
-    }
-
-    #[test]
-    fn channel_member_participates_in_state_root() {
-        // C2: the channel-members subtree must actually affect the anchored
-        // root — otherwise adding it is a no-op and the fix does nothing.
-        let mut without_member = StateManager::new();
-        without_member.add_user(b"user1");
-        without_member.add_channel(b"channel1");
-        without_member.add_delegation(b"delegation1");
-
-        let mut with_member = StateManager::new();
-        with_member.add_user(b"user1");
-        with_member.add_channel(b"channel1");
-        with_member.add_delegation(b"delegation1");
-        with_member.add_channel_member(b"key1", b"member1");
-
-        assert_ne!(without_member.compute_state_root(), with_member.compute_state_root());
-    }
-
-    #[test]
-    fn channel_member_binds_key_not_just_value() {
-        // Regression: CHANNEL_MEMBERS values don't redundantly encode their
-        // key (channel_id + address) the way USERS/DELEGATIONS values do —
-        // production rows are just {"joined_at": ..., "role": ...}. If the
-        // leaf hash only covered the value, an attacker could reassign a
-        // genuine (joined_at, role) blob to a totally different
-        // (channel_id, address) key and produce the SAME root — same
-        // multiset of values, different (and forged) membership grants.
+    fn every_subtree_participates_and_position_matters() {
+        let mut base = StateManager::new();
+        base.add(0, b"x");
+        for i in 0..SUBTREE_COUNT {
+            let mut other = StateManager::new();
+            other.add(0, b"x");
+            other.add(i, b"y");
+            assert_ne!(base.compute_state_root(), other.compute_state_root(), "subtree {i}");
+        }
+        // The same leaf in a different subtree is a different root.
         let mut a = StateManager::new();
-        a.add_channel_member(b"channel1:klv1alice", b"{\"joined_at\":1,\"role\":\"member\"}");
-
+        a.add(1, b"z");
         let mut b = StateManager::new();
-        // Same VALUE, different KEY — must NOT produce the same root.
-        b.add_channel_member(b"channel2:klv1mallory", b"{\"joined_at\":1,\"role\":\"member\"}");
-
+        b.add(2, b"z");
         assert_ne!(a.compute_state_root(), b.compute_state_root());
     }
 
@@ -496,10 +397,10 @@ mod tests {
     fn state_manager_uses_leaf_domain_separation() {
         // W13: StateManager leaves must be hash_leaf (0x00), not bare sha256.
         let mut sm = StateManager::new();
-        sm.add_user(b"u");
+        sm.add(0, b"u");
         // Single-leaf subtree root == the leaf == hash_leaf(data), NOT sha256.
-        assert_eq!(compute_root(&sm.user_hashes), hash_leaf(b"u"));
-        assert_ne!(compute_root(&sm.user_hashes), sha256(b"u"));
+        assert_eq!(compute_root(&sm.leaves[0]), hash_leaf(b"u"));
+        assert_ne!(compute_root(&sm.leaves[0]), sha256(b"u"));
     }
 
     #[test]
@@ -508,19 +409,16 @@ mod tests {
         // `compute_root`, but the leaf-count framing must make the *state roots*
         // differ so a padded duplicate can't forge the anchored root.
         let mut a = StateManager::new();
-        a.add_user(b"a");
-        a.add_user(b"b");
-        a.add_user(b"c");
-
+        for v in [b"a", b"b", b"c"] {
+            a.add(0, v);
+        }
         let mut b = StateManager::new();
-        b.add_user(b"a");
-        b.add_user(b"b");
-        b.add_user(b"c");
-        b.add_user(b"c"); // duplicated last → same compute_root, different count
-
+        for v in [b"a", b"b", b"c", b"c"] {
+            b.add(0, v);
+        }
         assert_eq!(
-            compute_root(&a.user_hashes),
-            compute_root(&b.user_hashes),
+            compute_root(&a.leaves[0]),
+            compute_root(&b.leaves[0]),
             "precondition: duplicate-last shares the bare subtree root",
         );
         assert_ne!(

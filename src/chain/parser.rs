@@ -26,7 +26,7 @@ pub fn parse_sc_call(call_data: &str, sender: &str, timestamp: u64) -> Option<Sc
         "createChannel" => parse_create_channel(args, sender, timestamp),
         "transferChannel" => parse_transfer_channel(args),
         "delegateDevice" => parse_delegate_device(args, sender, timestamp),
-        "revokeDevice" => parse_revoke_device(args, sender),
+        "revokeDevice" => parse_revoke_device(args, sender, timestamp),
         "anchorState" => parse_anchor_state(args, sender, timestamp),
         "tip" => parse_tip(args, sender),
         // init, upgrade, admin endpoints — not events we need to track
@@ -112,7 +112,7 @@ fn parse_delegate_device(args: &[&str], sender: &str, timestamp: u64) -> Option<
     })
 }
 
-fn parse_revoke_device(args: &[&str], sender: &str) -> Option<ScEvent> {
+fn parse_revoke_device(args: &[&str], sender: &str, timestamp: u64) -> Option<ScEvent> {
     // revokeDevice(device_pub_key: hex64)
     if args.is_empty() {
         return None;
@@ -121,6 +121,7 @@ fn parse_revoke_device(args: &[&str], sender: &str) -> Option<ScEvent> {
     Some(ScEvent::DeviceRevoked {
         user: sender.to_string(),
         device_key,
+        timestamp,
     })
 }
 

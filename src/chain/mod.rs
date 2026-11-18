@@ -1,6 +1,6 @@
 //! Klever blockchain integration — chain scanner and state anchoring.
 
-pub mod anchor_verify;
+pub mod anchored_repair;
 pub mod anchoring;
 pub mod governance_autoexec;
 pub mod metadata_reconcile;

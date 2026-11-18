@@ -29,6 +29,7 @@ use tracing::warn;
 use crate::storage::rocks::Storage;
 use crate::storage::schema::{self, snapshot::DOMAIN_CFS};
 use crate::storage::snapshot::{BuiltCf, CfManifest};
+use crate::storage::state_checkpoints::Subtree;
 
 /// Maximum manifest payload size accepted from a peer (1 MiB).
 /// Manifests are small (a few KB of headers per CF) — anything larger is
@@ -48,7 +49,9 @@ pub const MAX_CHUNK_BYTES: u32 = 16 * 1024 * 1024;
 /// client side — Phase 2 wires verification when the fetch path lands.)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotManifest {
-    /// Format version. Phase 1 = `schema::snapshot::MANIFEST_VERSION` (1).
+    /// Format version: `schema::snapshot::MANIFEST_VERSION` (2 since
+    /// l2-node 0.148.0, chain-mirror-only content; other versions are
+    /// rejected).
     pub version: u8,
     /// "mainnet" or "testnet" — receivers reject manifests from other networks.
     pub network_id: String,
@@ -426,15 +429,21 @@ pub fn build_cache(
 ) -> Result<SnapshotCache> {
     use ed25519_dalek::Signer;
 
-    let block_height = storage
-        .get_chain_cursor()
-        .context("reading chain_cursor for snapshot cache")?;
-    let total_users = storage
-        .get_stat(schema::state_keys::TOTAL_USERS)
-        .context("reading TOTAL_USERS")?;
-    let total_channels = storage
-        .get_stat(schema::state_keys::TOTAL_CHANNELS)
-        .context("reading TOTAL_CHANNELS")?;
+    // Serve the newest canonical-confirmed sealed checkpoint (receivers can
+    // verify it against the chain), else the newest sealed one (only
+    // receivers running `experimental_skip_anchor_verify` accept that).
+    let canonical = storage.canonical_state_checkpoint_heights()?;
+    let sealed = storage.state_checkpoint_heights()?;
+    let block_height = canonical
+        .last()
+        .or(sealed.last())
+        .copied()
+        .context("no sealed state checkpoint yet — nothing to serve")?;
+    let header = storage
+        .load_state_checkpoint_header(block_height)?
+        .context("sealed checkpoint header missing")?;
+    let total_users = header.subtrees[0].0;
+    let total_channels = header.subtrees[1].0;
 
     let mut cfs_manifest: Vec<CfManifest> = Vec::with_capacity(DOMAIN_CFS.len());
     let mut cf_roots: Vec<[u8; 32]> = Vec::with_capacity(DOMAIN_CFS.len());
@@ -447,8 +456,22 @@ pub fn build_cache(
     let mut compressed_total_bytes: u64 = 0;
 
     for cf_name in DOMAIN_CFS {
-        let built: BuiltCf = storage
-            .build_snapshot_cf(cf_name, chunk_size_bytes, codec_id)
+        debug_assert_eq!(*cf_name, schema::cf::ANCHORED_STATE);
+        // The sealed rows in ascending key order: channels (`c`) <
+        // delegations (`d`) < users (`u`).
+        let mut subtrees = Vec::new();
+        for subtree in [Subtree::Channels, Subtree::Delegations, Subtree::Users] {
+            subtrees.push(
+                storage
+                    .load_state_checkpoint_subtree(block_height, subtree)?
+                    .context("sealed checkpoint subtree missing")?,
+            );
+        }
+        let rows = subtrees
+            .into_iter()
+            .flat_map(|st| st.keys.into_iter().zip(st.values))
+            .map(Ok);
+        let built: BuiltCf = Storage::build_snapshot_rows(cf_name, rows, chunk_size_bytes, codec_id)
             .with_context(|| format!("building snapshot for cf '{}'", cf_name))?;
 
         // Snapshot the per-CF manifest before we consume `built.chunks` /

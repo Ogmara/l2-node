@@ -5,6 +5,153 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.148.0] - 2026-11-18
+
+Anchored state v4: nodes now agree on their anchored roots. Live check of
+0.147.x showed no height had become canonical since the test anchor at
+9 992 356 — every node anchored its own scanner position on its own timer,
+and the v3 root covered gossip-derived state (profiles, channel metadata,
+memberships) that no two nodes hold identically.
+
+### Changed
+
+- **State root v4 is chain-only** (`ogmara-state-root-v4`, spec 02 §7).
+  It covers a new scanner-owned chain mirror, `anchored_state`, with three
+  subtrees: users `{address, public_key}`, channels
+  `{channel_id, creator, slug}`, delegations
+  `{created_at, device_key, expires_at, permissions, revoked_at, user}` —
+  canonical JSON, only fields the scanner and the SC views report
+  identically. Gossip state left the root (it is authenticated by its
+  authors' signatures); the channel-members subtree is gone. The mirror is
+  written only by the chain scanner and the repair sweep, never by gossip
+  or the API. Registration/creation times are not leaf fields: the SC only
+  records them since 0.6.1.
+- **Shared anchor heights.** `[anchoring] interval_seconds` is rounded to
+  the nearest divisor of 24 h (1, 2, 3, 4, 6, 8, 12, 24 h; logged at
+  startup) and anchor heights are exactly the multiples of
+  `900 × hours` blocks, so every node anchors every 24 h boundary and nodes
+  with overlapping intervals meet more often. The anchor-overdue alert uses
+  the rounded interval.
+- **Seal at the boundary.** The chain scanner stops each batch at the next
+  boundary and, once that block is applied (and nothing after it), seals the
+  mirror into a checkpoint — before the cursor moves, so a crash re-seals.
+  A catching-up node skips boundaries older than two intervals. A height
+  is never re-sealed (its root may already be submitted), and a failed seal
+  only costs that height its anchor — it never stalls the scanner. The anchorer
+  no longer picks a height: it submits the newest sealed checkpoint above
+  its last submission (persisted; a height the SC refuses as already
+  submitted or below the floor is marked done). The manual trigger follows
+  the same rule.
+- **Checkpoints store values** (format v2): `/api/v1/state/proof` serves
+  the value sealed at that height, so `409 record_changed` is gone;
+  `subtree=channel_members` answers `400`. The private-channel refusal is
+  gone too — the mirror holds only on-chain channels. 0.147.x checkpoints
+  are purged at startup.
+- **Snapshot manifest v2 is chain-only.** A snapshot carries the sealed
+  `anchored_state` rows of one height (newest canonical-confirmed, else
+  newest). The receiver checks every row is canonical and filed under its
+  own key, recomputes the v4 root and requires the SC's FINAL canonical
+  root at that height (escalation-aware) — then derives the chain-owned
+  `users`/`channels`/`delegations` rows; profiles, channel metadata and
+  memberships come through the signed sync paths. Nothing unverified is
+  imported any more (previously the gossip rows rode along, and a v3 root
+  that never matched let the check fall through to the skip flag).
+  Derived users carry `registered_at = 1` ("registered, time unknown"; no
+  reputation age credit). v1 and v2 peers ignore each other.
+
+### Added
+
+- **Repair sweep** (`chain::anchored_repair`): keeps the mirror complete
+  and correct against the SC. Candidates: every channel id up to
+  `getStats`, the scanner's `delegations` rows (existing ones re-checked
+  every round — a missed revoke must not survive), wallets in `users`, and
+  **other nodes' sealed mirrors** — one connected peer per round, streamed
+  over the snapshot protocol in the background one chunk at a time (signed
+  manifest, canonical rows, diffed on the fly; 64 MiB / 8 MiB-per-chunk
+  caps, 5 min deadline), never trusted: every row it holds differently
+  becomes a candidate (≤ 1000 per round; channel ids beyond the SC's count
+  are dropped). **Every repair write needs two SC sightings of the same
+  value with no scanner write to that row in between** (the scanner reports
+  every mirror key it writes; a row that went A → B → A does not count as
+  unchanged): a working tick first
+  checks the Klever node has reached our cursor (a lagging node would roll
+  a correct row back); the first sighting is stamped with the node's block
+  nonce (`/node/overview`, read after the value); the write happens on a
+  later sighting once the scanner cursor is 10 blocks past that stamp — the
+  scanner then provably missed that change, so the write holds for every
+  later seal and nodes converge deterministically.
+  This inserts registrations this node never saw at all and corrects
+  missed key updates, transfers and revokes. A confirmed revoke the scanner
+  missed is applied like the scanner's own revoke (see Security).
+
+  A budget of 4 Klever calls per 30 s tick (all counted, failed ones too; a
+  step in progress may finish, at most 7) through the
+  scanner's own request pacing, only while the scanner is at a tip polled
+  within 2 minutes (a frozen cursor during an API outage stops it); a
+  `node_url` that keeps lagging the scanner is warned about after ~10 min.
+  Assumption: `/vm/hex` and `/node/overview` answers come from one Klever
+  backend whose nonce only grows; a stale backend could at worst make a row
+  flap until the next round.
+  Before the first pass, peer candidates alternate with the local phases. After a
+  full round the sweep rests 30 min (not before the first clean round).
+  Unregistered wallets are cached as negative for 7 days. A failing item is
+  skipped and revisited next round — nothing is counted. On upgrade (and
+  after `db drop-cf anchored_state`) the first clean round of the local
+  phases fills the mirror and sealing waits for it; an unconfirmed
+  observation of the local phases keeps a round unclean, peer candidates
+  never do; until then only
+  wallets the scanner recorded as registered are `users` candidates, so a
+  flood of unregistered rows cannot delay it. New SC view clients:
+  `getUserPubKey`, `getChannelSlug`, `getDelegation` (only the documented
+  "not found" `require!` maps to `None`; any other VM error is retried),
+  the node's `/node/overview` nonce, and an escalation-aware
+  `get_final_canonical_anchor`.
+- **Downgrade round-trip detection.** The scanner records how far it has
+  written the mirror (`anchored_mirror_cursor`); if that is behind the chain
+  cursor at startup (an older release ran in between), the mirror counts as
+  unmigrated again until a clean repair round.
+- `anchored_state` and `anchored_repair` column families, both droppable
+  by `ogmara-node db drop-cf` (dropping the mirror restarts the migration).
+  Rolling back to 0.147.x: also drop `state_checkpoints` (0.147.x cannot
+  read the v2 rows), `anchored_state` and `anchored_repair`.
+
+### Removed
+
+- `chain::anchor_verify` (the v3 snapshot anchor check) and the
+  CF-iterating snapshot builder.
+
+### Security
+
+- **Snapshot manifests: the declared chunk sizes must fit the receiver's
+  byte cap** (shipped runtime code). Only the producer's `total_bytes`
+  claim was checked, so a manifest claiming 1 byte could list thousands of
+  128 MiB chunks (a decompression-bomb OOM) — reachable at bootstrap
+  before, and on every repair round with the peer mirror fetch. Now the sum
+  of the chunks' declared uncompressed sizes — what is actually decoded —
+  is bounded too; repair fetches are additionally capped at 64 MiB total and
+  8 MiB per chunk and streamed one chunk at a time.
+- **An on-chain `revokeDevice` now stops the device authenticating**
+  (shipped runtime code; the gap predates this release). The chain scanner
+  only set `active = false` on the `delegations` row, but authentication
+  resolves devices through the device→wallet map, so a device revoked
+  on-chain kept acting for its wallet. The scanner's revoke now removes the
+  mapping and writes the revocation tombstone (`IdentityResolver::
+  revoke_device_from_chain`, owner-checked, milliseconds) like an L2 or API
+  revoke — last writer wins, so a device re-registered AFTER the revoke
+  keeps its newer mapping, and a replayed chain delegation never lowers a
+  newer same-wallet claim (a catching-up node keeps an L2 re-registration it
+  received first). The repair sweep does the same for a revoke the
+  scanner missed (before writing the mirror row, so a failure is retried);
+  on upgrade its first pass therefore also unmaps devices revoked on-chain
+  before 0.148.0 that were never re-registered. A chain delegation is now
+  refused only by a strictly newer tombstone, so a revoke and a
+  re-delegation in the same block both take effect.
+- **A device revoke takes effect in every component at once** (shipped
+  runtime code; predates this release). `IdentityResolver` clones (API,
+  router, network, scanner) each held their own copy of the device→wallet
+  cache, so a revoke through one left the mapping cached in the others until
+  restart. The cache is now shared by all clones.
+
 ## [0.147.1] - 2026-11-17
 
 ### Fixed

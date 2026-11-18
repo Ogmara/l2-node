@@ -587,7 +587,7 @@ impl Storage {
     /// node-local state whose loss is recoverable, so an operator typo can
     /// never delete user data.
     pub const DROPPABLE_CFS: &'static [&'static str] =
-        &[cf::CHANNEL_KEY_COMMITS, cf::STATE_CHECKPOINTS];
+        &[cf::CHANNEL_KEY_COMMITS, cf::STATE_CHECKPOINTS, cf::ANCHORED_STATE, cf::ANCHORED_REPAIR];
 
     /// Offline maintenance for `ogmara-node db drop-cf` (l2-node 0.143.0
     /// rollback runbook): drop one allow-listed column family from a STOPPED
@@ -662,6 +662,24 @@ impl Storage {
                 let mut wo = rocksdb::WriteOptions::default();
                 wo.set_sync(true);
                 db.write_opt(batch, &wo).context("clearing key-commit migration sentinels")?;
+            }
+        }
+        if name == cf::ANCHORED_STATE {
+            // The mirror is rebuilt by the repair sweep; sealing must wait
+            // for that pass again, so the migration starts over.
+            if let Some(state) = db.cf_handle(cf::NODE_STATE) {
+                let mut batch = WriteBatch::default();
+                for k in [
+                    super::schema::state_keys::ANCHORED_STATE_MIGRATED_V1,
+                    super::schema::state_keys::ANCHORED_REPAIR_USER_CURSOR,
+                    super::schema::state_keys::ANCHORED_REPAIR_CHANNEL_CURSOR,
+                    super::schema::state_keys::ANCHORED_REPAIR_DELEGATION_CURSOR,
+                ] {
+                    batch.delete_cf(&state, k);
+                }
+                let mut wo = rocksdb::WriteOptions::default();
+                wo.set_sync(true);
+                db.write_opt(batch, &wo).context("clearing anchored-state migration sentinels")?;
             }
         }
         // Persist everything replayed from the WAL into SST files before the
@@ -2424,6 +2442,7 @@ impl Storage {
     }
 
     /// Store the chain scanner cursor (last processed block height).
+    #[cfg(test)]
     pub fn set_chain_cursor(&self, block_height: u64) -> Result<()> {
         self.put_cf(
             cf::NODE_STATE,
@@ -2901,94 +2920,68 @@ impl Storage {
 
     // --- State Anchoring ---
 
-    /// Compute the current L2 state Merkle root by iterating USERS, CHANNELS,
-    /// DELEGATIONS, and CHANNEL_MEMBERS column families.
+    /// Compute the current anchored state root (v4) over the chain mirror
+    /// (`ANCHORED_STATE`).
     ///
     /// Returns `(state_root, message_count, channel_count, user_count)`.
     /// Should be called from `spawn_blocking` to avoid blocking the async runtime.
     pub fn compute_current_state_root(&self) -> Result<([u8; 32], u64, u32, u32)> {
-        // Keys are only needed for proofs; don't hold them for a plain root.
-        let cp = self.build_state_checkpoint(false)?;
+        let cp = self.compute_state_checkpoint()?;
         let message_count = self.get_stat(super::schema::state_keys::TOTAL_MESSAGES)?;
         let channel_count = cp.subtrees[1].leaves.len() as u32;
         let user_count = cp.subtrees[0].leaves.len() as u32;
         Ok((cp.state_root, message_count, channel_count, user_count))
     }
 
-    /// The state root plus everything it commits to: per subtree, the
-    /// RocksDB keys in iteration order and the leaf hashes `StateManager`
-    /// hashed (`storage::state_checkpoints`). Should be called from
-    /// `spawn_blocking`.
+    /// The anchored state root plus everything it commits to: per subtree,
+    /// the `ANCHORED_STATE` keys in iteration order and their canonical
+    /// values (`storage::state_checkpoints`). The single place the anchored
+    /// root is computed. Reads one RocksDB snapshot, so a concurrent write
+    /// can never tear the root. Should be called from `spawn_blocking`.
     pub fn compute_state_checkpoint(&self) -> Result<super::state_checkpoints::StateCheckpoint> {
-        self.build_state_checkpoint(true)
-    }
-
-    /// The single place the anchored root is computed. With
-    /// `collect_keys = false` the returned subtrees carry leaves only.
-    fn build_state_checkpoint(
-        &self,
-        collect_keys: bool,
-    ) -> Result<super::state_checkpoints::StateCheckpoint> {
         use super::state_checkpoints::{StateCheckpoint, Subtree, SubtreeCheckpoint};
         use crate::crypto::merkle::StateManager;
 
+        let handle = self
+            .db
+            .cf_handle(cf::ANCHORED_STATE)
+            .context("anchored_state cf not found")?;
+        let snapshot = self.db.snapshot();
         let mut state_mgr = StateManager::new();
-        let mut keys: [Vec<Vec<u8>>; 4] = Default::default();
+        let mut subtrees: [SubtreeCheckpoint; crate::crypto::merkle::SUBTREE_COUNT] = Default::default();
         for subtree in Subtree::ALL {
-            let handle = self
-                .db
-                .cf_handle(subtree.cf())
-                .with_context(|| format!("{} cf not found", subtree.cf()))?;
-            let mut iter = self.db.raw_iterator_cf(&handle);
-            iter.seek_to_first();
+            let mut ro = rocksdb::ReadOptions::default();
+            ro.set_snapshot(&snapshot);
+            let mut iter = self.db.raw_iterator_cf_opt(&handle, ro);
+            iter.seek([subtree.prefix()]);
             while iter.valid() {
-                if let (Some(key), Some(value)) = (iter.key(), iter.value()) {
-                    match subtree {
-                        Subtree::Users => state_mgr.add_user(value),
-                        Subtree::Channels => state_mgr.add_channel(value),
-                        Subtree::Delegations => state_mgr.add_delegation(value),
-                        // CHANNEL_MEMBERS values don't redundantly encode
-                        // their key (channel_id + address) the way the
-                        // other three do — the key is hashed in too (see
-                        // `StateManager::add_channel_member`; audit C2).
-                        Subtree::ChannelMembers => state_mgr.add_channel_member(key, value),
-                    }
-                    if collect_keys {
-                        keys[subtree.index()].push(key.to_vec());
-                    }
+                let (Some(key), Some(value)) = (iter.key(), iter.value()) else { break };
+                if key.first() != Some(&subtree.prefix()) {
+                    break;
                 }
+                state_mgr.add(subtree.index(), value);
+                subtrees[subtree.index()].push(key.to_vec(), value.to_vec());
                 iter.next();
             }
-            iter.status().with_context(|| format!("iterating {}", subtree.cf()))?;
+            iter.status().context("iterating anchored_state")?;
         }
-
         let (state_root, leaves) = state_mgr.into_root_and_leaves();
-        let mut keys = keys.into_iter();
-        let mut leaves = leaves.into_iter();
-        let subtrees = std::array::from_fn(|_| SubtreeCheckpoint {
-            keys: keys.next().expect("four subtrees"),
-            leaves: leaves.next().expect("four subtrees"),
-        });
+        debug_assert!(subtrees.iter().zip(&leaves).all(|(st, l)| &st.leaves == l));
         Ok(StateCheckpoint { state_root, subtrees })
     }
 
     // --- Snapshot Bootstrap (spec 11-snapshot-sync.md) ---
 
-    /// Build the chunk-set for a single CF in the snapshot pipeline.
-    ///
-    /// Iterates the CF in key-sorted order (RocksDB's natural iteration order)
-    /// and packs `(key, value)` rows into chunks of roughly `chunk_size_bytes`
-    /// of uncompressed payload. Returns the per-CF manifest (chunk headers +
-    /// Merkle root) and the compressed chunk bytes indexed by `seq`.
-    ///
-    /// `codec_id` is one of `schema::snapshot::codec::*`. The serve path uses
-    /// `ZSTD` (level 3); `NONE` is available for tests where determinism
-    /// trumps size.
-    ///
-    /// Should be called from `spawn_blocking` — full-CF iteration is unbounded.
-    pub fn build_snapshot_cf(
-        &self,
+    /// Chunk an ordered sequence of `(key, value)` rows for the snapshot
+    /// pipeline (spec 11-snapshot-sync.md): per-row `hash_kv` leaves, chunks
+    /// of roughly `chunk_size_bytes`, per-CF Merkle root. Returns the per-CF
+    /// manifest (chunk headers + Merkle root) and the compressed chunk bytes
+    /// indexed by `seq`. `codec_id` is one of `schema::snapshot::codec::*`:
+    /// the serve path uses `ZSTD` (level 3); `NONE` is for tests. Rows must arrive in ascending key order (the receiver applies
+    /// and re-verifies them in that order).
+    pub fn build_snapshot_rows(
         cf_name: &str,
+        rows: impl Iterator<Item = Result<(Vec<u8>, Vec<u8>)>>,
         chunk_size_bytes: u32,
         codec_id: u8,
     ) -> Result<super::snapshot::BuiltCf> {
@@ -3005,9 +2998,6 @@ impl Storage {
         {
             anyhow::bail!("unsupported snapshot codec id: {}", codec_id);
         }
-
-        let cf_handle = self.db.cf_handle(cf_name)
-            .with_context(|| format!("column family '{}' not found", cf_name))?;
         let target_chunk_bytes = chunk_size_bytes as usize;
 
         let mut current_entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
@@ -3020,12 +3010,10 @@ impl Storage {
         let mut total_bytes: u64 = 0;
         let mut seq: u32 = 0;
 
-        // RocksDB iterators take an implicit DB snapshot at creation, so
-        // concurrent scanner writes don't produce inconsistent chunks here.
-        let mut iter = self.db.raw_iterator_cf(&cf_handle);
-        iter.seek_to_first();
-        while iter.valid() {
-            if let (Some(key), Some(value)) = (iter.key(), iter.value()) {
+        for row in rows {
+            let (key, value) = row?;
+            {
+                let (key, value) = (key.as_slice(), value.as_slice());
                 let row_size = key.len() + value.len();
                 total_entries = total_entries.saturating_add(1);
                 total_bytes = total_bytes.saturating_add(row_size as u64);
@@ -3067,12 +3055,7 @@ impl Storage {
                     })?;
                 }
             }
-            iter.next();
         }
-        // Surface RocksDB iteration errors (corruption, I/O) rather than
-        // letting a truncated scan silently produce a wrong Merkle root.
-        iter.status()
-            .with_context(|| format!("rocksdb iteration error on cf '{}'", cf_name))?;
 
         if !current_entries.is_empty() {
             finish_chunk(
