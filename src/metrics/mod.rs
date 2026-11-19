@@ -107,6 +107,10 @@ pub struct MetricsSnapshot {
     pub reconcile_attempts_dispatched_total: u64,
     /// Private-channel-sync attempts dispatched.
     pub private_sync_attempts_dispatched_total: u64,
+    /// Private-channel-sync sessions started from a persisted resume row
+    /// (same-peer continuation, fanout continuation of an unfinished walk,
+    /// or high-water catch-up; l2-node 0.149.0).
+    pub private_sync_resumed_sessions_total: u64,
     /// Public reconcile comparisons verified in sync (throttle state).
     pub reconcile_in_sync_total: u64,
     /// Private-channel-sync sessions verified in sync (throttle state).
@@ -117,6 +121,18 @@ pub struct MetricsSnapshot {
     pub private_sync_budget_refusals_total: u64,
     /// Budget refusals of a new key because the key map was full.
     pub backfill_budget_map_full_total: u64,
+
+    // Private-channel lifecycle (l2-node 0.149.0).
+    /// Private-channel topics dropped because no local member is left.
+    pub private_channel_unsubscribes_total: u64,
+    /// Private-channel topics re-subscribed because a local member returned.
+    pub private_channel_resubscribes_total: u64,
+    /// Gauge: private channels currently pending local cleanup.
+    pub private_channels_pending: u64,
+    /// Private channels whose local data the purge reaper deleted.
+    pub private_channels_purged_total: u64,
+    /// Rows deleted by the private-channel purge reaper.
+    pub private_channel_purge_rows_total: u64,
 
     // Anchoring
     pub last_anchor_height: u64,
@@ -386,11 +402,17 @@ impl MetricsCollector {
             failed_signature_verifications_total: counter_snap.failed_signature_verifications,
             reconcile_attempts_dispatched_total: counter_snap.reconcile_attempts_dispatched,
             private_sync_attempts_dispatched_total: counter_snap.private_sync_attempts_dispatched,
+            private_sync_resumed_sessions_total: counter_snap.private_sync_resumed_sessions,
             reconcile_in_sync_total: counter_snap.reconcile_in_sync_outcomes,
             private_sync_in_sync_total: counter_snap.private_sync_in_sync_outcomes,
             reconcile_budget_refusals_total: counter_snap.reconcile_budget_refusals,
             private_sync_budget_refusals_total: counter_snap.private_sync_budget_refusals,
             backfill_budget_map_full_total: counter_snap.backfill_budget_map_full_refusals,
+            private_channel_unsubscribes_total: counter_snap.private_channel_unsubscribes,
+            private_channel_resubscribes_total: counter_snap.private_channel_resubscribes,
+            private_channels_pending: counter_snap.private_channels_pending,
+            private_channels_purged_total: counter_snap.private_channels_purged,
+            private_channel_purge_rows_total: counter_snap.private_channel_purge_rows,
             klever_rpc_last_success_ms: self.klever_health.load(Ordering::Relaxed),
             db_size_bytes: ss.db_size,
             messages_total: ss.messages_total,

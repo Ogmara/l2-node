@@ -148,6 +148,34 @@ impl TopicManager {
         }
     }
 
+    /// Unsubscribe from a channel's GossipSub topic (private-channel
+    /// lifecycle, l2-node 0.149.0 — the last local member is gone). Mirrors
+    /// `unsubscribe_dm`. No-op if not currently subscribed. Returns `true`
+    /// iff a subscription was actually removed. Callers decide WHETHER a
+    /// channel may be dropped (`NetworkService::reconcile_channel_lifecycle`
+    /// never drops a public or pinned channel).
+    pub fn unsubscribe_channel(
+        &mut self,
+        swarm: &mut Swarm<OgmaraBehaviour>,
+        channel_id: u64,
+    ) -> bool {
+        if self.subscribed_channels.remove(&channel_id) {
+            let topic = IdentTopic::new(channel_topic(&self.network_id, channel_id));
+            match swarm.behaviour_mut().gossipsub.unsubscribe(&topic) {
+                true => debug!(topic = %topic, "Unsubscribed from channel topic"),
+                false => debug!(topic = %topic, "Was not subscribed to channel topic"),
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// `true` if this node is currently subscribed to `channel_id`'s topic.
+    pub fn is_channel_subscribed(&self, channel_id: u64) -> bool {
+        self.subscribed_channels.contains(&channel_id)
+    }
+
     /// Get the set of subscribed channel IDs — public AND private.
     /// Test-only: production code goes through `subscribed_public_channels()`
     /// so nothing that crosses a trust boundary sees private channel IDs.

@@ -218,11 +218,21 @@ impl Storage {
     /// Advance the chain cursor and record that the mirror is current up to
     /// it (`ANCHORED_MIRROR_CURSOR`) in one atomic batch — a crash between
     /// two separate writes would trigger a needless re-verification.
+    ///
+    /// Also stamps `PRIVATE_LIFECYCLE_CHAIN_CURSOR` (l2-node 0.149.0) in the
+    /// same batch: an older binary advances the cursor without it, which is
+    /// how the next boot of this release detects that one ran (see
+    /// `Storage::prepare_private_channel_lifecycle`).
     pub fn set_chain_cursor_with_mirror(&self, block_height: u64) -> Result<()> {
         let handle = self.cf_handle(cf::NODE_STATE)?;
         let mut batch = rocksdb::WriteBatch::default();
         batch.put_cf(&handle, super::schema::state_keys::CHAIN_CURSOR, block_height.to_be_bytes());
         batch.put_cf(&handle, super::schema::state_keys::ANCHORED_MIRROR_CURSOR, block_height.to_be_bytes());
+        batch.put_cf(
+            &handle,
+            super::schema::state_keys::PRIVATE_LIFECYCLE_CHAIN_CURSOR,
+            block_height.to_be_bytes(),
+        );
         drop(handle);
         self.write_batch(batch).context("advancing the chain cursor")
     }
@@ -298,7 +308,9 @@ impl Storage {
                 description: None,
                 member_count: 0,
             };
-            self.put_channel_and_replay_pending_member_removals(c.channel_id, &serde_json::to_vec(&record)?)?;
+            if !self.put_channel_and_replay_pending_member_removals(c.channel_id, &serde_json::to_vec(&record)?)? {
+                continue; // a private channel's local data is being purged (0.149.0)
+            }
             let member_key = super::schema::encode_channel_member_key(c.channel_id, &c.creator);
             self.put_cf(cf::CHANNEL_MEMBERS, &member_key, br#"{"joined_at":0,"role":"creator"}"#)?;
             self.mark_channel_creator_verified(c.channel_id, now)?;

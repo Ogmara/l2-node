@@ -5,6 +5,308 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.149.0] - 2026-11-19
+
+Private-channel lifecycle on a node, and a persisted resume cursor for
+private-channel sync (plan `docs/planning/private-channel-lifecycle-plan.md`,
+owner decisions D1-D7). A node now keeps a private channel only while one of
+its own users is a member. All changes below are runtime code; no dependency
+changed. No wire change: clients and older nodes are unaffected, apart from a
+new transient `503` on federate (below).
+
+### Added
+
+- **Local-member evidence (`LOCAL_CHANNEL_HOMES`, new node-local CF).** Key
+  `channel_id ‖ wallet`, value `first_seen_ms ‖ last_seen_ms`. A wallet counts
+  as a local member of a private channel when it is a member AND it used this
+  node for that channel as itself: an accepted `ChannelCreate`, `ChannelJoin`,
+  `ChatMessage`, `ChatEdit` or `ChatReaction` it submitted over REST or the
+  authenticated WebSocket with `author` equal to the authenticated wallet; a
+  successful federate; or a member read of the channel through any
+  `check_channel_access` path (lazy touch, throttled per channel and wallet to
+  once per 10 min in memory and once per hour on disk). Recorded in the API
+  layer, never from an envelope someone else submitted, so replaying a
+  member's join cannot pin a channel on a node. Public ids (at or below
+  `PRIVATE_CHANNEL_ID_FLOOR`) never get a row. Migration: a one-time,
+  resumable seeding pass (500,000 member rows per boot, sentinel
+  `migration_private_channel_homes_seeded_v1`) writes a row for every member
+  of a private channel who is in `LOCAL_DM_USERS` or has a
+  `CHANNEL_READ_STATE` row here; every boot also seeds from every
+  `LOCAL_CHANNEL_FED` row (up to 500,000), which covers federations made
+  while an older binary ran. Nothing is scheduled for cleanup until the
+  one-time pass has finished.
+- **Private-channel lifecycle (`PRIVATE_CHANNEL_LIFECYCLE`, new node-local
+  CF, JSON row per channel).** When a membership removal (leave, kick, ban)
+  leaves a private channel with at least one `LOCAL_CHANNEL_HOMES` row but no
+  home wallet still a member, a `pending` row is written in the same batch as
+  the removal, under the channel-membership lock. The decision is recomputed
+  from current state on every add and every removal, so replay order and
+  duplicates cannot leave a stale row. The node then unsubscribes the
+  channel's gossip topic at the next event-driven reconcile (deferred while a
+  private-sync session for the channel is in flight) and keeps the data for
+  `purge_grace_hours` (default 7 days; never earlier than the first boot of
+  this release plus the grace). A channel its creator deleted gets a
+  `deleted` row due at once (D4). A returning local member (any of the
+  evidence paths above) deletes a pending `no_local_member` row; the node
+  re-subscribes and asks private sync to backfill the gap for up to 16 local
+  members (the API path that cancelled it also sends its own trigger).
+  Pinned channels (`[storage] pinned_channels`) and public channel ids are
+  never scheduled or unsubscribed, and a pinned channel's `pending` row
+  never starts a purge (a pin configured after a purge STARTED does not stop
+  it: the channel row is already gone, so it runs to completion and the
+  channel can then be federated again). A channel with no local evidence at
+  all is never scheduled. **Single-host protection:** a private channel
+  created on this node (its `CHANNELS` row has no `federated_from`, which
+  only a federate writes) is never scheduled while its creator is still a
+  member — this node may be its only host; checked by the removal hook, the
+  boot re-evaluation and again at purge start. A deleted private channel
+  gets a `deleted` row only when this node holds local data for it (a home,
+  or a `CHANNEL_MSGS` / `CHANNEL_META_MSGS` row); otherwise the tombstone
+  alone suffices, so a flood of deletes cannot grow the CF. Startup skips the
+  topic of a channel with a row, and the chain-discovery / federate / create
+  subscribe path no longer undoes a pending decision. A backstop pass every
+  `lifecycle_check_interval_secs` re-applies the ids notified since the last
+  tick and every channel held unsubscribed (point reads), and reads ONE
+  bounded page (1024 rows) of the lifecycle CF from a rotating cursor on the
+  blocking pool (a failed or panicked read reports back as an error page, so
+  the scan never wedges) — never a whole-CF scan on the network event loop; the
+  pending gauge is refreshed when a rotation completes.
+- **Purge reaper** (`storage::channel_purge`, own task every
+  `purge_interval_secs`, at most about `purge_batch_rows` deleted rows per
+  pass, at most 16 purges started per pass). Start, under the membership lock
+  with every condition re-checked: the row is a due `pending` row, the id is
+  private, the `CHANNELS` row is Private or absent, the channel is not
+  pinned, and (unless it is a genuinely tombstoned channel) no local member
+  exists, the channel is not single-host protected, and no current member
+  authenticated here since the row was written (`LOCAL_DM_USERS.
+  last_active_ms`; such a member gets a home row, the pending row is deleted
+  and the channel kept). Activity of a local home that is NO LONGER a member
+  re-arms the row ONCE (`since = now`, deadline = now + grace, new
+  serde-default row field `activity_rearmed`; the topic stays unsubscribed):
+  a member wrongly removed by a replayed old kick or leave gets a second
+  grace period for its healing sync to restore the membership (which cancels
+  the row), while a voluntary leaver who keeps using the node has the
+  channel purged after two grace periods instead of never. After that one
+  re-arm, home-only activity no longer holds the purge back; member activity
+  still cancels. One batch then deletes the `CHANNELS` row (and
+  decrements `TOTAL_CHANNELS`) and flips the row to `purging`, capturing the
+  channel's creator. The reaper reads one page (4096 rows) of the lifecycle
+  CF per pass from a persisted rotating cursor
+  (`private_channel_purge_cursor`), so no row beyond any cap is starved.
+  Deleted, step
+  by step: `CHANNEL_MSGS` with each message's `MESSAGES` envelope,
+  `DELETION_MARKERS`, `EDIT_HISTORY`, `CHAT_REACTIONS`,
+  `CHAT_REACTION_COUNTS`, `REPORTS` and `COUNTER_VOTES` rows;
+  `CHANNEL_EDIT_DELETE_MSGS`, `CHANNEL_META_MSGS`, `CHANNEL_KEYS` and
+  `CHANNEL_KEY_COMMITS` with their `MESSAGES` envelopes; `CHANNEL_MEMBERS`,
+  `CHANNEL_MODERATORS`, `CHANNEL_PINS`, `CHANNEL_INVITES`,
+  `CHANNEL_MEMBERSHIP_INDEX`, `PRIVATE_CHANNEL_KEYS`,
+  `PENDING_CHANNEL_MEMBER_REMOVALS`; `CHANNEL_VERIFICATION`,
+  `CHANNEL_BACKFILL_STATE`, `PENDING_CHANNEL_DELETES` and `pin_seq:{cid}`;
+  per captured wallet (up to 4096, local homes first) `LOCAL_CHANNEL_FED`
+  (which frees one of the wallet's 256 federation slots),
+  `PRIVATE_CHANNEL_SYNC_STATE`, `PRIVATE_CHANNEL_SYNC_RESUME` and
+  `CHANNEL_READ_STATE`; then `LOCAL_CHANNEL_HOMES` and finally the lifecycle
+  row. `TOTAL_MESSAGES` and `TOTAL_CHANNEL_MESSAGES` are decremented.
+  **Kept** (D5): `CHANNEL_ROLE_WATERMARKS`, `CHANNEL_BANS` and
+  `CHANNEL_MUTES` (without them an old pre-kick invite would pass the join
+  gate after a re-federation, and a ban or mute would be lifted), the
+  `DELETED_CHANNELS` tombstone, and `NOTIFICATIONS` (own 30-day reaper).
+  This applies to `no_local_member` purges; for a deleted channel
+  `tombstone_channel` already cleared bans and watermarks, as before, and
+  the tombstone blocks re-creation. `purge_batch_rows` is a soft cap: a
+  message's side rows are deleted together with it, so a pass can
+  overshoot; only a message with 4096 or more rows in one side column
+  family is spread over several passes. Every pass writes
+  its deletes, the counter decrements and the advanced step/cursor in one
+  batch, so a crash or restart resumes where it stopped. A purge is
+  abandoned (remaining data kept) if the channel's row is re-created while
+  it runs. `purge_grace_hours = 0` disables purging entirely, including
+  creator-deleted channels (operator opt-out; the topic is still
+  unsubscribed).
+- **Guards while a purge runs.** The router refuses, before storing,
+  every envelope that targets the channel (Step 7f, reason
+  `channel cleanup in progress, retry later`), including `ChannelCreate`,
+  `ChannelLeave` and channel-scope `ChannelKeyEnvelope`s — except a
+  `ChannelDelete` by the creator captured at purge start while the channel
+  is not yet tombstoned, which writes the permanent tombstone (the purge
+  continues and completes; later deletes are refused); re-creating the channel row is refused under the
+  lock (router `ChannelCreate` apply, chain scanner, snapshot import);
+  private-sync pages for the channel are dropped; and
+  `POST /channels/{id}/federate` answers `503 channel cleanup in progress,
+  retry later` (clients already treat 503 as transient) — but only to a
+  caller that would be authorized to join (the creator or a wallet the
+  purge captured, or a valid invite against the captured creator), checked
+  after the pre-fetch join gate; anyone else falls through to exactly the
+  path of any other unknown channel id (the bootstrap gate decides before
+  anything is stored, and re-creation mid-purge is refused under the lock),
+  so federate is no oracle for an ongoing purge. Once the purge has
+  finished the channel federates afresh. A `pending` row does not block
+  federate: that is the "member returns" case.
+- **Private-sync resume cursor (`PRIVATE_CHANNEL_SYNC_RESUME`, new node-local
+  CF, keyed like `LOCAL_CHANNEL_FED`).** The requester writes one row per
+  applied page: phase, metadata and chat cursors, cumulative `Accepted`
+  count, session count, the peer that issued the cursors, and the high-water
+  mark of the last finished walk. The high-water mark advances ONLY to the
+  highest `(timestamp, msg_id)` of an envelope this node verified and stored
+  during the walk (`Accepted`, or a `Duplicate` byte-identical to the stored
+  copy), per phase, clamped to now — never to a responder's cursor, so a
+  hostile responder's empty final page cannot push it forward. An
+  unfinished walk continues with ONE
+  request to the SAME peer while it is connected, for at most 6 sessions in
+  a row (row field `same_peer_sessions`); a cursor is never handed to
+  another peer. Peer gone or that cap reached → a FANOUT continuation from
+  this node's own verified position of the walk (`walk_hw`), never a peer
+  cursor; the first responder becomes the new resume peer. The walk's
+  position is abandoned (high-water mark kept, next trigger fans out) when
+  the stored peer rejects the request's auth, or after 3 CONSECUTIVE
+  stalled same-peer continuations (row field `stalls`). A session that took
+  at least one verified envelope resets the stall count; one that only
+  moved the cursor over zero envelopes (ForwardOnly-skipped rows) is
+  neutral; anything else (`server_capped`, a failed or timed-out request,
+  no cursor move, only unverifiable envelopes) is a stall — so a peer whose
+  budget is still refilling does not cost the walk its position. A stall
+  never refreshes `updated_at`, so `resume_ttl_hours` still bounds how long
+  a peer that never serves can hold the walk. A high-water CATCH-UP (after a
+  finished walk) becomes a FRESH walk from the first page once the last
+  fresh walk started more than `resume_ttl_hours` ago (row field
+  `fresh_walk_at`, set only by a fresh start; a row without it walks
+  afresh), so rows a responder withheld before a mark are re-requested at
+  least that often; an unfinished walk is never reset by this (it stays
+  bounded by the `updated_at` TTL and the 50-session cap). For a
+  ForwardOnly channel, a current member's fanout starts (any fanout start:
+  fresh walk, fanout continuation or high-water catch-up; never a same-peer
+  continuation) begin the chat phase at `min(own joined_at,
+  earliest ChannelJoin recorded in its membership index) −
+  catchup_overlap_hours` — only the requester's own stored membership, and
+  no floor for the creator, a member without a recorded join, or a healing
+  walk — so a long pre-join stretch the responder only skips is not
+  re-walked by each fallback. A
+  healing walk — for a wallet that is NOT a current member here, standing
+  only through a `LOCAL_CHANNEL_HOMES` / `LOCAL_CHANNEL_FED` row — always
+  starts fresh: the re-join it must recover may predate any mark. Completion is judged on the walk's cumulative
+  `Accepted` count, so a walk that needs several budget refills now
+  completes. After a finished walk, a catch-up starts at the high-water mark
+  minus `catchup_overlap_hours`, with any peer. A row older than
+  `resume_ttl_hours` (since its last update) or with 50 sessions in its walk
+  is ignored and a fresh walk starts; a row that does not validate is
+  treated as absent. No request is dispatched, and no row written, for a
+  wallet with no stake in the channel here: neither a member nor holding a
+  `LOCAL_CHANNEL_HOMES` / `LOCAL_CHANNEL_FED` row (a home whose membership
+  a stale replay removed still runs its healing walk (from the first page
+  each time; its row is kept for when the membership is restored)). Wire unchanged: a resumed first request
+  is an ordinary continuation request.
+- **Config.** New section `[private_channels]`: `purge_grace_hours = 168`
+  (0 = never clean up, including creator-deleted channels; the topic is
+  still unsubscribed; clamped to at most 8760), `lifecycle_check_interval_secs = 30` (clamped 5..=600),
+  `purge_interval_secs = 300` (clamped 10..=86400), `purge_batch_rows = 5000`
+  (clamped 100..=100000). New `[private_channel_sync]` keys:
+  `resume_ttl_hours = 72` (0 = off, else clamped 1..=720) and
+  `catchup_overlap_hours = 24` (clamped 1..=720). All are soft clamps (logged,
+  never a startup failure); a config without them gets the defaults.
+- **Metrics** (dashboard `MetricsSnapshot`): `private_channels_pending`
+  (gauge), `private_channels_purged_total`, `private_channel_purge_rows_total`,
+  `private_channel_unsubscribes_total`, `private_channel_resubscribes_total`,
+  `private_sync_resumed_sessions_total`.
+
+### Changed
+
+- A private channel whose last local member is gone no longer stays
+  subscribed and stored forever. After a purge the channel answers 404 on
+  this node; a member who rejoined through a different node sees nothing
+  here until they federate again (an unsubscribed node cannot see a remote
+  rejoin).
+- `LOCAL_CHANNEL_FED` rows are now deleted when their channel is purged.
+- **Downgrade.** The three new CFs are node-local, not in snapshot
+  `DOMAIN_CFS` and not droppable. 0.148.x opens the database unchanged
+  (unknown CFs are tolerated since 0.143.0) and ignores them: it keeps
+  every channel subscribed and records no local evidence. Upgrading again is
+  detected through `private_lifecycle_chain_cursor` (stamped with every chain
+  cursor advance): if another binary advanced the cursor, every pending
+  deadline is re-armed to now + grace, and federations made meanwhile are
+  re-seeded.
+
+### Known limitations
+
+- **Orphan `MESSAGES` rows.** `ChatReaction`, Pin/Unpin, Mute and Invite
+  envelopes of a purged channel are stored but not indexed by channel, so
+  the purge cannot find them. They stay behind: small, opaque and
+  unreachable through any channel read. Also left: `CHANNEL_READ_STATE`
+  rows of wallets that were neither a local home nor a member, per-wallet
+  rows beyond the 4096-wallet capture, and superseded `CHANNEL_KEYS`
+  envelopes whose index rows were evicted before the purge. Because the
+  reaction and pin envelopes stay in `MESSAGES`, after a re-federation the
+  same envelopes re-delivered by sync or gossip are `Duplicate`s and the
+  derived rows the purge deleted (reaction counts, pins) are NOT rebuilt on
+  this node. A per-channel index of auxiliary envelopes (`CHANNEL_AUX_MSGS`)
+  would close this gap; not in this release. A `ChannelDelete` accepted
+  during a purge (creator only) leaves its own small `MESSAGES` /
+  metadata-index row behind if the purge already passed that step
+  (unreachable: the channel is tombstoned).
+- **Unlocked `ChannelCreate` merge (pre-existing).** The router's merge of
+  an EXISTING `CHANNELS` row is an unlocked read-modify-write; one that read
+  the row just before a purge started can write it back afterwards. The
+  purge then abandons and keeps the remaining data (safe, but the channel is
+  left partly purged until a later removal schedules it again).
+- **High-water marks prove existence, not contiguity.** `hw` / `walk_hw`
+  are the newest positions of verified envelopes a responder CHOSE to serve;
+  rows it withheld before them are only re-requested by the next fresh
+  walk (forced at least every `resume_ttl_hours` after a finished walk).
+- **Healing walks never resume** (as in 0.148): a wallet that is not a
+  current member here always walks from the first page.
+- **Purge-time federate answers.** While a purge runs, an invite issued by
+  a moderator can be answered 403 instead of 503 (the purge already deleted
+  the moderator records the authority check needs), and a kicked or banned
+  wallet that was captured as a local home sees 503 rather than its usual
+  denial.
+- **Deferred: two small orphans.** A channel-scope `ChannelKeyEnvelope`
+  whose payload carries no `channel_id` is not caught by the Step 7f purge
+  guard, so one arriving mid-purge can leave its rows behind the cursor;
+  and the creator's one allowed `ChannelDelete` during a purge can itself
+  remain as an unreachable row. Both are tiny and unreachable.
+- **A left channel can take two grace periods.** A wallet that left a
+  channel but keeps using this node re-arms that channel's cleanup once, so
+  its data is purged after up to 2 × `purge_grace_hours`.
+- **Very long walks.** A private-sync walk that needs more than 50
+  budget-limited sessions against one responder (very roughly
+  100,000-250,000 rows with the default 20k burst and 5k/h refill) is
+  abandoned and restarted, so it still cannot finish.
+- **Rows withheld before the high-water mark.** A catch-up only re-reads
+  `catchup_overlap_hours` before the last finished walk's end. A row that
+  reaches the responder later than that, or that a hostile responder
+  withheld before ending the walk early, is only picked up by the next fresh
+  walk (forced by the 50-session cap or the TTL).
+- **No gap backfill without a federation row** (deferred to Phase E). The
+  private-sync claim gate and retry sweep still look only at
+  `LOCAL_CHANNEL_FED`, so a local member who created or joined the channel
+  directly on this node is re-subscribed after returning but gets no
+  automatic gap backfill.
+- **Not scheduled: channels that lost their last local member before the
+  upgrade.** Seeding only records current members, so such a channel has no
+  local evidence and is kept as before.
+- **Caps that keep a channel.** A channel with more than 10,000 members (the
+  purge-start check cannot be completed) has its pending cleanup cancelled,
+  and a channel with 1024 or more local homes always counts as having a
+  local member. Both resolve to keep.
+- **Old leave/kick ordering (pre-existing).** A late, older leave, kick or
+  ban still removes a membership created by a newer join that was already
+  applied (for example a federate followed by private sync replaying an old
+  kick). The trigger is level-based, an in-flight sync defers the
+  unsubscribe and the grace period absorbs it, but the ordering itself is a
+  separate protocol audit item.
+- **Unfinished walk vs. fresh-walk safety net.** The fresh-walk rule applies
+  only after a walk finishes. While a walk is unfinished (bounded by
+  `MAX_RESUME_SESSIONS` = 50), rows a hostile first responder withheld before
+  `walk_hw` are not re-requested. No data is lost; live gossip is unaffected.
+- **ForwardOnly floor and federation-stamped membership.** A responder whose
+  member row came from its own federation (stamped with its clock, not a
+  signed join) may serve rows older than this node's floor; this node does
+  not fetch them. Availability only: the rows stay readable on that node.
+- **Federate during purge start.** A federate that read the channel as known
+  just before its purge started can write a `LOCAL_CHANNEL_FED` row after the
+  purge's wallet step, stranding one of the wallet's 256 federation slots for
+  that channel id. Nothing is subscribed or exposed.
+
 ## [0.148.1] - 2026-11-18
 
 ### Security

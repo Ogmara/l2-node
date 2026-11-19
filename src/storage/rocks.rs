@@ -237,7 +237,7 @@ pub struct SelfAnchorStatus {
 /// `resolve_channel_type` do — deliberately a small standalone copy rather
 /// than importing `chain::scanner`'s helper, to keep this storage-layer
 /// module free of a dependency on a higher-level one.
-fn json_channel_type_is_private(channel_type: &serde_json::Value) -> bool {
+pub(super) fn json_channel_type_is_private(channel_type: &serde_json::Value) -> bool {
     match channel_type {
         serde_json::Value::Number(n) => n.as_u64() == Some(2),
         serde_json::Value::String(s) => s == "Private",
@@ -369,6 +369,10 @@ pub struct Storage {
     /// "none" and the key-arbitration hot path can skip its legacy-detection
     /// and max-epoch scans. `Arc` so every `Storage` clone sees the flip.
     key_commit_legacy_rows_done: Arc<std::sync::atomic::AtomicBool>,
+    /// Private-channel lifecycle state shared by every clone (l2-node
+    /// 0.149.0, `storage::channel_lifecycle`): operator policy, the network
+    /// notifier, and the seeding / first-boot markers.
+    pub(super) lifecycle: Arc<super::channel_lifecycle::LifecycleShared>,
 }
 
 impl Storage {
@@ -532,7 +536,9 @@ impl Storage {
             social_counters_lock: Arc::new(std::sync::Mutex::new(())),
             pending_channel_member_removal_lock: Arc::new(std::sync::Mutex::new(())),
             key_commit_legacy_rows_done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            lifecycle: Arc::new(super::channel_lifecycle::LifecycleShared::default()),
         };
+        storage.load_lifecycle_markers();
         // A read error leaves the flag false — the slower, scan-based path is
         // always correct, so failing towards it is safe.
         if storage
@@ -827,7 +833,10 @@ impl Storage {
         // old get-then-put did, so an unmatched decrement here no longer
         // self-corrects on the next write — it silently eats future genuine
         // increments until enough of them pay the debt down).
-        let channel_existed = self.exists_cf(cf::CHANNELS, &channel_key)?;
+        // Read the row itself (not just existence): the private-channel
+        // lifecycle hook below needs its `channel_type` before it is gone.
+        let channel_row = self.get_cf(cf::CHANNELS, &channel_key)?;
+        let channel_existed = channel_row.is_some();
 
         // Capture BEFORE the cleanup loop below wipes CHANNEL_MEMBERS. Best-effort:
         // an empty/failed capture just means the delete notification has no
@@ -860,9 +869,25 @@ impl Storage {
         let channels_cf = self.cf_handle(cf::CHANNELS)?;
         batch.put_cf(&tombstone_cf, channel_key, tombstone_value);
         batch.delete_cf(&channels_cf, channel_key);
+        // Private-channel lifecycle (l2-node 0.149.0, owner decision D4): a
+        // deleted PRIVATE channel is scheduled for local cleanup with
+        // deadline = now, in the same batch as the tombstone. The tombstone
+        // itself is permanent and never touched by that cleanup.
+        // A lifecycle failure never blocks the tombstone (it MUST land).
+        let lifecycle_staged = self
+            .stage_lifecycle_on_tombstone(&mut batch, channel_id, channel_row.as_deref(), crate::util::now_ms())
+            .unwrap_or_else(|e| {
+                tracing::warn!(channel_id, error = %e, "private-channel lifecycle: tombstone hook failed; channel not scheduled");
+                false
+            });
+        drop(tombstone_cf);
+        drop(channels_cf);
         self.write_batch(batch)
             .context("writing channel deletion batch")?;
         drop(_guard);
+        if lifecycle_staged {
+            self.notify_lifecycle(channel_id);
+        }
 
         // Bulk cleanup — the tombstone already prevents resurrection, so a partial
         // failure here is safe (the leftover rows are unreachable once CHANNELS is gone).
@@ -1655,7 +1680,23 @@ impl Storage {
                 batch.put_cf(&channels_cf, channel_key, bytes);
             }
         }
+        // Private-channel lifecycle (l2-node 0.149.0): a returning member
+        // with a local home cancels a pending cleanup in the same batch
+        // (level-triggered — see `storage::channel_lifecycle`).
+        // A lifecycle failure never blocks the membership write; a missed
+        // cancel is caught by the lazy touch / boot re-evaluation.
+        let lifecycle_staged = self
+            .stage_lifecycle_on_add(&mut batch, channel_id, address)
+            .unwrap_or_else(|e| {
+                tracing::warn!(channel_id, error = %e, "private-channel lifecycle: add hook failed");
+                false
+            });
+        drop(members_cf);
+        drop(channels_cf);
         self.write_batch(batch)?;
+        if lifecycle_staged {
+            self.notify_lifecycle(channel_id);
+        }
         Ok(true)
     }
 
@@ -1733,6 +1774,7 @@ impl Storage {
         let was_member = self.exists_cf(cf::CHANNEL_MEMBERS, &member_key)?;
         let mut batch = WriteBatch::default();
         batch.delete_cf(&members_cf, &member_key);
+        let mut lifecycle_staged = false;
 
         let channel_data = self.get_cf(cf::CHANNELS, &channel_key)?;
         if channel_data.is_none() {
@@ -1769,12 +1811,31 @@ impl Storage {
                     }
                 }
 
+                // Private-channel lifecycle (l2-node 0.149.0): if this
+                // removal leaves the channel without any local member,
+                // schedule its local cleanup in the same batch. Evaluated
+                // on every removal (level-triggered), member or not.
+                // A lifecycle failure never blocks the removal (a kick/ban
+                // must apply); it only means "not scheduled" — the safe side.
+                lifecycle_staged = self
+                    .stage_lifecycle_on_removal(&mut batch, channel_id, address, &meta, crate::util::now_ms())
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(channel_id, error = %e, "private-channel lifecycle: removal hook failed; channel not scheduled");
+                        false
+                    });
+
                 if let Ok(bytes) = serde_json::to_vec(&meta) {
                     batch.put_cf(&channels_cf, channel_key, bytes);
                 }
             }
         }
-        self.write_batch(batch)
+        drop(members_cf);
+        drop(channels_cf);
+        self.write_batch(batch)?;
+        if lifecycle_staged {
+            self.notify_lifecycle(channel_id);
+        }
+        Ok(())
     }
 
     /// Writes a newly-created channel's `CHANNELS` row and replays any
@@ -1804,22 +1865,34 @@ impl Storage {
     /// replay. If after, it will observe `CHANNELS` as already present (this
     /// call already wrote it) and apply directly instead of writing a claim
     /// at all. Either way, no window remains for an orphaned claim.
+    ///
+    /// Returns `false` — and writes nothing — while the private-channel
+    /// purge reaper is deleting this channel's local data (l2-node 0.149.0,
+    /// `storage::channel_purge`): re-creating the row mid-purge would let
+    /// the remaining purge steps delete data of the NEW channel. Checked
+    /// under the same lock the purge's start (`CHANNELS` delete + `purging`
+    /// row) runs under, so the two cannot interleave. Callers must skip
+    /// their post-create work (counters, creator membership) on `false`.
     pub fn put_channel_and_replay_pending_member_removals(
         &self,
         channel_id: u64,
         channel_bytes: &[u8],
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let _guard = self
             .channel_membership_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.private_channel_purge_in_progress(channel_id)? {
+            tracing::info!(channel_id, "channel create refused: local cleanup of this private channel is in progress");
+            return Ok(false);
+        }
         let channel_key = channel_id.to_be_bytes();
         self.put_cf(cf::CHANNELS, &channel_key, channel_bytes)?;
         let removals = self.take_pending_channel_member_removals(channel_id)?;
         for (address, _requested_at) in removals {
             self.remove_channel_member_and_raise_epoch_floor_locked(channel_id, &address)?;
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Apply the result of one `getChannelCreator` re-verification
@@ -2102,6 +2175,30 @@ impl Storage {
         .flatten()
         .and_then(|b| <[u8; 8]>::try_from(b.as_slice()).ok())
         .map(u64::from_be_bytes)
+    }
+
+    /// Raw `PRIVATE_CHANNEL_SYNC_RESUME` row of `(wallet, channel_id)`
+    /// (l2-node 0.149.0, plan §6). Undecoded on purpose: the row's type
+    /// lives with the protocol (`network::private_channel_sync::ResumeRow`),
+    /// which also validates it. `None` on absence or a read error.
+    pub fn private_channel_sync_resume_raw(&self, wallet: &str, channel_id: u64) -> Option<Vec<u8>> {
+        self.get_cf(
+            cf::PRIVATE_CHANNEL_SYNC_RESUME,
+            &super::schema::encode_local_channel_fed_key(wallet, channel_id),
+        )
+        .ok()
+        .flatten()
+    }
+
+    /// Store the `PRIVATE_CHANNEL_SYNC_RESUME` row of `(wallet,
+    /// channel_id)` — one put. Sole writer is the network task's event
+    /// loop (once per applied private-sync page), so no lock is needed.
+    pub fn put_private_channel_sync_resume(&self, wallet: &str, channel_id: u64, value: &[u8]) -> Result<()> {
+        self.put_cf(
+            cf::PRIVATE_CHANNEL_SYNC_RESUME,
+            &super::schema::encode_local_channel_fed_key(wallet, channel_id),
+            value,
+        )
     }
 
     /// Run `f` while holding `channel_membership_lock`.

@@ -490,6 +490,9 @@ const GOSSIP_KEY_BUCKETS_MAX: usize = 200_000;
 /// Rejection reason for a gossip key envelope over its token bucket (maps to
 /// gossipsub `Ignore`; never reaches an HTTP client).
 pub(crate) const GOSSIP_KEY_RATE_LIMITED_REASON: &str = "rate limited (KeyEnvelope gossip bucket)";
+/// Rejection reason (Step 7f) for an envelope targeting a private channel
+/// whose local data this node is purging (l2-node 0.149.0).
+pub(crate) const CHANNEL_CLEANUP_IN_PROGRESS_REASON: &str = "channel cleanup in progress, retry later";
 
 /// The channel scope of a channel-scope `ChannelKeyEnvelope`, else `None`.
 fn channel_key_scope(envelope: &Envelope) -> Option<[u8; 32]> {
@@ -1145,6 +1148,23 @@ impl MessageRouter {
         // (no-downgrade guarantee). Encrypted + attachment-only messages pass.
         if let Err(e) = self.check_channel_encryption_required(&envelope) {
             return RouteResult::Rejected(wrap_rejection("channel_encryption_required", e));
+        }
+
+        // Step 7f (l2-node 0.149.0): this node is deleting the local data of
+        // the private channel the envelope targets (`storage::channel_purge`).
+        // Refuse it before Step 8 stores anything: a stored envelope would be
+        // left behind the purge cursor AND dedup a later legitimate re-import
+        // of the same envelope (e.g. the `ChannelCreate` a re-federation
+        // fetches). Public ids never pay more than the id comparison.
+        // The one exception: a `ChannelDelete` by the creator the purge
+        // captured, so the permanent tombstone is still written (otherwise
+        // the deleted channel could be re-federated once the purge ends).
+        if let Some(cid) = self.purge_guarded_channel_id(&envelope) {
+            if matches!(self.storage.private_channel_purge_in_progress(cid), Ok(true))
+                && !self.is_purging_channel_delete_by_creator(&envelope, cid, &resolved_author)
+            {
+                return RouteResult::Rejected(CHANNEL_CLEANUP_IN_PROGRESS_REASON.into());
+            }
         }
 
         // Step 7g (audit final pre-mainnet W11): per-recipient DM storage cap.
@@ -3162,6 +3182,46 @@ impl MessageRouter {
         Ok(())
     }
 
+    /// The channel id Step 7f checks against an in-progress private-channel
+    /// purge: every channel-scoped type `extract_channel_id` knows, plus
+    /// `ChannelCreate` and `ChannelLeave` (which it deliberately omits).
+    fn purge_guarded_channel_id(&self, envelope: &Envelope) -> Option<u64> {
+        match envelope.msg_type {
+            // Channel-scope key envelopes carry the channel id (DM-scope
+            // ones carry none and are never guarded).
+            MessageType::ChannelKeyEnvelope => rmp_serde::from_slice::<ChannelKeyEnvelopePayload>(&envelope.payload)
+                .ok()
+                .filter(|p| p.scope_kind == crate::messages::types::key_scope_kind::CHANNEL)
+                .and_then(|p| p.channel_id),
+            MessageType::ChannelCreate => rmp_serde::from_slice::<ChannelCreatePayload>(&envelope.payload)
+                .ok()
+                .map(|p| p.channel_id),
+            MessageType::ChannelLeave => rmp_serde::from_slice::<ChannelLeavePayload>(&envelope.payload)
+                .ok()
+                .map(|p| p.channel_id),
+            _ => self.extract_channel_id(envelope),
+        }
+    }
+
+    /// `true` for a `ChannelDelete` of `channel_id` authored by the creator
+    /// that the in-progress purge of that channel captured
+    /// (`Storage::purging_channel_creator`), while the channel is not yet
+    /// tombstoned — the only envelope Step 7f lets through while a purge
+    /// runs. Its apply writes the tombstone.
+    fn is_purging_channel_delete_by_creator(&self, envelope: &Envelope, channel_id: u64, author: &str) -> bool {
+        matches!(envelope.msg_type, MessageType::ChannelDelete)
+            // Once tombstoned, further deletes are refused (they would only
+            // be stored behind the purge cursor).
+            && !self
+                .storage
+                .exists_cf(schema::cf::DELETED_CHANNELS, &channel_id.to_be_bytes())
+                .unwrap_or(true)
+            && matches!(
+                self.storage.purging_channel_creator(channel_id),
+                Ok(Some(ref creator)) if creator == author
+            )
+    }
+
     /// Extract the channel_id from channel-scoped message payloads.
     fn extract_channel_id(&self, envelope: &Envelope) -> Option<u64> {
         match envelope.msg_type {
@@ -3839,6 +3899,40 @@ impl MessageRouter {
                 kill_horizon,
             }),
         })
+    }
+
+    /// Federate during an in-progress purge of `channel_id` (security round
+    /// 2, N1): `true` when the caller would be authorized to join — it is
+    /// the creator the purge captured, one of the wallets it captured
+    /// (local homes and members), or it attaches an invite passing rules
+    /// 4-8 against the captured creator. Only such a caller is told about
+    /// the purge (503); anyone else gets the ordinary join denial, so the
+    /// endpoint is no oracle for "this node is purging channel X".
+    pub(crate) fn federate_purging_caller_authorized(
+        &self,
+        channel_id: u64,
+        caller: &str,
+        now_ms: u64,
+        invite: Option<&[u8]>,
+        creator: Option<&str>,
+        wallets: &[String],
+    ) -> bool {
+        if creator == Some(caller) || wallets.iter().any(|w| w == caller) {
+            return true;
+        }
+        let Some(raw) = invite else { return false };
+        let Ok(inv) = self.verify_invite_proof(channel_id, caller, now_ms, raw) else {
+            return false;
+        };
+        self.verify_inviter_authority(
+            channel_id,
+            creator,
+            &inv.inviter,
+            inv.invite_ts,
+            inv.inviter_grant.as_deref(),
+            now_ms,
+        )
+        .is_ok()
     }
 
     /// `federate_channel`'s pre-fetch gate. Runs BEFORE any outbound DNS/
@@ -4544,6 +4638,22 @@ impl MessageRouter {
                         );
                         return Ok(false);
                     }
+                    // Private-channel purge guard (l2-node 0.149.0): while this
+                    // node deletes the channel's local data, it must not be
+                    // re-created — the remaining purge steps would delete the
+                    // new channel's rows. Re-checked under the membership lock
+                    // by `put_channel_and_replay_pending_member_removals`.
+                    if self
+                        .storage
+                        .private_channel_purge_in_progress(payload.channel_id)
+                        .unwrap_or(false)
+                    {
+                        debug!(
+                            channel_id = payload.channel_id,
+                            "ChannelCreate during local cleanup of this private channel — ignoring"
+                        );
+                        return Ok(false);
+                    }
                     if let Ok(Some(existing)) = self.storage.get_cf(schema::cf::CHANNELS, &key) {
                         // Channel already exists — typically the chain scanner's
                         // skeleton (slug/creator, no L2 fields) for a public
@@ -4635,11 +4745,17 @@ impl MessageRouter {
                         // `channel_membership_lock`-guarded critical section — see
                         // `put_channel_and_replay_pending_member_removals`'s doc
                         // comment for the orphaned-claim race this closes.
-                        self.storage
+                        if !self
+                            .storage
                             .put_channel_and_replay_pending_member_removals(
                                 payload.channel_id,
                                 &meta_bytes,
-                            )?;
+                            )?
+                        {
+                            // Purge started between the guard above and the
+                            // locked write (l2-node 0.149.0): nothing created.
+                            return Ok(false);
+                        }
                         self.storage
                             .increment_stat(schema::state_keys::TOTAL_CHANNELS)?;
 
@@ -4770,6 +4886,26 @@ impl MessageRouter {
                     // should already have blocked NotCreator.
                     match self.channel_creator_check(payload.channel_id, resolved_author) {
                         Ok(ChannelCreatorCheck::IsCreator) => {
+                            self.storage.tombstone_channel(
+                                payload.channel_id,
+                                envelope.timestamp,
+                                Some(resolved_author),
+                            )?;
+                        }
+                        // l2-node 0.149.0: the CHANNELS row is gone because a
+                        // private-channel purge is running; the creator it
+                        // captured may still delete the channel — write the
+                        // permanent tombstone now (`tombstone_channel` leaves
+                        // the purging lifecycle row alone).
+                        Ok(ChannelCreatorCheck::Unknown)
+                            if self
+                                .storage
+                                .purging_channel_creator(payload.channel_id)
+                                .ok()
+                                .flatten()
+                                .as_deref()
+                                == Some(resolved_author) =>
+                        {
                             self.storage.tombstone_channel(
                                 payload.channel_id,
                                 envelope.timestamp,
@@ -11751,6 +11887,148 @@ mod private_join_gate_tests {
             r.federate_bootstrap_gate(b"junk", gcid, &c.addr, now(), None),
             Err(BootstrapGateError::BadBootstrap(_))
         ));
+    }
+
+    #[test]
+    fn channel_create_is_not_applied_while_the_channel_is_being_purged() {
+        let (r, _d) = enforced();
+        let c = wallet();
+        register(&r, &c.addr);
+        let (create, cid) = derived_create(&c, "purged-room", now() - 60_000, false);
+        let purging = br#"{"v":1,"state":"purging","since_ms":1,"deadline_ms":1,"reason":"deleted","phase":1}"#;
+        r.storage.put_cf(schema::cf::PRIVATE_CHANNEL_LIFECYCLE, &cid.to_be_bytes(), purging).unwrap();
+        let channels = r.storage.get_stat(schema::state_keys::TOTAL_CHANNELS).unwrap();
+        assert!(matches!(
+            r.process_message(&create),
+            RouteResult::Rejected(ref m) if m == CHANNEL_CLEANUP_IN_PROGRESS_REASON
+        ));
+        let msg_id = rmp_serde::from_slice::<Envelope>(&create).unwrap().msg_id;
+        assert!(!r.storage.message_exists(&msg_id).unwrap(), "not stored: a later re-import is not a Duplicate");
+        assert!(!r.storage.exists_cf(schema::cf::CHANNELS, &cid.to_be_bytes()).unwrap(), "not re-created mid-purge");
+        assert!(!is_member(&r, cid, &c.addr));
+        assert_eq!(r.storage.get_stat(schema::state_keys::TOTAL_CHANNELS).unwrap(), channels);
+        // Control: once the purge has finished, a create applies normally.
+        r.storage.delete_cf(schema::cf::PRIVATE_CHANNEL_LIFECYCLE, &cid.to_be_bytes()).unwrap();
+        let (create2, cid2) = derived_create(&c, "fresh-room", now() - 30_000, false);
+        assert!(accepted(&r.process_message(&create2)));
+        assert!(r.storage.exists_cf(schema::cf::CHANNELS, &cid2.to_be_bytes()).unwrap());
+    }
+
+    /// A real channel through a REAL full purge, as a re-federation sees it:
+    /// the `ChannelCreate` envelope the purge deleted must be applied again
+    /// (not deduped) when the same bytes are re-imported.
+    fn purge_fully(r: &MessageRouter, cid: u64) {
+        // Federated here (no single-host protection), no local member.
+        let mut meta: serde_json::Value =
+            serde_json::from_slice(&r.storage.get_cf(schema::cf::CHANNELS, &cid.to_be_bytes()).unwrap().unwrap()).unwrap();
+        meta["federated_from"] = serde_json::json!("https://host.example");
+        r.storage.put_cf(schema::cf::CHANNELS, &cid.to_be_bytes(), &serde_json::to_vec(&meta).unwrap()).unwrap();
+        let pending = br#"{"v":1,"state":"pending","since_ms":1,"deadline_ms":1,"reason":"no_local_member"}"#;
+        r.storage.put_cf(schema::cf::PRIVATE_CHANNEL_LIFECYCLE, &cid.to_be_bytes(), pending).unwrap();
+        assert_eq!(
+            r.storage.start_private_channel_purge(cid, now()).unwrap(),
+            crate::storage::channel_purge::PurgeStart::Started
+        );
+    }
+
+    fn finish_purge(r: &MessageRouter) {
+        for _ in 0..100 {
+            let rep = r.storage.run_private_channel_purge_pass(now(), 5000).unwrap();
+            if rep.rows == 0 && rep.started == 0 {
+                return;
+            }
+        }
+        panic!("purge did not converge");
+    }
+
+    #[test]
+    fn the_same_channel_create_is_accepted_again_after_a_real_full_purge() {
+        let (r, _d) = enforced();
+        let c = wallet();
+        register(&r, &c.addr);
+        let (create, cid) = derived_create(&c, "re-fed-room", now() - 60_000, false);
+        assert!(accepted(&r.process_message(&create)));
+        let msg_id = rmp_serde::from_slice::<Envelope>(&create).unwrap().msg_id;
+        purge_fully(&r, cid);
+        finish_purge(&r);
+        assert!(!r.storage.message_exists(&msg_id).unwrap(), "the purge deleted the stored ChannelCreate");
+        assert!(!r.storage.exists_cf(schema::cf::CHANNELS, &cid.to_be_bytes()).unwrap());
+        assert!(!r.storage.private_channel_purge_in_progress(cid).unwrap());
+        // Re-federation re-imports the SAME bytes: applied, not a Duplicate.
+        assert!(accepted(&r.process_message(&create)));
+        assert!(r.storage.exists_cf(schema::cf::CHANNELS, &cid.to_be_bytes()).unwrap());
+        assert!(is_member(&r, cid, &c.addr));
+    }
+
+    #[test]
+    fn a_channel_delete_by_the_creator_still_tombstones_during_a_purge() {
+        let (r, _d) = enforced();
+        let (c, x) = (wallet(), wallet());
+        register(&r, &c.addr);
+        register(&r, &x.addr);
+        let (create, cid) = derived_create(&c, "deleted-mid-purge", now() - 60_000, false);
+        assert!(accepted(&r.process_message(&create)));
+        purge_fully(&r, cid);
+        r.storage.purge_step(cid, 2).unwrap();
+        assert!(r.storage.private_channel_purge_in_progress(cid).unwrap());
+        let del = |w: &W, ts| {
+            let p = ChannelDeletePayload { channel_id: cid };
+            sign(w, MessageType::ChannelDelete, rmp_serde::to_vec_named(&p).unwrap(), ts)
+        };
+        // Anyone else: still refused, nothing stored.
+        assert!(matches!(
+            r.process_message(&del(&x, now() - 500)),
+            RouteResult::Rejected(ref m) if m == CHANNEL_CLEANUP_IN_PROGRESS_REASON
+        ));
+        assert!(!r.storage.exists_cf(schema::cf::DELETED_CHANNELS, &cid.to_be_bytes()).unwrap());
+        // The captured creator: the permanent tombstone is written, the
+        // purge row is not rewritten and the purge still completes.
+        assert!(accepted(&r.process_message(&del(&c, now() - 400))));
+        assert!(r.storage.exists_cf(schema::cf::DELETED_CHANNELS, &cid.to_be_bytes()).unwrap());
+        assert!(r.storage.private_channel_purge_in_progress(cid).unwrap());
+        // A second delete by the same creator, now tombstoned: refused, not stored.
+        let again = del(&c, now() - 300);
+        assert!(matches!(
+            r.process_message(&again),
+            RouteResult::Rejected(ref m) if m == CHANNEL_CLEANUP_IN_PROGRESS_REASON
+        ));
+        let again_id = rmp_serde::from_slice::<Envelope>(&again).unwrap().msg_id;
+        assert!(!r.storage.message_exists(&again_id).unwrap());
+        finish_purge(&r);
+        assert!(!r.storage.has_private_channel_lifecycle_row(cid).unwrap());
+        // The deleted channel can never be re-created by a re-import.
+        let _ = r.process_message(&create);
+        assert!(!r.storage.exists_cf(schema::cf::CHANNELS, &cid.to_be_bytes()).unwrap());
+    }
+
+    #[test]
+    fn a_channel_scope_key_envelope_is_purge_guarded() {
+        let (r, _d) = enforced();
+        let c = wallet();
+        let scope = crypto::compute_channel_scope(CID);
+        let payload = |kind: u8, channel_id: Option<u64>| ChannelKeyEnvelopePayload {
+            key_scope: scope,
+            scope_kind: kind,
+            epoch: 1,
+            target: c.addr.clone(),
+            device_id: "ab".repeat(32),
+            peer: None,
+            channel_id,
+            eph_pub: [0u8; 32],
+            nonce: [0u8; 24],
+            wrapped: vec![0u8; 48],
+            key_commitment: None,
+            key_ts: None,
+        };
+        let env = |p: ChannelKeyEnvelopePayload| {
+            let raw = sign(&c, MessageType::ChannelKeyEnvelope, rmp_serde::to_vec_named(&p).unwrap(), now());
+            rmp_serde::from_slice::<Envelope>(&raw).unwrap()
+        };
+        let channel = env(payload(crate::messages::types::key_scope_kind::CHANNEL, Some(CID)));
+        assert_eq!(r.purge_guarded_channel_id(&channel), Some(CID));
+        // A DM-scope envelope (even one carrying a stray channel id) is not.
+        let dm = env(payload(crate::messages::types::key_scope_kind::DM, Some(CID)));
+        assert_eq!(r.purge_guarded_channel_id(&dm), None);
     }
 
     #[test]

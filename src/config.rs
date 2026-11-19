@@ -91,6 +91,12 @@ pub struct Config {
     /// gap, l2-node 0.138.0+). See `network::private_channel_sync`.
     #[serde(default)]
     pub private_channel_sync: PrivateChannelSyncConfig,
+    /// Private-channel lifecycle on this node (l2-node 0.149.0): when the
+    /// last local member of a private channel is gone, its gossip topic is
+    /// unsubscribed and its local data scheduled for cleanup after a grace
+    /// period. See `storage::channel_lifecycle`.
+    #[serde(default)]
+    pub private_channels: PrivateChannelsConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -778,6 +784,20 @@ pub struct PrivateChannelSyncConfig {
     /// attempt is at least 60 s old.
     #[serde(default = "default_private_channel_sync_retry_backoff_max_minutes")]
     pub retry_backoff_max_minutes: u64,
+    /// Requester: how long, in hours, a persisted resume cursor
+    /// (`PRIVATE_CHANNEL_SYNC_RESUME`, l2-node 0.149.0) stays usable after
+    /// its last update (default 72). An older row starts the walk over from
+    /// the first page. `0` turns the resume cursor off (every session starts
+    /// from the first page and no row is written). Soft-clamped to
+    /// `1..=720` otherwise.
+    #[serde(default = "default_private_channel_sync_resume_ttl_hours")]
+    pub resume_ttl_hours: u64,
+    /// Requester: a catch-up after a finished walk resumes from the walk's
+    /// high-water mark minus this many hours (default 24), so rows that
+    /// reached the responder late (offline authors, its own backfill) are
+    /// still picked up. Soft-clamped to `1..=720`.
+    #[serde(default = "default_private_channel_sync_catchup_overlap_hours")]
+    pub catchup_overlap_hours: u64,
 }
 
 impl Default for PrivateChannelSyncConfig {
@@ -793,6 +813,8 @@ impl Default for PrivateChannelSyncConfig {
                 default_private_channel_sync_responder_budget_refill_per_hour(),
             in_sync_recheck_minutes: default_private_channel_sync_in_sync_recheck_minutes(),
             retry_backoff_max_minutes: default_private_channel_sync_retry_backoff_max_minutes(),
+            resume_ttl_hours: default_private_channel_sync_resume_ttl_hours(),
+            catchup_overlap_hours: default_private_channel_sync_catchup_overlap_hours(),
         }
     }
 }
@@ -818,6 +840,90 @@ fn default_private_channel_sync_in_sync_recheck_minutes() -> u64 {
 fn default_private_channel_sync_retry_backoff_max_minutes() -> u64 {
     30
 }
+fn default_private_channel_sync_resume_ttl_hours() -> u64 {
+    72
+}
+fn default_private_channel_sync_catchup_overlap_hours() -> u64 {
+    24
+}
+/// Accepted range of `[private_channel_sync] resume_ttl_hours` when not 0
+/// (l2-node 0.149.0; soft clamp).
+pub const PRIVATE_SYNC_RESUME_TTL_RANGE: std::ops::RangeInclusive<u64> = 1..=720;
+/// Accepted range of `[private_channel_sync] catchup_overlap_hours`
+/// (l2-node 0.149.0; soft clamp).
+pub const PRIVATE_SYNC_CATCHUP_OVERLAP_RANGE: std::ops::RangeInclusive<u64> = 1..=720;
+
+/// Private-channel lifecycle policy (l2-node 0.149.0, `[private_channels]`,
+/// `storage::channel_lifecycle`). A private channel with no local member
+/// left is unsubscribed at once and its local data kept for
+/// `purge_grace_hours` before cleanup; a member returning within the grace
+/// cancels the cleanup. Pinned channels (`[storage] pinned_channels`) are
+/// never affected, and public channels never are either.
+///
+/// Defaults live in the `default_private_channels_*` functions below, in
+/// `Config::default_toml()` and in `ogmara.example.toml` — keep all three
+/// in step.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrivateChannelsConfig {
+    /// Hours a private channel's local data is kept after its last local
+    /// member is gone (default 168 = 7 days). `0` = never clean up (the
+    /// gossip topic is still unsubscribed) — this also disables the purge of
+    /// creator-DELETED private channels (operator opt-out). Clamped to at
+    /// most 8760.
+    #[serde(default = "default_private_channels_purge_grace_hours")]
+    pub purge_grace_hours: u64,
+    /// Seconds between backstop passes that re-apply every pending
+    /// lifecycle decision to the gossip subscriptions (default 30; the
+    /// normal path is event-driven). Clamped to 5..=600.
+    #[serde(default = "default_private_channels_lifecycle_check_interval_secs")]
+    pub lifecycle_check_interval_secs: u64,
+    /// Seconds between passes of the purge reaper that deletes the local
+    /// data of private channels whose grace has run out (default 300).
+    /// Clamped to 10..=86400.
+    #[serde(default = "default_private_channels_purge_interval_secs")]
+    pub purge_interval_secs: u64,
+    /// Max rows the purge reaper deletes per pass (default 5000), so a
+    /// large channel is removed over several passes instead of stalling the
+    /// node. A soft cap: a message's side rows (reactions, edit history,
+    /// reports, …) are deleted together with it, so a pass can overshoot;
+    /// only a message with 4096 or more rows in one side column family is
+    /// spread over several passes. Clamped to 100..=100000.
+    #[serde(default = "default_private_channels_purge_batch_rows")]
+    pub purge_batch_rows: u64,
+}
+
+impl Default for PrivateChannelsConfig {
+    fn default() -> Self {
+        Self {
+            purge_grace_hours: default_private_channels_purge_grace_hours(),
+            lifecycle_check_interval_secs: default_private_channels_lifecycle_check_interval_secs(),
+            purge_interval_secs: default_private_channels_purge_interval_secs(),
+            purge_batch_rows: default_private_channels_purge_batch_rows(),
+        }
+    }
+}
+
+fn default_private_channels_purge_grace_hours() -> u64 {
+    168
+}
+fn default_private_channels_lifecycle_check_interval_secs() -> u64 {
+    30
+}
+fn default_private_channels_purge_interval_secs() -> u64 {
+    300
+}
+fn default_private_channels_purge_batch_rows() -> u64 {
+    5000
+}
+
+/// Ceiling for `[private_channels] purge_grace_hours` (one year).
+pub const MAX_PRIVATE_CHANNELS_PURGE_GRACE_HOURS: u64 = 8760;
+/// Bounds for `[private_channels] lifecycle_check_interval_secs`.
+pub const PRIVATE_CHANNELS_LIFECYCLE_CHECK_RANGE: std::ops::RangeInclusive<u64> = 5..=600;
+/// Bounds for `[private_channels] purge_interval_secs`.
+pub const PRIVATE_CHANNELS_PURGE_INTERVAL_RANGE: std::ops::RangeInclusive<u64> = 10..=86_400;
+/// Bounds for `[private_channels] purge_batch_rows`.
+pub const PRIVATE_CHANNELS_PURGE_BATCH_RANGE: std::ops::RangeInclusive<u64> = 100..=100_000;
 
 /// Ceilings for the l2-node 0.141.0 rolling responder budgets and the
 /// requester attempt throttle (`Config::validate`).
@@ -3145,6 +3251,58 @@ impl Config {
                     .saturating_add(RECONCILE_RIDE_ALONG_CHARGE_ESTIMATE),
             )?;
         }
+        // `[private_channels]` (l2-node 0.149.0). SOFT clamps: an
+        // out-of-range value has an obvious nearest sane value, and refusing
+        // to start over a retention knob would be worse than clamping it.
+        if self.private_channels.purge_grace_hours > MAX_PRIVATE_CHANNELS_PURGE_GRACE_HOURS {
+            eprintln!(
+                "[config] private_channels.purge_grace_hours ({}) exceeds the maximum; \
+                 clamping to {} (one year). Use 0 to never clean up.",
+                self.private_channels.purge_grace_hours, MAX_PRIVATE_CHANNELS_PURGE_GRACE_HOURS,
+            );
+            self.private_channels.purge_grace_hours = MAX_PRIVATE_CHANNELS_PURGE_GRACE_HOURS;
+        }
+        let check = self.private_channels.lifecycle_check_interval_secs;
+        let clamped = check.clamp(
+            *PRIVATE_CHANNELS_LIFECYCLE_CHECK_RANGE.start(),
+            *PRIVATE_CHANNELS_LIFECYCLE_CHECK_RANGE.end(),
+        );
+        if clamped != check {
+            eprintln!(
+                "[config] private_channels.lifecycle_check_interval_secs ({}) is outside \
+                 {}..={}; clamping to {}.",
+                check,
+                PRIVATE_CHANNELS_LIFECYCLE_CHECK_RANGE.start(),
+                PRIVATE_CHANNELS_LIFECYCLE_CHECK_RANGE.end(),
+                clamped,
+            );
+            self.private_channels.lifecycle_check_interval_secs = clamped;
+        }
+        for (name, value, range) in [
+            (
+                "purge_interval_secs",
+                &mut self.private_channels.purge_interval_secs,
+                PRIVATE_CHANNELS_PURGE_INTERVAL_RANGE,
+            ),
+            (
+                "purge_batch_rows",
+                &mut self.private_channels.purge_batch_rows,
+                PRIVATE_CHANNELS_PURGE_BATCH_RANGE,
+            ),
+        ] {
+            let clamped = (*value).clamp(*range.start(), *range.end());
+            if clamped != *value {
+                eprintln!(
+                    "[config] private_channels.{} ({}) is outside {}..={}; clamping to {}.",
+                    name,
+                    value,
+                    range.start(),
+                    range.end(),
+                    clamped,
+                );
+                *value = clamped;
+            }
+        }
         // `[private_channel_sync]` budget + throttle (l2-node 0.141.0) —
         // validated regardless of `enabled`: the responder side serves
         // peers even when this node's own private sync is off.
@@ -3158,6 +3316,39 @@ impl Config {
             self.private_channel_sync.retry_backoff_max_minutes,
             PRIVATE_SYNC_PAGE_CHARGE_ESTIMATE,
         )?;
+        // `[private_channel_sync]` resume cursor (l2-node 0.149.0). SOFT
+        // clamps like `[private_channels]`: 0 keeps its meaning (off).
+        let ttl = self.private_channel_sync.resume_ttl_hours;
+        if ttl != 0 {
+            let clamped = ttl.clamp(*PRIVATE_SYNC_RESUME_TTL_RANGE.start(), *PRIVATE_SYNC_RESUME_TTL_RANGE.end());
+            if clamped != ttl {
+                eprintln!(
+                    "[config] private_channel_sync.resume_ttl_hours ({}) is outside {}..={}; \
+                     clamping to {}. Use 0 to turn the resume cursor off.",
+                    ttl,
+                    PRIVATE_SYNC_RESUME_TTL_RANGE.start(),
+                    PRIVATE_SYNC_RESUME_TTL_RANGE.end(),
+                    clamped,
+                );
+                self.private_channel_sync.resume_ttl_hours = clamped;
+            }
+        }
+        let overlap = self.private_channel_sync.catchup_overlap_hours;
+        let clamped = overlap.clamp(
+            *PRIVATE_SYNC_CATCHUP_OVERLAP_RANGE.start(),
+            *PRIVATE_SYNC_CATCHUP_OVERLAP_RANGE.end(),
+        );
+        if clamped != overlap {
+            eprintln!(
+                "[config] private_channel_sync.catchup_overlap_hours ({}) is outside {}..={}; \
+                 clamping to {}.",
+                overlap,
+                PRIVATE_SYNC_CATCHUP_OVERLAP_RANGE.start(),
+                PRIVATE_SYNC_CATCHUP_OVERLAP_RANGE.end(),
+                clamped,
+            );
+            self.private_channel_sync.catchup_overlap_hours = clamped;
+        }
         // Spec 13 §6.4 (l2-node 0.46.9+) — onion-transport surface.
         // We only check the operator-controlled inputs here; the
         // SOCKS5 dialer module enforces the runtime properties (DNS
@@ -4081,6 +4272,38 @@ responder_budget_refill_per_hour = 5000
 # between failing attempts.
 in_sync_recheck_minutes = 60
 retry_backoff_max_minutes = 30
+# Requester: a walk that ends early (responder budget, page backstops)
+# continues later from a persisted cursor with the same peer instead of
+# starting over. Hours a cursor stays usable after its last update
+# (0 = off, otherwise 1..=720).
+resume_ttl_hours = 72
+# Requester: a catch-up after a finished walk starts this many hours
+# before the walk's high-water mark (1..=720).
+catchup_overlap_hours = 24
+
+[private_channels]
+# Private-channel lifecycle on this node. When the last LOCAL member of a
+# private channel is gone, the node unsubscribes its gossip topic at once
+# and keeps its local data for purge_grace_hours; a member returning within
+# that time cancels the cleanup. Pinned channels ([storage]
+# pinned_channels) are never affected (a pin made after a channel's purge
+# started does not stop that purge).
+# Hours to keep the data. 0 = never clean up (still unsubscribes; also
+# disables purging creator-deleted private channels). Max 8760.
+purge_grace_hours = 168
+# Seconds between backstop passes that re-apply pending decisions to the
+# gossip subscriptions (the normal path is event-driven). 5..=600.
+lifecycle_check_interval_secs = 30
+# Seconds between purge passes that delete the local data of channels
+# whose grace has run out (a creator-deleted private channel: at once).
+# 10..=86400.
+purge_interval_secs = 300
+# Max rows deleted per purge pass (a big channel takes several passes;
+# progress survives restarts). A soft cap: a message's side rows are deleted
+# together with it, so a pass can overshoot; only a message with 4096 or
+# more rows in one side column family is spread over several passes.
+# 100..=100000.
+purge_batch_rows = 5000
 
 [api]
 # Set to "0.0.0.0" to accept connections from all interfaces
@@ -4902,6 +5125,91 @@ mod tests {
 
     // --- 0.47.0 channel-history backfill (spec 1) -------------------
 
+    // --- 0.149.0 private-channel lifecycle ----------------------------
+
+    #[test]
+    fn private_channels_defaults_validate_and_match_the_struct_default() {
+        let mut c = baseline_config();
+        c.validate().expect("defaults validate");
+        assert_eq!(c.private_channels.purge_grace_hours, 168);
+        assert_eq!(c.private_channels.lifecycle_check_interval_secs, 30);
+        assert_eq!(c.private_channels.purge_interval_secs, 300);
+        assert_eq!(c.private_channels.purge_batch_rows, 5000);
+        let d = PrivateChannelsConfig::default();
+        assert_eq!(d.purge_grace_hours, c.private_channels.purge_grace_hours);
+        assert_eq!(d.lifecycle_check_interval_secs, c.private_channels.lifecycle_check_interval_secs);
+        assert_eq!(d.purge_interval_secs, c.private_channels.purge_interval_secs);
+        assert_eq!(d.purge_batch_rows, c.private_channels.purge_batch_rows);
+        // A config written before 0.149.0 (no section) gets the defaults.
+        let mut old = baseline_config();
+        old.private_channels = toml::from_str("").unwrap();
+        old.validate().unwrap();
+        assert_eq!(old.private_channels.purge_grace_hours, 168);
+    }
+
+    #[test]
+    fn private_channels_values_are_soft_clamped() {
+        let mut c = baseline_config();
+        c.private_channels.purge_grace_hours = 0; // 0 = never: valid as-is
+        c.private_channels.lifecycle_check_interval_secs = 1;
+        c.private_channels.purge_interval_secs = 0;
+        c.private_channels.purge_batch_rows = 1;
+        c.validate().unwrap();
+        assert_eq!(c.private_channels.purge_grace_hours, 0);
+        assert_eq!(c.private_channels.lifecycle_check_interval_secs, 5);
+        assert_eq!(c.private_channels.purge_interval_secs, 10);
+        assert_eq!(c.private_channels.purge_batch_rows, 100);
+        c.private_channels.purge_grace_hours = 100_000;
+        c.private_channels.lifecycle_check_interval_secs = 100_000;
+        c.private_channels.purge_interval_secs = u64::MAX;
+        c.private_channels.purge_batch_rows = u64::MAX;
+        c.validate().unwrap();
+        assert_eq!(c.private_channels.purge_grace_hours, MAX_PRIVATE_CHANNELS_PURGE_GRACE_HOURS);
+        assert_eq!(c.private_channels.lifecycle_check_interval_secs, 600);
+        assert_eq!(c.private_channels.purge_interval_secs, 86_400);
+        assert_eq!(c.private_channels.purge_batch_rows, 100_000);
+    }
+
+    #[test]
+    fn private_sync_resume_keys_default_and_soft_clamp() {
+        let mut c = baseline_config();
+        c.validate().expect("defaults validate");
+        assert_eq!(c.private_channel_sync.resume_ttl_hours, 72);
+        assert_eq!(c.private_channel_sync.catchup_overlap_hours, 24);
+        let d = PrivateChannelSyncConfig::default();
+        assert_eq!(d.resume_ttl_hours, 72);
+        assert_eq!(d.catchup_overlap_hours, 24);
+        // A config written before 0.149.0 (keys absent) gets the defaults.
+        let old: Config = toml::from_str(
+            &Config::default_toml()
+                .lines()
+                .filter(|l| !l.starts_with("resume_ttl_hours") && !l.starts_with("catchup_overlap_hours"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        assert_eq!(old.private_channel_sync.resume_ttl_hours, 72);
+        assert_eq!(old.private_channel_sync.catchup_overlap_hours, 24);
+        // 0 = off is kept; out-of-range values are clamped, not rejected.
+        let mut c = baseline_config();
+        c.private_channel_sync.resume_ttl_hours = 0;
+        c.private_channel_sync.catchup_overlap_hours = 0;
+        c.validate().unwrap();
+        assert_eq!(c.private_channel_sync.resume_ttl_hours, 0);
+        assert_eq!(c.private_channel_sync.catchup_overlap_hours, 1);
+        c.private_channel_sync.resume_ttl_hours = u64::MAX;
+        c.private_channel_sync.catchup_overlap_hours = 10_000;
+        c.validate().unwrap();
+        assert_eq!(c.private_channel_sync.resume_ttl_hours, 720);
+        assert_eq!(c.private_channel_sync.catchup_overlap_hours, 720);
+        // Edges are accepted unchanged.
+        c.private_channel_sync.resume_ttl_hours = 1;
+        c.private_channel_sync.catchup_overlap_hours = 720;
+        c.validate().unwrap();
+        assert_eq!(c.private_channel_sync.resume_ttl_hours, 1);
+        assert_eq!(c.private_channel_sync.catchup_overlap_hours, 720);
+    }
+
     // --- 0.141.0 rolling budgets + attempt throttle -------------------
 
     #[test]
@@ -5328,6 +5636,7 @@ mod tests {
             "[api.admin]",
             "[api.rate_limits]",
             "[storage]",
+            "[private_channels]",
             "[cache]",
             "[dm]",
             "[identity_resync]",

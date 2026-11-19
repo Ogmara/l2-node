@@ -267,7 +267,7 @@ async fn handle_authenticated_ws(socket: WebSocket, state: Arc<AppState>) {
             client_msg = receiver.next() => {
                 match client_msg {
                     Some(Ok(Message::Text(text))) => {
-                        if let Err(e) = handle_ws_client_message(&text, &state, &mut sender).await {
+                        if let Err(e) = handle_ws_client_message(&text, &state, &wallet_address, &mut sender).await {
                             warn!(error = %e, "WebSocket client message error");
                         }
                     }
@@ -290,6 +290,7 @@ async fn handle_authenticated_ws(socket: WebSocket, state: Arc<AppState>) {
 async fn handle_ws_client_message(
     text: &str,
     state: &Arc<AppState>,
+    wallet: &str,
     _sender: &mut SplitSink<WebSocket, Message>,
 ) -> anyhow::Result<()> {
     let msg: WsClientMessage = serde_json::from_str(text)?;
@@ -315,9 +316,13 @@ async fn handle_ws_client_message(
                     raw_bytes,
                     bot_commands_changed,
                     key_status,
+                    author,
                     ..
                 } = result
                 {
+                    // Private-channel lifecycle (l2-node 0.149.0): local
+                    // member evidence when the connection's wallet authored it.
+                    super::routes::note_local_channel_activity(state, &raw_bytes, &author, wallet);
                     // An already-present key wrap was not stored: no relay.
                     let relay = key_status != Some(crate::messages::router::KeyStatus::AlreadyPresent);
                     // Same reason as the REST submit path: gossip does not loop
@@ -363,9 +368,13 @@ async fn handle_ws_client_message(
                     raw_bytes,
                     bot_commands_changed,
                     key_status,
+                    author,
                     ..
                 } = result
                 {
+                    // Same as `Message`: the frame variant does not
+                    // constrain `msg_type` (see below).
+                    super::routes::note_local_channel_activity(state, &raw_bytes, &author, wallet);
                     // An already-present key wrap was not stored: no relay.
                     let relay = key_status != Some(crate::messages::router::KeyStatus::AlreadyPresent);
                     if relay {

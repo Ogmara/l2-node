@@ -508,7 +508,19 @@ pub struct AppState {
     /// exact (wallet, device) pair without gating the wallet's other
     /// devices or its wallet-direct claims.
     pub pchansync_no_proof: Cache<String, ()>,
+    /// Throttle for the private-channel lifecycle's lazy touch in
+    /// `check_channel_access` (l2-node 0.149.0): `(channel_id, wallet)` →
+    /// unix ms of the last `record_local_channel_home` call, so a member
+    /// polling a channel costs one map lookup, not two RocksDB reads, per
+    /// request. Cleared wholesale at `CHANNEL_HOME_TOUCH_MAX_ENTRIES`
+    /// (a clear only costs one extra storage check per pair).
+    pub channel_home_touch: Arc<std::sync::Mutex<HashMap<(u64, String), u64>>>,
 }
+
+/// Cap of `AppState::channel_home_touch`.
+pub const CHANNEL_HOME_TOUCH_MAX_ENTRIES: usize = 100_000;
+/// How long one lazy touch of a `(channel, wallet)` pair suppresses the next.
+pub const CHANNEL_HOME_TOUCH_INTERVAL_MS: u64 = 10 * 60 * 1000;
 
 /// Cached `registration/info` body + age tracking (v0.126.0).
 #[derive(Clone)]
@@ -808,6 +820,7 @@ impl AppState {
             governance_inflight,
             pchansync_claim_gate,
             pchansync_no_proof,
+            channel_home_touch: Arc::new(std::sync::Mutex::new(HashMap::new())),
             alerts_config,
             bots_config,
             alert_test_tx,

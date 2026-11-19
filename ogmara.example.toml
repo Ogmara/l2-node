@@ -234,6 +234,38 @@ responder_budget_refill_per_hour = 5000
 # between failing attempts.
 in_sync_recheck_minutes = 60
 retry_backoff_max_minutes = 30
+# Requester: a walk that ends early (responder budget, page backstops)
+# continues later from a persisted cursor with the same peer instead of
+# starting over. Hours a cursor stays usable after its last update
+# (0 = off, otherwise 1..=720).
+resume_ttl_hours = 72
+# Requester: a catch-up after a finished walk starts this many hours
+# before the walk's high-water mark (1..=720).
+catchup_overlap_hours = 24
+
+[private_channels]
+# Private-channel lifecycle on this node. When the last LOCAL member of a
+# private channel is gone, the node unsubscribes its gossip topic at once
+# and keeps its local data for purge_grace_hours; a member returning within
+# that time cancels the cleanup. Pinned channels ([storage]
+# pinned_channels) are never affected (a pin made after a channel's purge
+# started does not stop that purge).
+# Hours to keep the data. 0 = never clean up (still unsubscribes; also
+# disables purging creator-deleted private channels). Max 8760.
+purge_grace_hours = 168
+# Seconds between backstop passes that re-apply pending decisions to the
+# gossip subscriptions (the normal path is event-driven). 5..=600.
+lifecycle_check_interval_secs = 30
+# Seconds between purge passes that delete the local data of channels
+# whose grace has run out (a creator-deleted private channel: at once).
+# 10..=86400.
+purge_interval_secs = 300
+# Max rows deleted per purge pass (a big channel takes several passes;
+# progress survives restarts). A soft cap: a message's side rows are deleted
+# together with it, so a pass can overshoot; only a message with 4096 or
+# more rows in one side column family is spread over several passes.
+# 100..=100000.
+purge_batch_rows = 5000
 
 [api]
 # Set to "0.0.0.0" to accept connections from all interfaces

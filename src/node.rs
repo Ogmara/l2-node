@@ -678,6 +678,35 @@ fn reap_channel_delete_claims(storage: &Storage, pending_retention_hours: u64) {
     }
 }
 
+/// One pass of the private-channel purge reaper (l2-node 0.149.0,
+/// `storage::channel_purge`): start due purges and delete up to
+/// `batch_rows` rows, then account the pass in the
+/// `private_channels_purged_total` / `private_channel_purge_rows_total`
+/// metrics. Never fatal: a failed pass resumes from the persisted cursor
+/// on the next tick.
+fn run_private_channel_purge(
+    storage: &Storage,
+    batch_rows: u64,
+    counters: &crate::metrics::counters::NetworkCounters,
+) {
+    match storage.run_private_channel_purge_pass(crate::util::now_ms(), batch_rows) {
+        Ok(r) => {
+            counters.add_private_channel_purge(r.completed as u64, r.rows);
+            if r != crate::storage::channel_purge::PurgePassReport::default() {
+                info!(
+                    started = r.started,
+                    cancelled = r.cancelled,
+                    aborted = r.aborted,
+                    completed = r.completed,
+                    rows = r.rows,
+                    "Private-channel purge pass"
+                );
+            }
+        }
+        Err(e) => warn!(error = %e, "Private-channel purge pass failed; retried next tick"),
+    }
+}
+
 /// Pending-channel-member-removal-claim reaper batch cap (W18 residual) —
 /// same numbers as `CHANNEL_DELETE_CLAIM_REAP_BATCH_LIMIT`/`_MAX_ROWS_EXAMINED`,
 /// same rationale (`ChannelKick`/`Ban`/`Leave` also require on-chain-verified
@@ -1021,6 +1050,58 @@ impl Node {
             Ok(0) => {}
             Ok(n) => info!(purged = n, "Purged retired CHANNEL_INVITES rows"),
             Err(e) => warn!(error = %e, "Failed to purge retired CHANNEL_INVITES rows"),
+        }
+
+        // Private-channel lifecycle (l2-node 0.149.0). Never fatal — every
+        // failure only means "schedule nothing / keep everything":
+        // 1. policy (grace + pinned set) before any membership write;
+        // 2. one-time seeding of LOCAL_CHANNEL_HOMES (budget-capped per boot,
+        //    resumable; scheduling stays off until it completes);
+        // 3. re-seed from LOCAL_CHANNEL_FED (every boot — covers federations
+        //    made while an older binary ran);
+        // 4. downgrade re-arm + re-evaluation of pending rows.
+        storage.set_private_channel_policy(
+            crate::storage::channel_lifecycle::PrivateChannelPolicy::new(
+                config.private_channels.purge_grace_hours,
+                config.storage.pinned_channels.iter().copied(),
+            ),
+        );
+        {
+            let now_ms = crate::util::now_ms();
+            match storage.run_private_channel_homes_seeding(
+                crate::storage::channel_lifecycle::HOMES_SEED_BUDGET_PER_BOOT,
+                now_ms,
+            ) {
+                Ok((n, true)) => {
+                    if n > 0 {
+                        info!(seeded = n, "Private-channel local-member evidence seeded");
+                    }
+                }
+                Ok((n, false)) => info!(
+                    seeded = n,
+                    "Private-channel local-member seeding paused at its per-boot budget; resumes next start (no channel is scheduled for cleanup until it completes)"
+                ),
+                Err(e) => warn!(error = %e, "Private-channel local-member seeding failed; will retry next start"),
+            }
+            match storage.seed_local_channel_homes_from_fed(now_ms) {
+                Ok(0) => {}
+                Ok(n) => info!(seeded = n, "Private-channel local-member evidence re-seeded from federations"),
+                Err(e) => warn!(error = %e, "Re-seeding local-member evidence from federations failed"),
+            }
+            match storage.prepare_private_channel_lifecycle(now_ms) {
+                Ok(r) => {
+                    if r.rearmed {
+                        warn!(
+                            updated = r.updated,
+                            "Another node binary advanced the chain since this release last ran; re-armed every pending private-channel cleanup deadline"
+                        );
+                    }
+                    if r.cancelled > 0 {
+                        info!(cancelled = r.cancelled, "Pending private-channel cleanups cancelled at startup (local member present)");
+                    }
+                }
+                Err(e) => warn!(error = %e, "Private-channel lifecycle preparation failed"),
+            }
         }
 
         // Backfill CHANNEL_EDIT_DELETE_MSGS/DM_EDIT_DELETE_MSGS/NEWS_EDIT_DELETE
@@ -1514,33 +1595,12 @@ impl Node {
             tokio::sync::mpsc::unbounded_channel::<crate::network::PrivateChannelSyncTrigger>();
 
         // Subscribe to all existing channels from storage so the node
-        // participates in GossipSub for channels it already knows about.
-        match self.storage.prefix_iter_cf(
-            crate::storage::schema::cf::CHANNELS,
-            &[],
-            100_000,
-        ) {
-            Ok(entries) => {
-                let mut count = 0u64;
-                for (key, _) in &entries {
-                    if key.len() == 8 {
-                        let channel_id = u64::from_be_bytes(
-                            <[u8; 8]>::try_from(key.as_slice()).expect("len checked"),
-                        );
-                        network.subscribe_channel(channel_id);
-                        count += 1;
-                    }
-                }
-                if count > 0 {
-                    info!(count, "Subscribed to existing channel topics");
-                }
-            }
-            Err(e) => warn!(error = %e, "Failed to load existing channels for GossipSub"),
-        }
-
-        // Subscribe to pinned channels (may overlap with above, subscribe_channel is idempotent)
-        for &channel_id in &self.config.storage.pinned_channels {
-            network.subscribe_channel(channel_id);
+        // participates in GossipSub for channels it already knows about —
+        // except private channels pending local cleanup (no local member
+        // left, l2-node 0.149.0) — then to every pinned channel.
+        let count = network.subscribe_stored_channels(&self.config.storage.pinned_channels);
+        if count > 0 {
+            info!(count, "Subscribed to existing channel topics");
         }
 
         // Persist Lamport counter periodically
@@ -2608,6 +2668,38 @@ impl Node {
                         );
                     }
                     _ = channel_member_removal_reap_shutdown_rx.recv() => break,
+                }
+            }
+        });
+
+        // Private-channel purge reaper (l2-node 0.149.0, plan §4): deletes
+        // the local data of private channels whose cleanup is due, batch-
+        // capped per pass with its progress persisted in the lifecycle row
+        // (restart-safe). Storage-only; the RocksDB work runs on the
+        // blocking pool so a large batch never stalls an async worker.
+        let purge_storage = self.storage.clone();
+        let purge_counters = app_state.counters.clone();
+        let purge_interval_secs = self.config.private_channels.purge_interval_secs;
+        let purge_batch_rows = self.config.private_channels.purge_batch_rows;
+        let mut purge_shutdown_rx = self.shutdown_rx();
+        spawn_supervised("private_channel_purge_reaper", async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+                purge_interval_secs.max(1),
+            ));
+            interval.tick().await; // skip immediate tick
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let storage = purge_storage.clone();
+                        let counters = purge_counters.clone();
+                        let pass = tokio::task::spawn_blocking(move || {
+                            run_private_channel_purge(&storage, purge_batch_rows, &counters)
+                        });
+                        if let Err(e) = pass.await {
+                            warn!(error = %e, "private-channel purge pass panicked or was cancelled");
+                        }
+                    }
+                    _ = purge_shutdown_rx.recv() => break,
                 }
             }
         });

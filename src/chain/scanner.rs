@@ -1241,8 +1241,16 @@ impl ChainScanner {
                     // `channel_membership_lock`-guarded critical section — see
                     // `put_channel_and_replay_pending_member_removals`'s doc
                     // comment for the orphaned-claim race this closes.
-                    self.storage
-                        .put_channel_and_replay_pending_member_removals(channel_id, &bytes)?;
+                    if !self
+                        .storage
+                        .put_channel_and_replay_pending_member_removals(channel_id, &bytes)?
+                    {
+                        // Refused: the local data of a private channel with
+                        // this id is being purged (l2-node 0.149.0). Never
+                        // reached for a real on-chain id (always below the
+                        // private floor); nothing else to do for this event.
+                        return Ok(());
+                    }
                     // Chain-derived — the creator IS the on-chain value.
                     // Recorded in the separate CHANNEL_VERIFICATION CF, not
                     // as a field on this row (see that CF's doc comment).

@@ -26,6 +26,41 @@ pub mod cf {
     /// from snapshot `DOMAIN_CFS`. Used to cap how many channels one wallet may
     /// federate (bounds the gossip-topic subscriptions a single user can drive).
     pub const LOCAL_CHANNEL_FED: &str = "local_channel_fed";
+    /// (channel_id_be8, wallet_address) → (first_seen_ms:8 BE, last_seen_ms:8 BE)
+    /// — node-local proof that `wallet` uses THIS node for the PRIVATE channel
+    /// `channel_id` (private-channel lifecycle, l2-node 0.149.0,
+    /// `storage::channel_lifecycle`). Written only for an authenticated
+    /// caller acting as itself on a channel it is a member of (federate,
+    /// local create/join/chat, the lazy touch in `check_channel_access`) and
+    /// by the boot-time seeding. Indexed by channel so "does this channel
+    /// still have a local member" is one bounded prefix scan. Rows are only
+    /// ever deleted together with the channel's local data, by the last step
+    /// of the purge (`storage::channel_purge`, `purge_phase::
+    /// LOCAL_CHANNEL_HOMES`). NODE-LOCAL; not in snapshot `DOMAIN_CFS` (which is only the
+    /// anchored chain mirror) and not droppable.
+    pub const LOCAL_CHANNEL_HOMES: &str = "local_channel_homes";
+    /// channel_id_be8 → JSON `PrivateChannelLifecycleRow` — a private
+    /// channel this node no longer has a local member for (or that its
+    /// creator deleted), pending local cleanup (l2-node 0.149.0,
+    /// `storage::channel_lifecycle`). While a row exists the channel's
+    /// gossip topic is not subscribed (pinned channels excepted). A separate
+    /// CF rather than `NODE_STATE` keys because `NODE_STATE` carries the
+    /// stat-counter merge operator. NODE-LOCAL; not in snapshot `DOMAIN_CFS`
+    /// and not droppable (a downgrade simply ignores it — unknown CFs are
+    /// tolerated since 0.143.0).
+    pub const PRIVATE_CHANNEL_LIFECYCLE: &str = "private_channel_lifecycle";
+    /// (wallet, 0xFF, channel_id_be8) → JSON `private_channel_sync::ResumeRow`
+    /// — the persisted resume cursor of a `(wallet, channel)` private-channel
+    /// sync walk (l2-node 0.149.0, plan §6): the peer that issued the
+    /// cursors, the metadata/chat cursors, the cumulative `Accepted` count,
+    /// a session counter and the high-water mark of the last finished walk.
+    /// Same key bytes as `LOCAL_CHANNEL_FED`. Sole writer is the network
+    /// task (one put per applied page); deleted with the channel's local
+    /// data by the purge (`Storage::stage_purge_wallet_channel_rows`).
+    /// Node-local and untrusted on read (a row that does not validate is
+    /// treated as absent). NODE-LOCAL; not in snapshot `DOMAIN_CFS` and not
+    /// droppable (a downgrade simply ignores it).
+    pub const PRIVATE_CHANNEL_SYNC_RESUME: &str = "private_channel_sync_resume";
     /// (timestamp, msg_id) → () — global news feed index
     pub const NEWS_FEED: &str = "news_feed";
     /// (tag, timestamp, msg_id) → () — tag-based news index
@@ -538,6 +573,9 @@ pub mod cf {
         STATE_CHECKPOINTS,
         ANCHORED_STATE,
         ANCHORED_REPAIR,
+        LOCAL_CHANNEL_HOMES,
+        PRIVATE_CHANNEL_LIFECYCLE,
+        PRIVATE_CHANNEL_SYNC_RESUME,
     ];
 }
 
@@ -784,6 +822,32 @@ pub mod state_keys {
     /// sweeps progress independently. Empty means "start from the
     /// beginning".
     pub const PRIVATE_CHANNEL_SYNC_RETRY_CURSOR: &[u8] = b"private_channel_sync_retry_cursor";
+    /// Sentinel: set to 1 once the one-time `LOCAL_CHANNEL_HOMES` seeding
+    /// pass over `CHANNEL_MEMBERS ∩ (LOCAL_DM_USERS ∪ CHANNEL_READ_STATE)`
+    /// has reached the end of the private-channel member range (l2-node
+    /// 0.149.0). Until it is set, no membership change schedules a private
+    /// channel for cleanup (the evidence set is still incomplete).
+    pub const PRIVATE_CHANNEL_HOMES_SEEDED_V1: &[u8] = b"migration_private_channel_homes_seeded_v1";
+    /// Resume cursor (raw `CHANNEL_MEMBERS` key) for that seeding pass, so a
+    /// budget-capped boot continues where it stopped. Deleted on completion.
+    pub const PRIVATE_CHANNEL_HOMES_SEED_CURSOR: &[u8] = b"migration_private_channel_homes_seed_cursor";
+    /// Unix ms at which this node first ran a release with the private-
+    /// channel lifecycle (l2-node 0.149.0). No cleanup deadline is ever
+    /// earlier than this plus `[private_channels] purge_grace_hours`.
+    pub const PRIVATE_LIFECYCLE_MIGRATED_AT_MS: &[u8] = b"private_lifecycle_migrated_at_ms";
+    /// Chain cursor stamp written in the same batch as `CHAIN_CURSOR` by
+    /// this release (`set_chain_cursor_with_mirror`). Behind `CHAIN_CURSOR`
+    /// at boot means another (older) binary ran the scanner meanwhile — it
+    /// recorded no local-channel evidence, so every pending cleanup deadline
+    /// is re-armed to `now + grace` (same detection as
+    /// `ANCHORED_MIRROR_CURSOR`).
+    pub const PRIVATE_LIFECYCLE_CHAIN_CURSOR: &[u8] = b"private_lifecycle_chain_cursor";
+    /// Rotating scan cursor (a raw `PRIVATE_CHANNEL_LIFECYCLE` key) of the
+    /// private-channel purge reaper (`Storage::run_private_channel_purge_
+    /// pass`, l2-node 0.149.0): each pass reads one bounded page from here,
+    /// so no row can be starved by rows before it. Empty / absent = from
+    /// the start.
+    pub const PRIVATE_CHANNEL_PURGE_CURSOR: &[u8] = b"private_channel_purge_cursor";
     /// Sentinel: set to 1 once the key-epoch arbitration migration
     /// (`Storage::migrate_channel_key_commits`, l2-node 0.143.0) has written
     /// `legacy` `CHANNEL_KEY_COMMITS` rows for every pre-existing channel
@@ -1220,6 +1284,14 @@ pub fn encode_local_channel_fed_prefix(wallet: &str) -> Vec<u8> {
 pub fn encode_local_channel_fed_key(wallet: &str, channel_id: u64) -> Vec<u8> {
     let mut key = encode_local_channel_fed_prefix(wallet);
     key.extend_from_slice(&channel_id.to_be_bytes());
+    key
+}
+
+/// Encode a `LOCAL_CHANNEL_HOMES` key: (channel_id_be8, wallet).
+pub fn encode_local_channel_home_key(channel_id: u64, wallet: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(8 + wallet.len());
+    key.extend_from_slice(&channel_id.to_be_bytes());
+    key.extend_from_slice(wallet.as_bytes());
     key
 }
 

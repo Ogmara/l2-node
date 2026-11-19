@@ -803,6 +803,38 @@ pub struct NetworkService {
     /// never verify here and vice versa; keeping distinct maps avoids any
     /// accidental cross-use.
     private_channel_sync_wallet_claims: HashMap<String, private_channel_sync::WalletAuthClaim>,
+    /// Private channels whose gossip topic this node deliberately does NOT
+    /// hold because their `PRIVATE_CHANNEL_LIFECYCLE` row says no local
+    /// member is left (l2-node 0.149.0). Only channels in this set are ever
+    /// re-subscribed by `reconcile_channel_lifecycle`; everything else keeps
+    /// the existing subscribe paths.
+    lifecycle_unsubscribed: HashSet<u64>,
+    /// Receiver of `Storage`'s lifecycle notifier (a channel id whose
+    /// lifecycle row was written or removed by ANY ingress path — API, WS,
+    /// gossip, sync, scanner). Taken by `run()`.
+    lifecycle_rx: Option<tokio::sync::mpsc::UnboundedReceiver<u64>>,
+    /// `[private_channels] lifecycle_check_interval_secs` — cadence of the
+    /// backstop pass (`lifecycle_backstop`).
+    lifecycle_check_interval_secs: u64,
+    /// Channel ids notified by the storage layer (or whose unsubscribe was
+    /// deferred) since the last backstop tick — re-applied by that tick.
+    lifecycle_dirty: HashSet<u64>,
+    /// Rotating position (channel id) of the backstop tick's batch over
+    /// `lifecycle_unsubscribed`; `0` = from the smallest id.
+    lifecycle_unsub_cursor: u64,
+    /// Rotating cursor (raw `PRIVATE_CHANNEL_LIFECYCLE` key) of the
+    /// background page scan that converges missed rows and maintains the
+    /// pending gauge. Empty = from the start.
+    lifecycle_scan_cursor: Vec<u8>,
+    /// Pending rows counted so far in the current scan rotation; published
+    /// to the `private_channels_pending` gauge when the rotation completes.
+    lifecycle_scan_pending: u64,
+    /// A page read is running on the blocking pool (one at a time).
+    lifecycle_scan_in_flight: bool,
+    /// Finished page reads come back here (sender cloned into the blocking
+    /// task; receiver taken by `run()`).
+    lifecycle_scan_tx: tokio::sync::mpsc::UnboundedSender<LifecycleScanPage>,
+    lifecycle_scan_rx: Option<tokio::sync::mpsc::UnboundedReceiver<LifecycleScanPage>>,
     /// Presence-gossip manager (spec 13 §10, l2-node 0.48.0+). `Some`
     /// iff `[network.presence] enabled = true` at startup; held in an
     /// `Arc` so the cache + rate limiter can be shared with the REST
@@ -1249,6 +1281,37 @@ struct DmSyncPending {
     consecutive_unproductive_pages: u32,
 }
 
+/// Lifecycle rows read per backstop page (`NetworkService::
+/// start_lifecycle_scan_page`, l2-node 0.149.0).
+const LIFECYCLE_BACKSTOP_PAGE: usize = 1024;
+
+/// One finished backstop page read: `(ids with "is pending", next cursor)`
+/// as returned by `Storage::private_channel_lifecycle_page`, or the error.
+struct LifecycleScanPage {
+    result: Result<(Vec<(u64, bool)>, Option<Vec<u8>>), String>,
+}
+
+/// Delivers exactly one `LifecycleScanPage` for a backstop page read: the
+/// real one via `send`, or — if the blocking task panics or is dropped
+/// before it ran — an `Err` page from `Drop`, so `lifecycle_scan_in_flight`
+/// is always cleared and the backstop never stops scanning.
+struct LifecycleScanSendGuard(Option<tokio::sync::mpsc::UnboundedSender<LifecycleScanPage>>);
+
+impl LifecycleScanSendGuard {
+    fn send(&mut self, page: LifecycleScanPage) {
+        if let Some(tx) = self.0.take() {
+            // The loop may be shutting down (receiver gone).
+            let _ = tx.send(page);
+        }
+    }
+}
+
+impl Drop for LifecycleScanSendGuard {
+    fn drop(&mut self) {
+        self.send(LifecycleScanPage { result: Err("backstop page read did not complete".into()) });
+    }
+}
+
 /// Per-pending-outbound-private-channel-sync state (closes the F2 backfill
 /// gap). Keyed by `(wallet, channel_id)` rather than just `wallet` (dm_sync)
 /// since one wallet can be independently backfilling several channels.
@@ -1261,8 +1324,23 @@ struct PrivateChannelSyncPending {
     /// `ReconcilePending`'s doc comment, audit final pre-mainnet W9, and
     /// `private_channel_sync::MAX_META_PAGES_PER_SESSION`), strictly
     /// advancing cursors, and the session-cumulative `Accepted` count that
-    /// completion requires (round 4).
+    /// completion requires (round 4). Since l2-node 0.149.0 it may be
+    /// seeded from the persisted resume row, so `accepted_total` is then
+    /// the WALK's cumulative count (all its sessions).
     session: private_channel_sync::SyncSession,
+    /// `session.accepted_total` when this session started (the part
+    /// carried over from earlier sessions of the walk), so the attempt
+    /// throttle can tell whether THIS session admitted anything new.
+    accepted_base: usize,
+    /// Resume-row context for the per-page row write (`None` = the resume
+    /// cursor is off, `[private_channel_sync] resume_ttl_hours = 0`).
+    resume: Option<private_channel_sync::ResumeSeed>,
+    /// This session is a same-peer continuation of a stored walk (ONE
+    /// request to the peer that issued its cursors). An auth rejection by
+    /// that peer abandons the walk; a session that makes no cursor progress
+    /// counts as a stall (`note_private_channel_sync_stall`), and
+    /// `MAX_RESUME_STALLS` consecutive stalls abandon it too.
+    same_peer_resume: bool,
 }
 
 /// Per-pending-outbound-news-sync state (P-3). Audit final pre-mainnet W9:
@@ -2295,6 +2373,16 @@ impl NetworkService {
         // carries its build (or waiter) slot, released only after the loop
         // has sent the response.
         let (deferred_response_tx, deferred_response_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Private-channel lifecycle (l2-node 0.149.0): the storage layer
+        // reports every lifecycle-row change here, whichever path caused it.
+        // Only the FIRST service built on a database owns the notifier (one
+        // per process in production); a later one keeps `None` and relies on
+        // its backstop pass.
+        let lifecycle_rx = {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            storage.set_channel_lifecycle_notifier(tx).then_some(rx)
+        };
+        let (lifecycle_scan_tx, lifecycle_scan_rx) = tokio::sync::mpsc::unbounded_channel();
         // l2-node 0.141.0: rolling responder budgets + requester attempt
         // throttles (see `budget`'s module doc).
         let reconcile_budget = budget::Gcra::new(
@@ -2380,6 +2468,16 @@ impl NetworkService {
             pending_private_channel_sync_requests: HashMap::new(),
             private_channel_sync_triggered: HashSet::new(),
             private_channel_sync_wallet_claims: HashMap::new(),
+            lifecycle_unsubscribed: HashSet::new(),
+            lifecycle_rx,
+            lifecycle_check_interval_secs: config.private_channels.lifecycle_check_interval_secs,
+            lifecycle_dirty: HashSet::new(),
+            lifecycle_unsub_cursor: 0,
+            lifecycle_scan_cursor: Vec::new(),
+            lifecycle_scan_pending: 0,
+            lifecycle_scan_in_flight: false,
+            lifecycle_scan_tx,
+            lifecycle_scan_rx: Some(lifecycle_scan_rx),
             presence_manager,
             presence_topic_hash,
             hot_topics,
@@ -2478,6 +2576,252 @@ impl NetworkService {
     pub fn unsubscribe_dm(&mut self, address: &str) {
         self.topics
             .unsubscribe_dm(&mut self.swarm, address);
+    }
+
+    /// Unsubscribe from a channel's gossip topic (private-channel lifecycle,
+    /// l2-node 0.149.0). Only `reconcile_channel_lifecycle` calls this, and
+    /// only for a private, unpinned channel with a lifecycle row and no
+    /// private-sync session in flight.
+    pub fn unsubscribe_channel(&mut self, channel_id: u64) -> bool {
+        self.topics.unsubscribe_channel(&mut self.swarm, channel_id)
+    }
+
+    /// `true` while any private-channel-sync request for `channel_id` is
+    /// outstanding (owner decision D7: no unsubscribe mid-session — a
+    /// session replaying old removals could otherwise flap the topic).
+    fn private_sync_in_flight(&self, channel_id: u64) -> bool {
+        self.pending_private_channel_sync_requests
+            .values()
+            .any(|p| p.channel_id == channel_id)
+    }
+
+    /// Make the gossip subscription of `channel_id` match its lifecycle
+    /// state (l2-node 0.149.0, `storage::channel_lifecycle`):
+    ///
+    /// - a public id or a pinned channel is never touched;
+    /// - a lifecycle row present → unsubscribe (deferred while a private-
+    ///   sync session for the channel is in flight) and remember it in
+    ///   `lifecycle_unsubscribed`;
+    /// - no row, but this node dropped the topic earlier → subscribe again
+    ///   and ask the private-sync requester to backfill the gap for every
+    ///   local member (it no-ops without a cached wallet claim; the API
+    ///   path that cancelled the row sends its own trigger as well).
+    ///
+    /// A storage error keeps the current subscription (fail towards keep).
+    /// Idempotent; driven by the storage notifier, the `channel_rx`
+    /// subscribe path, private-sync completion and the backstop pass.
+    fn reconcile_channel_lifecycle(&mut self, channel_id: u64) {
+        if crate::messages::types::is_public_channel_id(channel_id) {
+            return;
+        }
+        let blocked = match self.storage.lifecycle_blocks_subscription(channel_id) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(channel_id, error = %e, "private-channel lifecycle: row read failed; keeping the subscription");
+                return;
+            }
+        };
+        let subscribed = self.topics.is_channel_subscribed(channel_id);
+        if blocked {
+            if subscribed {
+                if self.private_sync_in_flight(channel_id) {
+                    debug!(channel_id, "private-channel lifecycle: unsubscribe deferred while a private-sync session is in flight");
+                    // The session's release re-applies it; the next
+                    // backstop tick does too, should that be missed.
+                    self.lifecycle_dirty.insert(channel_id);
+                    return;
+                }
+                if self.unsubscribe_channel(channel_id) {
+                    self.counters.inc_private_channel_unsubscribes();
+                    info!(channel_id, "private-channel lifecycle: no local member left; unsubscribed the channel topic");
+                }
+            }
+            self.lifecycle_unsubscribed.insert(channel_id);
+        } else if self.lifecycle_unsubscribed.remove(&channel_id) {
+            // The row is gone because the purge reaper FINISHED (or the
+            // channel was deleted): the channel no longer exists here, so
+            // there is nothing to re-subscribe to. A later re-federation
+            // subscribes through `channel_rx` like any new channel.
+            if !matches!(
+                self.storage.exists_cf(schema::cf::CHANNELS, &channel_id.to_be_bytes()),
+                Ok(true)
+            ) {
+                debug!(channel_id, "private-channel lifecycle: channel purged; topic stays unsubscribed");
+                return;
+            }
+            if !subscribed {
+                self.subscribe_channel(channel_id);
+                self.counters.inc_private_channel_resubscribes();
+                info!(channel_id, "private-channel lifecycle: local member returned; re-subscribed the channel topic");
+            }
+            match self
+                .storage
+                .local_member_wallets(channel_id, crate::storage::channel_lifecycle::RESUBSCRIBE_SYNC_WALLETS)
+            {
+                Ok(wallets) => {
+                    for wallet in wallets {
+                        self.maybe_trigger_private_channel_sync(channel_id, &wallet, None, false);
+                    }
+                }
+                Err(e) => debug!(channel_id, error = %e, "private-channel lifecycle: local-member read failed; no gap backfill triggered"),
+            }
+        }
+    }
+
+    /// Backstop pass (`[private_channels] lifecycle_check_interval_secs`).
+    /// Never scans the lifecycle CF on the event loop:
+    ///
+    /// 1. re-applies the ids notified (or deferred) since the last tick and
+    ///    every channel this node holds unsubscribed (point reads only —
+    ///    a row that disappeared re-subscribes, a deferred unsubscribe
+    ///    applies);
+    /// 2. starts ONE bounded page read ([`LIFECYCLE_BACKSTOP_PAGE`] rows) of
+    ///    the CF on the blocking pool from a rotating cursor; its result
+    ///    (`apply_lifecycle_scan_page`) converges rows whose notification
+    ///    was missed and, once a rotation completes, refreshes the
+    ///    `private_channels_pending` gauge.
+    fn lifecycle_backstop(&mut self) {
+        self.lifecycle_backstop_tick();
+        self.start_lifecycle_scan_page();
+    }
+
+    /// Step 1 of `lifecycle_backstop`: every dirty id, plus a rotating
+    /// batch of at most [`LIFECYCLE_BACKSTOP_PAGE`] of the channels held
+    /// unsubscribed (ascending id after `lifecycle_unsub_cursor`, wrapping),
+    /// so a large unsubscribed set is never re-read whole on one tick.
+    fn lifecycle_backstop_tick(&mut self) {
+        let mut ids: HashSet<u64> = std::mem::take(&mut self.lifecycle_dirty);
+        let cursor = self.lifecycle_unsub_cursor;
+        let mut batch: Vec<u64> = self.lifecycle_unsubscribed.iter().copied().filter(|&c| c > cursor).collect();
+        batch.sort_unstable();
+        batch.truncate(LIFECYCLE_BACKSTOP_PAGE);
+        if batch.len() < LIFECYCLE_BACKSTOP_PAGE {
+            let mut head: Vec<u64> = self.lifecycle_unsubscribed.iter().copied().filter(|&c| c <= cursor).collect();
+            head.sort_unstable();
+            head.truncate(LIFECYCLE_BACKSTOP_PAGE - batch.len());
+            batch.extend(head);
+        }
+        self.lifecycle_unsub_cursor = if batch.len() >= LIFECYCLE_BACKSTOP_PAGE {
+            batch.last().copied().unwrap_or(0)
+        } else {
+            0
+        };
+        ids.extend(batch);
+        for cid in ids {
+            self.reconcile_channel_lifecycle(cid);
+        }
+    }
+
+    /// Step 2 of `lifecycle_backstop`: one page read off the event loop
+    /// (skipped while the previous one is still running).
+    fn start_lifecycle_scan_page(&mut self) {
+        if self.lifecycle_scan_in_flight {
+            return;
+        }
+        self.lifecycle_scan_in_flight = true;
+        let storage = self.storage.clone();
+        let cursor = self.lifecycle_scan_cursor.clone();
+        let mut guard = LifecycleScanSendGuard(Some(self.lifecycle_scan_tx.clone()));
+        tokio::task::spawn_blocking(move || {
+            let result = storage
+                .private_channel_lifecycle_page(&cursor, LIFECYCLE_BACKSTOP_PAGE)
+                .map_err(|e| e.to_string());
+            guard.send(LifecycleScanPage { result });
+        });
+    }
+
+    /// Apply one finished page read: reconcile every id not already held
+    /// unsubscribed (those are re-applied by every tick anyway), advance the
+    /// rotating cursor, and publish the pending gauge at the end of a
+    /// rotation. A read error keeps the cursor (retried next tick).
+    fn apply_lifecycle_scan_page(&mut self, page: LifecycleScanPage) {
+        self.lifecycle_scan_in_flight = false;
+        let (ids, next) = match page.result {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(error = %e, "private-channel lifecycle: backstop page read failed");
+                return;
+            }
+        };
+        for (cid, pending) in ids {
+            self.lifecycle_scan_pending += u64::from(pending);
+            if !self.lifecycle_unsubscribed.contains(&cid) {
+                self.reconcile_channel_lifecycle(cid);
+            }
+        }
+        match next {
+            Some(cursor) => self.lifecycle_scan_cursor = cursor,
+            None => {
+                self.counters.set_private_channels_pending(self.lifecycle_scan_pending);
+                self.lifecycle_scan_pending = 0;
+                self.lifecycle_scan_cursor.clear();
+            }
+        }
+    }
+
+    /// Subscribe a channel on request (`channel_rx`: chain discovery,
+    /// federate, local create/join). A private channel with a lifecycle row
+    /// is NOT subscribed — otherwise any of those re-subscribes would undo
+    /// the lifecycle decision — and goes through
+    /// `reconcile_channel_lifecycle` instead.
+    fn handle_channel_subscribe_request(&mut self, channel_id: u64) {
+        match self.storage.lifecycle_blocks_subscription(channel_id) {
+            Ok(true) => {
+                debug!(channel_id, "channel subscribe request: pending private-channel cleanup, not subscribing");
+                self.reconcile_channel_lifecycle(channel_id);
+            }
+            // A read error falls back to today's behavior: subscribe.
+            Ok(false) | Err(_) => {
+                self.lifecycle_unsubscribed.remove(&channel_id);
+                self.subscribe_channel(channel_id);
+                info!(channel_id, "Auto-subscribed to channel topic (chain discovery)");
+            }
+        }
+    }
+
+    /// Startup: subscribe every channel in `CHANNELS` (up to 100k) except a
+    /// private channel with a lifecycle row, then every pinned channel
+    /// (always — pinned channels are never affected by the lifecycle).
+    /// Returns how many stored channels were subscribed.
+    pub fn subscribe_stored_channels(&mut self, pinned: &[u64]) -> u64 {
+        let mut count = 0u64;
+        match self.storage.prefix_iter_cf(crate::storage::schema::cf::CHANNELS, &[], 100_000) {
+            Ok(entries) => {
+                for (key, _) in &entries {
+                    let Ok(id_bytes) = <[u8; 8]>::try_from(key.as_slice()) else { continue };
+                    let channel_id = u64::from_be_bytes(id_bytes);
+                    match self.storage.lifecycle_blocks_subscription(channel_id) {
+                        Ok(true) => {
+                            self.lifecycle_unsubscribed.insert(channel_id);
+                        }
+                        Ok(false) | Err(_) => {
+                            self.subscribe_channel(channel_id);
+                            count += 1;
+                        }
+                    }
+                }
+            }
+            Err(e) => warn!(error = %e, "Failed to load existing channels for GossipSub"),
+        }
+        if !self.lifecycle_unsubscribed.is_empty() {
+            info!(
+                count = self.lifecycle_unsubscribed.len(),
+                "Not subscribing private channels pending local cleanup (no local member)"
+            );
+        }
+        // Pinned channels (may overlap with above; subscribe_channel is
+        // idempotent). Never in `lifecycle_unsubscribed` — except one whose
+        // purge started before the pin and is still running (it finishes;
+        // `lifecycle_blocks_subscription` keeps it off meanwhile).
+        for &channel_id in pinned {
+            if matches!(self.storage.private_channel_purge_in_progress(channel_id), Ok(true)) {
+                self.lifecycle_unsubscribed.insert(channel_id);
+                continue;
+            }
+            self.lifecycle_unsubscribed.remove(&channel_id);
+            self.subscribe_channel(channel_id);
+        }
+        count
     }
 
     /// Register `wallet` as a local DM user (offline store-and-forward Phase 1).
@@ -2904,6 +3248,17 @@ impl NetworkService {
         // Finished off-loop backfill responses (round 4). Always `Some` on
         // the first (only) `run()`; a second `run()` would park this arm.
         let mut deferred_response_rx = self.deferred_response_rx.take();
+        // Private-channel lifecycle notifications (l2-node 0.149.0); `None`
+        // when another service owns the notifier (tests) — the backstop
+        // pass below still converges.
+        let mut lifecycle_rx = self.lifecycle_rx.take();
+        // Results of the backstop's off-loop page reads.
+        let mut lifecycle_scan_rx = self.lifecycle_scan_rx.take();
+        // Backstop pass for the lifecycle (re-applies every row: deferred
+        // unsubscribes, missed notifications) + the pending gauge.
+        let mut lifecycle_interval =
+            tokio::time::interval(Duration::from_secs(self.lifecycle_check_interval_secs.max(1)));
+        lifecycle_interval.tick().await; // skip immediate tick
 
         // Dial persisted peers from previous sessions (survives restart)
         self.dial_persisted_peers();
@@ -3052,9 +3407,32 @@ impl NetworkService {
                     // the bare `Topics::subscribe_channel`) so the
                     // cold-join backfill trigger fires. The trigger is
                     // idempotent via `reconcile_triggered`, so
-                    // duplicate calls are safe.
-                    self.subscribe_channel(channel_id);
-                    info!(channel_id, "Auto-subscribed to channel topic (chain discovery)");
+                    // duplicate calls are safe. l2-node 0.149.0: a private
+                    // channel pending local cleanup is not re-subscribed
+                    // here (that would undo the lifecycle decision).
+                    self.handle_channel_subscribe_request(channel_id);
+                }
+                Some(channel_id) = async {
+                    match lifecycle_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    self.reconcile_channel_lifecycle(channel_id);
+                    // Re-applied by the next backstop tick too (a deferred
+                    // or failed reconcile must not depend on a full scan).
+                    self.lifecycle_dirty.insert(channel_id);
+                }
+                Some(page) = async {
+                    match lifecycle_scan_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    self.apply_lifecycle_scan_page(page);
+                }
+                _ = lifecycle_interval.tick() => {
+                    self.lifecycle_backstop();
                 }
                 Some(req) = gossip_rx.recv() => {
                     let GossipPublish { topic, data, respond_to } = req;
@@ -4970,6 +5348,9 @@ impl NetworkService {
         if !still_pending {
             self.private_channel_sync_triggered.remove(&(wallet.to_string(), channel_id));
         }
+        // l2-node 0.149.0: an unsubscribe deferred while this session ran
+        // (or a re-subscribe its replay caused) is applied now.
+        self.reconcile_channel_lifecycle(channel_id);
     }
 
     /// Cache `claim` as `wallet`'s private-channel-sync claim unless a
@@ -5090,6 +5471,18 @@ impl NetworkService {
         if !reconcile::is_private_channel(&self.storage, channel_id) {
             return;
         }
+        // l2-node 0.149.0 (plan §6): a wallet with no stake in the channel
+        // on this node has nothing to backfill. A current member qualifies,
+        // and so does a wallet with a `LOCAL_CHANNEL_HOMES` /
+        // `LOCAL_CHANNEL_FED` row that is not (or no longer) a member here: a
+        // stale replay (an old kick learned late) may have removed it while
+        // its newer re-join is still missing — the healing walk is what
+        // brings that re-join (the responder checks membership on ITS
+        // side). Checked before any throttle state moves; a read error
+        // skips (retried by the sweep).
+        if !matches!(self.storage.wallet_has_local_channel_standing(channel_id, wallet), Ok(true)) {
+            return;
+        }
         let key = (wallet.to_string(), channel_id);
         if !self.private_channel_sync_triggered.insert(key.clone()) {
             // Already in flight (or due-but-not-yet-resolved) this
@@ -5174,21 +5567,50 @@ impl NetworkService {
             return;
         }
 
+        // l2-node 0.149.0 (plan §6): the persisted resume row decides where
+        // this session starts — a same-peer continuation (one request to
+        // the peer that issued the cursors), a high-water catch-up, or a
+        // fresh walk from the first page.
+        // A wallet that is NOT a current member here (standing only from a
+        // home or federation row) is running a HEALING walk: the re-join it
+        // must recover may predate any mark, so it always walks afresh from
+        // the first page (security round 2, B1).
+        let healing = !reconcile::is_channel_member(&self.storage, channel_id, wallet);
+        let (start, resume_seed) = self.plan_private_channel_sync_start(wallet, channel_id, healing);
+        let from_row = !matches!(start, private_channel_sync::ResumeStart::Fresh);
+        let (mut seed_session, resume_peer) = match start {
+            private_channel_sync::ResumeStart::Fresh => (private_channel_sync::SyncSession::default(), None),
+            private_channel_sync::ResumeStart::Resume { peer, session } => (session, Some(peer)),
+            private_channel_sync::ResumeStart::CatchUp { session } => (session, None),
+        };
+        // Round 4 W3: a ForwardOnly member's fanout start begins its chat
+        // phase at its own join floor (never for a same-peer continuation
+        // or a healing walk).
+        if resume_peer.is_none() && !healing {
+            if let Some(floor) = self.forward_only_chat_floor(channel_id, wallet) {
+                private_channel_sync::apply_chat_floor(&mut seed_session, floor);
+            }
+        }
+
         // Candidate selection: GossipSub mesh peers for this channel's
-        // topic; fall back to any connected peer if the mesh is sparse.
+        // topic; fall back to any connected peer if the mesh is sparse. A
+        // same-peer continuation asks only that peer.
         let topic = libp2p::gossipsub::IdentTopic::new(gossip::channel_topic(
             self.topics.network_id(),
             channel_id,
         ));
         let topic_hash = topic.hash();
-        let mut candidates: Vec<PeerId> = self
-            .swarm
-            .behaviour()
-            .gossipsub
-            .mesh_peers(&topic_hash)
-            .copied()
-            .collect();
-        if candidates.len() < private_channel_sync::FANOUT {
+        let mut candidates: Vec<PeerId> = match resume_peer {
+            Some(peer) => vec![peer],
+            None => self
+                .swarm
+                .behaviour()
+                .gossipsub
+                .mesh_peers(&topic_hash)
+                .copied()
+                .collect(),
+        };
+        if resume_peer.is_none() && candidates.len() < private_channel_sync::FANOUT {
             for p in self.swarm.connected_peers() {
                 if !candidates.contains(p) {
                     candidates.push(*p);
@@ -5244,6 +5666,16 @@ impl NetworkService {
         self.private_channel_sync_throttle
             .on_dispatch(key.clone(), now_instant, budget::random_jitter());
         self.counters.inc_private_sync_attempts_dispatched();
+        if from_row {
+            self.counters.inc_private_sync_resumed_sessions();
+            debug!(
+                %wallet, channel_id,
+                same_peer = resume_peer.is_some(),
+                sessions = resume_seed.as_ref().map(|s| s.sessions),
+                "private-channel-sync: session starts from the persisted resume row"
+            );
+        }
+        let (cursor, meta_cursor, meta_done) = seed_session.request_cursors();
 
         for peer in candidates {
             let request = private_channel_sync::sign_request(
@@ -5254,14 +5686,18 @@ impl NetworkService {
                 channel_id,
                 now,
                 max_age_secs,
-                None,
+                cursor.clone(),
                 Some(claim.clone()),
             );
             // Walk ALL metadata first (R3-1, raw keyset paging); a responder
             // that predates metadata paging ignores this and answers with
-            // its legacy first page.
+            // its legacy first page. A session seeded from a resume row
+            // starts at its stored position (an ordinary continuation
+            // request on the wire).
             let request = private_channel_sync::PrivateChannelSyncRequest {
                 meta_paging: true,
+                meta_cursor: meta_cursor.clone(),
+                meta_done,
                 ..request
             };
             let id = self
@@ -5275,10 +5711,194 @@ impl NetworkService {
                     peer_id: peer,
                     wallet: wallet.to_string(),
                     channel_id,
-                    session: private_channel_sync::SyncSession::default(),
+                    accepted_base: seed_session.accepted_total,
+                    session: seed_session.clone(),
+                    resume: resume_seed.clone(),
+                    same_peer_resume: resume_peer.is_some(),
                 },
             );
         }
+    }
+
+    /// ForwardOnly chat floor for a CURRENT member's fanout start (round 4,
+    /// W3): `min(own CHANNEL_MEMBERS joined_at, earliest ChannelJoin
+    /// timestamp in the member's CHANNEL_MEMBERSHIP_INDEX) −
+    /// catchup_overlap_hours`, as a chat cursor (`CHANNEL_MSGS` is keyed by
+    /// the signed envelope timestamp, msg_id zeroed). Uses only this node's
+    /// own stored membership. `None` (no floor) for a FullHistory channel
+    /// (`history_visibility == 1`), the creator, a non-member, or a member
+    /// whose join is not recorded in the index: the local `joined_at` alone
+    /// can be LATER than the responder's (a federation stamps its own
+    /// time), and flooring there could skip rows the member may read. Every
+    /// responder sets its floor at or after the signed join it applied, so
+    /// the earliest indexed join never lies past it.
+    fn forward_only_chat_floor(
+        &self,
+        channel_id: u64,
+        wallet: &str,
+    ) -> Option<private_channel_sync::PrivateChannelSyncCursor> {
+        if reconcile::channel_history_visibility(&self.storage, channel_id) == Some(1) {
+            return None;
+        }
+        let creator = self
+            .storage
+            .get_cf(schema::cf::CHANNELS, &channel_id.to_be_bytes())
+            .ok()
+            .flatten()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .and_then(|m| m.get("creator").and_then(|c| c.as_str()).map(str::to_string));
+        if creator.as_deref() == Some(wallet) {
+            return None;
+        }
+        let joined_ms = reconcile::member_joined_at(&self.storage, channel_id, wallet)?.saturating_mul(1000);
+        let first_join = self
+            .storage
+            .membership_index_state(channel_id, wallet)
+            .ok()
+            .flatten()?
+            .rows
+            .iter()
+            .filter(|(ty, _, _)| *ty == crate::messages::types::MessageType::ChannelJoin as u8)
+            .map(|(_, ts, _)| *ts)
+            .min()?;
+        let overlap_ms = self.private_channel_sync_config.catchup_overlap_hours.saturating_mul(3_600_000);
+        Some(private_channel_sync::PrivateChannelSyncCursor {
+            after_lamport_ts: joined_ms.min(first_join).saturating_sub(overlap_ms),
+            after_msg_id: [0u8; 32],
+        })
+    }
+
+    /// Where a new private-channel-sync session for `(wallet, channel_id)`
+    /// starts (l2-node 0.149.0, plan §6): reads and validates the persisted
+    /// resume row and applies `private_channel_sync::plan_resume`. The seed
+    /// is `None` when the resume cursor is off (`resume_ttl_hours = 0`):
+    /// nothing is read or written and every session starts fresh.
+    fn plan_private_channel_sync_start(
+        &self,
+        wallet: &str,
+        channel_id: u64,
+        force_fresh: bool,
+    ) -> (private_channel_sync::ResumeStart, Option<private_channel_sync::ResumeSeed>) {
+        let ttl_hours = self.private_channel_sync_config.resume_ttl_hours;
+        if ttl_hours == 0 {
+            return (private_channel_sync::ResumeStart::Fresh, None);
+        }
+        let now = now_ms();
+        if force_fresh {
+            let (start, seed) = private_channel_sync::fresh_start(now);
+            return (start, Some(seed));
+        }
+        let row = self
+            .storage
+            .private_channel_sync_resume_raw(wallet, channel_id)
+            .and_then(|raw| {
+                let row = private_channel_sync::decode_resume_row(&raw, now);
+                if row.is_none() {
+                    debug!(%wallet, channel_id, "private-channel-sync: resume row does not validate; starting fresh");
+                }
+                row
+            });
+        let (start, seed) = private_channel_sync::plan_resume(
+            row.as_ref(),
+            now,
+            ttl_hours,
+            self.private_channel_sync_config.catchup_overlap_hours,
+            |p| self.swarm.is_connected(p),
+        );
+        (start, Some(seed))
+    }
+
+    /// Persist the resume row after an applied private-sync page (l2-node
+    /// 0.149.0, plan §6) — exactly one put. Skipped (nothing written) when
+    /// the wallet has no stake in the channel here any more (not a member,
+    /// no `LOCAL_CHANNEL_HOMES` / `LOCAL_CHANNEL_FED` row): a page that
+    /// arrives after a genuine leave or a purge must not leave an orphan
+    /// row behind, while a local home whose membership a stale replay
+    /// removed still runs its healing walk (from the first page each time;
+    /// its row is kept for when the membership is restored).
+    #[allow(clippy::too_many_arguments)]
+    fn persist_private_channel_sync_resume(
+        &self,
+        wallet: &str,
+        channel_id: u64,
+        peer: &PeerId,
+        session: &private_channel_sync::SyncSession,
+        step: &private_channel_sync::NextStep,
+        response: &private_channel_sync::PrivateChannelSyncResponse,
+        seed: &private_channel_sync::ResumeSeed,
+    ) {
+        if !matches!(self.storage.wallet_has_local_channel_standing(channel_id, wallet), Ok(true)) {
+            return;
+        }
+        let row = private_channel_sync::resume_row_after_page(session, step, response, seed, peer, now_ms());
+        self.write_private_channel_sync_resume(wallet, channel_id, &row);
+    }
+
+    /// Encode and store one resume row (errors are logged without the
+    /// wallet: the pair (wallet, private channel) is not logged above debug).
+    fn write_private_channel_sync_resume(
+        &self,
+        wallet: &str,
+        channel_id: u64,
+        row: &private_channel_sync::ResumeRow,
+    ) {
+        match serde_json::to_vec(row) {
+            Ok(bytes) => {
+                if let Err(e) = self.storage.put_private_channel_sync_resume(wallet, channel_id, &bytes) {
+                    warn!(channel_id, error = %e, "private-channel-sync: failed to persist the resume row");
+                }
+            }
+            Err(e) => warn!(channel_id, error = %e, "private-channel-sync: failed to encode the resume row"),
+        }
+    }
+
+    /// The stored unfinished walk of a same-peer RESUME session, if the
+    /// resume cursor is on and the row still describes one.
+    fn resumed_walk_row(&self, pending: &PrivateChannelSyncPending, now: u64) -> Option<private_channel_sync::ResumeRow> {
+        if !pending.same_peer_resume || pending.resume.is_none() {
+            return None;
+        }
+        self.storage
+            .private_channel_sync_resume_raw(&pending.wallet, pending.channel_id)
+            .and_then(|raw| private_channel_sync::decode_resume_row(&raw, now))
+            .filter(|row| row.phase.is_some())
+    }
+
+    /// The stored peer rejected a same-peer RESUME session's auth: clear the
+    /// stored walk's position, keeping its high-water mark, so the next
+    /// trigger fans out instead of asking the same peer again (audit S2).
+    fn abandon_private_channel_sync_walk(&self, pending: &PrivateChannelSyncPending) {
+        let now = now_ms();
+        let Some(row) = self.resumed_walk_row(pending, now) else { return };
+        debug!(channel_id = pending.channel_id, "private-channel-sync: resume peer rejected the walk; next session fans out");
+        let abandoned = private_channel_sync::resume_row_abandon_walk(&row, now);
+        self.write_private_channel_sync_resume(&pending.wallet, pending.channel_id, &abandoned);
+    }
+
+    /// A same-peer RESUME session ended (`server_capped`, a failed or timed
+    /// out request, or an early finish) — `session` is its state at that
+    /// point. Classified by `private_channel_sync::resume_session_outcome`:
+    /// a session that took a verified envelope is progress, a zero-envelope
+    /// cursor move is neutral, anything else is a STALL — counted, and the
+    /// walk is abandoned only after `MAX_RESUME_STALLS` consecutive stalls
+    /// (a peer whose budget is still refilling must not cost the walk its
+    /// position).
+    fn note_private_channel_sync_stall(
+        &self,
+        pending: &PrivateChannelSyncPending,
+        session: &private_channel_sync::SyncSession,
+    ) {
+        let Some(seed) = pending.resume.as_ref() else { return };
+        if private_channel_sync::resume_session_outcome(session, seed) != private_channel_sync::SessionOutcome::Stall {
+            return;
+        }
+        let now = now_ms();
+        let Some(row) = self.resumed_walk_row(pending, now) else { return };
+        let next = private_channel_sync::resume_row_after_stall(&row, now);
+        if next.phase.is_none() {
+            debug!(channel_id = pending.channel_id, stalls = private_channel_sync::MAX_RESUME_STALLS, "private-channel-sync: resumed walk stalled repeatedly with its peer; next session fans out");
+        }
+        self.write_private_channel_sync_resume(&pending.wallet, pending.channel_id, &next);
     }
 
     /// Handle inbound + outbound private-channel-sync request-response
@@ -5472,11 +6092,22 @@ impl NetworkService {
                     None => return,
                 };
                 if response.auth_failed {
-                    warn!(peer = %peer, wallet = %pending.wallet, channel_id = pending.channel_id, "private-channel-sync: responder rejected our auth");
+                    debug!(peer = %peer, wallet = %pending.wallet, channel_id = pending.channel_id, "private-channel-sync: responder rejected our auth");
+                    self.abandon_private_channel_sync_walk(&pending);
+                    self.release_private_channel_sync_trigger_if_no_siblings(&pending.wallet, pending.channel_id);
+                    return;
+                }
+                // l2-node 0.149.0: the channel's local data is being purged
+                // (the session was dispatched before the purge started).
+                // Applying the page now would leave rows behind the purge
+                // cursor; drop it — nothing is lost, the channel is going.
+                if matches!(self.storage.private_channel_purge_in_progress(pending.channel_id), Ok(true)) {
+                    debug!(channel_id = pending.channel_id, "private-channel-sync: page dropped, local cleanup of the channel in progress");
                     self.release_private_channel_sync_trigger_if_no_siblings(&pending.wallet, pending.channel_id);
                     return;
                 }
                 if response.server_capped {
+                    self.note_private_channel_sync_stall(&pending, &pending.session);
                     self.release_private_channel_sync_trigger_if_no_siblings(&pending.wallet, pending.channel_id);
                     return;
                 }
@@ -5499,7 +6130,11 @@ impl NetworkService {
                     p.peer_id == peer || p.wallet != wallet || p.channel_id != channel_id
                 });
 
+                // Two-phase session state (round 4); the verified positions
+                // of this page are recorded into it below (l2-node 0.149.0).
+                let mut session = pending.session.clone();
                 let count = response.envelopes.len();
+                session.envelopes_seen = session.envelopes_seen.saturating_add(count);
                 let mut admitted = 0usize;
                 let mut accepted = 0usize;
                 let mut dropped = 0usize;
@@ -5527,11 +6162,15 @@ impl NetworkService {
                             RouteResult::Accepted { .. } => {
                                 admitted += 1;
                                 accepted += 1;
+                                // Stored and verified by THIS node: the only
+                                // source of the resume high-water mark.
+                                session.record_verified(response.meta_phase, env_bytes);
                             }
                             RouteResult::Duplicate => {
                                 admitted += 1;
                                 if duplicate_is_verified(&self.storage, env_bytes) {
                                     verified_dups += 1;
+                                    session.record_verified(response.meta_phase, env_bytes);
                                 } else {
                                     tainted = true;
                                 }
@@ -5552,9 +6191,13 @@ impl NetworkService {
                 // budgets, strictly advancing cursors, no metadata page
                 // after the chat phase started; completion only after the
                 // chat phase ends with >= 1 `Accepted` in the session.
-                let mut session = pending.session;
                 session.record_evidence(verified_dups, tainted);
                 let step = session.advance(&response, admitted, accepted);
+                // l2-node 0.149.0 (plan §6): persist the walk's position (or
+                // its finished high-water mark) — one put per applied page.
+                if let Some(seed) = pending.resume.as_ref() {
+                    self.persist_private_channel_sync_resume(&wallet, channel_id, &peer, &session, &step, &response, seed);
+                }
                 if matches!(step, private_channel_sync::NextStep::Finish { complete: false, .. })
                     && (response.has_more || response.meta_phase)
                 {
@@ -5571,7 +6214,9 @@ impl NetworkService {
                     bool,
                 )> = match step {
                     private_channel_sync::NextStep::MetaPage(c) => Some((None, Some(c), false)),
-                    private_channel_sync::NextStep::StartChat => Some((None, None, true)),
+                    // A catch-up enters chat at its seeded chat cursor
+                    // (`None` for an ordinary walk: the first chat page).
+                    private_channel_sync::NextStep::StartChat => Some(session.request_cursors()),
                     private_channel_sync::NextStep::ChatPage(c) => Some((Some(c), None, true)),
                     private_channel_sync::NextStep::Finish { complete, in_sync } => {
                         // Attempt throttle outcome (l2-node 0.141.0).
@@ -5584,6 +6229,7 @@ impl NetworkService {
                         // anything else keeps the backoff set at dispatch.
                         let throttle_key = (wallet.clone(), channel_id);
                         let now_instant = Instant::now();
+                        let finished_naturally = private_channel_sync::finished_naturally(&response);
                         if complete {
                             self.private_channel_sync_throttle.on_complete(&throttle_key);
                         } else if in_sync {
@@ -5594,9 +6240,16 @@ impl NetworkService {
                             );
                             self.counters.inc_private_sync_in_sync_outcomes();
                             debug!(%wallet, channel_id, verified_dups = session.verified_dups, "private-channel-sync: verified in sync (nothing new); rechecking later");
-                        } else if session.accepted_total > 0 {
+                        } else if session.accepted_total > pending.accepted_base {
+                            // THIS session admitted something new (the
+                            // walk's carried-over count does not count).
                             self.private_channel_sync_throttle
                                 .on_accepted_incomplete(throttle_key, now_instant);
+                        }
+                        if !finished_naturally {
+                            // A same-peer continuation that ended early: a
+                            // stall unless its cursors moved (round 2).
+                            self.note_private_channel_sync_stall(&pending, &session);
                         }
                         // Completion only after BOTH phases ended and the
                         // session admitted at least one genuinely NEW,
@@ -5656,8 +6309,16 @@ impl NetworkService {
                             wallet,
                             channel_id,
                             session,
+                            accepted_base: pending.accepted_base,
+                            resume: pending.resume,
+                            same_peer_resume: pending.same_peer_resume,
                         },
                     );
+                    // l2-node 0.149.0: the page may have changed membership.
+                    // The continuation is registered above, so the session
+                    // still counts as in flight and this can only
+                    // re-subscribe; an unsubscribe waits for the release.
+                    self.reconcile_channel_lifecycle(channel_id);
                     return;
                 }
                 self.release_private_channel_sync_trigger_if_no_siblings(&wallet, channel_id);
@@ -5665,6 +6326,7 @@ impl NetworkService {
             Event::OutboundFailure { peer, request_id, error, .. } => {
                 if let Some(p) = self.pending_private_channel_sync_requests.remove(&request_id) {
                     debug!(peer = %peer, wallet = %p.wallet, channel_id = p.channel_id, error = ?error, "private-channel-sync: outbound failed; siblings may succeed");
+                    self.note_private_channel_sync_stall(&p, &p.session);
                     self.release_private_channel_sync_trigger_if_no_siblings(&p.wallet, p.channel_id);
                 }
             }
@@ -9143,6 +9805,7 @@ mod backfill_throttle_tests {
             .put_cf(schema::cf::CHANNELS, &pcid.to_be_bytes(), br#"{"channel_type":2,"history_visibility":1}"#)
             .unwrap();
         let w = wallet();
+        svc.storage.add_channel_member(pcid, &w.addr, 1, "member").unwrap();
         svc.maybe_trigger_private_channel_sync(pcid, &w.addr, None, false);
         let key = (w.addr.clone(), pcid);
         assert!(svc.private_channel_sync_throttle.entry(&key).is_none(), "no stamp without a claim");
@@ -9240,6 +9903,7 @@ mod backfill_throttle_tests {
             .put_cf(schema::cf::CHANNELS, &pcid.to_be_bytes(), br#"{"channel_type":2,"history_visibility":1}"#)
             .unwrap();
         let w = wallet();
+        a.storage.add_channel_member(pcid, &w.addr, 1, "member").unwrap();
         let key = (w.addr.clone(), pcid);
         let claim = || private_channel_sync::WalletAuthClaim { timestamp: now_ms(), signature: vec![0; 64], device: None };
         let sent = |a: &NetworkService| a.pending_private_channel_sync_requests.len();
@@ -9314,6 +9978,7 @@ mod backfill_throttle_tests {
             .put_cf(schema::cf::CHANNELS, &pcid.to_be_bytes(), br#"{"channel_type":2,"history_visibility":1}"#)
             .unwrap();
         let w = wallet();
+        a.storage.add_channel_member(pcid, &w.addr, 1, "member").unwrap();
         a.storage
             .put_cf(
                 schema::cf::LOCAL_CHANNEL_FED,
@@ -9442,5 +10107,523 @@ mod backfill_throttle_tests {
         // Missing and undecodable.
         assert!(!duplicate_is_verified(&s, &chat(&c, T0 + 1)), "not stored");
         assert!(!duplicate_is_verified(&s, &[0xFF, 0x00, 0x01]), "undecodable");
+    }
+
+    // --- private-channel lifecycle (l2-node 0.149.0) -------------------
+
+    impl NetworkService {
+        /// `lifecycle_backstop` with the page reads run inline, until one
+        /// full rotation of the scan completed (tests).
+        fn lifecycle_backstop_sync(&mut self) {
+            self.lifecycle_backstop_tick();
+            loop {
+                let result = self
+                    .storage
+                    .private_channel_lifecycle_page(&self.lifecycle_scan_cursor, LIFECYCLE_BACKSTOP_PAGE)
+                    .map_err(|e| e.to_string());
+                self.lifecycle_scan_in_flight = true;
+                self.apply_lifecycle_scan_page(LifecycleScanPage { result });
+                if self.lifecycle_scan_cursor.is_empty() {
+                    return;
+                }
+            }
+        }
+    }
+
+    fn put_private_channel(s: &Storage, cid: u64) {
+        s.put_cf(schema::cf::CHANNELS, &cid.to_be_bytes(), br#"{"channel_type":2,"history_visibility":1}"#)
+            .unwrap();
+    }
+
+    fn put_lifecycle_row(s: &Storage, cid: u64) {
+        let row = br#"{"v":1,"state":"pending","since_ms":1,"deadline_ms":2,"reason":"no_local_member"}"#;
+        s.put_cf(schema::cf::PRIVATE_CHANNEL_LIFECYCLE, &cid.to_be_bytes(), row).unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_skips_private_channels_pending_cleanup_but_not_pinned_or_public() {
+        let (mut a, _d) = service().await;
+        let pending = (1u64 << 40) + 1;
+        let live = (1u64 << 40) + 2;
+        let pinned = (1u64 << 40) + 3;
+        assert!(a.storage.set_private_channel_policy(
+            crate::storage::channel_lifecycle::PrivateChannelPolicy::new(168, [pinned]),
+        ));
+        for cid in [pending, live, pinned] {
+            put_private_channel(&a.storage, cid);
+        }
+        a.storage.put_cf(schema::cf::CHANNELS, &CID.to_be_bytes(), br#"{"channel_type":0}"#).unwrap();
+        put_lifecycle_row(&a.storage, pending);
+        put_lifecycle_row(&a.storage, pinned);
+        // Even a (forged) row for a public id never blocks it.
+        put_lifecycle_row(&a.storage, CID);
+        let n = a.subscribe_stored_channels(&[pinned]);
+        assert_eq!(n, 3);
+        assert!(!a.topics.is_channel_subscribed(pending));
+        assert!(a.lifecycle_unsubscribed.contains(&pending));
+        for cid in [live, pinned, CID] {
+            assert!(a.topics.is_channel_subscribed(cid), "{cid} must be subscribed");
+            assert!(!a.lifecycle_unsubscribed.contains(&cid));
+        }
+    }
+
+    #[tokio::test]
+    async fn channel_rx_subscribe_respects_the_lifecycle_and_resubscribes_after_cancel() {
+        let (mut a, _d) = service().await;
+        let cid = (1u64 << 40) + 4;
+        put_private_channel(&a.storage, cid);
+        put_lifecycle_row(&a.storage, cid);
+        // Chain discovery / federate / create re-subscribe request: refused.
+        a.handle_channel_subscribe_request(cid);
+        assert!(!a.topics.is_channel_subscribed(cid));
+        assert!(a.lifecycle_unsubscribed.contains(&cid));
+        // Row cancelled (member returned) → the notifier-driven reconcile
+        // subscribes again and counts it.
+        a.storage.delete_cf(schema::cf::PRIVATE_CHANNEL_LIFECYCLE, &cid.to_be_bytes()).unwrap();
+        a.reconcile_channel_lifecycle(cid);
+        assert!(a.topics.is_channel_subscribed(cid));
+        assert!(!a.lifecycle_unsubscribed.contains(&cid));
+        assert_eq!(a.counters.private_channel_resubscribes.load(Ordering::Relaxed), 1);
+        // A plain subscribe request with no row behaves as before.
+        let other = (1u64 << 40) + 5;
+        put_private_channel(&a.storage, other);
+        a.handle_channel_subscribe_request(other);
+        assert!(a.topics.is_channel_subscribed(other));
+    }
+
+    #[tokio::test]
+    async fn reconcile_unsubscribes_but_never_public_or_pinned_and_backstop_converges() {
+        let (mut a, _d) = service().await;
+        let cid = (1u64 << 40) + 6;
+        let pinned = (1u64 << 40) + 7;
+        a.storage.set_private_channel_policy(
+            crate::storage::channel_lifecycle::PrivateChannelPolicy::new(168, [pinned]),
+        );
+        for c in [cid, pinned] {
+            put_private_channel(&a.storage, c);
+            a.subscribe_channel(c);
+            put_lifecycle_row(&a.storage, c);
+        }
+        a.subscribe_channel(CID);
+        put_lifecycle_row(&a.storage, CID);
+        a.lifecycle_backstop_sync();
+        assert!(!a.topics.is_channel_subscribed(cid), "no local member → unsubscribed");
+        assert!(a.topics.is_channel_subscribed(pinned), "pinned always subscribed");
+        assert!(a.topics.is_channel_subscribed(CID), "public id never touched");
+        assert_eq!(a.counters.private_channel_unsubscribes.load(Ordering::Relaxed), 1);
+        assert_eq!(a.counters.private_channels_pending.load(Ordering::Relaxed), 3);
+        // Idempotent.
+        a.lifecycle_backstop_sync();
+        assert_eq!(a.counters.private_channel_unsubscribes.load(Ordering::Relaxed), 1);
+        // The row disappears without a notification: the backstop re-subscribes.
+        a.storage.delete_cf(schema::cf::PRIVATE_CHANNEL_LIFECYCLE, &cid.to_be_bytes()).unwrap();
+        a.lifecycle_backstop_sync();
+        assert!(a.topics.is_channel_subscribed(cid));
+        assert_eq!(a.counters.private_channel_resubscribes.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn a_finished_purge_does_not_resubscribe_the_topic() {
+        let (mut a, _d) = service().await;
+        let cid = (1u64 << 40) + 10;
+        put_private_channel(&a.storage, cid);
+        a.subscribe_channel(cid);
+        put_lifecycle_row(&a.storage, cid);
+        a.reconcile_channel_lifecycle(cid);
+        assert!(!a.topics.is_channel_subscribed(cid));
+        // The purge reaper deleted the channel row, its data and finally the
+        // lifecycle row: the channel no longer exists here.
+        a.storage.delete_cf(schema::cf::CHANNELS, &cid.to_be_bytes()).unwrap();
+        a.storage.delete_cf(schema::cf::PRIVATE_CHANNEL_LIFECYCLE, &cid.to_be_bytes()).unwrap();
+        a.lifecycle_backstop_sync();
+        assert!(!a.topics.is_channel_subscribed(cid), "a purged channel stays unsubscribed");
+        assert!(!a.lifecycle_unsubscribed.contains(&cid));
+        assert_eq!(a.counters.private_channel_resubscribes.load(Ordering::Relaxed), 0);
+        // A later re-federation subscribes through `channel_rx` as usual.
+        put_private_channel(&a.storage, cid);
+        a.handle_channel_subscribe_request(cid);
+        assert!(a.topics.is_channel_subscribed(cid));
+    }
+
+    #[tokio::test]
+    async fn the_storage_notifier_reaches_the_service() {
+        let (mut a, _d) = service().await;
+        let mut rx = a.lifecycle_rx.take().expect("the first service owns the notifier");
+        let cid = (1u64 << 40) + 8;
+        put_private_channel(&a.storage, cid);
+        // Local data → a cleanup row is written (a bare id would get none).
+        a.storage
+            .put_cf(schema::cf::CHANNEL_MSGS, &schema::encode_channel_msg_key(cid, 5, &[7; 32]), &[])
+            .unwrap();
+        a.storage.tombstone_channel(cid, 1, None).unwrap();
+        assert_eq!(rx.try_recv().ok(), Some(cid), "a deleted private channel notifies");
+    }
+
+    /// Audit W4: the backstop tick never scans the lifecycle CF on the
+    /// event loop — a row nobody was notified about is converged by the
+    /// off-loop page read, whose result comes back over a channel.
+    #[tokio::test]
+    async fn the_backstop_reads_the_lifecycle_cf_off_the_event_loop() {
+        let (mut a, _d) = service().await;
+        let mut rx = a.lifecycle_scan_rx.take().expect("scan receiver");
+        let cid = (1u64 << 40) + 11;
+        put_private_channel(&a.storage, cid);
+        a.subscribe_channel(cid);
+        put_lifecycle_row(&a.storage, cid); // no notification
+        a.lifecycle_backstop();
+        assert!(a.topics.is_channel_subscribed(cid), "the tick itself did not scan");
+        assert!(a.lifecycle_scan_in_flight);
+        a.lifecycle_backstop(); // a second tick while the read runs: no second read
+        let page = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(200), rx.recv()).await.is_err(), "one read at a time");
+        a.apply_lifecycle_scan_page(page);
+        assert!(!a.topics.is_channel_subscribed(cid), "converged from the page");
+        assert!(a.lifecycle_unsubscribed.contains(&cid));
+        assert_eq!(a.counters.private_channels_pending.load(Ordering::Relaxed), 1, "rotation done → gauge");
+        assert!(!a.lifecycle_scan_in_flight);
+    }
+
+    /// Round-2 note: a page read that panics (or never runs) still reports
+    /// back, so the in-flight flag is cleared and the scan continues.
+    #[tokio::test]
+    async fn a_failed_backstop_page_read_clears_the_in_flight_flag() {
+        let (mut a, _d) = service().await;
+        let mut rx = a.lifecycle_scan_rx.take().expect("scan receiver");
+        let guard = LifecycleScanSendGuard(Some(a.lifecycle_scan_tx.clone()));
+        let joined = tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            panic!("simulated page-read panic");
+        })
+        .await;
+        assert!(joined.is_err(), "the task panicked");
+        let page = rx.try_recv().expect("an error page was delivered");
+        assert!(page.result.is_err());
+        a.lifecycle_scan_in_flight = true;
+        a.apply_lifecycle_scan_page(page);
+        assert!(!a.lifecycle_scan_in_flight);
+        // A normal send delivers exactly one page (no extra from Drop).
+        let mut g = LifecycleScanSendGuard(Some(a.lifecycle_scan_tx.clone()));
+        g.send(LifecycleScanPage { result: Ok((Vec::new(), None)) });
+        drop(g);
+        assert!(rx.try_recv().unwrap().result.is_ok());
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// Security round 2 B1: a healing walk (the wallet lost its membership
+    /// here, standing only through its home row) always starts FRESH from
+    /// the first page — a high-water catch-up could skip the re-join that
+    /// an old replayed kick removed.
+    #[tokio::test]
+    async fn a_healing_walk_ignores_the_high_water_mark() {
+        let (mut a, _da, _b, _db) = connected_pair().await;
+        let pcid = (1u64 << 40) + 36;
+        put_private_channel(&a.storage, pcid);
+        let w = wallet();
+        a.storage.add_channel_member(pcid, &w.addr, 1, "member").unwrap();
+        a.storage
+            .put_cf(schema::cf::LOCAL_CHANNEL_HOMES, &schema::encode_local_channel_home_key(pcid, &w.addr), &[0u8; 16])
+            .unwrap();
+        let mark = private_channel_sync::ResumeRow {
+            v: private_channel_sync::RESUME_ROW_VERSION,
+            phase: None,
+            meta_cursor: None,
+            chat_cursor: None,
+            meta_done: false,
+            accepted_total: 0,
+            sessions: 1,
+            peer: PeerId::random().to_string(),
+            updated_at: now_ms(),
+            hw: Some(private_channel_sync::ResumeHighWater {
+                meta: Some(reconcile::MetaCursor { tier: 1, ts: now_ms() - 1_000, msg_id: [1; 32] }),
+                chat: None,
+            }),
+            walk_hw: None,
+            stalls: 0,
+            fresh_walk_at: now_ms() - 1_000,
+            same_peer_sessions: 0,
+        };
+        a.storage.put_private_channel_sync_resume(&w.addr, pcid, &serde_json::to_vec(&mark).unwrap()).unwrap();
+        let key = (w.addr.clone(), pcid);
+        let claim = private_channel_sync::WalletAuthClaim { timestamp: now_ms(), signature: vec![0; 64], device: None };
+        // Control: a member catches up from the mark.
+        a.maybe_trigger_private_channel_sync(pcid, &w.addr, Some(claim.clone()), true);
+        let p = a.pending_private_channel_sync_requests.values().next().unwrap();
+        assert!(p.session.last_meta_cursor.is_some(), "member: catch-up");
+        a.pending_private_channel_sync_requests.clear();
+        a.private_channel_sync_throttle.on_complete(&key);
+        a.private_channel_sync_triggered.clear();
+        // The old kick lands: the healing walk requests metadata from the start.
+        a.storage.remove_channel_member_and_raise_epoch_floor(pcid, &w.addr).unwrap();
+        a.maybe_trigger_private_channel_sync(pcid, &w.addr, Some(claim), true);
+        let p = a.pending_private_channel_sync_requests.values().next().unwrap();
+        assert_eq!(p.session, private_channel_sync::SyncSession::default(), "fresh walk from page 1");
+        assert_eq!(p.session.request_cursors(), (None, None, false));
+        assert!(p.resume.as_ref().is_some_and(|s| s.sessions == 1 && s.fresh_walk_at > 0));
+    }
+
+    /// Round 4 W3: a ForwardOnly member's fanout start is floored at its own
+    /// earliest recorded join minus the overlap; without a recorded join
+    /// (or for FullHistory) there is no floor.
+    #[tokio::test]
+    async fn a_forward_only_member_starts_chat_at_its_join_floor() {
+        let (mut a, _da, _b, _db) = connected_pair().await;
+        let pcid = (1u64 << 40) + 37;
+        a.storage
+            .put_cf(schema::cf::CHANNELS, &pcid.to_be_bytes(), br#"{"channel_type":2,"history_visibility":0,"creator":"klv1c"}"#)
+            .unwrap();
+        let w = wallet();
+        let joined = now_ms() - 10 * 24 * 3_600_000;
+        a.storage.add_channel_member(pcid, &w.addr, joined + 5_000, "member").unwrap();
+        let key = (w.addr.clone(), pcid);
+        let claim = private_channel_sync::WalletAuthClaim { timestamp: now_ms(), signature: vec![0; 64], device: None };
+        // No recorded join: no floor.
+        a.maybe_trigger_private_channel_sync(pcid, &w.addr, Some(claim.clone()), true);
+        assert_eq!(a.pending_private_channel_sync_requests.values().next().unwrap().session.last_chat_cursor, None);
+        a.pending_private_channel_sync_requests.clear();
+        a.private_channel_sync_throttle.on_complete(&key);
+        a.private_channel_sync_triggered.clear();
+        // The signed join recorded in the membership index: floored.
+        a.storage
+            .index_membership_event(pcid, &w.addr, crate::storage::rocks::MembershipEvent::Join, joined, &[3; 32])
+            .unwrap();
+        a.maybe_trigger_private_channel_sync(pcid, &w.addr, Some(claim), true);
+        let p = a.pending_private_channel_sync_requests.values().next().unwrap();
+        let overlap = a.private_channel_sync_config.catchup_overlap_hours * 3_600_000;
+        assert_eq!(p.session.last_chat_cursor.as_ref().map(|c| c.after_lamport_ts), Some(joined - overlap));
+        assert_eq!(p.session.verified_chat_hw, None);
+    }
+
+    /// Security round 2 W-C: the backstop tick re-reads the unsubscribed set
+    /// in rotating batches of at most one page, not all of it per tick.
+    #[tokio::test]
+    async fn the_backstop_tick_rotates_over_a_large_unsubscribed_set() {
+        let (mut a, _d) = service().await;
+        let base = (1u64 << 40) + 10_000;
+        // Rows gone, channels gone: each reconcile drops the id from the set.
+        for i in 0..1_500u64 {
+            a.lifecycle_unsubscribed.insert(base + i);
+        }
+        a.lifecycle_backstop_tick();
+        assert_eq!(a.lifecycle_unsubscribed.len(), 1_500 - LIFECYCLE_BACKSTOP_PAGE, "one batch per tick");
+        assert!(a.lifecycle_unsubscribed.iter().all(|&c| c >= base + LIFECYCLE_BACKSTOP_PAGE as u64), "lowest ids first");
+        a.lifecycle_backstop_tick();
+        assert!(a.lifecycle_unsubscribed.is_empty(), "the rotation reached the rest");
+        assert_eq!(a.lifecycle_unsub_cursor, 0, "wrapped");
+    }
+
+    /// Audit W2: an OLD kick replayed after a federation removed a local
+    /// home's membership while its newer re-join is still withheld — the
+    /// healing walk must still be dispatched, and its progress persisted.
+    #[tokio::test]
+    async fn the_healing_sync_is_dispatched_for_a_local_home_that_lost_membership() {
+        use libp2p::request_response::{Event, Message};
+        let (mut a, _da, b, _db) = connected_pair().await;
+        let b_id = *b.swarm.local_peer_id();
+        let pcid = (1u64 << 40) + 35;
+        put_private_channel(&a.storage, pcid);
+        let w = wallet();
+        a.storage.add_channel_member(pcid, &w.addr, 1, "member").unwrap();
+        a.storage
+            .put_cf(schema::cf::LOCAL_CHANNEL_HOMES, &schema::encode_local_channel_home_key(pcid, &w.addr), &[0u8; 16])
+            .unwrap();
+        // The stale kick lands.
+        a.storage.remove_channel_member_and_raise_epoch_floor(pcid, &w.addr).unwrap();
+        assert!(!reconcile::is_channel_member(&a.storage, pcid, &w.addr));
+        let claim = private_channel_sync::WalletAuthClaim { timestamp: now_ms(), signature: vec![0; 64], device: None };
+        a.maybe_trigger_private_channel_sync(pcid, &w.addr, Some(claim), true);
+        assert_eq!(a.pending_private_channel_sync_requests.len(), 1, "healing walk dispatched");
+        let (&id, _) = a.pending_private_channel_sync_requests.iter().next().unwrap();
+        let page = private_channel_sync::PrivateChannelSyncResponse {
+            has_more: true,
+            server_capped: false,
+            meta_phase: true,
+            meta_has_more: true,
+            meta_next_cursor: Some(reconcile::MetaCursor { tier: 1, ts: now_ms() - 1_000, msg_id: [5; 32] }),
+            ..private_channel_sync::capped_response(pcid)
+        };
+        a.handle_private_channel_sync_event(Event::Message {
+            peer: b_id,
+            message: Message::Response { request_id: id, response: page },
+            connection_id: libp2p::swarm::ConnectionId::new_unchecked(0),
+        });
+        assert!(a.storage.private_channel_sync_resume_raw(&w.addr, pcid).is_some(), "its progress is persisted");
+        // A wallet with no stake at all is still never dispatched for.
+        let stranger = wallet();
+        let claim = private_channel_sync::WalletAuthClaim { timestamp: now_ms(), signature: vec![0; 64], device: None };
+        let before = a.pending_private_channel_sync_requests.len();
+        a.maybe_trigger_private_channel_sync(pcid, &stranger.addr, Some(claim), true);
+        assert_eq!(a.pending_private_channel_sync_requests.len(), before);
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_waits_for_an_in_flight_private_sync_session() {
+        let (mut a, _da, _b, _db) = connected_pair().await;
+        let pcid = (1u64 << 40) + 9;
+        put_private_channel(&a.storage, pcid);
+        a.subscribe_channel(pcid);
+        let w = wallet();
+        a.storage.add_channel_member(pcid, &w.addr, 1, "member").unwrap();
+        let claim = private_channel_sync::WalletAuthClaim { timestamp: now_ms(), signature: vec![0; 64], device: None };
+        a.maybe_trigger_private_channel_sync(pcid, &w.addr, Some(claim), true);
+        assert_eq!(a.pending_private_channel_sync_requests.len(), 1);
+        put_lifecycle_row(&a.storage, pcid);
+        a.reconcile_channel_lifecycle(pcid);
+        assert!(a.topics.is_channel_subscribed(pcid), "deferred while the session runs");
+        // Session ends (release path) → the deferred unsubscribe applies.
+        a.pending_private_channel_sync_requests.clear();
+        a.release_private_channel_sync_trigger_if_no_siblings(&w.addr, pcid);
+        assert!(!a.topics.is_channel_subscribed(pcid));
+        assert!(a.lifecycle_unsubscribed.contains(&pcid));
+    }
+
+    /// l2-node 0.149.0 (plan §6): a wallet that is no longer a member is
+    /// never dispatched for (no request, no throttle stamp).
+    #[tokio::test]
+    async fn private_sync_is_not_dispatched_for_a_non_member() {
+        let (mut a, _da, _b, _db) = connected_pair().await;
+        let pcid = (1u64 << 40) + 31;
+        put_private_channel(&a.storage, pcid);
+        let w = wallet();
+        let key = (w.addr.clone(), pcid);
+        let claim = private_channel_sync::WalletAuthClaim { timestamp: now_ms(), signature: vec![0; 64], device: None };
+        a.maybe_trigger_private_channel_sync(pcid, &w.addr, Some(claim.clone()), true);
+        assert!(a.pending_private_channel_sync_requests.is_empty(), "non-member: nothing sent");
+        assert!(a.private_channel_sync_throttle.entry(&key).is_none(), "and nothing stamped");
+        assert!(!a.private_channel_sync_triggered.contains(&key));
+        // Positive control: the same call once the wallet is a member.
+        a.storage.add_channel_member(pcid, &w.addr, 1, "member").unwrap();
+        a.maybe_trigger_private_channel_sync(pcid, &w.addr, Some(claim), true);
+        assert_eq!(a.pending_private_channel_sync_requests.len(), 1);
+    }
+
+    /// l2-node 0.149.0 (plan §6): the requester writes the resume row after
+    /// an applied page, a `server_capped` answer leaves it as it was, the
+    /// next session continues with ONE request to the same (connected)
+    /// peer from the stored cursor, and a row naming another peer is never
+    /// followed (fresh walk).
+    #[tokio::test]
+    async fn private_sync_persists_and_resumes_with_the_same_peer_only() {
+        use libp2p::request_response::{Event, Message};
+        let (mut a, _da, b, _db) = connected_pair().await;
+        let b_id = *b.swarm.local_peer_id();
+        let pcid = (1u64 << 40) + 33;
+        put_private_channel(&a.storage, pcid);
+        let w = wallet();
+        a.storage.add_channel_member(pcid, &w.addr, 1, "member").unwrap();
+        let key = (w.addr.clone(), pcid);
+        let claim = private_channel_sync::WalletAuthClaim { timestamp: now_ms(), signature: vec![0; 64], device: None };
+        a.maybe_trigger_private_channel_sync(pcid, &w.addr, Some(claim.clone()), true);
+        let (&id, pending) = a.pending_private_channel_sync_requests.iter().next().unwrap();
+        assert_eq!(pending.peer_id, b_id);
+        assert_eq!(pending.session, private_channel_sync::SyncSession::default(), "first walk starts fresh");
+        let respond = |a: &mut NetworkService, request_id, response| {
+            a.handle_private_channel_sync_event(Event::Message {
+                peer: b_id,
+                message: Message::Response { request_id, response },
+                connection_id: libp2p::swarm::ConnectionId::new_unchecked(0),
+            });
+        };
+        // A metadata page with more to come → row written, continuation sent.
+        let c1 = reconcile::MetaCursor { tier: 1, ts: now_ms() - 1_000, msg_id: [5; 32] };
+        let page = private_channel_sync::PrivateChannelSyncResponse {
+            has_more: true,
+            server_capped: false,
+            meta_phase: true,
+            meta_has_more: true,
+            meta_next_cursor: Some(c1.clone()),
+            ..private_channel_sync::capped_response(pcid)
+        };
+        respond(&mut a, id, page.clone());
+        let row = |a: &NetworkService| {
+            private_channel_sync::decode_resume_row(
+                &a.storage.private_channel_sync_resume_raw(&w.addr, pcid).expect("row written"),
+                now_ms(),
+            )
+            .expect("row validates")
+        };
+        let r = row(&a);
+        assert_eq!(r.phase, Some(private_channel_sync::ResumePhase::Meta));
+        assert_eq!(r.meta_cursor, Some(c1.clone()));
+        assert_eq!((r.peer.as_str(), r.sessions), (b_id.to_string().as_str(), 1));
+        // The continuation is capped (budget gone): the row is unchanged.
+        let (&id2, _) = a.pending_private_channel_sync_requests.iter().next().unwrap();
+        respond(&mut a, id2, private_channel_sync::capped_response(pcid));
+        assert_eq!(row(&a), r, "a refused page writes nothing");
+        assert!(a.pending_private_channel_sync_requests.is_empty());
+        // Next session (gate reopened): one request to the same peer, seeded.
+        a.private_channel_sync_throttle.on_complete(&key);
+        a.private_channel_sync_triggered.clear();
+        a.maybe_trigger_private_channel_sync(pcid, &w.addr, Some(claim.clone()), true);
+        assert_eq!(a.pending_private_channel_sync_requests.len(), 1);
+        let pending = a.pending_private_channel_sync_requests.values().next().unwrap();
+        assert_eq!(pending.peer_id, b_id);
+        assert_eq!(pending.session.last_meta_cursor, Some(c1));
+        assert_eq!(pending.resume.as_ref().map(|s| s.sessions), Some(2));
+        assert!(pending.same_peer_resume);
+        assert_eq!(a.counters.private_sync_resumed_sessions.load(Ordering::Relaxed), 1);
+        // Round 2: the stored peer refuses the continuation (budget still
+        // refilling): ONE stall, the walk and its position are kept.
+        let (&rid, _) = a.pending_private_channel_sync_requests.iter().next().unwrap();
+        respond(&mut a, rid, private_channel_sync::capped_response(pcid));
+        let kept = row(&a);
+        assert_eq!((kept.phase, kept.meta_cursor.clone(), kept.stalls), (r.phase, r.meta_cursor.clone(), 1));
+        // After the refill the next session resumes with the same peer; its
+        // page only moves the cursor (no envelope): neutral — the walk
+        // continues and the stall count is neither reset nor raised.
+        let redispatch = |a: &mut NetworkService| {
+            a.pending_private_channel_sync_requests.clear();
+            a.private_channel_sync_throttle.on_complete(&key);
+            a.private_channel_sync_triggered.clear();
+            a.maybe_trigger_private_channel_sync(pcid, &w.addr, Some(claim.clone()), true);
+            let (&id, p) = a.pending_private_channel_sync_requests.iter().next().unwrap();
+            (id, p.same_peer_resume)
+        };
+        let (rid, same) = redispatch(&mut a);
+        assert!(same, "walk kept → same-peer continuation");
+        let c2 = reconcile::MetaCursor { tier: 1, ts: now_ms() - 500, msg_id: [6; 32] };
+        let page2 = private_channel_sync::PrivateChannelSyncResponse {
+            meta_next_cursor: Some(c2.clone()),
+            ..page.clone()
+        };
+        respond(&mut a, rid, page2);
+        let advanced = row(&a);
+        assert_eq!((advanced.meta_cursor.clone(), advanced.stalls), (Some(c2), 1), "a bare cursor move is neutral");
+        // Its continuation finishes the walk naturally: phase cleared.
+        let (&cid2, _) = a.pending_private_channel_sync_requests.iter().next().unwrap();
+        let last_meta = private_channel_sync::PrivateChannelSyncResponse { meta_has_more: false, meta_next_cursor: None, ..page.clone() };
+        respond(&mut a, cid2, last_meta);
+        let (&cid3, _) = a.pending_private_channel_sync_requests.iter().next().unwrap();
+        let last_chat = private_channel_sync::PrivateChannelSyncResponse { server_capped: false, ..private_channel_sync::capped_response(pcid) };
+        respond(&mut a, cid3, last_chat);
+        assert_eq!(row(&a).phase, None, "walk completed after the refill");
+        // Three CONSECUTIVE stalls of a same-peer continuation → fanout.
+        a.storage
+            .put_private_channel_sync_resume(&w.addr, pcid, &serde_json::to_vec(&r).unwrap())
+            .unwrap();
+        for n in 1..=private_channel_sync::MAX_RESUME_STALLS {
+            let (rid, same) = redispatch(&mut a);
+            assert!(same, "stall {n}: still the same peer");
+            respond(&mut a, rid, private_channel_sync::capped_response(pcid));
+        }
+        assert_eq!(row(&a).phase, None, "walk abandoned after the stall cap");
+        let (_, same) = redispatch(&mut a);
+        assert!(!same, "next session fans out");
+        a.pending_private_channel_sync_requests.clear();
+        // A row naming a peer that is not connected is never followed.
+        let foreign = private_channel_sync::ResumeRow { peer: PeerId::random().to_string(), ..r };
+        a.storage
+            .put_private_channel_sync_resume(&w.addr, pcid, &serde_json::to_vec(&foreign).unwrap())
+            .unwrap();
+        a.pending_private_channel_sync_requests.clear();
+        a.private_channel_sync_throttle.on_complete(&key);
+        a.private_channel_sync_triggered.clear();
+        a.maybe_trigger_private_channel_sync(pcid, &w.addr, Some(claim), true);
+        let pending = a.pending_private_channel_sync_requests.values().next().unwrap();
+        assert_eq!(pending.session, private_channel_sync::SyncSession::default(), "no foreign cursor");
+        assert!(!pending.same_peer_resume, "a fanout continuation from our own (empty) position");
+        // 1 + the post-refill resume + three stalled resumes + the foreign
+        // row's fanout continuation (a resume of the walk, from our own
+        // position).
+        assert_eq!(a.counters.private_sync_resumed_sessions.load(Ordering::Relaxed), 6);
     }
 }

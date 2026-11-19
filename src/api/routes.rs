@@ -2304,6 +2304,102 @@ fn strip_channel_verification_fields(mut channel: serde_json::Value) -> serde_js
     channel
 }
 
+/// Record that the authenticated `wallet` uses this node for the private
+/// channel `channel_id` (private-channel lifecycle, l2-node 0.149.0 —
+/// `Storage::record_local_channel_home`). When that cancels a pending
+/// cleanup, the network task re-subscribes on the storage notifier and this
+/// asks it to backfill the gap (`private_channel_sync_tx`; the federate
+/// path sends its own trigger and passes `trigger_sync = false`). Never
+/// fails the request: a storage error only means no evidence was recorded
+/// (the lazy touch retries later).
+fn record_local_channel_home_for(state: &AppState, channel_id: u64, wallet: &str, trigger_sync: bool) {
+    if crate::messages::types::is_public_channel_id(channel_id) {
+        return;
+    }
+    match state
+        .storage
+        .record_local_channel_home(channel_id, wallet, crate::util::now_ms())
+    {
+        Ok(outcome) => {
+            if outcome.cancelled && trigger_sync {
+                let _ = state.private_channel_sync_tx.send(crate::network::PrivateChannelSyncTrigger {
+                    channel_id: Some(channel_id),
+                    wallet: wallet.to_string(),
+                    wallet_claim: None,
+                });
+            }
+        }
+        Err(e) => {
+            tracing::warn!(channel_id, error = %e, "private-channel lifecycle: recording local member evidence failed");
+        }
+    }
+}
+
+/// Private-channel lifecycle hook for an envelope a LOCAL client just
+/// submitted and the router `Accepted` (l2-node 0.149.0, plan §1): a
+/// `ChannelCreate`, `ChannelJoin`, `ChatMessage`, `ChatEdit` or
+/// `ChatReaction` whose resolved `author` IS the authenticated caller marks
+/// that wallet as a local member of the (private) channel. Lives in the API
+/// layer, not the router, because the submit paths do not require the
+/// envelope author to be the caller — evidence taken from someone else's
+/// replayed envelope would let anyone pin a channel on this node.
+/// `record_local_channel_home` itself requires private-channel membership.
+pub(crate) fn note_local_channel_activity(
+    state: &AppState,
+    raw_bytes: &[u8],
+    author: &str,
+    auth_wallet: &str,
+) {
+    use crate::messages::types::MessageType;
+    if author.is_empty() || author != auth_wallet {
+        return;
+    }
+    let Ok(envelope) = rmp_serde::from_slice::<crate::messages::envelope::Envelope>(raw_bytes) else {
+        return;
+    };
+    let channel_id = match envelope.msg_type {
+        MessageType::ChannelCreate => channel_id_for_resubscribe(&envelope),
+        MessageType::ChannelJoin
+        | MessageType::ChatMessage
+        | MessageType::ChatEdit
+        | MessageType::ChatReaction => gossip_channel_id(&envelope),
+        _ => None,
+    };
+    if let Some(cid) = channel_id {
+        record_local_channel_home_for(state, cid, auth_wallet, true);
+    }
+}
+
+/// Lazy touch (plan §1): a member reading a private channel through this
+/// node is a local member. Throttled per `(channel, wallet)` by
+/// `AppState::channel_home_touch`. Only ever called with the AUTHENTICATED
+/// caller after its membership was confirmed.
+fn touch_local_channel_home(state: &AppState, channel_id: u64, wallet: &str) {
+    use super::state::{CHANNEL_HOME_TOUCH_INTERVAL_MS, CHANNEL_HOME_TOUCH_MAX_ENTRIES};
+    if crate::messages::types::is_public_channel_id(channel_id) {
+        return;
+    }
+    let now = crate::util::now_ms();
+    {
+        let mut seen = state
+            .channel_home_touch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = (channel_id, wallet.to_string());
+        if seen
+            .get(&key)
+            .is_some_and(|&t| now.saturating_sub(t) < CHANNEL_HOME_TOUCH_INTERVAL_MS)
+        {
+            return;
+        }
+        if seen.len() >= CHANNEL_HOME_TOUCH_MAX_ENTRIES {
+            seen.clear();
+        }
+        seen.insert(key, now);
+    }
+    record_local_channel_home_for(state, channel_id, wallet, true);
+}
+
 fn is_private_channel(channel_meta: &serde_json::Value) -> bool {
     match channel_meta.get("channel_type") {
         Some(serde_json::Value::Number(n)) => n.as_u64() == Some(2),
@@ -2325,7 +2421,15 @@ fn check_channel_access(
     }
     let Some(addr) = caller else { return false };
     let member_key = crate::storage::schema::encode_channel_member_key(channel_id, addr);
-    state.storage.exists_cf(cf::CHANNEL_MEMBERS, &member_key).unwrap_or(false)
+    let is_member = state.storage.exists_cf(cf::CHANNEL_MEMBERS, &member_key).unwrap_or(false);
+    if is_member {
+        // Private-channel lifecycle (l2-node 0.149.0): `caller` is always
+        // the authenticated wallet here, so a member reading through this
+        // node is evidence it is a local member (safety net for legacy
+        // users and any missed hook; cancels a pending cleanup).
+        touch_local_channel_home(state, channel_id, addr);
+    }
+    is_member
 }
 
 /// Fetch channel metadata and check private channel access in one step.
@@ -3583,11 +3687,14 @@ pub async fn post_message(
             // ever runs — the broadened observed-author trigger only wires
             // into the live-gossip path (`handle_gossip_message`), where no
             // such auth-time trigger exists for a message's author.
-            author: _,
+            author,
             bot_commands_changed,
             key_status,
         } => {
             state.counters.inc_messages_stored();
+            // Private-channel lifecycle (l2-node 0.149.0): local evidence
+            // only when the caller authored the envelope itself.
+            note_local_channel_activity(&state, &raw_bytes, &author, &_auth_user.address);
 
             // Real-time GossipSub delivery outcome (B4 fix proper,
             // 0.48.4). `None` for messages with no gossip topic; set to
@@ -3709,7 +3816,10 @@ pub async fn create_channel(
     use crate::messages::router::RouteResult;
 
     match state.router.process_message(&body) {
-        RouteResult::Accepted { msg_id, .. } => {
+        RouteResult::Accepted { msg_id, author, .. } => {
+            // Private-channel lifecycle (l2-node 0.149.0): the creator
+            // creating through this node is a local member.
+            note_local_channel_activity(&state, &body, &author, &_auth_user.address);
             // Try to extract channel_id from the envelope payload
             let channel_id = rmp_serde::from_slice::<Envelope>(&body)
                 .ok()
@@ -4359,7 +4469,10 @@ fn federate_denial_response(reason: &str) -> axum::response::Response {
 
 /// `federate_channel`'s local preflight, in its fixed order (round-3 audit
 /// N-4): (1) invite base64/size → 400; (2) pre-fetch invite gate → 403 /
-/// 500; (3) per-wallet federation-slot cap → 429; (4) local channel row →
+/// 500; (2b) private-channel purge in progress → 503, only for a caller
+/// authorized to join (anyone else continues as for an unknown channel id,
+/// l2-node 0.149.0); (3) per-wallet federation-slot cap → 429; (4) local
+/// channel row →
 /// decision, a known NON-private channel → 400. None of these does any
 /// outbound work or touches the fetch permits/limiter. Returns the decoded
 /// invite and whether an outbound bootstrap fetch is needed.
@@ -4412,6 +4525,35 @@ fn federate_preflight(
     ) {
         tracing::debug!(channel_id, address = %caller, %reason, "federate: pre-fetch invite gate rejected");
         return Err(federate_denial_response(&reason));
+    }
+
+    // --- Private-channel purge in progress (l2-node 0.149.0) ---
+    // This node is deleting the channel's local data (its last local member
+    // left, or its creator deleted it). Re-federating now would race the
+    // remaining purge steps, so an AUTHORIZED joiner (the captured creator
+    // or wallets, or a valid invite against the captured creator) gets a
+    // transient 503; once the purge has finished the channel federates
+    // afresh. Anyone else falls through to exactly the path of any other
+    // UNKNOWN channel id (the purge already deleted the `CHANNELS` row): the
+    // bootstrap gate rejects a non-creator without an invite before
+    // anything is stored, and re-creation mid-purge is refused under the
+    // lock — so the endpoint is no oracle for an ongoing purge (security
+    // rounds 2/4, N1/W1). A read error falls through the same way.
+    if let Ok(Some(purging)) = storage.purging_lifecycle_row(channel_id) {
+        if router.federate_purging_caller_authorized(
+            channel_id,
+            caller,
+            now_ms,
+            invite_bytes.as_deref(),
+            purging.creator.as_deref(),
+            &purging.wallets,
+        ) {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "channel cleanup in progress, retry later",
+            )
+                .into_response());
+        }
     }
 
     // --- Per-wallet federation-slot cap (cheap, local) ---
@@ -4869,6 +5011,11 @@ pub async fn federate_channel(
         tracing::error!(channel_id, error = %e, "federate: storage error recording federation slot");
         return (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response();
     }
+    // Private-channel lifecycle (l2-node 0.149.0): the federating wallet is
+    // a local member (cancels a pending cleanup). Recorded BEFORE the
+    // subscribe request below, so the network task sees no lifecycle row
+    // and actually subscribes. The backfill trigger is sent further down.
+    record_local_channel_home_for(&state, channel_id, &caller, false);
 
     // Subscribe to the channel's gossip topic (reuses the chain-scanner subscribe
     // path) so its messages + key envelopes flow here live.
@@ -11745,6 +11892,42 @@ mod federate_limiter_tests {
     }
 
     #[test]
+    fn preflight_answers_503_while_the_channel_is_being_purged() {
+        let (r, s, _d) = preflight_node();
+        let now = now_unix_ms();
+        let status = |res: Result<(Option<Vec<u8>>, bool), axum::response::Response>| match res {
+            Ok((_, fetch)) => if fetch { 0 } else { 1 },
+            Err(resp) => resp.status().as_u16(),
+        };
+        let cid: u64 = (1 << 40) + 9;
+        let row = |state: &str| {
+            format!(r#"{{"v":1,"state":"{state}","since_ms":1,"deadline_ms":1,"reason":"no_local_member","phase":1}}"#)
+        };
+        let purging = r#"{"v":1,"state":"purging","since_ms":1,"deadline_ms":1,"reason":"no_local_member","phase":1,"wallets":["klv1home"],"creator":"klv1creator"}"#;
+        s.put_cf(cf::PRIVATE_CHANNEL_LIFECYCLE, &cid.to_be_bytes(), purging.as_bytes()).unwrap();
+        let res = federate_preflight(&r, &s, cid, "klv1creator", None, now);
+        assert_eq!(res.err().map(|e| e.status().as_u16()), Some(503), "even the creator waits");
+        let res = federate_preflight(&r, &s, cid, "klv1home", None, now);
+        assert_eq!(res.err().map(|e| e.status().as_u16()), Some(503), "a captured local member waits too");
+        // Security rounds 2/4 (N1/W1): an outsider learns nothing about the
+        // purge — exactly what the same caller gets for any other UNKNOWN id
+        // (the fetch path, where the bootstrap gate decides before storing).
+        let other_unknown: u64 = (1 << 40) + 10;
+        let unknown = status(federate_preflight(&r, &s, other_unknown, "klv1stranger", None, now));
+        assert_eq!(status(federate_preflight(&r, &s, cid, "klv1stranger", None, now)), unknown, "no purge oracle");
+        assert_eq!(unknown, 0);
+        // A pending (not yet purging) row does not block re-federation: the
+        // federating member is exactly the "member returns" case.
+        s.put_cf(cf::PRIVATE_CHANNEL_LIFECYCLE, &cid.to_be_bytes(), row("pending").as_bytes()).unwrap();
+        assert!(federate_preflight(&r, &s, cid, "klv1creator", None, now).is_ok());
+        // A forged purging row on a public id is ignored (400 as usual).
+        s.put_cf(cf::PRIVATE_CHANNEL_LIFECYCLE, &77u64.to_be_bytes(), row("purging").as_bytes()).unwrap();
+        put_row(&s, 77, 0);
+        let res = federate_preflight(&r, &s, 77, "klv1x", None, now);
+        assert_eq!(res.err().map(|e| e.status().as_u16()), Some(400));
+    }
+
+    #[test]
     fn known_channels_are_never_fetched() {
         let hosted_priv = serde_json::json!({"channel_type": 2, "creator": "klv1c"});
         let public = serde_json::json!({"channel_type": 0, "creator": "klv1c"});
@@ -11880,5 +12063,107 @@ mod enc_key_binding_tests {
         let bad = mark_enc_key_binding(serde_json::json!({ "enc_pub": "aa", "wallet_signature": "AAAA" }));
         assert_eq!(bad["bound"], false);
         assert!(bad.get("wallet_signature").is_none(), "malformed signature dropped");
+    }
+}
+
+#[cfg(test)]
+mod local_channel_activity_tests {
+    //! Private-channel lifecycle evidence from the API layer (l2-node 0.149.0).
+    use super::*;
+    use crate::messages::envelope::Envelope;
+    use crate::messages::router::MessageRouter;
+    use crate::messages::types::{ChannelJoinPayload, MessageType, PRIVATE_CHANNEL_ID_FLOOR};
+    use crate::storage::identity::IdentityResolver;
+    use crate::storage::rocks::Storage;
+    use crate::storage::schema;
+    use tempfile::TempDir;
+
+    const CID: u64 = PRIVATE_CHANNEL_ID_FLOOR + 31;
+
+    fn state() -> (AppState, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let identity = IdentityResolver::new(storage.clone());
+        let router = MessageRouter::new(
+            storage.clone(),
+            identity.clone(),
+            None,
+            "testnet".to_string(),
+            usize::MAX,
+            Arc::new(crate::metrics::counters::NetworkCounters::new()),
+            crate::config::RateLimitsConfig::default(),
+        );
+        let s = AppState::new(
+            storage, router, "n".into(), "testnet".into(), String::new(), String::new(), None, identity, None,
+            None, None,
+        );
+        (s, dir)
+    }
+
+    fn join_bytes(cid: u64) -> Vec<u8> {
+        let env = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::ChannelJoin,
+            msg_id: [0u8; 32],
+            author: "klv1member".to_string(),
+            timestamp: 0,
+            lamport_ts: 0,
+            payload: rmp_serde::to_vec(&ChannelJoinPayload { channel_id: cid, invite: None }).unwrap(),
+            signature: Vec::new(),
+            relay_path: Vec::new(),
+        };
+        rmp_serde::to_vec(&env).unwrap()
+    }
+
+    fn setup(s: &AppState, cid: u64, ctype: u8) {
+        let meta = serde_json::json!({ "channel_id": cid, "channel_type": ctype, "creator": "klv1c" });
+        s.storage.put_cf(cf::CHANNELS, &cid.to_be_bytes(), meta.to_string().as_bytes()).unwrap();
+        s.storage.add_channel_member(cid, "klv1member", 1, "member").unwrap();
+    }
+
+    fn has_home(s: &AppState, cid: u64) -> bool {
+        s.storage
+            .exists_cf(cf::LOCAL_CHANNEL_HOMES, &schema::encode_local_channel_home_key(cid, "klv1member"))
+            .unwrap()
+    }
+
+    #[test]
+    fn only_the_authenticated_author_counts_as_local_evidence() {
+        let (s, _d) = state();
+        setup(&s, CID, 2);
+        // Someone else submitting (replaying) the member's envelope: nothing.
+        note_local_channel_activity(&s, &join_bytes(CID), "klv1member", "klv1someoneelse");
+        assert!(!has_home(&s, CID));
+        note_local_channel_activity(&s, &join_bytes(CID), "klv1member", "klv1member");
+        assert!(has_home(&s, CID));
+    }
+
+    #[test]
+    fn public_channels_never_get_local_evidence() {
+        let (s, _d) = state();
+        setup(&s, 5, 2); // legacy pre-floor row typed private
+        note_local_channel_activity(&s, &join_bytes(5), "klv1member", "klv1member");
+        assert!(!has_home(&s, 5));
+        touch_local_channel_home(&s, 5, "klv1member");
+        assert!(!has_home(&s, 5));
+    }
+
+    #[test]
+    fn lazy_touch_through_check_channel_access_cancels_and_triggers_a_backfill() {
+        let (mut s, _d) = state();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        s.private_channel_sync_tx = tx;
+        setup(&s, CID, 2);
+        // A pending cleanup row from an earlier "no local member" decision.
+        let row = br#"{"v":1,"state":"pending","since_ms":1,"deadline_ms":2,"reason":"no_local_member"}"#;
+        s.storage.put_cf(cf::PRIVATE_CHANNEL_LIFECYCLE, &CID.to_be_bytes(), row).unwrap();
+        let meta = serde_json::json!({ "channel_type": 2 });
+        assert!(!check_channel_access(&s, &meta, CID, Some("klv1stranger")));
+        assert!(s.storage.private_channel_lifecycle_row(CID).unwrap().is_some(), "a non-member never cancels");
+        assert!(check_channel_access(&s, &meta, CID, Some("klv1member")));
+        assert!(has_home(&s, CID));
+        assert!(s.storage.private_channel_lifecycle_row(CID).unwrap().is_none(), "the member's read cancelled it");
+        let trig = rx.try_recv().expect("gap backfill requested");
+        assert_eq!((trig.channel_id, trig.wallet.as_str()), (Some(CID), "klv1member"));
     }
 }

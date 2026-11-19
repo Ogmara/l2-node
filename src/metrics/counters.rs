@@ -41,6 +41,10 @@ pub struct NetworkCounters {
     pub reconcile_attempts_dispatched: AtomicU64,
     /// Private-channel-sync attempts actually dispatched (l2-node 0.141.0).
     pub private_sync_attempts_dispatched: AtomicU64,
+    /// Private-channel-sync sessions started from a persisted resume row
+    /// (same-peer continuation, fanout continuation of an unfinished walk,
+    /// or high-water catch-up; l2-node 0.149.0).
+    pub private_sync_resumed_sessions: AtomicU64,
     /// Public reconcile comparisons that ended IN_SYNC (verified nothing
     /// new — a throttle state, never a completion).
     pub reconcile_in_sync_outcomes: AtomicU64,
@@ -55,6 +59,23 @@ pub struct NetworkCounters {
     /// Budget refusals of a NEW key because the budget map was full (both
     /// protocols) — a flood indicator.
     pub backfill_budget_map_full_refusals: AtomicU64,
+    /// Private channels whose gossip topic this node dropped because no
+    /// local member is left (l2-node 0.149.0, private-channel lifecycle).
+    pub private_channel_unsubscribes: AtomicU64,
+    /// Private channels re-subscribed because a local member returned
+    /// (l2-node 0.149.0).
+    pub private_channel_resubscribes: AtomicU64,
+    /// GAUGE, not a total: private channels currently pending local cleanup
+    /// (understood `pending` `PRIVATE_CHANNEL_LIFECYCLE` rows only; purging
+    /// ones are not counted), refreshed each time the network task's
+    /// lifecycle backstop completes a full rotation (l2-node 0.149.0).
+    pub private_channels_pending: AtomicU64,
+    /// Private channels whose local data the purge reaper finished deleting
+    /// (l2-node 0.149.0, `storage::channel_purge`).
+    pub private_channels_purged: AtomicU64,
+    /// Rows the private-channel purge reaper deleted (index rows, message
+    /// envelopes and their side rows; l2-node 0.149.0).
+    pub private_channel_purge_rows: AtomicU64,
     /// Recent rejection reasons for dashboard display (last 50).
     pub recent_rejections: Mutex<VecDeque<RecentRejection>>,
 }
@@ -82,11 +103,17 @@ impl NetworkCounters {
             failed_signature_verifications: AtomicU64::new(0),
             reconcile_attempts_dispatched: AtomicU64::new(0),
             private_sync_attempts_dispatched: AtomicU64::new(0),
+            private_sync_resumed_sessions: AtomicU64::new(0),
             reconcile_in_sync_outcomes: AtomicU64::new(0),
             private_sync_in_sync_outcomes: AtomicU64::new(0),
             reconcile_budget_refusals: AtomicU64::new(0),
             private_sync_budget_refusals: AtomicU64::new(0),
             backfill_budget_map_full_refusals: AtomicU64::new(0),
+            private_channel_unsubscribes: AtomicU64::new(0),
+            private_channel_resubscribes: AtomicU64::new(0),
+            private_channels_pending: AtomicU64::new(0),
+            private_channels_purged: AtomicU64::new(0),
+            private_channel_purge_rows: AtomicU64::new(0),
             recent_rejections: Mutex::new(VecDeque::new()),
         }
     }
@@ -147,6 +174,11 @@ impl NetworkCounters {
         self.private_sync_attempts_dispatched.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Increment `private_sync_resumed_sessions` (l2-node 0.149.0).
+    pub fn inc_private_sync_resumed_sessions(&self) {
+        self.private_sync_resumed_sessions.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Increment `reconcile_in_sync_outcomes` (l2-node 0.141.0).
     pub fn inc_reconcile_in_sync_outcomes(&self) {
         self.reconcile_in_sync_outcomes.fetch_add(1, Ordering::Relaxed);
@@ -170,6 +202,28 @@ impl NetworkCounters {
     /// Increment `backfill_budget_map_full_refusals` (l2-node 0.141.0).
     pub fn inc_backfill_budget_map_full_refusals(&self) {
         self.backfill_budget_map_full_refusals.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment `private_channel_unsubscribes` (l2-node 0.149.0).
+    pub fn inc_private_channel_unsubscribes(&self) {
+        self.private_channel_unsubscribes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment `private_channel_resubscribes` (l2-node 0.149.0).
+    pub fn inc_private_channel_resubscribes(&self) {
+        self.private_channel_resubscribes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Set the `private_channels_pending` gauge (l2-node 0.149.0).
+    pub fn set_private_channels_pending(&self, n: u64) {
+        self.private_channels_pending.store(n, Ordering::Relaxed);
+    }
+
+    /// Add one pass of the private-channel purge reaper (l2-node 0.149.0):
+    /// `channels` finished, `rows` deleted.
+    pub fn add_private_channel_purge(&self, channels: u64, rows: u64) {
+        self.private_channels_purged.fetch_add(channels, Ordering::Relaxed);
+        self.private_channel_purge_rows.fetch_add(rows, Ordering::Relaxed);
     }
 
     /// Record a rejection with reason for dashboard display.
@@ -212,11 +266,17 @@ impl NetworkCounters {
             failed_signature_verifications: self.failed_signature_verifications.load(Ordering::Relaxed),
             reconcile_attempts_dispatched: self.reconcile_attempts_dispatched.load(Ordering::Relaxed),
             private_sync_attempts_dispatched: self.private_sync_attempts_dispatched.load(Ordering::Relaxed),
+            private_sync_resumed_sessions: self.private_sync_resumed_sessions.load(Ordering::Relaxed),
             reconcile_in_sync_outcomes: self.reconcile_in_sync_outcomes.load(Ordering::Relaxed),
             private_sync_in_sync_outcomes: self.private_sync_in_sync_outcomes.load(Ordering::Relaxed),
             reconcile_budget_refusals: self.reconcile_budget_refusals.load(Ordering::Relaxed),
             private_sync_budget_refusals: self.private_sync_budget_refusals.load(Ordering::Relaxed),
             backfill_budget_map_full_refusals: self.backfill_budget_map_full_refusals.load(Ordering::Relaxed),
+            private_channel_unsubscribes: self.private_channel_unsubscribes.load(Ordering::Relaxed),
+            private_channel_resubscribes: self.private_channel_resubscribes.load(Ordering::Relaxed),
+            private_channels_pending: self.private_channels_pending.load(Ordering::Relaxed),
+            private_channels_purged: self.private_channels_purged.load(Ordering::Relaxed),
+            private_channel_purge_rows: self.private_channel_purge_rows.load(Ordering::Relaxed),
         }
     }
 }
@@ -243,11 +303,18 @@ pub struct CounterSnapshot {
     pub failed_signature_verifications: u64,
     pub reconcile_attempts_dispatched: u64,
     pub private_sync_attempts_dispatched: u64,
+    pub private_sync_resumed_sessions: u64,
     pub reconcile_in_sync_outcomes: u64,
     pub private_sync_in_sync_outcomes: u64,
     pub reconcile_budget_refusals: u64,
     pub private_sync_budget_refusals: u64,
     pub backfill_budget_map_full_refusals: u64,
+    pub private_channel_unsubscribes: u64,
+    pub private_channel_resubscribes: u64,
+    /// Gauge (current value, not a total).
+    pub private_channels_pending: u64,
+    pub private_channels_purged: u64,
+    pub private_channel_purge_rows: u64,
 }
 
 impl CounterSnapshot {

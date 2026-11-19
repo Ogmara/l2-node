@@ -67,19 +67,16 @@
 //! giving an effective skip budget of `5 * MAX_ENVELOPES_PER_RESPONSE`
 //! (1,000) rows before the session gives up. A channel whose requesting
 //! member joined after more than 1,000 earlier messages will abort
-//! before reaching anything it's entitled to see, and — since the cursor
-//! lives only in-memory on `PrivateChannelSyncPending`, never persisted —
-//! every later retry (sweep or re-federation) restarts from the channel's
-//! oldest message and burns the identical budget again, making zero
-//! cumulative progress. Same shape as `reconcile::build_response`'s own
-//! documented KNOWN LIMITATION (time-window filtering, not join-time
-//! filtering), just reached sooner here (`MAX_ENVELOPES_PER_RESPONSE =
-//! 200` vs reconcile's configurable, default-1000, cap). Not fixed in
-//! this pass — a real fix needs either a persisted per-(wallet, channel)
-//! cursor (surviving across retry attempts, not just within one) or not
-//! counting a "filtered but cursor-advancing" page as unproductive.
-//! Recorded rather than silently shipped past, per this project's audit-
-//! triage rules.
+//! before reaching anything it's entitled to see. Same shape as
+//! `reconcile::build_response`'s own documented KNOWN LIMITATION
+//! (time-window filtering, not join-time filtering), just reached sooner
+//! here (`MAX_ENVELOPES_PER_RESPONSE = 200` vs reconcile's configurable,
+//! default-1000, cap). **Mitigated in l2-node 0.149.0** by the persisted
+//! per-(wallet, channel) resume cursor (`PRIVATE_CHANNEL_SYNC_RESUME`, see
+//! "Persisted resume cursor" below): the stopped session's position
+//! survives, so the next session (same peer) continues past the skipped
+//! rows instead of restarting at the oldest message — progress accumulates
+//! 1,000 rows per session, bounded by `MAX_RESUME_SESSIONS` per walk.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -197,11 +194,17 @@ pub const META_RESERVE: usize = 64;
 // recheck after a verified in-sync session (`SyncSession::advance`'s
 // `in_sync`).
 //
-// **Recorded limitation (unchanged):** a channel whose single session
-// costs more than the burst (≈ 20,000 metadata + chat rows) still cannot
-// complete against one responder — every session restarts from the first
-// page (no persisted cursor), so it hits the same wall each time; the
-// requester then tries its other fanout peers.
+// A channel whose walk costs more than the burst (≈ 20,000 metadata + chat
+// rows) used to restart from the first page every session and never
+// complete against one responder. Since l2-node 0.149.0 the requester
+// persists its position (`PRIVATE_CHANNEL_SYNC_RESUME`, "Persisted resume
+// cursor" below) and continues with the same peer after the budget
+// refills. Remaining bound: a walk is abandoned (fresh start) after
+// `MAX_RESUME_SESSIONS` sessions or `resume_ttl_hours` without progress,
+// so with the default budget (20k burst, 5k/h refill) and one responder a
+// walk that needs more than 50 budget-limited sessions (very roughly
+// 100,000–250,000 rows, depending on how often the retry backoff lets a
+// session start) still cannot finish.
 //
 // (No constant: the burst and refill are config, `PrivateChannelSyncConfig`.)
 
@@ -911,6 +914,18 @@ pub struct SyncSession {
     /// envelope reusing a known msg_id). A tainted session can still be
     /// COMPLETE (that only needs `Accepted`) but never `in_sync`.
     pub tainted: bool,
+    /// Highest `(tier, timestamp, msg_id)` of a METADATA envelope this node
+    /// verified and stored during the walk (`Accepted`, or a `Duplicate`
+    /// byte-identical to the stored copy) — `record_verified`. The only
+    /// source of the resume row's metadata high-water mark (l2-node
+    /// 0.149.0); never a responder's cursor.
+    pub verified_meta_hw: Option<MetaCursor>,
+    /// The same for the chat phase: highest `(timestamp, msg_id)` of a
+    /// verified, stored `ChatMessage` (the key order of `CHANNEL_MSGS`).
+    pub verified_chat_hw: Option<PrivateChannelSyncCursor>,
+    /// Envelopes received by THIS session (all pages, verified or not) —
+    /// for the stall classification (`resume_session_outcome`).
+    pub envelopes_seen: usize,
 }
 
 impl SyncSession {
@@ -1008,6 +1023,40 @@ impl SyncSession {
         self.tainted |= tainted;
     }
 
+    /// Record one envelope of a page with `meta_phase` that THIS node
+    /// verified and stored (`Accepted`, or a byte-verified `Duplicate`) as a
+    /// high-water candidate of its phase: a metadata type on a metadata page
+    /// (position `(replay tier, timestamp, msg_id)`, the metadata cursor
+    /// order), a `ChatMessage` on a chat page (`(timestamp, msg_id)`, the
+    /// `CHANNEL_MSGS` key order). Anything else — ride-along edits/deletes,
+    /// legacy-page metadata, undecodable bytes — is not a position of the
+    /// phase's index and is ignored (a lower mark only re-walks more).
+    pub fn record_verified(&mut self, meta_phase: bool, env_bytes: &[u8]) {
+        use crate::messages::types::MessageType;
+        let Ok(env) = rmp_serde::from_slice::<crate::messages::envelope::Envelope>(env_bytes) else {
+            return;
+        };
+        if meta_phase {
+            let ty = env.msg_type_u8();
+            let Some(tier) = reconcile::META_REPLAY_TIERS.iter().position(|types| types.contains(&ty)) else {
+                return;
+            };
+            let pos = MetaCursor {
+                tier: u8::try_from(tier).unwrap_or(u8::MAX),
+                ts: env.timestamp,
+                msg_id: env.msg_id,
+            };
+            if self.verified_meta_hw.as_ref().is_none_or(|c| pos > *c) {
+                self.verified_meta_hw = Some(pos);
+            }
+        } else if matches!(env.msg_type, MessageType::ChatMessage) {
+            let pos = PrivateChannelSyncCursor { after_lamport_ts: env.timestamp, after_msg_id: env.msg_id };
+            if self.verified_chat_hw.as_ref().is_none_or(|c| pos > *c) {
+                self.verified_chat_hw = Some(pos);
+            }
+        }
+    }
+
     /// The in-sync conditions, checked at a natural end of the chat phase
     /// (`resp` is the final chat page): the chat phase really ended
     /// (`has_more == false` — a `has_more` page without a cursor does not
@@ -1035,6 +1084,574 @@ impl SyncSession {
 /// empty final chat page of an all-duplicate session.)
 pub fn is_empty_first_response(resp: &PrivateChannelSyncResponse, session: &SyncSession) -> bool {
     resp.envelopes.is_empty() && !resp.has_more && *session == SyncSession::default()
+}
+
+impl SyncSession {
+    /// Cursor fields of the NEXT request this session would send if it
+    /// were (re)started now: `(cursor, meta_cursor, meta_done)`. A session
+    /// in the chat phase asks for chat after its last chat cursor (`None` =
+    /// the first chat page); otherwise it asks for metadata after its last
+    /// metadata cursor. Used for a session seeded from a resume row
+    /// (l2-node 0.149.0) and for `StartChat` (a catch-up enters the chat
+    /// phase at its seeded chat cursor, not at the first chat row).
+    pub fn request_cursors(&self) -> (Option<PrivateChannelSyncCursor>, Option<MetaCursor>, bool) {
+        if self.in_chat {
+            (self.last_chat_cursor.clone(), None, true)
+        } else {
+            (None, self.last_meta_cursor.clone(), false)
+        }
+    }
+}
+
+/// `true` when a session that just returned `NextStep::Finish` reached the
+/// END of the responder's history: the final page is a chat page without
+/// `has_more`. A backstop or a protocol violation (a metadata page, or a
+/// chat page still claiming `has_more`) is not a natural end.
+pub fn finished_naturally(resp: &PrivateChannelSyncResponse) -> bool {
+    !resp.meta_phase && !resp.has_more
+}
+
+// --- Persisted resume cursor (l2-node 0.149.0, plan §6, owner decision D3) ---
+//
+// A `(wallet, channel)` walk whose cost exceeds the responder's burst used
+// to restart from the first page every session and never complete (see the
+// "Recorded limitation" above and the ForwardOnly limitation in the module
+// doc). The requester now persists its position after every applied page
+// (`PRIVATE_CHANNEL_SYNC_RESUME`, one put per page) and continues there:
+//
+// * An UNFINISHED walk (`phase` set) continues with the SAME peer that
+//   issued its cursors — one request to that peer while it is connected,
+//   for at most `MAX_SAME_PEER_SESSIONS` sessions in a row. A cursor is the
+//   responder's own claim; following it with the peer that made it adds no
+//   trust (that peer could already omit rows within one session), but it is
+//   never handed to another peer. Peer not connected, or the same-peer cap
+//   reached → a FANOUT continuation from this node's own verified position
+//   of the walk (`walk_hw`, see `session_from_walk`), never a peer cursor;
+//   the first responder becomes the new resume peer.
+// * A FINISHED walk (`phase` cleared — it completed or was verified in
+//   sync) leaves its high-water mark `hw`. The next catch-up starts at
+//   `hw` minus `catchup_overlap_hours`, with any peer: `hw` is this node's
+//   own record of where a finished walk ended, a position in the shared,
+//   signed-timestamp key order, not a peer continuation.
+// * Completion is judged on the CUMULATIVE `accepted_total` of the walk
+//   (all its sessions), so a walk that took several budget refills still
+//   completes.
+// * Bounds: a row older than `resume_ttl_hours` (since its last UPDATE —
+//   a stall never refreshes it) or with `MAX_RESUME_SESSIONS` sessions
+//   since its walk started is ignored and a fresh walk from the first page
+//   starts. A high-water CATCH-UP (after a finished walk) is replaced by a
+//   fresh walk once the last FRESH walk started more than
+//   `resume_ttl_hours` ago (`fresh_walk_at`, never refreshed by catch-ups
+//   or resumes), so rows a responder withheld before a mark are
+//   re-requested at least that often; an unfinished walk is never reset by
+//   it (its continuations are bounded by the `updated_at` TTL and
+//   `MAX_RESUME_SESSIONS`).
+//   A same-peer continuation is abandoned (next session fans out) when the
+//   stored peer rejects its auth, or after `MAX_RESUME_STALLS` consecutive
+//   STALLED sessions; a session that took at least one verified envelope
+//   resets that count, one that only moved the cursor over zero envelopes
+//   (ForwardOnly-skipped rows) is neutral, anything else is a stall. A peer
+//   can hold a walk with same-peer continuations for at most
+//   `MAX_SAME_PEER_SESSIONS` sessions in a row; after that the walk fans
+//   out from this node's own verified position. For a ForwardOnly channel
+//   every fanout start of a current member begins its chat phase no
+//   earlier than the member's own earliest known join minus
+//   `catchup_overlap_hours` (`apply_chat_floor`), so a long pre-join
+//   stretch the responder only skips is not re-walked by each fallback; a
+//   member whose join is not recorded locally, the creator, and healing
+//   walks get no floor (they may still re-walk such a stretch). `hw` and `walk_hw` come
+//   only from envelopes this node verified and stored. A healing walk for a
+//   wallet that is NOT a current member here always starts fresh (the
+//   requester decides that, `NetworkService::maybe_trigger_private_channel_
+//   sync`): the re-join it must recover may predate any mark.
+// * Everything read back is validated (`decode_resume_row`); a row that
+//   does not validate is treated as absent — never a panic, never a cursor
+//   used with another peer.
+// * Wire format unchanged: a resumed first request is an ordinary
+//   continuation request (`PrivateChannelSyncRequest::is_continuation`).
+
+/// On-disk format version of [`ResumeRow`]. A row with another version is
+/// treated as absent.
+pub const RESUME_ROW_VERSION: u8 = 1;
+/// Sessions per walk after which a resume row is ignored and a fresh walk
+/// starts (plan §6).
+pub const MAX_RESUME_SESSIONS: u32 = 50;
+/// Consecutive STALLED same-peer resume sessions ([`SessionOutcome::Stall`]:
+/// refused as `server_capped`, failed or timed out, or ended without taking
+/// a verified envelope and without a zero-envelope cursor move) after which
+/// the stored walk is abandoned and the next session fans out
+/// (`resume_row_after_stall`). A session that took a verified envelope
+/// resets the count; a zero-envelope cursor move leaves it unchanged.
+pub const MAX_RESUME_STALLS: u32 = 3;
+/// Same-peer resume sessions in a row after which an unfinished walk fans
+/// out from this node's own verified position instead (`session_from_walk`).
+pub const MAX_SAME_PEER_SESSIONS: u32 = 6;
+/// A stored row larger than this is corrupt (a real row is a few hundred
+/// bytes) and treated as absent without parsing it.
+pub const MAX_RESUME_ROW_BYTES: usize = 4096;
+
+/// Phase of an unfinished walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResumePhase {
+    /// Walking metadata (`meta_cursor` is where to continue).
+    Meta,
+    /// Walking chat (`chat_cursor` is where to continue; `None` = the
+    /// first chat page).
+    Chat,
+}
+
+/// High-water mark of the last finished walk: where its metadata and chat
+/// phases ended (`None` = that phase never needed a cursor).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResumeHighWater {
+    pub meta: Option<MetaCursor>,
+    pub chat: Option<PrivateChannelSyncCursor>,
+}
+
+/// One `PRIVATE_CHANNEL_SYNC_RESUME` row (JSON), keyed `wallet ‖ 0xFF ‖
+/// cid_be8` like `LOCAL_CHANNEL_FED`. Node-local, written only by the
+/// network task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResumeRow {
+    /// [`RESUME_ROW_VERSION`].
+    pub v: u8,
+    /// `Some` while a walk is unfinished; `None` after it finished.
+    pub phase: Option<ResumePhase>,
+    /// Next metadata cursor of the unfinished walk.
+    pub meta_cursor: Option<MetaCursor>,
+    /// Next chat cursor of the unfinished walk.
+    pub chat_cursor: Option<PrivateChannelSyncCursor>,
+    /// The unfinished walk is in its chat phase.
+    pub meta_done: bool,
+    /// `Accepted` envelopes over every session of the unfinished walk.
+    pub accepted_total: u64,
+    /// Sessions since the walk chain started (fresh walk = 1).
+    pub sessions: u32,
+    /// PeerId (string form) that issued the cursors.
+    pub peer: String,
+    /// Unix ms of the last write.
+    pub updated_at: u64,
+    /// High-water mark of the last finished walk.
+    pub hw: Option<ResumeHighWater>,
+    /// Highest positions of envelopes this node verified and stored during
+    /// the UNFINISHED walk (`SyncSession::verified_meta_hw` /
+    /// `verified_chat_hw`), carried across its sessions; folded into `hw`
+    /// when the walk finishes. `None` once the walk finished.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub walk_hw: Option<ResumeHighWater>,
+    /// Consecutive stalled same-peer resume sessions of the unfinished walk
+    /// (at most [`MAX_RESUME_STALLS`]; `0` after any cursor progress).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub stalls: u32,
+    /// Unix ms the last FRESH walk (from the first page) started; carried
+    /// unchanged by catch-ups and resumes. `0` (absent) = unknown → the
+    /// next catch-up is a fresh walk.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub fresh_walk_at: u64,
+    /// Same-peer resume sessions in a row of the unfinished walk (at most
+    /// [`MAX_SAME_PEER_SESSIONS`]; `0` after a fanout session).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub same_peer_sessions: u32,
+}
+
+fn is_zero_u64(n: &u64) -> bool {
+    *n == 0
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+/// The cursor fields of a session's next request (`SyncSession::
+/// request_cursors`): `(chat cursor, metadata cursor, meta_done)`.
+pub type RequestCursors = (Option<PrivateChannelSyncCursor>, Option<MetaCursor>, bool);
+
+/// What a new session for a `(wallet, channel)` pair starts from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResumeStart {
+    /// No usable row: a fresh walk from the first page (fanout).
+    Fresh,
+    /// Continue an unfinished walk with the peer that issued its cursors
+    /// (one request, `session` seeded from the row).
+    Resume { peer: libp2p::PeerId, session: SyncSession },
+    /// A catch-up from the last finished walk's high-water mark minus the
+    /// overlap (fanout, `session` seeded with the rewound cursors).
+    CatchUp { session: SyncSession },
+}
+
+/// Per-session resume context carried with the pending request: what the
+/// next row write needs that `SyncSession` does not hold.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResumeSeed {
+    /// Value of the row's `sessions` for this session.
+    pub sessions: u32,
+    /// High-water mark carried over from the row.
+    pub hw: Option<ResumeHighWater>,
+    /// The row's stall count (same-peer resume only; `0` otherwise).
+    pub stalls: u32,
+    /// The request cursors the session was seeded with.
+    pub start: RequestCursors,
+    /// `accepted_total` the session was seeded with (the walk's count from
+    /// earlier sessions): above it = this session accepted something.
+    pub start_accepted: usize,
+    /// The walk's last fresh start ([`ResumeRow::fresh_walk_at`]).
+    pub fresh_walk_at: u64,
+    /// Same-peer sessions in a row including this one (`0` for fanout).
+    pub same_peer_sessions: u32,
+}
+
+/// How a same-peer resume session ended, for the stall count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionOutcome {
+    /// It took at least one verified envelope (`Accepted`, or a `Duplicate`
+    /// byte-identical to the stored copy): the stall count resets.
+    Progress,
+    /// It received no envelope at all but its cursors moved (pages of
+    /// ForwardOnly-skipped rows): the stall count is left as it is.
+    Neutral,
+    /// Anything else (refused, failed, timed out, no cursor move, or only
+    /// unverifiable envelopes): one stall.
+    Stall,
+}
+
+/// Classify a session (`session` = its state when it ended, `seed` = what
+/// it was seeded with). See [`SessionOutcome`].
+pub fn resume_session_outcome(session: &SyncSession, seed: &ResumeSeed) -> SessionOutcome {
+    if session.accepted_total > seed.start_accepted || session.verified_dups > 0 {
+        SessionOutcome::Progress
+    } else if session.envelopes_seen == 0 && session.request_cursors() != seed.start {
+        SessionOutcome::Neutral
+    } else {
+        SessionOutcome::Stall
+    }
+}
+
+/// A fresh walk from the first page, started at `now_ms`.
+pub fn fresh_start(now_ms: u64) -> (ResumeStart, ResumeSeed) {
+    (ResumeStart::Fresh, ResumeSeed { sessions: 1, fresh_walk_at: now_ms, ..ResumeSeed::default() })
+}
+
+/// Highest acceptable timestamp in a stored cursor or row: a stored row
+/// never has one later than `now` plus the envelope drift window (synced
+/// envelopes are bounded to it).
+fn ts_ceiling(now_ms: u64) -> u64 {
+    now_ms.saturating_add(MAX_TIMESTAMP_DRIFT_MS)
+}
+
+/// Decode and validate a stored row. `None` (= no row) for anything that
+/// is not a well-formed row of this version: oversized bytes, bad JSON, an
+/// unparseable peer, a timestamp past `now` + drift, or a phase that
+/// contradicts its cursors.
+pub fn decode_resume_row(raw: &[u8], now_ms: u64) -> Option<ResumeRow> {
+    if raw.len() > MAX_RESUME_ROW_BYTES {
+        return None;
+    }
+    let row: ResumeRow = serde_json::from_slice(raw).ok()?;
+    if row.v != RESUME_ROW_VERSION
+        || row.peer.parse::<libp2p::PeerId>().is_err()
+        || row.stalls > MAX_RESUME_STALLS
+        || row.same_peer_sessions > MAX_SAME_PEER_SESSIONS
+    {
+        return None;
+    }
+    let ceiling = ts_ceiling(now_ms);
+    let meta_ok = |c: &Option<MetaCursor>| c.as_ref().is_none_or(|c| c.ts <= ceiling);
+    let chat_ok = |c: &Option<PrivateChannelSyncCursor>| c.as_ref().is_none_or(|c| c.after_lamport_ts <= ceiling);
+    if row.updated_at > ceiling
+        || row.fresh_walk_at > ceiling
+        || !meta_ok(&row.meta_cursor)
+        || !chat_ok(&row.chat_cursor)
+    {
+        return None;
+    }
+    for hw in [&row.hw, &row.walk_hw].into_iter().flatten() {
+        if !meta_ok(&hw.meta) || !chat_ok(&hw.chat) {
+            return None;
+        }
+    }
+    match row.phase {
+        // A metadata-phase row always has a cursor (one is written only
+        // after a page, and a final metadata page moves to chat).
+        Some(ResumePhase::Meta) if row.meta_done || row.meta_cursor.is_none() => None,
+        Some(ResumePhase::Chat) if !row.meta_done => None,
+        _ => Some(row),
+    }
+}
+
+/// Seed a session from an unfinished walk's row (same-peer continuation).
+fn session_from_row(row: &ResumeRow) -> SyncSession {
+    SyncSession {
+        in_chat: row.meta_done,
+        // The walk's metadata phase is done: counts as walked for the
+        // in-sync evidence (`is_in_sync_end`).
+        meta_pages: u32::from(row.meta_done),
+        accepted_total: usize::try_from(row.accepted_total).unwrap_or(usize::MAX),
+        last_meta_cursor: row.meta_cursor.clone(),
+        last_chat_cursor: row.chat_cursor.clone(),
+        verified_meta_hw: row.walk_hw.as_ref().and_then(|w| w.meta.clone()),
+        verified_chat_hw: row.walk_hw.as_ref().and_then(|w| w.chat.clone()),
+        ..SyncSession::default()
+    }
+}
+
+/// Seed a catch-up session: the high-water cursors moved back by
+/// `overlap_ms` (`msg_id` zeroed, so every row at or after the rewound
+/// timestamp is served again).
+fn session_from_high_water(hw: &ResumeHighWater, overlap_ms: u64) -> SyncSession {
+    SyncSession {
+        last_meta_cursor: hw.meta.as_ref().map(|c| MetaCursor {
+            tier: c.tier,
+            ts: c.ts.saturating_sub(overlap_ms),
+            msg_id: [0u8; 32],
+        }),
+        last_chat_cursor: hw.chat.as_ref().map(|c| PrivateChannelSyncCursor {
+            after_lamport_ts: c.after_lamport_ts.saturating_sub(overlap_ms),
+            after_msg_id: [0u8; 32],
+        }),
+        ..SyncSession::default()
+    }
+}
+
+/// Seed a FANOUT continuation of an unfinished walk from this node's own
+/// verified position (`walk_hw`), never a responder cursor: a walk past its
+/// metadata phase continues chat strictly after its newest verified chat
+/// row (the first chat page if none); a walk still in metadata continues
+/// after its newest verified metadata row (from the start if none). The
+/// walk's cumulative `Accepted` count is carried.
+fn session_from_walk(row: &ResumeRow) -> SyncSession {
+    let walk = row.walk_hw.clone().unwrap_or_default();
+    SyncSession {
+        in_chat: row.meta_done,
+        meta_pages: u32::from(row.meta_done),
+        accepted_total: usize::try_from(row.accepted_total).unwrap_or(usize::MAX),
+        last_meta_cursor: if row.meta_done { None } else { walk.meta.clone() },
+        last_chat_cursor: if row.meta_done { walk.chat.clone() } else { None },
+        verified_meta_hw: walk.meta,
+        verified_chat_hw: walk.chat,
+        ..SyncSession::default()
+    }
+}
+
+/// ForwardOnly chat floor (round 4, W3): start the chat phase no earlier
+/// than `floor` — raises the session's chat cursor to `floor` when it is
+/// lower (never lowers it). Only the request cursor moves: the verified
+/// positions (`verified_*_hw`, hence `walk_hw` / `hw`) are untouched. The
+/// caller derives `floor` from the requester's OWN stored membership and
+/// applies it only to fanout starts of a current member (never to a
+/// same-peer continuation or a healing walk).
+pub fn apply_chat_floor(session: &mut SyncSession, floor: PrivateChannelSyncCursor) {
+    if session.last_chat_cursor.as_ref().is_none_or(|c| *c < floor) {
+        session.last_chat_cursor = Some(floor);
+    }
+}
+
+/// Decide what a new session starts from (pure; see the section comment).
+/// `row` must already be validated (`decode_resume_row`); `ttl_hours == 0`
+/// (resume off) always starts fresh. `connected` says whether a peer is
+/// currently connected.
+pub fn plan_resume(
+    row: Option<&ResumeRow>,
+    now_ms: u64,
+    ttl_hours: u64,
+    overlap_hours: u64,
+    connected: impl Fn(&libp2p::PeerId) -> bool,
+) -> (ResumeStart, ResumeSeed) {
+    let fresh = fresh_start(now_ms);
+    let Some(row) = row else { return fresh };
+    let ttl_ms = ttl_hours.saturating_mul(3_600_000);
+    if ttl_hours == 0 || now_ms.saturating_sub(row.updated_at) >= ttl_ms || row.sessions >= MAX_RESUME_SESSIONS {
+        return fresh;
+    }
+    let seed = ResumeSeed {
+        sessions: row.sessions.saturating_add(1),
+        hw: row.hw.clone(),
+        fresh_walk_at: row.fresh_walk_at,
+        ..ResumeSeed::default()
+    };
+    if row.phase.is_some() && row.same_peer_sessions < MAX_SAME_PEER_SESSIONS {
+        if let Ok(peer) = row.peer.parse::<libp2p::PeerId>() {
+            if connected(&peer) {
+                let session = session_from_row(row);
+                let seed = ResumeSeed {
+                    stalls: row.stalls,
+                    start: session.request_cursors(),
+                    start_accepted: session.accepted_total,
+                    same_peer_sessions: row.same_peer_sessions.saturating_add(1),
+                    ..seed
+                };
+                return (ResumeStart::Resume { peer, session }, seed);
+            }
+        }
+    }
+    // An unfinished walk continues by fanout from its own verified
+    // position; it stays bounded by the `updated_at` TTL and
+    // `MAX_RESUME_SESSIONS` above (a long walk is never reset mid-way).
+    if row.phase.is_some() {
+        let session = session_from_walk(row);
+        let seed = ResumeSeed {
+            start: session.request_cursors(),
+            start_accepted: session.accepted_total,
+            ..seed
+        };
+        return (ResumeStart::CatchUp { session }, seed);
+    }
+    // A high-water catch-up rests on marks from earlier walks; once the
+    // last fresh walk is older than the TTL (or unknown), walk afresh.
+    if row.fresh_walk_at == 0 || now_ms.saturating_sub(row.fresh_walk_at) > ttl_ms {
+        return fresh;
+    }
+    match &row.hw {
+        Some(hw) if hw.meta.is_some() || hw.chat.is_some() => {
+            let session = session_from_high_water(hw, overlap_hours.saturating_mul(3_600_000));
+            let seed = ResumeSeed { start: session.request_cursors(), ..seed };
+            (ResumeStart::CatchUp { session }, seed)
+        }
+        _ => fresh,
+    }
+}
+
+/// The larger of two optional cursors (`None` is the smallest).
+fn max_cursor<T: Ord + Clone>(a: Option<&T>, b: Option<&T>) -> Option<T> {
+    std::cmp::max(a, b).cloned()
+}
+
+/// Clamp a high-water mark to `now`: a signed envelope timestamp past the
+/// present (inside the drift window) is never kept as this node's record.
+fn clamp_high_water(mut hw: ResumeHighWater, now_ms: u64) -> ResumeHighWater {
+    if let Some(c) = hw.meta.as_mut() {
+        c.ts = c.ts.min(now_ms);
+    }
+    if let Some(c) = hw.chat.as_mut() {
+        c.after_lamport_ts = c.after_lamport_ts.min(now_ms);
+    }
+    hw
+}
+
+/// The walk's verified positions so far (`None` when it verified nothing).
+fn session_walk_hw(session: &SyncSession) -> Option<ResumeHighWater> {
+    (session.verified_meta_hw.is_some() || session.verified_chat_hw.is_some()).then(|| ResumeHighWater {
+        meta: session.verified_meta_hw.clone(),
+        chat: session.verified_chat_hw.clone(),
+    })
+}
+
+/// The row to persist after an applied page (one put per page). `step` is
+/// what `SyncSession::advance` returned for that page and `resp` the page.
+///
+/// * Not finished, or finished at a backstop / protocol violation: the
+///   walk's progress (`phase` set, cursors, cumulative `accepted_total`,
+///   and its verified positions in `walk_hw`).
+/// * Finished naturally as COMPLETE or IN SYNC: `phase` cleared and the
+///   high-water mark raised to the highest position of an envelope THIS
+///   node verified and stored during the walk, per phase, clamped to `now`
+///   (never lowered — a catch-up that only re-read its overlap keeps the
+///   old mark). A responder's cursors (`next_cursor`, `meta_next_cursor`,
+///   the followed `last_*_cursor`) never move it: a hostile responder's
+///   empty final page claiming a position at `now` changes nothing.
+/// * Finished naturally otherwise (nothing new, but no verified evidence):
+///   `phase` cleared, the previous high-water mark kept.
+pub fn resume_row_after_page(
+    session: &SyncSession,
+    step: &NextStep,
+    resp: &PrivateChannelSyncResponse,
+    seed: &ResumeSeed,
+    peer: &libp2p::PeerId,
+    now_ms: u64,
+) -> ResumeRow {
+    let finished = match step {
+        NextStep::Finish { complete, in_sync } if finished_naturally(resp) => Some(*complete || *in_sync),
+        _ => None,
+    };
+    let Some(advance_hw) = finished else {
+        return ResumeRow {
+            v: RESUME_ROW_VERSION,
+            phase: Some(if session.in_chat { ResumePhase::Chat } else { ResumePhase::Meta }),
+            meta_cursor: session.last_meta_cursor.clone(),
+            chat_cursor: session.last_chat_cursor.clone(),
+            meta_done: session.in_chat,
+            accepted_total: u64::try_from(session.accepted_total).unwrap_or(u64::MAX),
+            sessions: seed.sessions,
+            peer: peer.to_string(),
+            updated_at: now_ms,
+            hw: seed.hw.clone(),
+            walk_hw: session_walk_hw(session),
+            // Only a verified envelope resets the stall count (a bare cursor
+            // move is neutral, `resume_session_outcome`).
+            stalls: if resume_session_outcome(session, seed) == SessionOutcome::Progress { 0 } else { seed.stalls },
+            fresh_walk_at: seed.fresh_walk_at,
+            same_peer_sessions: seed.same_peer_sessions,
+        };
+    };
+    let hw = match (advance_hw, session_walk_hw(session)) {
+        (true, Some(walk)) => {
+            let old = seed.hw.clone().unwrap_or_default();
+            let end = clamp_high_water(walk, now_ms);
+            Some(ResumeHighWater {
+                meta: max_cursor(old.meta.as_ref(), end.meta.as_ref()),
+                chat: max_cursor(old.chat.as_ref(), end.chat.as_ref()),
+            })
+        }
+        _ => seed.hw.clone(),
+    };
+    ResumeRow {
+        v: RESUME_ROW_VERSION,
+        phase: None,
+        meta_cursor: None,
+        chat_cursor: None,
+        meta_done: false,
+        accepted_total: 0,
+        sessions: seed.sessions,
+        peer: peer.to_string(),
+        updated_at: now_ms,
+        hw,
+        walk_hw: None,
+        stalls: 0,
+        fresh_walk_at: seed.fresh_walk_at,
+        same_peer_sessions: 0,
+    }
+}
+
+/// The row after a STALLED same-peer resume session (see
+/// [`MAX_RESUME_STALLS`]): the stall count goes up while the walk's
+/// position, cursors and mark are kept; at the cap the walk is abandoned
+/// (`resume_row_abandon_walk`) so the next session fans out. `updated_at`
+/// is NOT refreshed by a stall, so `resume_ttl_hours` still bounds how long
+/// a peer that never serves can hold the walk. A row without an unfinished
+/// walk is returned unchanged.
+pub fn resume_row_after_stall(row: &ResumeRow, now_ms: u64) -> ResumeRow {
+    if row.phase.is_none() {
+        return row.clone();
+    }
+    let stalls = row.stalls.saturating_add(1);
+    if stalls >= MAX_RESUME_STALLS {
+        return resume_row_abandon_walk(row, now_ms);
+    }
+    ResumeRow { stalls, ..row.clone() }
+}
+
+/// The row after the stored peer rejected a same-peer RESUME session's auth,
+/// or after [`MAX_RESUME_STALLS`] consecutive stalls: the unfinished walk is
+/// abandoned (`phase` and its cursors cleared) so the next trigger fans out
+/// (a catch-up from `hw`, or a fresh walk) instead of asking the same peer
+/// again. `hw` and the session count are kept.
+/// A row without an unfinished walk is returned unchanged.
+pub fn resume_row_abandon_walk(row: &ResumeRow, now_ms: u64) -> ResumeRow {
+    if row.phase.is_none() {
+        return row.clone();
+    }
+    ResumeRow {
+        phase: None,
+        meta_cursor: None,
+        chat_cursor: None,
+        meta_done: false,
+        accepted_total: 0,
+        updated_at: now_ms,
+        walk_hw: None,
+        stalls: 0,
+        same_peer_sessions: 0,
+        ..row.clone()
+    }
 }
 
 /// Sign a private-channel-sync request as the requesting node.
@@ -2444,6 +3061,7 @@ mod meta_paging_tests {
             assert!(resp.envelopes.len() <= MAX_ENVELOPES_PER_RESPONSE);
             tamper(&mut resp);
             let (mut admitted, mut accepted, mut verified_dups, mut tainted) = (0, 0, 0, false);
+            session.envelopes_seen += resp.envelopes.len();
             for env in &resp.envelopes {
                 if resp.meta_phase {
                     if let Ok(e) = rmp_serde::from_slice::<Envelope>(env) {
@@ -3184,6 +3802,716 @@ mod meta_paging_tests {
         // And a new requester reading a legacy response treats it as chat.
         let mut s = SyncSession::default();
         assert_eq!(s.advance(&r, 1, 1), NextStep::Finish { complete: true, in_sync: false });
+    }
+
+    // ---------------------------------------------------------------
+    // Persisted resume cursor (l2-node 0.149.0, plan §6 / §9).
+    // ---------------------------------------------------------------
+
+    /// "Now" for row validation: ten days after the fixtures.
+    const NOW: u64 = T0 + 10 * 24 * 3_600_000;
+    const HOUR: u64 = 3_600_000;
+
+    struct ResumeRun {
+        start: ResumeStart,
+        /// `None` = the responder's budget ran out (`server_capped`).
+        last: Option<NextStep>,
+        /// Cursor of the first CHAT request of this session.
+        first_chat_cursor: Option<Option<PrivateChannelSyncCursor>>,
+    }
+
+    /// ONE requester session, driven like the network loop with the resume
+    /// cursor: plan from the stored row (`peer` connected or not), seed the
+    /// session, then page until it finishes or the responder's `budget`
+    /// (units, charged like the real responder) runs out — a refused page
+    /// writes nothing. The row is rewritten after every applied page.
+    #[allow(clippy::too_many_arguments)]
+    fn resume_session(
+        rs: &Storage,
+        requester: &MessageRouter,
+        qs: &Storage,
+        wallet: &str,
+        peer: libp2p::PeerId,
+        connected: bool,
+        row: &mut Option<Vec<u8>>,
+        budget: &mut u64,
+        overlap_hours: u64,
+    ) -> ResumeRun {
+        resume_session_floored(rs, requester, qs, wallet, peer, connected, row, budget, overlap_hours, None)
+    }
+
+    /// `resume_session` with a ForwardOnly chat floor applied to fanout
+    /// starts, as the requester does for a current member.
+    #[allow(clippy::too_many_arguments)]
+    fn resume_session_floored(
+        rs: &Storage,
+        requester: &MessageRouter,
+        qs: &Storage,
+        wallet: &str,
+        peer: libp2p::PeerId,
+        connected: bool,
+        row: &mut Option<Vec<u8>>,
+        budget: &mut u64,
+        overlap_hours: u64,
+        floor: Option<PrivateChannelSyncCursor>,
+    ) -> ResumeRun {
+        let decoded = row.as_deref().and_then(|r| decode_resume_row(r, NOW));
+        let (start, seed) = plan_resume(decoded.as_ref(), NOW, 72, overlap_hours, |p| connected && *p == peer);
+        let mut session = match &start {
+            ResumeStart::Fresh => SyncSession::default(),
+            ResumeStart::Resume { session, .. } | ResumeStart::CatchUp { session } => session.clone(),
+        };
+        if let Some(f) = floor {
+            if !matches!(start, ResumeStart::Resume { .. }) {
+                apply_chat_floor(&mut session, f);
+            }
+        }
+        let (cursor, meta_cursor, meta_done) = session.request_cursors();
+        let mut req = PrivateChannelSyncRequest {
+            channel_id: CID,
+            wallet: wallet.into(),
+            requester_pubkey: vec![0; 32],
+            timestamp: 0,
+            signature: vec![0; 64],
+            max_age_secs: u64::MAX,
+            cursor,
+            wallet_claim: None,
+            meta_paging: true,
+            meta_cursor,
+            meta_done,
+        };
+        let mut first_chat_cursor = meta_done.then(|| req.cursor.clone());
+        for _ in 0..2000 {
+            if *budget == 0 {
+                return ResumeRun { start, last: None, first_chat_cursor };
+            }
+            let (resp, work) = build_response_metered(rs, &req, MAX_ENVELOPES_PER_RESPONSE, NOW / 1000, u64::MAX);
+            *budget = budget.saturating_sub(reconcile::budget_charge(resp.envelopes.len(), work));
+            let (mut admitted, mut accepted, mut verified_dups, mut tainted) = (0, 0, 0, false);
+            for env in &resp.envelopes {
+                match requester.process_synced_message(env) {
+                    RouteResult::Accepted { .. } => {
+                        admitted += 1;
+                        accepted += 1;
+                        session.record_verified(resp.meta_phase, env);
+                    }
+                    RouteResult::Duplicate => {
+                        admitted += 1;
+                        if crate::network::duplicate_is_verified(qs, env) {
+                            verified_dups += 1;
+                            session.record_verified(resp.meta_phase, env);
+                        } else {
+                            tainted = true;
+                        }
+                    }
+                    _ => tainted = true,
+                }
+            }
+            session.record_evidence(verified_dups, tainted);
+            let step = session.advance(&resp, admitted, accepted);
+            let new_row = resume_row_after_page(&session, &step, &resp, &seed, &peer, NOW);
+            *row = Some(serde_json::to_vec(&new_row).unwrap());
+            match step.clone() {
+                NextStep::MetaPage(c) => req.meta_cursor = Some(c),
+                NextStep::StartChat => {
+                    let (cursor, meta_cursor, meta_done) = session.request_cursors();
+                    req.cursor = cursor;
+                    req.meta_cursor = meta_cursor;
+                    req.meta_done = meta_done;
+                    first_chat_cursor.get_or_insert(req.cursor.clone());
+                }
+                NextStep::ChatPage(c) => req.cursor = Some(c),
+                NextStep::Finish { .. } => return ResumeRun { start, last: Some(step), first_chat_cursor },
+            }
+        }
+        panic!("session did not finish");
+    }
+
+    fn decoded(row: &Option<Vec<u8>>) -> ResumeRow {
+        decode_resume_row(row.as_deref().unwrap(), NOW).expect("stored row validates")
+    }
+
+    /// A channel with 250 extra members (two metadata pages) and `chats`
+    /// chat messages at `T0 + i` on the responder; the creator requests.
+    fn big_channel(chats: u64) -> (MessageRouter, Storage, TempDir, MessageRouter, Storage, TempDir, W) {
+        let (resp, rs, d1) = node();
+        let (reqr, qs, d2) = node();
+        let c = wallet();
+        setup_channel(&rs, &c.addr);
+        setup_channel(&qs, &c.addr);
+        for i in 0..250u64 {
+            feed(&resp, &join(&wallet(), T0 + i));
+        }
+        for i in 0..chats {
+            feed(&resp, &chat(&c, T0 + 1_000 + i));
+        }
+        (resp, rs, d1, reqr, qs, d2, c)
+    }
+
+    /// Plan §9: a walk that costs more than the responder's burst completes
+    /// across budget refills (scaled down: a 450-unit burst/refill against a
+    /// ~1,500-unit walk — the same shape as 20k burst + 5k/h against a
+    /// larger channel), and without the resume cursor it never does.
+    #[test]
+    fn a_walk_larger_than_the_burst_completes_across_refills() {
+        let (_resp, rs, _d1, reqr, qs, _d2, c) = big_channel(1_000);
+        let peer = libp2p::PeerId::random();
+        // Control: no persisted row (pre-0.149 behaviour) — every session
+        // restarts at the first page and hits the same wall.
+        {
+            let (_r2, qs2, _d3) = node();
+            setup_channel(&qs2, &c.addr);
+            let reqr2 = {
+                let identity = crate::storage::identity::IdentityResolver::new(qs2.clone());
+                MessageRouter::new(
+                    qs2.clone(), identity, None, "testnet".into(), usize::MAX,
+                    std::sync::Arc::new(crate::metrics::counters::NetworkCounters::new()),
+                    crate::config::RateLimitsConfig::default(),
+                )
+                .with_channel_verify_config(crate::config::ChannelVerifyConfig {
+                    private_join_proof_activation_ms: u64::MAX / 2,
+                    ..Default::default()
+                })
+            };
+            for _ in 0..10 {
+                let mut row = None;
+                let mut budget = 450;
+                let run = resume_session(&rs, &reqr2, &qs2, &c.addr, peer, true, &mut row, &mut budget, 24);
+                assert_eq!(run.last, None, "without a resume cursor the walk never gets past the burst");
+            }
+        }
+        let mut row = None;
+        let mut sessions = 0;
+        let last = loop {
+            sessions += 1;
+            assert!(sessions <= 20, "walk did not complete");
+            let mut budget = 450; // one refill per session
+            let run = resume_session(&rs, &reqr, &qs, &c.addr, peer, true, &mut row, &mut budget, 24);
+            if sessions > 1 {
+                // Same peer while it is connected, a fanout continuation from
+                // our own verified position after `MAX_SAME_PEER_SESSIONS`.
+                assert!(
+                    matches!(run.start, ResumeStart::Resume { .. } | ResumeStart::CatchUp { .. }),
+                    "a continuation, never a fresh restart"
+                );
+            }
+            if let Some(step) = run.last {
+                break step;
+            }
+            let r = decoded(&row);
+            assert!(r.phase.is_some(), "an unfinished walk keeps its position");
+            assert_eq!(r.peer, peer.to_string());
+        };
+        assert!(sessions > 2, "needed several refills ({sessions})");
+        assert_eq!(last, NextStep::Finish { complete: true, in_sync: false });
+        assert_eq!(rows(&qs, schema::cf::CHANNEL_MSGS).len(), 1_000, "every chat row arrived exactly once");
+        assert_converged(&rs, &qs);
+        let r = decoded(&row);
+        assert_eq!(r.phase, None, "finished: progress cleared");
+        assert_eq!(r.accepted_total, 0);
+        assert_eq!(r.sessions, sessions);
+        let hw = r.hw.expect("high-water mark recorded");
+        // The mark is the newest envelope THIS node verified and stored
+        // (never a responder cursor).
+        assert_eq!(hw.chat.map(|c| c.after_lamport_ts), Some(T0 + 1_000 + 999), "hw = newest verified chat");
+        assert!(hw.meta.is_some());
+    }
+
+    /// Plan §9: a catch-up starts at the high-water mark minus the overlap —
+    /// it picks up new rows and late rows inside the overlap, re-reads no
+    /// more than that, and never lowers the mark.
+    #[test]
+    fn a_catch_up_resumes_from_the_high_water_mark_minus_the_overlap() {
+        let (resp, rs, _d1, reqr, qs, _d2, c) = big_channel(450);
+        let peer = libp2p::PeerId::random();
+        let mut row = None;
+        let mut budget = u64::MAX;
+        let run = resume_session(&rs, &reqr, &qs, &c.addr, peer, true, &mut row, &mut budget, 24);
+        assert_eq!(run.start, ResumeStart::Fresh);
+        assert_eq!(run.last, Some(NextStep::Finish { complete: true, in_sync: false }));
+        let hw = decoded(&row).hw.unwrap().chat.unwrap().after_lamport_ts;
+        assert_eq!(hw, T0 + 1_000 + 449, "newest chat this node verified and stored");
+        // New history on the responder: a new row, a late row inside the
+        // 24 h overlap, and a late row older than the overlap.
+        let newer = T0 + 5 * HOUR;
+        feed(&resp, &chat(&c, newer));
+        feed(&resp, &chat(&c, hw - 2 * HOUR));
+        feed(&resp, &chat(&c, hw - 48 * HOUR));
+        // Any peer (the issuing one is gone): the mark is our own record.
+        let other = libp2p::PeerId::random();
+        let mut budget = u64::MAX;
+        let run = resume_session(&rs, &reqr, &qs, &c.addr, other, false, &mut row, &mut budget, 24);
+        assert!(matches!(run.start, ResumeStart::CatchUp { .. }));
+        assert_eq!(
+            run.first_chat_cursor,
+            Some(Some(PrivateChannelSyncCursor { after_lamport_ts: hw - 24 * HOUR, after_msg_id: [0; 32] })),
+            "chat restarts exactly overlap before the mark"
+        );
+        assert_eq!(run.last, Some(NextStep::Finish { complete: true, in_sync: false }));
+        let have = |ts: u64| {
+            rows(&qs, schema::cf::CHANNEL_MSGS).iter().any(|k| u64::from_be_bytes(k[8..16].try_into().unwrap()) == ts)
+        };
+        assert!(have(newer) && have(hw - 2 * HOUR), "new and in-overlap rows fetched");
+        assert!(!have(hw - 48 * HOUR), "rows older than the overlap are not re-walked");
+        let r = decoded(&row);
+        assert!(r.hw.clone().unwrap().chat.unwrap().after_lamport_ts >= hw, "mark never lowered by the overlap re-read");
+        assert_eq!(r.sessions, 2);
+        let mark = r.hw.unwrap().chat.unwrap().after_lamport_ts;
+        // A catch-up with nothing new is verified in sync and keeps the mark.
+        let mut budget = u64::MAX;
+        let run = resume_session(&rs, &reqr, &qs, &c.addr, other, false, &mut row, &mut budget, 24);
+        assert_eq!(run.last, Some(NextStep::Finish { complete: false, in_sync: true }));
+        assert_eq!(decoded(&row).hw.unwrap().chat.unwrap().after_lamport_ts, mark, "never lowered");
+    }
+
+    fn progress_row(peer: &libp2p::PeerId) -> ResumeRow {
+        ResumeRow {
+            v: RESUME_ROW_VERSION,
+            phase: Some(ResumePhase::Chat),
+            meta_cursor: Some(MetaCursor { tier: 1, ts: T0 + 5, msg_id: [7; 32] }),
+            chat_cursor: Some(PrivateChannelSyncCursor { after_lamport_ts: T0 + 500, after_msg_id: [9; 32] }),
+            meta_done: true,
+            accepted_total: 4_000,
+            sessions: 3,
+            peer: peer.to_string(),
+            updated_at: NOW - HOUR,
+            hw: None,
+            walk_hw: None,
+            stalls: 0,
+            fresh_walk_at: NOW - HOUR,
+            same_peer_sessions: 0,
+        }
+    }
+
+    #[test]
+    fn a_cursor_is_only_ever_used_with_the_peer_that_issued_it() {
+        let issuer = libp2p::PeerId::random();
+        let other = libp2p::PeerId::random();
+        let row = progress_row(&issuer);
+        // Issuer connected → one-peer continuation seeded from the row.
+        let (start, seed) = plan_resume(Some(&row), NOW, 72, 24, |p| *p == issuer);
+        let ResumeStart::Resume { peer, session } = start else { panic!("expected a continuation") };
+        assert_eq!(peer, issuer);
+        assert_eq!(session.request_cursors(), (row.chat_cursor.clone(), None, true));
+        assert_eq!(session.accepted_total, 4_000, "cumulative count carried");
+        assert_eq!(seed.sessions, 4);
+        // Issuer gone (only another peer connected) → a FANOUT continuation
+        // from this node's own verified position (none yet: the first chat
+        // page), never the issuer's cursor.
+        let (start, seed) = plan_resume(Some(&row), NOW, 72, 24, |p| *p == other);
+        let ResumeStart::CatchUp { session } = start else { panic!("expected a fanout continuation") };
+        assert_eq!(session.request_cursors(), (None, None, true), "no peer cursor");
+        assert_eq!(session.accepted_total, 4_000, "the walk's count carried");
+        assert_eq!((seed.same_peer_sessions, seed.start_accepted), (0, 4_000));
+        // With a verified position the continuation starts right after it.
+        let mine = PrivateChannelSyncCursor { after_lamport_ts: T0 + 400, after_msg_id: [4; 32] };
+        let walked = ResumeRow {
+            walk_hw: Some(ResumeHighWater { meta: None, chat: Some(mine.clone()) }),
+            ..progress_row(&issuer)
+        };
+        let ResumeStart::CatchUp { session } = plan_resume(Some(&walked), NOW, 72, 24, |p| *p == other).0 else {
+            panic!("expected a fanout continuation")
+        };
+        assert_eq!(session.request_cursors(), (Some(mine), None, true));
+        // A FINISHED walk with a high-water mark: a catch-up from the MARK.
+        let hw = ResumeHighWater {
+            meta: Some(MetaCursor { tier: 1, ts: T0 + 100 * HOUR, msg_id: [1; 32] }),
+            chat: Some(PrivateChannelSyncCursor { after_lamport_ts: T0 + 100 * HOUR, after_msg_id: [1; 32] }),
+        };
+        let row = ResumeRow { hw: Some(hw), phase: None, ..progress_row(&issuer) };
+        let (start, _) = plan_resume(Some(&row), NOW, 72, 24, |p| *p == other);
+        let ResumeStart::CatchUp { session } = start else { panic!("expected a catch-up") };
+        assert_eq!(session.accepted_total, 0);
+        assert_eq!(
+            session.request_cursors(),
+            (None, Some(MetaCursor { tier: 1, ts: T0 + 76 * HOUR, msg_id: [0; 32] }), false)
+        );
+        assert_eq!(session.last_chat_cursor.unwrap().after_lamport_ts, T0 + 76 * HOUR);
+        // The first responder of the fallback becomes the new resume peer.
+        let resp = PrivateChannelSyncResponse { has_more: true, ..capped_response(CID) };
+        let resp = PrivateChannelSyncResponse { server_capped: false, ..resp };
+        let s = SyncSession { in_chat: true, ..SyncSession::default() };
+        let written = resume_row_after_page(&s, &NextStep::StartChat, &resp, &ResumeSeed { sessions: 1, ..ResumeSeed::default() }, &other, NOW);
+        assert_eq!(written.peer, other.to_string());
+    }
+
+    #[test]
+    fn an_expired_row_or_one_at_the_session_cap_starts_fresh() {
+        let issuer = libp2p::PeerId::random();
+        let on = |p: &libp2p::PeerId| *p == issuer;
+        let at = |age: u64| ResumeRow { updated_at: NOW - age, ..progress_row(&issuer) };
+        assert!(matches!(plan_resume(Some(&at(71 * HOUR)), NOW, 72, 24, on).0, ResumeStart::Resume { .. }));
+        assert_eq!(plan_resume(Some(&at(72 * HOUR)), NOW, 72, 24, on).0, ResumeStart::Fresh, "TTL expired");
+        assert_eq!(plan_resume(Some(&at(0)), NOW, 0, 24, on).0, ResumeStart::Fresh, "resume off");
+        let capped = |n| ResumeRow { sessions: n, ..progress_row(&issuer) };
+        assert!(matches!(plan_resume(Some(&capped(49)), NOW, 72, 24, on).0, ResumeStart::Resume { .. }));
+        let (start, seed) = plan_resume(Some(&capped(MAX_RESUME_SESSIONS)), NOW, 72, 24, on);
+        assert_eq!(start, ResumeStart::Fresh, "session cap reached");
+        assert_eq!(seed.sessions, 1, "a fresh walk starts a new chain");
+        assert_eq!(plan_resume(None, NOW, 72, 24, on).0, ResumeStart::Fresh);
+    }
+
+    #[test]
+    fn corrupt_rows_are_treated_as_absent() {
+        let issuer = libp2p::PeerId::random();
+        let good = progress_row(&issuer);
+        let enc = |r: &ResumeRow| serde_json::to_vec(r).unwrap();
+        assert_eq!(decode_resume_row(&enc(&good), NOW), Some(good.clone()), "positive control");
+        let future = NOW + MAX_TIMESTAMP_DRIFT_MS + 1;
+        let bad: Vec<Vec<u8>> = vec![
+            b"not json".to_vec(),
+            b"{}".to_vec(),
+            vec![b' '; MAX_RESUME_ROW_BYTES + 1],
+            enc(&ResumeRow { v: 2, ..good.clone() }),
+            enc(&ResumeRow { peer: "not-a-peer".into(), ..good.clone() }),
+            enc(&ResumeRow { updated_at: future, ..good.clone() }),
+            enc(&ResumeRow {
+                chat_cursor: Some(PrivateChannelSyncCursor { after_lamport_ts: future, after_msg_id: [0; 32] }),
+                ..good.clone()
+            }),
+            enc(&ResumeRow {
+                hw: Some(ResumeHighWater {
+                    meta: Some(MetaCursor { tier: 1, ts: future, msg_id: [0; 32] }),
+                    chat: None,
+                }),
+                ..good.clone()
+            }),
+            enc(&ResumeRow {
+                walk_hw: Some(ResumeHighWater {
+                    meta: None,
+                    chat: Some(PrivateChannelSyncCursor { after_lamport_ts: future, after_msg_id: [0; 32] }),
+                }),
+                ..good.clone()
+            }),
+            enc(&ResumeRow { stalls: MAX_RESUME_STALLS + 1, ..good.clone() }),
+            enc(&ResumeRow { same_peer_sessions: MAX_SAME_PEER_SESSIONS + 1, ..good.clone() }),
+            enc(&ResumeRow { fresh_walk_at: future, ..good.clone() }),
+            enc(&ResumeRow { phase: Some(ResumePhase::Meta), meta_done: false, meta_cursor: None, ..good.clone() }),
+            enc(&ResumeRow { phase: Some(ResumePhase::Meta), ..good.clone() }),
+            enc(&ResumeRow { phase: Some(ResumePhase::Chat), meta_done: false, ..good.clone() }),
+        ];
+        for (i, raw) in bad.iter().enumerate() {
+            assert_eq!(decode_resume_row(raw, NOW), None, "case {i}");
+        }
+        // A corrupt row never yields a cursor: the session starts fresh.
+        let row = decode_resume_row(&bad[4], NOW);
+        assert_eq!(plan_resume(row.as_ref(), NOW, 72, 24, |_| true).0, ResumeStart::Fresh);
+    }
+
+    /// Audit S1: the high-water mark moves only to envelopes THIS node
+    /// verified and stored. A hostile responder that ends the walk with an
+    /// empty final page claiming a position at `now` moves nothing; an
+    /// honest accepted envelope does.
+    #[test]
+    fn a_responder_cursor_never_moves_the_high_water_mark() {
+        let peer = libp2p::PeerId::random();
+        let old = ResumeHighWater {
+            meta: Some(MetaCursor { tier: 1, ts: T0 + 3, msg_id: [3; 32] }),
+            chat: Some(PrivateChannelSyncCursor { after_lamport_ts: T0 + 10, after_msg_id: [3; 32] }),
+        };
+        let seed = ResumeSeed { sessions: 2, hw: Some(old.clone()), ..ResumeSeed::default() };
+        let at_now = PrivateChannelSyncCursor { after_lamport_ts: NOW, after_msg_id: [0xFF; 32] };
+        let hostile_final = PrivateChannelSyncResponse {
+            server_capped: false,
+            next_cursor: Some(at_now.clone()),
+            ..capped_response(CID)
+        };
+        // A walk whose carried-over count makes the end COMPLETE, and which
+        // even FOLLOWED hostile cursors up to `now`.
+        let mut s = SyncSession {
+            in_chat: true,
+            meta_pages: 1,
+            accepted_total: 7,
+            last_meta_cursor: Some(MetaCursor { tier: 1, ts: NOW, msg_id: [0xFF; 32] }),
+            last_chat_cursor: Some(at_now),
+            ..SyncSession::default()
+        };
+        let step = s.advance(&hostile_final, 0, 0);
+        assert_eq!(step, NextStep::Finish { complete: true, in_sync: false });
+        let row = resume_row_after_page(&s, &step, &hostile_final, &seed, &peer, NOW);
+        assert_eq!(row.phase, None);
+        assert_eq!(row.hw, Some(old.clone()), "responder cursors never move the mark");
+        // Honest: one accepted chat and one accepted metadata envelope.
+        let c = wallet();
+        let mut s = SyncSession { in_chat: false, accepted_total: 7, ..SyncSession::default() };
+        s.record_verified(true, &join(&c, T0 + 50));
+        s.record_verified(true, &chat(&c, T0 + 99)); // not a metadata type: ignored
+        s.record_verified(false, &chat(&c, T0 + 60));
+        s.record_verified(false, &join(&c, T0 + 70)); // not a chat row: ignored
+        s.record_verified(false, b"garbage");
+        let honest_final = PrivateChannelSyncResponse { server_capped: false, ..capped_response(CID) };
+        s.in_chat = true;
+        s.meta_pages = 1;
+        let step = s.advance(&honest_final, 1, 1);
+        let row = resume_row_after_page(&s, &step, &honest_final, &seed, &peer, NOW);
+        let hw = row.hw.unwrap();
+        assert_eq!(hw.chat.map(|c| c.after_lamport_ts), Some(T0 + 60));
+        assert_eq!(hw.meta.map(|c| (c.tier, c.ts)), Some((1, T0 + 50)));
+        // A verified envelope inside the future drift window is clamped.
+        let mut s = SyncSession { in_chat: true, meta_pages: 1, accepted_total: 1, ..SyncSession::default() };
+        s.record_verified(false, &chat(&c, NOW + 1_000));
+        let step = s.advance(&honest_final, 1, 1);
+        let row = resume_row_after_page(&s, &step, &honest_final, &seed, &peer, NOW);
+        assert_eq!(row.hw.unwrap().chat.map(|c| c.after_lamport_ts), Some(NOW));
+        // An unfinished walk carries its verified positions, and a session
+        // resumed from that row continues from them.
+        let mut s = SyncSession { in_chat: true, ..SyncSession::default() };
+        s.record_verified(false, &chat(&c, T0 + 80));
+        let more = PrivateChannelSyncResponse {
+            server_capped: false,
+            has_more: true,
+            next_cursor: Some(PrivateChannelSyncCursor { after_lamport_ts: T0 + 80, after_msg_id: [1; 32] }),
+            ..capped_response(CID)
+        };
+        let step = s.advance(&more, 1, 1);
+        let row = resume_row_after_page(&s, &step, &more, &seed, &peer, NOW);
+        assert_eq!(row.walk_hw.as_ref().and_then(|w| w.chat.as_ref()).map(|c| c.after_lamport_ts), Some(T0 + 80));
+        assert_eq!(row.hw, Some(old), "the mark itself moves only at a finish");
+        let (start, _) = plan_resume(Some(&row), NOW, 72, 24, |p| *p == peer);
+        let ResumeStart::Resume { session, .. } = start else { panic!("expected a continuation") };
+        assert_eq!(session.verified_chat_hw.map(|c| c.after_lamport_ts), Some(T0 + 80));
+    }
+
+    /// Round-2 audit: a same-peer walk survives refusals while the peer's
+    /// budget refills; only `MAX_RESUME_STALLS` CONSECUTIVE stalls abandon
+    /// it, and any cursor progress — even over pages that admitted nothing
+    /// new (ForwardOnly-skipped or duplicate rows) — resets the count.
+    #[test]
+    fn stalls_abandon_only_after_the_cap_and_verified_progress_resets_them() {
+        let issuer = libp2p::PeerId::random();
+        let on = |p: &libp2p::PeerId| *p == issuer;
+        let mut row = ResumeRow { hw: Some(ResumeHighWater::default()), ..progress_row(&issuer) };
+        for n in 1..MAX_RESUME_STALLS {
+            row = resume_row_after_stall(&row, NOW);
+            assert_eq!(row.stalls, n);
+            assert!(row.phase.is_some() && row.chat_cursor.is_some(), "walk kept");
+            assert_eq!(row.updated_at, NOW - HOUR, "a stall never refreshes the TTL");
+            assert!(decode_resume_row(&serde_json::to_vec(&row).unwrap(), NOW).is_some());
+            assert!(matches!(plan_resume(Some(&row), NOW, 72, 24, on).0, ResumeStart::Resume { .. }));
+        }
+        let abandoned = resume_row_after_stall(&row, NOW);
+        assert_eq!((abandoned.phase, abandoned.stalls), (None, 0), "third stall → fanout");
+        assert!(!matches!(plan_resume(Some(&abandoned), NOW, 72, 24, on).0, ResumeStart::Resume { .. }));
+
+        // A resumed session over skipped rows: an empty page whose cursor
+        // advances is progress — the count resets and the walk continues.
+        let stalled = ResumeRow { stalls: MAX_RESUME_STALLS - 1, ..progress_row(&issuer) };
+        let (start, seed) = plan_resume(Some(&stalled), NOW, 72, 24, on);
+        let ResumeStart::Resume { mut session, .. } = start else { panic!("expected a continuation") };
+        assert_eq!(seed.stalls, MAX_RESUME_STALLS - 1);
+        let skipped = PrivateChannelSyncResponse {
+            server_capped: false,
+            has_more: true,
+            next_cursor: Some(PrivateChannelSyncCursor { after_lamport_ts: T0 + 900, after_msg_id: [9; 32] }),
+            ..capped_response(CID)
+        };
+        let step = session.advance(&skipped, 0, 0);
+        assert!(matches!(step, NextStep::ChatPage(_)));
+        let after = resume_row_after_page(&session, &step, &skipped, &seed, &issuer, NOW);
+        assert_eq!(after.stalls, MAX_RESUME_STALLS - 1, "a zero-envelope cursor move is neutral");
+        assert_eq!(resume_session_outcome(&session, &seed), SessionOutcome::Neutral);
+        assert!(after.phase.is_some());
+        // A page with one verified envelope is progress: the count resets.
+        let mut verified = session.clone();
+        verified.envelopes_seen = 1;
+        verified.verified_dups = 1;
+        assert_eq!(resume_session_outcome(&verified, &seed), SessionOutcome::Progress);
+        let reset = resume_row_after_page(&verified, &step, &skipped, &seed, &issuer, NOW);
+        assert_eq!(reset.stalls, 0);
+        // Envelopes received but none verifiable: a stall.
+        let mut junk = session.clone();
+        junk.envelopes_seen = 3;
+        assert_eq!(resume_session_outcome(&junk, &seed), SessionOutcome::Stall);
+        // A page that does NOT move the cursor keeps the count.
+        let (_, seed) = plan_resume(Some(&stalled), NOW, 72, 24, on);
+        let unchanged = session_from_row(&stalled);
+        let same = resume_row_after_page(&unchanged, &NextStep::Finish { complete: false, in_sync: false }, &skipped, &seed, &issuer, NOW);
+        assert_eq!(same.stalls, MAX_RESUME_STALLS - 1);
+    }
+
+    /// Security round 2 W-A(b): zero-envelope cursor nudges (neutral for the
+    /// stall count) cannot hold a walk with one peer beyond
+    /// `MAX_SAME_PEER_SESSIONS`; after that it fans out from this node's own
+    /// verified position, never the peer's cursor.
+    #[test]
+    fn same_peer_continuations_are_capped() {
+        let issuer = libp2p::PeerId::random();
+        let on = |p: &libp2p::PeerId| *p == issuer;
+        let mut row = progress_row(&issuer);
+        let mut ts = T0 + 500;
+        for n in 1..=MAX_SAME_PEER_SESSIONS {
+            let (start, seed) = plan_resume(Some(&row), NOW, 72, 24, on);
+            let ResumeStart::Resume { mut session, .. } = start else { panic!("session {n}: expected a continuation") };
+            assert_eq!(seed.same_peer_sessions, n);
+            ts += 1;
+            let nudge = PrivateChannelSyncResponse {
+                server_capped: false,
+                has_more: true,
+                next_cursor: Some(PrivateChannelSyncCursor { after_lamport_ts: ts, after_msg_id: [0xEE; 32] }),
+                ..capped_response(CID)
+            };
+            let step = session.advance(&nudge, 0, 0);
+            row = resume_row_after_page(&session, &step, &nudge, &seed, &issuer, NOW);
+            assert_eq!(row.stalls, 0, "neutral");
+            assert_eq!(row.same_peer_sessions, n);
+        }
+        let (start, seed) = plan_resume(Some(&row), NOW, 72, 24, on);
+        let ResumeStart::CatchUp { session } = start else { panic!("expected the fanout fallback") };
+        assert_eq!(session.request_cursors(), (None, None, true), "not the peer's nudged cursor");
+        assert_eq!(seed.same_peer_sessions, 0);
+        // The fanout session's rows reset the counter.
+        let page = PrivateChannelSyncResponse { server_capped: false, has_more: true, ..capped_response(CID) };
+        let mut s = session.clone();
+        let step = s.advance(&page, 0, 0);
+        assert_eq!(resume_row_after_page(&s, &step, &page, &seed, &libp2p::PeerId::random(), NOW).same_peer_sessions, 0);
+    }
+
+    /// Security round 2 W-B: a catch-up or fanout continuation becomes a
+    /// FRESH walk once the last fresh walk started more than the TTL ago
+    /// (or is unknown); a fresh start records `fresh_walk_at`, catch-ups
+    /// and resumes carry it unchanged.
+    #[test]
+    fn a_stale_fresh_walk_forces_a_full_re_walk() {
+        let issuer = libp2p::PeerId::random();
+        let hw = ResumeHighWater {
+            meta: None,
+            chat: Some(PrivateChannelSyncCursor { after_lamport_ts: T0 + 100 * HOUR, after_msg_id: [1; 32] }),
+        };
+        let done = |fresh_walk_at| ResumeRow { phase: None, hw: Some(hw.clone()), fresh_walk_at, ..progress_row(&issuer) };
+        let off = |_: &libp2p::PeerId| false;
+        assert!(matches!(plan_resume(Some(&done(NOW - HOUR)), NOW, 72, 24, off).0, ResumeStart::CatchUp { .. }));
+        let (start, seed) = plan_resume(Some(&done(NOW - 73 * HOUR)), NOW, 72, 24, off);
+        assert_eq!(start, ResumeStart::Fresh, "last fresh walk older than the TTL");
+        assert_eq!(seed.fresh_walk_at, NOW, "a fresh start records its time");
+        assert_eq!(plan_resume(Some(&done(0)), NOW, 72, 24, off).0, ResumeStart::Fresh, "unknown → fresh");
+        // An UNFINISHED walk older than the TTL (but recently updated) is
+        // never reset: it continues by fanout from its own verified position.
+        let mine = PrivateChannelSyncCursor { after_lamport_ts: T0 + 400, after_msg_id: [4; 32] };
+        let long = ResumeRow {
+            fresh_walk_at: NOW - 100 * HOUR,
+            walk_hw: Some(ResumeHighWater { meta: None, chat: Some(mine.clone()) }),
+            ..progress_row(&issuer)
+        };
+        let (start, seed) = plan_resume(Some(&long), NOW, 72, 24, off);
+        let ResumeStart::CatchUp { mut session } = start else { panic!("expected the fanout continuation") };
+        assert_eq!(session.request_cursors(), (Some(mine), None, true));
+        // ... and completes: its final page finishes the walk naturally, and
+        // only then does the stale fresh start force the next walk fresh.
+        let last = PrivateChannelSyncResponse { server_capped: false, ..capped_response(CID) };
+        let step = session.advance(&last, 0, 0);
+        assert_eq!(step, NextStep::Finish { complete: true, in_sync: false }, "the walk's carried count completes it");
+        let done_row = resume_row_after_page(&session, &step, &last, &seed, &issuer, NOW);
+        assert_eq!(done_row.phase, None);
+        assert_eq!(plan_resume(Some(&done_row), NOW, 72, 24, off).0, ResumeStart::Fresh, "now the TTL applies");
+        // A catch-up carries the original fresh start.
+        let (_, seed) = plan_resume(Some(&done(NOW - HOUR)), NOW, 72, 24, off);
+        assert_eq!(seed.fresh_walk_at, NOW - HOUR);
+        let page = PrivateChannelSyncResponse { server_capped: false, ..capped_response(CID) };
+        let s = SyncSession { in_chat: true, meta_pages: 1, ..SyncSession::default() };
+        let written = resume_row_after_page(&s, &NextStep::Finish { complete: false, in_sync: false }, &page, &seed, &issuer, NOW);
+        assert_eq!(written.fresh_walk_at, NOW - HOUR, "not refreshed by a catch-up");
+    }
+
+    /// Round 4 W3: a ForwardOnly member who joined after a long pre-join
+    /// stretch (rows the responder only skips for it) completes within one
+    /// budget when its chat phase starts at its own join floor; without the
+    /// floor the same budget is spent skipping and the walk does not end.
+    #[test]
+    fn a_forward_only_member_after_a_long_pre_join_stretch_completes() {
+        let (resp, rs, _d1) = node();
+        let (reqr, qs, _d2) = node();
+        let c = wallet();
+        let j = wallet();
+        for s in [&rs, &qs] {
+            setup_channel(s, &c.addr);
+            let mut meta: serde_json::Value =
+                serde_json::from_slice(&s.get_cf(schema::cf::CHANNELS, &CID.to_be_bytes()).unwrap().unwrap()).unwrap();
+            meta["history_visibility"] = serde_json::json!(0); // ForwardOnly
+            s.put_cf(schema::cf::CHANNELS, &CID.to_be_bytes(), &serde_json::to_vec(&meta).unwrap()).unwrap();
+        }
+        for i in 0..2_000u64 {
+            feed(&resp, &chat(&c, T0 + i));
+        }
+        let joined = T0 + 10_000;
+        rs.add_channel_member(CID, &j.addr, joined, "member").unwrap();
+        qs.add_channel_member(CID, &j.addr, joined, "member").unwrap();
+        for i in 0..20u64 {
+            feed(&resp, &chat(&c, joined + 1_000 + i));
+        }
+        let peer = libp2p::PeerId::random();
+        // Control: no floor — the budget is spent skipping pre-join rows.
+        {
+            let (_r2, qs2, _d3) = node();
+            setup_channel(&qs2, &c.addr);
+            let reqr2 = {
+                let identity = crate::storage::identity::IdentityResolver::new(qs2.clone());
+                MessageRouter::new(
+                    qs2.clone(), identity, None, "testnet".into(), usize::MAX,
+                    std::sync::Arc::new(crate::metrics::counters::NetworkCounters::new()),
+                    crate::config::RateLimitsConfig::default(),
+                )
+                .with_channel_verify_config(crate::config::ChannelVerifyConfig {
+                    private_join_proof_activation_ms: u64::MAX / 2,
+                    ..Default::default()
+                })
+            };
+            let mut row = None;
+            let mut budget = 450;
+            let run = resume_session(&rs, &reqr2, &qs2, &j.addr, peer, true, &mut row, &mut budget, 24);
+            assert_eq!(run.last, None, "without the floor one budget does not get past the pre-join stretch");
+        }
+        let floor = PrivateChannelSyncCursor { after_lamport_ts: joined - 1_000, after_msg_id: [0; 32] };
+        let mut row = None;
+        let mut budget = 450;
+        let run = resume_session_floored(&rs, &reqr, &qs, &j.addr, peer, true, &mut row, &mut budget, 24, Some(floor.clone()));
+        assert_eq!(run.first_chat_cursor, Some(Some(floor)), "chat starts at the floor");
+        assert_eq!(run.last, Some(NextStep::Finish { complete: true, in_sync: false }));
+        assert_eq!(rows(&qs, schema::cf::CHANNEL_MSGS).len(), 20, "every post-join row arrived");
+        // The floor never moved the verified marks beyond what was stored.
+        let hw = decoded(&row).hw.unwrap();
+        assert_eq!(hw.chat.map(|c| c.after_lamport_ts), Some(joined + 1_000 + 19));
+    }
+
+    #[test]
+    fn the_chat_floor_only_raises_the_request_cursor() {
+        let low = PrivateChannelSyncCursor { after_lamport_ts: T0 + 5, after_msg_id: [0; 32] };
+        let high = PrivateChannelSyncCursor { after_lamport_ts: T0 + 50, after_msg_id: [0; 32] };
+        let mut s = SyncSession::default();
+        apply_chat_floor(&mut s, low.clone());
+        assert_eq!(s.last_chat_cursor, Some(low.clone()));
+        apply_chat_floor(&mut s, high.clone());
+        assert_eq!(s.last_chat_cursor, Some(high.clone()));
+        apply_chat_floor(&mut s, low);
+        assert_eq!(s.last_chat_cursor, Some(high), "never lowered");
+        assert_eq!((s.verified_chat_hw, s.verified_meta_hw), (None, None), "no verified mark from a floor");
+    }
+
+    /// Audit S2: abandoning a stalled same-peer walk clears its position
+    /// (the next trigger fans out) but keeps the mark and the session count.
+    #[test]
+    fn abandoning_a_walk_keeps_the_mark_and_falls_back_to_fanout() {
+        let issuer = libp2p::PeerId::random();
+        let hw = ResumeHighWater {
+            meta: None,
+            chat: Some(PrivateChannelSyncCursor { after_lamport_ts: T0 + 100 * HOUR, after_msg_id: [1; 32] }),
+        };
+        let row = ResumeRow { hw: Some(hw.clone()), ..progress_row(&issuer) };
+        let abandoned = resume_row_abandon_walk(&row, NOW);
+        assert_eq!(abandoned.phase, None);
+        assert_eq!((abandoned.meta_cursor.clone(), abandoned.chat_cursor.clone()), (None, None));
+        assert_eq!(abandoned.accepted_total, 0);
+        assert_eq!(abandoned.hw, Some(hw));
+        assert_eq!(abandoned.sessions, row.sessions);
+        assert!(decode_resume_row(&serde_json::to_vec(&abandoned).unwrap(), NOW).is_some());
+        // Even with the issuer connected, the next session is a catch-up
+        // (fanout), never another single request to it.
+        let (start, _) = plan_resume(Some(&abandoned), NOW, 72, 24, |p| *p == issuer);
+        assert!(matches!(start, ResumeStart::CatchUp { .. }));
+        // No mark: a fresh walk.
+        let bare = resume_row_abandon_walk(&progress_row(&issuer), NOW);
+        assert_eq!(plan_resume(Some(&bare), NOW, 72, 24, |p| *p == issuer).0, ResumeStart::Fresh);
+        // A row without an unfinished walk is left as it is.
+        assert_eq!(resume_row_abandon_walk(&abandoned, NOW + 5), abandoned);
     }
 }
 
