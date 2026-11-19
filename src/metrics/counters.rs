@@ -45,6 +45,14 @@ pub struct NetworkCounters {
     /// (same-peer continuation, fanout continuation of an unfinished walk,
     /// or high-water catch-up; l2-node 0.149.0).
     pub private_sync_resumed_sessions: AtomicU64,
+    /// Private-channel-sync triggers for a pair with no `LOCAL_CHANNEL_FED`
+    /// row skipped because no peer subscribes the channel's topic (the
+    /// no-host gate, l2-node 0.150.0) — no throttle state moved.
+    pub private_sync_skipped_no_host: AtomicU64,
+    /// `(wallet, channel)` pairs enumerated from the
+    /// `LOCAL_CHANNEL_HOMES_BY_WALLET` index by the claim refresh and the
+    /// HOMES retry sweep (l2-node 0.150.0).
+    pub private_sync_homes_pairs_evaluated: AtomicU64,
     /// Public reconcile comparisons that ended IN_SYNC (verified nothing
     /// new — a throttle state, never a completion).
     pub reconcile_in_sync_outcomes: AtomicU64,
@@ -104,6 +112,8 @@ impl NetworkCounters {
             reconcile_attempts_dispatched: AtomicU64::new(0),
             private_sync_attempts_dispatched: AtomicU64::new(0),
             private_sync_resumed_sessions: AtomicU64::new(0),
+            private_sync_skipped_no_host: AtomicU64::new(0),
+            private_sync_homes_pairs_evaluated: AtomicU64::new(0),
             reconcile_in_sync_outcomes: AtomicU64::new(0),
             private_sync_in_sync_outcomes: AtomicU64::new(0),
             reconcile_budget_refusals: AtomicU64::new(0),
@@ -177,6 +187,16 @@ impl NetworkCounters {
     /// Increment `private_sync_resumed_sessions` (l2-node 0.149.0).
     pub fn inc_private_sync_resumed_sessions(&self) {
         self.private_sync_resumed_sessions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment `private_sync_skipped_no_host` (l2-node 0.150.0).
+    pub fn inc_private_sync_skipped_no_host(&self) {
+        self.private_sync_skipped_no_host.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Add `n` to `private_sync_homes_pairs_evaluated` (l2-node 0.150.0).
+    pub fn add_private_sync_homes_pairs_evaluated(&self, n: u64) {
+        self.private_sync_homes_pairs_evaluated.fetch_add(n, Ordering::Relaxed);
     }
 
     /// Increment `reconcile_in_sync_outcomes` (l2-node 0.141.0).
@@ -267,6 +287,8 @@ impl NetworkCounters {
             reconcile_attempts_dispatched: self.reconcile_attempts_dispatched.load(Ordering::Relaxed),
             private_sync_attempts_dispatched: self.private_sync_attempts_dispatched.load(Ordering::Relaxed),
             private_sync_resumed_sessions: self.private_sync_resumed_sessions.load(Ordering::Relaxed),
+            private_sync_skipped_no_host: self.private_sync_skipped_no_host.load(Ordering::Relaxed),
+            private_sync_homes_pairs_evaluated: self.private_sync_homes_pairs_evaluated.load(Ordering::Relaxed),
             reconcile_in_sync_outcomes: self.reconcile_in_sync_outcomes.load(Ordering::Relaxed),
             private_sync_in_sync_outcomes: self.private_sync_in_sync_outcomes.load(Ordering::Relaxed),
             reconcile_budget_refusals: self.reconcile_budget_refusals.load(Ordering::Relaxed),
@@ -304,6 +326,8 @@ pub struct CounterSnapshot {
     pub reconcile_attempts_dispatched: u64,
     pub private_sync_attempts_dispatched: u64,
     pub private_sync_resumed_sessions: u64,
+    pub private_sync_skipped_no_host: u64,
+    pub private_sync_homes_pairs_evaluated: u64,
     pub reconcile_in_sync_outcomes: u64,
     pub private_sync_in_sync_outcomes: u64,
     pub reconcile_budget_refusals: u64,

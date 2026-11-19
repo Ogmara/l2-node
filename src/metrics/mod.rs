@@ -111,6 +111,12 @@ pub struct MetricsSnapshot {
     /// (same-peer continuation, fanout continuation of an unfinished walk,
     /// or high-water catch-up; l2-node 0.149.0).
     pub private_sync_resumed_sessions_total: u64,
+    /// Private-sync triggers for non-federated (`LOCAL_CHANNEL_HOMES`-only)
+    /// pairs skipped because no peer subscribes the channel (l2-node 0.150.0).
+    pub private_sync_skipped_no_host_total: u64,
+    /// `(wallet, channel)` pairs enumerated from the local-homes wallet index
+    /// by the claim refresh and the HOMES retry sweep (l2-node 0.150.0).
+    pub private_sync_homes_pairs_evaluated_total: u64,
     /// Public reconcile comparisons verified in sync (throttle state).
     pub reconcile_in_sync_total: u64,
     /// Private-channel-sync sessions verified in sync (throttle state).
@@ -403,6 +409,8 @@ impl MetricsCollector {
             reconcile_attempts_dispatched_total: counter_snap.reconcile_attempts_dispatched,
             private_sync_attempts_dispatched_total: counter_snap.private_sync_attempts_dispatched,
             private_sync_resumed_sessions_total: counter_snap.private_sync_resumed_sessions,
+            private_sync_skipped_no_host_total: counter_snap.private_sync_skipped_no_host,
+            private_sync_homes_pairs_evaluated_total: counter_snap.private_sync_homes_pairs_evaluated,
             reconcile_in_sync_total: counter_snap.reconcile_in_sync_outcomes,
             private_sync_in_sync_total: counter_snap.private_sync_in_sync_outcomes,
             reconcile_budget_refusals_total: counter_snap.reconcile_budget_refusals,

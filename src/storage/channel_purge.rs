@@ -269,7 +269,8 @@ fn prefix_cf_for(phase: u8) -> Option<&'static str> {
         p::CHANNEL_MEMBERSHIP_INDEX => cf::CHANNEL_MEMBERSHIP_INDEX,
         p::PRIVATE_CHANNEL_KEYS => cf::PRIVATE_CHANNEL_KEYS,
         p::PENDING_CHANNEL_MEMBER_REMOVALS => cf::PENDING_CHANNEL_MEMBER_REMOVALS,
-        p::LOCAL_CHANNEL_HOMES => cf::LOCAL_CHANNEL_HOMES,
+        // `LOCAL_CHANNEL_HOMES` has its own arm in `stage_purge_phase`
+        // (each row is deleted together with its wallet-index entry).
         _ => return None,
     })
 }
@@ -550,9 +551,10 @@ impl Storage {
         let mut batch = WriteBatch::default();
         if let Some(home) = home_key {
             if !self.exists_cf(cf::LOCAL_CHANNEL_HOMES, home)? {
-                let now = crate::util::now_ms();
-                let homes = self.cf_handle(cf::LOCAL_CHANNEL_HOMES)?;
-                batch.put_cf(&homes, home, encode_home(now, now));
+                if let Some(cid) = home.get(..8).and_then(|b| <[u8; 8]>::try_from(b).ok()) {
+                    let now = crate::util::now_ms();
+                    self.stage_home_put(&mut batch, u64::from_be_bytes(cid), &home[8..], &encode_home(now, now))?;
+                }
             }
         }
         self.stage_delete(&mut batch, cf::PRIVATE_CHANNEL_LIFECYCLE, &channel_id.to_be_bytes())?;
@@ -759,6 +761,19 @@ impl Storage {
                     acc.rows += self.stage_purge_wallet_channel_rows(batch, wallet, channel_id)?;
                 }
                 Ok((end < row.wallets.len()).then(|| (end as u64).to_be_bytes().to_vec()))
+            }
+            p::LOCAL_CHANNEL_HOMES => {
+                // Each HOMES row goes together with its
+                // `LOCAL_CHANNEL_HOMES_BY_WALLET` entry (two deletes per
+                // key), so half a page of keys per slice. Same cursor
+                // semantics as the generic prefix arm.
+                let half = (page / 2).max(1);
+                let rows = self.purge_scan(cf::LOCAL_CHANNEL_HOMES, &cid, cursor, half)?;
+                for (k, _) in &rows {
+                    self.stage_home_delete(batch, k)?;
+                    acc.rows += 2;
+                }
+                Ok(if rows.len() < half { None } else { rows.last().map(|(k, _)| k.clone()) })
             }
             phase => {
                 let Some(cf_name) = prefix_cf_for(phase) else {
@@ -999,7 +1014,7 @@ mod tests {
         s.add_channel_member(cid, "klv1b", 1, "member").unwrap();
         if !s.record_local_channel_home(cid, "klv1a", crate::util::now_ms()).unwrap().recorded {
             // A public id never gets one through the API; force it.
-            put(s, cf::LOCAL_CHANNEL_HOMES, &schema::encode_local_channel_home_key(cid, "klv1a"), &encode_home(1, 1));
+            s.put_local_channel_home_for_test(cid, "klv1a", 1, 1).unwrap();
         }
         for i in 0..MSGS {
             let chat = id(tag, 1, i);
@@ -1071,6 +1086,8 @@ mod tests {
             n(cf::CHANNEL_BACKFILL_STATE, &p),
             n(cf::PENDING_CHANNEL_DELETES, &p),
             n(cf::LOCAL_CHANNEL_HOMES, &p),
+            n(cf::LOCAL_CHANNEL_HOMES_BY_WALLET, &schema::encode_local_channel_home_wallet_key(b"klv1a", cid)),
+            n(cf::LOCAL_CHANNEL_HOMES_BY_WALLET, &schema::encode_local_channel_home_wallet_key(b"klv1b", cid)),
             n(cf::PRIVATE_CHANNEL_LIFECYCLE, &p),
             n(cf::LOCAL_CHANNEL_FED, &schema::encode_local_channel_fed_key("klv1a", cid)),
             n(cf::PRIVATE_CHANNEL_SYNC_STATE, &schema::encode_local_channel_fed_key("klv1a", cid)),
@@ -1549,5 +1566,148 @@ mod tests {
         for i in 0..10 {
             assert!(row(&s, pcid(30 + i)).is_some(), "never-due rows untouched");
         }
+    }
+
+    // ---- l2-node 0.150.0 (Phase E): HOMES ⇔ LOCAL_CHANNEL_HOMES_BY_WALLET ----
+
+    fn index_has(s: &Storage, cid: u64, w: &str) -> bool {
+        s.exists_cf(cf::LOCAL_CHANNEL_HOMES_BY_WALLET, &schema::encode_local_channel_home_wallet_key(w.as_bytes(), cid))
+            .unwrap()
+    }
+
+    /// HOMES ⇔ index, over the whole database.
+    fn assert_mirror(s: &Storage) {
+        let homes = s.prefix_iter_cf(cf::LOCAL_CHANNEL_HOMES, &[], 1_000_000).unwrap();
+        let index = s.prefix_iter_cf(cf::LOCAL_CHANNEL_HOMES_BY_WALLET, &[], 1_000_000).unwrap();
+        assert_eq!(homes.len(), index.len(), "HOMES and its wallet index differ in size");
+        for (k, _) in &homes {
+            let cid = u64::from_be_bytes(k[..8].try_into().unwrap());
+            assert!(
+                s.exists_cf(cf::LOCAL_CHANNEL_HOMES_BY_WALLET, &schema::encode_local_channel_home_wallet_key(&k[8..], cid))
+                    .unwrap(),
+                "HOMES row without index entry"
+            );
+        }
+    }
+
+    #[test]
+    fn cancel_records_the_home_with_its_index_entry() {
+        let dir = TempDir::new().unwrap();
+        let s = seeded(&dir);
+        let a = pcid(40);
+        populate(&s, a, 0xC1);
+        schedule(&s, a);
+        let since = row(&s, a).unwrap().since_ms;
+        put(&s, cf::LOCAL_DM_USERS, b"klv1b", &schema::encode_local_dm_user(1, since));
+        assert_eq!(s.start_private_channel_purge(a, far_future()).unwrap(), PurgeStart::Cancelled);
+        assert!(s.exists_cf(cf::LOCAL_CHANNEL_HOMES, &schema::encode_local_channel_home_key(a, "klv1b")).unwrap());
+        assert!(index_has(&s, a, "klv1b"));
+        assert_mirror(&s);
+    }
+
+    #[test]
+    fn homes_phase_in_many_slices_leaves_no_index_rows() {
+        let dir = TempDir::new().unwrap();
+        let s = seeded(&dir);
+        let a = pcid(41);
+        let b = pcid(42);
+        populate(&s, a, 0xC2);
+        populate(&s, b, 0xC3);
+        for i in 0..9 {
+            s.put_local_channel_home_for_test(a, &format!("klv1h{i}"), 1, 1).unwrap();
+            s.put_local_channel_home_for_test(b, &format!("klv1h{i}"), 1, 1).unwrap();
+        }
+        schedule(&s, a);
+        assert_eq!(s.start_private_channel_purge(a, far_future()).unwrap(), PurgeStart::Started);
+        // Tiny slices: the HOMES step is split across several calls.
+        let mut homes_slices = 0;
+        for _ in 0..10_000 {
+            let in_homes = row(&s, a).is_some_and(|r| r.phase == purge_phase::LOCAL_CHANNEL_HOMES);
+            let o = s.purge_step(a, 3).unwrap();
+            if in_homes {
+                homes_slices += 1;
+                assert_mirror(&s);
+            }
+            if o.finished {
+                break;
+            }
+        }
+        assert!(homes_slices > 2, "the HOMES step ran in several slices ({homes_slices})");
+        assert!(row(&s, a).is_none());
+        assert!(s.prefix_iter_cf(cf::LOCAL_CHANNEL_HOMES, &a.to_be_bytes(), 10).unwrap().is_empty());
+        for i in 0..9 {
+            let w = format!("klv1h{i}");
+            assert!(!index_has(&s, a, &w), "no index row left for the purged channel");
+            assert!(index_has(&s, b, &w), "the other channel keeps its index rows");
+        }
+        assert!(index_has(&s, b, "klv1a"));
+        assert_mirror(&s);
+    }
+
+    /// Randomized: any interleaving of the HOMES writers (record, both
+    /// seedings, cancel) and deleters (the purge HOMES step, in slices)
+    /// keeps HOMES ⇔ index.
+    #[test]
+    fn randomized_writers_and_purge_keep_homes_and_index_in_step() {
+        let dir = TempDir::new().unwrap();
+        let s = seeded(&dir);
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut rnd = |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        let cids: Vec<u64> = (0..4).map(|i| pcid(50 + i)).collect();
+        for &c in &cids {
+            put_channel(&s, c, 2);
+        }
+        let wallets: Vec<String> = (0..6).map(|i| format!("klv1r{i}")).collect();
+        for _ in 0..400 {
+            let cid = cids[rnd(cids.len() as u64) as usize];
+            let w = wallets[rnd(wallets.len() as u64) as usize].as_str();
+            match rnd(6) {
+                0 => {
+                    let _ = s.add_channel_member(cid, w, 1, "member");
+                    s.record_local_channel_home(cid, w, crate::util::now_ms() + rnd(10) * 7_200_000).unwrap();
+                }
+                1 => {
+                    put(&s, cf::LOCAL_CHANNEL_FED, &schema::encode_local_channel_fed_key(w, cid), &1u64.to_be_bytes());
+                    s.seed_local_channel_homes_from_fed(1).unwrap();
+                }
+                2 => {
+                    let _ = s.add_channel_member(cid, w, 1, "member");
+                    put(&s, cf::LOCAL_DM_USERS, w.as_bytes(), &schema::encode_local_dm_user(1, 1));
+                    // Re-run the one-time seeding from scratch.
+                    s.reset_homes_seeding_for_test().unwrap();
+                    while !s.run_private_channel_homes_seeding(3, 1).unwrap().1 {}
+                }
+                3 => {
+                    let key = schema::encode_channel_member_key(cid, w);
+                    s.with_channel_membership_lock(|| s.cancel_pending_purge(cid, Some(&key))).unwrap();
+                }
+                _ => {
+                    // One slice of the HOMES purge step for `cid`.
+                    let row = PrivateChannelLifecycleRow {
+                        v: 1,
+                        state: LifecycleState::Purging,
+                        since_ms: 1,
+                        deadline_ms: Some(1),
+                        reason: LifecycleReason::NoLocalMember,
+                        phase: purge_phase::LOCAL_CHANNEL_HOMES,
+                        cursor_hex: String::new(),
+                        wallets: Vec::new(),
+                        creator: None,
+                        activity_rearmed: false,
+                    };
+                    let mut batch = WriteBatch::default();
+                    let mut acc = PurgeAcc::default();
+                    s.stage_purge_phase(&mut batch, &mut acc, cid, &row, &[], 1 + rnd(5)).unwrap();
+                    s.write_batch(batch).unwrap();
+                }
+            }
+            assert_mirror(&s);
+        }
+        assert!(!s.prefix_iter_cf(cf::LOCAL_CHANNEL_HOMES, &[], 10).unwrap().is_empty(), "the run produced homes");
     }
 }

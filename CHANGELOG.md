@@ -5,6 +5,140 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.150.0] - 2026-11-19
+
+Private-sync backfill for local members recorded only in `LOCAL_CHANNEL_HOMES`
+(Phase E of the private-channel lifecycle), the node part of message
+permalinks (`around=` on the channel-messages endpoint), and a fail-closed
+access fix on that endpoint (plan `docs/planning/l2-node-0.150.0-plan.md`,
+owner decisions E1-E5, P1-P6). All changes are runtime code; no dependency
+changed. No wire change on the P2P side; the REST response gains fields.
+
+### Added
+
+- **`LOCAL_CHANNEL_HOMES_BY_WALLET` (new node-local CF).** Key
+  `wallet ‖ 0xFF ‖ channel_id` (the same bytes as `LOCAL_CHANNEL_FED`), empty
+  value: a wallet-keyed index of `LOCAL_CHANNEL_HOMES`. Every HOMES writer
+  and deleter goes through one pair of helpers (`stage_home_put` /
+  `stage_home_delete`) that write or delete both rows in one batch:
+  `record_local_channel_home`, both seeding passes, the purge-start cancel
+  path and the purge's `LOCAL_CHANNEL_HOMES` step (now a dedicated arm that
+  deletes both rows, half a page of keys per slice, same cursor semantics;
+  phase numbers unchanged). It is a backfill CANDIDATE SET only: it never
+  feeds `has_local_member`, the single-host protection, the purge gates or
+  any retention decision, and every hit is verified against
+  `LOCAL_CHANNEL_HOMES` before it is acted on. Not in snapshot
+  `DOMAIN_CFS`, not droppable.
+- **Boot-time index rebuild, every boot.** Right after the `LOCAL_CHANNEL_FED`
+  re-seed and before the network starts:
+  `rebuild_local_channel_homes_wallet_index` adds missing entries and removes
+  orphans (e.g. left by a 0.149 binary's purge after a downgrade), at most
+  500,000 rows per boot, resumable through the new `NODE_STATE` key
+  `homes_wallet_index_cursor`, each chunk under the channel-membership lock.
+  Logs `added` / `orphans_removed`.
+- **HOMES retry sweep.** A second private-sync retry sweep walks the index
+  (`catchup_batch_size` keys per tick, own cursor
+  `private_channel_sync_homes_retry_cursor`), checking per key a fresh cached
+  wallet claim in memory first (no claim → no storage read), then skipping
+  keys the federation sweep covers, then verifying the HOMES row.
+- **`around=<msg_id>` on `GET /api/v1/channels/{id}/messages`.** Returns
+  `ceil((L-1)/2)` older rows, the target and `floor((L-1)/2)` newer rows for
+  `L = clamp(limit, 1, 100)` (the target counts toward the limit), plus
+  `target_found`. Precedence `around` > `after` > `before`. A malformed,
+  unknown or other-channel id answers with the newest page and
+  `target_found: false`, byte-identical in all three cases. A soft-deleted
+  target is found and returned as a tombstone; an edited-then-deleted one
+  stays a tombstone. DMs have no `around` (their parameters are unchanged).
+- **`has_more_before` / `has_more_after`** on every mode of that endpoint,
+  exact (one extra key is read beyond the page). Legacy `has_more` is
+  unchanged byte for byte ("the page is full" in the direction scanned; in
+  `around` mode it equals `has_more_before` when the target is found).
+- **Metrics:** `private_sync_skipped_no_host_total`,
+  `private_sync_homes_pairs_evaluated_total`.
+
+### Changed
+
+- **Claim gate and claim refresh include local homes.** The REST/WS
+  pchansync claim is processed for a wallet with a `LOCAL_CHANNEL_FED` row OR
+  an index entry. The refresh re-evaluates the union of the wallet's
+  federations (≤ 256) and verified local homes (≤ 256 more, reading at most
+  512 index entries, so up to 256 orphan or public-id entries ahead of them
+  cannot hide valid ones; the boot-time rebuild removes orphans),
+  deduplicated, and
+  now caches the claim whenever that union is non-empty (it used to require
+  a federation). As a side effect the gap backfill a cancelled cleanup
+  requests now also runs for wallets without a federation row.
+- **The no-host gate is cheap and late.** It runs only for a pair that is not
+  already in flight and that the attempt throttle would let through, and
+  looks the topic up in one snapshot of the peers' announced subscriptions,
+  built at most once per claim refresh, sweep tick or single trigger (not one
+  walk of the peer table per channel).
+- **Logs:** the private-sync "triggering bounded private-channel backfill" and
+  "applied batch" `info!` lines no longer carry the wallet (no
+  wallet + private-channel pair at `info`).
+- The HOMES retry sweep does not rewrite its cursor when it did not move.
+
+### Security
+
+- **Fail-closed access on `GET /api/v1/channels/{id}/messages`.** The
+  endpoint checked access only when the `CHANNELS` row existed and parsed: a
+  missing row (after `tombstone_channel`, during a private-channel purge, or
+  for channels deleted before 0.149.0), a corrupt row or a storage error
+  served the channel's leftover envelopes (ciphertext, authors, timestamps)
+  to anyone, unauthenticated. It now returns 404 when the row is missing and
+  the channel is tombstoned, has a lifecycle row, or has a private-range id,
+  and 500 on a corrupt row or a storage error. Only a public id with no row,
+  no tombstone and no lifecycle row keeps the old behaviour. The other
+  channel read endpoints (`/members`, `/pins`, `/bots`, `/bans`, `/keys`,
+  `/key-commitment`, `/member-proofs`, `GET /channels/{id}`, unread counts,
+  WS delivery) were checked and already fail closed.
+- **No connected-peer fallback for non-federated private-sync pairs.** A
+  `(wallet, channel)` pair without a `LOCAL_CHANNEL_FED` row is evaluated
+  only while some peer subscribes the channel's topic (else skipped before
+  any throttle state moves), and asks only subscribed peers (mesh, then
+  announced subscribers) — never an arbitrary connected peer, which would
+  receive the signed wallet claim and the channel id with nothing to give.
+  Federated pairs are unchanged.
+
+### Known limitations
+
+- **Gossip subscriptions are unauthenticated.** A peer that subscribes to a
+  private channel's topic (ids are enumerable) passes the no-host gate and
+  becomes a candidate for non-federated pairs, learning that the wallet is in
+  the channel. The node-id-bound claim cannot be replayed; subscribed-only
+  candidates raise the cost, they do not prevent it.
+- **ForwardOnly REST parity (decision P1).** The channel-messages endpoint
+  applies no ForwardOnly join floor in any mode (as before): a ForwardOnly
+  member can page or `around`-jump into history from before it joined and
+  receives ciphertext it has no epoch key for. Private-channel sync does
+  apply the floor. Recorded, not changed.
+- **`thread_root` is not implemented** on the channel-messages endpoint (the
+  parameter is ignored; spec 03 now marks it and `thread_reply_count` as not
+  implemented).
+- Non-federated pairs get no backfill while no peer has announced a
+  subscription to the channel (e.g. right after a restart); the next refresh
+  or sweep retries.
+- Every HOMES row of a wallet that left or was kicked can trigger futile
+  healing walks while the client is active, bounded by the due-gate, the
+  backoff, the responders' budgets and the no-host gate (federation rows
+  already behaved this way).
+- The claim gate does not verify the index entry; an orphan costs at most
+  one claim verification per wallet per 60 s until the next boot's rebuild.
+- **Deferred hardening: gossipsub subscription filter / per-peer topic cap.**
+  A peer can announce an unbounded number of topic subscriptions, which
+  inflates every walk of gossipsub's peer table (`all_peers()`, allocating
+  per peer). 0.150.0 bounds how OFTEN private sync walks it (once per
+  refresh / sweep tick / trigger); the per-walk cost — also paid by the
+  existing metrics / publish-failure paths — stays until a subscription
+  filter or per-peer topic cap is added.
+- If a 0.149 binary ran while the index rebuild was paused in its orphan
+  pass, the resumed pass does not revisit HOMES rows 0.149 wrote meanwhile;
+  their index entries appear on the next full rebuild cycle (a missed
+  backfill attempt only, never data).
+- A same-peer resume of a non-federated pair (from a resume row written by
+  0.149) may still target a peer that does not subscribe the channel; that
+  peer already received this wallet's claim for the channel earlier.
+
 ## [0.149.0] - 2026-11-19
 
 Private-channel lifecycle on a node, and a persisted resume cursor for

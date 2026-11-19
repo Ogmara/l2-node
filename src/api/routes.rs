@@ -2626,21 +2626,140 @@ pub async fn get_channel(
     }
 }
 
+/// Query parameters of `GET /api/v1/channels/:channel_id/messages`
+/// (separate from [`MessageParams`], which the DM endpoint keeps unchanged —
+/// DMs have no `around`, l2-node 0.150.0 decision P6).
+///
+/// Cursor precedence: `around` > `after` > `before`. Every cursor is a hex
+/// `msg_id` resolved WITHIN this channel's index; a malformed, unknown or
+/// other-channel id is "unresolved" and yields the newest page.
+#[derive(Debug, Deserialize)]
+pub struct ChannelMessageParams {
+    /// Return messages strictly older than this message.
+    pub before: Option<String>,
+    /// Return messages strictly newer than this message (wins over `before`).
+    pub after: Option<String>,
+    /// Return a window centred on this message, the message included (wins
+    /// over `after` and `before`; message permalinks, l2-node 0.150.0).
+    pub around: Option<String>,
+    /// Page size: 0..=100 (default 50) for the newest page / `before` /
+    /// `after`; clamped to 1..=100 in `around` mode.
+    pub limit: Option<u32>,
+}
+
+/// Access gate of `GET /api/v1/channels/:channel_id/messages` (l2-node
+/// 0.150.0, security fix): like [`require_channel_access`], but a channel
+/// with NO `CHANNELS` row is still served when — and only when — it is a
+/// public channel id with no tombstone (`DELETED_CHANNELS`) and no private-
+/// channel lifecycle row (unchanged pre-0.150 behaviour for public chat a
+/// node holds before its metadata). A missing row of a deleted, purging or
+/// private-range channel is a 404 (its leftover index rows must never be
+/// served); a corrupt row or a storage error is a 500 (fail closed).
+fn require_channel_messages_access(
+    state: &AppState,
+    channel_id: u64,
+    caller: Option<&str>,
+) -> Result<(), axum::response::Response> {
+    let key = channel_id.to_be_bytes();
+    match state.storage.get_cf(cf::CHANNELS, &key) {
+        Ok(Some(_)) => require_channel_access(state, channel_id, caller),
+        Ok(None) => {
+            let tombstoned = state.storage.exists_cf(cf::DELETED_CHANNELS, &key);
+            let lifecycle = state.storage.has_private_channel_lifecycle_row(channel_id);
+            match (tombstoned, lifecycle) {
+                (Ok(false), Ok(false))
+                    if crate::messages::types::is_public_channel_id(channel_id) =>
+                {
+                    Ok(())
+                }
+                (Ok(_), Ok(_)) => Err((StatusCode::NOT_FOUND, "channel not found").into_response()),
+                (Err(e), _) | (_, Err(e)) => {
+                    tracing::error!(error = %e, "Storage error in channel messages access check");
+                    Err((StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response())
+                }
+            }
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Storage error in channel messages access check");
+            Err((StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response())
+        }
+    }
+}
+
+/// Resolve a hex `msg_id` cursor to its `CHANNEL_MSGS` key in THIS channel.
+/// `None` for malformed hex, an unknown id, an undecodable envelope, a
+/// storage error, or an id that is not indexed under `channel_id` — the
+/// mandatory `exists_cf(CHANNEL_MSGS, key)` check is the cross-channel
+/// oracle guard: "in another channel" and "unknown" must answer alike.
+fn resolve_channel_cursor(state: &AppState, channel_id: u64, msg_id_hex: &str) -> Option<Vec<u8>> {
+    let msg_id: [u8; 32] = hex::decode(msg_id_hex).ok()?.try_into().ok()?;
+    let envelope_bytes = state.storage.get_message(&msg_id).ok()??;
+    let envelope =
+        rmp_serde::from_slice::<crate::messages::envelope::Envelope>(&envelope_bytes).ok()?;
+    // CHANNEL_MSGS is keyed by wall-clock timestamp (0.58.0), matching the
+    // writer (router.rs) and the re-index migration. Must NOT use
+    // lamport_ts here (always 0) or the cursor key won't exist and
+    // pagination silently resets to the first page.
+    let key = encode_channel_msg_key(channel_id, envelope.timestamp, &msg_id);
+    if !state.storage.exists_cf(cf::CHANNEL_MSGS, &key).unwrap_or(false) {
+        return None;
+    }
+    Some(key)
+}
+
+/// One page of `CHANNEL_MSGS` keys (ascending) plus its paging flags.
+struct ChannelPage {
+    keys: Vec<Vec<u8>>,
+    /// Legacy flag: `true` when the page is full (per direction scanned).
+    has_more: bool,
+    /// Exact: an older indexed message exists before the first key.
+    has_more_before: bool,
+    /// Exact: a newer indexed message exists after the last key.
+    has_more_after: bool,
+}
+
+/// The newest `limit` keys of a channel (fetching one extra key to make
+/// `has_more_before` exact; `has_more` keeps its legacy "page is full"
+/// meaning, byte-identical to pre-0.150 responses).
+fn newest_channel_page(state: &AppState, prefix: &[u8], limit: usize) -> anyhow::Result<ChannelPage> {
+    let mut rows = state.storage.reverse_iter_cf(
+        cf::CHANNEL_MSGS,
+        &message_key_upper_bound(prefix),
+        prefix,
+        limit.saturating_add(1),
+    )?;
+    let more = rows.len() > limit;
+    rows.truncate(limit);
+    rows.reverse();
+    Ok(ChannelPage {
+        has_more: rows.len() == limit,
+        keys: rows.into_iter().map(|(k, _)| k).collect(),
+        has_more_before: more,
+        has_more_after: false,
+    })
+}
+
 /// GET /api/v1/channels/:channel_id/messages
+///
+/// Modes (precedence `around` > `after` > `before`, else the newest page);
+/// messages are always returned oldest-first. `around` (l2-node 0.150.0,
+/// message permalinks) returns `ceil((L-1)/2)` older rows, the target and
+/// `floor((L-1)/2)` newer rows for `L = clamp(limit, 1, 100)`, and
+/// `target_found`. An unresolvable cursor in any mode yields the newest
+/// page (and `target_found: false` for `around`), identically for
+/// malformed, unknown and other-channel ids.
 pub async fn get_channel_messages(
     Extension(state): Extension<Arc<AppState>>,
     auth_user: Option<Extension<AuthUser>>,
     Path(channel_id): Path<u64>,
-    Query(params): Query<MessageParams>,
+    Query(params): Query<ChannelMessageParams>,
 ) -> impl IntoResponse {
-    // Block access to private channel messages for non-members
-    if let Ok(Some(data)) = state.storage.get_cf(cf::CHANNELS, &channel_id.to_be_bytes()) {
-        if let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&data) {
-            let caller = auth_user.as_ref().map(|u| u.address.as_str());
-            if !check_channel_access(&state, &meta, channel_id, caller) {
-                return (StatusCode::NOT_FOUND, "channel not found").into_response();
-            }
-        }
+    // Block access to private / deleted / purging channel messages for
+    // anyone not entitled to them; fail closed (l2-node 0.150.0). Runs
+    // before any cursor logic.
+    let caller = auth_user.as_ref().map(|u| u.address.as_str());
+    if let Err(resp) = require_channel_messages_access(&state, channel_id, caller) {
+        return resp;
     }
 
     // Clamped to 100, matching the convention every other message-listing
@@ -2650,7 +2769,8 @@ pub async fn get_channel_messages(
     // realistic per-message ceiling (~34 KiB) is ~545 MiB resident per
     // request. 100 keeps the same worst case in the ~100 MiB range, in line
     // with every other paginated read here.
-    let limit = params.limit.unwrap_or(50).min(100) as usize;
+    let requested = params.limit.unwrap_or(50);
+    let limit = requested.min(100) as usize;
     let prefix = channel_id.to_be_bytes();
 
     // Look up the authenticated user's read cursor for unread divider support
@@ -2664,97 +2784,87 @@ pub async fn get_channel_messages(
         }
     });
 
-    // Resolve `after`/`before` cursors to a seek key for incremental fetching.
-    // No cursor at all (a fresh conversation open) must return the NEWEST
-    // `limit` messages, not the oldest — `prefix_iter_cf` seeks from the start
-    // of the key range, which previously made every fresh open land on the
-    // earliest history ever exchanged once a channel exceeded one page.
-    // `reverse_order` tracks whether `entries` came back newest-first and
-    // needs flipping to the ascending order the response format always uses.
-    let (entries_result, reverse_order) = if let Some(after_hex) = &params.after {
-        // Parse the hex msg_id, look up the message to get its lamport_ts,
-        // then verify the message belongs to this channel (prevents cross-channel oracle)
-        let after_key = (|| -> Option<Vec<u8>> {
-            let msg_id_bytes = hex::decode(after_hex).ok()?;
-            let msg_id: [u8; 32] = msg_id_bytes.try_into().ok()?;
-            let envelope_bytes = state.storage.get_message(&msg_id).ok()??;
-            let envelope = rmp_serde::from_slice::<crate::messages::envelope::Envelope>(
-                &envelope_bytes,
-            ).ok()?;
-            // CHANNEL_MSGS is keyed by wall-clock timestamp (0.58.0), matching
-            // the writer (router.rs) and the re-index migration. Must NOT use
-            // lamport_ts here (always 0) or the cursor key won't exist and
-            // pagination silently resets to the first page.
-            let key = encode_channel_msg_key(channel_id, envelope.timestamp, &msg_id);
-            // Verify this msg_id is indexed under this channel (not a foreign channel)
-            if !state.storage.exists_cf(cf::CHANNEL_MSGS, &key).unwrap_or(false) {
-                return None;
-            }
-            Some(key)
-        })();
-        match after_key {
-            Some(seek_key) => (
-                state.storage.prefix_iter_cf_after(cf::CHANNEL_MSGS, &seek_key, &prefix, limit),
-                false,
-            ),
-            // Cursor not found or not in this channel — fall back to the newest page.
-            None => (
-                state.storage.reverse_iter_cf(
-                    cf::CHANNEL_MSGS, &message_key_upper_bound(&prefix), &prefix, limit,
-                ),
-                true,
-            ),
+    // Resolve the cursor and fetch the page. No cursor at all (a fresh
+    // conversation open) returns the NEWEST `limit` messages. Every mode
+    // fetches one key beyond the page so `has_more_before` /
+    // `has_more_after` are exact, then trims, so the legacy `has_more`
+    // ("the page is full", in the direction scanned) is unchanged.
+    let mut target_found: Option<bool> = None;
+    let page = (|| -> anyhow::Result<ChannelPage> {
+        if let Some(around_hex) = &params.around {
+            let l = requested.clamp(1, 100) as usize;
+            let Some(target) = resolve_channel_cursor(&state, channel_id, around_hex) else {
+                target_found = Some(false);
+                return newest_channel_page(&state, &prefix, l);
+            };
+            target_found = Some(true);
+            // The target counts toward L: never more than `limit` rows.
+            let rest = l - 1;
+            let older_n = rest.div_ceil(2);
+            let newer_n = rest / 2;
+            let mut older =
+                state.storage.reverse_iter_cf_before(cf::CHANNEL_MSGS, &target, &prefix, older_n + 1)?;
+            let mut newer =
+                state.storage.prefix_iter_cf_after(cf::CHANNEL_MSGS, &target, &prefix, newer_n + 1)?;
+            let has_more_before = older.len() > older_n;
+            let has_more_after = newer.len() > newer_n;
+            older.truncate(older_n);
+            newer.truncate(newer_n);
+            let mut keys = Vec::with_capacity(older.len() + 1 + newer.len());
+            keys.extend(older.into_iter().rev().map(|(k, _)| k));
+            keys.push(target);
+            keys.extend(newer.into_iter().map(|(k, _)| k));
+            return Ok(ChannelPage { keys, has_more: has_more_before, has_more_before, has_more_after });
         }
-    } else if let Some(before_hex) = &params.before {
-        // Same resolve/verify pattern as `after`, for "load older" pagination.
-        let before_key = (|| -> Option<Vec<u8>> {
-            let msg_id_bytes = hex::decode(before_hex).ok()?;
-            let msg_id: [u8; 32] = msg_id_bytes.try_into().ok()?;
-            let envelope_bytes = state.storage.get_message(&msg_id).ok()??;
-            let envelope = rmp_serde::from_slice::<crate::messages::envelope::Envelope>(
-                &envelope_bytes,
-            ).ok()?;
-            let key = encode_channel_msg_key(channel_id, envelope.timestamp, &msg_id);
-            if !state.storage.exists_cf(cf::CHANNEL_MSGS, &key).unwrap_or(false) {
-                return None;
-            }
-            Some(key)
-        })();
-        match before_key {
-            Some(seek_key) => (
-                state.storage.reverse_iter_cf_before(cf::CHANNEL_MSGS, &seek_key, &prefix, limit),
-                true,
-            ),
-            // Cursor not found or not in this channel — fall back to the newest page.
-            // Currently unreachable in normal "load older" scroll-up use: message
-            // deletion is a soft tombstone (content hidden, key/entry untouched —
-            // see docs/specs/03-l2-node.md), so a `before` cursor that was valid
-            // when handed to a client stays resolvable indefinitely. If that ever
-            // changes (hard delete), reconsider returning an explicit error here
-            // instead of silently teleporting a mid-scroll client to the bottom.
-            None => (
-                state.storage.reverse_iter_cf(
-                    cf::CHANNEL_MSGS, &message_key_upper_bound(&prefix), &prefix, limit,
-                ),
-                true,
-            ),
+        if let Some(after_hex) = &params.after {
+            // Cursor not found or not in this channel — the newest page.
+            let Some(seek_key) = resolve_channel_cursor(&state, channel_id, after_hex) else {
+                return newest_channel_page(&state, &prefix, limit);
+            };
+            let mut rows = state.storage.prefix_iter_cf_after(
+                cf::CHANNEL_MSGS, &seek_key, &prefix, limit.saturating_add(1),
+            )?;
+            let more = rows.len() > limit;
+            rows.truncate(limit);
+            return Ok(ChannelPage {
+                has_more: rows.len() == limit,
+                keys: rows.into_iter().map(|(k, _)| k).collect(),
+                // The cursor row itself is older than this page.
+                has_more_before: true,
+                has_more_after: more,
+            });
         }
-    } else {
-        (
-            state.storage.reverse_iter_cf(
-                cf::CHANNEL_MSGS, &message_key_upper_bound(&prefix), &prefix, limit,
-            ),
-            true,
-        )
-    };
+        if let Some(before_hex) = &params.before {
+            // Cursor not found or not in this channel — the newest page.
+            // Currently unreachable in normal "load older" scroll-up use:
+            // message deletion is a soft tombstone (content hidden,
+            // key/entry untouched — see docs/specs/03-l2-node.md), so a
+            // `before` cursor that was valid when handed to a client stays
+            // resolvable until the channel itself is purged.
+            let Some(seek_key) = resolve_channel_cursor(&state, channel_id, before_hex) else {
+                return newest_channel_page(&state, &prefix, limit);
+            };
+            let mut rows = state.storage.reverse_iter_cf_before(
+                cf::CHANNEL_MSGS, &seek_key, &prefix, limit.saturating_add(1),
+            )?;
+            let more = rows.len() > limit;
+            rows.truncate(limit);
+            rows.reverse();
+            return Ok(ChannelPage {
+                has_more: rows.len() == limit,
+                keys: rows.into_iter().map(|(k, _)| k).collect(),
+                has_more_before: more,
+                // The cursor row itself is newer than this page.
+                has_more_after: true,
+            });
+        }
+        newest_channel_page(&state, &prefix, limit)
+    })();
 
-    match entries_result {
-        Ok(mut entries) => {
-            if reverse_order {
-                entries.reverse();
-            }
-            let mut messages = Vec::with_capacity(entries.len());
-            for (key, _) in &entries {
+    match page {
+        Ok(page) => {
+            let mut messages = Vec::with_capacity(page.keys.len());
+            for key in &page.keys {
                 if key.len() >= 48 {
                     let msg_id: [u8; 32] = key[16..48].try_into().unwrap_or([0u8; 32]);
                     if let Ok(Some(envelope_bytes)) = state.storage.get_message(&msg_id) {
@@ -2777,11 +2887,15 @@ pub async fn get_channel_messages(
                     }
                 }
             }
-            let has_more = entries.len() == limit;
             let mut resp = serde_json::json!({
                 "messages": messages,
-                "has_more": has_more,
+                "has_more": page.has_more,
+                "has_more_before": page.has_more_before,
+                "has_more_after": page.has_more_after,
             });
+            if let Some(found) = target_found {
+                resp["target_found"] = serde_json::json!(found);
+            }
             // Include the read cursor so clients can render an unread divider
             if let Some(ts) = last_read_ts {
                 resp["last_read_ts"] = serde_json::json!(ts);
@@ -2789,10 +2903,8 @@ pub async fn get_channel_messages(
             Json(resp).into_response()
         }
         Err(e) => {
-            {
-                tracing::error!(error = %e, "Storage error in API handler");
-                (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
-            }
+            tracing::error!(error = %e, "Storage error in API handler");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
         }
     }
 }
@@ -12165,5 +12277,362 @@ mod local_channel_activity_tests {
         assert!(s.storage.private_channel_lifecycle_row(CID).unwrap().is_none(), "the member's read cancelled it");
         let trig = rx.try_recv().expect("gap backfill requested");
         assert_eq!((trig.channel_id, trig.wallet.as_str()), (Some(CID), "klv1member"));
+    }
+}
+
+#[cfg(test)]
+mod channel_messages_around_tests {
+    //! `GET /api/v1/channels/:id/messages` (l2-node 0.150.0): the `around`
+    //! window and its flags, cursor precedence, the anti-oracle rule and the
+    //! fail-closed access gate for channels without a `CHANNELS` row.
+    use super::*;
+    use crate::messages::envelope::Envelope;
+    use crate::messages::router::MessageRouter;
+    use crate::messages::types::{MessageType, PRIVATE_CHANNEL_ID_FLOOR};
+    use crate::storage::identity::IdentityResolver;
+    use crate::storage::rocks::Storage;
+    use tempfile::TempDir;
+
+    const PUB: u64 = 7;
+    const PRIV: u64 = PRIVATE_CHANNEL_ID_FLOOR + 77;
+    const N: u8 = 120;
+
+    fn state() -> (Arc<AppState>, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let identity = IdentityResolver::new(storage.clone());
+        let router = MessageRouter::new(
+            storage.clone(),
+            identity.clone(),
+            None,
+            "testnet".to_string(),
+            usize::MAX,
+            Arc::new(crate::metrics::counters::NetworkCounters::new()),
+            crate::config::RateLimitsConfig::default(),
+        );
+        let s = AppState::new(
+            storage, router, "n".into(), "testnet".into(), String::new(), String::new(), None, identity, None,
+            None, None,
+        );
+        (Arc::new(s), dir)
+    }
+
+    fn mid(cid: u64, i: u8) -> [u8; 32] {
+        let mut m = [0u8; 32];
+        m[..8].copy_from_slice(&cid.to_be_bytes());
+        m[8] = i;
+        m[9] = 0xAB;
+        m
+    }
+
+    fn put_msg(s: &AppState, cid: u64, i: u8, author: &str) {
+        let id = mid(cid, i);
+        let env = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::ChatMessage,
+            msg_id: id,
+            author: author.to_string(),
+            timestamp: 1_000 + u64::from(i),
+            lamport_ts: 0,
+            payload: vec![1, 2, 3],
+            signature: Vec::new(),
+            relay_path: Vec::new(),
+        };
+        s.storage.put_cf(cf::MESSAGES, &id, &rmp_serde::to_vec(&env).unwrap()).unwrap();
+        s.storage
+            .put_cf(cf::CHANNEL_MSGS, &encode_channel_msg_key(cid, env.timestamp, &id), &[])
+            .unwrap();
+    }
+
+    /// A channel with `n` messages (ids `mid(cid, 0..n)`, ascending).
+    fn channel(s: &AppState, cid: u64, ctype: u8, n: u8) {
+        let meta = serde_json::json!({ "channel_id": cid, "channel_type": ctype, "creator": "klv1c", "history_visibility": 1 });
+        s.storage.put_cf(cf::CHANNELS, &cid.to_be_bytes(), meta.to_string().as_bytes()).unwrap();
+        for i in 0..n {
+            put_msg(s, cid, i, "klv1author");
+        }
+    }
+
+    struct Q<'a> {
+        before: Option<&'a str>,
+        after: Option<&'a str>,
+        around: Option<&'a str>,
+        limit: Option<u32>,
+    }
+    const NONE: Q<'static> = Q { before: None, after: None, around: None, limit: None };
+
+    async fn call(s: &Arc<AppState>, cid: u64, q: Q<'_>, caller: Option<&str>) -> (StatusCode, Vec<u8>) {
+        let params = ChannelMessageParams {
+            before: q.before.map(str::to_string),
+            after: q.after.map(str::to_string),
+            around: q.around.map(str::to_string),
+            limit: q.limit,
+        };
+        let auth = caller.map(|a| Extension(AuthUser { address: a.to_string(), signing_address: a.to_string() }));
+        let res = get_channel_messages(Extension(s.clone()), auth, Path(cid), Query(params))
+            .await
+            .into_response();
+        let status = res.status();
+        (status, axum::body::to_bytes(res.into_body(), 64 << 20).await.unwrap().to_vec())
+    }
+
+    async fn json(s: &Arc<AppState>, cid: u64, q: Q<'_>) -> serde_json::Value {
+        let (st, body) = call(s, cid, q, None).await;
+        assert_eq!(st, StatusCode::OK);
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    /// The `i` bytes (`mid(cid, i)[8]`) of the returned messages, in order.
+    fn ids(v: &serde_json::Value) -> Vec<u8> {
+        v["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| hex::decode(m["msg_id"].as_str().unwrap()).unwrap()[8])
+            .collect()
+    }
+
+    fn flags(v: &serde_json::Value) -> (bool, bool, bool) {
+        (
+            v["has_more"].as_bool().unwrap(),
+            v["has_more_before"].as_bool().unwrap(),
+            v["has_more_after"].as_bool().unwrap(),
+        )
+    }
+
+    fn h(cid: u64, i: u8) -> String {
+        hex::encode(mid(cid, i))
+    }
+
+    #[tokio::test]
+    async fn around_splits_the_limit_and_sets_exact_flags() {
+        let (s, _d) = state();
+        channel(&s, PUB, 0, N);
+        let t = h(PUB, 60);
+        // (limit, expected older, expected newer)
+        for (limit, older, newer) in [(1u32, 0u8, 0u8), (2, 1, 0), (50, 25, 24), (51, 25, 25), (100, 50, 49), (500, 50, 49), (0, 0, 0)] {
+            let v = json(&s, PUB, Q { around: Some(&t), limit: Some(limit), ..NONE }).await;
+            let want: Vec<u8> = (60 - older..=60 + newer).collect();
+            assert_eq!(ids(&v), want, "limit={limit}");
+            assert_eq!(v["target_found"], serde_json::json!(true));
+            let (hm, hb, ha) = flags(&v);
+            assert_eq!((hb, ha), (true, true), "limit={limit}: history on both sides");
+            assert_eq!(hm, hb, "around: has_more = has_more_before");
+        }
+        // Default limit 50.
+        let v = json(&s, PUB, Q { around: Some(&t), ..NONE }).await;
+        assert_eq!(ids(&v), (35..=84).collect::<Vec<u8>>());
+    }
+
+    #[tokio::test]
+    async fn around_the_first_and_the_last_message() {
+        let (s, _d) = state();
+        channel(&s, PUB, 0, N);
+        let first = json(&s, PUB, Q { around: Some(&h(PUB, 0)), limit: Some(5), ..NONE }).await;
+        assert_eq!(ids(&first), vec![0, 1, 2]);
+        assert_eq!(flags(&first), (false, false, true));
+        let last = json(&s, PUB, Q { around: Some(&h(PUB, N - 1)), limit: Some(5), ..NONE }).await;
+        assert_eq!(ids(&last), vec![N - 3, N - 2, N - 1]);
+        assert_eq!(flags(&last), (true, true, false));
+        // Exactly enough on each side: the +1 probe makes the flags false.
+        let edge = json(&s, PUB, Q { around: Some(&h(PUB, 2)), limit: Some(5), ..NONE }).await;
+        assert_eq!(ids(&edge), vec![0, 1, 2, 3, 4]);
+        assert_eq!(flags(&edge), (false, false, true));
+        let (s2, _d2) = state();
+        channel(&s2, PUB, 0, 5);
+        let all = json(&s2, PUB, Q { around: Some(&h(PUB, 2)), limit: Some(5), ..NONE }).await;
+        assert_eq!(ids(&all), vec![0, 1, 2, 3, 4]);
+        assert_eq!(flags(&all), (false, false, false));
+    }
+
+    #[tokio::test]
+    async fn precedence_is_around_then_after_then_before() {
+        let (s, _d) = state();
+        channel(&s, PUB, 0, N);
+        let (a, b, c) = (h(PUB, 60), h(PUB, 10), h(PUB, 100));
+        let v = json(&s, PUB, Q { around: Some(&a), after: Some(&b), before: Some(&c), limit: Some(3) }).await;
+        assert_eq!(ids(&v), vec![59, 60, 61]);
+        let v = json(&s, PUB, Q { after: Some(&b), before: Some(&c), limit: Some(3), ..NONE }).await;
+        assert_eq!(ids(&v), vec![11, 12, 13]);
+        assert!(v.get("target_found").is_none(), "target_found only in around mode");
+    }
+
+    #[tokio::test]
+    async fn unresolvable_targets_answer_with_the_newest_page_and_identical_bodies() {
+        let (s, _d) = state();
+        channel(&s, PUB, 0, N);
+        channel(&s, 8, 0, 10); // another channel whose ids resolve globally
+        let unknown = hex::encode([0x77u8; 32]);
+        let foreign = h(8, 3);
+        let (st_u, body_u) = call(&s, PUB, Q { around: Some(&unknown), limit: Some(4), ..NONE }, None).await;
+        let (st_f, body_f) = call(&s, PUB, Q { around: Some(&foreign), limit: Some(4), ..NONE }, None).await;
+        let (st_m, body_m) = call(&s, PUB, Q { around: Some("zz-not-hex"), limit: Some(4), ..NONE }, None).await;
+        let (st_e, body_e) = call(&s, PUB, Q { around: Some(""), limit: Some(4), ..NONE }, None).await;
+        assert_eq!((st_u, st_f, st_m, st_e), (StatusCode::OK, StatusCode::OK, StatusCode::OK, StatusCode::OK));
+        assert_eq!(body_f, body_u, "other-channel id is indistinguishable from an unknown id");
+        assert_eq!(body_m, body_u, "malformed = unknown");
+        assert_eq!(body_e, body_u);
+        let v: serde_json::Value = serde_json::from_slice(&body_u).unwrap();
+        assert_eq!(v["target_found"], serde_json::json!(false));
+        assert_eq!(ids(&v), vec![N - 4, N - 3, N - 2, N - 1]);
+        assert_eq!(flags(&v), (true, true, false));
+        // Same for the legacy cursors (no target_found there).
+        let (_, a_u) = call(&s, PUB, Q { after: Some(&unknown), limit: Some(4), ..NONE }, None).await;
+        let (_, a_f) = call(&s, PUB, Q { after: Some(&foreign), limit: Some(4), ..NONE }, None).await;
+        assert_eq!(a_u, a_f);
+    }
+
+    #[tokio::test]
+    async fn legacy_has_more_is_unchanged_and_new_flags_are_exact() {
+        let (s, _d) = state();
+        channel(&s, PUB, 0, 10);
+        // Newest page.
+        let v = json(&s, PUB, Q { limit: Some(4), ..NONE }).await;
+        assert_eq!(ids(&v), vec![6, 7, 8, 9]);
+        assert_eq!(flags(&v), (true, true, false));
+        let v = json(&s, PUB, Q { limit: Some(10), ..NONE }).await;
+        assert_eq!(flags(&v), (true, false, false), "legacy: a full page says has_more even at the very start");
+        let v = json(&s, PUB, Q { limit: Some(20), ..NONE }).await;
+        assert_eq!(flags(&v), (false, false, false));
+        let v = json(&s, PUB, Q { limit: Some(0), ..NONE }).await;
+        assert_eq!(ids(&v), Vec::<u8>::new());
+        assert!(v["has_more"].as_bool().unwrap(), "legacy limit=0 quirk preserved");
+        // `before`: the cursor row is newer → has_more_after is true.
+        let c = h(PUB, 5);
+        let v = json(&s, PUB, Q { before: Some(&c), limit: Some(3), ..NONE }).await;
+        assert_eq!(ids(&v), vec![2, 3, 4]);
+        assert_eq!(flags(&v), (true, true, true));
+        let v = json(&s, PUB, Q { before: Some(&c), limit: Some(5), ..NONE }).await;
+        assert_eq!(ids(&v), vec![0, 1, 2, 3, 4]);
+        assert_eq!(flags(&v), (true, false, true));
+        let v = json(&s, PUB, Q { before: Some(&c), limit: Some(9), ..NONE }).await;
+        assert_eq!(flags(&v), (false, false, true));
+        // `after`: legacy has_more means "more newer"; the cursor row is older.
+        let v = json(&s, PUB, Q { after: Some(&c), limit: Some(3), ..NONE }).await;
+        assert_eq!(ids(&v), vec![6, 7, 8]);
+        assert_eq!(flags(&v), (true, true, true));
+        let v = json(&s, PUB, Q { after: Some(&c), limit: Some(4), ..NONE }).await;
+        assert_eq!(flags(&v), (true, true, false));
+        let v = json(&s, PUB, Q { after: Some(&c), limit: Some(9), ..NONE }).await;
+        assert_eq!(flags(&v), (false, true, false));
+    }
+
+    #[tokio::test]
+    async fn deleted_edited_and_muted_targets() {
+        let (s, _d) = state();
+        channel(&s, PUB, 0, 10);
+        put_msg(&s, PUB, 50, "klv1muted");
+        s.storage.store_channel_mute(PUB, "klv1muted", "klv1c", 0, "", 1).unwrap();
+        s.storage.store_deletion_marker(&mid(PUB, 3), "klv1author", 5).unwrap();
+        // Edited, then deleted: stays a tombstone.
+        s.storage.store_edit(&mid(PUB, 4), 2_000, &[0x99; 32]).unwrap();
+        s.storage.store_deletion_marker(&mid(PUB, 4), "klv1author", 6).unwrap();
+        let v = json(&s, PUB, Q { around: Some(&h(PUB, 3)), limit: Some(1), ..NONE }).await;
+        assert_eq!(v["target_found"], serde_json::json!(true));
+        assert_eq!(v["messages"][0]["deleted"], serde_json::json!(true));
+        assert!(v["messages"][0]["payload"].is_null());
+        let v = json(&s, PUB, Q { around: Some(&h(PUB, 4)), limit: Some(1), ..NONE }).await;
+        let m = &v["messages"][0];
+        assert_eq!(m["deleted"], serde_json::json!(true));
+        assert!(m["payload"].is_null(), "edited-then-deleted never re-exposes content");
+        assert!(m.get("edited").is_none());
+        let v = json(&s, PUB, Q { around: Some(&h(PUB, 50)), limit: Some(1), ..NONE }).await;
+        assert_eq!(v["messages"][0]["muted"], serde_json::json!(true));
+    }
+
+    #[tokio::test]
+    async fn private_channels_need_membership_in_every_mode() {
+        let (s, _d) = state();
+        channel(&s, PRIV, 2, 10);
+        s.storage.add_channel_member(PRIV, "klv1member", 1, "member").unwrap();
+        let t = h(PRIV, 5);
+        for q in [
+            Q { around: Some(&t), ..NONE },
+            Q { after: Some(&t), ..NONE },
+            Q { before: Some(&t), ..NONE },
+            NONE,
+        ] {
+            let around = q.around.is_some();
+            let (st, _) = call(&s, PRIV, Q { ..q }, Some("klv1stranger")).await;
+            assert_eq!(st, StatusCode::NOT_FOUND);
+            let (st, _) = call(&s, PRIV, Q { around: around.then_some(t.as_str()), ..NONE }, None).await;
+            assert_eq!(st, StatusCode::NOT_FOUND);
+        }
+        let (st, body) = call(&s, PRIV, Q { around: Some(&t), limit: Some(3), ..NONE }, Some("klv1member")).await;
+        assert_eq!(st, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(ids(&v), vec![4, 5, 6]);
+    }
+
+    /// Security regression (l2-node 0.150.0): a channel whose `CHANNELS`
+    /// row is gone (tombstoned, or mid-purge) must not serve its leftover
+    /// index rows to anyone, in any mode.
+    #[tokio::test]
+    async fn tombstoned_and_purging_channels_are_404_in_every_mode() {
+        let (s, _d) = state();
+        let purging = PRIVATE_CHANNEL_ID_FLOOR + 78;
+        let deleted_pub = 9u64;
+        let rowless_priv = PRIVATE_CHANNEL_ID_FLOOR + 79;
+        for cid in [PRIV, purging, deleted_pub, rowless_priv] {
+            channel(&s, cid, if cid == deleted_pub { 0 } else { 2 }, 10);
+            s.storage.add_channel_member(cid, "klv1member", 1, "member").unwrap();
+        }
+        s.storage.tombstone_channel(PRIV, 1, Some("klv1c")).unwrap();
+        s.storage.tombstone_channel(deleted_pub, 1, Some("klv1c")).unwrap();
+        // Mid-purge: CHANNELS gone, a purging lifecycle row, data left.
+        s.storage.delete_cf(cf::CHANNELS, &purging.to_be_bytes()).unwrap();
+        let row = br#"{"v":1,"state":"purging","since_ms":1,"deadline_ms":1,"reason":"no_local_member","phase":1}"#;
+        s.storage.put_cf(cf::PRIVATE_CHANNEL_LIFECYCLE, &purging.to_be_bytes(), row).unwrap();
+        // A private-range id whose row is missing with no tombstone at all.
+        s.storage.delete_cf(cf::CHANNELS, &rowless_priv.to_be_bytes()).unwrap();
+        for cid in [PRIV, purging, deleted_pub, rowless_priv] {
+            assert!(s.storage.exists_cf(cf::CHANNEL_MSGS, &encode_channel_msg_key(cid, 1_005, &mid(cid, 5))).unwrap());
+            let t = h(cid, 5);
+            for q in [
+                Q { around: Some(&t), ..NONE },
+                Q { after: Some(&t), ..NONE },
+                Q { before: Some(&t), ..NONE },
+                NONE,
+            ] {
+                for caller in [None, Some("klv1member")] {
+                    let (st, _) = call(&s, cid, Q { ..q }, caller).await;
+                    assert_eq!(st, StatusCode::NOT_FOUND, "cid {cid} caller {caller:?}");
+                }
+            }
+        }
+        // A public id with no row and no tombstone keeps today's behaviour.
+        let bare = 11u64;
+        put_msg(&s, bare, 0, "klv1author");
+        let v = json(&s, bare, NONE).await;
+        assert_eq!(ids(&v), vec![0]);
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_channel_row_fails_closed() {
+        let (s, _d) = state();
+        channel(&s, PRIV, 2, 3);
+        s.storage.put_cf(cf::CHANNELS, &PRIV.to_be_bytes(), b"{not json").unwrap();
+        let (st, _) = call(&s, PRIV, Q { around: Some(&h(PRIV, 1)), ..NONE }, None).await;
+        assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR);
+        let (st, _) = call(&s, PRIV, NONE, Some("klv1member")).await;
+        assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// Parity (decision P1): the REST endpoint applies no ForwardOnly join
+    /// floor in any mode — a member that joined after the target still gets
+    /// it (confidentiality comes from the epoch keys).
+    #[tokio::test]
+    async fn a_forward_only_pre_join_target_is_returned() {
+        let (s, _d) = state();
+        channel(&s, PRIV, 2, 10);
+        let meta = serde_json::json!({ "channel_id": PRIV, "channel_type": 2, "creator": "klv1c", "history_visibility": 0 });
+        s.storage.put_cf(cf::CHANNELS, &PRIV.to_be_bytes(), meta.to_string().as_bytes()).unwrap(); // 0 = ForwardOnly
+        s.storage.add_channel_member(PRIV, "klv1late", 1_000_000, "member").unwrap();
+        let (st, body) =
+            call(&s, PRIV, Q { around: Some(&h(PRIV, 2)), limit: Some(1), ..NONE }, Some("klv1late")).await;
+        assert_eq!(st, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["target_found"], serde_json::json!(true));
+        assert_eq!(ids(&v), vec![2]);
     }
 }

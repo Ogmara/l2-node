@@ -39,6 +39,27 @@ pub mod cf {
     /// LOCAL_CHANNEL_HOMES`). NODE-LOCAL; not in snapshot `DOMAIN_CFS` (which is only the
     /// anchored chain mirror) and not droppable.
     pub const LOCAL_CHANNEL_HOMES: &str = "local_channel_homes";
+    /// (wallet, 0xFF, channel_id_be8) → () — wallet-keyed secondary index of
+    /// `LOCAL_CHANNEL_HOMES` (l2-node 0.150.0, Phase E). Same key bytes as
+    /// `LOCAL_CHANNEL_FED`. Lets the private-sync requester enumerate the
+    /// private channels a wallet uses this node for (claim refresh, HOMES
+    /// retry sweep, the API claim gate) with one prefix scan.
+    ///
+    /// **Invariant: a candidate set only, never a retention input.**
+    /// `LOCAL_CHANNEL_HOMES` stays the single source of truth; this index
+    /// must never feed `has_local_member`, `local_member_scan`,
+    /// `single_host_creator_protected`, the purge start gates or any other
+    /// retention / purge decision. Every hit is verified against
+    /// `LOCAL_CHANNEL_HOMES` before it is acted on (the cheap API claim gate
+    /// excepted — its worst case is one extra claim verification). All
+    /// writes go through `Storage::stage_home_put` / `stage_home_delete`
+    /// (same `WriteBatch` as the HOMES row); the boot-time rebuild
+    /// (`Storage::rebuild_local_channel_homes_wallet_index`) adds missing
+    /// entries and removes orphans, so a divergence (e.g. a 0.149 binary
+    /// ran meanwhile) can only cost a missed or wasted backfill attempt,
+    /// never data. NODE-LOCAL; not in snapshot `DOMAIN_CFS` and not
+    /// droppable.
+    pub const LOCAL_CHANNEL_HOMES_BY_WALLET: &str = "local_channel_homes_by_wallet";
     /// channel_id_be8 → JSON `PrivateChannelLifecycleRow` — a private
     /// channel this node no longer has a local member for (or that its
     /// creator deleted), pending local cleanup (l2-node 0.149.0,
@@ -574,6 +595,7 @@ pub mod cf {
         ANCHORED_STATE,
         ANCHORED_REPAIR,
         LOCAL_CHANNEL_HOMES,
+        LOCAL_CHANNEL_HOMES_BY_WALLET,
         PRIVATE_CHANNEL_LIFECYCLE,
         PRIVATE_CHANNEL_SYNC_RESUME,
     ];
@@ -822,6 +844,20 @@ pub mod state_keys {
     /// sweeps progress independently. Empty means "start from the
     /// beginning".
     pub const PRIVATE_CHANNEL_SYNC_RETRY_CURSOR: &[u8] = b"private_channel_sync_retry_cursor";
+    /// Rotating cursor (raw `LOCAL_CHANNEL_HOMES_BY_WALLET` key bytes) for
+    /// the periodic HOMES private-channel-sync retry sweep
+    /// (`NetworkService::retry_incomplete_private_channel_syncs_homes`,
+    /// l2-node 0.150.0). Independent of `PRIVATE_CHANNEL_SYNC_RETRY_CURSOR`.
+    /// Empty means "start from the beginning".
+    pub const PRIVATE_CHANNEL_SYNC_HOMES_RETRY_CURSOR: &[u8] = b"private_channel_sync_homes_retry_cursor";
+    /// Resume cursor of the boot-time `LOCAL_CHANNEL_HOMES_BY_WALLET`
+    /// rebuild (`Storage::rebuild_local_channel_homes_wallet_index`, l2-node
+    /// 0.150.0): one pass byte (0 = adding missing entries from
+    /// `LOCAL_CHANNEL_HOMES`, 1 = removing orphan index entries) followed by
+    /// the last key examined in that pass. Present only while a budget-
+    /// capped rebuild is unfinished; deleted on completion (the rebuild runs
+    /// again from the start on the next boot).
+    pub const HOMES_WALLET_INDEX_CURSOR: &[u8] = b"homes_wallet_index_cursor";
     /// Sentinel: set to 1 once the one-time `LOCAL_CHANNEL_HOMES` seeding
     /// pass over `CHANNEL_MEMBERS ∩ (LOCAL_DM_USERS ∪ CHANNEL_READ_STATE)`
     /// has reached the end of the private-channel member range (l2-node
@@ -1293,6 +1329,33 @@ pub fn encode_local_channel_home_key(channel_id: u64, wallet: &str) -> Vec<u8> {
     key.extend_from_slice(&channel_id.to_be_bytes());
     key.extend_from_slice(wallet.as_bytes());
     key
+}
+
+/// Encode a `LOCAL_CHANNEL_HOMES_BY_WALLET` key: (wallet, 0xFF,
+/// channel_id_be8) — byte-identical to [`encode_local_channel_fed_key`].
+/// Takes raw wallet bytes (a HOMES key's wallet suffix); pass
+/// `wallet.as_bytes()` for an address string.
+pub fn encode_local_channel_home_wallet_key(wallet: &[u8], channel_id: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(wallet.len() + 1 + 8);
+    key.extend_from_slice(wallet);
+    key.push(0xFF);
+    key.extend_from_slice(&channel_id.to_be_bytes());
+    key
+}
+
+/// Split a `(wallet, 0xFF, channel_id_be8)` key (`LOCAL_CHANNEL_FED`,
+/// `LOCAL_CHANNEL_HOMES_BY_WALLET`) into `(wallet bytes, channel_id)`.
+/// `None` for a key of any other shape.
+pub fn decode_wallet_channel_key(key: &[u8]) -> Option<(&[u8], u64)> {
+    if key.len() < 10 {
+        return None;
+    }
+    let (wallet, rest) = key.split_at(key.len() - 9);
+    if rest[0] != 0xFF {
+        return None;
+    }
+    let cid = u64::from_be_bytes(<[u8; 8]>::try_from(&rest[1..]).ok()?);
+    Some((wallet, cid))
 }
 
 /// Kind byte for `CHANNEL_ROLE_WATERMARKS` keys (spec 03 §3.5).

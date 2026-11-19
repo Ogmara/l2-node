@@ -1112,6 +1112,7 @@ mod http {
                 .unwrap();
         }
         let storage = r.storage().clone();
+        let app_storage = storage.clone();
         let identity = r.identity().clone();
         let mut state = AppState::new(
             storage,
@@ -1147,6 +1148,13 @@ mod http {
         assert_eq!(res.status(), StatusCode::OK);
         assert!(rx.try_recv().is_err(), "no LOCAL_CHANNEL_FED row → nothing forwarded");
         assert!(t.wallet_claim.unwrap().device.is_none());
+        // l2-node 0.150.0 (Phase E): a wallet with only a LOCAL_CHANNEL_HOMES
+        // row (no federation) is processed too.
+        app_storage.put_local_channel_home_for_test(cid, &c.addr, T, T).unwrap();
+        let res = post(&app, &c, cid, body(&[&c]), Some(wallet_claim(&c, now()))).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let t = rx.try_recv().expect("HOMES-only wallet's claim forwarded");
+        assert_eq!((t.channel_id, t.wallet.as_str()), (None, c.addr.as_str()));
         // A second valid claim inside the minute is not forwarded.
         let res = post(&app, &j1, cid, body(&[&j1]), Some(wallet_claim(&j1, now()))).await;
         assert_eq!(res.status(), StatusCode::OK);

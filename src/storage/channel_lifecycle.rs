@@ -11,6 +11,12 @@
 //!   private channel `cid`. Written only for an authenticated caller acting
 //!   as itself on a channel it is a member of (`record_local_channel_home`),
 //!   and by the boot-time seeding below.
+//! - `LOCAL_CHANNEL_HOMES_BY_WALLET` (`wallet ‖ 0xFF ‖ cid_be8` → empty,
+//!   l2-node 0.150.0): wallet-keyed index of the HOMES rows, written and
+//!   deleted only together with them ([`Storage::stage_home_put`] /
+//!   [`Storage::stage_home_delete`]). It only ENUMERATES private-sync
+//!   backfill candidates; it is never a retention or purge input (see
+//!   [`Storage::has_local_member`]).
 //! - `PRIVATE_CHANNEL_LIFECYCLE` (`cid_be8` → JSON
 //!   [`PrivateChannelLifecycleRow`]): the channel has no local member any
 //!   more (or its creator deleted it) and is pending local cleanup. While a
@@ -222,6 +228,22 @@ pub struct LocalHomeOutcome {
     /// channel is subscribed again and its gap backfilled.
     pub cancelled: bool,
 }
+
+/// What one boot-time `LOCAL_CHANNEL_HOMES_BY_WALLET` rebuild call did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HomesIndexRebuildReport {
+    /// Index entries added for HOMES rows that had none.
+    pub added: usize,
+    /// Index entries removed because no HOMES row backs them.
+    pub orphans_removed: usize,
+    /// Both passes reached the end (`false` = paused at the budget; the
+    /// next call resumes from `HOMES_WALLET_INDEX_CURSOR`).
+    pub done: bool,
+}
+
+/// Rebuild pass byte stored at the head of `HOMES_WALLET_INDEX_CURSOR`.
+const REBUILD_PASS_ADD: u8 = 0;
+const REBUILD_PASS_ORPHANS: u8 = 1;
 
 /// What the boot-time lifecycle preparation did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -463,6 +485,13 @@ impl Storage {
     /// `true` if some wallet with a `LOCAL_CHANNEL_HOMES` row for
     /// `channel_id` is currently a member (plan §1 predicate). Hitting the
     /// scan cap counts as `true`.
+    ///
+    /// Reads `LOCAL_CHANNEL_HOMES` ONLY. The wallet-keyed index
+    /// `LOCAL_CHANNEL_HOMES_BY_WALLET` (l2-node 0.150.0) is a backfill
+    /// candidate set and must never feed this predicate, `local_member_scan`,
+    /// `single_host_creator_protected` or any purge / retention gate — an
+    /// index entry is not evidence of anything (test
+    /// `has_local_member_ignores_the_wallet_index`).
     pub fn has_local_member(&self, channel_id: u64) -> Result<bool> {
         Ok(self.local_member_scan(channel_id, None)?.0)
     }
@@ -684,9 +713,7 @@ impl Storage {
                 .map(|(f, _)| f)
                 .unwrap_or(now_ms);
             let mut batch = WriteBatch::default();
-            let homes = self.cf_handle(cf::LOCAL_CHANNEL_HOMES)?;
-            batch.put_cf(&homes, &home_key, encode_home(first, now_ms));
-            drop(homes);
+            self.stage_home_put(&mut batch, channel_id, wallet.as_bytes(), &encode_home(first, now_ms))?;
             let cancelled = self
                 .private_channel_lifecycle_row(channel_id)
                 .ok()
@@ -720,9 +747,227 @@ impl Storage {
         if self.exists_cf(cf::LOCAL_CHANNEL_HOMES, &key)? {
             return Ok(false);
         }
-        let handle = self.cf_handle(cf::LOCAL_CHANNEL_HOMES)?;
-        batch.put_cf(&handle, &key, encode_home(seen_ms, seen_ms));
+        self.stage_home_put(batch, channel_id, wallet, &encode_home(seen_ms, seen_ms))?;
         Ok(true)
+    }
+
+    /// Stage a `LOCAL_CHANNEL_HOMES` row for `(channel_id, wallet)` AND its
+    /// `LOCAL_CHANNEL_HOMES_BY_WALLET` index entry in one batch. THE only
+    /// way any code path writes a HOMES row (l2-node 0.150.0).
+    pub(super) fn stage_home_put(
+        &self,
+        batch: &mut WriteBatch,
+        channel_id: u64,
+        wallet: &[u8],
+        value: &[u8],
+    ) -> Result<()> {
+        let mut home_key = channel_id.to_be_bytes().to_vec();
+        home_key.extend_from_slice(wallet);
+        let homes = self.cf_handle(cf::LOCAL_CHANNEL_HOMES)?;
+        batch.put_cf(&homes, &home_key, value);
+        drop(homes);
+        let index = self.cf_handle(cf::LOCAL_CHANNEL_HOMES_BY_WALLET)?;
+        batch.put_cf(
+            &index,
+            schema::encode_local_channel_home_wallet_key(wallet, channel_id),
+            [],
+        );
+        Ok(())
+    }
+
+    /// Stage the delete of the `LOCAL_CHANNEL_HOMES` row `home_key`
+    /// (`cid_be8 ‖ wallet`) AND its `LOCAL_CHANNEL_HOMES_BY_WALLET` entry.
+    /// THE only way any code path deletes a HOMES row (l2-node 0.150.0).
+    pub(super) fn stage_home_delete(&self, batch: &mut WriteBatch, home_key: &[u8]) -> Result<()> {
+        let homes = self.cf_handle(cf::LOCAL_CHANNEL_HOMES)?;
+        batch.delete_cf(&homes, home_key);
+        drop(homes);
+        if let Some(cid) = home_key
+            .get(..8)
+            .and_then(|b| <[u8; 8]>::try_from(b).ok())
+            .map(u64::from_be_bytes)
+        {
+            let index = self.cf_handle(cf::LOCAL_CHANNEL_HOMES_BY_WALLET)?;
+            batch.delete_cf(
+                &index,
+                schema::encode_local_channel_home_wallet_key(&home_key[8..], cid),
+            );
+        }
+        Ok(())
+    }
+
+    /// Test-only: write a HOMES row for `(channel_id, wallet)` the way the
+    /// production writers do (row + index entry, one batch) without any of
+    /// their membership checks.
+    #[cfg(test)]
+    pub(crate) fn put_local_channel_home_for_test(
+        &self,
+        channel_id: u64,
+        wallet: &str,
+        first_seen_ms: u64,
+        last_seen_ms: u64,
+    ) -> Result<()> {
+        let mut batch = WriteBatch::default();
+        self.stage_home_put(&mut batch, channel_id, wallet.as_bytes(), &encode_home(first_seen_ms, last_seen_ms))?;
+        self.write_batch(batch)
+    }
+
+    /// Test-only: forget that the one-time HOMES seeding ran, so it runs
+    /// again from the start.
+    #[cfg(test)]
+    pub(crate) fn reset_homes_seeding_for_test(&self) -> Result<()> {
+        self.delete_cf(cf::NODE_STATE, state_keys::PRIVATE_CHANNEL_HOMES_SEEDED_V1)?;
+        self.lifecycle.homes_seeded.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    /// Up to `cap` PRIVATE channel ids `wallet` has a `LOCAL_CHANNEL_HOMES`
+    /// row for, enumerated through the `LOCAL_CHANNEL_HOMES_BY_WALLET`
+    /// index and each VERIFIED against `LOCAL_CHANNEL_HOMES` — an orphan
+    /// entry or a public id is skipped. Reads at most `2 × cap` index
+    /// entries and stops after `cap` verified hits, so a few orphan or
+    /// public-id entries cannot hide valid channels. Backfill candidates
+    /// only (never a retention input).
+    pub fn local_home_channels_for_wallet(&self, wallet: &str, cap: usize) -> Result<Vec<u64>> {
+        let prefix = schema::encode_local_channel_fed_prefix(wallet);
+        let rows = self.prefix_iter_cf(cf::LOCAL_CHANNEL_HOMES_BY_WALLET, &prefix, cap.saturating_mul(2))?;
+        let mut out = Vec::with_capacity(cap.min(rows.len()));
+        for (key, _) in &rows {
+            if out.len() >= cap {
+                break;
+            }
+            let Some(cid) = key
+                .get(prefix.len()..)
+                .and_then(|b| <[u8; 8]>::try_from(b).ok())
+                .map(u64::from_be_bytes)
+            else {
+                continue;
+            };
+            if is_private_id(cid)
+                && self.exists_cf(cf::LOCAL_CHANNEL_HOMES, &schema::encode_local_channel_home_key(cid, wallet))?
+            {
+                out.push(cid);
+            }
+        }
+        Ok(out)
+    }
+
+    /// `true` when `wallet` has at least one `LOCAL_CHANNEL_HOMES_BY_WALLET`
+    /// entry. UNVERIFIED (one prefix seek): the cheap gate in front of the
+    /// API's pchansync claim verification, whose worst case for an orphan
+    /// entry is one wasted verification per wallet per 60 s. A read error
+    /// reads as `false`.
+    pub fn wallet_has_local_home_index(&self, wallet: &str) -> bool {
+        self.count_prefix_cf(
+            cf::LOCAL_CHANNEL_HOMES_BY_WALLET,
+            &schema::encode_local_channel_fed_prefix(wallet),
+            1,
+        )
+        .is_ok_and(|n| n > 0)
+    }
+
+    /// Boot-time repair of `LOCAL_CHANNEL_HOMES_BY_WALLET` (l2-node 0.150.0),
+    /// run on EVERY boot before the network task starts: pass 0 walks
+    /// `LOCAL_CHANNEL_HOMES` and adds every missing index entry; pass 1
+    /// walks the index and removes every entry without a HOMES row (an
+    /// orphan, e.g. left by a 0.149 binary's purge after a downgrade).
+    /// Examines at most `budget` rows per call over both passes and resumes
+    /// from `HOMES_WALLET_INDEX_CURSOR`; each chunk is decided and written
+    /// under `channel_membership_lock`, re-checking HOMES there. Idempotent.
+    /// Never touches `LOCAL_CHANNEL_HOMES` itself.
+    pub fn rebuild_local_channel_homes_wallet_index(&self, budget: usize) -> Result<HomesIndexRebuildReport> {
+        let budget = budget.max(1);
+        let mut report = HomesIndexRebuildReport::default();
+        let (mut pass, mut cursor) = match self.get_cf(cf::NODE_STATE, state_keys::HOMES_WALLET_INDEX_CURSOR)? {
+            Some(raw) if raw.first().is_some_and(|p| *p <= REBUILD_PASS_ORPHANS) => (raw[0], raw[1..].to_vec()),
+            // Absent or unreadable: start over (every pass is idempotent).
+            _ => (REBUILD_PASS_ADD, Vec::new()),
+        };
+        let mut examined = 0usize;
+        loop {
+            if examined >= budget {
+                let mut raw = Vec::with_capacity(1 + cursor.len());
+                raw.push(pass);
+                raw.extend_from_slice(&cursor);
+                self.put_cf(cf::NODE_STATE, state_keys::HOMES_WALLET_INDEX_CURSOR, &raw)?;
+                return Ok(report);
+            }
+            let take = HOMES_SEED_BATCH.min(budget - examined);
+            let cf_name = if pass == REBUILD_PASS_ADD {
+                cf::LOCAL_CHANNEL_HOMES
+            } else {
+                cf::LOCAL_CHANNEL_HOMES_BY_WALLET
+            };
+            let rows = if cursor.is_empty() {
+                self.prefix_iter_cf(cf_name, &[], take)?
+            } else {
+                self.prefix_iter_cf_after(cf_name, &cursor, &[], take)?
+            };
+            let exhausted = rows.len() < take;
+            examined += rows.len();
+            let (added, removed) = self.with_channel_membership_lock(|| -> Result<(usize, usize)> {
+                let mut batch = WriteBatch::default();
+                let (mut added, mut removed) = (0usize, 0usize);
+                let index = self.cf_handle(cf::LOCAL_CHANNEL_HOMES_BY_WALLET)?;
+                for (key, _) in &rows {
+                    if pass == REBUILD_PASS_ADD {
+                        let Some(cid) = key
+                            .get(..8)
+                            .and_then(|b| <[u8; 8]>::try_from(b).ok())
+                            .map(u64::from_be_bytes)
+                        else {
+                            continue;
+                        };
+                        let wallet = &key[8..];
+                        if wallet.is_empty() {
+                            continue;
+                        }
+                        let idx = schema::encode_local_channel_home_wallet_key(wallet, cid);
+                        if !self.exists_cf(cf::LOCAL_CHANNEL_HOMES_BY_WALLET, &idx)?
+                            && self.exists_cf(cf::LOCAL_CHANNEL_HOMES, key)?
+                        {
+                            batch.put_cf(&index, &idx, []);
+                            added += 1;
+                        }
+                    } else {
+                        // A key of any other shape cannot be backed by a
+                        // HOMES row: it is an orphan too.
+                        let backed = match schema::decode_wallet_channel_key(key) {
+                            Some((wallet, cid)) => {
+                                let mut home_key = cid.to_be_bytes().to_vec();
+                                home_key.extend_from_slice(wallet);
+                                self.exists_cf(cf::LOCAL_CHANNEL_HOMES, &home_key)?
+                            }
+                            None => false,
+                        };
+                        if !backed && self.exists_cf(cf::LOCAL_CHANNEL_HOMES_BY_WALLET, key)? {
+                            batch.delete_cf(&index, key);
+                            removed += 1;
+                        }
+                    }
+                }
+                drop(index);
+                if added + removed > 0 {
+                    self.write_batch(batch)?;
+                }
+                Ok((added, removed))
+            })?;
+            report.added += added;
+            report.orphans_removed += removed;
+            if let Some((key, _)) = rows.last() {
+                cursor = key.clone();
+            }
+            if exhausted {
+                if pass == REBUILD_PASS_ADD {
+                    pass = REBUILD_PASS_ORPHANS;
+                    cursor.clear();
+                    continue;
+                }
+                self.delete_cf(cf::NODE_STATE, state_keys::HOMES_WALLET_INDEX_CURSOR)?;
+                report.done = true;
+                return Ok(report);
+            }
+        }
     }
 
     /// `true` if `channel_id`'s `CHANNELS` row exists and is Private.
@@ -1034,12 +1279,10 @@ mod tests {
     fn predicate_cap_is_conservative() {
         let (s, _d) = seeded_db();
         let cid = pcid(2);
-        let h = s.cf_handle(cf::LOCAL_CHANNEL_HOMES).unwrap();
         let mut b = WriteBatch::default();
         for i in 0..HAS_LOCAL_MEMBER_SCAN_CAP {
-            b.put_cf(&h, schema::encode_local_channel_home_key(cid, &format!("klv1w{i}")), encode_home(NOW, NOW));
+            s.stage_home_put(&mut b, cid, format!("klv1w{i}").as_bytes(), &encode_home(NOW, NOW)).unwrap();
         }
-        drop(h);
         s.write_batch(b).unwrap();
         assert!(s.has_local_member(cid).unwrap(), "cap hit → treated as having a local member");
     }
@@ -1117,7 +1360,7 @@ mod tests {
         put_channel(&s, 9, 2); // legacy pre-floor row typed private
         s.add_channel_member(9, "klv1a", NOW, "member").unwrap();
         // Force a home row (the API would refuse one for a public id).
-        s.put_cf(cf::LOCAL_CHANNEL_HOMES, &schema::encode_local_channel_home_key(9, "klv1a"), &encode_home(NOW, NOW)).unwrap();
+        s.put_local_channel_home_for_test(9, "klv1a", NOW, NOW).unwrap();
         s.remove_channel_member_and_raise_epoch_floor(9, "klv1a").unwrap();
         assert!(row(&s, 9).is_none());
         s.tombstone_channel(9, NOW / 1000, None).unwrap();
@@ -1400,5 +1643,150 @@ mod tests {
         // below migration time + grace.
         let d = row(&s, cid).unwrap().deadline_ms.unwrap();
         assert!(d >= NOW + 50 * HOUR + DEFAULT_PURGE_GRACE_HOURS * HOUR);
+    }
+
+    // ---- l2-node 0.150.0 (Phase E): LOCAL_CHANNEL_HOMES_BY_WALLET ----
+
+    fn idx(s: &Storage, cid: u64, w: &str) -> bool {
+        s.exists_cf(cf::LOCAL_CHANNEL_HOMES_BY_WALLET, &schema::encode_local_channel_home_wallet_key(w.as_bytes(), cid))
+            .unwrap()
+    }
+
+    fn home(s: &Storage, cid: u64, w: &str) -> bool {
+        s.exists_cf(cf::LOCAL_CHANNEL_HOMES, &schema::encode_local_channel_home_key(cid, w)).unwrap()
+    }
+
+    /// Every HOMES row has its index entry and every index entry its HOMES
+    /// row (the invariant the writers keep; the rebuild restores it).
+    fn assert_homes_index_mirror(s: &Storage) {
+        let homes = s.prefix_iter_cf(cf::LOCAL_CHANNEL_HOMES, &[], 1_000_000).unwrap();
+        let index = s.prefix_iter_cf(cf::LOCAL_CHANNEL_HOMES_BY_WALLET, &[], 1_000_000).unwrap();
+        assert_eq!(homes.len(), index.len(), "HOMES and its wallet index differ in size");
+        for (k, _) in &homes {
+            let cid = u64::from_be_bytes(k[..8].try_into().unwrap());
+            let i = schema::encode_local_channel_home_wallet_key(&k[8..], cid);
+            assert!(s.exists_cf(cf::LOCAL_CHANNEL_HOMES_BY_WALLET, &i).unwrap(), "HOMES row without index entry");
+        }
+    }
+
+    #[test]
+    fn record_and_seed_write_the_wallet_index() {
+        let (s, _d) = db();
+        let a = pcid(50);
+        put_channel(&s, a, 2);
+        // record_local_channel_home (new row, refresh, cancel path).
+        local_member(&s, a, "klv1a");
+        assert!(home(&s, a, "klv1a") && idx(&s, a, "klv1a"));
+        assert!(s.record_local_channel_home(a, "klv1a", NOW + 2 * HOUR).unwrap().recorded);
+        // Seeding from LOCAL_DM_USERS / read state and from FED.
+        s.add_channel_member(a, "klv1dm", NOW, "member").unwrap();
+        s.put_cf(cf::LOCAL_DM_USERS, b"klv1dm", &schema::encode_local_dm_user(NOW, NOW)).unwrap();
+        assert_eq!(s.run_private_channel_homes_seeding(1000, NOW).unwrap(), (1, true));
+        assert!(home(&s, a, "klv1dm") && idx(&s, a, "klv1dm"));
+        s.put_cf(cf::LOCAL_CHANNEL_FED, &schema::encode_local_channel_fed_key("klv1fed", a), &NOW.to_be_bytes()).unwrap();
+        assert_eq!(s.seed_local_channel_homes_from_fed(NOW).unwrap(), 1);
+        assert!(home(&s, a, "klv1fed") && idx(&s, a, "klv1fed"));
+        assert_homes_index_mirror(&s);
+    }
+
+    #[test]
+    fn local_home_channels_for_wallet_verifies_homes_and_skips_public_ids() {
+        let (s, _d) = seeded_db();
+        let (a, b, orphan) = (pcid(51), pcid(52), pcid(53));
+        s.put_local_channel_home_for_test(a, "klv1w", NOW, NOW).unwrap();
+        s.put_local_channel_home_for_test(b, "klv1w", NOW, NOW).unwrap();
+        s.put_local_channel_home_for_test(9, "klv1w", NOW, NOW).unwrap(); // public id
+        s.put_local_channel_home_for_test(a, "klv1wx", NOW, NOW).unwrap(); // prefix-sharing wallet
+        // An orphan index entry (no HOMES row).
+        s.put_cf(cf::LOCAL_CHANNEL_HOMES_BY_WALLET, &schema::encode_local_channel_home_wallet_key(b"klv1w", orphan), &[])
+            .unwrap();
+        assert_eq!(s.local_home_channels_for_wallet("klv1w", 256).unwrap(), vec![a, b]);
+        assert_eq!(s.local_home_channels_for_wallet("klv1w", 1).unwrap(), vec![a], "a public-id entry ahead does not hide a valid channel");
+        assert_eq!(s.local_home_channels_for_wallet("klv1w", 2).unwrap(), vec![a, b], "stops after cap verified hits");
+        // Orphans sorting first: up to `cap` of them cannot starve valid ones.
+        let o = schema::encode_local_channel_home_wallet_key(b"klv1v", pcid(1));
+        s.put_cf(cf::LOCAL_CHANNEL_HOMES_BY_WALLET, &o, &[]).unwrap();
+        s.put_cf(cf::LOCAL_CHANNEL_HOMES_BY_WALLET, &schema::encode_local_channel_home_wallet_key(b"klv1v", pcid(2)), &[]).unwrap();
+        s.put_local_channel_home_for_test(pcid(55), "klv1v", NOW, NOW).unwrap();
+        s.put_local_channel_home_for_test(pcid(56), "klv1v", NOW, NOW).unwrap();
+        assert_eq!(s.local_home_channels_for_wallet("klv1v", 2).unwrap(), vec![pcid(55), pcid(56)]);
+        assert_eq!(s.local_home_channels_for_wallet("klv1nobody", 256).unwrap(), Vec::<u64>::new());
+        assert!(s.wallet_has_local_home_index("klv1w"));
+        assert!(!s.wallet_has_local_home_index("klv1nobody"));
+        // The cheap gate is unverified: an orphan-only wallet passes it…
+        s.put_cf(cf::LOCAL_CHANNEL_HOMES_BY_WALLET, &schema::encode_local_channel_home_wallet_key(b"klv1ghost", orphan), &[])
+            .unwrap();
+        assert!(s.wallet_has_local_home_index("klv1ghost"));
+        // …while the enumeration finds nothing for it.
+        assert!(s.local_home_channels_for_wallet("klv1ghost", 256).unwrap().is_empty());
+    }
+
+    /// Data-loss guard: the wallet index is a backfill candidate set only.
+    /// No index entry (with or without a HOMES row) ever makes a channel
+    /// count as having a local member, and deleting index entries changes
+    /// nothing either.
+    #[test]
+    fn has_local_member_ignores_the_wallet_index() {
+        let (s, _d) = seeded_db();
+        let cid = pcid(54);
+        put_channel(&s, cid, 2);
+        s.add_channel_member(cid, "klv1a", NOW, "member").unwrap();
+        // An index entry for a current member, without a HOMES row.
+        s.put_cf(cf::LOCAL_CHANNEL_HOMES_BY_WALLET, &schema::encode_local_channel_home_wallet_key(b"klv1a", cid), &[])
+            .unwrap();
+        assert!(!s.has_local_member(cid).unwrap(), "an index entry is not local evidence");
+        assert!(s.local_member_wallets(cid, 10).unwrap().is_empty());
+        // The real evidence, then the index entry deleted: still a member.
+        assert!(s.record_local_channel_home(cid, "klv1a", NOW).unwrap().recorded);
+        s.delete_cf(cf::LOCAL_CHANNEL_HOMES_BY_WALLET, &schema::encode_local_channel_home_wallet_key(b"klv1a", cid))
+            .unwrap();
+        assert!(s.has_local_member(cid).unwrap(), "HOMES alone decides");
+        // Removal scheduling also ignores it.
+        s.remove_channel_member_and_raise_epoch_floor(cid, "klv1a").unwrap();
+        assert!(row(&s, cid).is_some());
+    }
+
+    #[test]
+    fn rebuild_adds_missing_removes_orphans_is_idempotent_and_resumes() {
+        let (s, _d) = seeded_db();
+        // 0.149-style HOMES rows without index entries.
+        for i in 0..7u64 {
+            s.put_cf(cf::LOCAL_CHANNEL_HOMES, &schema::encode_local_channel_home_key(pcid(60 + i), "klv1old"), &encode_home(NOW, NOW))
+                .unwrap();
+        }
+        // Rows written by this release (already indexed).
+        s.put_local_channel_home_for_test(pcid(70), "klv1new", NOW, NOW).unwrap();
+        // Orphans left by a 0.149 purge (HOMES deleted, index kept).
+        for i in 0..5u64 {
+            s.put_cf(cf::LOCAL_CHANNEL_HOMES_BY_WALLET, &schema::encode_local_channel_home_wallet_key(b"klv1gone", pcid(80 + i)), &[])
+                .unwrap();
+        }
+        // A malformed index key is an orphan too.
+        s.put_cf(cf::LOCAL_CHANNEL_HOMES_BY_WALLET, b"junk", &[]).unwrap();
+        // Budget 2 per call: resumable across "boots".
+        let mut total = HomesIndexRebuildReport::default();
+        let mut calls = 0;
+        loop {
+            let r = s.rebuild_local_channel_homes_wallet_index(2).unwrap();
+            total.added += r.added;
+            total.orphans_removed += r.orphans_removed;
+            calls += 1;
+            assert!(calls < 50);
+            if r.done {
+                break;
+            }
+            assert!(s.get_cf(cf::NODE_STATE, state_keys::HOMES_WALLET_INDEX_CURSOR).unwrap().is_some());
+        }
+        assert!(calls > 3, "the rebuild resumed from its cursor");
+        assert_eq!((total.added, total.orphans_removed), (7, 6));
+        assert!(s.get_cf(cf::NODE_STATE, state_keys::HOMES_WALLET_INDEX_CURSOR).unwrap().is_none(), "cursor cleared");
+        assert_homes_index_mirror(&s);
+        assert_eq!(s.prefix_iter_cf(cf::LOCAL_CHANNEL_HOMES, &[], 100).unwrap().len(), 8, "HOMES itself is never touched");
+        // Idempotent.
+        let again = s.rebuild_local_channel_homes_wallet_index(1000).unwrap();
+        assert_eq!(again, HomesIndexRebuildReport { added: 0, orphans_removed: 0, done: true });
+        // An unreadable cursor restarts from the beginning.
+        s.put_cf(cf::NODE_STATE, state_keys::HOMES_WALLET_INDEX_CURSOR, &[9, 9]).unwrap();
+        assert!(s.rebuild_local_channel_homes_wallet_index(1000).unwrap().done);
     }
 }

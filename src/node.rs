@@ -1059,7 +1059,10 @@ impl Node {
         //    resumable; scheduling stays off until it completes);
         // 3. re-seed from LOCAL_CHANNEL_FED (every boot — covers federations
         //    made while an older binary ran);
-        // 4. downgrade re-arm + re-evaluation of pending rows.
+        // 4. rebuild of the LOCAL_CHANNEL_HOMES_BY_WALLET index (every boot,
+        //    budget-capped and resumable — adds missing entries, removes
+        //    orphans; l2-node 0.150.0, Phase E);
+        // 5. downgrade re-arm + re-evaluation of pending rows.
         storage.set_private_channel_policy(
             crate::storage::channel_lifecycle::PrivateChannelPolicy::new(
                 config.private_channels.purge_grace_hours,
@@ -1087,6 +1090,21 @@ impl Node {
                 Ok(0) => {}
                 Ok(n) => info!(seeded = n, "Private-channel local-member evidence re-seeded from federations"),
                 Err(e) => warn!(error = %e, "Re-seeding local-member evidence from federations failed"),
+            }
+            match storage.rebuild_local_channel_homes_wallet_index(
+                crate::storage::channel_lifecycle::HOMES_SEED_BUDGET_PER_BOOT,
+            ) {
+                Ok(r) => {
+                    if r.added > 0 || r.orphans_removed > 0 || !r.done {
+                        info!(
+                            added = r.added,
+                            orphans_removed = r.orphans_removed,
+                            done = r.done,
+                            "Private-channel local-homes wallet index rebuilt"
+                        );
+                    }
+                }
+                Err(e) => warn!(error = %e, "Rebuilding the local-homes wallet index failed; private-sync backfill for local-only members may be incomplete until next start"),
             }
             match storage.prepare_private_channel_lifecycle(now_ms) {
                 Ok(r) => {

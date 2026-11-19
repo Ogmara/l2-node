@@ -113,10 +113,14 @@ pub fn pchansync_claim_from_headers(headers: &axum::http::HeaderMap) -> Option<R
 
 /// Verify a raw pchansync claim for an authenticated caller and, when it
 /// verifies, forward it to the network task (`channel_id: None` — cache +
-/// re-evaluate the wallet's federated private channels).
+/// re-evaluate the wallet's private channels on this node).
 ///
-/// * Nothing happens for a wallet with no `LOCAL_CHANNEL_FED` row on this
-///   node (nothing to backfill; one prefix seek, before any signature work).
+/// * Nothing happens for a wallet with neither a `LOCAL_CHANNEL_FED` row
+///   nor a `LOCAL_CHANNEL_HOMES_BY_WALLET` entry on this node (nothing to
+///   backfill; at most two prefix seeks, before any signature work). The
+///   HOMES index entry is not verified here (l2-node 0.150.0): an orphan
+///   costs at most one claim verification per wallet per 60 s, after which
+///   the network task's refresh verifies every candidate and finds nothing.
 /// * `AppState::pchansync_claim_gate` (per wallet, 60 s) is set ONLY by a
 ///   fully verified, forwarded claim; while it holds, claims are skipped.
 /// * A device-signed claim whose own signature verified but has no
@@ -141,7 +145,7 @@ pub async fn process_pchansync_claim(
         .storage
         .count_prefix_cf(crate::storage::schema::cf::LOCAL_CHANNEL_FED, &fed_prefix, 1)
         .is_ok_and(|n| n > 0);
-    if !has_federated {
+    if !has_federated && !state.storage.wallet_has_local_home_index(wallet) {
         return;
     }
     if state.pchansync_claim_gate.get(wallet).await.is_some() {

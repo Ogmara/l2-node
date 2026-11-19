@@ -813,6 +813,10 @@ pub struct NetworkService {
     /// lifecycle row was written or removed by ANY ingress path — API, WS,
     /// gossip, sync, scanner). Taken by `run()`.
     lifecycle_rx: Option<tokio::sync::mpsc::UnboundedReceiver<u64>>,
+    /// How many times the private-sync no-host gate walked gossipsub's
+    /// `all_peers()` (`remote_subscribed_topics`) — lets tests assert one
+    /// walk per claim refresh / sweep tick, not one per channel.
+    remote_subscriber_walks: u64,
     /// `[private_channels] lifecycle_check_interval_secs` — cadence of the
     /// backstop pass (`lifecycle_backstop`).
     lifecycle_check_interval_secs: u64,
@@ -1385,11 +1389,16 @@ pub struct DmSubscribeEvent {
 /// None`, at most once per wallet per 60 s — `api::auth`): the network task
 /// then caches the claim and re-evaluates every private channel the wallet
 /// federated here, through the normal attempt throttle (no bypass).
+/// l2-node 0.150.0 (Phase E): "every private channel" is the union of the
+/// wallet's `LOCAL_CHANNEL_FED` rows and its `LOCAL_CHANNEL_HOMES` rows
+/// (through the `LOCAL_CHANNEL_HOMES_BY_WALLET` index), at most
+/// `MAX_CLAIM_REFRESH_CHANNELS` from each source.
 #[derive(Debug, Clone)]
 pub struct PrivateChannelSyncTrigger {
-    /// `Some` = one federated channel (federate call; a fresh claim may
-    /// bypass the attempt throttle down to its 60 s floor). `None` = every
-    /// private channel in `LOCAL_CHANNEL_FED` for `wallet`, never bypassing.
+    /// `Some` = one channel (federate call — a fresh claim may bypass the
+    /// attempt throttle down to its 60 s floor — or a cancelled cleanup).
+    /// `None` = every private channel in `LOCAL_CHANNEL_FED` ∪
+    /// `LOCAL_CHANNEL_HOMES` for `wallet`, never bypassing.
     pub channel_id: Option<u64>,
     /// The wallet whose membership/backfill this concerns.
     pub wallet: String,
@@ -1398,8 +1407,15 @@ pub struct PrivateChannelSyncTrigger {
 }
 
 /// Max private channels re-evaluated for one wallet per claim refresh
-/// (`PrivateChannelSyncTrigger { channel_id: None, .. }`).
+/// (`PrivateChannelSyncTrigger { channel_id: None, .. }`), PER SOURCE
+/// (`LOCAL_CHANNEL_FED` and the HOMES wallet index, l2-node 0.150.0 — so
+/// at most twice this many distinct channels per refresh).
 pub const MAX_CLAIM_REFRESH_CHANNELS: usize = 256;
+
+/// Lazily built snapshot of the gossip topics some connected peer
+/// subscribes (`NetworkService::remote_subscribed_topics`), shared across
+/// the channels one claim refresh / sweep tick evaluates (l2-node 0.150.0).
+type RemoteSubscriberCache = Option<HashSet<libp2p::gossipsub::TopicHash>>;
 
 /// Max wallets with a cached private-channel-sync claim (oldest/expired
 /// evicted first when full).
@@ -2470,6 +2486,7 @@ impl NetworkService {
             private_channel_sync_wallet_claims: HashMap::new(),
             lifecycle_unsubscribed: HashSet::new(),
             lifecycle_rx,
+            remote_subscriber_walks: 0,
             lifecycle_check_interval_secs: config.private_channels.lifecycle_check_interval_secs,
             lifecycle_dirty: HashSet::new(),
             lifecycle_unsub_cursor: 0,
@@ -3503,6 +3520,9 @@ impl NetworkService {
                     // history (F2 backfill gap) — see
                     // `retry_incomplete_private_channel_syncs`'s doc comment.
                     self.retry_incomplete_private_channel_syncs();
+                    // l2-node 0.150.0 (Phase E): the same for local
+                    // members recorded only in LOCAL_CHANNEL_HOMES.
+                    self.retry_incomplete_private_channel_syncs_homes();
                     // l2-node 0.141.0: drop refilled responder-budget
                     // entries (never one in debt) and long-idle throttle
                     // entries.
@@ -5394,11 +5414,16 @@ impl NetworkService {
     /// A wallet presented a fresh, verified pchansync claim on an
     /// authenticated REST request or WS connect (l2-node 0.142.0, at most
     /// once per wallet per 60 s — gated in the API layer). Cache it and
-    /// re-evaluate every private channel the wallet federated here
-    /// (`LOCAL_CHANNEL_FED`, at most `MAX_CLAIM_REFRESH_CHANNELS`) through
-    /// the normal attempt throttle and completion due-gate — never the
-    /// federate bypass, so an active client cannot defeat the 0.141.0
-    /// in-sync recheck interval.
+    /// re-evaluate every private channel the wallet has local standing for
+    /// here through the normal attempt throttle and completion due-gate —
+    /// never the federate bypass, so an active client cannot defeat the
+    /// 0.141.0 in-sync recheck interval.
+    ///
+    /// l2-node 0.150.0 (Phase E): the channels are the union of the
+    /// wallet's `LOCAL_CHANNEL_FED` rows and its (verified)
+    /// `LOCAL_CHANNEL_HOMES` rows, at most `MAX_CLAIM_REFRESH_CHANNELS`
+    /// from each source, deduplicated by channel id. The claim is cached
+    /// only when that union is non-empty (N3).
     fn refresh_private_channel_sync_claim(
         &mut self,
         wallet: &str,
@@ -5408,36 +5433,95 @@ impl NetworkService {
         if !self.private_channel_sync_config.enabled {
             return;
         }
-        let mut prefix = wallet.as_bytes().to_vec();
-        prefix.push(0xFF);
-        let rows = match self.storage.prefix_iter_cf(
+        let channels = self.private_sync_refresh_channels(wallet);
+        // N3: a wallet with nothing federated and no local home here has
+        // nothing to backfill — its claim is not cached at all.
+        if channels.is_empty() {
+            return;
+        }
+        self.cache_private_channel_sync_claim(wallet, claim);
+        // One subscriber snapshot for the whole refresh (≤ 512 channels).
+        let mut subscribers: RemoteSubscriberCache = None;
+        for cid in channels {
+            // `None`: the cached (freshest) claim is picked up inside.
+            self.maybe_trigger_private_channel_sync_with(cid, wallet, None, false, &mut subscribers);
+        }
+    }
+
+    /// The private channels a claim refresh re-evaluates for `wallet`
+    /// (l2-node 0.150.0, Phase E): its `LOCAL_CHANNEL_FED` rows and its
+    /// verified `LOCAL_CHANNEL_HOMES` rows (through the wallet index), at
+    /// most `MAX_CLAIM_REFRESH_CHANNELS` from EACH source (so a wallet with
+    /// many federations cannot starve its local-only channels), deduplicated
+    /// by channel id. A read error of one source only drops that source.
+    fn private_sync_refresh_channels(&self, wallet: &str) -> std::collections::BTreeSet<u64> {
+        let prefix = crate::storage::schema::encode_local_channel_fed_prefix(wallet);
+        let fed_rows = match self.storage.prefix_iter_cf(
             crate::storage::schema::cf::LOCAL_CHANNEL_FED,
             &prefix,
             MAX_CLAIM_REFRESH_CHANNELS,
         ) {
             Ok(r) => r,
             Err(e) => {
-                warn!(error = %e, %wallet, "private-channel-sync claim refresh: LOCAL_CHANNEL_FED read failed");
-                return;
+                warn!(error = %e, "private-channel-sync claim refresh: LOCAL_CHANNEL_FED read failed");
+                Vec::new()
             }
         };
-        // N3: a wallet with nothing federated here has nothing to backfill —
-        // its claim is not cached at all.
-        if rows.is_empty() {
-            return;
-        }
-        self.cache_private_channel_sync_claim(wallet, claim);
-        for (key, _) in rows {
-            let Some(cid) = key
-                .get(prefix.len()..)
-                .and_then(|b| <[u8; 8]>::try_from(b).ok())
-                .map(u64::from_be_bytes)
-            else {
-                continue;
-            };
-            // `None`: the cached (freshest) claim is picked up inside.
-            self.maybe_trigger_private_channel_sync(cid, wallet, None, false);
-        }
+        let homes = match self
+            .storage
+            .local_home_channels_for_wallet(wallet, MAX_CLAIM_REFRESH_CHANNELS)
+        {
+            Ok(h) => h,
+            Err(e) => {
+                warn!(error = %e, "private-channel-sync claim refresh: local-homes index read failed");
+                Vec::new()
+            }
+        };
+        self.counters
+            .add_private_sync_homes_pairs_evaluated(homes.len() as u64);
+        let mut channels: std::collections::BTreeSet<u64> = fed_rows
+            .iter()
+            .filter_map(|(key, _)| {
+                key.get(prefix.len()..)
+                    .and_then(|b| <[u8; 8]>::try_from(b).ok())
+                    .map(u64::from_be_bytes)
+            })
+            .collect();
+        channels.extend(homes);
+        channels
+    }
+
+    /// Every topic some connected peer subscribes (any peer whose
+    /// subscription announcement we hold — gossipsub tracks those even while
+    /// this node is itself off the topic, e.g. while a lifecycle row is
+    /// pending; mesh peers are a subset). ONE walk of `all_peers()`, which
+    /// allocates per peer and costs O(sum of topics over peers): callers
+    /// build it at most once per claim refresh / sweep tick / single
+    /// trigger (lazily, through [`RemoteSubscriberCache`]) and look every
+    /// channel up in it, never one walk per channel (round-1 audit W1).
+    fn remote_subscribed_topics(&mut self) -> HashSet<libp2p::gossipsub::TopicHash> {
+        self.remote_subscriber_walks = self.remote_subscriber_walks.saturating_add(1);
+        self.swarm
+            .behaviour()
+            .gossipsub
+            .all_peers()
+            .flat_map(|(_, topics)| topics.into_iter().cloned())
+            .collect()
+    }
+
+    /// [`maybe_trigger_private_channel_sync_with`] for a single trigger (its
+    /// own lazily built subscriber snapshot).
+    ///
+    /// [`maybe_trigger_private_channel_sync_with`]: Self::maybe_trigger_private_channel_sync_with
+    fn maybe_trigger_private_channel_sync(
+        &mut self,
+        channel_id: u64,
+        wallet: &str,
+        wallet_claim: Option<private_channel_sync::WalletAuthClaim>,
+        bypass: bool,
+    ) {
+        let mut subscribers: RemoteSubscriberCache = None;
+        self.maybe_trigger_private_channel_sync_with(channel_id, wallet, wallet_claim, bypass, &mut subscribers);
     }
 
     /// One-time-per-due-window bounded backfill of a single private
@@ -5454,12 +5538,17 @@ impl NetworkService {
     /// `bypass` (l2-node 0.142.0): only a `federate_channel` call carrying a
     /// fresh claim passes `true` (the 60 s-floored throttle bypass); the
     /// periodic sweep and the auth-path claim refresh pass `false`.
-    fn maybe_trigger_private_channel_sync(
+    ///
+    /// `subscribers` (l2-node 0.150.0): the caller's lazily built snapshot of
+    /// remotely subscribed topics for the no-host gate, shared across every
+    /// channel a refresh or sweep tick evaluates.
+    fn maybe_trigger_private_channel_sync_with(
         &mut self,
         channel_id: u64,
         wallet: &str,
         wallet_claim: Option<private_channel_sync::WalletAuthClaim>,
         bypass: bool,
+        subscribers: &mut RemoteSubscriberCache,
     ) {
         if !self.private_channel_sync_config.enabled {
             return;
@@ -5483,7 +5572,50 @@ impl NetworkService {
         if !matches!(self.storage.wallet_has_local_channel_standing(channel_id, wallet), Ok(true)) {
             return;
         }
+        // Cheap in-memory READS first (no state moves): a pair already in
+        // flight, or one the attempt throttle would hold back anyway, needs
+        // no further work — in particular not the no-host gate below.
         let key = (wallet.to_string(), channel_id);
+        if self.private_channel_sync_triggered.contains(&key)
+            || !self.private_channel_sync_throttle.ready_or_bypass(
+                &key,
+                Instant::now(),
+                bypass && wallet_claim.is_some(),
+            )
+        {
+            return;
+        }
+        // l2-node 0.150.0 (Phase E): a pair WITHOUT a `LOCAL_CHANNEL_FED`
+        // row (standing only from membership or a `LOCAL_CHANNEL_HOMES`
+        // row — e.g. a channel created here) may have no other host at all;
+        // asking random peers would only waste fanout and tell them that
+        // this wallet is in this channel. Such a pair is evaluated only
+        // while some peer subscribes the channel's topic (a node that
+        // federated it from us can still hold history we missed). Checked
+        // before any throttle state moves. A FED read error counts as
+        // "not federated" (the stricter gate).
+        let fed = matches!(
+            self.storage.exists_cf(
+                crate::storage::schema::cf::LOCAL_CHANNEL_FED,
+                &crate::storage::schema::encode_local_channel_fed_key(wallet, channel_id),
+            ),
+            Ok(true)
+        );
+        let topic_hash = libp2p::gossipsub::IdentTopic::new(gossip::channel_topic(
+            self.topics.network_id(),
+            channel_id,
+        ))
+        .hash();
+        if !fed {
+            if subscribers.is_none() {
+                *subscribers = Some(self.remote_subscribed_topics());
+            }
+            if !subscribers.as_ref().is_some_and(|set| set.contains(&topic_hash)) {
+                self.counters.inc_private_sync_skipped_no_host();
+                debug!(channel_id, "private-channel-sync: no peer subscribes the channel; non-federated pair skipped");
+                return;
+            }
+        }
         if !self.private_channel_sync_triggered.insert(key.clone()) {
             // Already in flight (or due-but-not-yet-resolved) this
             // session — don't pile another request on top of it.
@@ -5593,13 +5725,13 @@ impl NetworkService {
         }
 
         // Candidate selection: GossipSub mesh peers for this channel's
-        // topic; fall back to any connected peer if the mesh is sparse. A
-        // same-peer continuation asks only that peer.
-        let topic = libp2p::gossipsub::IdentTopic::new(gossip::channel_topic(
-            self.topics.network_id(),
-            channel_id,
-        ));
-        let topic_hash = topic.hash();
+        // topic; for a federated pair, fall back to any connected peer if
+        // the mesh is sparse. A non-federated pair (l2-node 0.150.0) asks
+        // ONLY peers subscribed to the topic (mesh first, then any peer
+        // that announced the subscription) — never an arbitrary connected
+        // peer, which would receive the signed wallet claim and the channel
+        // id with nothing to give. A same-peer continuation asks only that
+        // peer.
         let mut candidates: Vec<PeerId> = match resume_peer {
             Some(peer) => vec![peer],
             None => self
@@ -5610,7 +5742,17 @@ impl NetworkService {
                 .copied()
                 .collect(),
         };
-        if resume_peer.is_none() && candidates.len() < private_channel_sync::FANOUT {
+        if resume_peer.is_none() && !fed && candidates.len() < private_channel_sync::FANOUT {
+            for (p, topics) in self.swarm.behaviour().gossipsub.all_peers() {
+                if candidates.len() >= private_channel_sync::FANOUT * 2 {
+                    break;
+                }
+                if topics.iter().any(|t| **t == topic_hash) && !candidates.contains(p) {
+                    candidates.push(*p);
+                }
+            }
+        }
+        if resume_peer.is_none() && fed && candidates.len() < private_channel_sync::FANOUT {
             for p in self.swarm.connected_peers() {
                 if !candidates.contains(p) {
                     candidates.push(*p);
@@ -5642,7 +5784,7 @@ impl NetworkService {
         let network = self.topics.network_id().to_string();
         let now = now_ms();
         info!(
-            %wallet, channel_id,
+            channel_id,
             fanout = candidates.len(),
             "private-channel-sync: triggering bounded private-channel backfill"
         );
@@ -6185,7 +6327,7 @@ impl NetworkService {
                         }
                     }
                 }
-                info!(peer = %peer, %wallet, channel_id, received = count, admitted, dropped, has_more = response.has_more, "private-channel-sync: applied batch");
+                info!(peer = %peer, channel_id, received = count, admitted, dropped, has_more = response.has_more, "private-channel-sync: applied batch");
 
                 // Two-phase state machine (round 4): per-phase page
                 // budgets, strictly advancing cursors, no metadata page
@@ -6372,6 +6514,9 @@ impl NetworkService {
         };
         let hit_end = entries.len() < batch;
         let mut last_key: Option<Vec<u8>> = None;
+        // One subscriber snapshot per sweep tick (only built if a
+        // non-federated pair needs it — never here in practice).
+        let mut subscribers: RemoteSubscriberCache = None;
         for (key, _) in &entries {
             // Key: wallet bytes ++ 0xFF ++ channel_id_be8. Wallet
             // addresses are bech32 (ASCII, never contains 0xFF), so the
@@ -6383,7 +6528,7 @@ impl NetworkService {
                         <[u8; 8]>::try_from(&key[sep + 1..]),
                     ) {
                         let channel_id = u64::from_be_bytes(channel_id_bytes);
-                        self.maybe_trigger_private_channel_sync(channel_id, wallet, None, false);
+                        self.maybe_trigger_private_channel_sync_with(channel_id, wallet, None, false, &mut subscribers);
                     }
                 }
             }
@@ -6400,6 +6545,88 @@ impl NetworkService {
             &next_cursor,
         ) {
             warn!(error = %e, "private-channel-sync retry sweep: failed to persist cursor");
+        }
+    }
+
+    /// Periodic retry sweep for private-channel-sync pairs recorded only in
+    /// `LOCAL_CHANNEL_HOMES` (l2-node 0.150.0, Phase E). Walks the
+    /// `LOCAL_CHANNEL_HOMES_BY_WALLET` index `catchup_batch_size` keys per
+    /// tick from its own rotating cursor
+    /// (`PRIVATE_CHANNEL_SYNC_HOMES_RETRY_CURSOR`). Per key, cheapest check
+    /// first: (1) a fresh cached claim for the wallet in memory — without
+    /// one nothing can be sent, so the key is skipped with no storage read;
+    /// (2) a `LOCAL_CHANNEL_FED` row (same key bytes) means the FED sweep
+    /// already covers the pair; (3) the HOMES row must exist (the index is
+    /// only a candidate set); then the normal throttled trigger.
+    fn retry_incomplete_private_channel_syncs_homes(&mut self) {
+        use crate::storage::schema::{cf, state_keys};
+        if !self.private_channel_sync_config.enabled {
+            return;
+        }
+        let cursor_key = state_keys::PRIVATE_CHANNEL_SYNC_HOMES_RETRY_CURSOR;
+        let start_key = self
+            .storage
+            .get_cf(cf::NODE_STATE, cursor_key)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let batch = self.private_channel_sync_config.catchup_batch_size.max(1);
+        let entries = match self.storage.prefix_iter_cf_after(
+            cf::LOCAL_CHANNEL_HOMES_BY_WALLET,
+            &start_key,
+            &[],
+            batch,
+        ) {
+            Ok(e) => e,
+            Err(e) => {
+                warn!(error = %e, "private-channel-sync HOMES retry sweep: index iteration failed");
+                return;
+            }
+        };
+        let hit_end = entries.len() < batch;
+        let max_age = private_channel_sync::WALLET_AUTH_MAX_AGE_SECS.saturating_mul(1000);
+        let now = now_ms();
+        let mut last_key: Option<Vec<u8>> = None;
+        // One subscriber snapshot per sweep tick.
+        let mut subscribers: RemoteSubscriberCache = None;
+        for (key, _) in &entries {
+            last_key = Some(key.clone());
+            let Some((wallet_bytes, channel_id)) = crate::storage::schema::decode_wallet_channel_key(key) else {
+                continue;
+            };
+            let Ok(wallet) = std::str::from_utf8(wallet_bytes) else { continue };
+            // (1) In memory only: a cached claim inside its freshness window
+            // (full usability incl. device revocation is checked inside the
+            // trigger).
+            let has_claim = self
+                .private_channel_sync_wallet_claims
+                .get(wallet)
+                .is_some_and(|c| now.abs_diff(c.timestamp) <= max_age);
+            if !has_claim {
+                continue;
+            }
+            self.counters.add_private_sync_homes_pairs_evaluated(1);
+            // (2) Covered by the FED sweep (identical key bytes).
+            if !matches!(self.storage.exists_cf(cf::LOCAL_CHANNEL_FED, key), Ok(false)) {
+                continue;
+            }
+            // (3) The index is a candidate set: verify the HOMES row.
+            let home_key = crate::storage::schema::encode_local_channel_home_key(channel_id, wallet);
+            if !matches!(self.storage.exists_cf(cf::LOCAL_CHANNEL_HOMES, &home_key), Ok(true)) {
+                continue;
+            }
+            self.maybe_trigger_private_channel_sync_with(channel_id, wallet, None, false, &mut subscribers);
+        }
+        let next_cursor = if hit_end {
+            Vec::new()
+        } else {
+            last_key.unwrap_or_default()
+        };
+        // Skip the write when nothing moved (e.g. an empty index).
+        if next_cursor != start_key {
+            if let Err(e) = self.storage.put_cf(cf::NODE_STATE, cursor_key, &next_cursor) {
+                warn!(error = %e, "private-channel-sync HOMES retry sweep: failed to persist cursor");
+            }
         }
     }
 
@@ -9869,6 +10096,38 @@ mod backfill_throttle_tests {
         (a, da, b, db)
     }
 
+    /// [`connected_pair`] where `b` subscribes `cid`'s gossip topic and
+    /// `a` has seen that subscription — `b` is a known host of the channel,
+    /// which a non-federated private-sync pair needs (l2-node 0.150.0
+    /// no-host gate).
+    async fn connected_pair_subscribed(cid: u64) -> (NetworkService, TempDir, NetworkService, TempDir) {
+        let (mut a, da, mut b, db) = connected_pair().await;
+        subscribe_remote(&mut a, &mut b, cid).await;
+        (a, da, b, db)
+    }
+
+    /// `b` subscribes `cid`'s topic; pump both swarms until `a` knows it.
+    async fn subscribe_remote(a: &mut NetworkService, b: &mut NetworkService, cid: u64) {
+        let topic = libp2p::gossipsub::IdentTopic::new(gossip::channel_topic(b.topics.network_id(), cid));
+        b.swarm.behaviour_mut().gossipsub.subscribe(&topic).unwrap();
+        let hash = topic.hash();
+        let b_id = *b.swarm.local_peer_id();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while !a
+            .swarm
+            .behaviour()
+            .gossipsub
+            .all_peers()
+            .any(|(p, t)| *p == b_id && t.iter().any(|h| **h == hash))
+        {
+            assert!(tokio::time::Instant::now() < deadline, "subscription announcement timed out");
+            tokio::select! {
+                _ = a.swarm.select_next_some() => {}
+                _ = b.swarm.select_next_some() => {}
+            }
+        }
+    }
+
     #[tokio::test]
     async fn the_throttle_gate_holds_back_a_dispatch_to_a_real_candidate() {
         let (mut a, _da, _b, _db) = connected_pair().await;
@@ -9897,8 +10156,8 @@ mod backfill_throttle_tests {
 
     #[tokio::test]
     async fn the_private_gate_and_federate_floor_hold_back_redispatch() {
-        let (mut a, _da, _b, _db) = connected_pair().await;
         let pcid = (1u64 << 40) + 9;
+        let (mut a, _da, _b, _db) = connected_pair_subscribed(pcid).await;
         a.storage
             .put_cf(schema::cf::CHANNELS, &pcid.to_be_bytes(), br#"{"channel_type":2,"history_visibility":1}"#)
             .unwrap();
@@ -10315,14 +10574,12 @@ mod backfill_throttle_tests {
     /// an old replayed kick removed.
     #[tokio::test]
     async fn a_healing_walk_ignores_the_high_water_mark() {
-        let (mut a, _da, _b, _db) = connected_pair().await;
         let pcid = (1u64 << 40) + 36;
+        let (mut a, _da, _b, _db) = connected_pair_subscribed(pcid).await;
         put_private_channel(&a.storage, pcid);
         let w = wallet();
         a.storage.add_channel_member(pcid, &w.addr, 1, "member").unwrap();
-        a.storage
-            .put_cf(schema::cf::LOCAL_CHANNEL_HOMES, &schema::encode_local_channel_home_key(pcid, &w.addr), &[0u8; 16])
-            .unwrap();
+        a.storage.put_local_channel_home_for_test(pcid, &w.addr, 0, 0).unwrap();
         let mark = private_channel_sync::ResumeRow {
             v: private_channel_sync::RESUME_ROW_VERSION,
             phase: None,
@@ -10366,8 +10623,8 @@ mod backfill_throttle_tests {
     /// (or for FullHistory) there is no floor.
     #[tokio::test]
     async fn a_forward_only_member_starts_chat_at_its_join_floor() {
-        let (mut a, _da, _b, _db) = connected_pair().await;
         let pcid = (1u64 << 40) + 37;
+        let (mut a, _da, _b, _db) = connected_pair_subscribed(pcid).await;
         a.storage
             .put_cf(schema::cf::CHANNELS, &pcid.to_be_bytes(), br#"{"channel_type":2,"history_visibility":0,"creator":"klv1c"}"#)
             .unwrap();
@@ -10417,15 +10674,13 @@ mod backfill_throttle_tests {
     #[tokio::test]
     async fn the_healing_sync_is_dispatched_for_a_local_home_that_lost_membership() {
         use libp2p::request_response::{Event, Message};
-        let (mut a, _da, b, _db) = connected_pair().await;
-        let b_id = *b.swarm.local_peer_id();
         let pcid = (1u64 << 40) + 35;
+        let (mut a, _da, b, _db) = connected_pair_subscribed(pcid).await;
+        let b_id = *b.swarm.local_peer_id();
         put_private_channel(&a.storage, pcid);
         let w = wallet();
         a.storage.add_channel_member(pcid, &w.addr, 1, "member").unwrap();
-        a.storage
-            .put_cf(schema::cf::LOCAL_CHANNEL_HOMES, &schema::encode_local_channel_home_key(pcid, &w.addr), &[0u8; 16])
-            .unwrap();
+        a.storage.put_local_channel_home_for_test(pcid, &w.addr, 0, 0).unwrap();
         // The stale kick lands.
         a.storage.remove_channel_member_and_raise_epoch_floor(pcid, &w.addr).unwrap();
         assert!(!reconcile::is_channel_member(&a.storage, pcid, &w.addr));
@@ -10457,8 +10712,8 @@ mod backfill_throttle_tests {
 
     #[tokio::test]
     async fn unsubscribe_waits_for_an_in_flight_private_sync_session() {
-        let (mut a, _da, _b, _db) = connected_pair().await;
         let pcid = (1u64 << 40) + 9;
+        let (mut a, _da, _b, _db) = connected_pair_subscribed(pcid).await;
         put_private_channel(&a.storage, pcid);
         a.subscribe_channel(pcid);
         let w = wallet();
@@ -10480,8 +10735,8 @@ mod backfill_throttle_tests {
     /// never dispatched for (no request, no throttle stamp).
     #[tokio::test]
     async fn private_sync_is_not_dispatched_for_a_non_member() {
-        let (mut a, _da, _b, _db) = connected_pair().await;
         let pcid = (1u64 << 40) + 31;
+        let (mut a, _da, _b, _db) = connected_pair_subscribed(pcid).await;
         put_private_channel(&a.storage, pcid);
         let w = wallet();
         let key = (w.addr.clone(), pcid);
@@ -10504,9 +10759,9 @@ mod backfill_throttle_tests {
     #[tokio::test]
     async fn private_sync_persists_and_resumes_with_the_same_peer_only() {
         use libp2p::request_response::{Event, Message};
-        let (mut a, _da, b, _db) = connected_pair().await;
-        let b_id = *b.swarm.local_peer_id();
         let pcid = (1u64 << 40) + 33;
+        let (mut a, _da, b, _db) = connected_pair_subscribed(pcid).await;
+        let b_id = *b.swarm.local_peer_id();
         put_private_channel(&a.storage, pcid);
         let w = wallet();
         a.storage.add_channel_member(pcid, &w.addr, 1, "member").unwrap();
@@ -10626,4 +10881,225 @@ mod backfill_throttle_tests {
         // position).
         assert_eq!(a.counters.private_sync_resumed_sessions.load(Ordering::Relaxed), 6);
     }
+
+    // ---- l2-node 0.150.0 (Phase E): HOMES-keyed private-sync backfill ----
+
+    fn fresh_claim() -> private_channel_sync::WalletAuthClaim {
+        private_channel_sync::WalletAuthClaim { timestamp: now_ms(), signature: vec![0; 64], device: None }
+    }
+
+    fn put_fed(s: &Storage, w: &str, cid: u64) {
+        s.put_cf(schema::cf::LOCAL_CHANNEL_FED, &schema::encode_local_channel_fed_key(w, cid), &now_ms().to_be_bytes())
+            .unwrap();
+    }
+
+    fn homes_evaluated(a: &NetworkService) -> u64 {
+        a.counters.private_sync_homes_pairs_evaluated.load(Ordering::Relaxed)
+    }
+
+    #[tokio::test]
+    async fn claim_refresh_caches_and_triggers_for_a_homes_only_wallet() {
+        let pcid = (1u64 << 40) + 60;
+        let (mut a, _da, b, _db) = connected_pair_subscribed(pcid).await;
+        let b_id = *b.swarm.local_peer_id();
+        put_private_channel(&a.storage, pcid);
+        let w = wallet();
+        a.storage.add_channel_member(pcid, &w.addr, 1, "member").unwrap();
+        a.storage.put_local_channel_home_for_test(pcid, &w.addr, 1, 1).unwrap();
+        a.refresh_private_channel_sync_claim(&w.addr, Some(fresh_claim()));
+        assert!(a.private_channel_sync_wallet_claims.contains_key(&w.addr), "claim cached (N3: union non-empty)");
+        assert_eq!(a.pending_private_channel_sync_requests.len(), 1, "dispatched");
+        assert_eq!(a.pending_private_channel_sync_requests.values().next().unwrap().peer_id, b_id);
+        assert_eq!(homes_evaluated(&a), 1);
+        // The cancel path (`record_local_channel_home_for`: channel id, no
+        // claim) now dispatches for this wallet off the cached claim.
+        let key = (w.addr.clone(), pcid);
+        a.pending_private_channel_sync_requests.clear();
+        a.private_channel_sync_triggered.clear();
+        a.private_channel_sync_throttle.on_complete(&key);
+        a.maybe_trigger_private_channel_sync(pcid, &w.addr, None, false);
+        assert_eq!(a.pending_private_channel_sync_requests.len(), 1, "cancel-triggered sync dispatched");
+        // A wallet with neither FED nor HOMES rows: nothing cached.
+        let other = wallet();
+        a.refresh_private_channel_sync_claim(&other.addr, Some(fresh_claim()));
+        assert!(!a.private_channel_sync_wallet_claims.contains_key(&other.addr));
+    }
+
+    #[tokio::test]
+    async fn a_channel_in_both_sources_triggers_once_and_each_source_is_capped() {
+        let pcid = (1u64 << 40) + 61;
+        let (mut a, _da, _b, _db) = connected_pair_subscribed(pcid).await;
+        put_private_channel(&a.storage, pcid);
+        let w = wallet();
+        a.storage.add_channel_member(pcid, &w.addr, 1, "member").unwrap();
+        a.storage.put_local_channel_home_for_test(pcid, &w.addr, 1, 1).unwrap();
+        put_fed(&a.storage, &w.addr, pcid);
+        assert_eq!(a.private_sync_refresh_channels(&w.addr).len(), 1, "deduplicated by channel id");
+        a.refresh_private_channel_sync_claim(&w.addr, Some(fresh_claim()));
+        assert_eq!(a.pending_private_channel_sync_requests.len(), 1, "one dispatch for the pair");
+        // Caps: 300 FED-only + 300 HOMES-only channels → 256 + 256.
+        let v = wallet();
+        for i in 0..300u64 {
+            put_fed(&a.storage, &v.addr, (1u64 << 40) + 1_000 + i);
+            a.storage.put_local_channel_home_for_test((1u64 << 40) + 5_000 + i, &v.addr, 1, 1).unwrap();
+        }
+        let set = a.private_sync_refresh_channels(&v.addr);
+        assert_eq!(set.len(), 2 * MAX_CLAIM_REFRESH_CHANNELS, "a full FED source does not starve HOMES");
+        assert_eq!(set.iter().filter(|c| **c >= (1u64 << 40) + 5_000).count(), MAX_CLAIM_REFRESH_CHANNELS);
+    }
+
+    /// Round-1 audit W1: the no-host gate walks gossipsub's peer table once
+    /// per claim refresh / sweep tick, not once per channel, and never for
+    /// a pair the in-flight set or the throttle already holds back.
+    #[tokio::test]
+    async fn a_refresh_over_many_channels_walks_the_peer_table_once() {
+        let (mut a, _da, _b, _db) = connected_pair().await;
+        let w = wallet();
+        for i in 0..20u64 {
+            let cid = (1u64 << 40) + 200 + i;
+            put_private_channel(&a.storage, cid);
+            a.storage.add_channel_member(cid, &w.addr, 1, "member").unwrap();
+            a.storage.put_local_channel_home_for_test(cid, &w.addr, 1, 1).unwrap();
+        }
+        a.refresh_private_channel_sync_claim(&w.addr, Some(fresh_claim()));
+        assert_eq!(a.remote_subscriber_walks, 1, "one walk for 20 channels");
+        assert_eq!(a.counters.private_sync_skipped_no_host.load(Ordering::Relaxed), 20);
+        // One sweep tick: one more walk.
+        a.private_channel_sync_config.catchup_batch_size = 100;
+        a.retry_incomplete_private_channel_syncs_homes();
+        assert_eq!(a.remote_subscriber_walks, 2, "one walk per sweep tick");
+        // A pair the throttle holds back never reaches the gate.
+        let cid = (1u64 << 40) + 200;
+        let key = (w.addr.clone(), cid);
+        a.private_channel_sync_throttle.on_dispatch(key, Instant::now(), 0.0);
+        a.maybe_trigger_private_channel_sync(cid, &w.addr, None, false);
+        assert_eq!(a.remote_subscriber_walks, 2, "throttled: no walk");
+        // A single trigger (cancel path) builds its own snapshot.
+        let other = (1u64 << 40) + 201;
+        a.maybe_trigger_private_channel_sync(other, &w.addr, None, false);
+        assert_eq!(a.remote_subscriber_walks, 3);
+    }
+
+    #[tokio::test]
+    async fn the_no_host_gate_skips_non_federated_pairs_without_moving_the_throttle() {
+        let (mut a, _da, _b, _db) = connected_pair().await;
+        let pcid = (1u64 << 40) + 62;
+        put_private_channel(&a.storage, pcid);
+        let w = wallet();
+        a.storage.add_channel_member(pcid, &w.addr, 1, "member").unwrap();
+        a.storage.put_local_channel_home_for_test(pcid, &w.addr, 1, 1).unwrap();
+        let key = (w.addr.clone(), pcid);
+        // A connected peer exists, but nobody subscribes the channel.
+        a.maybe_trigger_private_channel_sync(pcid, &w.addr, Some(fresh_claim()), true);
+        assert!(a.pending_private_channel_sync_requests.is_empty(), "no host: nothing sent");
+        assert!(a.private_channel_sync_throttle.entry(&key).is_none(), "no throttle stamp");
+        assert!(!a.private_channel_sync_triggered.contains(&key));
+        assert_eq!(a.counters.private_sync_skipped_no_host.load(Ordering::Relaxed), 1);
+        // A federated pair keeps the connected-peer fallback.
+        put_fed(&a.storage, &w.addr, pcid);
+        a.maybe_trigger_private_channel_sync(pcid, &w.addr, Some(fresh_claim()), true);
+        assert_eq!(a.pending_private_channel_sync_requests.len(), 1, "FED pair: fallback to a connected peer");
+        assert_eq!(a.counters.private_sync_skipped_no_host.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn a_non_federated_pair_asks_only_subscribed_peers() {
+        let pcid = (1u64 << 40) + 63;
+        let (mut a, _da, mut b, _db) = connected_pair().await;
+        // A third node, connected to `a` but NOT subscribed.
+        let (mut c, _dc) = service().await;
+        let c_id = *c.swarm.local_peer_id();
+        let addr = loop {
+            if let SwarmEvent::NewListenAddr { address, .. } = c.swarm.select_next_some().await {
+                if address.to_string().starts_with("/ip4/127.0.0.1/tcp/") {
+                    break address;
+                }
+            }
+        };
+        a.swarm.dial(addr).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while !a.swarm.is_connected(&c_id) {
+            assert!(tokio::time::Instant::now() < deadline, "loopback connection timed out");
+            tokio::select! {
+                _ = a.swarm.select_next_some() => {}
+                _ = b.swarm.select_next_some() => {}
+                _ = c.swarm.select_next_some() => {}
+            }
+        }
+        subscribe_remote(&mut a, &mut b, pcid).await;
+        let b_id = *b.swarm.local_peer_id();
+        // `a` is not on the topic itself: `b` is a subscriber, not a mesh peer.
+        put_private_channel(&a.storage, pcid);
+        let topic_hash = libp2p::gossipsub::IdentTopic::new(gossip::channel_topic(a.topics.network_id(), pcid)).hash();
+        assert_eq!(a.swarm.behaviour().gossipsub.mesh_peers(&topic_hash).count(), 0);
+        let w = wallet();
+        a.storage.add_channel_member(pcid, &w.addr, 1, "member").unwrap();
+        a.storage.put_local_channel_home_for_test(pcid, &w.addr, 1, 1).unwrap();
+        a.maybe_trigger_private_channel_sync(pcid, &w.addr, Some(fresh_claim()), true);
+        let peers: Vec<PeerId> = a.pending_private_channel_sync_requests.values().map(|p| p.peer_id).collect();
+        assert_eq!(peers, vec![b_id], "only the subscribed peer, never the unsubscribed connected one");
+    }
+
+    #[tokio::test]
+    async fn the_homes_sweep_prefilters_on_the_claim_skips_fed_and_wraps() {
+        let pcid = (1u64 << 40) + 64;
+        let (mut a, _da, _b, _db) = connected_pair_subscribed(pcid).await;
+        a.private_channel_sync_config.catchup_batch_size = 2;
+        put_private_channel(&a.storage, pcid);
+        let (w1, w2, w3) = (wallet(), wallet(), wallet());
+        for w in [&w1, &w2, &w3] {
+            a.storage.add_channel_member(pcid, &w.addr, 1, "member").unwrap();
+            a.storage.put_local_channel_home_for_test(pcid, &w.addr, 1, 1).unwrap();
+        }
+        // No cached claim for anyone: every key skipped before any per-key
+        // storage read (the evaluated counter stays 0); the cursor advances
+        // (2 keys) and then wraps (1 key < batch).
+        a.retry_incomplete_private_channel_syncs_homes();
+        assert_eq!(homes_evaluated(&a), 0, "no claim → no storage read per key");
+        let c1 = a
+            .storage
+            .get_cf(schema::cf::NODE_STATE, schema::state_keys::PRIVATE_CHANNEL_SYNC_HOMES_RETRY_CURSOR)
+            .unwrap()
+            .unwrap();
+        assert!(!c1.is_empty(), "cursor advanced");
+        a.retry_incomplete_private_channel_syncs_homes();
+        let c2 = a
+            .storage
+            .get_cf(schema::cf::NODE_STATE, schema::state_keys::PRIVATE_CHANNEL_SYNC_HOMES_RETRY_CURSOR)
+            .unwrap()
+            .unwrap();
+        assert!(c2.is_empty(), "cursor wrapped at the end of the index");
+        assert!(a.pending_private_channel_sync_requests.is_empty());
+        // Claims cached for all three; w1 is also federated (the FED sweep's
+        // job): only w2 and w3 are dispatched by the HOMES sweep.
+        for w in [&w1, &w2, &w3] {
+            a.cache_private_channel_sync_claim(&w.addr, fresh_claim());
+        }
+        put_fed(&a.storage, &w1.addr, pcid);
+        a.private_channel_sync_config.catchup_batch_size = 10;
+        a.retry_incomplete_private_channel_syncs_homes();
+        assert_eq!(homes_evaluated(&a), 3);
+        let mut sent: Vec<String> = a.pending_private_channel_sync_requests.values().map(|p| p.wallet.clone()).collect();
+        sent.sort();
+        let mut want = vec![w2.addr.clone(), w3.addr.clone()];
+        want.sort();
+        assert_eq!(sent, want, "FED-covered key skipped");
+        // An orphan index entry (no HOMES row) is never acted on.
+        let orphan = wallet();
+        a.cache_private_channel_sync_claim(&orphan.addr, fresh_claim());
+        a.storage.add_channel_member(pcid, &orphan.addr, 1, "member").unwrap();
+        a.storage
+            .put_cf(
+                schema::cf::LOCAL_CHANNEL_HOMES_BY_WALLET,
+                &schema::encode_local_channel_home_wallet_key(orphan.addr.as_bytes(), pcid),
+                &[],
+            )
+            .unwrap();
+        a.retry_incomplete_private_channel_syncs_homes();
+        assert!(
+            !a.pending_private_channel_sync_requests.values().any(|p| p.wallet == orphan.addr),
+            "the index is only a candidate set"
+        );
+    }
+
 }
