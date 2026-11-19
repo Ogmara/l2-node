@@ -23,9 +23,9 @@
 //! `router::process_synced_message`, so a relaying peer is never trusted.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 use tracing::warn;
+
+use crate::network::reconcile::{append_within_byte_budget, envelope_wire_cost, MAX_RESPONSE_ENVELOPE_BYTES};
 
 use crate::crypto::signing;
 use crate::storage::rocks::Storage;
@@ -42,10 +42,18 @@ pub fn protocol_string(network_id: &str) -> String {
 
 // --- Tuning (window comes from config; these bound it further) ---
 
-/// Max envelopes a responder returns per page.
+/// Max envelopes a responder returns per page — the primary `DM_MESSAGES`
+/// scan only; the LAST page also carries the edit/delete ride-along.
 pub const MAX_ENVELOPES_PER_RESPONSE: usize = 200;
-/// Hard ceiling on cumulative envelopes one peer may pull per process lifetime.
-pub const TOTAL_ENVELOPES_CAP: u64 = 5_000;
+/// Max edit/delete (and, since l2-node 0.151.0, GDPR `DeletionRequest`)
+/// envelopes the last-page ride-along carries.
+pub const DM_EDIT_DELETE_CAP: usize = 1_000;
+/// The largest page an honest responder sends (a full primary page plus a
+/// full ride-along). Before l2-node 0.151.0 the requester refused anything
+/// above `MAX_ENVELOPES_PER_RESPONSE`, discarding every last page whose
+/// ride-along pushed it past 200 envelopes.
+pub const MAX_ENVELOPES_PER_PAGE_WITH_RIDE_ALONGS: usize =
+    MAX_ENVELOPES_PER_RESPONSE + DM_EDIT_DELETE_CAP;
 /// Max concurrent inbound dm-sync requests served to one peer.
 pub const SERVER_MAX_CONCURRENT_PER_PEER: usize = 2;
 /// How many peers an outbound backfill races (first non-empty wins).
@@ -80,6 +88,10 @@ pub fn is_dm_type(msg_type: u8) -> bool {
             MessageType::DirectMessage
                 | MessageType::DirectMessageEdit
                 | MessageType::DirectMessageDelete
+                // GDPR DeletionRequest (l2-node 0.151.0, G5): indexed into
+                // DM_EDIT_DELETE_MSGS under its DM target's conversation. The
+                // receiver also checks the target (`network::deletion_request_fit`).
+                | MessageType::DeletionRequest
         )
     )
 }
@@ -337,6 +349,12 @@ pub fn verify_request_auth(
 /// request's `max_age_secs`. Returns `(response, scanned_all_conversations)` —
 /// the caller logs when `scanned_all` is false so a conversation-count cap is
 /// never silent.
+///
+/// Also returns the storage work done (one unit per seek and per index row
+/// examined, ride-along rows included) for the responder's rolling budget
+/// (`reconcile::budget_charge`, l2-node 0.151.0): `(response, scanned_all,
+/// work)`. A DM erased by a GDPR `DeletionRequest` (decision D4) is never
+/// re-served, nor is an edit/delete of one; the request rides along.
 pub fn build_response(
     storage: &Storage,
     wallet: &str,
@@ -344,7 +362,7 @@ pub fn build_response(
     max_envelopes: usize,
     now_ms: u64,
     window_max_age_secs: u64,
-) -> (DmSyncResponse, bool) {
+) -> (DmSyncResponse, bool, u64) {
     let empty = DmSyncResponse {
         envelopes: Vec::new(),
         has_more: false,
@@ -376,8 +394,9 @@ pub fn build_response(
         MAX_CONVERSATIONS.saturating_add(1),
     ) {
         Ok(r) => r,
-        Err(_) => return (empty, true),
+        Err(_) => return (empty, true, 1),
     };
+    let mut work: u64 = 1 + conv_rows.len() as u64;
     let mut conv_ids: Vec<[u8; 32]> = Vec::with_capacity(conv_rows.len());
     for (key, _) in &conv_rows {
         if key.len() < prefix.len() + 8 + 32 {
@@ -393,7 +412,7 @@ pub fn build_response(
     conv_ids.truncate(MAX_CONVERSATIONS);
 
     if conv_ids.is_empty() {
-        return (empty, scanned_all);
+        return (empty, scanned_all, work);
     }
 
     // 2. Resume point: the cursor's conversation (or its insertion slot if that
@@ -409,6 +428,9 @@ pub fn build_response(
     let mut envelopes: Vec<Vec<u8>> = Vec::new();
     let mut next_cursor: Option<DmCursor> = None;
     let mut has_more = false;
+    // Wire bytes of the page so far, and whether they filled it (W5).
+    let mut bytes: usize = 0;
+    let mut byte_full = false;
 
     for (ci, cid) in conv_ids.iter().enumerate().skip(start_idx) {
         if envelopes.len() >= max_envelopes {
@@ -434,6 +456,7 @@ pub fn build_response(
             Ok(r) => r,
             Err(_) => continue,
         };
+        work += 1 + rows.len() as u64;
         let conv_has_more = rows.len() > budget;
         for (key, _) in rows.iter().take(budget) {
             // key = (conversation_id:32, timestamp:8 BE, msg_id:32) = 72 bytes.
@@ -449,6 +472,20 @@ pub fn build_response(
             }
             let mut msg_id = [0u8; 32];
             msg_id.copy_from_slice(&key[40..72]);
+            // D4 (l2-node 0.151.0): never re-serve a GDPR-erased DM.
+            let raw = if storage.is_gdpr_erased(&msg_id) {
+                None
+            } else {
+                storage.get_cf(schema::cf::MESSAGES, &msg_id).ok().flatten()
+            };
+            // W5 (l2-node 0.151.0): page full by BYTES — stop before this row
+            // (the cursor stays on the previous one).
+            if let Some(r) = raw.as_ref() {
+                if !envelopes.is_empty() && bytes.saturating_add(envelope_wire_cost(r)) > MAX_RESPONSE_ENVELOPE_BYTES {
+                    byte_full = true;
+                    break;
+                }
+            }
             // Advance the cursor over EVERY in-window row examined (even if its
             // MESSAGES entry is missing) so a sparse page can't strand rows.
             next_cursor = Some(DmCursor {
@@ -456,9 +493,14 @@ pub fn build_response(
                 after_timestamp: ts,
                 after_msg_id: msg_id,
             });
-            if let Ok(Some(raw)) = storage.get_cf(schema::cf::MESSAGES, &msg_id) {
-                envelopes.push(raw);
+            if let Some(r) = raw {
+                bytes = bytes.saturating_add(envelope_wire_cost(&r));
+                envelopes.push(r);
             }
+        }
+        if byte_full {
+            has_more = true;
+            break;
         }
         if conv_has_more {
             has_more = true;
@@ -475,7 +517,10 @@ pub fn build_response(
         // the last page every original DM the session could have delivered
         // has already been applied — which `authorize_edit_delete` requires
         // before an edit/delete can be accepted.
-        envelopes.extend(dm_edit_delete_envelopes(storage, &conv_ids, min_ts));
+        let (ed, ed_work) = dm_edit_delete_envelopes(storage, &conv_ids, min_ts);
+        work += ed_work;
+        // W5: within the response byte budget.
+        append_within_byte_budget(&mut envelopes, ed, bytes);
     }
 
     (
@@ -487,6 +532,7 @@ pub fn build_response(
             auth_failed: false,
         },
         scanned_all,
+        work,
     )
 }
 
@@ -503,9 +549,9 @@ fn dm_edit_delete_envelopes(
     storage: &Storage,
     conv_ids: &[[u8; 32]],
     min_ts: u64,
-) -> Vec<Vec<u8>> {
-    const DM_EDIT_DELETE_CAP: usize = 1_000;
+) -> (Vec<Vec<u8>>, u64) {
     let mut out = Vec::new();
+    let mut work: u64 = 0;
     for cid in conv_ids {
         if out.len() >= DM_EDIT_DELETE_CAP {
             warn!(
@@ -531,6 +577,7 @@ fn dm_edit_delete_envelopes(
             Ok(r) => r,
             Err(_) => continue,
         };
+        work += 1 + rows.len() as u64;
         for (key, _) in rows.into_iter().take(budget) {
             // key = (conversation_id:32, timestamp:8 BE, msg_id:32) = 72 bytes,
             // same shape as DM_MESSAGES.
@@ -547,95 +594,31 @@ fn dm_edit_delete_envelopes(
             let mut msg_id = [0u8; 32];
             msg_id.copy_from_slice(&key[40..72]);
             if let Ok(Some(raw)) = storage.get_cf(schema::cf::MESSAGES, &msg_id) {
+                // D4: no edit/delete of a GDPR-erased DM (the request itself
+                // is indexed here too and is served).
+                if crate::network::reconcile::ride_along_target_erased(storage, &raw) {
+                    continue;
+                }
                 out.push(raw);
             }
         }
     }
-    out
+    (out, work)
 }
 
 // --- Responder rate limiting (per peer) ---
 
-/// Bounds how much one peer can pull, mirroring `news_sync::NewsResponderLimits`.
-#[derive(Debug, Default)]
-pub struct DmResponderLimits {
-    inner: Mutex<DmLimitsInner>,
-}
-
-/// Soft ceiling on distinct per-peer cumulative-served entries. Previously
-/// cleared WHOLESALE on overflow — a Sybil cycling fresh PeerIds could reset
-/// everyone's cumulative "served" counter, defeating `TOTAL_ENVELOPES_CAP`
-/// (audit W5, bundled fix). Now the single oldest entry is evicted per
-/// overflow insert instead, so a new identity can only ever displace ONE
-/// other peer's counter, not all of them.
-pub(crate) const MAX_TRACKED_SERVED_PEERS: usize = 100_000;
-
-#[derive(Debug, Default)]
-struct DmLimitsInner {
-    per_peer: HashMap<libp2p::PeerId, usize>,
-    served: HashMap<libp2p::PeerId, u64>,
-    /// Insertion order of `served` keys, oldest-first — lets `add_served`
-    /// evict a single oldest entry on overflow (audit W5).
-    served_order: std::collections::VecDeque<libp2p::PeerId>,
-}
-
-impl DmResponderLimits {
-    /// Admit one inbound request, or `None` if over a cap (→ `capped_response`).
-    pub fn try_acquire(
-        self: &Arc<Self>,
-        peer: libp2p::PeerId,
-        max_concurrent_per_peer: usize,
-        total_envelopes_cap: u64,
-    ) -> Option<DmResponderGuard> {
-        let mut inner = self.inner.lock().ok()?;
-        let in_flight = inner.per_peer.get(&peer).copied().unwrap_or(0);
-        if in_flight >= max_concurrent_per_peer {
-            return None;
-        }
-        if inner.served.get(&peer).copied().unwrap_or(0) >= total_envelopes_cap {
-            return None;
-        }
-        inner.per_peer.insert(peer, in_flight + 1);
-        Some(DmResponderGuard {
-            limits: Arc::clone(self),
-            peer,
-        })
-    }
-
-    pub fn add_served(&self, peer: libp2p::PeerId, count: u64) {
-        if let Ok(mut inner) = self.inner.lock() {
-            let is_new = !inner.served.contains_key(&peer);
-            if is_new {
-                if inner.served.len() >= MAX_TRACKED_SERVED_PEERS {
-                    if let Some(oldest) = inner.served_order.pop_front() {
-                        inner.served.remove(&oldest);
-                    }
-                }
-                inner.served_order.push_back(peer);
-            }
-            *inner.served.entry(peer).or_insert(0) += count;
-        }
-    }
-}
-
-/// RAII guard releasing a peer's in-flight slot on drop.
-pub struct DmResponderGuard {
-    limits: Arc<DmResponderLimits>,
-    peer: libp2p::PeerId,
-}
-
-impl Drop for DmResponderGuard {
-    fn drop(&mut self) {
-        if let Ok(mut inner) = self.limits.inner.lock() {
-            if let Some(n) = inner.per_peer.get_mut(&self.peer) {
-                *n = n.saturating_sub(1);
-                if *n == 0 {
-                    inner.per_peer.remove(&self.peer);
-                }
-            }
-        }
-    }
-}
+/// Responder admission for dm-sync (l2-node 0.151.0): per-peer concurrency
+/// (`SERVER_MAX_CONCURRENT_PER_PEER`) plus a rolling budget per peer (all
+/// wallets together) — `[dm] sync_responder_budget_burst` units (default
+/// 5,000) refilled at `sync_responder_budget_refill_per_hour` (default
+/// 2,500/h), charged with `reconcile::budget_charge`. Before 0.151.0 this was
+/// a LIFETIME counter of envelopes served (`TOTAL_ENVELOPES_CAP = 5,000`)
+/// that never refilled until the responder restarted, and it evicted its
+/// oldest entry FIFO past 100k peers (a Sybil cycling identities got its
+/// budget back); the budget map instead prunes only refilled buckets and
+/// refuses NEW peers when full.
+pub type DmResponderLimits = crate::network::budget::PeerBudgetLimits<libp2p::PeerId>;
 
 #[cfg(test)]
 mod tests {
@@ -859,7 +842,7 @@ mod tests {
                 cursor: cursor.clone(),
                 wallet_claim: None,
             };
-            let (resp, scanned_all) = build_response(&storage, wallet, &req, 2, now, u64::MAX);
+            let (resp, scanned_all, _) = build_response(&storage, wallet, &req, 2, now, u64::MAX);
             assert!(scanned_all);
             for env in &resp.envelopes {
                 let mut m = [0u8; 32];
@@ -919,46 +902,43 @@ mod tests {
             cursor: None,
             wallet_claim: None,
         };
-        let (resp, _) = build_response(&storage, wallet, &req, 200, now, u64::MAX);
+        let (resp, _, _) = build_response(&storage, wallet, &req, 200, now, u64::MAX);
         assert_eq!(resp.envelopes.len(), 1);
         assert_eq!(resp.envelopes[0].as_slice(), new_id.as_slice());
     }
 
-    // --- W5 bundled fix: DmResponderLimits eviction, not clear-all ---
+    // --- l2-node 0.151.0: rolling budget replaces the lifetime counter ---
 
+    /// The pre-0.151.0 lifetime counter is gone: a peer that spent the
+    /// default 5,000-unit burst is refused, keeps its debt however many
+    /// other peers arrive (no FIFO eviction), and is served again once the
+    /// budget refilled (2,500/h) — no responder restart needed.
     #[test]
-    fn add_served_evicts_oldest_not_everyone() {
-        // `PeerId::random()` (no real keypair derivation needed — this test
-        // only exercises the eviction bookkeeping, not signature validity)
-        // keeps 100k inserts fast enough for a unit test.
-        let limits = DmResponderLimits::default();
-        let first_peer = libp2p::PeerId::random();
-        limits.add_served(first_peer, 1);
-        for _ in 1..MAX_TRACKED_SERVED_PEERS - 1 {
-            limits.add_served(libp2p::PeerId::random(), 1);
+    fn dm_budget_refills_and_never_evicts_a_peer_in_debt() {
+        use crate::network::budget::{Gcra, Refusal};
+        use std::time::{Duration, Instant};
+        let limits = std::sync::Arc::new(DmResponderLimits::new(1_000));
+        let gcra = Gcra::new(5_000, 2_500);
+        let now = Instant::now();
+        let spent = libp2p::PeerId::random();
+        limits.charge(spent, 5_000, &gcra, now);
+        for _ in 1..1_000 {
+            limits.charge(libp2p::PeerId::random(), 1, &gcra, now);
         }
-        let last_peer = libp2p::PeerId::random();
-        limits.add_served(last_peer, 1);
-
-        // One more, over capacity — must evict the FIRST-inserted peer only,
-        // not clear the whole map (audit W5).
-        let overflow_peer = libp2p::PeerId::random();
-        limits.add_served(overflow_peer, 1);
-
-        let inner = limits.inner.lock().unwrap();
-        assert_eq!(inner.served.len(), MAX_TRACKED_SERVED_PEERS);
-        assert!(
-            !inner.served.contains_key(&first_peer),
-            "oldest peer's counter must be evicted"
-        );
-        assert!(
-            inner.served.contains_key(&last_peer),
-            "a recently-inserted peer's counter must survive"
-        );
-        assert!(
-            inner.served.contains_key(&overflow_peer),
-            "the new insert itself must be present"
-        );
+        assert!(matches!(
+            limits.try_acquire(libp2p::PeerId::random(), &libp2p::PeerId::random(), SERVER_MAX_CONCURRENT_PER_PEER, &gcra, now),
+            Err(Refusal::MapFull)
+        ));
+        assert!(matches!(
+            limits.try_acquire(spent, &spent, SERVER_MAX_CONCURRENT_PER_PEER, &gcra, now),
+            Err(Refusal::OverBudget)
+        ));
+        // One unit refills in 1.44 s: the prune drops the one-unit peers only.
+        let later = now + Duration::from_secs(2);
+        assert_eq!(limits.prune(later), 999);
+        assert_eq!(limits.budget_len(), 1);
+        let refilled = now + Duration::from_secs(3_600);
+        assert!(limits.try_acquire(spent, &spent, SERVER_MAX_CONCURRENT_PER_PEER, &gcra, refilled).is_ok());
     }
 }
 
@@ -1076,7 +1056,7 @@ mod edit_delete_ride_along_tests {
             cursor: None,
             wallet_claim: None,
         };
-        let (resp1, _) = build_response(&storage, wallet, &req1, 2, base_ts + 1000, u64::MAX);
+        let (resp1, _, _) = build_response(&storage, wallet, &req1, 2, base_ts + 1000, u64::MAX);
         assert!(resp1.has_more, "page 1 should be capped (2 of 3 DMs)");
         assert!(
             !contains_type(&resp1.envelopes, MessageType::DirectMessageDelete),
@@ -1093,11 +1073,62 @@ mod edit_delete_ride_along_tests {
             cursor: resp1.next_cursor,
             wallet_claim: None,
         };
-        let (resp2, _) = build_response(&storage, wallet, &req2, 2, base_ts + 1000, u64::MAX);
+        let (resp2, _, _) = build_response(&storage, wallet, &req2, 2, base_ts + 1000, u64::MAX);
         assert!(!resp2.has_more, "page 2 should be the final page");
         assert!(
             contains_type(&resp2.envelopes, MessageType::DirectMessageDelete),
             "delete must ride along on the final page"
         );
+    }
+
+    /// D4 + G5 (l2-node 0.151.0): an erased DM is never served, nor is a
+    /// delete of it; its DeletionRequest (indexed into DM_EDIT_DELETE_MSGS
+    /// under the DM's own conversation) rides along on the last page.
+    #[test]
+    fn erased_dm_is_withheld_and_its_request_rides_along() {
+        use crate::messages::types::{DeletionRequestPayload, DeletionType};
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let wallet = "klv1wallet";
+        let conv = [0xDEu8; 32];
+        let base_ts = 1_700_000_000_000u64;
+        let (keep, erase, del, req_id) = ([1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]);
+        put_dm(&storage, wallet, "klv1peer", conv, keep, base_ts);
+        put_dm(&storage, wallet, "klv1peer", conv, erase, base_ts + 1);
+        put_dm_delete(&storage, wallet, conv, erase, del, base_ts + 2);
+        let payload = DeletionRequestPayload { delete_type: DeletionType::SingleMessage, target_id: Some(erase) };
+        let env = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::DeletionRequest,
+            msg_id: req_id,
+            author: wallet.to_string(),
+            timestamp: base_ts + 3,
+            lamport_ts: 0,
+            payload: rmp_serde::to_vec_named(&payload).unwrap(),
+            signature: vec![],
+            relay_path: vec![],
+        };
+        storage.store_message(&req_id, &rmp_serde::to_vec_named(&env).unwrap()).unwrap();
+        storage.put_verified_deletion_request(&erase, &req_id, wallet, base_ts + 3).unwrap();
+        assert!(storage.index_deletion_request(&erase, &req_id, base_ts + 3).unwrap());
+
+        let req = DmSyncRequest {
+            wallet: wallet.into(),
+            requester_pubkey: vec![0u8; 32],
+            timestamp: base_ts,
+            signature: vec![0u8; 64],
+            max_age_secs: u64::MAX,
+            cursor: None,
+            wallet_claim: None,
+        };
+        let (resp, _, work) = build_response(&storage, wallet, &req, 10, base_ts + 1000, u64::MAX);
+        let ids: Vec<[u8; 32]> = resp
+            .envelopes
+            .iter()
+            .map(|e| rmp_serde::from_slice::<Envelope>(e).unwrap().msg_id)
+            .collect();
+        assert_eq!(ids, vec![keep, req_id]);
+        assert!(work > 1, "storage work is metered: {work}");
+        assert!(is_dm_type(MessageType::DeletionRequest as u8));
     }
 }

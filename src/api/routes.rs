@@ -3139,6 +3139,34 @@ pub async fn get_enc_keys(
                 .filter(|r| !r.get("revoked").and_then(|b| b.as_bool()).unwrap_or(false))
                 .map(mark_enc_key_binding)
                 .collect();
+            // G1 (l2-node 0.151.0): an empty directory on this node may only
+            // mean the wallet bound its keys before this node joined (the
+            // bindings are gossip-only otherwise). Ask peers for the wallet's
+            // identity bundle — SCOPE_ALL, which includes the enc-key entries
+            // (SCOPE_ENC_KEYS): the network task dedups pulls per wallet per
+            // session regardless of scope, so a narrower first pull would
+            // suppress a later full one (e.g. at that wallet's auth here) and
+            // leave its delegations/follows unpulled. Unauthenticated
+            // route: only plausible addresses, behind a per-wallet dedup and
+            // a node-wide per-window budget (`EncKeysPullGate`). The pull is
+            // asynchronous — this response stays empty; a retry after the
+            // pull lands sees the keys.
+            if keys.is_empty()
+                && crate::network::identity_sync::is_plausible_subject(&wallet)
+                && crate::crypto::address_to_pubkey_bytes(&wallet).is_ok()
+            {
+                let admitted = state
+                    .enc_keys_pull_gate
+                    .lock()
+                    .map(|mut g| g.try_admit(&wallet, std::time::Instant::now()))
+                    .unwrap_or(false);
+                if admitted {
+                    let _ = state.identity_sync_tx.send(crate::network::IdentitySyncCommand {
+                        wallet: wallet.clone(),
+                        scopes: crate::network::identity_sync::SCOPE_ALL,
+                    });
+                }
+            }
             Json(serde_json::json!({ "address": wallet, "keys": keys })).into_response()
         }
         Err(e) => {
@@ -3802,6 +3830,7 @@ pub async fn post_message(
             author,
             bot_commands_changed,
             key_status,
+            erased_on_arrival,
         } => {
             state.counters.inc_messages_stored();
             // Private-channel lifecycle (l2-node 0.149.0): local evidence
@@ -3820,7 +3849,10 @@ pub async fn post_message(
             {
                 // An already-present key wrap was not stored, so it is not
                 // relayed either (round-4 audit W1b).
-                let relay = key_status != Some(crate::messages::router::KeyStatus::AlreadyPresent);
+                // A message erased on arrival by a pending GDPR deletion
+                // request (l2-node 0.151.0) is stored hidden, never relayed.
+                let relay = key_status != Some(crate::messages::router::KeyStatus::AlreadyPresent)
+                    && !erased_on_arrival;
                 if let Some(topic) = gossip_topic_for_envelope(&envelope, &state.klever_network).filter(|_| relay) {
                     let (tx, rx) = tokio::sync::oneshot::channel();
                     let sent = state
@@ -3871,8 +3903,9 @@ pub async fn post_message(
                     }
                 }
 
-                // Feed to notification engine for mention detection
-                if let Some(ref engine) = state.notification_engine {
+                // Feed to notification engine for mention detection — never for
+                // a message erased on arrival (l2-node 0.151.0, audit W-A).
+                if let Some(engine) = state.notification_engine.as_ref().filter(|_| !erased_on_arrival) {
                     let engine = engine.clone();
                     // Only fires when the router's content comparison saw a REAL
                     // descriptor change — a no-op republish (every bot restart)
@@ -5186,14 +5219,17 @@ pub async fn send_dm(
     use crate::messages::router::RouteResult;
 
     match state.router.process_message(&body) {
-        RouteResult::Accepted { msg_id, raw_bytes, .. } => {
+        RouteResult::Accepted { msg_id, raw_bytes, erased_on_arrival, .. } => {
             // Publish the DM to the recipient's gossip topic so the recipient's
             // node receives and indexes it (it subscribes to its users' DM topics
             // on WS connect, 0.60.0). Without this, the DM was only stored locally
             // on the sender's node — same-node DMs worked, cross-node never did.
+            // Not for a DM erased on arrival by a pending GDPR deletion request
+            // (l2-node 0.151.0, audit W-A): it is stored hidden, never relayed.
             let mut delivery: Option<&'static str> = None;
-            if let Ok(envelope) =
-                rmp_serde::from_slice::<crate::messages::envelope::Envelope>(&raw_bytes)
+            if let Some(envelope) = rmp_serde::from_slice::<crate::messages::envelope::Envelope>(&raw_bytes)
+                .ok()
+                .filter(|_| !erased_on_arrival)
             {
                 if let Some(topic) = gossip_topic_for_envelope(&envelope, &state.klever_network) {
                     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -5643,9 +5679,13 @@ pub async fn follow_user(
     use crate::messages::router::RouteResult;
 
     match state.router.process_message(&body) {
-        RouteResult::Accepted { raw_bytes, .. } => {
-            gossip_if_applicable(&state, &raw_bytes).await;
-            notify_if_applicable(&state, &raw_bytes);
+        RouteResult::Accepted { raw_bytes, erased_on_arrival, .. } => {
+            // Never relay or notify a message erased on arrival by a pending
+            // GDPR deletion request (l2-node 0.151.0, audit W-A).
+            if !erased_on_arrival {
+                gossip_if_applicable(&state, &raw_bytes).await;
+                notify_if_applicable(&state, &raw_bytes);
+            }
             Json(OkResponse { ok: true }).into_response()
         }
         RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
@@ -5667,9 +5707,13 @@ pub async fn unfollow_user(
     use crate::messages::router::RouteResult;
 
     match state.router.process_message(&body) {
-        RouteResult::Accepted { raw_bytes, .. } => {
-            gossip_if_applicable(&state, &raw_bytes).await;
-            notify_if_applicable(&state, &raw_bytes);
+        RouteResult::Accepted { raw_bytes, erased_on_arrival, .. } => {
+            // Never relay or notify a message erased on arrival by a pending
+            // GDPR deletion request (l2-node 0.151.0, audit W-A).
+            if !erased_on_arrival {
+                gossip_if_applicable(&state, &raw_bytes).await;
+                notify_if_applicable(&state, &raw_bytes);
+            }
             Json(OkResponse { ok: true }).into_response()
         }
         RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
@@ -5744,9 +5788,13 @@ pub async fn react_to_news(
     use crate::messages::router::RouteResult;
 
     match state.router.process_message(&body) {
-        RouteResult::Accepted { raw_bytes, .. } => {
-            gossip_if_applicable(&state, &raw_bytes).await;
-            notify_if_applicable(&state, &raw_bytes);
+        RouteResult::Accepted { raw_bytes, erased_on_arrival, .. } => {
+            // Never relay or notify a message erased on arrival by a pending
+            // GDPR deletion request (l2-node 0.151.0, audit W-A).
+            if !erased_on_arrival {
+                gossip_if_applicable(&state, &raw_bytes).await;
+                notify_if_applicable(&state, &raw_bytes);
+            }
             Json(OkResponse { ok: true }).into_response()
         }
         RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
@@ -5768,13 +5816,16 @@ pub async fn repost_news(
     use crate::messages::router::RouteResult;
 
     match state.router.process_message(&body) {
-        RouteResult::Accepted { msg_id, raw_bytes, .. } => {
+        RouteResult::Accepted { msg_id, raw_bytes, erased_on_arrival, .. } => {
             // A repost never federated at all: unlike every other news write this
             // handler dropped the accepted envelope on the floor instead of
             // publishing it, so a repost stayed on the node it was made on and
             // was invisible to the rest of the network.
-            gossip_if_applicable(&state, &raw_bytes).await;
-            notify_if_applicable(&state, &raw_bytes);
+            // Never relay or notify a message erased on arrival (audit W-A).
+            if !erased_on_arrival {
+                gossip_if_applicable(&state, &raw_bytes).await;
+                notify_if_applicable(&state, &raw_bytes);
+            }
             Json(MessageResponse {
                 msg_id: hex::encode(msg_id),
                 delivery: None,
@@ -6337,9 +6388,13 @@ pub async fn add_moderator(
     use crate::messages::router::RouteResult;
 
     match state.router.process_message(&body) {
-        RouteResult::Accepted { raw_bytes, .. } => {
-            gossip_if_applicable(&state, &raw_bytes).await;
-            notify_if_applicable(&state, &raw_bytes);
+        RouteResult::Accepted { raw_bytes, erased_on_arrival, .. } => {
+            // Never relay or notify a message erased on arrival by a pending
+            // GDPR deletion request (l2-node 0.151.0, audit W-A).
+            if !erased_on_arrival {
+                gossip_if_applicable(&state, &raw_bytes).await;
+                notify_if_applicable(&state, &raw_bytes);
+            }
             Json(OkResponse { ok: true }).into_response()
         }
         RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
@@ -6436,9 +6491,13 @@ pub async fn remove_moderator(
     use crate::messages::router::RouteResult;
 
     match state.router.process_message(&body) {
-        RouteResult::Accepted { raw_bytes, .. } => {
-            gossip_if_applicable(&state, &raw_bytes).await;
-            notify_if_applicable(&state, &raw_bytes);
+        RouteResult::Accepted { raw_bytes, erased_on_arrival, .. } => {
+            // Never relay or notify a message erased on arrival by a pending
+            // GDPR deletion request (l2-node 0.151.0, audit W-A).
+            if !erased_on_arrival {
+                gossip_if_applicable(&state, &raw_bytes).await;
+                notify_if_applicable(&state, &raw_bytes);
+            }
             Json(OkResponse { ok: true }).into_response()
         }
         RouteResult::Duplicate => Json(OkResponse { ok: true }).into_response(),
@@ -6460,9 +6519,13 @@ pub async fn kick_user(
     use crate::messages::router::RouteResult;
 
     match state.router.process_message(&body) {
-        RouteResult::Accepted { raw_bytes, .. } => {
-            gossip_if_applicable(&state, &raw_bytes).await;
-            notify_if_applicable(&state, &raw_bytes);
+        RouteResult::Accepted { raw_bytes, erased_on_arrival, .. } => {
+            // Never relay or notify a message erased on arrival by a pending
+            // GDPR deletion request (l2-node 0.151.0, audit W-A).
+            if !erased_on_arrival {
+                gossip_if_applicable(&state, &raw_bytes).await;
+                notify_if_applicable(&state, &raw_bytes);
+            }
             Json(OkResponse { ok: true }).into_response()
         }
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
@@ -6484,9 +6547,13 @@ pub async fn ban_user(
     use crate::messages::router::RouteResult;
 
     match state.router.process_message(&body) {
-        RouteResult::Accepted { raw_bytes, .. } => {
-            gossip_if_applicable(&state, &raw_bytes).await;
-            notify_if_applicable(&state, &raw_bytes);
+        RouteResult::Accepted { raw_bytes, erased_on_arrival, .. } => {
+            // Never relay or notify a message erased on arrival by a pending
+            // GDPR deletion request (l2-node 0.151.0, audit W-A).
+            if !erased_on_arrival {
+                gossip_if_applicable(&state, &raw_bytes).await;
+                notify_if_applicable(&state, &raw_bytes);
+            }
             Json(OkResponse { ok: true }).into_response()
         }
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
@@ -6508,9 +6575,13 @@ pub async fn unban_user(
     use crate::messages::router::RouteResult;
 
     match state.router.process_message(&body) {
-        RouteResult::Accepted { raw_bytes, .. } => {
-            gossip_if_applicable(&state, &raw_bytes).await;
-            notify_if_applicable(&state, &raw_bytes);
+        RouteResult::Accepted { raw_bytes, erased_on_arrival, .. } => {
+            // Never relay or notify a message erased on arrival by a pending
+            // GDPR deletion request (l2-node 0.151.0, audit W-A).
+            if !erased_on_arrival {
+                gossip_if_applicable(&state, &raw_bytes).await;
+                notify_if_applicable(&state, &raw_bytes);
+            }
             Json(OkResponse { ok: true }).into_response()
         }
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
@@ -6541,9 +6612,13 @@ pub async fn mute_user(
     use crate::messages::router::RouteResult;
 
     match state.router.process_message(&body) {
-        RouteResult::Accepted { raw_bytes, .. } => {
-            gossip_if_applicable(&state, &raw_bytes).await;
-            notify_if_applicable(&state, &raw_bytes);
+        RouteResult::Accepted { raw_bytes, erased_on_arrival, .. } => {
+            // Never relay or notify a message erased on arrival by a pending
+            // GDPR deletion request (l2-node 0.151.0, audit W-A).
+            if !erased_on_arrival {
+                gossip_if_applicable(&state, &raw_bytes).await;
+                notify_if_applicable(&state, &raw_bytes);
+            }
             Json(OkResponse { ok: true }).into_response()
         }
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
@@ -6570,9 +6645,13 @@ pub async fn unmute_user(
     use crate::messages::router::RouteResult;
 
     match state.router.process_message(&body) {
-        RouteResult::Accepted { raw_bytes, .. } => {
-            gossip_if_applicable(&state, &raw_bytes).await;
-            notify_if_applicable(&state, &raw_bytes);
+        RouteResult::Accepted { raw_bytes, erased_on_arrival, .. } => {
+            // Never relay or notify a message erased on arrival by a pending
+            // GDPR deletion request (l2-node 0.151.0, audit W-A).
+            if !erased_on_arrival {
+                gossip_if_applicable(&state, &raw_bytes).await;
+                notify_if_applicable(&state, &raw_bytes);
+            }
             Json(OkResponse { ok: true }).into_response()
         }
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
@@ -6594,9 +6673,13 @@ pub async fn pin_message(
     use crate::messages::router::RouteResult;
 
     match state.router.process_message(&body) {
-        RouteResult::Accepted { raw_bytes, .. } => {
-            gossip_if_applicable(&state, &raw_bytes).await;
-            notify_if_applicable(&state, &raw_bytes);
+        RouteResult::Accepted { raw_bytes, erased_on_arrival, .. } => {
+            // Never relay or notify a message erased on arrival by a pending
+            // GDPR deletion request (l2-node 0.151.0, audit W-A).
+            if !erased_on_arrival {
+                gossip_if_applicable(&state, &raw_bytes).await;
+                notify_if_applicable(&state, &raw_bytes);
+            }
             Json(OkResponse { ok: true }).into_response()
         }
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
@@ -6618,9 +6701,13 @@ pub async fn unpin_message(
     use crate::messages::router::RouteResult;
 
     match state.router.process_message(&body) {
-        RouteResult::Accepted { raw_bytes, .. } => {
-            gossip_if_applicable(&state, &raw_bytes).await;
-            notify_if_applicable(&state, &raw_bytes);
+        RouteResult::Accepted { raw_bytes, erased_on_arrival, .. } => {
+            // Never relay or notify a message erased on arrival by a pending
+            // GDPR deletion request (l2-node 0.151.0, audit W-A).
+            if !erased_on_arrival {
+                gossip_if_applicable(&state, &raw_bytes).await;
+                notify_if_applicable(&state, &raw_bytes);
+            }
             Json(OkResponse { ok: true }).into_response()
         }
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),
@@ -6642,9 +6729,13 @@ pub async fn invite_user(
     use crate::messages::router::RouteResult;
 
     match state.router.process_message(&body) {
-        RouteResult::Accepted { raw_bytes, .. } => {
-            gossip_if_applicable(&state, &raw_bytes).await;
-            notify_if_applicable(&state, &raw_bytes);
+        RouteResult::Accepted { raw_bytes, erased_on_arrival, .. } => {
+            // Never relay or notify a message erased on arrival by a pending
+            // GDPR deletion request (l2-node 0.151.0, audit W-A).
+            if !erased_on_arrival {
+                gossip_if_applicable(&state, &raw_bytes).await;
+                notify_if_applicable(&state, &raw_bytes);
+            }
             Json(OkResponse { ok: true }).into_response()
         }
         RouteResult::PowRequired { address } => pow_required_response(&state, &address),

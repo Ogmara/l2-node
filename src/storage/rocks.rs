@@ -298,6 +298,43 @@ pub enum ChannelVerificationOutcome {
     NoOnChainBacking,
 }
 
+/// Node-wide cap on pending GDPR deletion requests (`cf::PENDING_DELETIONS`,
+/// l2-node 0.151.0). A full table refuses NEW pending requests; nothing is
+/// evicted.
+pub const MAX_PENDING_DELETIONS: u64 = 100_000;
+/// Cap on pending deletion requests per requesting wallet.
+pub const MAX_PENDING_DELETIONS_PER_DELETER: u64 = 1_000;
+/// How long a pending deletion request is kept (and the oldest one the sync
+/// path accepts): the default 30-day backfill window plus 30 days.
+pub const PENDING_DELETION_TTL_MS: u64 = 60 * 24 * 3_600 * 1_000;
+/// Rows of other requesters examined when matching a pending request by
+/// delegation (`Storage::promote_pending_deletion`).
+const PENDING_MATCH_SCAN: usize = 64;
+
+/// Shared pending-deletion state (`Storage::pending_deletions`).
+#[derive(Debug, Default)]
+pub struct PendingDeletionState {
+    /// Serializes pending-row writes, promotions and reaps.
+    lock: std::sync::Mutex<()>,
+    /// Number of pending requests; changed only while `lock` is held.
+    count: std::sync::atomic::AtomicU64,
+}
+
+/// Kind of a stored `DeletionRequest` target (`Storage::deletion_target_kind`,
+/// l2-node 0.151.0) — decides which edit/delete side-index carries the
+/// request to backfilling peers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeletionTargetKind {
+    /// A `ChatMessage` in this channel (from the target's own payload).
+    Chat(u64),
+    /// A `NewsPost` / `NewsComment` / `NewsRepost` (`NEWS_FEED` content).
+    News,
+    /// A `DirectMessage` in this conversation.
+    Dm([u8; 32]),
+    /// Any other type: no backfill side-index exists for it.
+    Other,
+}
+
 /// Wrapper around RocksDB with typed column family access.
 #[derive(Clone)]
 pub struct Storage {
@@ -373,6 +410,12 @@ pub struct Storage {
     /// 0.149.0, `storage::channel_lifecycle`): operator policy, the network
     /// notifier, and the seeding / first-boot markers.
     pub(super) lifecycle: Arc<super::channel_lifecycle::LifecycleShared>,
+    /// Pending GDPR deletion-request bookkeeping (l2-node 0.151.0): a lock
+    /// serializing every pending-row write / promotion / reap, and the exact
+    /// number of pending requests (`PENDING_DELETIONS` `T` rows) as an
+    /// atomic so the hot path (every stored message) can skip all work when
+    /// it is 0. `Arc` so every clone shares it.
+    pending_deletions: Arc<PendingDeletionState>,
 }
 
 impl Storage {
@@ -537,8 +580,11 @@ impl Storage {
             pending_channel_member_removal_lock: Arc::new(std::sync::Mutex::new(())),
             key_commit_legacy_rows_done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             lifecycle: Arc::new(super::channel_lifecycle::LifecycleShared::default()),
+            pending_deletions: Arc::new(PendingDeletionState::default()),
         };
         storage.load_lifecycle_markers();
+        let pending = storage.count_pending_deletions();
+        storage.pending_deletions.count.store(pending, std::sync::atomic::Ordering::Release);
         // A read error leaves the flag false — the slower, scan-based path is
         // always correct, so failing towards it is safe.
         if storage
@@ -4474,6 +4520,549 @@ impl Storage {
     /// Check if a message has been soft-deleted.
     pub fn is_deleted(&self, msg_id: &[u8; 32]) -> Result<bool> {
         self.exists_cf(cf::DELETION_MARKERS, msg_id)
+    }
+
+    // --- GDPR DeletionRequest records (l2-node 0.151.0) ---
+
+    /// `true` iff `msg_id` carries a VERIFIED GDPR `DeletionRequest` record
+    /// (`DELETION_REQUESTS[msg_id]`, see the CF doc). Backfill responders
+    /// use it to skip serving the erased original (decision D4). A storage
+    /// error reads as "not erased" — the same answer as before 0.151.0, so
+    /// a transient fault never hides genuine content.
+    pub fn is_gdpr_erased(&self, msg_id: &[u8; 32]) -> bool {
+        self.exists_cf(cf::DELETION_REQUESTS, msg_id).unwrap_or(false)
+    }
+
+    /// JSON value of a verified `DELETION_REQUESTS` row and of a pending
+    /// `PENDING_DELETIONS` `P` row.
+    fn deletion_request_value(request_id: &[u8; 32], deleted_by: &str, deleted_at: u64) -> Result<Vec<u8>> {
+        Ok(serde_json::to_vec(&serde_json::json!({
+            "request_id": hex::encode(request_id),
+            "deleted_by": deleted_by,
+            "deleted_at": deleted_at,
+        }))?)
+    }
+
+    /// `PENDING_DELETIONS` keys of one pending request: `(P, T, D)`.
+    fn pending_deletion_keys(target_id: &[u8; 32], deleter: &str, deleted_at: u64) -> [Vec<u8>; 3] {
+        let mut p = Vec::with_capacity(1 + 32 + deleter.len());
+        p.push(b'P');
+        p.extend_from_slice(target_id);
+        p.extend_from_slice(deleter.as_bytes());
+        let mut t = Vec::with_capacity(1 + 8 + 32 + deleter.len());
+        t.push(b'T');
+        t.extend_from_slice(&deleted_at.to_be_bytes());
+        t.extend_from_slice(target_id);
+        t.extend_from_slice(deleter.as_bytes());
+        let mut d = Self::pending_deleter_prefix(deleter);
+        d.extend_from_slice(target_id);
+        [p, t, d]
+    }
+
+    /// `b'D' ++ deleter ++ 0xFF` — the per-requester prefix.
+    fn pending_deleter_prefix(deleter: &str) -> Vec<u8> {
+        let mut d = Vec::with_capacity(2 + deleter.len() + 32);
+        d.push(b'D');
+        d.extend_from_slice(deleter.as_bytes());
+        d.push(0xFF);
+        d
+    }
+
+    /// Parse a `P` row value into `(request_id, deleted_at)`.
+    fn parse_pending_value(raw: &[u8]) -> Option<([u8; 32], u64)> {
+        let v: serde_json::Value = serde_json::from_slice(raw).ok()?;
+        let request_id = v
+            .get("request_id")
+            .and_then(|r| r.as_str())
+            .and_then(|r| hex::decode(r).ok())
+            .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())?;
+        Some((request_id, v.get("deleted_at").and_then(|t| t.as_u64())?))
+    }
+
+    /// Record a VERIFIED GDPR erasure of `target_id` (its author `deleted_by`
+    /// issued `request_id` at `deleted_at`). Callers write it only for a
+    /// backfilled content kind (`deletion_target_kind` Chat / News / Dm).
+    pub fn put_verified_deletion_request(
+        &self,
+        target_id: &[u8; 32],
+        request_id: &[u8; 32],
+        deleted_by: &str,
+        deleted_at: u64,
+    ) -> Result<()> {
+        let value = Self::deletion_request_value(request_id, deleted_by, deleted_at)?;
+        self.put_cf(cf::DELETION_REQUESTS, target_id, &value)
+    }
+
+    /// Number of pending deletion requests stored (`T` rows), counted once
+    /// at open and maintained under the pending-deletion lock.
+    #[cfg(test)]
+    pub fn pending_deletion_count(&self) -> u64 {
+        self.pending_deletions.count.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Whether one more pending request by `deleter` is admissible: fewer
+    /// than `MAX_PENDING_DELETIONS` node-wide and fewer than
+    /// `MAX_PENDING_DELETIONS_PER_DELETER` for this requester. Checked by the
+    /// router BEFORE the request is stored (input cap — a full table refuses
+    /// new requests, nothing is evicted). A storage error refuses.
+    pub fn pending_deletion_admissible(&self, deleter: &str) -> bool {
+        if self.pending_deletions.count.load(std::sync::atomic::Ordering::Acquire) >= MAX_PENDING_DELETIONS {
+            return false;
+        }
+        match self.count_prefix_cf(
+            cf::PENDING_DELETIONS,
+            &Self::pending_deleter_prefix(deleter),
+            MAX_PENDING_DELETIONS_PER_DELETER as usize,
+        ) {
+            Ok(n) => n < MAX_PENDING_DELETIONS_PER_DELETER,
+            Err(_) => false,
+        }
+    }
+
+    /// Whether a pending request by `deleter` for `target_id` is already
+    /// recorded (`P ‖ target ‖ deleter`). A storage error answers `true`
+    /// (the caller refuses — fail closed).
+    pub fn pending_deletion_exists(&self, target_id: &[u8; 32], deleter: &str) -> bool {
+        let mut key = Self::pending_target_prefix(target_id);
+        key.extend_from_slice(deleter.as_bytes());
+        self.exists_cf(cf::PENDING_DELETIONS, &key).unwrap_or(true)
+    }
+
+    fn pending_lock(&self) -> Result<std::sync::MutexGuard<'_, ()>> {
+        self.pending_deletions
+            .lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("pending-deletion lock poisoned"))
+    }
+
+    /// Record a PENDING `DeletionRequest` received on a sync path for a
+    /// target this node does not store (see `cf::PENDING_DELETIONS`). Inert
+    /// until a message `target_id` by the same author is stored. A repeat
+    /// for the same `(target, deleter)` keeps the first record. Admission
+    /// (caps, age) is the caller's job (`pending_deletion_admissible`).
+    ///
+    /// TOCTOU (audit note 3): the target may have been stored — and its own
+    /// promotion check run, finding nothing — between the router's "target
+    /// missing" decision and this write. So the target's existence is
+    /// re-checked UNDER the lock after writing; if it is there now, the
+    /// promotion runs inline (`resolve` maps an address to its wallet, as
+    /// in `promote_pending_deletion`). Returns whether that inline promotion
+    /// applied the deletion.
+    pub fn put_pending_deletion_request(
+        &self,
+        target_id: &[u8; 32],
+        deleter: &str,
+        request_id: &[u8; 32],
+        deleted_at: u64,
+        resolve: impl Fn(&str) -> String,
+    ) -> Result<bool> {
+        let _guard = self.pending_lock()?;
+        let [p, t, d] = Self::pending_deletion_keys(target_id, deleter, deleted_at);
+        // Caps re-checked under the lock (audit round 3 N1): the router's
+        // admission check ran unlocked, so concurrent requests could
+        // otherwise overshoot them. Over a cap → no new row.
+        let room = self.pending_deletions.count.load(std::sync::atomic::Ordering::Acquire) < MAX_PENDING_DELETIONS
+            && self
+                .count_prefix_cf(
+                    cf::PENDING_DELETIONS,
+                    &Self::pending_deleter_prefix(deleter),
+                    MAX_PENDING_DELETIONS_PER_DELETER as usize,
+                )
+                .is_ok_and(|n| n < MAX_PENDING_DELETIONS_PER_DELETER);
+        if room && !self.exists_cf(cf::PENDING_DELETIONS, &p)? {
+            let handle = self.cf_handle(cf::PENDING_DELETIONS)?;
+            let mut batch = WriteBatch::default();
+            batch.put_cf(&handle, &p, Self::deletion_request_value(request_id, deleter, deleted_at)?);
+            batch.put_cf(&handle, &t, []);
+            batch.put_cf(&handle, &d, []);
+            drop(handle);
+            self.write_batch(batch)?;
+            self.pending_deletions.count.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+        let Some(target_raw) = self.get_cf(cf::MESSAGES, target_id)? else {
+            return Ok(false);
+        };
+        let Ok(target) = rmp_serde::from_slice::<crate::messages::envelope::Envelope>(&target_raw) else {
+            return Ok(false);
+        };
+        let author_wallet = resolve(&target.author);
+        self.promote_pending_locked(target_id, &author_wallet, &target.author, &resolve)
+    }
+
+    /// Turn the PENDING request for `target_id` (a message that was just
+    /// stored, resolved author `author_wallet`, signing key `signer`) into a
+    /// verified erasure, if one matches. A pending row matches when its
+    /// requester is `author_wallet` or `signer`, or — for a requester that was
+    /// an unresolved device when the request arrived — resolves (`resolve`)
+    /// to `author_wallet` now. The `msg_id` binds the target to its signing
+    /// key, so a match can never erase someone else's message.
+    ///
+    /// Hot path (every stored chat/news/DM message): returns at once when no
+    /// pending request exists at all (an atomic load) or none for this
+    /// target (one bounded prefix probe), before any `MESSAGES` read.
+    ///
+    /// On a match, ONE `WriteBatch`: delete the pending rows, write the
+    /// `DELETION_MARKERS` row, the verified `DELETION_REQUESTS` row and the
+    /// target's side-index row (`index_deletion_request`'s layout). Only for
+    /// a backfilled content kind (Chat / News / Dm); anything else returns
+    /// `false` untouched (an identity envelope is never erased this way).
+    /// At most `PENDING_MATCH_SCAN` rows of other requesters are examined
+    /// for the resolution match. Returns whether a deletion was applied.
+    pub fn promote_pending_deletion(
+        &self,
+        target_id: &[u8; 32],
+        author_wallet: &str,
+        signer: &str,
+        resolve: impl Fn(&str) -> String,
+    ) -> Result<bool> {
+        if self.pending_deletions.count.load(std::sync::atomic::Ordering::Acquire) == 0 {
+            return Ok(false);
+        }
+        if self.prefix_iter_cf(cf::PENDING_DELETIONS, &Self::pending_target_prefix(target_id), 1)?.is_empty() {
+            return Ok(false);
+        }
+        let _guard = self.pending_lock()?;
+        self.promote_pending_locked(target_id, author_wallet, signer, &resolve)
+    }
+
+    /// `b'P' ++ target_msg_id`.
+    fn pending_target_prefix(target_id: &[u8; 32]) -> Vec<u8> {
+        let mut prefix = Vec::with_capacity(33);
+        prefix.push(b'P');
+        prefix.extend_from_slice(target_id);
+        prefix
+    }
+
+    /// `promote_pending_deletion`'s body; the caller holds the lock.
+    fn promote_pending_locked(
+        &self,
+        target_id: &[u8; 32],
+        author_wallet: &str,
+        signer: &str,
+        resolve: &dyn Fn(&str) -> String,
+    ) -> Result<bool> {
+        let kind = match self.deletion_target_kind(target_id) {
+            Some(k @ (DeletionTargetKind::Chat(_) | DeletionTargetKind::News | DeletionTargetKind::Dm(_))) => k,
+            _ => return Ok(false),
+        };
+        let prefix = Self::pending_target_prefix(target_id);
+        let mut found: Option<(String, Vec<u8>)> = None;
+        for who in [author_wallet, signer] {
+            let mut key = prefix.clone();
+            key.extend_from_slice(who.as_bytes());
+            if let Some(raw) = self.get_cf(cf::PENDING_DELETIONS, &key)? {
+                found = Some((who.to_string(), raw));
+                break;
+            }
+        }
+        if found.is_none() {
+            for (key, raw) in self.prefix_iter_cf(cf::PENDING_DELETIONS, &prefix, PENDING_MATCH_SCAN)? {
+                let Ok(deleter) = std::str::from_utf8(&key[prefix.len()..]) else { continue };
+                if resolve(deleter) == author_wallet {
+                    found = Some((deleter.to_string(), raw));
+                    break;
+                }
+            }
+        }
+        let Some((deleter, raw)) = found else { return Ok(false) };
+        let Some((request_id, deleted_at)) = Self::parse_pending_value(&raw) else { return Ok(false) };
+        let [p, t, d] = Self::pending_deletion_keys(target_id, &deleter, deleted_at);
+        let pending = self.cf_handle(cf::PENDING_DELETIONS)?;
+        let markers = self.cf_handle(cf::DELETION_MARKERS)?;
+        let verified = self.cf_handle(cf::DELETION_REQUESTS)?;
+        let mut batch = WriteBatch::default();
+        batch.delete_cf(&pending, &p);
+        batch.delete_cf(&pending, &t);
+        batch.delete_cf(&pending, &d);
+        batch.put_cf(
+            &markers,
+            target_id,
+            serde_json::to_vec(&serde_json::json!({
+                "deleted_by": author_wallet,
+                "deleted_at": deleted_at,
+            }))?,
+        );
+        batch.put_cf(&verified, target_id, Self::deletion_request_value(&request_id, author_wallet, deleted_at)?);
+        let (side_cf, side_key) = Self::deletion_side_index(kind, &request_id, deleted_at);
+        let side = self.cf_handle(side_cf)?;
+        batch.put_cf(&side, &side_key, []);
+        drop((pending, markers, verified, side));
+        self.write_batch(batch)?;
+        let _ = self.pending_deletions.count.fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |c| Some(c.saturating_sub(1)),
+        );
+        Ok(true)
+    }
+
+    /// Delete pending requests older than `cutoff_ms` (oldest first, at most
+    /// `max_rows` `T` rows per call) together with their request envelope
+    /// in `MESSAGES` — a pending request is indexed nowhere else, so its
+    /// envelope would otherwise stay forever — decrementing
+    /// `TOTAL_MESSAGES` for each envelope that existed. Every removed `T`
+    /// row (malformed ones included — the count at open includes them)
+    /// decrements the pending count once, so it never drifts. Returns how
+    /// many `T` rows were removed.
+    pub fn reap_pending_deletions(&self, cutoff_ms: u64, max_rows: usize) -> Result<usize> {
+        let _guard = self.pending_lock()?;
+        let rows = self.prefix_iter_cf(cf::PENDING_DELETIONS, b"T", max_rows)?;
+        let pending = self.cf_handle(cf::PENDING_DELETIONS)?;
+        let messages = self.cf_handle(cf::MESSAGES)?;
+        let state = self.cf_handle(cf::NODE_STATE)?;
+        let mut batch = WriteBatch::default();
+        let mut reaped = 0usize;
+        for (key, _) in &rows {
+            let parsed = (key.len() >= 1 + 8 + 32)
+                .then(|| {
+                    let ts = u64::from_be_bytes(<[u8; 8]>::try_from(&key[1..9]).ok()?);
+                    let target = <[u8; 32]>::try_from(&key[9..41]).ok()?;
+                    let deleter = std::str::from_utf8(&key[41..]).ok()?;
+                    Some((ts, target, deleter))
+                })
+                .flatten();
+            let Some((ts, target, deleter)) = parsed else {
+                // Malformed: never written by this code; drop it (counted).
+                batch.delete_cf(&pending, key);
+                reaped += 1;
+                continue;
+            };
+            if ts >= cutoff_ms {
+                break;
+            }
+            let [p, t, d] = Self::pending_deletion_keys(&target, deleter, ts);
+            if let Some((request_id, _)) =
+                self.get_cf(cf::PENDING_DELETIONS, &p)?.as_deref().and_then(Self::parse_pending_value)
+            {
+                if self.exists_cf(cf::MESSAGES, &request_id)? {
+                    batch.delete_cf(&messages, request_id);
+                    batch.merge_cf(&state, super::schema::state_keys::TOTAL_MESSAGES, (-1i64).to_be_bytes());
+                }
+            }
+            batch.delete_cf(&pending, &p);
+            batch.delete_cf(&pending, &t);
+            batch.delete_cf(&pending, &d);
+            reaped += 1;
+        }
+        drop((pending, messages, state));
+        self.write_batch(batch)?;
+        let _ = self.pending_deletions.count.fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |c| Some(c.saturating_sub(reaped as u64)),
+        );
+        Ok(reaped)
+    }
+
+    /// Count the `T` rows (one per pending request).
+    /// Counted WITHOUT a cap (audit round 3 N1) so the in-memory count can
+    /// never undercount — an undercount would let the table exceed its cap.
+    /// The table is bounded by the input caps, so this boot-time scan is too.
+    /// A storage error reads as "full" (fail closed).
+    fn count_pending_deletions(&self) -> u64 {
+        self.count_prefix_cf(cf::PENDING_DELETIONS, b"T", usize::MAX)
+            .unwrap_or(MAX_PENDING_DELETIONS)
+    }
+
+    /// The side-index CF and key that carry a `DeletionRequest` for a target
+    /// of `kind` (only called for Chat / News / Dm).
+    fn deletion_side_index(kind: DeletionTargetKind, request_id: &[u8; 32], request_ts: u64) -> (&'static str, Vec<u8>) {
+        match kind {
+            DeletionTargetKind::Chat(cid) => (
+                cf::CHANNEL_EDIT_DELETE_MSGS,
+                super::schema::encode_channel_msg_key(cid, request_ts, request_id),
+            ),
+            DeletionTargetKind::Dm(conv) => (
+                cf::DM_EDIT_DELETE_MSGS,
+                super::schema::encode_dm_msg_key(&conv, request_ts, request_id),
+            ),
+            DeletionTargetKind::News | DeletionTargetKind::Other => (
+                cf::NEWS_EDIT_DELETE,
+                super::schema::encode_news_key(request_ts, request_id),
+            ),
+        }
+    }
+
+    /// Where a stored message's backfill side-index lives, for a
+    /// `DeletionRequest` that targets it (`None` = not stored here). The
+    /// channel / conversation is always derived from the TARGET's own signed
+    /// payload, never from anything the request carries.
+    pub fn deletion_target_kind(&self, target_id: &[u8; 32]) -> Option<DeletionTargetKind> {
+        use crate::messages::envelope::Envelope;
+        use crate::messages::types::{ChatMessagePayload, DirectMessagePayload, MessageType};
+        let raw = self.get_cf(cf::MESSAGES, target_id).ok().flatten()?;
+        let Ok(env) = rmp_serde::from_slice::<Envelope>(&raw) else {
+            return Some(DeletionTargetKind::Other);
+        };
+        Some(match env.msg_type {
+            MessageType::ChatMessage => match rmp_serde::from_slice::<ChatMessagePayload>(&env.payload) {
+                Ok(p) => DeletionTargetKind::Chat(p.channel_id),
+                Err(_) => DeletionTargetKind::Other,
+            },
+            MessageType::NewsPost | MessageType::NewsComment | MessageType::NewsRepost => {
+                DeletionTargetKind::News
+            }
+            MessageType::DirectMessage => match rmp_serde::from_slice::<DirectMessagePayload>(&env.payload) {
+                Ok(p) => DeletionTargetKind::Dm(p.conversation_id),
+                Err(_) => DeletionTargetKind::Other,
+            },
+            _ => DeletionTargetKind::Other,
+        })
+    }
+
+    /// Index a `DeletionRequest` envelope (`request_id`, signed at
+    /// `request_ts`) into the edit/delete side-index of its stored target,
+    /// so the existing last-page ride-alongs carry it after the target:
+    /// `CHANNEL_EDIT_DELETE_MSGS` (chat), `NEWS_EDIT_DELETE` (news post /
+    /// comment / repost) or `DM_EDIT_DELETE_MSGS` (DM). Returns `false` when
+    /// the target is not stored or of no backfilled kind.
+    pub fn index_deletion_request(
+        &self,
+        target_id: &[u8; 32],
+        request_id: &[u8; 32],
+        request_ts: u64,
+    ) -> Result<bool> {
+        match self.deletion_target_kind(target_id) {
+            Some(kind @ (DeletionTargetKind::Chat(_) | DeletionTargetKind::News | DeletionTargetKind::Dm(_))) => {
+                let (side_cf, key) = Self::deletion_side_index(kind, request_id, request_ts);
+                self.put_cf(side_cf, &key, &[])?;
+                Ok(true)
+            }
+            Some(DeletionTargetKind::Other) | None => Ok(false),
+        }
+    }
+
+    /// Mark every news post of `author` as GDPR-erased by `request_id`
+    /// (an `AllUserContent` request): a verified `DELETION_REQUESTS` row per
+    /// `NEWS_BY_AUTHOR` entry, paged so no post is left behind. Returns how
+    /// many rows were written. Used by the router's apply step and by the
+    /// one-time `backfill_deletion_requests` migration.
+    pub fn mark_author_news_gdpr_erased(
+        &self,
+        author: &str,
+        request_id: &[u8; 32],
+        deleted_at: u64,
+    ) -> Result<u64> {
+        const PAGE: usize = 10_000;
+        let mut prefix = Vec::with_capacity(author.len() + 1);
+        prefix.extend_from_slice(author.as_bytes());
+        prefix.push(0xFF);
+        let mut written = 0u64;
+        let mut cursor: Option<Vec<u8>> = None;
+        loop {
+            let entries = match &cursor {
+                None => self.prefix_iter_cf(cf::NEWS_BY_AUTHOR, &prefix, PAGE)?,
+                Some(start) => self.prefix_iter_cf_after(cf::NEWS_BY_AUTHOR, start, &prefix, PAGE)?,
+            };
+            let page_len = entries.len();
+            cursor = entries.last().map(|(k, _)| k.clone());
+            for (key, _) in &entries {
+                // Key: (author, 0xFF, !timestamp:8, msg_id:32)
+                if key.len() < prefix.len() + 8 + 32 {
+                    continue;
+                }
+                let Ok(msg_id) = <[u8; 32]>::try_from(&key[key.len() - 32..]) else { continue };
+                if msg_id != [0u8; 32] {
+                    self.put_verified_deletion_request(&msg_id, request_id, author, deleted_at)?;
+                    written += 1;
+                }
+            }
+            if page_len < PAGE {
+                break;
+            }
+        }
+        Ok(written)
+    }
+
+    /// One-time, resumable re-index of the `DeletionRequest` envelopes
+    /// already in `MESSAGES` (l2-node 0.151.0, `DELETION_REQUESTS_INDEXED`):
+    /// for each accepted `SingleMessage` request whose target is a stored chat
+    /// message, news item or DM authored by the requester, a verified
+    /// `DELETION_REQUESTS` record plus
+    /// the side-index row the backfill ride-alongs serve
+    /// (`index_deletion_request`); for each `AllUserContent` request, the
+    /// author's news posts are marked (`mark_author_news_gdpr_erased`).
+    ///
+    /// Examines at most `budget` `MESSAGES` rows per call, resuming after
+    /// `DELETION_REQUESTS_INDEX_CURSOR`; writes the sentinel once the scan
+    /// reaches the end. Returns `(requests_indexed, done)`. Idempotent: every
+    /// write is a keyed overwrite.
+    pub fn backfill_deletion_requests(&self, budget: usize) -> Result<(u64, bool)> {
+        use crate::messages::envelope::Envelope;
+        use crate::messages::types::{DeletionRequestPayload, DeletionType, MessageType};
+
+        let resolve = |addr: &str| self.resolve_wallet(addr).ok().flatten().unwrap_or_else(|| addr.to_string());
+        let cursor = self.get_cf(cf::NODE_STATE, super::schema::state_keys::DELETION_REQUESTS_INDEX_CURSOR)?;
+        let handle = self
+            .db
+            .cf_handle(cf::MESSAGES)
+            .with_context(|| "column family 'messages' not found")?;
+        let mut iter = self.db.raw_iterator_cf(&handle);
+        match &cursor {
+            Some(c) => {
+                iter.seek(c);
+                if iter.valid() && iter.key() == Some(c.as_slice()) {
+                    iter.next();
+                }
+            }
+            None => iter.seek_to_first(),
+        }
+
+        let mut indexed = 0u64;
+        let mut examined = 0usize;
+        let mut last_key: Option<Vec<u8>> = None;
+        while iter.valid() && examined < budget {
+            examined += 1;
+            if let (Some(key), Some(raw)) = (iter.key(), iter.value()) {
+                last_key = Some(key.to_vec());
+                if let Ok(env) = rmp_serde::from_slice::<Envelope>(raw) {
+                    if env.msg_type == MessageType::DeletionRequest {
+                        if let Ok(p) = rmp_serde::from_slice::<DeletionRequestPayload>(&env.payload) {
+                            let deleter = resolve(&env.author);
+                            match (p.delete_type, p.target_id) {
+                                (DeletionType::SingleMessage, Some(target)) => {
+                                    let target_author = self
+                                        .get_cf(cf::MESSAGES, &target)?
+                                        .and_then(|t| rmp_serde::from_slice::<Envelope>(&t).ok())
+                                        .map(|t| resolve(&t.author));
+                                    // Backfilled content kinds only (never an
+                                    // identity envelope, B1).
+                                    let content = matches!(
+                                        self.deletion_target_kind(&target),
+                                        Some(DeletionTargetKind::Chat(_) | DeletionTargetKind::News | DeletionTargetKind::Dm(_))
+                                    );
+                                    if content && target_author.as_deref() == Some(deleter.as_str()) {
+                                        self.put_verified_deletion_request(&target, &env.msg_id, &deleter, env.timestamp)?;
+                                        self.index_deletion_request(&target, &env.msg_id, env.timestamp)?;
+                                        indexed += 1;
+                                    }
+                                }
+                                (DeletionType::AllUserContent, _) => {
+                                    self.mark_author_news_gdpr_erased(&deleter, &env.msg_id, env.timestamp)?;
+                                    indexed += 1;
+                                }
+                                (DeletionType::SingleMessage, None) => {}
+                            }
+                        }
+                    }
+                }
+            }
+            iter.next();
+        }
+        let done = !iter.valid();
+        iter.status().with_context(|| "MESSAGES scan failed")?;
+        drop(iter);
+        if let Some(k) = last_key {
+            self.put_cf(cf::NODE_STATE, super::schema::state_keys::DELETION_REQUESTS_INDEX_CURSOR, &k)?;
+        }
+        if done {
+            self.put_cf(
+                cf::NODE_STATE,
+                super::schema::state_keys::DELETION_REQUESTS_INDEXED,
+                &1u64.to_be_bytes(),
+            )?;
+        }
+        Ok((indexed, done))
     }
 
     // --- Edit History ---

@@ -864,6 +864,50 @@ fn supervise_handle(
 /// per boot (l2-node 0.143.0); larger databases resume on the next start.
 const KEY_COMMITS_MIGRATION_BUDGET: usize = 5_000_000;
 
+/// Max `MESSAGES` rows the deletion-request re-index (l2-node 0.151.0,
+/// `Storage::backfill_deletion_requests`) examines per boot; larger
+/// databases resume on the next start. Same order as the key-commit
+/// migration — one top-level envelope decode per row.
+const DELETION_REQUESTS_INDEX_BUDGET_PER_BOOT: usize = 5_000_000;
+
+/// Pending GDPR deletion-request reaper cadence and per-pass bound (l2-node
+/// 0.151.0, audit W1).
+const PENDING_DELETION_REAP_INTERVAL_SECS: u64 = 900;
+const PENDING_DELETION_REAP_BATCH: usize = 5_000;
+
+/// Max `CHANNELS` ids queued for subscription after a snapshot bootstrap
+/// (G8) — the same 100k bound `subscribe_stored_channels` uses at startup.
+const SNAPSHOT_SUBSCRIBE_CAP: usize = 100_000;
+
+/// Send every `CHANNELS` id (at most `cap`, in key order) through the
+/// channel-subscribe sender — the path chain discovery uses, handled by
+/// `NetworkService::handle_channel_subscribe_request` (which respects the
+/// private-channel lifecycle and is idempotent). Used after a successful
+/// snapshot bootstrap (G8, l2-node 0.151.0). Returns how many were queued;
+/// a storage error queues nothing (logged) and a closed receiver stops early.
+fn enqueue_channel_subscriptions(
+    storage: &Storage,
+    tx: &tokio::sync::mpsc::UnboundedSender<u64>,
+    cap: usize,
+) -> usize {
+    let rows = match storage.prefix_iter_cf(crate::storage::schema::cf::CHANNELS, &[], cap) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(error = %e, "Failed to list channels for post-snapshot subscription");
+            return 0;
+        }
+    };
+    let mut queued = 0usize;
+    for (key, _) in &rows {
+        let Ok(id) = <[u8; 8]>::try_from(key.as_slice()) else { continue };
+        if tx.send(u64::from_be_bytes(id)).is_err() {
+            break;
+        }
+        queued += 1;
+    }
+    queued
+}
+
 /// The running L2 node instance.
 pub struct Node {
     /// Node configuration.
@@ -1132,6 +1176,27 @@ impl Node {
         if !edit_delete_markers_indexed {
             if let Err(e) = storage.backfill_edit_delete_markers() {
                 warn!(error = %e, "Failed to backfill edit/delete marker indexes");
+            }
+        }
+
+        // Re-index stored GDPR DeletionRequests (l2-node 0.151.0, G5): verified
+        // DELETION_REQUESTS records (responders stop serving erased originals,
+        // D4) plus the request in its target's edit/delete side-index so the
+        // backfill ride-alongs carry it. Budget-capped per boot and resumable
+        // (cursor in NODE_STATE); the sentinel is written once the MESSAGES
+        // scan reaches the end.
+        if storage.get_stat(state_keys::DELETION_REQUESTS_INDEXED)? == 0 {
+            match storage.backfill_deletion_requests(DELETION_REQUESTS_INDEX_BUDGET_PER_BOOT) {
+                Ok((n, true)) => {
+                    if n > 0 {
+                        info!(indexed = n, "Indexed stored deletion requests");
+                    }
+                }
+                Ok((n, false)) => info!(
+                    indexed = n,
+                    "Deletion-request indexing paused at its per-boot budget; resumes next start"
+                ),
+                Err(e) => warn!(error = %e, "Failed to index stored deletion requests; will retry next start"),
             }
         }
 
@@ -1715,6 +1780,20 @@ impl Node {
                             rollback_dir = %outcome.rollback_dir.display(),
                             "Snapshot bootstrap succeeded — chain scanner will resume from new cursor"
                         );
+                        // G8 (l2-node 0.151.0): `subscribe_stored_channels`
+                        // ran before the bootstrap, and the scanner cursor
+                        // now jumps past every derived channel's
+                        // `ChannelCreated` event — so nothing would subscribe
+                        // their gossip topics until a restart. Route every
+                        // CHANNELS id through the scanner's subscribe channel
+                        // (`handle_channel_subscribe_request` keeps the
+                        // private-channel lifecycle rules).
+                        let queued = enqueue_channel_subscriptions(
+                            &self.storage,
+                            &channel_tx,
+                            SNAPSHOT_SUBSCRIBE_CAP,
+                        );
+                        info!(queued, "Snapshot bootstrap: queued gossip subscriptions for derived channels");
                     }
                     Ok(None) => {
                         warn!("Snapshot bootstrap skipped — falling back to chain scan");
@@ -2642,6 +2721,30 @@ impl Node {
             }
         });
 
+        // Pending GDPR deletion-request reaper (l2-node 0.151.0, audit W1):
+        // drops pending requests (and their request envelopes) older than
+        // `PENDING_DELETION_TTL_MS`, oldest first, bounded per pass.
+        let pending_deletion_reap_storage = self.storage.clone();
+        let mut pending_deletion_reap_shutdown_rx = self.shutdown_rx();
+        spawn_supervised("pending_deletion_reaper", async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(PENDING_DELETION_REAP_INTERVAL_SECS));
+            interval.tick().await; // skip immediate tick
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let cutoff = crate::util::now_ms()
+                            .saturating_sub(crate::storage::rocks::PENDING_DELETION_TTL_MS);
+                        match pending_deletion_reap_storage.reap_pending_deletions(cutoff, PENDING_DELETION_REAP_BATCH) {
+                            Ok(0) => {}
+                            Ok(n) => debug!(reaped = n, "Reaped expired pending deletion requests"),
+                            Err(e) => warn!(error = %e, "reap_pending_deletions failed"),
+                        }
+                    }
+                    _ = pending_deletion_reap_shutdown_rx.recv() => break,
+                }
+            }
+        });
+
         // Pending-channel-delete-claim reaper (audit final pre-mainnet W14):
         // own interval, same reasoning as the reapers above.
         let channel_delete_reap_storage = self.storage.clone();
@@ -3375,5 +3478,39 @@ mod channel_member_removal_reaper_tests {
         let (to_delete, next_cursor) = plan_channel_member_removal_reap(&[], 1000, 100);
         assert!(to_delete.is_empty());
         assert!(next_cursor.is_none());
+    }
+}
+
+#[cfg(test)]
+mod snapshot_subscribe_tests {
+    //! G8 (l2-node 0.151.0): after a snapshot bootstrap derives CHANNELS
+    //! rows, every derived channel is sent to the network task's subscribe
+    //! channel (the scanner cursor has already jumped past their
+    //! `ChannelCreated` events).
+    use super::*;
+    use crate::storage::schema::cf;
+
+    #[test]
+    fn derived_channels_are_queued_for_subscription() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        // The rows a bootstrap derives from ANCHORED_STATE (shape irrelevant
+        // here — only the 8-byte keys are read), plus one malformed key.
+        for id in [7u64, 42, 1_000_000] {
+            storage.put_cf(cf::CHANNELS, &id.to_be_bytes(), b"{}").unwrap();
+        }
+        storage.put_cf(cf::CHANNELS, b"bogus", b"{}").unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+        assert_eq!(enqueue_channel_subscriptions(&storage, &tx, SNAPSHOT_SUBSCRIBE_CAP), 3);
+        let mut got = Vec::new();
+        while let Ok(id) = rx.try_recv() {
+            got.push(id);
+        }
+        assert_eq!(got, vec![7, 42, 1_000_000]);
+        // Bounded by `cap`.
+        assert_eq!(enqueue_channel_subscriptions(&storage, &tx, 1), 1);
+        // A closed receiver stops early instead of erroring.
+        drop(rx);
+        assert_eq!(enqueue_channel_subscriptions(&storage, &tx, SNAPSHOT_SUBSCRIBE_CAP), 0);
     }
 }

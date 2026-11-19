@@ -405,11 +405,189 @@ impl<K: Eq + Hash + Clone> AttemptThrottle<K> {
     }
 }
 
+// --- Per-peer concurrency + rolling budget (news / dm / identity sync) ---
+
+/// Hard cap on budget keys tracked by one [`PeerBudgetLimits`] (l2-node
+/// 0.151.0). Past it NEW keys are refused until a prune frees room — the
+/// same fail-closed rule as every other [`BudgetMap`].
+pub const MAX_TRACKED_RESPONDER_KEYS: usize = 100_000;
+
+/// Responder admission for the news-sync, dm-sync and identity-sync
+/// protocols (l2-node 0.151.0): a per-peer in-flight cap plus a rolling
+/// [`Gcra`] budget per key `K` (`PeerId` for news/dm, `(PeerId, wallet)` for
+/// identity-sync). Replaces the pre-0.151.0 LIFETIME "served" counters,
+/// which never refilled until the responder restarted — a long-lived pair
+/// of nodes stopped catching each other up after one busy session. Charged
+/// after each build with `reconcile::budget_charge`; pruned on the 30 s
+/// tick (only full buckets are dropped, so a prune never grants a refill).
+///
+/// Uses `std::sync::Mutex`: the critical sections are a few map
+/// operations and nothing awaits while holding the lock.
+#[derive(Debug)]
+pub struct PeerBudgetLimits<K> {
+    inner: std::sync::Mutex<PeerBudgetInner<K>>,
+}
+
+#[derive(Debug)]
+struct PeerBudgetInner<K> {
+    /// `peer` → requests currently being served to it.
+    per_peer: HashMap<libp2p::PeerId, usize>,
+    /// Rolling budget state per key.
+    budget: BudgetMap<K>,
+}
+
+impl<K: Eq + Hash> PeerBudgetLimits<K> {
+    /// Empty limits tracking at most `cap` budget keys.
+    pub fn new(cap: usize) -> Self {
+        Self {
+            inner: std::sync::Mutex::new(PeerBudgetInner {
+                per_peer: HashMap::new(),
+                budget: BudgetMap::new(cap),
+            }),
+        }
+    }
+
+    /// Admit one inbound request from `peer` charged to `key`, or the
+    /// reason it is refused (the caller answers `server_capped`). The
+    /// concurrency slot is checked first, then the key's budget. Refusals
+    /// are never charged; a poisoned lock is treated like a busy slot
+    /// (fail closed).
+    pub fn try_acquire(
+        self: &std::sync::Arc<Self>,
+        peer: libp2p::PeerId,
+        key: &K,
+        max_concurrent_per_peer: usize,
+        gcra: &Gcra,
+        now: Instant,
+    ) -> Result<PeerSlotGuard<K>, Refusal> {
+        let mut inner = self.inner.lock().map_err(|_| Refusal::Concurrency)?;
+        let in_flight = inner.per_peer.get(&peer).copied().unwrap_or(0);
+        if in_flight >= max_concurrent_per_peer {
+            return Err(Refusal::Concurrency);
+        }
+        inner.budget.admit(key, gcra, now)?;
+        inner.per_peer.insert(peer, in_flight + 1);
+        Ok(PeerSlotGuard {
+            limits: std::sync::Arc::clone(self),
+            peer,
+        })
+    }
+
+    /// Charge `units` to `key` after a build, before the response is
+    /// queued, so the peer's next request already sees it.
+    pub fn charge(&self, key: K, units: u64, gcra: &Gcra, now: Instant) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.budget.charge(key, units, gcra, now);
+        }
+    }
+
+    /// Drop every budget entry whose bucket is full again (never one in
+    /// debt). Run on the 30 s tick. Returns how many were removed.
+    pub fn prune(&self, now: Instant) -> usize {
+        self.inner.lock().map(|mut inner| inner.budget.prune(now)).unwrap_or(0)
+    }
+
+    /// Number of tracked budget keys (tests).
+    #[cfg(test)]
+    pub fn budget_len(&self) -> usize {
+        self.inner.lock().map(|inner| inner.budget.len()).unwrap_or(0)
+    }
+}
+
+/// RAII guard releasing a peer's in-flight slot on drop.
+pub struct PeerSlotGuard<K> {
+    limits: std::sync::Arc<PeerBudgetLimits<K>>,
+    peer: libp2p::PeerId,
+}
+
+impl<K> Drop for PeerSlotGuard<K> {
+    fn drop(&mut self) {
+        if let Ok(mut inner) = self.limits.inner.lock() {
+            if let Some(n) = inner.per_peer.get_mut(&self.peer) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    inner.per_peer.remove(&self.peer);
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const S: fn(u64) -> Duration = Duration::from_secs;
+
+    // ---------------- PeerBudgetLimits (l2-node 0.151.0) ----------------
+
+    /// The rolling budget refills: a key that spent its whole burst is
+    /// refused, then admitted again once enough time passed — no restart.
+    #[test]
+    fn peer_budget_refills_after_time_passes() {
+        let limits = std::sync::Arc::new(PeerBudgetLimits::<libp2p::PeerId>::new(10));
+        let gcra = Gcra::new(2_000, 2_000); // news defaults: 1 unit per 1.8 s
+        let peer = libp2p::PeerId::random();
+        let t0 = Instant::now();
+        let g = limits.try_acquire(peer, &peer, 4, &gcra, t0).expect("fresh key admitted");
+        drop(g);
+        limits.charge(peer, 2_000, &gcra, t0);
+        assert!(matches!(limits.try_acquire(peer, &peer, 4, &gcra, t0), Err(Refusal::OverBudget)));
+        // One unit refills after 1.8 s.
+        assert!(limits.try_acquire(peer, &peer, 4, &gcra, t0 + S(2)).is_ok());
+        // A whole session's worth after an hour.
+        let g = limits.try_acquire(peer, &peer, 4, &gcra, t0 + S(3_600)).expect("refilled");
+        drop(g);
+        limits.charge(peer, 1_999, &gcra, t0 + S(3_600));
+        assert!(limits.try_acquire(peer, &peer, 4, &gcra, t0 + S(3_600)).is_ok());
+    }
+
+    /// The map is bounded (a full map refuses NEW keys, never evicts a key
+    /// in debt) and the prune drops only full buckets.
+    #[test]
+    fn peer_budget_map_is_bounded_and_prunes_only_full_buckets() {
+        let limits = std::sync::Arc::new(PeerBudgetLimits::<(libp2p::PeerId, String)>::new(3));
+        let gcra = Gcra::new(4_000, 1_000); // identity defaults: 3.6 s per unit
+        let peer = libp2p::PeerId::random();
+        let t0 = Instant::now();
+        let k = |w: &str| (peer, w.to_string());
+        limits.charge(k("klv1spent"), 8_000, &gcra, t0); // ~8 h of debt (2× the burst)
+        limits.charge(k("klv1a"), 1, &gcra, t0);
+        limits.charge(k("klv1b"), 1, &gcra, t0);
+        assert_eq!(limits.budget_len(), 3);
+        // A fourth key is refused while the map is full (the on-demand prune
+        // finds nothing refilled yet).
+        assert!(matches!(
+            limits.try_acquire(peer, &k("klv1c"), 4, &gcra, t0),
+            Err(Refusal::MapFull)
+        ));
+        // 4 s later the two one-unit keys are full again; the spent key is not.
+        let later = t0 + S(4);
+        assert_eq!(limits.prune(later), 2);
+        assert_eq!(limits.budget_len(), 1);
+        assert!(matches!(
+            limits.try_acquire(peer, &k("klv1spent"), 4, &gcra, later),
+            Err(Refusal::OverBudget)
+        ));
+        assert!(limits.try_acquire(peer, &k("klv1c"), 4, &gcra, later).is_ok());
+    }
+
+    /// The per-peer in-flight cap is enforced and released on guard drop,
+    /// and a refused request is not charged.
+    #[test]
+    fn peer_budget_concurrency_slot_is_released_on_drop() {
+        let limits = std::sync::Arc::new(PeerBudgetLimits::<libp2p::PeerId>::new(10));
+        let gcra = Gcra::new(5_000, 2_500);
+        let peer = libp2p::PeerId::random();
+        let t0 = Instant::now();
+        let a = limits.try_acquire(peer, &peer, 2, &gcra, t0).expect("slot 1");
+        let b = limits.try_acquire(peer, &peer, 2, &gcra, t0).expect("slot 2");
+        assert!(matches!(limits.try_acquire(peer, &peer, 2, &gcra, t0), Err(Refusal::Concurrency)));
+        assert_eq!(limits.budget_len(), 0, "admission alone never inserts a key");
+        drop(a);
+        assert!(limits.try_acquire(peer, &peer, 2, &gcra, t0).is_ok());
+        drop(b);
+    }
 
     // ---------------- GCRA ----------------
 

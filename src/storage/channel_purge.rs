@@ -90,8 +90,8 @@ use super::schema::{self, cf, state_keys};
 pub mod purge_phase {
     /// `CHANNEL_MSGS` (prefix cid) → each message's `MESSAGES` envelope,
     /// `DELETION_MARKERS` row, and `EDIT_HISTORY` / `CHAT_REACTIONS` /
-    /// `CHAT_REACTION_COUNTS` / `REPORTS` / `COUNTER_VOTES` rows (prefix
-    /// msg_id).
+    /// `CHAT_REACTION_COUNTS` / `REPORTS` / `COUNTER_VOTES` /
+    /// `DELETION_REQUESTS` rows (prefix msg_id).
     pub const CHANNEL_MSGS: u8 = 1;
     /// `CHANNEL_EDIT_DELETE_MSGS` (prefix cid) → `MESSAGES`.
     pub const CHANNEL_EDIT_DELETE_MSGS: u8 = 2;
@@ -178,12 +178,15 @@ pub const MSG_SIDE_ROWS_CAP: usize = 4096;
 /// message (verified against `encode_edit_history_key`,
 /// `encode_chat_reaction_key`, `encode_chat_reaction_count_key`,
 /// `encode_report_key`, `encode_counter_vote_key`).
-const MSG_SIDE_CFS: [&str; 5] = [
+const MSG_SIDE_CFS: [&str; 6] = [
     cf::EDIT_HISTORY,
     cf::CHAT_REACTIONS,
     cf::CHAT_REACTION_COUNTS,
     cf::REPORTS,
     cf::COUNTER_VOTES,
+    // l2-node 0.151.0: the verified GDPR deletion-request record of the
+    // message (pending rows live in `PENDING_DELETIONS` and expire by TTL).
+    cf::DELETION_REQUESTS,
 ];
 
 /// What one purge pass did (for logging and the `private_channels_purged_

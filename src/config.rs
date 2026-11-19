@@ -640,6 +640,18 @@ pub struct BackfillConfig {
     /// no mechanism that could ever close the gap.
     #[serde(default = "default_backfill_news_catchup_interval_hours")]
     pub news_catchup_interval_hours: u64,
+    /// Server-side: BURST of the news-sync responder's rolling budget per
+    /// requesting peer (default 2_000 units; one unit ≈ one envelope sent or
+    /// index row examined, ride-alongs included — l2-node 0.151.0). Replaces
+    /// the former hard-coded LIFETIME cap of 2,000 envelopes per peer, which
+    /// only reset when this node restarted. Validated (`1..=100_000_000`)
+    /// even when `enabled = false`: the responder serves peers regardless.
+    #[serde(default = "default_backfill_news_responder_budget_burst")]
+    pub news_responder_budget_burst: u64,
+    /// Server-side: refill rate of the news-sync budget above, in units per
+    /// hour (default 2_000; l2-node 0.151.0).
+    #[serde(default = "default_backfill_news_responder_budget_refill_per_hour")]
+    pub news_responder_budget_refill_per_hour: u64,
     /// Consecutive first-page reconcile comparisons (l2-node 0.137.0)
     /// where a peer's reported count was meaningfully behind the
     /// leading candidate before it's flagged "stale" and deprioritized
@@ -682,6 +694,9 @@ impl Default for BackfillConfig {
             news_max_age_days: default_backfill_news_max_age_days(),
             news_catchup_interval_hours:
                 default_backfill_news_catchup_interval_hours(),
+            news_responder_budget_burst: default_backfill_news_responder_budget_burst(),
+            news_responder_budget_refill_per_hour:
+                default_backfill_news_responder_budget_refill_per_hour(),
         }
     }
 }
@@ -694,6 +709,12 @@ fn default_backfill_news_max_age_days() -> u64 {
 }
 fn default_backfill_news_catchup_interval_hours() -> u64 {
     6
+}
+fn default_backfill_news_responder_budget_burst() -> u64 {
+    2_000
+}
+fn default_backfill_news_responder_budget_refill_per_hour() -> u64 {
+    2_000
 }
 fn default_backfill_fanout() -> usize {
     3
@@ -949,15 +970,14 @@ const PRIVATE_SYNC_PAGE_CHARGE_ESTIMATE: u64 = 800;
 /// when the burst is smaller than one page's charge — that still works,
 /// it just serves at most about one page per refill interval.
 #[allow(clippy::too_many_arguments)]
-fn validate_budget_block(
+/// Range checks shared by every rolling responder budget (burst + refill
+/// rate): both in range, and a full burst refills within a year.
+fn validate_burst_refill(
     section: &str,
     burst_key: &str,
     burst: u64,
     refill_key: &str,
     refill_per_hour: u64,
-    in_sync_recheck_minutes: u64,
-    retry_backoff_max_minutes: u64,
-    page_charge_estimate: u64,
 ) -> Result<()> {
     if burst == 0 || burst > MAX_BUDGET_BURST {
         anyhow::bail!("{section}.{burst_key} = {burst} must be in 1..={MAX_BUDGET_BURST}");
@@ -974,6 +994,20 @@ fn validate_budget_block(
             burst / refill_per_hour
         );
     }
+    Ok(())
+}
+
+fn validate_budget_block(
+    section: &str,
+    burst_key: &str,
+    burst: u64,
+    refill_key: &str,
+    refill_per_hour: u64,
+    in_sync_recheck_minutes: u64,
+    retry_backoff_max_minutes: u64,
+    page_charge_estimate: u64,
+) -> Result<()> {
+    validate_burst_refill(section, burst_key, burst, refill_key, refill_per_hour)?;
     if in_sync_recheck_minutes == 0 || in_sync_recheck_minutes > MAX_IN_SYNC_RECHECK_MINUTES {
         anyhow::bail!(
             "{section}.in_sync_recheck_minutes = {in_sync_recheck_minutes} must be in \
@@ -1048,6 +1082,17 @@ pub struct DmConfig {
     /// than blocking. Default 900 (15 min).
     #[serde(default = "default_dm_reap_interval_secs")]
     pub reap_interval_secs: u64,
+    /// Server-side: BURST of the dm-sync responder's rolling budget per
+    /// requesting peer, all wallets together (default 5_000 units; one unit
+    /// ≈ one envelope sent or index row examined — l2-node 0.151.0).
+    /// Replaces the former hard-coded LIFETIME cap of 5,000 envelopes per
+    /// peer, which only reset when this node restarted.
+    #[serde(default = "default_dm_sync_responder_budget_burst")]
+    pub sync_responder_budget_burst: u64,
+    /// Server-side: refill rate of the dm-sync budget above, in units per
+    /// hour (default 2_500; l2-node 0.151.0).
+    #[serde(default = "default_dm_sync_responder_budget_refill_per_hour")]
+    pub sync_responder_budget_refill_per_hour: u64,
 }
 
 impl Default for DmConfig {
@@ -1058,6 +1103,8 @@ impl Default for DmConfig {
             backfill_max_age_days: default_dm_backfill_max_age_days(),
             max_stored_messages_per_recipient: default_dm_max_stored_messages_per_recipient(),
             reap_interval_secs: default_dm_reap_interval_secs(),
+            sync_responder_budget_burst: default_dm_sync_responder_budget_burst(),
+            sync_responder_budget_refill_per_hour: default_dm_sync_responder_budget_refill_per_hour(),
         }
     }
 }
@@ -1076,6 +1123,12 @@ fn default_dm_max_stored_messages_per_recipient() -> usize {
 }
 fn default_dm_reap_interval_secs() -> u64 {
     900
+}
+fn default_dm_sync_responder_budget_burst() -> u64 {
+    5_000
+}
+fn default_dm_sync_responder_budget_refill_per_hour() -> u64 {
+    2_500
 }
 
 /// Identity-sync coverage-gap policy (design doc "Closing the Identity-Sync
@@ -1154,6 +1207,18 @@ pub struct IdentityResyncConfig {
     /// Clamped to 1000 in `Config::validate`.
     #[serde(default = "default_identity_resync_max_observed_triggers_per_interval")]
     pub max_observed_triggers_per_interval: usize,
+    /// Server-side: BURST of the identity-sync responder's rolling budget
+    /// per `(requesting peer, wallet)` (default 4_000 units; one unit ≈ one
+    /// envelope sent or index row examined — l2-node 0.151.0). Replaces the
+    /// former hard-coded LIFETIME cap of 4,000 envelopes per (peer, wallet),
+    /// which only reset when this node restarted. Not affected by `enabled`
+    /// (the responder serves peers regardless).
+    #[serde(default = "default_identity_resync_responder_budget_burst")]
+    pub responder_budget_burst: u64,
+    /// Server-side: refill rate of the identity-sync budget above, in units
+    /// per hour (default 1_000; l2-node 0.151.0).
+    #[serde(default = "default_identity_resync_responder_budget_refill_per_hour")]
+    pub responder_budget_refill_per_hour: u64,
 }
 
 impl Default for IdentityResyncConfig {
@@ -1165,6 +1230,8 @@ impl Default for IdentityResyncConfig {
             max_retriggers_per_sweep: default_identity_resync_max_retriggers_per_sweep(),
             max_observed_triggers_per_interval:
                 default_identity_resync_max_observed_triggers_per_interval(),
+            responder_budget_burst: default_identity_resync_responder_budget_burst(),
+            responder_budget_refill_per_hour: default_identity_resync_responder_budget_refill_per_hour(),
         }
     }
 }
@@ -1180,6 +1247,12 @@ fn default_identity_resync_max_retriggers_per_sweep() -> usize {
 }
 fn default_identity_resync_max_observed_triggers_per_interval() -> usize {
     20
+}
+fn default_identity_resync_responder_budget_burst() -> u64 {
+    4_000
+}
+fn default_identity_resync_responder_budget_refill_per_hour() -> u64 {
+    1_000
 }
 
 /// Periodic re-verification of channel `creator` claims against the SC's
@@ -3303,6 +3376,31 @@ impl Config {
                 *value = clamped;
             }
         }
+        // Rolling responder budgets of news-sync / dm-sync / identity-sync
+        // (l2-node 0.151.0). Validated regardless of any `enabled` switch:
+        // the responders serve peers either way. Out-of-range values refuse
+        // to start (same contract as the reconcile / private-sync budgets).
+        validate_burst_refill(
+            "backfill",
+            "news_responder_budget_burst",
+            self.backfill.news_responder_budget_burst,
+            "news_responder_budget_refill_per_hour",
+            self.backfill.news_responder_budget_refill_per_hour,
+        )?;
+        validate_burst_refill(
+            "dm",
+            "sync_responder_budget_burst",
+            self.dm.sync_responder_budget_burst,
+            "sync_responder_budget_refill_per_hour",
+            self.dm.sync_responder_budget_refill_per_hour,
+        )?;
+        validate_burst_refill(
+            "identity_resync",
+            "responder_budget_burst",
+            self.identity_resync.responder_budget_burst,
+            "responder_budget_refill_per_hour",
+            self.identity_resync.responder_budget_refill_per_hour,
+        )?;
         // `[private_channel_sync]` budget + throttle (l2-node 0.141.0) —
         // validated regardless of `enabled`: the responder side serves
         // peers even when this node's own private sync is off.
@@ -4247,6 +4345,12 @@ stale_peer_threshold = 3
 # requalify. 0 disables re-probing (a stale peer stays deprioritized
 # until it happens to win a comparison some other way).
 stale_peer_reprobe_hours = 24
+# News-sync responder (l2-node 0.151.0): rolling work budget per requesting
+# peer — burst in units (~ one envelope sent or index row examined), refilled
+# per hour. Replaces the old lifetime cap that only reset on restart.
+# Applies even when enabled = false (the responder serves peers regardless).
+news_responder_budget_burst = 2000
+news_responder_budget_refill_per_hour = 2000
 
 [private_channel_sync]
 # Authenticated, membership-checked history backfill for PRIVATE channels
@@ -4404,6 +4508,11 @@ backfill_max_age_days = 30
 max_stored_messages_per_recipient = 2000
 # How often the DM retention reaper sweeps for expired rows (W11).
 reap_interval_secs = 900
+# dm-sync responder (l2-node 0.151.0): rolling work budget per requesting
+# peer (all wallets together) — burst in units, refilled per hour. Replaces
+# the old lifetime cap that only reset on restart.
+sync_responder_budget_burst = 5000
+sync_responder_budget_refill_per_hour = 2500
 
 [identity_resync]
 # Identity-sync coverage-gap policy: closes the gap where a wallet whose
@@ -4435,6 +4544,12 @@ max_retriggers_per_sweep = 5
 # outbound requests network-wide, with no ceiling. Auth-triggered pulls
 # are unaffected (already IP-rate-limited).
 max_observed_triggers_per_interval = 20
+# identity-sync responder (l2-node 0.151.0): rolling work budget per
+# (requesting peer, wallet) — burst in units, refilled per hour. Replaces the
+# old lifetime cap that only reset on restart. Applies even when
+# enabled = false (the responder serves peers regardless).
+responder_budget_burst = 4000
+responder_budget_refill_per_hour = 1000
 
 [channel_verify]
 # Periodic re-verification of channel creator claims against the SC's
@@ -5299,6 +5414,79 @@ mod tests {
         let mut c = baseline_config();
         c.backfill.total_envelopes_cap = 10;
         c.validate().expect("small burst warns, does not fail");
+    }
+
+    // --- 0.151.0 news / dm / identity-sync responder budgets ----------
+
+    #[test]
+    fn sync_responder_budgets_default_from_toml_and_old_configs() {
+        let c = baseline_config();
+        assert_eq!(c.backfill.news_responder_budget_burst, 2_000);
+        assert_eq!(c.backfill.news_responder_budget_refill_per_hour, 2_000);
+        assert_eq!(c.dm.sync_responder_budget_burst, 5_000);
+        assert_eq!(c.dm.sync_responder_budget_refill_per_hour, 2_500);
+        assert_eq!(c.identity_resync.responder_budget_burst, 4_000);
+        assert_eq!(c.identity_resync.responder_budget_refill_per_hour, 1_000);
+        // A pre-0.151 config without the keys gets the same defaults.
+        let old: Config = toml::from_str(
+            &Config::default_toml()
+                .lines()
+                .filter(|l| {
+                    !l.starts_with("news_responder_budget_")
+                        && !l.starts_with("sync_responder_budget_")
+                        && !l.starts_with("responder_budget_")
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        assert_eq!(old.backfill.news_responder_budget_burst, 2_000);
+        assert_eq!(old.backfill.news_responder_budget_refill_per_hour, 2_000);
+        assert_eq!(old.dm.sync_responder_budget_burst, 5_000);
+        assert_eq!(old.dm.sync_responder_budget_refill_per_hour, 2_500);
+        assert_eq!(old.identity_resync.responder_budget_burst, 4_000);
+        assert_eq!(old.identity_resync.responder_budget_refill_per_hour, 1_000);
+    }
+
+    #[test]
+    fn sync_responder_budgets_are_range_checked_even_when_disabled() {
+        type Set = fn(&mut Config);
+        let cases: [(Set, &str); 7] = [
+            (|c| c.backfill.news_responder_budget_burst = 0, "backfill.news_responder_budget_burst"),
+            (
+                |c| {
+                    c.backfill.enabled = false;
+                    c.backfill.news_responder_budget_refill_per_hour = 0;
+                },
+                "backfill.news_responder_budget_refill_per_hour",
+            ),
+            (|c| c.dm.sync_responder_budget_burst = 100_000_001, "dm.sync_responder_budget_burst"),
+            (|c| c.dm.sync_responder_budget_refill_per_hour = 0, "dm.sync_responder_budget_refill_per_hour"),
+            (
+                |c| {
+                    c.identity_resync.enabled = false;
+                    c.identity_resync.responder_budget_burst = 0;
+                },
+                "identity_resync.responder_budget_burst",
+            ),
+            (
+                |c| c.identity_resync.responder_budget_refill_per_hour = 1_000_000_001,
+                "identity_resync.responder_budget_refill_per_hour",
+            ),
+            (
+                |c| {
+                    c.dm.sync_responder_budget_burst = 10_000_000;
+                    c.dm.sync_responder_budget_refill_per_hour = 1;
+                },
+                "within a year",
+            ),
+        ];
+        for (set, want) in cases {
+            let mut c = baseline_config();
+            set(&mut c);
+            let err = c.validate().expect_err(want);
+            assert!(format!("{err}").contains(want), "{want}: {err}");
+        }
     }
 
     #[test]

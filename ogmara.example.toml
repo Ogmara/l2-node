@@ -209,6 +209,12 @@ stale_peer_threshold = 3
 # requalify. 0 disables re-probing (a stale peer stays deprioritized
 # until it happens to win a comparison some other way).
 stale_peer_reprobe_hours = 24
+# News-sync responder (l2-node 0.151.0): rolling work budget per requesting
+# peer — burst in units (~ one envelope sent or index row examined), refilled
+# per hour. Replaces the old lifetime cap that only reset on restart.
+# Applies even when enabled = false (the responder serves peers regardless).
+news_responder_budget_burst = 2000
+news_responder_budget_refill_per_hour = 2000
 
 [private_channel_sync]
 # Authenticated, membership-checked history backfill for PRIVATE channels
@@ -366,6 +372,11 @@ backfill_max_age_days = 30
 max_stored_messages_per_recipient = 2000
 # How often the DM retention reaper sweeps for expired rows (W11).
 reap_interval_secs = 900
+# dm-sync responder (l2-node 0.151.0): rolling work budget per requesting
+# peer (all wallets together) — burst in units, refilled per hour. Replaces
+# the old lifetime cap that only reset on restart.
+sync_responder_budget_burst = 5000
+sync_responder_budget_refill_per_hour = 2500
 
 [identity_resync]
 # Identity-sync coverage-gap policy: closes the gap where a wallet whose
@@ -397,6 +408,12 @@ max_retriggers_per_sweep = 5
 # outbound requests network-wide, with no ceiling. Auth-triggered pulls
 # are unaffected (already IP-rate-limited).
 max_observed_triggers_per_interval = 20
+# identity-sync responder (l2-node 0.151.0): rolling work budget per
+# (requesting peer, wallet) — burst in units, refilled per hour. Replaces the
+# old lifetime cap that only reset on restart. Applies even when
+# enabled = false (the responder serves peers regardless).
+responder_budget_burst = 4000
+responder_budget_refill_per_hour = 1000
 
 [channel_verify]
 # Periodic re-verification of channel creator claims against the SC's

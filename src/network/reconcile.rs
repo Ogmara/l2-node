@@ -426,39 +426,6 @@ pub fn build_response_metered(
     // the cap" vs "iteration ran out of channel rows".
     let probe_limit = cap.saturating_add(1);
 
-    // KNOWN LIMITATION (code-audit finding, round 4, 2026-09-30) — not
-    // fixed in this pass, recorded here so it isn't lost. `probe_limit`
-    // bounds RAW rows fetched, not ELIGIBLE ones, and iteration is always
-    // ascending from the OLDEST message (or from the cursor). If a
-    // channel accumulates more than `probe_limit` (default 1001)
-    // messages older than `request.max_age_secs`'s window (CHANNEL_MSGS
-    // has no age-based reaper — old rows persist indefinitely) AND the
-    // requester's window is finite (the default `[backfill] max_age_days
-    // = 30`, not `u64::MAX`), the FIRST page (`cursor: None`) can fetch
-    // only stale, out-of-window rows: every one hits the `env_secs <
-    // min_timestamp` skip below, so `chat_count` never leaves 0 and the
-    // response comes back `envelopes: [], has_more: false` —
-    // indistinguishable from a genuinely-empty channel. The requester
-    // (`NetworkService`'s reconcile handler) treats that shape as
-    // uninformative and never supplies a cursor to page past the stale
-    // prefix, so recent, genuinely in-window history can never be
-    // delivered to a cold-joining node for such a channel — deterministic
-    // and permanent for as long as the condition holds, the same failure
-    // class this whole feature (l2-node 0.136.0) exists to close, just
-    // reached via the time-window filter instead of the count cap.
-    //
-    // Not reachable at this project's current scale (requires substantial
-    // real usage older than the window before this trips) and has an
-    // immediate operator-level mitigation today: set `[backfill]
-    // max_age_days = 18446744073709551615` (u64::MAX / "archive mode, no
-    // time filter") — with no window filter to skip past, the ascending
-    // scan reaches eligible rows normally regardless of table size. A
-    // real fix needs `build_response` to keep scanning forward (bounded
-    // by a raw-row budget larger than `cap`, with its own cursor
-    // progress independent of whether anything eligible was found yet)
-    // rather than a single `probe_limit`-sized fetch — deferred as a
-    // separate, scoped follow-up rather than expanding this pass further.
-
     // Code Audit C1 (0.47.0): paging requires a seek-from-cursor
     // iterator. The earlier implementation used `prefix_iter_cf`
     // (which always starts at the channel prefix) plus a post-skip
@@ -480,7 +447,31 @@ pub fn build_response_metered(
             &prefix,
             probe_limit,
         )
+    } else if min_timestamp > 0 {
+        // G2 (l2-node 0.151.0): the FIRST page seeks straight to the window
+        // start instead of the channel's oldest row. Before, `probe_limit`
+        // bounded RAW rows from the oldest, so a channel with more than
+        // ~1,000 messages older than the requester's window fetched only
+        // stale rows, came back `envelopes: [], has_more: false` and the
+        // requester never received ANY history for it. Valid because
+        // `CHANNEL_MSGS` keys are `(channel_id, timestamp_ms, msg_id)` with
+        // the envelope's signed wall-clock timestamp in MILLISECONDS
+        // (`router::update_indexes`, re-keyed by the
+        // `CHANNEL_MSGS_TS_REINDEXED` migration), while `min_timestamp` is
+        // unix SECONDS: `env.timestamp / 1000 >= min_timestamp` ⇔
+        // `env.timestamp >= min_timestamp * 1000`. The all-zero `msg_id`
+        // sorts before every real one at that timestamp, and
+        // `prefix_iter_cf_after` only skips an exactly-equal key (which no
+        // real row can be), so the first in-window row is included.
+        let start_key = schema::encode_channel_msg_key(
+            request.channel_id,
+            min_timestamp.saturating_mul(1000),
+            &[0u8; 32],
+        );
+        storage.prefix_iter_cf_after(schema::cf::CHANNEL_MSGS, &start_key, &prefix, probe_limit)
     } else {
+        // Archive mode (`max_age_secs == u64::MAX`) — or a window reaching
+        // back to the epoch: every row is in window, start at the oldest.
         storage.prefix_iter_cf(schema::cf::CHANNEL_MSGS, &prefix, probe_limit)
     };
     let rows = match rows {
@@ -509,6 +500,9 @@ pub fn build_response_metered(
     let mut work: u64 = 1 + rows.len() as u64;
 
     let mut envelopes: Vec<Vec<u8>> = Vec::with_capacity(cap);
+    // Wire bytes of the page so far (W5): a page always fits the transport's
+    // response cap (`MAX_RESPONSE_ENVELOPE_BYTES`).
+    let mut bytes: usize = 0;
 
     // P-3b: on the FIRST page, ride the channel's L2 metadata + membership
     // envelopes (ChannelCreate/Update/Join/Leave) along with the chat history.
@@ -521,12 +515,18 @@ pub fn build_response_metered(
         let (meta, meta_work) =
             channel_meta_envelopes_metered(storage, request.channel_id, CHANNEL_META_CAP);
         work += meta_work;
-        envelopes.extend(meta);
+        bytes = append_within_byte_budget(&mut envelopes, meta, bytes);
     }
 
     let mut last_cursor: Option<ReconcileCursor> = None;
     let mut hit_cap = false;
     let mut chat_count = 0usize;
+    // The storage batch came back full: rows may exist beyond it even when
+    // fewer than `cap` of these were eligible (window / D4 skips below).
+    let truncated = rows.len() >= probe_limit;
+    // Position of the last row EXAMINED (served or skipped) — the resume
+    // point when a truncated batch ends without filling the page.
+    let mut last_examined: Option<ReconcileCursor> = None;
 
     for (key, _val) in rows {
         // Key layout from `encode_channel_msg_key`:
@@ -539,6 +539,21 @@ pub fn build_response_metered(
         let lamport_ts = u64::from_be_bytes(key[8..16].try_into().unwrap_or([0; 8]));
         let mut msg_id = [0u8; 32];
         msg_id.copy_from_slice(&key[16..48]);
+
+        // A genuine (cap+1)-th eligible row is checked below, before this
+        // row is consumed; until then every examined row moves the resume
+        // point past it.
+        if chat_count < cap {
+            last_examined = Some(ReconcileCursor { after_lamport_ts: lamport_ts, after_msg_id: msg_id });
+        }
+
+        // D4 (l2-node 0.151.0): an original its author erased with a GDPR
+        // DeletionRequest is never re-served. The request itself still rides
+        // along on the last page (`channel_edit_delete_envelopes_metered`), so
+        // a fresh requester learns of the erasure without the content.
+        if storage.is_gdpr_erased(&msg_id) {
+            continue;
+        }
 
         // Fetch the envelope, deserialise enough to check the
         // wall-clock timestamp for the window filter.
@@ -595,13 +610,28 @@ pub fn build_response_metered(
             hit_cap = true;
             break;
         }
+        // W5: the page is full by BYTES — continue on the next page from
+        // the last delivered row (at least one row is always served).
+        if chat_count > 0 && bytes.saturating_add(envelope_wire_cost(&raw)) > MAX_RESPONSE_ENVELOPE_BYTES {
+            hit_cap = true;
+            break;
+        }
 
+        bytes = bytes.saturating_add(envelope_wire_cost(&raw));
         envelopes.push(raw);
         chat_count += 1;
         last_cursor = Some(ReconcileCursor {
             after_lamport_ts: lamport_ts,
             after_msg_id: msg_id,
         });
+    }
+
+    // A truncated batch that did not fill the page (some examined rows were
+    // skipped) still has rows beyond it: continue after the last examined
+    // row instead of ending the session early (which would strand them).
+    if !hit_cap && truncated {
+        hit_cap = true;
+        last_cursor = last_examined;
     }
 
     // Audit final pre-mainnet W6: ride edit/delete envelopes along on the
@@ -618,7 +648,9 @@ pub fn build_response_metered(
             CHANNEL_EDIT_DELETE_CAP,
         );
         work += ed_work;
-        envelopes.extend(ed);
+        // W5: newest markers first; whatever does not fit the byte budget
+        // is not shipped this session (recorded limitation).
+        append_within_byte_budget(&mut envelopes, ed, bytes);
     }
 
     (
@@ -634,8 +666,60 @@ pub fn build_response_metered(
     )
 }
 
+/// Upper bound on the summed envelope bytes of one backfill response page
+/// (l2-node 0.151.0, audit W5) for reconcile, news-sync and dm-sync. The
+/// libp2p CBOR codec refuses a response above 10 MiB; keeping the summed
+/// worst-case wire cost of the envelopes (`envelope_wire_cost`) ≤ 8 MiB
+/// leaves room for the rest of the CBOR structure, so an honest page never
+/// fails in transport (which would end the session without completing it).
+pub const MAX_RESPONSE_ENVELOPE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Worst-case bytes one envelope costs on the wire. The responses carry
+/// `Vec<Vec<u8>>` through serde, which CBOR encodes as an ARRAY of integers
+/// (not a byte string): every byte ≥ 24 takes two bytes. So twice the
+/// length, plus an allowance for the array header and slot.
+pub fn envelope_wire_cost(raw: &[u8]) -> usize {
+    raw.len().saturating_mul(2).saturating_add(16)
+}
+
+/// Append `items` (in order) to `envelopes` while the page stays within
+/// `MAX_RESPONSE_ENVELOPE_BYTES`; returns the new byte total. Items that
+/// do not fit are dropped (logged at debug) — used for ride-alongs, which
+/// are best-effort and newest-first, so the oldest are the ones dropped.
+pub(crate) fn append_within_byte_budget(envelopes: &mut Vec<Vec<u8>>, items: Vec<Vec<u8>>, mut bytes: usize) -> usize {
+    let total = items.len();
+    let mut taken = 0usize;
+    for raw in items {
+        let cost = envelope_wire_cost(&raw);
+        if bytes.saturating_add(cost) > MAX_RESPONSE_ENVELOPE_BYTES {
+            break;
+        }
+        bytes += cost;
+        envelopes.push(raw);
+        taken += 1;
+    }
+    if taken < total {
+        debug!(dropped = total - taken, "backfill: ride-along truncated at the response byte budget");
+    }
+    bytes
+}
+
 /// Upper bound on metadata envelopes `channel_meta_envelopes` returns.
 pub(crate) const CHANNEL_META_CAP: usize = 256;
+
+/// The largest reconcile page an honest responder with a primary page cap of
+/// `max_envelopes` sends: the chat page plus the first-page metadata
+/// ride-along plus the last-page edit/delete ride-along (l2-node 0.151.0).
+/// The requester refuses (does not verify) anything larger. Before
+/// 0.151.0 it compared against `max_envelopes` alone, so a first page of a
+/// channel with a full chat page (plus its `ChannelCreate`) — or any last
+/// page whose markers pushed it past the cap — was discarded whole.
+pub fn max_page_with_ride_alongs(max_envelopes: usize) -> usize {
+    max_envelopes
+        .min(MAX_ENVELOPES_PER_RESPONSE_CEILING)
+        .saturating_add(CHANNEL_META_CAP)
+        .saturating_add(CHANNEL_EDIT_DELETE_CAP)
+}
 
 /// Replay tiers of a channel's `CHANNEL_META_MSGS` rows (round-4, l2-node
 /// 0.140.0). Serving order = replay order, because the requester applies a
@@ -1149,10 +1233,44 @@ pub(crate) fn channel_edit_delete_envelopes_metered(
         let mut msg_id = [0u8; 32];
         msg_id.copy_from_slice(&key[16..48]);
         if let Ok(Some(raw)) = storage.get_message(&msg_id) {
+            // D4: an edit (it carries the new plaintext) or delete of a
+            // GDPR-erased message is not served — the original never is, so
+            // the requester could not apply it anyway. The DeletionRequest
+            // itself is indexed here too (l2-node 0.151.0) and IS served.
+            if ride_along_target_erased(storage, &raw) {
+                continue;
+            }
             out.push(raw);
         }
     }
     (out, work)
+}
+
+/// `true` iff `raw` is an edit / delete / reaction whose TARGET carries a
+/// verified GDPR `DeletionRequest` record (l2-node 0.151.0, decision D4) —
+/// such a ride-along is never served: an edit would re-serve erased
+/// content, and none of them can be applied by a requester that never
+/// receives the original. A `DeletionRequest` itself is never filtered
+/// (that is how the requester learns of the erasure), nor is anything that
+/// does not decode (the requester's router decides).
+pub(crate) fn ride_along_target_erased(storage: &Storage, raw: &[u8]) -> bool {
+    use crate::messages::types::{DeletePayload, EditPayload, ReactionPayload};
+    let Ok(env) = rmp_serde::from_slice::<Envelope>(raw) else {
+        return false;
+    };
+    let target = match env.msg_type {
+        MessageType::ChatEdit | MessageType::DirectMessageEdit | MessageType::NewsEdit => {
+            rmp_serde::from_slice::<EditPayload>(&env.payload).ok().map(|p| p.target_id)
+        }
+        MessageType::ChatDelete | MessageType::DirectMessageDelete | MessageType::NewsDelete => {
+            rmp_serde::from_slice::<DeletePayload>(&env.payload).ok().map(|p| p.target_id)
+        }
+        MessageType::ChatReaction | MessageType::NewsReaction | MessageType::DirectMessageReaction => {
+            rmp_serde::from_slice::<ReactionPayload>(&env.payload).ok().map(|p| p.target_id)
+        }
+        _ => None,
+    };
+    target.is_some_and(|t| storage.is_gdpr_erased(&t))
 }
 
 /// Inspect the `CHANNELS` metadata row for `channel_id` and return
@@ -1475,6 +1593,176 @@ mod edit_delete_ride_along_tests {
         let resp = build_response(&s, &req, 500, 5_000);
         assert!(!resp.has_more);
         assert!(contains_type(&resp.envelopes, MessageType::ChatDelete));
+    }
+
+    // --- G2 (l2-node 0.151.0): first page seeks from the window start ---
+
+    fn id(n: u32) -> [u8; 32] {
+        let mut id = [0x5Au8; 32];
+        id[..4].copy_from_slice(&n.to_be_bytes());
+        id
+    }
+
+    fn msg_ids(envelopes: &[Vec<u8>]) -> Vec<[u8; 32]> {
+        envelopes.iter().map(|e| rmp_serde::from_slice::<Envelope>(e).unwrap().msg_id).collect()
+    }
+
+    const NOW: u64 = 2_000_000_000; // unix SECONDS
+    const DAY: u64 = 86_400;
+
+    fn window_req(channel_id: u64, max_age_secs: u64, cursor: Option<ReconcileCursor>) -> ReconcileRequest {
+        ReconcileRequest {
+            channel_id,
+            max_age_secs,
+            cursor,
+            fingerprint: Vec::new(),
+            epoch_root_known: None,
+            round: 0,
+        }
+    }
+
+    /// The KNOWN LIMITATION this release closes: 1,500 messages older than
+    /// the 30-day window used to fill the whole first probe, so the page
+    /// came back empty with `has_more = false` and the 10 in-window
+    /// messages were never delivered.
+    #[test]
+    fn first_page_skips_a_stale_backlog_and_delivers_the_window() {
+        let (s, _d) = db();
+        let cid = 90u64;
+        for n in 0..1_500u32 {
+            // Key timestamps are MILLISECONDS.
+            put_chat_message(&s, cid, id(n), (NOW - 40 * DAY) * 1000 + n as u64);
+        }
+        for n in 0..10u32 {
+            put_chat_message(&s, cid, id(10_000 + n), (NOW - DAY) * 1000 + n as u64);
+        }
+        let resp = build_response(&s, &window_req(cid, 30 * DAY, None), 1_000, NOW);
+        assert_eq!(resp.envelopes.len(), 10);
+        assert!(!resp.has_more);
+        assert!(resp.next_cursor.is_none());
+        assert_eq!(msg_ids(&resp.envelopes), (0..10).map(|n| id(10_000 + n)).collect::<Vec<_>>());
+    }
+
+    /// Units: the seek converts the window start from seconds to the key's
+    /// milliseconds — a row exactly at the boundary is in, one ms before is
+    /// out (matching the per-row `timestamp / 1000 >= min` check).
+    #[test]
+    fn window_start_seek_is_in_milliseconds_and_inclusive() {
+        let (s, _d) = db();
+        let cid = 91u64;
+        let start_ms = (NOW - 30 * DAY) * 1000;
+        put_chat_message(&s, cid, id(1), start_ms - 1);
+        put_chat_message(&s, cid, id(2), start_ms);
+        put_chat_message(&s, cid, id(3), start_ms + 1);
+        let resp = build_response(&s, &window_req(cid, 30 * DAY, None), 1_000, NOW);
+        assert_eq!(msg_ids(&resp.envelopes), vec![id(2), id(3)]);
+    }
+
+    /// Archive mode (`u64::MAX`) is unchanged: it starts at the oldest row
+    /// and pages by cursor.
+    #[test]
+    fn archive_mode_still_starts_at_the_oldest_row() {
+        let (s, _d) = db();
+        let cid = 92u64;
+        for n in 0..15u32 {
+            put_chat_message(&s, cid, id(n), (NOW - 400 * DAY) * 1000 + n as u64);
+        }
+        let p1 = build_response(&s, &window_req(cid, u64::MAX, None), 10, NOW);
+        assert_eq!(msg_ids(&p1.envelopes), (0..10).map(id).collect::<Vec<_>>());
+        assert!(p1.has_more);
+        let p2 = build_response(&s, &window_req(cid, u64::MAX, p1.next_cursor), 10, NOW);
+        assert_eq!(msg_ids(&p2.envelopes), (10..15).map(id).collect::<Vec<_>>());
+        assert!(!p2.has_more);
+    }
+
+    // --- D4 (l2-node 0.151.0): erased originals are never served ---
+
+    fn put_deletion_request(s: &Storage, target: [u8; 32], request_id: [u8; 32], ts: u64) {
+        use crate::messages::types::{DeletionRequestPayload, DeletionType};
+        let payload = DeletionRequestPayload { delete_type: DeletionType::SingleMessage, target_id: Some(target) };
+        let env = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::DeletionRequest,
+            msg_id: request_id,
+            author: "klv1author".to_string(),
+            timestamp: ts,
+            lamport_ts: 0,
+            payload: rmp_serde::to_vec_named(&payload).unwrap(),
+            signature: vec![],
+            relay_path: vec![],
+        };
+        s.put_cf(schema::cf::MESSAGES, &request_id, &rmp_serde::to_vec_named(&env).unwrap()).unwrap();
+        s.put_verified_deletion_request(&target, &request_id, "klv1author", ts).unwrap();
+        assert!(s.index_deletion_request(&target, &request_id, ts).unwrap(), "chat target → indexed");
+    }
+
+    /// The erased original, and a delete of it, are not served; the
+    /// DeletionRequest is (on the last page).
+    #[test]
+    fn erased_original_is_withheld_and_its_request_rides_along() {
+        let (s, _d) = db();
+        let cid = 93u64;
+        let base = (NOW - DAY) * 1000;
+        put_chat_message(&s, cid, id(1), base);
+        put_chat_message(&s, cid, id(2), base + 1);
+        put_chat_delete(&s, cid, id(2), id(50), base + 2);
+        put_deletion_request(&s, id(2), id(60), base + 3);
+        let resp = build_response(&s, &window_req(cid, 30 * DAY, None), 1_000, NOW);
+        let got = msg_ids(&resp.envelopes);
+        assert!(got.contains(&id(1)));
+        assert!(!got.contains(&id(2)), "erased original withheld");
+        assert!(!got.contains(&id(50)), "a delete of an erased message is not served");
+        assert!(got.contains(&id(60)), "the DeletionRequest rides along");
+        assert!(contains_type(&resp.envelopes, MessageType::DeletionRequest));
+    }
+
+    /// Skipped (erased) rows inside a FULL storage batch must not end the
+    /// session early: the page reports `has_more` with a cursor past the
+    /// last examined row, and the next page delivers the rest.
+    #[test]
+    fn skipped_rows_in_a_full_batch_do_not_strand_later_rows() {
+        let (s, _d) = db();
+        let cid = 94u64;
+        let base = (NOW - DAY) * 1000;
+        for n in 0..8u32 {
+            put_chat_message(&s, cid, id(n), base + n as u64);
+        }
+        put_deletion_request(&s, id(1), id(100), base + 20);
+        put_deletion_request(&s, id(2), id(101), base + 21);
+        // cap 4 → probe 5 raw rows (0..=4), two of them erased → 3 eligible.
+        let p1 = build_response(&s, &window_req(cid, 30 * DAY, None), 4, NOW);
+        assert_eq!(msg_ids(&p1.envelopes), vec![id(0), id(3), id(4)]);
+        assert!(p1.has_more, "rows 5..8 exist beyond the batch");
+        assert!(!contains_type(&p1.envelopes, MessageType::DeletionRequest), "ride-along only on the last page");
+        let p2 = build_response(&s, &window_req(cid, 30 * DAY, p1.next_cursor), 4, NOW);
+        let got = msg_ids(&p2.envelopes);
+        assert!(got.starts_with(&[id(5), id(6), id(7)]));
+        assert!(!p2.has_more);
+        assert!(got.contains(&id(100)) && got.contains(&id(101)));
+    }
+
+    /// W5: ride-alongs stop at the byte budget instead of overflowing the
+    /// page (newest first, the rest is not shipped this session).
+    #[test]
+    fn ride_alongs_stop_at_the_byte_budget() {
+        let item = vec![0u8; (1024 * 1024 - 16) / 2]; // exactly 1 MiB of wire cost
+        let mut page = Vec::new();
+        let bytes = append_within_byte_budget(&mut page, vec![item.clone(); 20], 0);
+        assert_eq!(page.len(), 8);
+        assert_eq!(bytes, MAX_RESPONSE_ENVELOPE_BYTES);
+        let mut page = vec![vec![0u8; 10]];
+        let bytes = append_within_byte_budget(&mut page, vec![item; 20], 7 * 1024 * 1024 + 100);
+        assert_eq!(page.len(), 1, "no room left for another MiB");
+        assert_eq!(bytes, 7 * 1024 * 1024 + 100);
+    }
+
+    #[test]
+    fn requester_page_bound_includes_the_ride_alongs() {
+        assert_eq!(max_page_with_ride_alongs(1_000), 1_000 + CHANNEL_META_CAP + CHANNEL_EDIT_DELETE_CAP);
+        assert_eq!(
+            max_page_with_ride_alongs(usize::MAX),
+            MAX_ENVELOPES_PER_RESPONSE_CEILING + CHANNEL_META_CAP + CHANNEL_EDIT_DELETE_CAP
+        );
     }
 }
 

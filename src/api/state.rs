@@ -199,6 +199,73 @@ pub struct WsOutbound {
     pub json: String,
 }
 
+/// Gate for the identity-sync pulls an EMPTY `GET /users/{a}/enc-keys`
+/// result may trigger (l2-node 0.151.0, G1). The route is unauthenticated,
+/// so two bounds apply before anything reaches the network task:
+///
+/// * a per-wallet dedup: a wallet admitted in the last [`Self::DEDUP_TTL`]
+///   is not admitted again (and costs no budget) — the network task's own
+///   per-session dedup (`identity_sync_triggered`) then also applies;
+/// * a node-wide budget of [`Self::BUDGET_PER_WINDOW`] pulls per
+///   [`Self::WINDOW`], so a flood of distinct (even well-formed) addresses
+///   is capped at that many P2P pulls per window, each racing at most
+///   `identity_sync::FANOUT` peers.
+///
+/// The dedup map is bounded ([`Self::MAX_TRACKED`], oldest evicted first —
+/// an evicted wallet merely becomes admissible again, still under budget).
+#[derive(Debug, Default)]
+pub struct EncKeysPullGate {
+    window_start: Option<Instant>,
+    used: usize,
+    recent: HashMap<String, Instant>,
+    order: std::collections::VecDeque<String>,
+}
+
+impl EncKeysPullGate {
+    /// Pulls admitted per window, node-wide.
+    pub const BUDGET_PER_WINDOW: usize = 20;
+    /// Budget window.
+    pub const WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+    /// A wallet admitted within this long is not admitted again.
+    pub const DEDUP_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+    /// Max wallets remembered for the dedup.
+    pub const MAX_TRACKED: usize = 10_000;
+
+    /// `true` if a pull for `wallet` may be sent now (and records it).
+    /// Dedup is checked before the budget, so repeats of one wallet never
+    /// spend it.
+    pub fn try_admit(&mut self, wallet: &str, now: Instant) -> bool {
+        if self
+            .window_start
+            .is_none_or(|t| now.saturating_duration_since(t) >= Self::WINDOW)
+        {
+            self.window_start = Some(now);
+            self.used = 0;
+        }
+        if let Some(&at) = self.recent.get(wallet) {
+            if now.saturating_duration_since(at) < Self::DEDUP_TTL {
+                return false;
+            }
+        }
+        if self.used >= Self::BUDGET_PER_WINDOW {
+            return false;
+        }
+        self.used += 1;
+        if self.recent.insert(wallet.to_string(), now).is_none() {
+            self.order.push_back(wallet.to_string());
+            while self.recent.len() > Self::MAX_TRACKED {
+                match self.order.pop_front() {
+                    Some(old) => {
+                        self.recent.remove(&old);
+                    }
+                    None => break,
+                }
+            }
+        }
+        true
+    }
+}
+
 /// Shared state accessible to all API handlers.
 pub struct AppState {
     /// Persistent storage.
@@ -266,6 +333,12 @@ pub struct AppState {
     /// wallet is first seen on this node or a device can't be resolved.
     pub identity_sync_tx:
         tokio::sync::mpsc::UnboundedSender<crate::network::IdentitySyncCommand>,
+    /// Bounds the identity-sync pulls `GET /users/{a}/enc-keys` may fire
+    /// for an empty directory (l2-node 0.151.0, G1). That route needs no
+    /// auth, so without this gate a flood of lookups would turn into a flood
+    /// of P2P requests (and of `identity_sync_tx` sends — the channel is
+    /// unbounded). See [`EncKeysPullGate`].
+    pub enc_keys_pull_gate: std::sync::Mutex<EncKeysPullGate>,
     /// Tells the network task to subscribe to a wallet's DM gossip topic so this
     /// node receives that user's cross-node DMs. Sent on each WS connect and
     /// each REST authenticated call, optionally carrying a wallet-signed
@@ -779,6 +852,7 @@ impl AppState {
             anchor_trigger,
             gossip_tx,
             identity_sync_tx,
+            enc_keys_pull_gate: std::sync::Mutex::new(EncKeysPullGate::default()),
             dm_subscribe_tx,
             private_channel_sync_tx,
             channel_subscribe_tx,
@@ -866,5 +940,54 @@ mod ws_audience_tests {
         assert!(out.audience.allows("klv1alice"));
         assert!(!out.audience.allows("klv1eve"));
         assert_eq!(out.json, r#"{"type":"dm"}"#);
+    }
+}
+
+#[cfg(test)]
+mod enc_keys_pull_gate_tests {
+    //! G1 (l2-node 0.151.0): the unauthenticated `GET /users/{a}/enc-keys`
+    //! route must not be able to turn a lookup flood into a P2P flood.
+    use super::EncKeysPullGate;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn repeated_lookups_of_one_wallet_fire_once_and_spend_no_budget() {
+        let mut g = EncKeysPullGate::default();
+        let t0 = Instant::now();
+        assert!(g.try_admit("klv1alice", t0));
+        for _ in 0..10_000 {
+            assert!(!g.try_admit("klv1alice", t0));
+        }
+        // The repeats did not spend the window budget.
+        let admitted = (0..100).filter(|i| g.try_admit(&format!("klv1w{i}"), t0)).count();
+        assert_eq!(admitted, EncKeysPullGate::BUDGET_PER_WINDOW - 1);
+        // Re-admissible only after the dedup TTL.
+        assert!(!g.try_admit("klv1alice", t0 + EncKeysPullGate::WINDOW + Duration::from_secs(1)));
+        assert!(g.try_admit("klv1alice", t0 + EncKeysPullGate::DEDUP_TTL));
+    }
+
+    #[test]
+    fn a_flood_of_distinct_wallets_is_capped_per_window_and_refills() {
+        let mut g = EncKeysPullGate::default();
+        let t0 = Instant::now();
+        let n = |g: &mut EncKeysPullGate, at: Instant, tag: &str| {
+            (0..5_000).filter(|i| g.try_admit(&format!("klv1{tag}{i}"), at)).count()
+        };
+        assert_eq!(n(&mut g, t0, "a"), EncKeysPullGate::BUDGET_PER_WINDOW);
+        assert_eq!(n(&mut g, t0 + Duration::from_secs(30), "b"), 0, "same window: spent");
+        assert_eq!(n(&mut g, t0 + EncKeysPullGate::WINDOW, "c"), EncKeysPullGate::BUDGET_PER_WINDOW);
+    }
+
+    #[test]
+    fn dedup_memory_is_bounded() {
+        let mut g = EncKeysPullGate::default();
+        let mut t = Instant::now();
+        // One admission per window for many windows.
+        for i in 0..(EncKeysPullGate::MAX_TRACKED + 50) {
+            t += EncKeysPullGate::WINDOW;
+            assert!(g.try_admit(&format!("klv1x{i}"), t));
+        }
+        assert!(g.recent.len() <= EncKeysPullGate::MAX_TRACKED);
+        assert!(g.order.len() <= EncKeysPullGate::MAX_TRACKED);
     }
 }

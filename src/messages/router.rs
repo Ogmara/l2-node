@@ -716,6 +716,10 @@ pub enum RouteResult {
         /// wrap was stored or the slot already held the winning key
         /// (POST `key_status`, l2-node 0.143.0).
         key_status: Option<KeyStatus>,
+        /// `true` when storing this message applied a pending GDPR
+        /// `DeletionRequest` for it (l2-node 0.151.0, router Step 8c): it is
+        /// stored but erased, so callers must not relay, push or notify it.
+        erased_on_arrival: bool,
     },
     /// Message is a duplicate (already stored).
     Duplicate,
@@ -1133,7 +1137,7 @@ impl MessageRouter {
 
         // Step 7d3: Authorize DeletionRequest — a SingleMessage deletion may
         // only target the sender's own message (security audit, BLOCKING).
-        if let Err(e) = self.authorize_deletion_request(&envelope, &resolved_author) {
+        if let Err(e) = self.authorize_deletion_request(&envelope, &resolved_author, is_sync, now_ms) {
             return RouteResult::Rejected(wrap_rejection("deletion_denied", e));
         }
 
@@ -1267,6 +1271,19 @@ impl MessageRouter {
             }
         };
 
+        // Step 8c (l2-node 0.151.0, G5): a GDPR DeletionRequest for this very
+        // message may have arrived earlier, through a sync path, while the
+        // message itself was withheld (D4). Its requester was recorded with
+        // it; only if that requester is this message's author does it become
+        // a real deletion marker now.
+        let erased_on_arrival = match self.promote_pending_deletion(&envelope, &resolved_author) {
+            Ok(applied) => applied,
+            Err(e) => {
+                warn!(error = %e, "Failed to apply a pending deletion request (message still stored)");
+                false
+            }
+        };
+
         // After first successful message from a basic (non-registered) wallet,
         // mark them as known so future PoW checks are skipped (persists across restarts).
         // Only needed for message types subject to PoW (step 4e).
@@ -1307,6 +1324,7 @@ impl MessageRouter {
                 None
             },
             key_status,
+            erased_on_arrival,
         }
     }
 
@@ -1698,6 +1716,55 @@ impl MessageRouter {
     /// (the per-wallet cap remains the only bound). The `>= ts` tie-break keeps the
     /// already-stored key on an exact timestamp collision; this converges across
     /// gossip replays because every node applies the same highest-ts-wins rule.
+    /// Side effects of a `DeviceEncBinding` that lost last-write-wins to a
+    /// newer record of its own key (l2-node 0.151.0, audit W3; see the
+    /// `DeviceEncBinding` apply arm). Tombstones the device's OLDER active
+    /// keys (`superseded_by` this key) and annotates a revoked record of this
+    /// key with `device_id` / `bound_ts` (the latest binding seen) for
+    /// `plan_enc_key_supersede`. Never activates anything.
+    fn apply_losing_enc_binding(
+        &self,
+        wallet: &str,
+        device_id: &str,
+        enc_pub: &str,
+        key: &[u8],
+        ts: u64,
+    ) -> Result<()> {
+        if device_id.is_empty() {
+            return Ok(());
+        }
+        let (_, to_revoke) = self.plan_enc_key_supersede(wallet, device_id, enc_pub, ts)?;
+        for (rk, old_enc) in &to_revoke {
+            let tomb = serde_json::json!({
+                "enc_pub": old_enc,
+                "device_id": device_id,
+                "ts": ts,
+                "revoked": true,
+                "revoked_at": ts,
+                "superseded_by": enc_pub,
+            });
+            self.storage.put_cf(schema::cf::DEVICE_ENC_KEYS, rk, tomb.to_string().as_bytes())?;
+        }
+        if let Some(raw) = self.storage.get_cf(schema::cf::DEVICE_ENC_KEYS, key)? {
+            if let Ok(serde_json::Value::Object(mut rec)) = serde_json::from_slice::<serde_json::Value>(&raw) {
+                let revoked = rec.get("revoked").and_then(|b| b.as_bool()).unwrap_or(false);
+                // Keep the LATEST binding time seen: the device held this key
+                // from then on, so every older binding of the device lost to it.
+                let later = rec.get("bound_ts").and_then(|t| t.as_u64()).is_none_or(|bt| ts > bt);
+                if revoked && later {
+                    rec.insert("device_id".into(), serde_json::json!(device_id));
+                    rec.insert("bound_ts".into(), serde_json::json!(ts));
+                    self.storage.put_cf(
+                        schema::cf::DEVICE_ENC_KEYS,
+                        key,
+                        serde_json::Value::Object(rec).to_string().as_bytes(),
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn plan_enc_key_supersede(
         &self,
         wallet: &str,
@@ -1720,11 +1787,23 @@ impl MessageRouter {
                 Ok(r) => r,
                 Err(_) => continue,
             };
-            if r.get("revoked").and_then(|b| b.as_bool()).unwrap_or(false) {
-                continue;
-            }
             let r_dev = r.get("device_id").and_then(|s| s.as_str()).unwrap_or("");
             let r_enc = r.get("enc_pub").and_then(|s| s.as_str()).unwrap_or("");
+            if r.get("revoked").and_then(|b| b.as_bool()).unwrap_or(false) {
+                // l2-node 0.151.0 (audit W3): a revoked key whose BINDING
+                // arrived after its revoke carries `bound_ts` — proof the
+                // device held that key from then on. A binding of the same
+                // device older than that was superseded by it, even though
+                // the newer key itself is revoked now (order-independent
+                // replay: identity-sync serves revokes before bindings).
+                let bound_ts = r.get("bound_ts").and_then(|t| t.as_u64());
+                if let Some(bt) = bound_ts {
+                    if !r_dev.is_empty() && r_dev == device_id && r_enc != keep_enc_pub && bt >= ts {
+                        newer_exists = true;
+                    }
+                }
+                continue;
+            }
             // Only collide with the SAME device's OTHER enc keys.
             if r_dev.is_empty() || r_dev != device_id || r_enc == keep_enc_pub {
                 continue;
@@ -3090,15 +3169,30 @@ impl MessageRouter {
     /// walks `NEWS_BY_AUTHOR` keyed on the caller's own address), so there is
     /// no attacker-supplied target to authorize.
     ///
-    /// A target that cannot be resolved locally is rejected outright rather
-    /// than writing a marker for an unknown id — this node has no way to
-    /// verify authorship of a message it has never seen, and correct sync/
-    /// gossip peers only ever construct a `DeletionRequest` against a
-    /// message they can already see.
+    /// A target that cannot be resolved locally is rejected outright on the
+    /// LIVE paths (gossip, local submit) rather than writing a marker for an
+    /// unknown id — this node has no way to verify authorship of a message
+    /// it has never seen.
+    ///
+    /// The SYNC path (l2-node 0.151.0, decision D4) is the one exception:
+    /// backfill responders deliberately withhold a GDPR-erased original but
+    /// still serve its `DeletionRequest`, so a fresh node receives the
+    /// request without its target. It is accepted there — only if younger
+    /// than `PENDING_DELETION_TTL_MS` and while the pending caps have room —
+    /// and the apply step records it only as a PENDING row
+    /// (`cf::PENDING_DELETIONS`, keyed by target and requester) that hides
+    /// nothing; it becomes a real deletion only if a chat / news / DM message
+    /// with that id AUTHORED BY THE REQUESTER is stored later
+    /// (`promote_pending_deletion`). A request
+    /// naming someone else's message therefore never erases it, on any
+    /// path. A target that IS stored is authorized against its author on
+    /// every path, as before.
     fn authorize_deletion_request(
         &self,
         envelope: &Envelope,
         resolved_author: &str,
+        is_sync: bool,
+        now_ms: u64,
     ) -> Result<(), String> {
         if envelope.msg_type != MessageType::DeletionRequest {
             return Ok(());
@@ -3112,11 +3206,34 @@ impl MessageRouter {
             Some(id) => id,
             None => return Ok(()), // validation already requires this to be present for SingleMessage
         };
-        let target_bytes = self
+        let target_bytes = match self
             .storage
             .get_cf(schema::cf::MESSAGES, &target_id)
             .map_err(|e| internal_error("storage", e))?
-            .ok_or_else(|| "target message not found".to_string())?;
+        {
+            Some(b) => b,
+            // Sync path: recorded as PENDING by the apply step (see above) —
+            // only while young enough to still be inside a backfill window
+            // (the TTL reaper drops older pending rows anyway) and while the
+            // input caps have room: a full table refuses, it never evicts.
+            None if is_sync => {
+                if envelope.timestamp.saturating_add(crate::storage::rocks::PENDING_DELETION_TTL_MS) < now_ms {
+                    return Err("deletion request for an unknown target is too old".into());
+                }
+                // A repeat for the same (target, requester) is refused BEFORE
+                // Step 8 stores it (audit round 3 W1): it would add nothing
+                // but an envelope no pending row (and so no reaper) covers,
+                // and repeats would bypass the per-requester cap.
+                if self.storage.pending_deletion_exists(&target_id, resolved_author) {
+                    return Err("a deletion request for this target by this requester is already pending".into());
+                }
+                if !self.storage.pending_deletion_admissible(resolved_author) {
+                    return Err("pending deletion requests are at capacity".into());
+                }
+                return Ok(());
+            }
+            None => return Err("target message not found".to_string()),
+        };
         let target_envelope: Envelope = rmp_serde::from_slice(&target_bytes)
             .map_err(|e| format!("failed to deserialize target message: {}", e))?;
         let target_resolved = self
@@ -3127,6 +3244,42 @@ impl MessageRouter {
             return Err("only the original author can delete this message".into());
         }
         Ok(())
+    }
+
+    /// Step 8c (l2-node 0.151.0): turn a PENDING `DeletionRequest` for
+    /// `envelope.msg_id` into a real deletion when the message it waited for
+    /// has just been stored AND was authored by the requester — matched on
+    /// the resolved wallet, the signing key, or the requester's resolution
+    /// now (a device whose delegation arrived after its request). Only for
+    /// backfilled content types (chat, news post/comment/repost, DM); the
+    /// marker, verified record and side-index row are written in one batch
+    /// (`Storage::promote_pending_deletion`). Returns whether the message
+    /// was erased on arrival — the caller must then not relay, push or
+    /// notify it.
+    fn promote_pending_deletion(&self, envelope: &Envelope, resolved_author: &str) -> Result<bool> {
+        if !matches!(
+            envelope.msg_type,
+            MessageType::ChatMessage
+                | MessageType::NewsPost
+                | MessageType::NewsComment
+                | MessageType::NewsRepost
+                | MessageType::DirectMessage
+        ) {
+            return Ok(false);
+        }
+        let applied = self.storage.promote_pending_deletion(
+            &envelope.msg_id,
+            resolved_author,
+            &envelope.author,
+            |addr| self.identity.resolve(addr).unwrap_or_else(|_| addr.to_string()),
+        )?;
+        if applied {
+            debug!(
+                target = %hex::encode(envelope.msg_id),
+                "Pending deletion request applied to the newly stored message"
+            );
+        }
+        Ok(applied)
     }
 
     /// Authorize `DirectMessageReaction` (audit final pre-mainnet W27,
@@ -5615,7 +5768,18 @@ impl MessageRouter {
                     let enc_pub = payload.enc_pub.to_ascii_lowercase();
                     let device_id = payload.device_id.to_ascii_lowercase();
                     let key = schema::encode_device_enc_key(resolved_author, &enc_pub);
-                    if self.enc_key_is_newer(&key, envelope.timestamp)? {
+                    if !self.enc_key_is_newer(&key, envelope.timestamp)? {
+                        // l2-node 0.151.0 (audit W3): this binding lost
+                        // last-write-wins to a newer record of the SAME key
+                        // (typically its revoke, which identity-sync now
+                        // serves first). It still proves the device held
+                        // this key from `ts` on, so (1) the device's older
+                        // keys are superseded exactly as if it had applied
+                        // in time order, and (2) a revoked record learns the
+                        // device and `bound_ts`, so a still-older binding of
+                        // the device arriving later is superseded too.
+                        self.apply_losing_enc_binding(resolved_author, &device_id, &enc_pub, &key, envelope.timestamp)?;
+                    } else {
                         // §2.4 one-active-enc_pub-per-device: plan which prior keys
                         // for THIS device this binding supersedes (and whether it
                         // itself lost the LWW race against a newer key for the device).
@@ -5938,16 +6102,75 @@ impl MessageRouter {
                     match payload.delete_type {
                         DeletionType::SingleMessage => {
                             if let Some(target_id) = payload.target_id {
-                                self.storage.store_deletion_marker(
-                                    &target_id,
-                                    resolved_author,
-                                    envelope.timestamp,
-                                )?;
-                                debug!(
-                                    target = %hex::encode(target_id),
-                                    author = %resolved_author,
-                                    "Single message deletion marker stored"
-                                );
+                                if self.storage.message_exists(&target_id)? {
+                                    // Authorized against the stored target's
+                                    // author (Step 7d3).
+                                    self.storage.store_deletion_marker(
+                                        &target_id,
+                                        resolved_author,
+                                        envelope.timestamp,
+                                    )?;
+                                    // l2-node 0.151.0 (G5): a verified GDPR
+                                    // record (responders stop serving the
+                                    // original, D4) and the request in its
+                                    // target's edit/delete side-index, so the
+                                    // existing last-page ride-alongs carry it
+                                    // to backfilling peers. The channel /
+                                    // conversation comes from the TARGET's
+                                    // payload, never from this request.
+                                    // Backfilled content kinds ONLY (B1): an
+                                    // identity envelope (e.g. the author's own
+                                    // DeviceRevocation / DeviceEncRevoke) keeps
+                                    // its soft-delete marker but is never
+                                    // withheld from backfill.
+                                    if matches!(
+                                        self.storage.deletion_target_kind(&target_id),
+                                        Some(
+                                            crate::storage::rocks::DeletionTargetKind::Chat(_)
+                                                | crate::storage::rocks::DeletionTargetKind::News
+                                                | crate::storage::rocks::DeletionTargetKind::Dm(_)
+                                        )
+                                    ) {
+                                        self.storage.put_verified_deletion_request(
+                                            &target_id,
+                                            &envelope.msg_id,
+                                            resolved_author,
+                                            envelope.timestamp,
+                                        )?;
+                                        self.storage.index_deletion_request(
+                                            &target_id,
+                                            &envelope.msg_id,
+                                            envelope.timestamp,
+                                        )?;
+                                    }
+                                    debug!(
+                                        target = %hex::encode(target_id),
+                                        author = %resolved_author,
+                                        "Single message deletion marker stored"
+                                    );
+                                } else {
+                                    // Sync path only (Step 7d3 rejects a
+                                    // missing target on every live path):
+                                    // the target was withheld by a responder
+                                    // because it is erased. Inert until a
+                                    // message with this id authored by
+                                    // `resolved_author` is stored here.
+                                    // The target may have been stored since
+                                    // Step 7d3 looked (TOCTOU): the storage
+                                    // call re-checks under its lock and
+                                    // promotes inline then.
+                                    self.storage.put_pending_deletion_request(
+                                        &target_id,
+                                        resolved_author,
+                                        &envelope.msg_id,
+                                        envelope.timestamp,
+                                        |addr| self.identity.resolve(addr).unwrap_or_else(|_| addr.to_string()),
+                                    )?;
+                                    debug!(
+                                        target = %hex::encode(target_id),
+                                        "Deletion request for an unknown target recorded as pending"
+                                    );
+                                }
                             }
                         }
                         DeletionType::AllUserContent => {
@@ -5996,6 +6219,14 @@ impl MessageRouter {
                                         if msg_id != [0u8; 32] {
                                             self.storage.store_deletion_marker(
                                                 &msg_id,
+                                                resolved_author,
+                                                envelope.timestamp,
+                                            )?;
+                                            // l2-node 0.151.0 (D4): responders
+                                            // stop serving the erased post.
+                                            self.storage.put_verified_deletion_request(
+                                                &msg_id,
+                                                &envelope.msg_id,
                                                 resolved_author,
                                                 envelope.timestamp,
                                             )?;
@@ -6593,6 +6824,153 @@ mod enc_supersede_tests {
             MessageRouter::new(storage, identity, None, "mainnet".to_string(), usize::MAX, std::sync::Arc::new(crate::metrics::counters::NetworkCounters::new()), crate::config::RateLimitsConfig::default()),
             dir,
         )
+    }
+
+    /// A wallet-signed DeviceEncBinding (`revoke == false`) or DeviceEncRevoke.
+    fn enc_op(wallet_key: &ed25519_dalek::SigningKey, enc_pub: &str, device_id: &str, ts: u64, revoke: bool) -> Vec<u8> {
+        let wallet = crypto::pubkey_to_address(&wallet_key.verifying_key()).unwrap();
+        let (msg_type, payload_bytes, claim) = if revoke {
+            let p = DeviceEncRevokePayload { enc_pub: enc_pub.to_string() };
+            (
+                MessageType::DeviceEncRevoke,
+                rmp_serde::to_vec_named(&p).unwrap(),
+                format!("ogmara-enc-revoke:testnet:{}:{}:{}", enc_pub, wallet, ts),
+            )
+        } else {
+            let p = DeviceEncBindingPayload { device_id: device_id.to_string(), enc_pub: enc_pub.to_string() };
+            (
+                MessageType::DeviceEncBinding,
+                rmp_serde::to_vec_named(&p).unwrap(),
+                format!("ogmara-enc-bind:testnet:{}:{}:{}:{}", enc_pub, device_id, wallet, ts),
+            )
+        };
+        let sig = signing::sign_klever_message(wallet_key, claim.as_bytes());
+        let msg_id = crypto::compute_msg_id("testnet", &wallet_key.verifying_key().to_bytes(), &payload_bytes, ts);
+        rmp_serde::to_vec_named(&Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type,
+            msg_id,
+            author: wallet,
+            timestamp: ts,
+            lamport_ts: 0,
+            payload: payload_bytes,
+            signature: sig.to_bytes().to_vec(),
+            relay_path: vec![],
+        })
+        .unwrap()
+    }
+
+    fn enc_row(r: &MessageRouter, wallet: &str, enc_pub: &str) -> Option<serde_json::Value> {
+        r.storage
+            .get_cf(schema::cf::DEVICE_ENC_KEYS, &schema::encode_device_enc_key(wallet, enc_pub))
+            .unwrap()
+            .map(|v| serde_json::from_slice(&v).unwrap())
+    }
+
+    /// G1 (l2-node 0.151.0): a wallet's enc-key directory travels by
+    /// identity-sync under `SCOPE_ENC_KEYS` (and `SCOPE_ALL`), never under
+    /// the pre-0.151 scopes (1|2|4 — what an old requester asks for), and a
+    /// FRESH node rebuilds it from the synced envelopes alone: the wallet
+    /// claim verifies with no local state, and the serve order (revokes
+    /// before bindings, audit W3) plus LWW and the losing-binding supersede
+    /// reproduces the responder's directory — including a rotated-away key
+    /// whose successor is revoked.
+    #[test]
+    fn enc_key_rotation_to_a_revoked_key_converges_in_any_order() {
+        // W3: dev1 binds `a` (t), rotates to `c` (t+2), `c` is revoked (t+4);
+        // later dev1 binds `x` (t+6). The responder ends with a superseded,
+        // c revoked, x active. Revoke-first serving (and every other arrival
+        // order of the bindings) must converge to the same directory.
+        let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let wallet = crypto::pubkey_to_address(&key.verifying_key()).unwrap();
+        let t = now_ms();
+        let (a, c, x) = ("a1".repeat(32), "c1".repeat(32), "e1".repeat(32));
+        let dev1 = "11".repeat(32);
+        let bind_a = enc_op(&key, &a, &dev1, t, false);
+        let bind_c = enc_op(&key, &c, &dev1, t + 2, false);
+        let revoke_c = enc_op(&key, &c, "", t + 4, true);
+        let bind_x = enc_op(&key, &x, &dev1, t + 6, false);
+        let orders: [[&Vec<u8>; 4]; 4] = [
+            [&bind_a, &bind_c, &revoke_c, &bind_x], // chronological (responder)
+            [&revoke_c, &bind_a, &bind_c, &bind_x], // revoke-first serve order
+            [&revoke_c, &bind_c, &bind_a, &bind_x], // older binding arrives last
+            [&revoke_c, &bind_x, &bind_c, &bind_a], // fully reversed bindings
+        ];
+        let mut results = Vec::new();
+        for order in orders {
+            let (r, _d) = router();
+            for op in order {
+                assert!(matches!(r.process_synced_message(op), RouteResult::Accepted { .. }));
+            }
+            let state: Vec<Option<bool>> = [&a, &c, &x]
+                .iter()
+                .map(|k| enc_row(&r, &wallet, k).map(|v| v["revoked"] == serde_json::json!(false)))
+                .collect();
+            results.push(state);
+        }
+        for r in &results {
+            assert_eq!(r, &vec![Some(false), Some(false), Some(true)], "a superseded, c revoked, x active: {results:?}");
+        }
+        // Truncated after the revoke (first page of a revoke-first session):
+        // nothing is active yet — never the revoked key.
+        let (r, _d) = router();
+        assert!(matches!(r.process_synced_message(&revoke_c), RouteResult::Accepted { .. }));
+        assert_eq!(enc_row(&r, &wallet, &c).map(|v| v["revoked"] == serde_json::json!(true)), Some(true));
+    }
+
+    #[test]
+    fn enc_key_directory_is_served_by_identity_sync_and_rebuilt_on_a_fresh_node() {
+        use crate::network::identity_sync::{self as isync, IdentitySyncRequest};
+        let (responder, _d1) = router();
+        let (fresh, _d2) = router();
+        let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let wallet = crypto::pubkey_to_address(&key.verifying_key()).unwrap();
+        let t = now_ms();
+        let (a, b, c) = ("aa".repeat(32), "cc".repeat(32), "dd".repeat(32));
+        let (dev1, dev2) = ("11".repeat(32), "22".repeat(32));
+        // dev1 bound `a`, later rotated to `c` (supersede); dev2 bound `b`,
+        // later revoked. Revoke arrives first at the responder.
+        for op in [
+            enc_op(&key, &b, &dev2, t + 3, true),
+            enc_op(&key, &a, &dev1, t, false),
+            enc_op(&key, &b, &dev2, t + 1, false),
+            enc_op(&key, &c, &dev1, t + 2, false),
+        ] {
+            assert!(matches!(responder.process_synced_message(&op), RouteResult::Accepted { .. }));
+        }
+        let req = |scopes: u8| IdentitySyncRequest {
+            wallet: wallet.clone(),
+            scopes,
+            cursor: None,
+            overlap_digest: Vec::new(),
+            round: 0,
+        };
+        // An old requester (no bit 8) gets no enc-key rows.
+        let old = isync::build_response(&responder.storage, &req(isync::SCOPE_DELEGATIONS | isync::SCOPE_PROFILE | isync::SCOPE_FOLLOWS), 200);
+        assert!(old.envelopes.is_empty());
+        let resp = isync::build_response(&responder.storage, &req(isync::SCOPE_ENC_KEYS), 200);
+        assert_eq!(resp.envelopes.len(), 4);
+        assert_eq!(isync::build_response(&responder.storage, &req(isync::SCOPE_ALL), 200).envelopes.len(), 4);
+        // Served order (audit W3): the revoke FIRST, then the bindings by ts.
+        let types: Vec<MessageType> = resp
+            .envelopes
+            .iter()
+            .map(|e| rmp_serde::from_slice::<Envelope>(e).unwrap().msg_type)
+            .collect();
+        assert_eq!(
+            types,
+            vec![MessageType::DeviceEncRevoke, MessageType::DeviceEncBinding, MessageType::DeviceEncBinding, MessageType::DeviceEncBinding]
+        );
+        for env in &resp.envelopes {
+            assert!(matches!(fresh.process_synced_message(env), RouteResult::Accepted { .. }));
+        }
+        let active = |r: &MessageRouter, k: &str| enc_row(r, &wallet, k).map(|v| v["revoked"] == serde_json::json!(false));
+        for k in [&a, &b, &c] {
+            assert_eq!(active(&fresh, k), active(&responder, k), "directory row {k} matches the responder");
+        }
+        assert_eq!(active(&fresh, &c), Some(true), "the rotated-to key is active");
+        assert_eq!(active(&fresh, &a), Some(false), "the rotated-away key is superseded");
+        assert_eq!(active(&fresh, &b), Some(false), "the revoked key stays revoked");
     }
 
     #[test]
@@ -9857,6 +10235,496 @@ mod deletion_request_authorization_tests {
         let delete_raw = signed_single_message_deletion(&sk, &author, unknown_id, now_ms());
         assert!(matches!(r.process_message(&delete_raw), RouteResult::Rejected(_)));
         assert!(!r.storage.is_deleted(&unknown_id).unwrap());
+    }
+
+    // --- l2-node 0.151.0 (G5): DeletionRequest propagation by backfill ---
+
+    /// A full signed `ChatMessage` envelope by `sk`'s wallet.
+    fn signed_chat(sk: &ed25519_dalek::SigningKey, channel_id: u64, content: &str, timestamp: u64) -> (Vec<u8>, [u8; 32]) {
+        let author = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        let payload = ChatMessagePayload {
+            channel_id,
+            content: content.to_string(),
+            content_rating: Default::default(),
+            reply_to: None,
+            mentions: vec![],
+            attachments: vec![],
+            enc_content: None,
+            enc_nonce: None,
+            key_epoch: None,
+            buttons: vec![],
+            via_button: false,
+        };
+        let payload_bytes = rmp_serde::to_vec_named(&payload).unwrap();
+        let pk: [u8; 32] = sk.verifying_key().to_bytes();
+        let msg_id = crypto::compute_msg_id("testnet", &pk, &payload_bytes, timestamp);
+        let signature = signing::sign_ogmara_message(
+            sk, "testnet", crate::messages::envelope::PROTOCOL_VERSION,
+            MessageType::ChatMessage as u8, &msg_id, timestamp, &payload_bytes,
+        );
+        let envelope = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::ChatMessage,
+            msg_id,
+            author,
+            timestamp,
+            lamport_ts: 0,
+            payload: payload_bytes,
+            signature: signature.to_bytes().to_vec(),
+            relay_path: vec![],
+        };
+        (rmp_serde::to_vec_named(&envelope).unwrap(), msg_id)
+    }
+
+    fn msg_id_of(raw: &[u8]) -> [u8; 32] {
+        rmp_serde::from_slice::<Envelope>(raw).unwrap().msg_id
+    }
+
+    /// The end-to-end property: a responder that holds an erased message
+    /// serves its DeletionRequest but never the original (D4); a FRESH
+    /// requester accepts the request without its target (pending), and if
+    /// the original ever reaches it later (e.g. from a 0.150 peer, which
+    /// still serves it), it is marked deleted the moment it is stored.
+    #[test]
+    fn fresh_requester_gets_the_marker_and_never_the_original() {
+        let (responder, _d1) = router();
+        let (requester, _d2) = router();
+        let sk = crypto::generate_keypair();
+        let author = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        register_user(&responder, &author, 1_000);
+        register_user(&requester, &author, 1_000);
+        let channel_id = 77u64;
+        let ts = now_ms();
+        let (keep_raw, keep_id) = signed_chat(&sk, channel_id, "keep me", ts);
+        let (erase_raw, erase_id) = signed_chat(&sk, channel_id, "erase me", ts + 1);
+        assert!(matches!(responder.process_synced_message(&keep_raw), RouteResult::Accepted { .. }));
+        assert!(matches!(responder.process_synced_message(&erase_raw), RouteResult::Accepted { .. }));
+        let delete_raw = signed_single_message_deletion(&sk, &author, erase_id, ts + 2);
+        let delete_id = msg_id_of(&delete_raw);
+        assert!(matches!(responder.process_message(&delete_raw), RouteResult::Accepted { .. }));
+        assert!(responder.storage.is_gdpr_erased(&erase_id));
+        assert!(!responder.storage.is_gdpr_erased(&keep_id));
+
+        // The responder's reconcile page (also its last page → ride-along).
+        let req = crate::network::reconcile::ReconcileRequest {
+            channel_id,
+            max_age_secs: 30 * 86_400,
+            cursor: None,
+            fingerprint: Vec::new(),
+            epoch_root_known: None,
+            round: 0,
+        };
+        let resp = crate::network::reconcile::build_response(&responder.storage, &req, 1_000, ts / 1000 + 10);
+        let served: Vec<[u8; 32]> = resp.envelopes.iter().map(|e| msg_id_of(e)).collect();
+        assert!(served.contains(&keep_id));
+        assert!(served.contains(&delete_id), "the DeletionRequest rides along");
+        assert!(!served.contains(&erase_id), "D4: the erased original is never served");
+
+        // The fresh requester applies the page in order.
+        for env in &resp.envelopes {
+            assert!(
+                matches!(requester.process_synced_message(env), RouteResult::Accepted { .. }),
+                "every served envelope is accepted on the sync path"
+            );
+        }
+        assert!(!requester.storage.message_exists(&erase_id).unwrap());
+        assert!(requester.storage.message_exists(&delete_id).unwrap());
+        assert!(!requester.storage.is_deleted(&keep_id).unwrap());
+
+        // Later the original arrives anyway (a 0.150 responder serves it):
+        // the pending request applies on arrival — content stays hidden.
+        assert!(matches!(requester.process_synced_message(&erase_raw), RouteResult::Accepted { .. }));
+        assert!(requester.storage.is_deleted(&erase_id).unwrap());
+        assert!(requester.storage.is_gdpr_erased(&erase_id));
+        // …and the requester now serves the request onward, never the original.
+        let resp2 = crate::network::reconcile::build_response(&requester.storage, &req, 1_000, ts / 1000 + 10);
+        let served2: Vec<[u8; 32]> = resp2.envelopes.iter().map(|e| msg_id_of(e)).collect();
+        assert!(served2.contains(&delete_id));
+        assert!(!served2.contains(&erase_id));
+    }
+
+    /// A pending request by anyone other than the target's author never
+    /// erases it — the pending row is keyed by the requester's wallet.
+    #[test]
+    fn a_pending_request_by_another_wallet_never_erases_the_target() {
+        let (r, _dir) = router();
+        let victim_sk = crypto::generate_keypair();
+        let attacker_sk = crypto::generate_keypair();
+        let attacker = crypto::pubkey_to_address(&attacker_sk.verifying_key()).unwrap();
+        register_user(&r, &attacker, 1_000);
+        let ts = now_ms();
+        let (victim_raw, victim_id) = signed_chat(&victim_sk, 5, "mine", ts);
+        // Sync path: unknown target → accepted as pending.
+        let delete_raw = signed_single_message_deletion(&attacker_sk, &attacker, victim_id, ts + 1);
+        assert!(matches!(r.process_synced_message(&delete_raw), RouteResult::Accepted { .. }));
+        assert!(!r.storage.is_gdpr_erased(&victim_id));
+        // The victim's message arrives: stays visible.
+        assert!(matches!(r.process_synced_message(&victim_raw), RouteResult::Accepted { .. }));
+        assert!(!r.storage.is_deleted(&victim_id).unwrap());
+        assert!(!r.storage.is_gdpr_erased(&victim_id));
+    }
+
+    /// The pending exception is sync-only: live paths still reject an
+    /// unknown target (`deleting_an_unknown_target_is_rejected`), and a
+    /// KNOWN target authored by someone else is rejected on the sync path
+    /// too.
+    #[test]
+    fn sync_path_still_authorizes_a_known_target() {
+        let (r, _dir) = router();
+        let victim_sk = crypto::generate_keypair();
+        let attacker_sk = crypto::generate_keypair();
+        let attacker = crypto::pubkey_to_address(&attacker_sk.verifying_key()).unwrap();
+        register_user(&r, &attacker, 1_000);
+        let ts = now_ms();
+        let (victim_raw, victim_id) = signed_chat(&victim_sk, 5, "mine", ts);
+        assert!(matches!(r.process_synced_message(&victim_raw), RouteResult::Accepted { .. }));
+        let delete_raw = signed_single_message_deletion(&attacker_sk, &attacker, victim_id, ts + 1);
+        assert!(matches!(r.process_synced_message(&delete_raw), RouteResult::Rejected(_)));
+        assert!(!r.storage.is_deleted(&victim_id).unwrap());
+    }
+
+    /// The one-time migration indexes a request stored before 0.151.0.
+    #[test]
+    fn migration_indexes_a_pre_0151_deletion_request() {
+        let (r, _dir) = router();
+        let sk = crypto::generate_keypair();
+        let author = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        register_user(&r, &author, 1_000);
+        let ts = now_ms();
+        let (raw, id) = signed_chat(&sk, 9, "old", ts);
+        assert!(matches!(r.process_synced_message(&raw), RouteResult::Accepted { .. }));
+        let delete_raw = signed_single_message_deletion(&sk, &author, id, ts + 1);
+        assert!(matches!(r.process_message(&delete_raw), RouteResult::Accepted { .. }));
+        // Simulate a pre-0.151.0 node: no verified record, no side-index row.
+        let delete_id = msg_id_of(&delete_raw);
+        r.storage.delete_cf(schema::cf::DELETION_REQUESTS, &id).unwrap();
+        let side_key = schema::encode_channel_msg_key(9, ts + 1, &delete_id);
+        r.storage.delete_cf(schema::cf::CHANNEL_EDIT_DELETE_MSGS, &side_key).unwrap();
+        assert!(!r.storage.is_gdpr_erased(&id));
+        // Budget 1 per call: resumable across "boots".
+        let mut passes = 0;
+        loop {
+            passes += 1;
+            let (_, done) = r.storage.backfill_deletion_requests(1).unwrap();
+            if done {
+                break;
+            }
+            assert!(passes < 10);
+        }
+        assert!(passes > 1, "the scan resumed from its cursor");
+        assert!(r.storage.is_gdpr_erased(&id));
+        assert!(r.storage.exists_cf(schema::cf::CHANNEL_EDIT_DELETE_MSGS, &side_key).unwrap());
+        assert_eq!(r.storage.get_stat(schema::state_keys::DELETION_REQUESTS_INDEXED).unwrap(), 1);
+    }
+
+    // --- round-1 audit fixes (l2-node 0.151.0) ---
+
+    /// Store a wallet-authored identity envelope (`msg_type`) directly, as
+    /// the responder holds it: MESSAGES + IDENTITY_ENVELOPES.
+    fn store_identity_envelope(r: &MessageRouter, author: &str, msg_type: MessageType, msg_id: [u8; 32], ts: u64) {
+        let env = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type,
+            msg_id,
+            author: author.to_string(),
+            timestamp: ts,
+            lamport_ts: 0,
+            payload: vec![0x80],
+            signature: vec![0; 64],
+            relay_path: vec![],
+        };
+        r.storage.put_cf(schema::cf::MESSAGES, &msg_id, &rmp_serde::to_vec_named(&env).unwrap()).unwrap();
+        r.storage
+            .put_cf(
+                schema::cf::IDENTITY_ENVELOPES,
+                &schema::encode_identity_envelope_key(author, msg_type as u8, ts, &msg_id),
+                &[],
+            )
+            .unwrap();
+    }
+
+    /// B1: a wallet "erasing" its own DeviceRevocation / DeviceEncRevoke —
+    /// live with the target stored, and on a fresh node where the request
+    /// arrives first — never withholds the revocation from any responder:
+    /// no verified record, no side-index row, identity-sync still serves it,
+    /// the migration skips it, and a later arrival is not promoted.
+    #[test]
+    fn erasing_a_revocation_has_no_effect_on_any_responder() {
+        use crate::network::identity_sync::{self as isync, IdentitySyncRequest};
+        let (r, _dir) = router();
+        let sk = crypto::generate_keypair();
+        let wallet = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        register_user(&r, &wallet, 1_000);
+        let ts = now_ms();
+        let (revocation, enc_revoke) = ([0x32u8; 32], [0x37u8; 32]);
+        store_identity_envelope(&r, &wallet, MessageType::DeviceRevocation, revocation, ts);
+        store_identity_envelope(&r, &wallet, MessageType::DeviceEncRevoke, enc_revoke, ts + 1);
+        for (i, target) in [revocation, enc_revoke].into_iter().enumerate() {
+            let del = signed_single_message_deletion(&sk, &wallet, target, ts + 10 + i as u64);
+            assert!(matches!(r.process_message(&del), RouteResult::Accepted { .. }));
+            assert!(!r.storage.is_gdpr_erased(&target), "no verified record for an identity type");
+        }
+        let req = IdentitySyncRequest { wallet: wallet.clone(), scopes: isync::SCOPE_ALL, cursor: None, overlap_digest: vec![], round: 0 };
+        let served: Vec<[u8; 32]> = isync::build_response(&r.storage, &req, 200)
+            .envelopes
+            .iter()
+            .map(|e| msg_id_of(e))
+            .collect();
+        assert!(served.contains(&revocation) && served.contains(&enc_revoke));
+        // The migration does not index them either.
+        r.storage.backfill_deletion_requests(1_000_000).unwrap();
+        assert!(!r.storage.is_gdpr_erased(&revocation) && !r.storage.is_gdpr_erased(&enc_revoke));
+        assert!(r.storage.prefix_iter_cf(schema::cf::CHANNEL_EDIT_DELETE_MSGS, &[], 10).unwrap().is_empty());
+        assert!(r.storage.prefix_iter_cf(schema::cf::NEWS_EDIT_DELETE, &[], 10).unwrap().is_empty());
+        assert!(r.storage.prefix_iter_cf(schema::cf::DM_EDIT_DELETE_MSGS, &[], 10).unwrap().is_empty());
+    }
+
+    /// W1: a sync-path request for an unknown target is accepted only while
+    /// young enough, and the pending table is capped on input.
+    #[test]
+    fn pending_requests_are_age_bounded_and_capped_on_input() {
+        let (r, _dir) = router();
+        let sk = crypto::generate_keypair();
+        let wallet = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        register_user(&r, &wallet, 1_000);
+        let now = now_ms();
+        let too_old = now - crate::storage::rocks::PENDING_DELETION_TTL_MS - 1_000;
+        let old = signed_single_message_deletion(&sk, &wallet, [0xA1; 32], too_old);
+        assert!(matches!(r.process_synced_message(&old), RouteResult::Rejected(_)));
+        assert!(!r.storage.message_exists(&msg_id_of(&old)).unwrap(), "refused before storing");
+        // Fill this requester's quota directly, then one more is refused.
+        for i in 0..crate::storage::rocks::MAX_PENDING_DELETIONS_PER_DELETER {
+            let mut t = [0u8; 32];
+            t[..8].copy_from_slice(&i.to_be_bytes());
+            r.storage.put_pending_deletion_request(&t, &wallet, &[1; 32], now, |a| a.to_string()).unwrap();
+        }
+        assert_eq!(r.storage.pending_deletion_count(), crate::storage::rocks::MAX_PENDING_DELETIONS_PER_DELETER);
+        let over = signed_single_message_deletion(&sk, &wallet, [0xA2; 32], now);
+        assert!(matches!(r.process_synced_message(&over), RouteResult::Rejected(_)));
+        // Another wallet still has room (refuse new, never evict).
+        let sk2 = crypto::generate_keypair();
+        let w2 = crypto::pubkey_to_address(&sk2.verifying_key()).unwrap();
+        register_user(&r, &w2, 1_000);
+        let ok = signed_single_message_deletion(&sk2, &w2, [0xA3; 32], now);
+        assert!(matches!(r.process_synced_message(&ok), RouteResult::Accepted { .. }));
+        assert_eq!(r.storage.pending_deletion_count(), crate::storage::rocks::MAX_PENDING_DELETIONS_PER_DELETER + 1);
+    }
+
+    /// W1: the TTL reaper drops expired pending rows and their request
+    /// envelopes, oldest first, bounded per pass.
+    #[test]
+    fn pending_reaper_drops_expired_rows_and_their_envelopes() {
+        let (r, _dir) = router();
+        let sk = crypto::generate_keypair();
+        let wallet = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        register_user(&r, &wallet, 1_000);
+        let now = now_ms();
+        let a = signed_single_message_deletion(&sk, &wallet, [0xB1; 32], now - 10_000);
+        let b = signed_single_message_deletion(&sk, &wallet, [0xB2; 32], now);
+        for raw in [&a, &b] {
+            assert!(matches!(r.process_synced_message(raw), RouteResult::Accepted { .. }));
+        }
+        assert_eq!(r.storage.pending_deletion_count(), 2);
+        // Cutoff between the two: only `a` goes, with its envelope.
+        assert_eq!(r.storage.reap_pending_deletions(now - 5_000, 100).unwrap(), 1);
+        assert_eq!(r.storage.pending_deletion_count(), 1);
+        assert!(!r.storage.message_exists(&msg_id_of(&a)).unwrap());
+        assert!(r.storage.message_exists(&msg_id_of(&b)).unwrap());
+        // Bounded per pass.
+        assert_eq!(r.storage.reap_pending_deletions(now + 1, 0).unwrap(), 0);
+        assert_eq!(r.storage.reap_pending_deletions(now + 1, 10).unwrap(), 1);
+        assert_eq!(r.storage.pending_deletion_count(), 0);
+        assert!(r.storage.prefix_iter_cf(schema::cf::PENDING_DELETIONS, &[], 10).unwrap().is_empty());
+    }
+
+    /// Audit round 3 W1/N1: repeats for the same (target, requester) are
+    /// refused before storing — one pending row, one stored envelope — and
+    /// the caps hold under the lock even for a direct storage call.
+    #[test]
+    fn repeated_pending_requests_store_one_row_and_one_envelope() {
+        let (r, _dir) = router();
+        let sk = crypto::generate_keypair();
+        let wallet = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        register_user(&r, &wallet, 1_000);
+        let now = now_ms();
+        let target = [0x9Au8; 32];
+        let mut ids = Vec::new();
+        for i in 0..5u64 {
+            let raw = signed_single_message_deletion(&sk, &wallet, target, now + i);
+            ids.push(msg_id_of(&raw));
+            let res = r.process_synced_message(&raw);
+            if i == 0 {
+                assert!(matches!(res, RouteResult::Accepted { .. }));
+            } else {
+                assert!(matches!(res, RouteResult::Rejected(_)), "repeat {i} refused");
+            }
+        }
+        assert_eq!(r.storage.pending_deletion_count(), 1);
+        let stored = ids.iter().filter(|id| r.storage.message_exists(id).unwrap()).count();
+        assert_eq!(stored, 1, "only the first request envelope is stored");
+        // N1: the per-requester cap holds inside the storage call itself.
+        for i in 0..crate::storage::rocks::MAX_PENDING_DELETIONS_PER_DELETER + 5 {
+            let mut t = [0u8; 32];
+            t[..8].copy_from_slice(&i.to_be_bytes());
+            t[31] = 1;
+            r.storage.put_pending_deletion_request(&t, "klv1capped", &[1; 32], now, |a| a.to_string()).unwrap();
+        }
+        assert_eq!(
+            r.storage.pending_deletion_count(),
+            1 + crate::storage::rocks::MAX_PENDING_DELETIONS_PER_DELETER
+        );
+    }
+
+    /// Audit note 4: the reaper decrements `TOTAL_MESSAGES` only for request
+    /// envelopes it actually deleted, and a malformed `T` row is removed
+    /// without the pending count drifting below the real number.
+    #[test]
+    fn pending_reaper_keeps_message_and_pending_counters_exact() {
+        let (r, _dir) = router();
+        let sk = crypto::generate_keypair();
+        let wallet = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        register_user(&r, &wallet, 1_000);
+        let now = now_ms();
+        let a = signed_single_message_deletion(&sk, &wallet, [0xE1; 32], now - 10_000);
+        assert!(matches!(r.process_synced_message(&a), RouteResult::Accepted { .. }));
+        // A pending row whose request envelope is NOT in MESSAGES.
+        r.storage.put_pending_deletion_request(&[0xE2; 32], &wallet, &[0xEE; 32], now - 9_000, |x| x.to_string()).unwrap();
+        // A malformed T row (never written by this code).
+        r.storage.put_cf(schema::cf::PENDING_DELETIONS, b"T\x00\x01", &[]).unwrap();
+        let total_before = r.storage.get_stat(schema::state_keys::TOTAL_MESSAGES).unwrap();
+        assert_eq!(r.storage.pending_deletion_count(), 2);
+        let reaped = r.storage.reap_pending_deletions(now, 100).unwrap();
+        assert_eq!(reaped, 3, "two pending requests and the malformed row");
+        assert_eq!(r.storage.pending_deletion_count(), 0, "saturates, never wraps");
+        assert_eq!(
+            r.storage.get_stat(schema::state_keys::TOTAL_MESSAGES).unwrap(),
+            total_before - 1,
+            "only the envelope that existed is uncounted"
+        );
+        assert!(r.storage.prefix_iter_cf(schema::cf::PENDING_DELETIONS, &[], 10).unwrap().is_empty());
+    }
+
+    /// Audit note 2: the promotion hot path does nothing without a pending
+    /// row for that target (the count and the `P ‖ target` prefix are
+    /// checked before any MESSAGES read / decode).
+    #[test]
+    fn promotion_fast_path_without_pending_rows() {
+        let (r, _dir) = router();
+        let sk = crypto::generate_keypair();
+        let wallet = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        assert_eq!(r.storage.pending_deletion_count(), 0);
+        let (raw, id) = signed_chat(&sk, 4, "x", now_ms());
+        assert!(matches!(r.process_synced_message(&raw), RouteResult::Accepted { erased_on_arrival: false, .. }));
+        // A pending row for ANOTHER target: still no promotion for this one.
+        r.storage.put_pending_deletion_request(&[0xF1; 32], &wallet, &[1; 32], now_ms(), |x| x.to_string()).unwrap();
+        assert!(!r.storage.promote_pending_deletion(&id, &wallet, &wallet, |x| x.to_string()).unwrap());
+        assert!(!r.storage.is_deleted(&id).unwrap());
+        assert_eq!(r.storage.pending_deletion_count(), 1);
+    }
+
+    /// W2: the request arrives first (wallet-signed), the delegation of the
+    /// device that signed the original arrives AFTER it, then the original:
+    /// the original resolves to the requester and is erased on arrival. The
+    /// storage-level match also accepts a requester that resolves to the
+    /// author only now.
+    #[test]
+    fn pending_request_matches_a_device_signed_original_after_its_delegation() {
+        let (r, _dir) = router();
+        let wallet_sk = crypto::generate_keypair();
+        let wallet = crypto::pubkey_to_address(&wallet_sk.verifying_key()).unwrap();
+        register_user(&r, &wallet, 1_000);
+        let device_sk = crypto::generate_keypair();
+        let device = crypto::device_pubkey_to_address(&device_sk.verifying_key()).unwrap();
+        let ts = now_ms();
+        // Original signed by the DEVICE.
+        let payload = ChatMessagePayload {
+            channel_id: 12,
+            content: "from my phone".into(),
+            content_rating: Default::default(),
+            reply_to: None,
+            mentions: vec![],
+            attachments: vec![],
+            enc_content: None,
+            enc_nonce: None,
+            key_epoch: None,
+            buttons: vec![],
+            via_button: false,
+        };
+        let pb = rmp_serde::to_vec_named(&payload).unwrap();
+        let mid = crypto::compute_msg_id("testnet", &device_sk.verifying_key().to_bytes(), &pb, ts);
+        let sig = signing::sign_ogmara_message(
+            &device_sk, "testnet", crate::messages::envelope::PROTOCOL_VERSION,
+            MessageType::ChatMessage as u8, &mid, ts, &pb,
+        );
+        let original = rmp_serde::to_vec_named(&Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::ChatMessage,
+            msg_id: mid,
+            author: device.clone(),
+            timestamp: ts,
+            lamport_ts: 0,
+            payload: pb,
+            signature: sig.to_bytes().to_vec(),
+            relay_path: vec![],
+        })
+        .unwrap();
+        let del = signed_single_message_deletion(&wallet_sk, &wallet, mid, ts + 1);
+        assert!(matches!(r.process_synced_message(&del), RouteResult::Accepted { .. }));
+        // The delegation lands after the request.
+        r.identity
+            .register_device(&crate::storage::rocks::DeviceClaim {
+                device_address: device.clone(),
+                wallet_address: wallet.clone(),
+                device_pubkey_hex: hex::encode(device_sk.verifying_key().to_bytes()),
+                wallet_signature: "test".to_string(),
+                registered_at: 1_000,
+            })
+            .unwrap();
+        assert!(matches!(
+            r.process_synced_message(&original),
+            RouteResult::Accepted { erased_on_arrival: true, .. }
+        ));
+        assert!(r.storage.is_deleted(&mid).unwrap() && r.storage.is_gdpr_erased(&mid));
+        assert_eq!(r.storage.pending_deletion_count(), 0);
+
+        // Storage level: a requester recorded under an address that only
+        // NOW resolves to the author is matched (bounded scan).
+        let (raw2, id2) = signed_chat(&wallet_sk, 12, "second", ts + 5);
+        let ident = |a: &str| a.to_string();
+        r.storage.put_pending_deletion_request(&id2, "ogd1placeholder", &[7; 32], ts + 6, ident).unwrap();
+        assert!(matches!(r.process_synced_message(&raw2), RouteResult::Accepted { erased_on_arrival: false, .. }));
+        // The target is stored now: re-recording the same pending row with a
+        // resolver mapping the placeholder to the author promotes INLINE
+        // (TOCTOU guard, audit note 3) — here through the resolution match.
+        let resolve = |a: &str| if a == "ogd1placeholder" { wallet.clone() } else { a.to_string() };
+        let applied = r
+            .storage
+            .put_pending_deletion_request(&id2, "ogd1placeholder", &[7; 32], ts + 6, resolve)
+            .unwrap();
+        assert!(applied);
+        assert!(r.storage.is_gdpr_erased(&id2));
+        assert_eq!(r.storage.pending_deletion_count(), 0);
+    }
+
+    /// N7: a LIVE gossip arrival erased on arrival is not relayed (verdict
+    /// Ignore) — the gossip handler also skips push/notify for it.
+    #[test]
+    fn gossip_arrival_erased_on_arrival_is_not_relayed() {
+        let (r, _dir) = router();
+        let sk = crypto::generate_keypair();
+        let wallet = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        register_user(&r, &wallet, 1_000);
+        let ts = now_ms();
+        let (raw, id) = signed_chat(&sk, 21, "gone", ts);
+        let del = signed_single_message_deletion(&sk, &wallet, id, ts + 1);
+        assert!(matches!(r.process_synced_message(&del), RouteResult::Accepted { .. }));
+        let result = r.process_gossip_message_at(&raw, ts + 2);
+        assert!(matches!(result, RouteResult::Accepted { erased_on_arrival: true, .. }));
+        assert_eq!(
+            crate::network::gossip_acceptance_for(&result),
+            libp2p::gossipsub::MessageAcceptance::Ignore
+        );
+        assert!(r.storage.is_deleted(&id).unwrap());
     }
 }
 

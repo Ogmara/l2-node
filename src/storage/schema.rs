@@ -332,6 +332,39 @@ pub mod cf {
     /// msg_id (32 bytes) → DeletionRecord JSON (deleted_by, deleted_at, msg_type)
     /// Soft-delete markers — content persists in storage but is hidden in API responses.
     pub const DELETION_MARKERS: &str = "deletion_markers";
+    /// VERIFIED GDPR `DeletionRequest` (0x50) `SingleMessage` erasures
+    /// (l2-node 0.151.0): key `target_msg_id:32` → JSON `{request_id,
+    /// deleted_by, deleted_at}`. Written only for targets of a backfilled
+    /// content kind — a `ChatMessage`, a `NewsPost`/`NewsComment`/
+    /// `NewsRepost` or a `DirectMessage` (`Storage::deletion_target_kind`) —
+    /// when the request was authorized against the stored target (its author
+    /// is the target's author), and for every news post an `AllUserContent`
+    /// request marks. Backfill responders consult it to withhold the erased
+    /// original (decision D4); `DELETION_MARKERS` alone cannot tell a GDPR
+    /// erasure from an ordinary `ChatDelete`. NEVER written for identity
+    /// types: erasing one's own `DeviceRevocation`/`DeviceEncRevoke` must not
+    /// hide the revocation from fresh nodes.
+    pub const DELETION_REQUESTS: &str = "deletion_requests";
+    /// PENDING GDPR deletion requests (l2-node 0.151.0): a `SingleMessage`
+    /// request received on a SYNC path for a target this node does not store
+    /// (responders withhold erased originals). Three key families, one row
+    /// each per pending request:
+    ///
+    /// - `b'P' ++ target_msg_id:32 ++ deleter_wallet` → JSON `{request_id,
+    ///   deleted_by, deleted_at}` (the record; looked up when a message with
+    ///   that id is stored, `Storage::promote_pending_deletion`);
+    /// - `b'T' ++ deleted_at:8 BE ++ target_msg_id:32 ++ deleter_wallet` → ()
+    ///   (oldest-first, for the TTL reaper);
+    /// - `b'D' ++ deleter_wallet ++ 0xFF ++ target_msg_id:32` → () (per-
+    ///   requester count, for the input cap).
+    ///
+    /// A pending row hides nothing; it becomes a verified erasure only when a
+    /// message with that id by the same author (directly, by signing key, or
+    /// through a delegation known by then) is stored. Capped on input
+    /// (`MAX_PENDING_DELETIONS` node-wide, `MAX_PENDING_DELETIONS_PER_DELETER`)
+    /// and reaped after `PENDING_DELETION_TTL_MS` together with the request
+    /// envelope.
+    pub const PENDING_DELETIONS: &str = "pending_deletions";
     /// (original_msg_id:32, edit_timestamp:8) → edit_msg_id (32 bytes)
     /// Edit chain: tracks successive edits to a message.
     pub const EDIT_HISTORY: &str = "edit_history";
@@ -568,6 +601,8 @@ pub mod cf {
         PENDING_CHANNEL_DELETES,
         PENDING_CHANNEL_MEMBER_REMOVALS,
         DELETION_MARKERS,
+        DELETION_REQUESTS,
+        PENDING_DELETIONS,
         EDIT_HISTORY,
         CHAT_REACTIONS,
         CHAT_REACTION_COUNTS,
@@ -679,6 +714,15 @@ pub mod state_keys {
     /// NEWS_EDIT_DELETE are backfilled from existing MESSAGES (audit final
     /// pre-mainnet W6, l2-node 0.95.0+).
     pub const EDIT_DELETE_MARKERS_INDEXED: &[u8] = b"migration_edit_delete_markers_indexed";
+    /// Sentinel: set to 1 once every stored `DeletionRequest` (0x50) has
+    /// been re-indexed (l2-node 0.151.0): verified `DELETION_REQUESTS` rows
+    /// plus the request envelope in `CHANNEL_EDIT_DELETE_MSGS` /
+    /// `NEWS_EDIT_DELETE` / `DM_EDIT_DELETE_MSGS`. Budget-capped per boot;
+    /// resumes from `DELETION_REQUESTS_INDEX_CURSOR`.
+    pub const DELETION_REQUESTS_INDEXED: &[u8] = b"migration_deletion_requests_indexed";
+    /// Last `MESSAGES` key examined by the `DELETION_REQUESTS_INDEXED`
+    /// migration (resume point across boots).
+    pub const DELETION_REQUESTS_INDEX_CURSOR: &[u8] = b"migration_deletion_requests_index_cursor";
     /// Sentinel: set to 1 after `NEWS_REACTION_MSGS` is backfilled from existing
     /// `MESSAGES`, making the reaction ride-along retroactive rather than only
     /// covering reactions made after the upgrade (l2-node 0.121.0+).

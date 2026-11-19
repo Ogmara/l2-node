@@ -13,9 +13,9 @@
 //! `router::process_synced_message`, so a relaying peer is never trusted.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 use tracing::warn;
+
+use crate::network::reconcile::{append_within_byte_budget, envelope_wire_cost, MAX_RESPONSE_ENVELOPE_BYTES};
 
 use crate::storage::rocks::Storage;
 use crate::storage::schema;
@@ -31,10 +31,23 @@ pub fn protocol_string(network_id: &str) -> String {
 
 // --- Tuning (window comes from config; these bound it further) ---
 
-/// Max envelopes a responder returns per page.
+/// Max envelopes a responder returns per page — the primary `NEWS_FEED`
+/// scan only. The LAST page also carries the edit/delete and reaction
+/// ride-alongs on top (see [`MAX_ENVELOPES_PER_PAGE_WITH_RIDE_ALONGS`]).
 pub const MAX_ENVELOPES_PER_RESPONSE: usize = 200;
-/// Hard ceiling on cumulative envelopes one peer may pull per process lifetime.
-pub const TOTAL_ENVELOPES_CAP: u64 = 2_000;
+/// Max edit/delete (and, since l2-node 0.151.0, GDPR `DeletionRequest`)
+/// envelopes one last-page ride-along carries.
+pub const NEWS_EDIT_DELETE_CAP: usize = 2_000;
+/// Max `NewsReaction` envelopes one last-page ride-along carries.
+pub const NEWS_REACTION_CAP: usize = 4_000;
+/// The largest page an honest responder sends: a full primary page plus both
+/// full ride-alongs. The requester refuses (does not verify) anything larger.
+/// Before l2-node 0.151.0 the requester compared against
+/// `MAX_ENVELOPES_PER_RESPONSE` alone, so any last page whose ride-alongs
+/// pushed it past 200 envelopes was discarded whole — edits, deletes and
+/// reactions included.
+pub const MAX_ENVELOPES_PER_PAGE_WITH_RIDE_ALONGS: usize =
+    MAX_ENVELOPES_PER_RESPONSE + NEWS_EDIT_DELETE_CAP + NEWS_REACTION_CAP;
 /// Max concurrent inbound news-sync requests served to one peer.
 pub const SERVER_MAX_CONCURRENT_PER_PEER: usize = 4;
 /// How many peers an outbound backfill races (first non-empty wins).
@@ -58,6 +71,11 @@ pub fn is_news_type(msg_type: u8) -> bool {
                 // nodes stayed permanently 0 — a node catching up via backfill
                 // never got a chance to see them either.
                 | MessageType::NewsReaction
+                // GDPR DeletionRequest (l2-node 0.151.0, G5): indexed into
+                // NEWS_EDIT_DELETE when its target is news, so the last-page
+                // ride-along carries it. The receiver also checks the target
+                // (`network::deletion_request_fit`).
+                | MessageType::DeletionRequest
         )
     )
 }
@@ -140,6 +158,9 @@ fn is_backfillable(raw: &[u8]) -> bool {
 /// window cutoff, re-serve the original signed envelopes from MESSAGES. Caps at
 /// `max_envelopes`. `window_max_age_secs` is the RESPONDER's configured window
 /// (we serve the tighter of it and the request's `max_age_secs`).
+///
+/// (Test convenience wrapper — production calls the `_metered` variant.)
+#[cfg(test)]
 pub fn build_response(
     storage: &Storage,
     request: &NewsSyncRequest,
@@ -147,6 +168,23 @@ pub fn build_response(
     now_ms: u64,
     window_max_age_secs: u64,
 ) -> NewsSyncResponse {
+    build_response_metered(storage, request, max_envelopes, now_ms, window_max_age_secs).0
+}
+
+/// `build_response` plus the storage work it did — one unit per seek and per
+/// index row examined (ride-along rows included), for the responder's
+/// rolling budget (`reconcile::budget_charge`, l2-node 0.151.0).
+///
+/// A post or comment erased by a GDPR `DeletionRequest` (decision D4) is
+/// never re-served, nor is an edit/delete/reaction of one; the request
+/// itself rides along on the last page.
+pub fn build_response_metered(
+    storage: &Storage,
+    request: &NewsSyncRequest,
+    max_envelopes: usize,
+    now_ms: u64,
+    window_max_age_secs: u64,
+) -> (NewsSyncResponse, u64) {
     // Honour the tighter of the requester's ask and our own configured window,
     // so a peer can't ask us to scan further back than we allow.
     let effective_age = request.max_age_secs.min(window_max_age_secs);
@@ -170,15 +208,19 @@ pub fn build_response(
     let rows = match rows {
         Ok(r) => r,
         Err(_) => {
-            return NewsSyncResponse {
-                envelopes: Vec::new(),
-                has_more: false,
-                next_cursor: None,
-                server_capped: false,
-                completeness_root: None,
-            }
+            return (
+                NewsSyncResponse {
+                    envelopes: Vec::new(),
+                    has_more: false,
+                    next_cursor: None,
+                    server_capped: false,
+                    completeness_root: None,
+                },
+                1,
+            )
         }
     };
+    let mut work: u64 = 1 + rows.len() as u64;
 
     // If the storage batch came back full, there may be rows beyond it.
     let truncated = rows.len() >= probe_limit;
@@ -186,6 +228,8 @@ pub fn build_response(
     let mut next_cursor: Option<NewsCursor> = None;
     let mut hit_cap = false;
     let mut hit_window_end = false;
+    // Wire bytes of the page so far (W5).
+    let mut bytes: usize = 0;
 
     for (key, _) in rows {
         if key.len() < 8 + 32 {
@@ -211,6 +255,25 @@ pub fn build_response(
         let mut msg_id = [0u8; 32];
         msg_id.copy_from_slice(&key[8..40]);
 
+        // D4 (l2-node 0.151.0): never re-serve a GDPR-erased post/comment.
+        let raw = if storage.is_gdpr_erased(&msg_id) {
+            None
+        } else {
+            storage
+                .get_cf(schema::cf::MESSAGES, &msg_id)
+                .ok()
+                .flatten()
+                .filter(|raw| is_backfillable(raw))
+        };
+        // W5 (l2-node 0.151.0): page full by BYTES — stop before consuming
+        // this row; the next page resumes at it.
+        if let Some(r) = raw.as_ref() {
+            if !envelopes.is_empty() && bytes.saturating_add(envelope_wire_cost(r)) > MAX_RESPONSE_ENVELOPE_BYTES {
+                hit_cap = true;
+                break;
+            }
+        }
+
         // Advance the cursor over EVERY in-window row we examine (even if its
         // MESSAGES entry is missing) so a sparse page can't strand older
         // in-window rows by ending with `envelopes.len() < max`.
@@ -218,10 +281,9 @@ pub fn build_response(
             after_timestamp: ts,
             after_msg_id: msg_id,
         });
-        if let Ok(Some(raw)) = storage.get_cf(schema::cf::MESSAGES, &msg_id) {
-            if is_backfillable(&raw) {
-                envelopes.push(raw);
-            }
+        if let Some(r) = raw {
+            bytes = bytes.saturating_add(envelope_wire_cost(&r));
+            envelopes.push(r);
         }
     }
 
@@ -239,17 +301,25 @@ pub fn build_response(
     // delivered has already been applied — which `authorize_edit_delete`
     // requires before an edit/delete can be accepted.
     if !has_more {
-        envelopes.extend(news_edit_delete_envelopes(storage, min_ts));
-        envelopes.extend(news_reaction_envelopes(storage, min_ts));
+        let (ed, ed_work) = news_edit_delete_envelopes(storage, min_ts);
+        let (re, re_work) = news_reaction_envelopes(storage, min_ts);
+        work += ed_work + re_work;
+        // W5: edits/deletes (incl. DeletionRequests) first, then reactions,
+        // each newest-first, within the response byte budget.
+        let bytes = append_within_byte_budget(&mut envelopes, ed, bytes);
+        append_within_byte_budget(&mut envelopes, re, bytes);
     }
 
-    NewsSyncResponse {
-        envelopes,
-        has_more,
-        next_cursor,
-        server_capped: false,
-        completeness_root: None,
-    }
+    (
+        NewsSyncResponse {
+            envelopes,
+            has_more,
+            next_cursor,
+            server_capped: false,
+            completeness_root: None,
+        },
+        work,
+    )
 }
 
 /// Gather `NewsReaction` envelopes within the window.
@@ -265,16 +335,16 @@ pub fn build_response(
 /// Bounded + best-effort, the same tradeoff already accepted for edits/deletes.
 /// Rides along on the last page for the same ordering reason: `toggle_news_reaction`
 /// keys off the target post, so the post wants to be applied first.
-fn news_reaction_envelopes(storage: &Storage, min_ts: u64) -> Vec<Vec<u8>> {
-    const NEWS_REACTION_CAP: usize = 4_000;
+fn news_reaction_envelopes(storage: &Storage, min_ts: u64) -> (Vec<Vec<u8>>, u64) {
     let rows = match storage.prefix_iter_cf(
         schema::cf::NEWS_REACTION_MSGS,
         &[],
         NEWS_REACTION_CAP.saturating_add(1),
     ) {
         Ok(r) => r,
-        Err(_) => return Vec::new(),
+        Err(_) => return (Vec::new(), 1),
     };
+    let work = 1 + rows.len() as u64;
     if rows.len() > NEWS_REACTION_CAP {
         warn!(
             cap = NEWS_REACTION_CAP,
@@ -299,12 +369,14 @@ fn news_reaction_envelopes(storage: &Storage, min_ts: u64) -> Vec<Vec<u8>> {
         let mut msg_id = [0u8; 32];
         msg_id.copy_from_slice(&key[8..40]);
         if let Ok(Some(raw)) = storage.get_cf(schema::cf::MESSAGES, &msg_id) {
-            if reaction_is_backfillable(storage, &raw) {
+            if reaction_is_backfillable(storage, &raw)
+                && !crate::network::reconcile::ride_along_target_erased(storage, &raw)
+            {
                 out.push(raw);
             }
         }
     }
-    out
+    (out, work)
 }
 
 /// Whether a `NewsReaction` may ride along to a backfilling peer.
@@ -339,16 +411,16 @@ fn reaction_is_backfillable(storage: &Storage, raw: &[u8]) -> bool {
 /// above only ever contains original `NewsPost`/`NewsComment` rows — so
 /// "deleted for everyone" content is re-served forever. Bounded +
 /// best-effort, same tradeoff already accepted elsewhere in this file.
-fn news_edit_delete_envelopes(storage: &Storage, min_ts: u64) -> Vec<Vec<u8>> {
-    const NEWS_EDIT_DELETE_CAP: usize = 2_000;
+fn news_edit_delete_envelopes(storage: &Storage, min_ts: u64) -> (Vec<Vec<u8>>, u64) {
     let rows = match storage.prefix_iter_cf(
         schema::cf::NEWS_EDIT_DELETE,
         &[],
         NEWS_EDIT_DELETE_CAP.saturating_add(1),
     ) {
         Ok(r) => r,
-        Err(_) => return Vec::new(),
+        Err(_) => return (Vec::new(), 1),
     };
+    let work = 1 + rows.len() as u64;
     if rows.len() > NEWS_EDIT_DELETE_CAP {
         warn!(
             cap = NEWS_EDIT_DELETE_CAP,
@@ -373,12 +445,14 @@ fn news_edit_delete_envelopes(storage: &Storage, min_ts: u64) -> Vec<Vec<u8>> {
         let mut msg_id = [0u8; 32];
         msg_id.copy_from_slice(&key[8..40]);
         if let Ok(Some(raw)) = storage.get_cf(schema::cf::MESSAGES, &msg_id) {
-            if edit_is_backfillable(storage, &raw) {
+            if edit_is_backfillable(storage, &raw)
+                && !crate::network::reconcile::ride_along_target_erased(storage, &raw)
+            {
                 out.push(raw);
             }
         }
     }
-    out
+    (out, work)
 }
 
 /// Whether a `NewsEdit`/`NewsDelete` envelope may ride along to a
@@ -412,74 +486,15 @@ fn edit_is_backfillable(storage: &Storage, raw: &[u8]) -> bool {
 
 // --- Responder rate limiting (per peer; the feed is global) ---
 
-/// Bounds how much one peer can pull, mirroring `reconcile::ResponderLimits`
-/// but global (keyed by `PeerId` only — no channel/wallet).
-#[derive(Debug, Default)]
-pub struct NewsResponderLimits {
-    inner: Mutex<NewsLimitsInner>,
-}
-
-#[derive(Debug, Default)]
-struct NewsLimitsInner {
-    per_peer: HashMap<libp2p::PeerId, usize>,
-    served: HashMap<libp2p::PeerId, u64>,
-}
-
-impl NewsResponderLimits {
-    /// Admit one inbound request, or `None` if over a cap (→ `capped_response`).
-    pub fn try_acquire(
-        self: &Arc<Self>,
-        peer: libp2p::PeerId,
-        max_concurrent_per_peer: usize,
-        total_envelopes_cap: u64,
-    ) -> Option<NewsResponderGuard> {
-        /// Soft ceiling on distinct per-peer cumulative-served entries; cleared
-        /// on overflow (abuse limiter, not a security invariant). Bounds growth
-        /// from an adversary cycling peer identities.
-        const MAX_TRACKED: usize = 100_000;
-        let mut inner = self.inner.lock().ok()?;
-        if inner.served.len() >= MAX_TRACKED {
-            inner.served.clear();
-        }
-        let in_flight = inner.per_peer.get(&peer).copied().unwrap_or(0);
-        if in_flight >= max_concurrent_per_peer {
-            return None;
-        }
-        if inner.served.get(&peer).copied().unwrap_or(0) >= total_envelopes_cap {
-            return None;
-        }
-        inner.per_peer.insert(peer, in_flight + 1);
-        Some(NewsResponderGuard {
-            limits: Arc::clone(self),
-            peer,
-        })
-    }
-
-    pub fn add_served(&self, peer: libp2p::PeerId, count: u64) {
-        if let Ok(mut inner) = self.inner.lock() {
-            *inner.served.entry(peer).or_insert(0) += count;
-        }
-    }
-}
-
-/// RAII guard releasing a peer's in-flight slot on drop.
-pub struct NewsResponderGuard {
-    limits: Arc<NewsResponderLimits>,
-    peer: libp2p::PeerId,
-}
-
-impl Drop for NewsResponderGuard {
-    fn drop(&mut self) {
-        if let Ok(mut inner) = self.limits.inner.lock() {
-            if let Some(n) = inner.per_peer.get_mut(&self.peer) {
-                *n = n.saturating_sub(1);
-                if *n == 0 {
-                    inner.per_peer.remove(&self.peer);
-                }
-            }
-        }
-    }
-}
+/// Responder admission for news-sync (l2-node 0.151.0): per-peer concurrency
+/// (`SERVER_MAX_CONCURRENT_PER_PEER`) plus a rolling budget per peer —
+/// `[backfill] news_responder_budget_burst` units (default 2,000) refilled at
+/// `news_responder_budget_refill_per_hour` (default 2,000/h), charged with
+/// `reconcile::budget_charge`. Before 0.151.0 this was a LIFETIME counter of
+/// envelopes served (`TOTAL_ENVELOPES_CAP = 2,000`, ride-alongs included)
+/// that never refilled until the responder restarted, so a long-lived peer
+/// was refused every 6-hourly catch-up after one busy session.
+pub type NewsResponderLimits = crate::network::budget::PeerBudgetLimits<libp2p::PeerId>;
 
 #[cfg(test)]
 mod tests {
@@ -624,6 +639,114 @@ mod edit_delete_ride_along_tests {
             contains_type(&resp2.envelopes, MessageType::NewsDelete),
             "delete must ride along on the final page"
         );
+    }
+
+    /// D4 + G5 (l2-node 0.151.0): an erased post is never served, nor is a
+    /// delete of it; its DeletionRequest (indexed into NEWS_EDIT_DELETE)
+    /// rides along on the last page. Work is metered for the budget.
+    #[test]
+    fn erased_post_is_withheld_and_its_request_rides_along() {
+        use crate::messages::types::{DeletionRequestPayload, DeletionType};
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let author = "klv1author";
+        let base_ts = 1_700_000_000_000u64;
+        let (keep, erase, del, req_id) = ([1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]);
+        put_news_post(&storage, author, keep, base_ts);
+        put_news_post(&storage, author, erase, base_ts + 1);
+        put_news_delete(&storage, author, erase, del, base_ts + 2);
+        let payload = DeletionRequestPayload { delete_type: DeletionType::SingleMessage, target_id: Some(erase) };
+        let env = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::DeletionRequest,
+            msg_id: req_id,
+            author: author.to_string(),
+            timestamp: base_ts + 3,
+            lamport_ts: 0,
+            payload: rmp_serde::to_vec_named(&payload).unwrap(),
+            signature: vec![],
+            relay_path: vec![],
+        };
+        storage.put_cf(schema::cf::MESSAGES, &req_id, &rmp_serde::to_vec_named(&env).unwrap()).unwrap();
+        storage.put_verified_deletion_request(&erase, &req_id, author, base_ts + 3).unwrap();
+        assert!(storage.index_deletion_request(&erase, &req_id, base_ts + 3).unwrap());
+
+        let req = NewsSyncRequest { max_age_secs: u64::MAX, cursor: None, overlap_digest: vec![], round: 0 };
+        let (resp, work) = build_response_metered(&storage, &req, 10, base_ts + 1000, u64::MAX);
+        let ids: Vec<[u8; 32]> = resp
+            .envelopes
+            .iter()
+            .map(|e| rmp_serde::from_slice::<Envelope>(e).unwrap().msg_id)
+            .collect();
+        assert_eq!(ids, vec![keep, req_id], "only the kept post and the request");
+        assert!(work >= 2 + 1 + 2, "feed rows plus ride-along rows are metered: {work}");
+        assert!(is_news_type(MessageType::DeletionRequest as u8));
+    }
+
+    /// W5 (audit, l2-node 0.151.0): a maximal page — big posts plus a full
+    /// set of large ride-alongs — is cut by BYTES so it always fits the
+    /// libp2p CBOR response cap (10 MiB); the rest continues on later pages.
+    /// Encoded and decoded with the real codec.
+    #[test]
+    fn maximal_page_encodes_under_the_transport_cap() {
+        use futures::executor::block_on;
+        use libp2p::request_response::Codec;
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let author = "klv1author";
+        let base_ts = 1_700_000_000_000u64;
+        let big = "x".repeat(60_000);
+        for n in 0..200u32 {
+            let mut id = [0u8; 32];
+            id[..4].copy_from_slice(&n.to_be_bytes());
+            id[31] = 1;
+            let payload = NewsPostPayload {
+                title: "t".into(),
+                content: big.clone(),
+                content_rating: Default::default(),
+                tags: vec![],
+                attachments: vec![],
+                visibility: Default::default(),
+            };
+            let env = Envelope {
+                version: crate::messages::envelope::PROTOCOL_VERSION,
+                msg_type: MessageType::NewsPost,
+                msg_id: id,
+                author: author.to_string(),
+                timestamp: base_ts + n as u64,
+                lamport_ts: 0,
+                payload: rmp_serde::to_vec_named(&payload).unwrap(),
+                signature: vec![],
+                relay_path: vec![],
+            };
+            storage.put_cf(schema::cf::NEWS_FEED, &schema::encode_news_key(base_ts + n as u64, &id), &[]).unwrap();
+            storage.put_cf(schema::cf::MESSAGES, &id, &rmp_serde::to_vec_named(&env).unwrap()).unwrap();
+        }
+        let codec_check = |resp: NewsSyncResponse| {
+            let mut codec = libp2p::request_response::cbor::codec::Codec::<NewsSyncRequest, NewsSyncResponse>::default();
+            let proto = libp2p::StreamProtocol::new("/test");
+            let mut buf = Vec::new();
+            block_on(codec.write_response(&proto, &mut futures::io::Cursor::new(&mut buf), resp)).unwrap();
+            assert!(buf.len() < 10 * 1024 * 1024, "encoded page {} bytes", buf.len());
+            block_on(codec.read_response(&proto, &mut futures::io::Cursor::new(&buf))).expect("decodes under the default cap")
+        };
+        let mut cursor = None;
+        let mut total = 0usize;
+        for _ in 0..10 {
+            let req = NewsSyncRequest { max_age_secs: u64::MAX, cursor: cursor.clone(), overlap_digest: vec![], round: 0 };
+            let resp = build_response(&storage, &req, MAX_ENVELOPES_PER_RESPONSE, base_ts + 10_000, u64::MAX);
+            let bytes: usize = resp.envelopes.iter().map(|e| envelope_wire_cost(e)).sum();
+            assert!(bytes <= MAX_RESPONSE_ENVELOPE_BYTES);
+            total += resp.envelopes.len();
+            let more = resp.has_more;
+            cursor = resp.next_cursor.clone();
+            let back = codec_check(resp);
+            assert_eq!(back.has_more, more);
+            if !more {
+                break;
+            }
+        }
+        assert_eq!(total, 200, "every post delivered across byte-bounded pages");
     }
 }
 

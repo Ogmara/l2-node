@@ -289,11 +289,15 @@ pub async fn dispatch_ogmara_channel_alert(
     };
 
     match dispatcher.router.process_message(&envelope_bytes) {
-        RouteResult::Accepted { raw_bytes, .. } => {
+        RouteResult::Accepted { raw_bytes, erased_on_arrival, .. } => {
+            // Never relay a message erased on arrival by a pending GDPR
+            // deletion request (l2-node 0.151.0, audit W-A).
             if let Some(topic) = crate::api::routes::gossip_topic_for_envelope(
                 &envelope,
                 &dispatcher.klever_network,
-            ) {
+            )
+            .filter(|_| !erased_on_arrival)
+            {
                 let _ = dispatcher.gossip_tx.send(GossipPublish {
                     topic,
                     data: raw_bytes,

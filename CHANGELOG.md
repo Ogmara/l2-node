@@ -5,6 +5,282 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.151.0] - 2026-11-19
+
+Fresh-node backfill gaps, part 1 (plan
+`docs/planning/fresh-node-backfill-gaps-plan.md`, items G1, G2, G3, G5, G8,
+G9; owner decisions D1, D4, D8). All changes are runtime code; no dependency
+changed. No new wire type and no new wire field: identity-sync gains a scope
+bit, two sync protocols accept one more message type, and a new node-local
+column family is added.
+
+### Added
+
+- **Encryption-key directory backfill (G1).** Identity-sync scope
+  `SCOPE_ENC_KEYS = 8` serves `DeviceEncBinding`/`DeviceEncRevoke`
+  (0x36/0x37), which were already indexed in `IDENTITY_ENVELOPES` but mapped
+  to scope 0 and never served. `SCOPE_ALL` now includes it (D1), so every
+  existing pull trigger (auth, observed author, staleness sweep) fetches the
+  wallet's enc keys too. A fresh node rebuilds the directory from the synced
+  envelopes alone: the wallet claim verifies with no local state, and the
+  serve order (revokes first, then bindings by timestamp) plus last-write-wins and the losing-binding supersede (`bound_ts`) reproduces the responder's rows in any arrival order.
+  Old-peer compatible both ways: a 0.150 responder never serves 0x36/0x37
+  whatever bits are asked for, and an old requester never sets bit 8.
+- **`GET /api/v1/users/{a}/enc-keys` pulls on an empty result (G1).** When no
+  active key is stored for a plausible, checksum-valid address, the node asks
+  peers for that wallet's identity bundle (`SCOPE_ALL`; the network task
+  dedups per wallet per session regardless of scope, so a narrower first pull
+  would suppress a later full one). The route needs no auth, so the trigger
+  is gated by `EncKeysPullGate`: a per-wallet dedup (10 min, bounded at
+  10,000 wallets) checked before a node-wide budget of 20 pulls per minute.
+  The response itself stays empty; a retry after the pull lands sees the
+  keys.
+- **`DELETION_REQUESTS` (new node-local CF, G5).** Verified GDPR erasure
+  records keyed by the target `msg_id`, written ONLY for a backfilled content
+  target — a `ChatMessage`, `NewsPost`/`NewsComment`/`NewsRepost` or
+  `DirectMessage` — when a `SingleMessage` request is authorized against it,
+  and for every news post an `AllUserContent` request marks. Purged with the
+  message by the private-channel purge (`MSG_SIDE_CFS`) and the DM reaper.
+- **`PENDING_DELETIONS` (new node-local CF, G5).** Pending requests (see
+  Security), three key families: `P ‖ target ‖ requester` (record),
+  `T ‖ deleted_at ‖ target ‖ requester` (TTL order), `D ‖ requester ‖ 0xFF ‖
+  target` (per-requester count). Capped on INPUT at 100,000 node-wide and
+  1,000 per requester (a full table refuses new requests, nothing is
+  evicted); the exact count is kept in memory under a lock. A new
+  `pending_deletion_reaper` task (every 15 min, ≤ 5,000 rows per pass) drops
+  pending requests older than 60 days (the default 30-day backfill window
+  plus 30 days) together with their request envelope in `MESSAGES`.
+- **One-time migration `migration_deletion_requests_indexed`.** Scans
+  `MESSAGES` for stored `DeletionRequest`s and writes their verified records
+  and side-index rows; at most 5,000,000 rows per boot, resumable through
+  `migration_deletion_requests_index_cursor`.
+- **Config keys (G3, D8), all validated `1..=100,000,000` / `1..=1,000,000,000`
+  with a full refill within a year, refusing to start otherwise, regardless
+  of the section's `enabled` switch:**
+  `[backfill] news_responder_budget_burst = 2000`,
+  `news_responder_budget_refill_per_hour = 2000`;
+  `[dm] sync_responder_budget_burst = 5000`,
+  `sync_responder_budget_refill_per_hour = 2500`;
+  `[identity_resync] responder_budget_burst = 4000`,
+  `responder_budget_refill_per_hour = 1000`. A config without them gets these
+  defaults.
+
+### Changed
+
+- **Rolling responder budgets for news-sync, dm-sync and identity-sync
+  (G3).** The LIFETIME per-peer counters (news 2,000 per peer, dm 5,000 per
+  peer, identity 4,000 per (peer, wallet)) never refilled until the responder
+  restarted, so long-lived node pairs stopped catching each other up after
+  one busy session. They are now `budget::Gcra` rolling budgets in a bounded
+  `budget::BudgetMap` (new shared `budget::PeerBudgetLimits`, ≤ 100,000 keys,
+  full map refuses NEW keys, only refilled buckets are pruned on the 30 s
+  tick), charged after each build with `reconcile::budget_charge` (the larger
+  of envelopes sent and storage rows examined, minimum 1 — ride-along rows
+  included), keyed per peer (news, dm) and per (peer, wallet) (identity).
+  The dm-sync FIFO eviction (a Sybil cycling identities got its budget back)
+  is gone. A full key map counts toward `backfill_budget_map_full_refusals`.
+- **Responders withhold GDPR-erased originals (D4).** Channel reconcile,
+  private-channel sync, news-sync and dm-sync no longer serve an envelope
+  with a verified `DELETION_REQUESTS` record, nor an
+  edit/delete/reaction ride-along whose target has one (an edit would
+  re-serve the erased content). The `DeletionRequest` itself is served.
+- **The identity-pull gate also sees backfilled authors (G9).** Authors of
+  envelopes newly `Accepted` from channel reconcile and news-sync go through
+  the same gate as live gossip (`observe_author_for_identity_pull`:
+  `[identity_resync]` enabled, a per-interval budget, the per-session dedup,
+  `triggers_identity_check`, `identity_looks_incomplete`), at most 32
+  distinct authors per page. Backfill has its OWN budget
+  (`backfill_author_trigger_budget`, sized and refilled like
+  `max_observed_triggers_per_interval`), so a large backfill and live gossip
+  cannot starve each other.
+- **Identity-sync serve order (audit W3).** `DeviceEncRevoke` (0x37) is
+  served FIRST, before any binding, so a session cut short never leaves a
+  revoked encryption key looking active; `DeviceDelegation` (0x31) and
+  `DeviceRevocation` (0x32) are served merged by `(timestamp, msg_id)` (a
+  revocation cannot precede the delegation it revokes — it needs the device
+  mapped and its signer resolvable — but chronological order means every
+  page prefix is a state that really existed); then `ProfileUpdate`,
+  `Follow`, `Unfollow`, `DeviceEncBinding`. The cursor format is unchanged.
+  To keep revoke-first replay order-independent, a `DeviceEncBinding` that
+  loses last-write-wins to its own key's newer record still supersedes the
+  device's older keys and stamps the revoked record with `device_id` and
+  `bound_ts`, which `plan_enc_key_supersede` treats as "this device had a
+  newer key".
+- **Responder pages are bounded by bytes (audit W5).** Reconcile, news-sync
+  and dm-sync stop a page once the summed worst-case wire cost of its
+  envelopes reaches 8 MiB (the libp2p CBOR codec refuses responses above
+  10 MiB; `Vec<u8>` travels as a CBOR integer array, so the cost is twice the
+  length). The primary scan continues on the next page from the last served
+  row; ride-alongs are cut (newest first, the rest not shipped that
+  session). This also covers the pre-existing case of 1,000 large chat
+  envelopes overflowing the transport cap.
+- **No GDPR withholding in identity-sync (audit B1).** Identity envelopes are
+  never withheld (and never get a verified record, see Security).
+
+### Fixed
+
+- **Reconcile delivered no history for channels with an old backlog (G2).**
+  The first page scanned from the channel's oldest row with a raw-row probe
+  of `max_envelopes_per_response + 1`; a channel with more than ~1,000
+  messages older than the requester's window (30 days by default) answered
+  `envelopes: [], has_more: false` and the requester never got any history
+  for it. The first page now seeks to `encode_channel_msg_key(cid,
+  min_timestamp × 1000, [0; 32])` (`CHANNEL_MSGS` keys carry the signed
+  timestamp in MILLISECONDS; the window is in seconds). Archive mode
+  (`u64::MAX`) is unchanged. A full storage batch whose rows were partly
+  skipped (window or D4) now reports `has_more` with a cursor past the last
+  examined row instead of ending the session early. The KNOWN LIMITATION
+  comment is gone.
+- **Requester refused every page that carried ride-alongs.** The reconcile,
+  news-sync and dm-sync requesters refused to verify any page larger than the
+  PRIMARY page cap, but honest responders add the metadata (first page,
+  ≤ 256) and edit/delete (last page, ≤ 2,000; news also ≤ 4,000 reactions;
+  dm ≤ 1,000) ride-alongs on top. Any busy channel's first page (a full chat
+  page plus its `ChannelCreate`) and any last page with enough markers was
+  discarded whole. The bound is now the primary cap plus the ride-along caps
+  (`reconcile::max_page_with_ride_alongs`,
+  `news_sync::MAX_ENVELOPES_PER_PAGE_WITH_RIDE_ALONGS`,
+  `dm_sync::MAX_ENVELOPES_PER_PAGE_WITH_RIDE_ALONGS`); larger pages are still
+  refused unverified. Found while implementing G5, which depends on these
+  ride-alongs.
+- **Snapshot-bootstrapped nodes missed live messages of every pre-snapshot
+  channel until restart (G8).** `subscribe_stored_channels` runs before the
+  bootstrap and the scanner cursor jumps past the derived channels'
+  `ChannelCreated` events. After a successful bootstrap every `CHANNELS` id
+  (≤ 100,000) is now sent through the scanner's subscribe channel, so
+  `handle_channel_subscribe_request` subscribes it with the private-channel
+  lifecycle rules applied.
+
+### Security
+
+- **GDPR deletion requests now reach backfilling nodes (G5, compliance).** A
+  `DeletionRequest` (0x50) `SingleMessage` was gossip-only and wrote only a
+  soft-delete marker, while every responder kept serving the original — a
+  fresh node showed content erased everywhere else. The request envelope is
+  now indexed into its stored target's side-index — `CHANNEL_EDIT_DELETE_MSGS`
+  (channel derived from the target's own payload, never the request),
+  `NEWS_EDIT_DELETE` (news post / comment / repost) or `DM_EDIT_DELETE_MSGS`
+  (the DM's conversation) — so the existing last-page ride-alongs carry it,
+  and the original is withheld (D4). 0x50 is accepted by news-sync, dm-sync
+  and private-channel sync; every receiver binds it to the synced scope
+  (`deletion_request_fit`: a stored target must be a chat message of that
+  channel / news / a DM; `AllUserContent` is never accepted through
+  backfill).
+- **Pending deletion requests (sync path only).** Because the original is
+  withheld, a fresh node receives the request without its target. The live
+  paths still reject an unknown target; the sync path accepts it only if it
+  is younger than 60 days, inside the receiving sync's own window, and the
+  pending caps have room, and records only a pending row that hides
+  nothing. When a chat/news/DM message with that id is later stored (e.g.
+  served by a 0.150 peer) and its author matches the requester — by resolved
+  wallet, by signing key, or by the requester's resolution at that moment
+  (audit W2) — the pending row, deletion marker, verified record and
+  side-index row are written in ONE batch (router Step 8c). A request naming
+  someone else's message never erases it, on any path. A KNOWN target is
+  still authorized against its author on the sync path too. A pending-only
+  acceptance is not progress: it never counts toward `newly_accepted` /
+  completion, the unproductive-page reset or in-sync evidence (audit W1).
+- **Erasure is restricted to backfilled content (audit B1, blocking).** A
+  `SingleMessage` request against any other stored type — notably the
+  author's own `DeviceRevocation` (0x32) or `DeviceEncRevoke` (0x37) — still
+  writes its soft-delete marker as before, but no verified record, no
+  side-index row, no pending promotion, and the migration skips it; and
+  identity-sync never withholds anything. Otherwise a holder of a stolen
+  device could "erase" the wallet's revocation of it and fresh nodes would
+  never see the revocation.
+- **A message erased on arrival is not propagated (audit N7, W-A).** When
+  storing a message applies a pending deletion (`RouteResult::Accepted.
+  erased_on_arrival`), it is kept hidden on every path: live gossip answers
+  `Ignore` (no relay) and skips the WebSocket push and notifications; the
+  local submit paths — `POST /messages`, `POST /dm/{address}`, the WS
+  `Message`/`Dm` frames, every dedicated REST write that relays through
+  `gossip_if_applicable`, and the node's own alert-channel posts — neither
+  publish it nor feed it to the notification engine.
+- **A refused DeletionRequest never taints a page (audit W4, W-B).** The
+  reconcile, news-, dm-, private- and generic-sync requesters treat a
+  well-formed `DeletionRequest` that their router refuses by POLICY
+  (`Rejected`: unknown target too old, pending caps full, author mismatch),
+  that falls outside their window or scope, that is `AllUserContent`, or that
+  is accepted only as pending, as neither progress nor a peer fault. An
+  `Invalid` one (bad signature / msg_id) or one whose envelope or payload
+  does not decode still taints the page (news-/dm-sync drop and warn).
+- **Race between a pending request and its target (audit note 3).** The
+  pending write re-checks under its lock whether the target was stored in the
+  meantime and then promotes it inline, so a request and its original
+  arriving concurrently never strand a pending row. The target's own path
+  may still have relayed it once before that promotion hides it locally;
+  other nodes get the request through backfill.
+- **Pending caps hold exactly (audit round 3).** A repeat sync-path request
+  for the same (target, requester) while one is pending is refused
+  (`Rejected`, neutral for the session) before it is stored, so repeats
+  can neither bypass the per-requester cap nor leave envelopes no reaper
+  covers. Both caps are re-checked under the pending lock, and the
+  in-memory count is taken at open without a cap, so it never undercounts.
+
+### Known limitations
+
+- **`AllUserContent` requests are still gossip-only (audit N6, deferred).**
+  No backfill carries them (they have no single target to index under); the
+  erasing node and every node that received the gossip withhold the author's
+  news posts from news-sync (D4), but a node that missed the request — and
+  every 0.150 peer — still serves them, and channel messages / DMs are not
+  marked by `AllUserContent` at all (unchanged).
+- **Pending rows of other requesters are not cleaned up** when the target
+  arrives (they can never match it); the TTL reaper removes them. They are
+  bounded by the input caps.
+- **A pending request whose author's delegation arrives only AFTER the
+  original** is not matched (the original was stored under the then
+  unresolved device); it expires with the TTL. A device-signed request by a
+  device unknown on the receiving node is rejected anyway (registration
+  check), so the request must come from the wallet or a known device.
+- **Mixed versions (0.150 requesters).** A 0.150 requester rejects our
+  `DeletionRequest` ride-alongs (unknown target, or not on its sync
+  allow-list) and counts them as page taint, so it keeps rechecking such a
+  channel at the throttle's backoff instead of the in-sync interval. Bounded
+  extra traffic; ends when the requester upgrades.
+- **Private-channel sync pages are not byte-bounded** (≤ 200 envelopes per
+  page, unchanged); very large private envelopes could still exceed the
+  transport cap.
+- **Pending-cap fill by a hostile responder (audit note 1).** The sync path
+  is PoW-exempt, so a responder can fill the 100,000-row pending table with
+  requests signed by registered wallets (≤ 1,000 each); while full, new
+  pending requests are refused for up to 60 days (TTL). Effect is bounded:
+  honest responders withhold erased originals anyway, so a refused pending
+  request only matters if the original later arrives from a 0.150 peer.
+- **Crash window (audit note 5).** A crash between storing a request
+  envelope and writing its pending row leaves that one envelope in
+  `MESSAGES` with no pending row; the TTL reaper (which walks pending rows)
+  never removes it. The same happens when two concurrent sync tasks carry
+  requests for the same target and requester, or a request loses the cap
+  race under the pending lock (bounded by sync concurrency times the
+  per-requester cap; needs a hostile responder).
+- **Unknown future `DeletionType` variants taint (audit round 3 N3).** A
+  variant this node does not know decodes as malformed and taints the page —
+  deliberate, so garbage 0x50 envelopes cannot pad pages for free; a new
+  variant needs a protocol version gate.
+- **Supersede scan bound (audit note 8).** `plan_enc_key_supersede` examines
+  at most 256 `device_enc_keys` rows per wallet (unchanged bound, now also on
+  the losing-binding path).
+- **Deferred: per-IP limit on `GET /users/{a}/enc-keys` pulls (audit N2).**
+  The route is already behind the tiered HTTP rate limits, and the pull
+  trigger has its own node-wide budget and per-wallet dedup.
+- **The enc-keys pull is asynchronous**: the first `GET .../enc-keys` on a
+  fresh node still answers empty; clients should retry. A wallet admitted by
+  the gate is not re-pulled through that route for 10 minutes, and the
+  network task pulls a wallet at most once per session (the staleness sweep
+  only re-pulls wallets whose profile looks incomplete).
+- **Reactions / edits of an erased original** are withheld from backfill but
+  existing copies on other nodes are untouched (unchanged).
+- **A page whose every raw row is skipped** (a full batch of erased or
+  out-of-window rows) answers empty with `has_more`; the requester's
+  zero-progress rule may end that session early. Rare: G2 seeks past the
+  out-of-window rows.
+- **Deep history** (chat/DM older than 30 days, news older than 7) is still
+  not fetchable on demand (D6, deferred to after mainnet).
+- **Not in this release:** G4 (DM-scope key envelopes and vault/settings,
+  0.153.0), G6/G7 (pins, mutes, chat reactions, public metadata paging,
+  0.152.0).
+
 ## [0.150.0] - 2026-11-19
 
 Private-sync backfill for local members recorded only in `LOCAL_CHANNEL_HOMES`

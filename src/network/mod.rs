@@ -679,6 +679,10 @@ pub struct NetworkService {
     /// Server-side rate-limit state for inbound `IdentitySyncRequest`s,
     /// keyed by `(peer, wallet)` (P-1, l2-node 0.50.0+).
     identity_sync_limits: Arc<identity_sync::IdentityResponderLimits>,
+    /// Rolling responder budget per `(peer, wallet)` for identity-sync
+    /// (l2-node 0.151.0): `[identity_resync] responder_budget_burst`,
+    /// refilled at `responder_budget_refill_per_hour`.
+    identity_sync_budget: budget::Gcra,
     /// Outstanding outbound identity-sync requests, keyed by
     /// `OutboundRequestId` → `(peer, wallet, scopes)` so the response
     /// handler can apply + page the right wallet's bundle.
@@ -699,6 +703,10 @@ pub struct NetworkService {
     identity_sync_triggered_order: std::collections::VecDeque<String>,
     /// Server-side rate-limit state for inbound news-sync requests (P-3).
     news_sync_limits: Arc<news_sync::NewsResponderLimits>,
+    /// Rolling responder budget per peer for news-sync (l2-node 0.151.0):
+    /// `[backfill] news_responder_budget_burst`, refilled at
+    /// `news_responder_budget_refill_per_hour`.
+    news_sync_budget: budget::Gcra,
     /// Outstanding outbound news-sync requests → the peer they went to plus
     /// the requester-side paging budget (for race-cancel + paging; W9).
     pending_news_sync_requests: HashMap<
@@ -735,8 +743,18 @@ pub struct NetworkService {
     /// actually fires. Starts at the full budget (not zero) so a
     /// freshly-started node isn't silently inert for its first interval.
     observed_trigger_budget: usize,
+    /// The same per-interval budget for authors of BACKFILLED envelopes
+    /// (G9, l2-node 0.151.0, audit N3) — separate so a large backfill cannot
+    /// starve the live-gossip trigger (or the reverse). Sized and refilled
+    /// like `observed_trigger_budget`
+    /// (`[identity_resync] max_observed_triggers_per_interval`).
+    backfill_author_trigger_budget: usize,
     /// Server-side rate-limit state for inbound dm-sync requests (Phase 2).
     dm_sync_limits: Arc<dm_sync::DmResponderLimits>,
+    /// Rolling responder budget per peer for dm-sync (l2-node 0.151.0):
+    /// `[dm] sync_responder_budget_burst`, refilled at
+    /// `sync_responder_budget_refill_per_hour`.
+    dm_sync_budget: budget::Gcra,
     /// Outstanding outbound dm-sync requests → `(peer, wallet)` for race-cancel
     /// + cursor paging of that wallet's backfill.
     pending_dm_sync_requests: HashMap<
@@ -1139,6 +1157,11 @@ struct ReconcileTally {
     /// or PoW-gated envelope, a `Duplicate` that is NOT byte-identical (a
     /// forged envelope reusing a known msg_id), or an oversized page.
     tainted: bool,
+    /// GDPR `DeletionRequest`s that carry no evidence either way (l2-node
+    /// 0.151.0, audit W1/W4): one accepted only as a PENDING row (its target
+    /// is withheld), or one this node refused (outside its window, wrong
+    /// scope, author skew, at capacity). Neither progress nor taint.
+    ignored_deletions: usize,
 }
 
 impl ReconcileTally {
@@ -1150,7 +1173,8 @@ impl ReconcileTally {
             && env_count > 0
             && !self.tainted
             && self.newly_accepted == 0
-            && self.verified_dups == env_count
+            && self.verified_dups > 0
+            && self.verified_dups + self.ignored_deletions == env_count
     }
 }
 
@@ -1165,6 +1189,8 @@ fn tally_reconcile_envelopes(
     channel_id: u64,
     envelopes: &[Vec<u8>],
     max_page_size: usize,
+    deletion_min_ts_ms: u64,
+    accepted_authors: &mut Vec<(String, u8)>,
 ) -> ReconcileTally {
     let mut t = ReconcileTally::default();
     if envelopes.len() > max_page_size {
@@ -1190,15 +1216,42 @@ fn tally_reconcile_envelopes(
         // happily index them under B. Reject any envelope whose
         // payload-extracted channel_id does not equal the channel we
         // asked for, BEFORE handing it to the router.
+        let is_deletion = is_deletion_request(env_bytes);
         if !envelope_targets_channel(env_bytes, channel_id) {
             t.cross_channel_dropped += 1;
             t.tainted = true;
             continue;
         }
+        match deletion_request_fit(storage, env_bytes, DeletionScope::Channel(channel_id), deletion_min_ts_ms) {
+            DeletionFit::Fits => {}
+            // A well-formed request this sync does not take is not evidence
+            // against the peer (W4: windows differ per node).
+            DeletionFit::Neutral => {
+                t.ignored_deletions += 1;
+                continue;
+            }
+            DeletionFit::Malformed => {
+                t.cross_channel_dropped += 1;
+                t.tainted = true;
+                continue;
+            }
+        }
         match router.process_synced_message(env_bytes) {
-            RouteResult::Accepted { .. } => {
+            RouteResult::Accepted { .. } if is_deletion && pending_only_deletion(storage, env_bytes) => {
+                // W1: accepted only as a pending row — not progress.
+                t.ignored_deletions += 1;
+            }
+            RouteResult::Rejected(_) if is_deletion => {
+                // W4: a 0x50 the router refuses by POLICY (target author skew,
+                // too old, pending capacity) must not taint the page forever.
+                // An `Invalid` one (bad signature / msg_id) still taints.
+                t.ignored_deletions += 1;
+            }
+            RouteResult::Accepted { author, msg_type, .. } => {
                 t.admitted += 1;
                 t.newly_accepted += 1;
+                // G9 (l2-node 0.151.0): sampled for the identity-pull gate.
+                note_backfilled_author(accepted_authors, author, msg_type as u8);
             }
             RouteResult::Duplicate => {
                 // Counted toward `admitted` but deliberately NOT toward
@@ -2021,6 +2074,140 @@ fn envelope_targets_scope(env_bytes: &[u8], scopes: u8) -> bool {
     identity_sync::type_in_scopes(envelope.msg_type_u8(), scopes)
 }
 
+/// Which backfill a `DeletionRequest` arrived through (l2-node 0.151.0,
+/// G5) — the scope its target must belong to (`deletion_request_fit`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeletionScope {
+    /// Channel reconcile / private-channel sync for this channel.
+    Channel(u64),
+    /// News-sync.
+    News,
+    /// DM-sync.
+    Dm,
+}
+
+/// Outcome of `deletion_request_fit` (l2-node 0.151.0, audit W-B).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeletionFit {
+    /// Not a `DeletionRequest`, or one bound to this sync: route it.
+    Fits,
+    /// A well-formed `DeletionRequest` this sync does not take (wrong scope,
+    /// outside the window, `AllUserContent`): skip it — neither progress nor
+    /// a peer fault (windows and versions differ between honest nodes).
+    Neutral,
+    /// Undecodable envelope or `DeletionRequest` payload: a fault (taint).
+    Malformed,
+}
+
+/// Receiver-side binding of a synced `DeletionRequest` (0x50) to the
+/// backfill it arrived through (l2-node 0.151.0, G5). `true` for every
+/// other type (the per-protocol checks handle those). A `DeletionRequest`
+/// must be `SingleMessage` with a target; when the target is stored here it
+/// must be a chat message of the synced channel / news content / a DM,
+/// matching `Storage::index_deletion_request` on the responder, so a relay
+/// cannot replay an unrelated request through a protocol that would never
+/// serve it. An UNKNOWN target is accepted: responders withhold erased
+/// originals (D4), so a fresh node gets the request without its target —
+/// the router then records it only as a pending row that hides nothing
+/// unless a message by the same author with that id is stored later.
+fn deletion_request_fit(storage: &Storage, env_bytes: &[u8], scope: DeletionScope, min_ts_ms: u64) -> DeletionFit {
+    use crate::messages::types::{DeletionRequestPayload, DeletionType, MessageType};
+    use crate::storage::rocks::DeletionTargetKind;
+    let Ok(env) = rmp_serde::from_slice::<Envelope>(env_bytes) else {
+        return DeletionFit::Malformed;
+    };
+    if env.msg_type != MessageType::DeletionRequest {
+        return DeletionFit::Fits;
+    }
+    let target = match rmp_serde::from_slice::<DeletionRequestPayload>(&env.payload) {
+        Ok(DeletionRequestPayload { delete_type: DeletionType::SingleMessage, target_id: Some(t) }) => t,
+        // `AllUserContent` is never indexed into any backfill side-index;
+        // a well-formed one is simply not this protocol's (neutral).
+        Ok(_) => return DeletionFit::Neutral,
+        // An undecodable payload is a broken envelope (audit W-B: taint).
+        Err(_) => return DeletionFit::Malformed,
+    };
+    let fits = match (storage.deletion_target_kind(&target), scope) {
+        // Unknown target → pending row: only inside this sync's window
+        // (audit W1 — the responder serves the request within the same
+        // window; anything older can never meet its target here).
+        (None, _) => env.timestamp >= min_ts_ms,
+        (Some(DeletionTargetKind::Chat(cid)), DeletionScope::Channel(want)) => cid == want,
+        (Some(DeletionTargetKind::News), DeletionScope::News) => true,
+        (Some(DeletionTargetKind::Dm(_)), DeletionScope::Dm) => true,
+        _ => false,
+    };
+    if fits {
+        DeletionFit::Fits
+    } else {
+        DeletionFit::Neutral
+    }
+}
+
+/// `true` iff `env_bytes` is a `DeletionRequest` (top-level decode only).
+fn is_deletion_request(env_bytes: &[u8]) -> bool {
+    rmp_serde::from_slice::<Envelope>(env_bytes)
+        .is_ok_and(|e| e.msg_type == crate::messages::types::MessageType::DeletionRequest)
+}
+
+/// `true` iff `env_bytes` is a `SingleMessage` `DeletionRequest` whose target
+/// is NOT stored here — after routing, i.e. it was accepted only as a pending
+/// row (l2-node 0.151.0, audit W1). Such an acceptance proves nothing about
+/// the responder's history and must not count as progress or completion.
+fn pending_only_deletion(storage: &Storage, env_bytes: &[u8]) -> bool {
+    use crate::messages::types::{DeletionRequestPayload, MessageType};
+    let Ok(env) = rmp_serde::from_slice::<Envelope>(env_bytes) else { return false };
+    if env.msg_type != MessageType::DeletionRequest {
+        return false;
+    }
+    match rmp_serde::from_slice::<DeletionRequestPayload>(&env.payload) {
+        Ok(DeletionRequestPayload { target_id: Some(t), .. }) => !storage.message_exists(&t).unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// Window in seconds for a `days` setting where `u64::MAX` means unlimited
+/// (`[backfill] max_age_days`).
+fn days_window_secs_max_unlimited(days: u64) -> u64 {
+    if days == u64::MAX { u64::MAX } else { days.saturating_mul(24 * 3600) }
+}
+
+/// Window in seconds for a `days` setting where `0` means unlimited
+/// (`news_max_age_days`, `[dm] backfill_max_age_days`,
+/// `[private_channel_sync] max_age_days`).
+fn days_window_secs_zero_unlimited(days: u64) -> u64 {
+    if days == 0 { u64::MAX } else { days.saturating_mul(24 * 3600) }
+}
+
+/// Earliest envelope timestamp (ms) inside a backfill window of
+/// `max_age_secs` (`u64::MAX` = unlimited → 0).
+fn window_start_ms(max_age_secs: u64) -> u64 {
+    if max_age_secs == u64::MAX {
+        0
+    } else {
+        now_ms().saturating_sub(max_age_secs.saturating_mul(1000))
+    }
+}
+
+/// Max distinct authors one backfill page feeds into the identity-pull gate
+/// (G9, l2-node 0.151.0). The gate's own per-interval budget bounds the
+/// pulls; this bounds the per-page bookkeeping and `USERS` reads.
+const MAX_BACKFILLED_AUTHORS_PER_PAGE: usize = 32;
+
+/// Record the author of an `Accepted` backfilled envelope for the
+/// identity-pull gate (G9): only types `identity_sync::
+/// triggers_identity_check` allows, deduplicated, at most
+/// `MAX_BACKFILLED_AUTHORS_PER_PAGE` per page.
+fn note_backfilled_author(out: &mut Vec<(String, u8)>, author: String, msg_type: u8) {
+    if out.len() >= MAX_BACKFILLED_AUTHORS_PER_PAGE
+        || !identity_sync::triggers_identity_check(msg_type)
+        || out.iter().any(|(a, _)| *a == author)
+    {
+        return;
+    }
+    out.push((author, msg_type));
+}
+
 /// Smuggling defense for news-sync responses (P-3): accept only news-feed
 /// message types, so a responder can't inject a non-news type through this
 /// path. Every envelope is still signature-validated by `process_synced_message`.
@@ -2414,6 +2601,19 @@ impl NetworkService {
             private_channel_sync_config.responder_budget_burst,
             private_channel_sync_config.responder_budget_refill_per_hour,
         );
+        // l2-node 0.151.0: news / dm / identity-sync responder budgets.
+        let news_sync_budget = budget::Gcra::new(
+            backfill_config.news_responder_budget_burst,
+            backfill_config.news_responder_budget_refill_per_hour,
+        );
+        let dm_sync_budget = budget::Gcra::new(
+            dm_config.sync_responder_budget_burst,
+            dm_config.sync_responder_budget_refill_per_hour,
+        );
+        let identity_sync_budget = budget::Gcra::new(
+            identity_resync_config.responder_budget_burst,
+            identity_resync_config.responder_budget_refill_per_hour,
+        );
         let private_channel_sync_throttle = budget::AttemptThrottle::new(
             budget::MAX_THROTTLE_KEYS,
             Duration::from_secs(private_channel_sync_config.retry_backoff_max_minutes.saturating_mul(60)),
@@ -2458,17 +2658,23 @@ impl NetworkService {
             peer_reconcile_health: HashMap::new(),
             sync_limits: Arc::new(reconcile::ResponderLimits::default()),
             pending_sync_requests: HashMap::new(),
-            identity_sync_limits: Arc::new(identity_sync::IdentityResponderLimits::default()),
+            identity_sync_limits: Arc::new(identity_sync::IdentityResponderLimits::new(
+                budget::MAX_TRACKED_RESPONDER_KEYS,
+            )),
+            identity_sync_budget,
             pending_identity_sync_requests: HashMap::new(),
             identity_sync_triggered: HashSet::new(),
             identity_sync_triggered_order: std::collections::VecDeque::new(),
-            news_sync_limits: Arc::new(news_sync::NewsResponderLimits::default()),
+            news_sync_limits: Arc::new(news_sync::NewsResponderLimits::new(budget::MAX_TRACKED_RESPONDER_KEYS)),
+            news_sync_budget,
             pending_news_sync_requests: HashMap::new(),
             last_news_sync: None,
             dm_config,
             observed_trigger_budget: identity_resync_config.max_observed_triggers_per_interval,
+            backfill_author_trigger_budget: identity_resync_config.max_observed_triggers_per_interval,
             identity_resync_config,
-            dm_sync_limits: Arc::new(dm_sync::DmResponderLimits::default()),
+            dm_sync_limits: Arc::new(dm_sync::DmResponderLimits::new(budget::MAX_TRACKED_RESPONDER_KEYS)),
+            dm_sync_budget,
             pending_dm_sync_requests: HashMap::new(),
             dm_backfill_triggered: HashSet::new(),
             wallet_claims: HashMap::new(),
@@ -3070,6 +3276,11 @@ impl NetworkService {
             let _ = self
                 .storage
                 .delete_cf(schema::cf::DELETION_MARKERS, msg_id);
+            // l2-node 0.151.0: the verified GDPR record of a reaped DM (its
+            // exact `msg_id` key) dies with it.
+            let _ = self
+                .storage
+                .delete_cf(schema::cf::DELETION_REQUESTS, msg_id);
         }
         // Persist the cursor just past the last row this sweep looked at (or
         // wrap to the start if the CF is empty/exhausted), so the next tick
@@ -3165,6 +3376,7 @@ impl NetworkService {
         // `USERS` table, or between real work), which is fine: the refill
         // is O(1) regardless.
         self.observed_trigger_budget = self.identity_resync_config.max_observed_triggers_per_interval;
+        self.backfill_author_trigger_budget = self.identity_resync_config.max_observed_triggers_per_interval;
         let cursor = match self.storage.get_cf(
             schema::cf::NODE_STATE,
             schema::state_keys::IDENTITY_STALENESS_CURSOR,
@@ -4522,6 +4734,65 @@ impl NetworkService {
         }
     }
 
+    /// The observed-author identity-pull gate (design doc "Closing the
+    /// Identity-Sync Coverage Gap"), shared by live gossip and — since
+    /// l2-node 0.151.0 (G9) — the authors of `Accepted` envelopes from
+    /// channel reconcile and news-sync. Fires a `SCOPE_ALL` pull only when
+    /// ALL hold, cheapest first: the feature is enabled; the per-interval
+    /// `observed_trigger_budget` is not spent; the wallet was not already
+    /// pulled this session; the message type is author-facing
+    /// (`triggers_identity_check`); and the local identity record looks
+    /// incomplete (`identity_looks_incomplete`, one `USERS` read). `backfill`
+    /// selects the budget: `backfill_author_trigger_budget` for authors of
+    /// synced envelopes, `observed_trigger_budget` for live gossip. Returns
+    /// whether a pull was triggered. See `handle_gossip_message` for the
+    /// threat model behind each condition.
+    fn observe_author_for_identity_pull(&mut self, author: &str, msg_type: u8, backfill: bool) -> bool {
+        let budget = if backfill { self.backfill_author_trigger_budget } else { self.observed_trigger_budget };
+        if !(self.identity_resync_config.enabled
+            && budget > 0
+            && !self.identity_sync_triggered.contains(author)
+            && identity_sync::triggers_identity_check(msg_type)
+            && identity_sync::identity_looks_incomplete(&self.storage, author))
+        {
+            return false;
+        }
+        let left = budget - 1;
+        if backfill {
+            self.backfill_author_trigger_budget = left;
+        } else {
+            self.observed_trigger_budget = left;
+        }
+        if left == 0 {
+            // Logged once per exhaustion (not per subsequent message — the
+            // `budget > 0` check above already suppresses those) so an
+            // operator can see the trigger going inert for this interval,
+            // rather than it degrading silently.
+            debug!(
+                sweep_interval_secs = self.identity_resync_config.sweep_interval_secs,
+                backfill,
+                "identity-sync: observed-author trigger budget exhausted for this interval"
+            );
+        }
+        self.maybe_trigger_identity_sync(author.to_string(), identity_sync::SCOPE_ALL);
+        true
+    }
+
+    /// G9 (l2-node 0.151.0): run the authors sampled from one backfill
+    /// page (`note_backfilled_author`, ≤ `MAX_BACKFILLED_AUTHORS_PER_PAGE`)
+    /// through `observe_author_for_identity_pull` — the same gate as live
+    /// gossip, but against its OWN per-interval budget
+    /// (`backfill_author_trigger_budget`, audit N3), so backfill and gossip
+    /// cannot starve each other. Stops early once that budget is spent.
+    fn observe_backfilled_authors(&mut self, authors: &[(String, u8)]) {
+        for (author, msg_type) in authors {
+            if self.backfill_author_trigger_budget == 0 {
+                break;
+            }
+            self.observe_author_for_identity_pull(author, *msg_type, true);
+        }
+    }
+
     /// Channel-history backfill trigger (spec 1, l2-node 0.47.0+).
     /// See [`Self::subscribe_channel`] for the full trigger contract.
     /// Lazily pull one wallet's identity bundle (delegation/profile/follows)
@@ -4628,26 +4899,41 @@ impl NetworkService {
                     );
                     return;
                 }
-                let guard = self.identity_sync_limits.try_acquire(
+                // l2-node 0.151.0: rolling budget per (peer, wallet) instead
+                // of a lifetime counter; charged for envelopes AND rows
+                // examined (`budget_charge`, minimum 1 — an empty or
+                // out-of-scope page is not free). Refusals are not charged.
+                let key = (peer, request.wallet.clone());
+                let gcra = self.identity_sync_budget;
+                let guard = match self.identity_sync_limits.try_acquire(
                     peer,
-                    &request.wallet,
+                    &key,
                     identity_sync::SERVER_MAX_CONCURRENT_PER_PEER,
-                    identity_sync::TOTAL_ENVELOPES_CAP,
-                );
+                    &gcra,
+                    Instant::now(),
+                ) {
+                    Ok(g) => Some(g),
+                    Err(refusal) => {
+                        self.count_sync_budget_refusal(refusal);
+                        None
+                    }
+                };
                 let response = if guard.is_none() {
                     identity_sync::capped_response(&request)
                 } else {
-                    identity_sync::build_response(
+                    let (resp, work) = identity_sync::build_response_metered(
                         &self.storage,
                         &request,
                         identity_sync::MAX_ENVELOPES_PER_RESPONSE,
-                    )
+                    );
+                    self.identity_sync_limits.charge(
+                        key,
+                        reconcile::budget_charge(resp.envelopes.len(), work),
+                        &gcra,
+                        Instant::now(),
+                    );
+                    resp
                 };
-                let envelopes_sent = response.envelopes.len();
-                if envelopes_sent > 0 {
-                    self.identity_sync_limits
-                        .add_served(peer, &request.wallet, envelopes_sent as u64);
-                }
                 if let Err(e) = self
                     .swarm
                     .behaviour_mut()
@@ -4869,14 +5155,14 @@ impl NetworkService {
         use crate::messages::router::RouteResult;
         use libp2p::request_response::{Event, Message};
 
-        let window_secs = || {
-            if self.backfill_config.news_max_age_days == 0 {
-                u64::MAX
-            } else {
-                self.backfill_config
-                    .news_max_age_days
-                    .saturating_mul(24 * 3600)
-            }
+        // A value, not a closure borrowing `self`: the response arm calls
+        // `&mut self` methods before paging (G9).
+        let window_secs = if self.backfill_config.news_max_age_days == 0 {
+            u64::MAX
+        } else {
+            self.backfill_config
+                .news_max_age_days
+                .saturating_mul(24 * 3600)
         };
 
         match event {
@@ -4886,11 +5172,22 @@ impl NetworkService {
                 message: Message::Request { request, channel, request_id: _ },
                 connection_id: _,
             } => {
-                let guard = self.news_sync_limits.try_acquire(
+                // l2-node 0.151.0: rolling budget per peer instead of a
+                // lifetime counter (see `news_sync::NewsResponderLimits`).
+                let gcra = self.news_sync_budget;
+                let guard = match self.news_sync_limits.try_acquire(
                     peer,
+                    &peer,
                     news_sync::SERVER_MAX_CONCURRENT_PER_PEER,
-                    news_sync::TOTAL_ENVELOPES_CAP,
-                );
+                    &gcra,
+                    Instant::now(),
+                ) {
+                    Ok(g) => Some(g),
+                    Err(refusal) => {
+                        self.count_sync_budget_refusal(refusal);
+                        None
+                    }
+                };
                 let response = if guard.is_none() {
                     news_sync::capped_response()
                 } else {
@@ -4898,18 +5195,21 @@ impl NetworkService {
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_millis() as u64)
                         .unwrap_or(0);
-                    news_sync::build_response(
+                    let (resp, work) = news_sync::build_response_metered(
                         &self.storage,
                         &request,
                         news_sync::MAX_ENVELOPES_PER_RESPONSE,
                         now_ms,
-                        window_secs(),
-                    )
+                        window_secs,
+                    );
+                    self.news_sync_limits.charge(
+                        peer,
+                        reconcile::budget_charge(resp.envelopes.len(), work),
+                        &gcra,
+                        Instant::now(),
+                    );
+                    resp
                 };
-                let sent = response.envelopes.len();
-                if sent > 0 {
-                    self.news_sync_limits.add_served(peer, sent as u64);
-                }
                 if let Err(e) = self
                     .swarm
                     .behaviour_mut()
@@ -4946,20 +5246,42 @@ impl NetworkService {
                 // envelope in a page that exceeds this protocol's own max
                 // page size, treating it as unproductive rather than
                 // paying the verification cost.
-                if count > news_sync::MAX_ENVELOPES_PER_RESPONSE {
+                let mut accepted_authors: Vec<(String, u8)> = Vec::new();
+                if count > news_sync::MAX_ENVELOPES_PER_PAGE_WITH_RIDE_ALONGS {
                     warn!(
                         peer = %peer, received = count,
-                        expected_max = news_sync::MAX_ENVELOPES_PER_RESPONSE,
+                        expected_max = news_sync::MAX_ENVELOPES_PER_PAGE_WITH_RIDE_ALONGS,
                         "news-sync: response exceeds this protocol's own max page size; refusing to verify, treating as unproductive"
                     );
                 } else {
+                    let deletion_min_ts = window_start_ms(window_secs);
                     for env_bytes in response.envelopes {
                         if !envelope_targets_news(&env_bytes) {
                             dropped += 1;
                             continue;
                         }
+                        let is_deletion = is_deletion_request(&env_bytes);
+                        match deletion_request_fit(&self.storage, &env_bytes, DeletionScope::News, deletion_min_ts) {
+                            DeletionFit::Fits => {}
+                            // Not progress, not a peer fault (W1/W4).
+                            DeletionFit::Neutral => continue,
+                            DeletionFit::Malformed => {
+                                warn!(peer = %peer, "news-sync: malformed deletion request dropped");
+                                dropped += 1;
+                                continue;
+                            }
+                        }
                         match self.router.process_synced_message(&env_bytes) {
-                            RouteResult::Accepted { .. } | RouteResult::Duplicate => admitted += 1,
+                            // A pending-only DeletionRequest, or one the router
+                            // refused by policy, is neither progress nor a
+                            // fault (W1/W4); an Invalid one is warned below.
+                            RouteResult::Accepted { .. } if is_deletion && pending_only_deletion(&self.storage, &env_bytes) => {}
+                            RouteResult::Rejected(_) if is_deletion => {}
+                            RouteResult::Accepted { author, msg_type, .. } => {
+                                admitted += 1;
+                                note_backfilled_author(&mut accepted_authors, author, msg_type as u8);
+                            }
+                            RouteResult::Duplicate => admitted += 1,
                             RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
                                 warn!(peer = %peer, reason = %reason, "news-sync: envelope rejected by router");
                             }
@@ -4969,6 +5291,9 @@ impl NetworkService {
                         }
                     }
                 }
+                // G9 (l2-node 0.151.0): authors of newly accepted news go
+                // through the same identity-pull gate as live gossip.
+                self.observe_backfilled_authors(&accepted_authors);
                 info!(peer = %peer, received = count, admitted, dropped, has_more = response.has_more, "news-sync: applied batch");
 
                 // Audit final pre-mainnet W9: requester-side paging budget —
@@ -4992,7 +5317,7 @@ impl NetworkService {
                 if response.has_more {
                     if let Some(cursor) = response.next_cursor {
                         let next_req = news_sync::NewsSyncRequest {
-                            max_age_secs: window_secs(),
+                            max_age_secs: window_secs,
                             cursor: Some(cursor),
                             overlap_digest: Vec::new(),
                             round: 0,
@@ -5193,15 +5518,26 @@ impl NetworkService {
                     return;
                 }
 
-                let guard = self.dm_sync_limits.try_acquire(
+                // l2-node 0.151.0: rolling budget per peer instead of a
+                // lifetime counter (see `dm_sync::DmResponderLimits`).
+                let gcra = self.dm_sync_budget;
+                let guard = match self.dm_sync_limits.try_acquire(
                     peer,
+                    &peer,
                     dm_sync::SERVER_MAX_CONCURRENT_PER_PEER,
-                    dm_sync::TOTAL_ENVELOPES_CAP,
-                );
+                    &gcra,
+                    Instant::now(),
+                ) {
+                    Ok(g) => Some(g),
+                    Err(refusal) => {
+                        self.count_sync_budget_refusal(refusal);
+                        None
+                    }
+                };
                 let response = if guard.is_none() {
                     dm_sync::capped_response()
                 } else {
-                    let (resp, scanned_all) = dm_sync::build_response(
+                    let (resp, scanned_all, work) = dm_sync::build_response(
                         &self.storage,
                         &request.wallet,
                         &request,
@@ -5218,12 +5554,14 @@ impl NetworkService {
                             dm_sync::MAX_CONVERSATIONS,
                         );
                     }
+                    self.dm_sync_limits.charge(
+                        peer,
+                        reconcile::budget_charge(resp.envelopes.len(), work),
+                        &gcra,
+                        Instant::now(),
+                    );
                     resp
                 };
-                let sent = response.envelopes.len();
-                if sent > 0 {
-                    self.dm_sync_limits.add_served(peer, sent as u64);
-                }
                 if let Err(e) = self
                     .swarm
                     .behaviour_mut()
@@ -5269,19 +5607,36 @@ impl NetworkService {
                 // envelope in a page that exceeds this protocol's own max
                 // page size, treating it as unproductive rather than
                 // paying the verification cost.
-                if count > dm_sync::MAX_ENVELOPES_PER_RESPONSE {
+                if count > dm_sync::MAX_ENVELOPES_PER_PAGE_WITH_RIDE_ALONGS {
                     warn!(
                         peer = %peer, wallet = %wallet, received = count,
-                        expected_max = dm_sync::MAX_ENVELOPES_PER_RESPONSE,
+                        expected_max = dm_sync::MAX_ENVELOPES_PER_PAGE_WITH_RIDE_ALONGS,
                         "dm-sync: response exceeds this protocol's own max page size; refusing to verify, treating as unproductive"
                     );
                 } else {
+                    let deletion_min_ts =
+                        window_start_ms(days_window_secs_zero_unlimited(self.dm_config.backfill_max_age_days));
                     for env_bytes in response.envelopes {
                         if !envelope_targets_dm(&env_bytes) {
                             dropped += 1;
                             continue;
                         }
+                        let is_deletion = is_deletion_request(&env_bytes);
+                        match deletion_request_fit(&self.storage, &env_bytes, DeletionScope::Dm, deletion_min_ts) {
+                            DeletionFit::Fits => {}
+                            DeletionFit::Neutral => continue,
+                            DeletionFit::Malformed => {
+                                warn!(peer = %peer, "dm-sync: malformed deletion request dropped");
+                                dropped += 1;
+                                continue;
+                            }
+                        }
                         match self.router.process_synced_message(&env_bytes) {
+                            // Pending-only / policy-refused DeletionRequest:
+                            // neither progress nor a fault (W1/W4); an Invalid
+                            // one is warned below.
+                            RouteResult::Accepted { .. } if is_deletion && pending_only_deletion(&self.storage, &env_bytes) => {}
+                            RouteResult::Rejected(_) if is_deletion => {}
                             RouteResult::Accepted { .. } | RouteResult::Duplicate => admitted += 1,
                             RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
                                 warn!(peer = %peer, reason = %reason, "dm-sync: envelope rejected by router");
@@ -6292,6 +6647,9 @@ impl NetworkService {
                         "private-channel-sync: response exceeds this protocol's own max page size; refusing to verify, treating as unproductive"
                     );
                 } else {
+                    let deletion_min_ts = window_start_ms(days_window_secs_zero_unlimited(
+                        self.private_channel_sync_config.max_age_days,
+                    ));
                     for env_bytes in &response.envelopes {
                         if !private_channel_sync::envelope_is_private_channel_sync_type(env_bytes)
                             || !envelope_targets_channel(env_bytes, channel_id)
@@ -6300,7 +6658,21 @@ impl NetworkService {
                             tainted = true;
                             continue;
                         }
+                        let is_deletion = is_deletion_request(env_bytes);
+                        match deletion_request_fit(&self.storage, env_bytes, DeletionScope::Channel(channel_id), deletion_min_ts) {
+                            DeletionFit::Fits => {}
+                            // Neither progress nor taint (W1/W4).
+                            DeletionFit::Neutral => continue,
+                            DeletionFit::Malformed => {
+                                dropped += 1;
+                                tainted = true;
+                                continue;
+                            }
+                        }
                         match self.router.process_synced_message(env_bytes) {
+                            RouteResult::Accepted { .. } if is_deletion && pending_only_deletion(&self.storage, env_bytes) => {}
+                            // Policy refusal: neutral. `Invalid` taints below.
+                            RouteResult::Rejected(_) if is_deletion => {}
                             RouteResult::Accepted { .. } => {
                                 admitted += 1;
                                 accepted += 1;
@@ -7020,6 +7392,10 @@ impl NetworkService {
         self.reconcile_limits.prune(now);
         self.sync_limits.prune(now);
         self.private_channel_sync_limits.prune(now);
+        // l2-node 0.151.0: the news / dm / identity-sync responder budgets.
+        self.news_sync_limits.prune(now);
+        self.dm_sync_limits.prune(now);
+        self.identity_sync_limits.prune(now);
         self.reconcile_throttle.prune(now);
         self.private_channel_sync_throttle.prune(now);
     }
@@ -7039,6 +7415,17 @@ impl NetworkService {
             self.counters.inc_reconcile_budget_refusals();
         } else {
             self.counters.inc_private_sync_budget_refusals();
+        }
+    }
+
+    /// Count a news / dm / identity-sync responder refusal (l2-node
+    /// 0.151.0). Only a full key map is counted (the shared flood
+    /// indicator); per-protocol over-budget refusals are logged at debug.
+    fn count_sync_budget_refusal(&self, refusal: budget::Refusal) {
+        match refusal {
+            budget::Refusal::MapFull => self.counters.inc_backfill_budget_map_full_refusals(),
+            budget::Refusal::OverBudget => debug!("sync responder: peer over its rolling budget; answering server_capped"),
+            budget::Refusal::Concurrency => {}
         }
     }
 
@@ -7593,14 +7980,18 @@ impl NetworkService {
         }
 
         let env_count = response.envelopes.len();
+        let mut accepted_authors: Vec<(String, u8)> = Vec::new();
         let tally = tally_reconcile_envelopes(
             &self.router,
             &self.storage,
             &peer,
             pending.channel_id,
             &response.envelopes,
-            self.backfill_config.max_envelopes_per_response,
+            reconcile::max_page_with_ride_alongs(self.backfill_config.max_envelopes_per_response),
+            window_start_ms(days_window_secs_max_unlimited(self.backfill_config.max_age_days)),
+            &mut accepted_authors,
         );
+        self.observe_backfilled_authors(&accepted_authors);
         let ReconcileTally { admitted, newly_accepted, cross_channel_dropped, .. } = tally;
         info!(
             peer = %peer,
@@ -8165,10 +8556,27 @@ impl NetworkService {
                 let mut accepted = 0u32;
                 let mut rejected = 0u32;
                 let mut cross_channel_dropped = 0u32;
+                let deletion_min_ts =
+                    window_start_ms(days_window_secs_max_unlimited(self.backfill_config.max_age_days));
                 for msg_bytes in &response.messages {
                     if !envelope_targets_channel(msg_bytes, expected_channel) {
                         cross_channel_dropped += 1;
                         continue;
+                    }
+                    // l2-node 0.151.0 (audit note 6): bind a DeletionRequest
+                    // to this channel and window like every other receiver.
+                    match deletion_request_fit(
+                        &self.storage,
+                        msg_bytes,
+                        DeletionScope::Channel(expected_channel),
+                        deletion_min_ts,
+                    ) {
+                        DeletionFit::Fits => {}
+                        DeletionFit::Neutral => continue,
+                        DeletionFit::Malformed => {
+                            cross_channel_dropped += 1;
+                            continue;
+                        }
                     }
                     self.counters.add_bytes_in(msg_bytes.len() as u64);
                     self.counters.inc_messages_received();
@@ -8922,7 +9330,15 @@ impl NetworkService {
                 author,
                 bot_commands_changed,
                 key_status,
+                erased_on_arrival,
             } => {
+                if erased_on_arrival {
+                    // N7 (l2-node 0.151.0): storing it applied a pending GDPR
+                    // deletion request — it is kept hidden: no relay (the
+                    // verdict is Ignore), no local push, no notification.
+                    debug!(msg_id = %hex::encode(msg_id), "Gossip message erased on arrival by a pending deletion request");
+                    return verdict;
+                }
                 if key_status == Some(crate::messages::router::KeyStatus::AlreadyPresent) {
                     // Nothing was stored (the slot already held a wrap): no
                     // stats, no local push, no relay (round-4 audit W1b).
@@ -8991,26 +9407,7 @@ impl NetworkService {
                 // of only inside `maybe_trigger_identity_sync` also means the
                 // budget is only ever spent on a trigger that will actually
                 // fire.
-                if self.identity_resync_config.enabled
-                    && self.observed_trigger_budget > 0
-                    && !self.identity_sync_triggered.contains(&author)
-                    && identity_sync::triggers_identity_check(msg_type as u8)
-                    && identity_sync::identity_looks_incomplete(&self.storage, &author)
-                {
-                    self.observed_trigger_budget -= 1;
-                    if self.observed_trigger_budget == 0 {
-                        // Logged once per exhaustion (not per subsequent
-                        // gossip message — the outer `budget > 0` check
-                        // already suppresses those) so an operator can see
-                        // the trigger going inert for this interval, rather
-                        // than it degrading silently.
-                        debug!(
-                            sweep_interval_secs = self.identity_resync_config.sweep_interval_secs,
-                            "identity-sync: observed-author trigger budget exhausted for this interval"
-                        );
-                    }
-                    self.maybe_trigger_identity_sync(author.clone(), identity_sync::SCOPE_ALL);
-                }
+                self.observe_author_for_identity_pull(&author, msg_type as u8, false);
 
                 // Feed to notification engine for mention detection (fire-and-forget)
                 if let Some(ref engine) = self.notification_engine {
@@ -9100,6 +9497,7 @@ pub(crate) fn gossip_acceptance_for(result: &RouteResult) -> libp2p::gossipsub::
             key_status: Some(crate::messages::router::KeyStatus::AlreadyPresent),
             ..
         } => MessageAcceptance::Ignore,
+        RouteResult::Accepted { erased_on_arrival: true, .. } => MessageAcceptance::Ignore,
         RouteResult::Accepted { .. } => MessageAcceptance::Accept,
         RouteResult::Invalid(_) => MessageAcceptance::Reject,
         RouteResult::Duplicate
@@ -11102,4 +11500,223 @@ mod backfill_throttle_tests {
         );
     }
 
+}
+
+#[cfg(test)]
+mod backfill_0151_tests {
+    //! l2-node 0.151.0: receiver-side binding of synced DeletionRequests
+    //! (G5) and the identity-pull sampling of backfilled authors (G9).
+    use super::*;
+    use crate::crypto::{self, signing};
+    use crate::messages::types::{ChatMessagePayload, DeletionRequestPayload, DeletionType, MessageType};
+    use crate::storage::identity::IdentityResolver;
+    use tempfile::TempDir;
+
+    fn router() -> (MessageRouter, Storage, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let identity = IdentityResolver::new(storage.clone());
+        let r = MessageRouter::new(
+            storage.clone(),
+            identity,
+            None,
+            "testnet".to_string(),
+            usize::MAX,
+            Arc::new(crate::metrics::counters::NetworkCounters::new()),
+            crate::config::RateLimitsConfig::default(),
+        );
+        (r, storage, dir)
+    }
+
+    fn signed(sk: &ed25519_dalek::SigningKey, msg_type: MessageType, payload: Vec<u8>, ts: u64) -> (Vec<u8>, [u8; 32]) {
+        let author = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        let msg_id = crypto::compute_msg_id("testnet", &sk.verifying_key().to_bytes(), &payload, ts);
+        let sig = signing::sign_ogmara_message(
+            sk, "testnet", crate::messages::envelope::PROTOCOL_VERSION, msg_type as u8, &msg_id, ts, &payload,
+        );
+        let env = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type,
+            msg_id,
+            author,
+            timestamp: ts,
+            lamport_ts: 0,
+            payload,
+            signature: sig.to_bytes().to_vec(),
+            relay_path: vec![],
+        };
+        (rmp_serde::to_vec_named(&env).unwrap(), msg_id)
+    }
+
+    fn chat(sk: &ed25519_dalek::SigningKey, channel_id: u64, ts: u64) -> (Vec<u8>, [u8; 32]) {
+        let p = ChatMessagePayload {
+            channel_id,
+            content: format!("hello {ts}"),
+            content_rating: Default::default(),
+            reply_to: None,
+            mentions: vec![],
+            attachments: vec![],
+            enc_content: None,
+            enc_nonce: None,
+            key_epoch: None,
+            buttons: vec![],
+            via_button: false,
+        };
+        signed(sk, MessageType::ChatMessage, rmp_serde::to_vec_named(&p).unwrap(), ts)
+    }
+
+    fn deletion(sk: &ed25519_dalek::SigningKey, target: Option<[u8; 32]>, kind: DeletionType, ts: u64) -> Vec<u8> {
+        let p = DeletionRequestPayload { delete_type: kind, target_id: target };
+        signed(sk, MessageType::DeletionRequest, rmp_serde::to_vec_named(&p).unwrap(), ts).0
+    }
+
+    fn now() -> u64 {
+        crate::util::now_ms()
+    }
+
+    #[test]
+    fn deletion_request_is_bound_to_the_synced_scope() {
+        let (r, storage, _d) = router();
+        let sk = crypto::generate_keypair();
+        let t = now();
+        let (raw, id) = chat(&sk, 7, t);
+        assert!(matches!(r.process_synced_message(&raw), RouteResult::Accepted { .. }));
+        let req = deletion(&sk, Some(id), DeletionType::SingleMessage, t + 1);
+        assert_eq!(deletion_request_fit(&storage, &req, DeletionScope::Channel(7), 0), DeletionFit::Fits);
+        assert_eq!(deletion_request_fit(&storage, &req, DeletionScope::Channel(8), 0), DeletionFit::Neutral, "other channel");
+        assert_eq!(deletion_request_fit(&storage, &req, DeletionScope::News, 0), DeletionFit::Neutral, "chat target via news-sync");
+        assert_eq!(deletion_request_fit(&storage, &req, DeletionScope::Dm, 0), DeletionFit::Neutral, "chat target via dm-sync");
+        // Unknown target: accepted (it becomes a pending row that hides nothing).
+        let unknown = deletion(&sk, Some([0xEE; 32]), DeletionType::SingleMessage, t + 2);
+        for scope in [DeletionScope::Channel(7), DeletionScope::News, DeletionScope::Dm] {
+            assert_eq!(deletion_request_fit(&storage, &unknown, scope, 0), DeletionFit::Fits);
+        }
+        // AllUserContent is never served by any backfill.
+        let all = deletion(&sk, None, DeletionType::AllUserContent, t + 3);
+        assert_eq!(deletion_request_fit(&storage, &all, DeletionScope::News, 0), DeletionFit::Neutral);
+        // Other types are not this check's business.
+        assert_eq!(deletion_request_fit(&storage, &raw, DeletionScope::News, 0), DeletionFit::Fits);
+        // Out of window → neutral; a broken payload → malformed (taint).
+        assert_eq!(deletion_request_fit(&storage, &unknown, DeletionScope::News, u64::MAX), DeletionFit::Neutral);
+        let broken = signed(&sk, MessageType::DeletionRequest, vec![0xC1, 0xFF], t + 4).0;
+        assert_eq!(deletion_request_fit(&storage, &broken, DeletionScope::News, 0), DeletionFit::Malformed);
+        assert_eq!(deletion_request_fit(&storage, b"not an envelope", DeletionScope::News, 0), DeletionFit::Malformed);
+    }
+
+    #[test]
+    fn backfilled_author_sample_is_bounded_deduped_and_allow_listed() {
+        let mut out = Vec::new();
+        note_backfilled_author(&mut out, "klv1a".into(), MessageType::ChatMessage as u8);
+        note_backfilled_author(&mut out, "klv1a".into(), MessageType::NewsPost as u8);
+        note_backfilled_author(&mut out, "klv1b".into(), MessageType::ChatEdit as u8);
+        assert_eq!(out, vec![("klv1a".to_string(), MessageType::ChatMessage as u8)]);
+        for i in 0..1_000 {
+            note_backfilled_author(&mut out, format!("klv1x{i}"), MessageType::NewsComment as u8);
+        }
+        assert_eq!(out.len(), MAX_BACKFILLED_AUTHORS_PER_PAGE);
+    }
+
+    /// G9: the reconcile tally samples the author of every newly ACCEPTED
+    /// author-facing envelope (not duplicates), for the identity-pull gate.
+    #[test]
+    fn reconcile_tally_samples_accepted_authors() {
+        let (r, storage, _d) = router();
+        let sk = crypto::generate_keypair();
+        let author = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        let t = now();
+        let (a, _) = chat(&sk, 3, t);
+        let (b, _) = chat(&sk, 3, t + 1);
+        let peer = PeerId::random();
+        let mut authors = Vec::new();
+        let tally = tally_reconcile_envelopes(&r, &storage, &peer, 3, &[a.clone(), b], 10, 0, &mut authors);
+        assert_eq!(tally.newly_accepted, 2);
+        assert_eq!(authors, vec![(author, MessageType::ChatMessage as u8)]);
+        // A page of duplicates samples nobody.
+        let mut again = Vec::new();
+        tally_reconcile_envelopes(&r, &storage, &peer, 3, &[a], 10, 0, &mut again);
+        assert!(again.is_empty());
+    }
+
+    /// W1/W4: a DeletionRequest accepted only as a pending row, or one the
+    /// router refuses, or one outside this sync's window, is neither
+    /// progress (newly_accepted / admitted) nor taint — and a page of
+    /// verified duplicates plus such requests still proves "in sync".
+    #[test]
+    fn deletion_requests_are_neither_progress_nor_taint() {
+        let (r, storage, _d) = router();
+        let sk = crypto::generate_keypair();
+        let wallet = crypto::pubkey_to_address(&sk.verifying_key()).unwrap();
+        storage
+            .put_cf(
+                crate::storage::schema::cf::USERS,
+                wallet.as_bytes(),
+                serde_json::json!({"address": wallet, "registered_at": 1_000}).to_string().as_bytes(),
+            )
+            .unwrap();
+        let t = now();
+        let (kept, _) = chat(&sk, 5, t);
+        assert!(matches!(r.process_synced_message(&kept), RouteResult::Accepted { .. }));
+        let pending = deletion(&sk, Some([0xD1; 32]), DeletionType::SingleMessage, t + 1);
+        let out_of_window = deletion(&sk, Some([0xD2; 32]), DeletionType::SingleMessage, t - 10_000);
+        // A request the router refuses: a stranger's known message.
+        let stranger = crypto::generate_keypair();
+        let (theirs, their_id) = chat(&stranger, 5, t + 2);
+        assert!(matches!(r.process_synced_message(&theirs), RouteResult::Accepted { .. }));
+        let refused = deletion(&sk, Some(their_id), DeletionType::SingleMessage, t + 3);
+        let peer = PeerId::random();
+        let mut authors = Vec::new();
+        let tally = tally_reconcile_envelopes(
+            &r,
+            &storage,
+            &peer,
+            5,
+            &[kept.clone(), pending.clone(), out_of_window, refused],
+            10,
+            t - 1_000, // this sync's window start
+            &mut authors,
+        );
+        assert_eq!(tally.newly_accepted, 0);
+        assert_eq!(tally.admitted, 1, "only the verified duplicate");
+        assert_eq!(tally.verified_dups, 1);
+        assert_eq!(tally.ignored_deletions, 3);
+        assert!(!tally.tainted);
+        assert!(tally.is_verified_in_sync_page(4, false));
+        assert!(storage.message_exists(&rmp_serde::from_slice::<Envelope>(&pending).unwrap().msg_id).unwrap());
+        // W-B: an INVALID DeletionRequest (forged signature) taints; a
+        // malformed one is dropped and taints too.
+        let mut forged_env = rmp_serde::from_slice::<Envelope>(&deletion(&sk, Some([0xD4; 32]), DeletionType::SingleMessage, t + 5)).unwrap();
+        forged_env.signature = vec![7u8; 64];
+        let forged = rmp_serde::to_vec_named(&forged_env).unwrap();
+        let mut a2 = Vec::new();
+        let tally = tally_reconcile_envelopes(&r, &storage, &peer, 5, &[forged], 10, 0, &mut a2);
+        assert!(tally.tainted, "an Invalid 0x50 taints");
+        assert_eq!(tally.ignored_deletions, 0);
+        let broken = signed(&sk, MessageType::DeletionRequest, vec![0xC1], t + 6).0;
+        let tally = tally_reconcile_envelopes(&r, &storage, &peer, 5, &[broken], 10, 0, &mut a2);
+        assert!(tally.tainted && tally.cross_channel_dropped == 1, "a malformed 0x50 taints");
+        // A page of ONLY ignorable requests is no in-sync evidence.
+        let only = ReconcileTally { ignored_deletions: 2, ..Default::default() };
+        assert!(!only.is_verified_in_sync_page(2, false));
+    }
+
+    /// The requester's oversized-page guard now admits a full page plus
+    /// the ride-alongs (pre-0.151.0 it refused anything above the primary
+    /// cap, discarding every busy channel's first / last page whole).
+    #[test]
+    fn page_with_ride_alongs_is_verified_not_refused() {
+        let (r, storage, _d) = router();
+        let sk = crypto::generate_keypair();
+        let t = now();
+        let envs: Vec<Vec<u8>> = (0..5).map(|i| chat(&sk, 4, t + i).0).collect();
+        let peer = PeerId::random();
+        let mut authors = Vec::new();
+        // Primary cap 3, but meta/edit ride-alongs may legitimately add more.
+        let tally = tally_reconcile_envelopes(
+            &r, &storage, &peer, 4, &envs, reconcile::max_page_with_ride_alongs(3), 0, &mut authors,
+        );
+        assert!(!tally.tainted);
+        assert_eq!(tally.newly_accepted, 5);
+        assert!(news_sync::MAX_ENVELOPES_PER_PAGE_WITH_RIDE_ALONGS > news_sync::MAX_ENVELOPES_PER_RESPONSE);
+        assert!(dm_sync::MAX_ENVELOPES_PER_PAGE_WITH_RIDE_ALONGS > dm_sync::MAX_ENVELOPES_PER_RESPONSE);
+    }
 }

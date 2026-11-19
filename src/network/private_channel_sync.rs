@@ -145,6 +145,11 @@ pub fn is_private_channel_sync_type(msg_type: u8) -> bool {
                 // the moderators are (and accepts their invites/kicks).
                 | MessageType::ChannelAddModerator
                 | MessageType::ChannelRemoveModerator
+                // GDPR DeletionRequest (l2-node 0.151.0, G5): indexed into
+                // CHANNEL_EDIT_DELETE_MSGS under its chat target's channel, so
+                // the edit/delete ride-along carries it. The receiver binds it
+                // to the synced channel (`network::deletion_request_fit`).
+                | MessageType::DeletionRequest
         )
     )
 }
@@ -2000,6 +2005,11 @@ pub fn build_response_metered(
         if env_secs < min_timestamp {
             continue;
         }
+        // D4 (l2-node 0.151.0): never re-serve a GDPR-erased original; its
+        // DeletionRequest rides along with the edits/deletes instead.
+        if storage.is_gdpr_erased(&msg_id) {
+            continue;
+        }
 
         chat_envelopes.push(raw);
     }
@@ -2509,6 +2519,58 @@ mod tests {
         let req = base_request(channel_id, wallet, None);
         let resp = build_response(&storage, &req, 200, base_ts + 1000, u64::MAX);
         assert_eq!(resp.envelopes.len(), 2, "FullHistory must serve messages from before the join too");
+    }
+
+    /// D4 + G5 (l2-node 0.151.0): an erased original is never served on
+    /// private sync either; its DeletionRequest rides along with the
+    /// edits/deletes and is an allowed type for the receiver.
+    #[test]
+    fn build_response_withholds_erased_original_and_serves_its_request() {
+        use crate::messages::envelope::Envelope;
+        use crate::messages::types::{DeletionRequestPayload, DeletionType, MessageType};
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let channel_id = 3u64;
+        make_private_channel(&storage, channel_id, 1);
+        let base_ts = 1_700_000_000u64;
+        put_chat_message(&storage, channel_id, base_ts * 1000, base_ts * 1000, [1u8; 32]);
+        put_chat_message(&storage, channel_id, base_ts * 1000 + 1, base_ts * 1000 + 1, [2u8; 32]);
+        let wallet = "klv1wallet";
+        storage
+            .put_cf(
+                schema::cf::CHANNEL_MEMBERS,
+                &schema::encode_channel_member_key(channel_id, wallet),
+                format!(r#"{{"joined_at":{},"role":"member"}}"#, base_ts * 1000).as_bytes(),
+            )
+            .unwrap();
+        let req_id = [9u8; 32];
+        let payload = DeletionRequestPayload { delete_type: DeletionType::SingleMessage, target_id: Some([2u8; 32]) };
+        let env = Envelope {
+            version: crate::messages::envelope::PROTOCOL_VERSION,
+            msg_type: MessageType::DeletionRequest,
+            msg_id: req_id,
+            author: "klv1author".to_string(),
+            timestamp: base_ts * 1000 + 5,
+            lamport_ts: 0,
+            payload: rmp_serde::to_vec_named(&payload).unwrap(),
+            signature: vec![0u8; 64],
+            relay_path: vec![],
+        };
+        let raw = rmp_serde::to_vec_named(&env).unwrap();
+        storage.store_message(&req_id, &raw).unwrap();
+        storage.put_verified_deletion_request(&[2u8; 32], &req_id, "klv1author", env.timestamp).unwrap();
+        assert!(storage.index_deletion_request(&[2u8; 32], &req_id, env.timestamp).unwrap());
+
+        let resp = build_response(&storage, &base_request(channel_id, wallet, None), 200, base_ts + 1000, u64::MAX);
+        let ids: Vec<[u8; 32]> = resp
+            .envelopes
+            .iter()
+            .map(|e| rmp_serde::from_slice::<Envelope>(e).unwrap().msg_id)
+            .collect();
+        assert!(ids.contains(&[1u8; 32]));
+        assert!(!ids.contains(&[2u8; 32]), "erased original withheld");
+        assert!(ids.contains(&req_id), "the DeletionRequest rides along");
+        assert!(envelope_is_private_channel_sync_type(&raw));
     }
 
     /// Code-audit regression (2026-10-01): `build_response` must never

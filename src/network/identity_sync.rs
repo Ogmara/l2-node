@@ -15,14 +15,19 @@
 //! never derived rows. The receiver re-runs every envelope through
 //! `router::process_synced_message`, so a relaying peer is never trusted.
 //!
-//! Only the five PUBLIC identity message types are ever indexed/served
-//! (DeviceDelegation, DeviceRevocation, ProfileUpdate, Follow, Unfollow); DMs,
-//! private-channel content, and encrypted settings are never in this index, so
-//! identity-sync cannot leak private data.
+//! Only the seven PUBLIC identity message types are ever served
+//! (DeviceDelegation, DeviceRevocation, ProfileUpdate, Follow, Unfollow, and
+//! since l2-node 0.151.0 the encryption-key directory entries DeviceEncBinding /
+//! DeviceEncRevoke — the "5+2 list"); DMs, private-channel content, and
+//! encrypted settings are never in this index, so identity-sync cannot leak
+//! private data.
+//!
+//! Old-peer compatibility of the 0.151.0 `SCOPE_ENC_KEYS` bit: a 0.150 (or
+//! older) responder maps 0x36/0x37 to scope 0 and so never serves them, whatever
+//! the request asks for; an old requester never sets bit 8, and a new responder
+//! filters by the requested scopes, so it never sends enc-key rows to it.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 
 use crate::messages::types::MessageType;
 use crate::storage::rocks::Storage;
@@ -43,9 +48,6 @@ pub fn protocol_string(network_id: &str) -> String {
 pub const MAX_ENVELOPES_PER_RESPONSE: usize = 200;
 /// Max concurrent inbound identity-sync requests served to one peer.
 pub const SERVER_MAX_CONCURRENT_PER_PEER: usize = 4;
-/// Cumulative envelopes one peer may pull about one wallet per process
-/// lifetime — stops cursor-paging abuse.
-pub const TOTAL_ENVELOPES_CAP: u64 = 4_000;
 /// How many peers an outbound pull races (first non-empty wins).
 pub const FANOUT: usize = 3;
 
@@ -54,7 +56,11 @@ pub const FANOUT: usize = 3;
 pub const SCOPE_DELEGATIONS: u8 = 1; // DeviceDelegation (0x31) + DeviceRevocation (0x32)
 pub const SCOPE_PROFILE: u8 = 2; // ProfileUpdate (0x30)
 pub const SCOPE_FOLLOWS: u8 = 4; // Follow (0x34) + Unfollow (0x35)
-pub const SCOPE_ALL: u8 = SCOPE_DELEGATIONS | SCOPE_PROFILE | SCOPE_FOLLOWS;
+/// DeviceEncBinding (0x36) + DeviceEncRevoke (0x37) — the wallet's public
+/// encryption-key directory (l2-node 0.151.0). Protocol §2.4 calls these keys
+/// "cheaply re-fetchable"; this scope is that fetch path.
+pub const SCOPE_ENC_KEYS: u8 = 8;
+pub const SCOPE_ALL: u8 = SCOPE_DELEGATIONS | SCOPE_PROFILE | SCOPE_FOLLOWS | SCOPE_ENC_KEYS;
 
 /// Map an identity message-type byte to its scope bit. Returns 0 for any type
 /// that is not an indexed identity type (so it is never served).
@@ -65,6 +71,8 @@ fn scope_of(msg_type: u8) -> u8 {
         t if t == MessageType::ProfileUpdate as u8 => SCOPE_PROFILE,
         t if t == MessageType::Follow as u8 => SCOPE_FOLLOWS,
         t if t == MessageType::Unfollow as u8 => SCOPE_FOLLOWS,
+        t if t == MessageType::DeviceEncBinding as u8 => SCOPE_ENC_KEYS,
+        t if t == MessageType::DeviceEncRevoke as u8 => SCOPE_ENC_KEYS,
         _ => 0,
     }
 }
@@ -87,9 +95,10 @@ pub fn type_in_scopes(msg_type: u8, scopes: u8) -> bool {
 /// starting to trigger checks on every gossip message, which matters as the
 /// mesh grows toward mainnet's larger peer/message volume.
 ///
-/// Any of the five identity types themselves (`scope_of != 0`) qualify —
-/// a ProfileUpdate/Follow/Unfollow/DeviceDelegation/DeviceRevocation from a
-/// wallet with no local record is itself the strongest possible signal.
+/// Any of the seven identity types themselves (`scope_of != 0`) qualify —
+/// a ProfileUpdate/Follow/Unfollow/DeviceDelegation/DeviceRevocation/
+/// DeviceEncBinding/DeviceEncRevoke from a wallet with no local record is
+/// itself the strongest possible signal.
 /// Beyond those, only types whose AUTHOR is shown to a viewer somewhere
 /// (chat, news, reactions, the sender half of a DM) qualify — types that
 /// carry no author-facing display surface gain nothing from a pull.
@@ -223,14 +232,107 @@ pub fn capped_response(request: &IdentitySyncRequest) -> IdentitySyncResponse {
     }
 }
 
+/// Serving order of a wallet's identity envelopes (l2-node 0.151.0, audit
+/// W3) — segments served one after the other; within a segment rows go by
+/// `(timestamp, msg_id)`:
+///
+/// 1. `DeviceEncRevoke` (0x37) FIRST, before any binding: a session cut
+///    short (page backstop, hostile or failing responder) can then never
+///    leave a revoked encryption key looking active on the requester. The
+///    apply is order-safe: a revoke of an unknown key leaves a tombstone, an
+///    older binding of it loses last-write-wins, and that losing binding
+///    still supersedes its device's older keys (router, `DeviceEncBinding`).
+/// 2. `DeviceDelegation` (0x31) and `DeviceRevocation` (0x32) MERGED
+///    chronologically. A revocation cannot be served before the delegation
+///    it revokes: applying it needs the device mapped (and its signer
+///    resolvable), and an unmapped revocation is stored without effect and
+///    then deduplicated forever. In time order every prefix of the stream is
+///    a state that really existed — never "all delegations, no revocations"
+///    as with the pre-0.151.0 key order.
+/// 3. `ProfileUpdate` (0x30), `Follow` (0x34), `Unfollow` (0x35),
+///    `DeviceEncBinding` (0x36) — each in key order (after the delegations,
+///    so a device-signed one resolves to its wallet).
+const SERVE_ORDER: [&[u8]; 6] = [
+    &[0x37],
+    &[0x31, 0x32],
+    &[0x30],
+    &[0x34],
+    &[0x35],
+    &[0x36],
+];
+
+/// Index of the `SERVE_ORDER` segment holding `msg_type`.
+fn segment_of(msg_type: u8) -> Option<usize> {
+    SERVE_ORDER.iter().position(|seg| seg.contains(&msg_type))
+}
+
+/// Up to `limit` rows of one `SERVE_ORDER` segment of `subject`'s
+/// `IDENTITY_ENVELOPES`, strictly after `(ts, msg_id)` when given, merged by
+/// `(timestamp, msg_id)`. Also returns the work done (one unit per seek and
+/// per row read).
+fn segment_rows(
+    storage: &Storage,
+    subject: &str,
+    types: &[u8],
+    after: Option<(u64, [u8; 32])>,
+    limit: usize,
+) -> anyhow::Result<(Vec<(u8, u64, [u8; 32])>, u64)> {
+    let base = schema::identity_envelope_prefix(subject);
+    let tail_at = base.len() + 1;
+    let mut out = Vec::new();
+    let mut work = 0u64;
+    for &t in types {
+        let mut prefix = base.clone();
+        prefix.push(t);
+        let got = match after {
+            Some((ts, id)) => {
+                let start = schema::encode_identity_envelope_key(subject, t, ts, &id);
+                storage.prefix_iter_cf_after(schema::cf::IDENTITY_ENVELOPES, &start, &prefix, limit)?
+            }
+            None => storage.prefix_iter_cf(schema::cf::IDENTITY_ENVELOPES, &prefix, limit)?,
+        };
+        work += 1 + got.len() as u64;
+        for (key, _) in got {
+            // Fixed-width tail ts(8) ++ msg_id(32); defensive for our own rows.
+            if key.len() != tail_at + 8 + 32 {
+                continue;
+            }
+            let Ok(ts) = <[u8; 8]>::try_from(&key[tail_at..tail_at + 8]) else { continue };
+            let Ok(id) = <[u8; 32]>::try_from(&key[tail_at + 8..]) else { continue };
+            out.push((t, u64::from_be_bytes(ts), id));
+        }
+    }
+    out.sort_by(|a, b| (a.1, a.2).cmp(&(b.1, b.2)));
+    out.truncate(limit);
+    Ok((out, work))
+}
+
 /// Build a response: scan the wallet's `IDENTITY_ENVELOPES` prefix, filter by
 /// requested scopes, page from the cursor, and re-serve the original signed
 /// envelopes from `MESSAGES`. Caps at `max_envelopes`.
+///
+/// (Test convenience wrapper — production calls the `_metered` variant.)
+#[cfg(test)]
 pub fn build_response(
     storage: &Storage,
     request: &IdentitySyncRequest,
     max_envelopes: usize,
 ) -> IdentitySyncResponse {
+    build_response_metered(storage, request, max_envelopes).0
+}
+
+/// `build_response` plus the storage work it did (one unit for the seek and
+/// one per index row examined, its `MESSAGES` read included), for the
+/// responder's rolling budget (`reconcile::budget_charge`, l2-node 0.151.0).
+///
+/// An envelope erased by a GDPR `DeletionRequest` (a verified
+/// `DELETION_REQUESTS` record, decision D4) is never re-served; the cursor
+/// still advances over it.
+pub fn build_response_metered(
+    storage: &Storage,
+    request: &IdentitySyncRequest,
+    max_envelopes: usize,
+) -> (IdentitySyncResponse, u64) {
     let empty = || IdentitySyncResponse {
         wallet: request.wallet.clone(),
         envelopes: Vec::new(),
@@ -243,7 +345,7 @@ pub fn build_response(
     // Self-defending: never use an unvalidated subject as a DB prefix, even if
     // a future caller forgets the handler-side check.
     if !is_plausible_subject(&request.wallet) {
-        return empty();
+        return (empty(), 1);
     }
 
     // A device-resolve-miss pull arrives keyed by the DEVICE address
@@ -254,65 +356,57 @@ pub fn build_response(
     let subject = if request.wallet.starts_with("ogd1") {
         match storage.resolve_wallet(&request.wallet) {
             Ok(Some(w)) => w,
-            _ => return empty(),
+            _ => return (empty(), 1),
         }
     } else {
         request.wallet.clone()
     };
 
-    let prefix = schema::identity_envelope_prefix(&subject);
     // Probe one extra row to detect `has_more` precisely.
     let probe_limit = max_envelopes.saturating_add(1);
-
-    let rows = if let Some(c) = request.cursor.as_ref() {
-        let start_key = schema::encode_identity_envelope_key(
-            &subject,
-            c.after_msg_type,
-            c.after_timestamp,
-            &c.after_msg_id,
-        );
-        storage.prefix_iter_cf_after(schema::cf::IDENTITY_ENVELOPES, &start_key, &prefix, probe_limit)
-    } else {
-        storage.prefix_iter_cf(schema::cf::IDENTITY_ENVELOPES, &prefix, probe_limit)
+    let start_seg = match request.cursor.as_ref() {
+        None => 0,
+        Some(c) => match segment_of(c.after_msg_type) {
+            Some(i) => i,
+            // Not a type this protocol serves: past the end.
+            None => return (empty(), 1),
+        },
     };
-
-    let rows = match rows {
-        Ok(r) => r,
-        Err(_) => {
-            // Storage fault → serve nothing (the requester races other peers).
-            return IdentitySyncResponse {
-                wallet: request.wallet.clone(),
-                envelopes: Vec::new(),
-                has_more: false,
-                next_cursor: None,
-                server_capped: false,
-                completeness_root: None,
-            };
+    let mut rows: Vec<(u8, u64, [u8; 32])> = Vec::new();
+    let mut work: u64 = 0;
+    for (seg_idx, seg) in SERVE_ORDER.iter().enumerate().skip(start_seg) {
+        let room = probe_limit.saturating_sub(rows.len());
+        if room == 0 {
+            break;
         }
-    };
+        // Skip a segment the caller asked nothing from (no rows examined).
+        if !seg.iter().any(|t| type_in_scopes(*t, request.scopes)) {
+            continue;
+        }
+        let after = request
+            .cursor
+            .as_ref()
+            .filter(|_| seg_idx == start_seg)
+            .map(|c| (c.after_timestamp, c.after_msg_id));
+        match segment_rows(storage, &subject, seg, after, room) {
+            Ok((mut got, w)) => {
+                work += w;
+                rows.append(&mut got);
+            }
+            // Storage fault → serve nothing (the requester races other peers).
+            Err(_) => return (empty(), work.max(1)),
+        }
+    }
+    let work = work.max(1);
 
-    let tail_at = prefix.len(); // key tail = msg_type(1) ++ ts(8) ++ msg_id(32)
-    // The storage layer returned at most `probe_limit` rows; if it returned
+    // The storage batch returned at most `probe_limit` rows; if it returned
     // exactly that many, there may be more beyond this batch.
     let truncated = rows.len() >= probe_limit;
     let mut envelopes: Vec<Vec<u8>> = Vec::new();
     let mut next_cursor: Option<IdentityCursor> = None;
     let mut more_in_batch = false;
 
-    for (key, _) in rows {
-        // Parse the fixed-width tail. Our index keys are always exactly this
-        // width, so these guards are defensive (never hit for our own rows).
-        if key.len() < tail_at + 1 + 8 + 32 {
-            continue;
-        }
-        let msg_type = key[tail_at];
-        let ts = u64::from_be_bytes(match key[tail_at + 1..tail_at + 9].try_into() {
-            Ok(b) => b,
-            Err(_) => continue,
-        });
-        let mut msg_id = [0u8; 32];
-        msg_id.copy_from_slice(&key[tail_at + 9..tail_at + 41]);
-
+    for (msg_type, ts, msg_id) in rows {
         // Page is full — stop BEFORE consuming this row so the next page
         // resumes at it (cursor stays at the previous row).
         if envelopes.len() >= max_envelopes {
@@ -320,12 +414,9 @@ pub fn build_response(
             break;
         }
 
-        // Code Audit C-1: advance the cursor over EVERY well-formed row,
-        // in-scope or not. The index sorts by msg_type first, so a subset
-        // `scopes` request would otherwise fill the probe window with
-        // out-of-scope rows and strand the in-scope rows beyond it (the scope
-        // filter is NOT monotonic with the key sort, unlike reconcile's
-        // timestamp filter). Advancing past skipped rows keeps paging correct.
+        // Code Audit C-1: advance the cursor over EVERY row examined, in-scope
+        // or not (a merged segment can hold a type outside a subset
+        // `scopes`), so out-of-scope rows never strand in-scope ones.
         next_cursor = Some(IdentityCursor {
             after_msg_type: msg_type,
             after_timestamp: ts,
@@ -336,6 +427,11 @@ pub fn build_response(
         if !type_in_scopes(msg_type, request.scopes) {
             continue;
         }
+        // Identity envelopes are NEVER withheld for a GDPR erasure (l2-node
+        // 0.151.0, audit B1): hiding a wallet's own DeviceRevocation /
+        // DeviceEncRevoke would keep a revoked device or key alive on every
+        // fresh node. (`DELETION_REQUESTS` is not written for these types
+        // either; this is the second line.)
         // Re-serve the ORIGINAL signed envelope; receiver re-validates it.
         // A missing MESSAGES entry (shouldn't happen) just advances the cursor.
         if let Ok(Some(raw)) = storage.get_cf(schema::cf::MESSAGES, &msg_id) {
@@ -350,112 +446,30 @@ pub fn build_response(
         next_cursor = None;
     }
 
-    IdentitySyncResponse {
-        wallet: request.wallet.clone(),
-        envelopes,
-        has_more,
-        next_cursor,
-        server_capped: false,
-        completeness_root: None,
-    }
+    (
+        IdentitySyncResponse {
+            wallet: request.wallet.clone(),
+            envelopes,
+            has_more,
+            next_cursor,
+            server_capped: false,
+            completeness_root: None,
+        },
+        work,
+    )
 }
 
 // --- Responder rate limiting (per (peer, wallet)) ---
 
-/// Bounds how much one peer can pull about one wallet, mirroring
-/// `reconcile::ResponderLimits` but keyed by `(PeerId, wallet)`. Prevents a
-/// peer from cursor-paging a wallet's bundle unboundedly or fanning a flood of
-/// concurrent identity-sync requests.
-#[derive(Debug, Default)]
-pub struct IdentityResponderLimits {
-    inner: Mutex<IdentityLimitsInner>,
-}
-
-/// Soft ceiling on distinct `(peer, wallet)` cumulative-served entries.
-/// Previously cleared WHOLESALE on overflow — a Sybil cycling fresh PeerIds
-/// could reset everyone's cumulative "served" counters, defeating
-/// `total_envelopes_cap` (audit W5, bundled fix — identical bug shape to
-/// `dm_sync::DmResponderLimits`). Now the single oldest entry is evicted per
-/// overflow insert instead.
-const MAX_TRACKED_SERVED: usize = 100_000;
-
-#[derive(Debug, Default)]
-struct IdentityLimitsInner {
-    /// Active in-flight requests per peer.
-    per_peer: HashMap<libp2p::PeerId, usize>,
-    /// Cumulative envelopes served per (peer, wallet) this process lifetime.
-    served: HashMap<(libp2p::PeerId, String), u64>,
-    /// Insertion order of `served` keys, oldest-first (audit W5).
-    served_order: std::collections::VecDeque<(libp2p::PeerId, String)>,
-}
-
-impl IdentityResponderLimits {
-    /// Try to admit one inbound request. Returns a guard that releases the
-    /// per-peer slot on drop, or `None` if over a cap (caller sends a
-    /// `capped_response`).
-    pub fn try_acquire(
-        self: &Arc<Self>,
-        peer: libp2p::PeerId,
-        wallet: &str,
-        max_concurrent_per_peer: usize,
-        total_envelopes_cap: u64,
-    ) -> Option<IdentityResponderGuard> {
-        let mut inner = self.inner.lock().ok()?;
-        let in_flight = inner.per_peer.get(&peer).copied().unwrap_or(0);
-        if in_flight >= max_concurrent_per_peer {
-            return None;
-        }
-        let served = inner
-            .served
-            .get(&(peer, wallet.to_string()))
-            .copied()
-            .unwrap_or(0);
-        if served >= total_envelopes_cap {
-            return None;
-        }
-        inner.per_peer.insert(peer, in_flight + 1);
-        Some(IdentityResponderGuard {
-            limits: Arc::clone(self),
-            peer,
-        })
-    }
-
-    /// Record envelopes served toward the per-(peer, wallet) cumulative cap.
-    pub fn add_served(&self, peer: libp2p::PeerId, wallet: &str, count: u64) {
-        if let Ok(mut inner) = self.inner.lock() {
-            let key = (peer, wallet.to_string());
-            let is_new = !inner.served.contains_key(&key);
-            if is_new {
-                if inner.served.len() >= MAX_TRACKED_SERVED {
-                    if let Some(oldest) = inner.served_order.pop_front() {
-                        inner.served.remove(&oldest);
-                    }
-                }
-                inner.served_order.push_back(key.clone());
-            }
-            *inner.served.entry(key).or_insert(0) += count;
-        }
-    }
-}
-
-/// RAII guard releasing a peer's in-flight slot on drop.
-pub struct IdentityResponderGuard {
-    limits: Arc<IdentityResponderLimits>,
-    peer: libp2p::PeerId,
-}
-
-impl Drop for IdentityResponderGuard {
-    fn drop(&mut self) {
-        if let Ok(mut inner) = self.limits.inner.lock() {
-            if let Some(n) = inner.per_peer.get_mut(&self.peer) {
-                *n = n.saturating_sub(1);
-                if *n == 0 {
-                    inner.per_peer.remove(&self.peer);
-                }
-            }
-        }
-    }
-}
+/// Responder admission for identity-sync (l2-node 0.151.0): per-peer
+/// concurrency (`SERVER_MAX_CONCURRENT_PER_PEER`) plus a rolling budget per
+/// `(peer, wallet)` — `[identity_resync] responder_budget_burst` units
+/// (default 4,000) refilled at `responder_budget_refill_per_hour` (default
+/// 1,000/h). Before 0.151.0 this was a LIFETIME counter of envelopes served
+/// that never refilled until the responder restarted. Keys are bounded by
+/// `budget::MAX_TRACKED_RESPONDER_KEYS`; the requester-chosen `wallet` half
+/// of the key is validated (`is_plausible_subject`) before it is used.
+pub type IdentityResponderLimits = crate::network::budget::PeerBudgetLimits<(libp2p::PeerId, String)>;
 
 #[cfg(test)]
 mod coverage_gap_tests {
@@ -474,16 +488,153 @@ mod coverage_gap_tests {
     use super::*;
 
     #[test]
-    fn triggers_identity_check_true_for_all_five_identity_types() {
+    fn triggers_identity_check_true_for_all_seven_identity_types() {
         for t in [
             MessageType::DeviceDelegation,
             MessageType::DeviceRevocation,
             MessageType::ProfileUpdate,
             MessageType::Follow,
             MessageType::Unfollow,
+            MessageType::DeviceEncBinding,
+            MessageType::DeviceEncRevoke,
         ] {
             assert!(triggers_identity_check(t as u8), "{:?} should trigger", t);
         }
+    }
+
+    /// G1 (l2-node 0.151.0) scope map, and old-peer compatibility in both
+    /// directions: the 0.150 mapping (`scope_of` without the enc arms)
+    /// never serves 0x36/0x37 whatever bits are asked for — so a new
+    /// requester's bit 8 is simply ignored by an old responder — and a new
+    /// responder serves enc rows only when bit 8 is set, which no old
+    /// requester ever does.
+    #[test]
+    fn enc_key_scope_is_bit_8_and_old_peer_compatible() {
+        let enc = [MessageType::DeviceEncBinding as u8, MessageType::DeviceEncRevoke as u8];
+        for t in enc {
+            assert_eq!(scope_of(t), SCOPE_ENC_KEYS);
+            assert!(type_in_scopes(t, SCOPE_ENC_KEYS));
+            assert!(type_in_scopes(t, SCOPE_ALL));
+            assert!(!type_in_scopes(t, SCOPE_DELEGATIONS | SCOPE_PROFILE | SCOPE_FOLLOWS));
+        }
+        assert_eq!(SCOPE_ALL, 15);
+        // The 0.150 responder's mapping.
+        fn scope_of_0150(t: u8) -> u8 {
+            match scope_of(t) {
+                SCOPE_ENC_KEYS => 0,
+                s => s,
+            }
+        }
+        for t in enc {
+            let s = scope_of_0150(t);
+            assert!(s == 0 || (s & SCOPE_ALL) == 0, "an old responder never serves enc rows");
+        }
+        // Nothing else moved.
+        assert_eq!(scope_of(MessageType::DeviceDelegation as u8), SCOPE_DELEGATIONS);
+        assert_eq!(scope_of(MessageType::ProfileUpdate as u8), SCOPE_PROFILE);
+        assert_eq!(scope_of(MessageType::Follow as u8), SCOPE_FOLLOWS);
+        assert_eq!(scope_of(MessageType::SettingsSync as u8), 0, "encrypted settings never served");
+        assert_eq!(scope_of(MessageType::KeyVaultSync as u8), 0, "key vault never served");
+    }
+
+    /// B1 (audit, l2-node 0.151.0): identity envelopes are NEVER withheld
+    /// — even a (hypothetical) GDPR record on one does not hide it, so a
+    /// wallet cannot "erase" its own revocation from fresh nodes.
+    #[test]
+    fn identity_envelopes_are_never_withheld() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let wallet = "klv1erasedprofile";
+        let ids = [[1u8; 32], [2u8; 32]];
+        for (i, (t, id)) in [(MessageType::DeviceRevocation, ids[0]), (MessageType::DeviceEncRevoke, ids[1])]
+            .iter()
+            .enumerate()
+        {
+            let key = schema::encode_identity_envelope_key(wallet, *t as u8, 100 + i as u64, id);
+            storage.put_cf(schema::cf::IDENTITY_ENVELOPES, &key, &[]).unwrap();
+            storage.put_cf(schema::cf::MESSAGES, id, &[i as u8 + 1]).unwrap();
+            storage.put_verified_deletion_request(id, &[9u8; 32], wallet, 200).unwrap();
+        }
+        let req = IdentitySyncRequest {
+            wallet: wallet.to_string(),
+            scopes: SCOPE_ALL,
+            cursor: None,
+            overlap_digest: Vec::new(),
+            round: 0,
+        };
+        let (resp, work) = build_response_metered(&storage, &req, 200);
+        // Serve order: enc revokes first, then delegations/revocations.
+        assert_eq!(resp.envelopes, vec![vec![2u8], vec![1u8]]);
+        assert!(work >= 2);
+    }
+
+    /// W3: `DeviceEncRevoke` is served before any `DeviceEncBinding`, and
+    /// delegations/revocations merge chronologically — so a session cut at
+    /// any page boundary never shows a revoked key/device "all bindings, no
+    /// revocations". Paging by cursor covers every row exactly once.
+    #[test]
+    fn serve_order_puts_revocations_first_and_pages_cleanly() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let wallet = "klv1ordertest";
+        let rows: Vec<(MessageType, u64, u8)> = vec![
+            (MessageType::DeviceEncBinding, 10, 1),
+            (MessageType::DeviceEncBinding, 11, 2),
+            (MessageType::DeviceEncRevoke, 12, 3),
+            (MessageType::DeviceDelegation, 5, 4),
+            (MessageType::DeviceRevocation, 7, 5),
+            (MessageType::DeviceDelegation, 9, 6),
+            (MessageType::ProfileUpdate, 1, 7),
+        ];
+        for (t, ts, n) in &rows {
+            let id = [*n; 32];
+            let key = schema::encode_identity_envelope_key(wallet, *t as u8, *ts, &id);
+            storage.put_cf(schema::cf::IDENTITY_ENVELOPES, &key, &[]).unwrap();
+            storage.put_cf(schema::cf::MESSAGES, &id, &[*n]).unwrap();
+        }
+        let mut cursor = None;
+        let mut served = Vec::new();
+        for _ in 0..10 {
+            let req = IdentitySyncRequest {
+                wallet: wallet.to_string(),
+                scopes: SCOPE_ALL,
+                cursor: cursor.clone(),
+                overlap_digest: Vec::new(),
+                round: 0,
+            };
+            // Page size 2 — every boundary is exercised.
+            let resp = build_response(&storage, &req, 2);
+            assert!(resp.envelopes.len() <= 2);
+            served.extend(resp.envelopes.iter().map(|e| e[0]));
+            if !resp.has_more {
+                break;
+            }
+            cursor = resp.next_cursor;
+        }
+        // enc revoke (3); delegation(5)=4, revocation(7)=5, delegation(9)=6;
+        // profile 7; enc bindings 1, 2.
+        assert_eq!(served, vec![3, 4, 5, 6, 7, 1, 2]);
+        // Truncated after the first page: the revoke is already there, no
+        // binding yet.
+        let first = build_response(
+            &storage,
+            &IdentitySyncRequest { wallet: wallet.to_string(), scopes: SCOPE_ENC_KEYS, cursor: None, overlap_digest: vec![], round: 0 },
+            1,
+        );
+        assert_eq!(first.envelopes, vec![vec![3u8]]);
+        // A cursor on a type this protocol never serves is past the end.
+        let bogus = build_response(
+            &storage,
+            &IdentitySyncRequest {
+                wallet: wallet.to_string(),
+                scopes: SCOPE_ALL,
+                cursor: Some(IdentityCursor { after_msg_type: 0x33, after_timestamp: 0, after_msg_id: [0; 32] }),
+                overlap_digest: vec![],
+                round: 0,
+            },
+            10,
+        );
+        assert!(bogus.envelopes.is_empty() && !bogus.has_more);
     }
 
     #[test]
