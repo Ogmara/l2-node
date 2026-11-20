@@ -21,6 +21,30 @@
 //! capped + rate-limited responses; the responder re-serves the ORIGINAL signed
 //! envelopes and the requester re-validates each through
 //! `router::process_synced_message`, so a relaying peer is never trusted.
+//!
+//! **Revision 1 (l2-node 0.153.0, G4, owner decision D2).** A requester that
+//! sends `revision ≥ 1` additionally receives, for the authorizing wallet
+//! only:
+//!  * on the session's FIRST page (no cursor) — the wallet's current
+//!    `KeyVaultSync` (0x38) and `SettingsSync` (0x33) envelopes (each
+//!    preceded by the signing device's `DeviceDelegation` (0x31) when a
+//!    delegated device signed it; a revoked device's copy is not served)
+//!    and the DM-scope `ChannelKeyEnvelope`s (0x61) wrapped FOR the wallet
+//!    (`target == wallet`) in its conversations. None of them depends on a
+//!    DM being applied first. On the last page a byte-full primary scan
+//!    could cut them every session; on the first page they come before the
+//!    DMs. They fit the 8 MiB page budget when the client encodes the
+//!    ciphertext as MessagePack `bin` (as the SDK does: a 2 MiB vault then
+//!    costs ~4 MiB on the wire); an item that does not fit is skipped, the
+//!    next one still tried;
+//!  * on the LAST page — the `DirectMessageReaction`s (0x08) of its
+//!    conversations within the window, after the edit/delete ride-along
+//!    (a reaction needs its target DM applied first).
+//!
+//! These never travel through identity-sync: identity-sync is
+//! unauthenticated, dm-sync is wallet-authorized (D2; protocol §8.4.3).
+//! A requester that sends no `revision` (0.152 and older) is served exactly
+//! the 0.152 page shape; an older responder ignores the field.
 
 use serde::{Deserialize, Serialize};
 use tracing::warn;
@@ -54,6 +78,52 @@ pub const DM_EDIT_DELETE_CAP: usize = 1_000;
 /// ride-along pushed it past 200 envelopes.
 pub const MAX_ENVELOPES_PER_PAGE_WITH_RIDE_ALONGS: usize =
     MAX_ENVELOPES_PER_RESPONSE + DM_EDIT_DELETE_CAP;
+/// The dm-sync revision this node speaks (l2-node 0.153.0, G4): the
+/// first-page vault / settings / DM key envelopes and the last-page DM
+/// reaction ride-along (see the module doc). Sent in every request.
+pub const DM_SYNC_REVISION: u8 = 1;
+/// Max DM-scope key envelopes (0x61) the revision-1 first page carries,
+/// across all of the wallet's conversations (most recently active first).
+pub const DM_KEY_ENVELOPE_CAP: usize = 1_000;
+/// Per conversation, max key envelopes served per AUTHOR (round-1 audit
+/// W4): the wallet's own wraps are scanned first, then the counterpart's,
+/// each with this budget, so neither sender (nor a counterpart flooding its
+/// own slots with fake device ids) can starve the other.
+pub const DM_KEYS_PER_AUTHOR: usize = 32;
+/// Per author, max key envelopes served per DEVICE (its newest epochs).
+pub const DM_KEYS_PER_DEVICE: usize = 8;
+/// Per author, max distinct devices visited (one seek each).
+pub const DM_KEY_DEVICES_PER_AUTHOR: usize = 16;
+/// Max `DirectMessageReaction`s the revision-1 last page carries (newest
+/// first per conversation, most recently active conversation first).
+pub const DM_REACTION_CAP: usize = 2_000;
+/// Max `DM_REACTION_MSGS` rows the reaction ride-along EXAMINES per page
+/// (served or skipped), across all conversations (round-2 audit N3).
+pub const DM_REACTION_SCAN_CAP: usize = 4 * DM_REACTION_CAP;
+/// Max envelopes of the revision-1 first-page head: vault + settings, up to
+/// two device delegations, and the key envelopes.
+pub const DM_HEAD_CAP: usize = 4 + DM_KEY_ENVELOPE_CAP;
+/// The most envelopes an honest revision-1 responder puts on one page
+/// (round-1 audit N2): the primary page, plus the head only on the FIRST
+/// page (the request had no cursor), plus the edit/delete and reaction
+/// ride-alongs only on the FINAL page (`has_more = false`). A revision-0
+/// responder's pages are always within this bound.
+pub fn max_page_envelopes(first_page: bool, final_page: bool) -> usize {
+    let mut n = if final_page {
+        MAX_ENVELOPES_PER_PAGE_WITH_RIDE_ALONGS + DM_REACTION_CAP
+    } else {
+        MAX_ENVELOPES_PER_RESPONSE
+    };
+    if first_page {
+        n += DM_HEAD_CAP;
+    }
+    n
+}
+/// Wire bytes of the vault / settings envelopes charged as ONE extra unit of
+/// the responder's rolling budget (l2-node 0.153.0). The budget otherwise
+/// counts envelopes and rows, and a 2 MiB vault re-fetched in a loop by an
+/// authorized node would cost one unit each time.
+pub const BLOB_WIRE_BYTES_PER_BUDGET_UNIT: usize = 16 * 1024;
 /// Max concurrent inbound dm-sync requests served to one peer.
 pub const SERVER_MAX_CONCURRENT_PER_PEER: usize = 2;
 /// How many peers an outbound backfill races (first non-empty wins).
@@ -80,6 +150,9 @@ pub const WALLET_AUTH_MAX_AGE_SECS: u64 = 300;
 /// accept `DirectMessageEdit` (`0x06`) / `DirectMessageDelete` (`0x07`)
 /// (audit final pre-mainnet W6) so the edit/delete ride-along
 /// (`dm_edit_delete_envelopes`) isn't silently dropped on receipt.
+/// Revision 1 (l2-node 0.153.0) adds the five [`is_dm_sync_v1_type`]s;
+/// those are additionally bound to the requested wallet by
+/// [`dm_envelope_fit`].
 pub fn is_dm_type(msg_type: u8) -> bool {
     use crate::messages::types::MessageType;
     matches!(
@@ -93,7 +166,205 @@ pub fn is_dm_type(msg_type: u8) -> bool {
                 // receiver also checks the target (`network::deletion_request_fit`).
                 | MessageType::DeletionRequest
         )
+    ) || is_dm_sync_v1_type(msg_type)
+}
+
+/// The types dm-sync revision 1 adds (l2-node 0.153.0, G4):
+/// `DirectMessageReaction` (0x08), `SettingsSync` (0x33), `KeyVaultSync`
+/// (0x38), `ChannelKeyEnvelope` (0x61, DM scope only) and — so a vault or
+/// settings blob signed by a delegated device can be verified on a fresh
+/// node (round-1 audit W2) — the wallet's own `DeviceDelegation` (0x31).
+pub fn is_dm_sync_v1_type(msg_type: u8) -> bool {
+    use crate::messages::types::MessageType;
+    matches!(
+        MessageType::from_u8(msg_type),
+        Some(
+            MessageType::DirectMessageReaction
+                | MessageType::SettingsSync
+                | MessageType::KeyVaultSync
+                | MessageType::ChannelKeyEnvelope
+                | MessageType::DeviceDelegation
+        )
     )
+}
+
+/// The revision-1 HEAD types: what a first page carries before the DMs and
+/// what a cancelled fanout sibling's first page still contributes (round-1
+/// audit N7) — all apply order-independently (LWW / first-write-wins).
+pub fn is_dm_sync_head_type(msg_type: u8) -> bool {
+    use crate::messages::types::MessageType;
+    matches!(
+        MessageType::from_u8(msg_type),
+        Some(
+            MessageType::SettingsSync
+                | MessageType::KeyVaultSync
+                | MessageType::ChannelKeyEnvelope
+                | MessageType::DeviceDelegation
+        )
+    )
+}
+
+/// How a dm-sync receiver classifies one envelope BEFORE routing it
+/// (l2-node 0.153.0): the scope binding of the revision-1 types to the
+/// wallet the session is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DmSyncFit {
+    /// Route it.
+    Fits,
+    /// Skip it silently: an honest responder can legitimately send it and
+    /// this node cannot use it yet (a reaction whose target DM is not
+    /// stored here; a vault / settings envelope signed by a device this
+    /// node cannot resolve). Neither progress nor a peer fault.
+    Neutral,
+    /// Drop and count it (taint): not a dm-sync type, undecodable, or
+    /// outside the wallet's scope — an honest responder never sends it.
+    Foreign,
+}
+
+/// `true` for a Ogmara device address (`ogd1…`).
+fn is_device_address(addr: &str) -> bool {
+    addr.strip_prefix(crate::crypto::DEVICE_HRP).is_some_and(|rest| rest.starts_with('1'))
+}
+
+/// Bind one received dm-sync envelope to `wallet` (l2-node 0.153.0, G4).
+/// The router still re-validates everything it routes; this only keeps a
+/// responder from using the wallet-authorized session to deliver content
+/// of another scope:
+///  * `ChannelKeyEnvelope` — DM scope only, wrapped FOR `wallet`
+///    (`target == wallet`), and in one of `wallet`'s conversations: either
+///    `wallet` authored it (`key_scope == conversation_id(wallet, peer)`) or
+///    names `wallet` as the `peer` (the router then proves `key_scope ==
+///    conversation_id(author, wallet)`);
+///  * `SettingsSync` / `KeyVaultSync` — authored by `wallet` itself or by a
+///    device (`ogd1…`) this node maps to `wallet`; another wallet, or a
+///    device it maps to ANOTHER wallet, is `Foreign`; an unknown device is
+///    `Neutral` (the router would file it under the device address, never
+///    under `wallet`). The responder sends the device's delegation first,
+///    so on an honest page the device is known by then;
+///  * `DeviceDelegation` — authored (wallet-signed) by `wallet` only;
+///  * `DirectMessageReaction` — its target, when stored here, must be a DM
+///    of `wallet` (`recipient == wallet`, or `wallet` sent it:
+///    `conversation_id == conversation_id(wallet, recipient)` — DM
+///    conversation ids are validated against sender / recipient at ingest);
+///    an unknown target is `Neutral`.
+///
+/// The older types pass on their type alone (unchanged; the deletion
+/// request has its own check, `network::deletion_request_fit`).
+pub fn dm_envelope_fit(storage: &Storage, wallet: &str, env_bytes: &[u8]) -> DmSyncFit {
+    use crate::messages::envelope::Envelope;
+    use crate::messages::types::{key_scope_kind, ChannelKeyEnvelopePayload, MessageType, ReactionPayload};
+    let Ok(env) = rmp_serde::from_slice::<Envelope>(env_bytes) else {
+        return DmSyncFit::Foreign;
+    };
+    let t = env.msg_type_u8();
+    if !is_dm_type(t) {
+        return DmSyncFit::Foreign;
+    }
+    match env.msg_type {
+        MessageType::ChannelKeyEnvelope => {
+            let Ok(p) = rmp_serde::from_slice::<ChannelKeyEnvelopePayload>(&env.payload) else {
+                return DmSyncFit::Foreign;
+            };
+            let in_scope = p.scope_kind == key_scope_kind::DM
+                && p.target == wallet
+                && p.peer.as_deref().is_some_and(|peer| {
+                    peer == wallet || p.key_scope == crate::crypto::compute_conversation_id(wallet, peer)
+                });
+            if in_scope {
+                DmSyncFit::Fits
+            } else {
+                DmSyncFit::Foreign
+            }
+        }
+        MessageType::DeviceDelegation => {
+            if env.author == wallet {
+                DmSyncFit::Fits
+            } else {
+                DmSyncFit::Foreign
+            }
+        }
+        MessageType::SettingsSync | MessageType::KeyVaultSync => {
+            if env.author == wallet {
+                return DmSyncFit::Fits;
+            }
+            // Signed directly by ANOTHER wallet: foreign. Only a device key
+            // (`ogd1…`) can still be this wallet's.
+            if !is_device_address(&env.author) {
+                return DmSyncFit::Foreign;
+            }
+            match storage.resolve_wallet(&env.author) {
+                Ok(Some(w)) if w == wallet => DmSyncFit::Fits,
+                Ok(Some(_)) => DmSyncFit::Foreign,
+                Ok(None) | Err(_) => DmSyncFit::Neutral,
+            }
+        }
+        MessageType::DirectMessageReaction => {
+            let Ok(p) = rmp_serde::from_slice::<ReactionPayload>(&env.payload) else {
+                return DmSyncFit::Foreign;
+            };
+            if storage.get_cf(schema::cf::MESSAGES, &p.target_id).ok().flatten().is_none() {
+                return DmSyncFit::Neutral;
+            }
+            match storage.dm_message_target(&p.target_id) {
+                Some(dm)
+                    if dm.recipient == wallet
+                        || dm.conversation_id == crate::crypto::compute_conversation_id(wallet, &dm.recipient) =>
+                {
+                    DmSyncFit::Fits
+                }
+                // Stored, but not a DM of this wallet (or not a DM at all).
+                _ => DmSyncFit::Foreign,
+            }
+        }
+        _ => DmSyncFit::Fits,
+    }
+}
+
+/// `true` when a router REFUSAL (`Rejected`, never `Invalid`) of a synced
+/// revision-1 envelope is neutral for a dm-sync session (l2-node 0.153.0,
+/// round-1 audit N1) — exactly the refusals an honest responder can cause
+/// on a fresh node:
+///  * the registration requirement (`REGISTRATION_REQUIRED_REASON`; this
+///    node's `USERS` rows may lag the chain);
+///  * a full key scope (`key_scope_full` / "scope is full");
+///  * a reaction whose target DM is not stored ("target message not
+///    found");
+///  * an envelope authored by a device (`ogd1…`) this node cannot resolve
+///    yet, or a reaction to a DM whose device author it cannot resolve
+///    (the participant / scope binding then fails on the device address).
+///
+/// Every other refusal warns.
+pub fn is_neutral_dm_sync_refusal(storage: &Storage, env_bytes: &[u8], reason: &str) -> bool {
+    use crate::messages::envelope::Envelope;
+    use crate::messages::types::{MessageType, ReactionPayload};
+    let Ok(env) = rmp_serde::from_slice::<Envelope>(env_bytes) else {
+        return false;
+    };
+    if !is_dm_sync_v1_type(env.msg_type_u8()) {
+        return false;
+    }
+    if reason == crate::messages::router::REGISTRATION_REQUIRED_REASON
+        || reason.contains("key_scope_full")
+        || reason.contains("scope is full")
+        || reason.contains("target message not found")
+    {
+        return true;
+    }
+    let unresolved = |addr: &str| is_device_address(addr) && matches!(storage.resolve_wallet(addr), Ok(None));
+    if unresolved(&env.author) {
+        return true;
+    }
+    if env.msg_type == MessageType::DirectMessageReaction {
+        let target_author = rmp_serde::from_slice::<ReactionPayload>(&env.payload)
+            .ok()
+            .and_then(|p| storage.get_cf(schema::cf::MESSAGES, &p.target_id).ok().flatten())
+            .and_then(|raw| rmp_serde::from_slice::<Envelope>(&raw).ok())
+            .map(|e| e.author);
+        if target_author.is_some_and(|a| unresolved(&a)) {
+            return true;
+        }
+    }
+    false
 }
 
 // --- Auth (node-signed, host-bound to the responder; spec 3) ---
@@ -198,6 +469,14 @@ pub struct DmSyncRequest {
     /// `auth_failed_response()` once the new check runs.
     #[serde(default)]
     pub wallet_claim: Option<WalletAuthClaim>,
+    /// Requester protocol revision (l2-node 0.153.0): `0` (absent) = a
+    /// 0.152-or-older requester, served exactly the 0.152 page shape (its
+    /// type allow-list and page-size guard predate the revision-1 types);
+    /// [`DM_SYNC_REVISION`] = 0.153+. Not part of the signed auth string
+    /// (the transport is authenticated; like `ReconcileRequest::revision`).
+    /// Additive, `#[serde(default)]`; an older responder ignores it.
+    #[serde(default)]
+    pub revision: u8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -274,6 +553,7 @@ pub fn sign_request(
         max_age_secs,
         cursor,
         wallet_claim,
+        revision: DM_SYNC_REVISION,
     }
 }
 
@@ -355,6 +635,14 @@ pub fn verify_request_auth(
 /// (`reconcile::budget_charge`, l2-node 0.151.0): `(response, scanned_all,
 /// work)`. A DM erased by a GDPR `DeletionRequest` (decision D4) is never
 /// re-served, nor is an edit/delete of one; the request rides along.
+///
+/// Revision 1 (l2-node 0.153.0, G4; `request.revision ≥ DM_SYNC_REVISION`):
+/// the first page (no cursor) starts with the wallet's vault, settings and
+/// DM key envelopes ([`dm_sync_head_envelopes`]) — served even when the
+/// wallet has no conversation — and the last page ends with its DM
+/// reactions ([`dm_reaction_envelopes`]). `max_envelopes` bounds the
+/// PRIMARY rows only, as before. The vault / settings wire bytes add
+/// `bytes / BLOB_WIRE_BYTES_PER_BUDGET_UNIT` to `work`.
 pub fn build_response(
     storage: &Storage,
     wallet: &str,
@@ -363,13 +651,7 @@ pub fn build_response(
     now_ms: u64,
     window_max_age_secs: u64,
 ) -> (DmSyncResponse, bool, u64) {
-    let empty = DmSyncResponse {
-        envelopes: Vec::new(),
-        has_more: false,
-        next_cursor: None,
-        server_capped: false,
-        auth_failed: false,
-    };
+    let v1 = request.revision >= DM_SYNC_REVISION;
 
     // Honour the tighter of the requester's ask and our own retention window.
     let effective_age = request.max_age_secs.min(window_max_age_secs);
@@ -394,25 +676,63 @@ pub fn build_response(
         MAX_CONVERSATIONS.saturating_add(1),
     ) {
         Ok(r) => r,
-        Err(_) => return (empty, true, 1),
+        Err(_) => return (empty_response(Vec::new()), true, 1),
     };
     let mut work: u64 = 1 + conv_rows.len() as u64;
+    // Revision 1: the same conversations in RECENCY order (key order —
+    // most recently active first, deduplicated keeping the first), which the
+    // capped extras walk so the active conversations come first.
+    // Each comes with its counterpart (the row value), kept only when it
+    // really is the conversation's other participant
+    // (`conversation_id(wallet, peer) == cid`), for the per-author key scan.
+    let mut conv_recent: Vec<[u8; 32]> = Vec::new();
+    let mut conv_heads: Vec<([u8; 32], Option<String>)> = Vec::new();
+    let mut seen: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
     let mut conv_ids: Vec<[u8; 32]> = Vec::with_capacity(conv_rows.len());
-    for (key, _) in &conv_rows {
+    for (key, value) in &conv_rows {
         if key.len() < prefix.len() + 8 + 32 {
             continue; // malformed
         }
         let mut cid = [0u8; 32];
         cid.copy_from_slice(&key[key.len() - 32..]);
         conv_ids.push(cid);
+        if v1 && seen.insert(cid) {
+            conv_recent.push(cid);
+            let peer = std::str::from_utf8(value)
+                .ok()
+                .filter(|p| crate::crypto::compute_conversation_id(wallet, p) == cid)
+                .map(str::to_owned);
+            conv_heads.push((cid, peer));
+        }
     }
     conv_ids.sort_unstable();
     conv_ids.dedup();
     let scanned_all = conv_ids.len() <= MAX_CONVERSATIONS;
     conv_ids.truncate(MAX_CONVERSATIONS);
+    conv_recent.truncate(MAX_CONVERSATIONS);
+    conv_heads.truncate(MAX_CONVERSATIONS);
+
+    let mut envelopes: Vec<Vec<u8>> = Vec::new();
+    // Wire bytes of the page so far, and whether they filled it (W5).
+    let mut bytes: usize = 0;
+
+    // Revision 1, first page: vault + settings + DM key envelopes.
+    if v1 && request.cursor.is_none() {
+        let head = dm_sync_head_envelopes(storage, wallet, &conv_heads);
+        work += head.work;
+        work += (head.blob_wire_bytes / BLOB_WIRE_BYTES_PER_BUDGET_UNIT) as u64;
+        // Round-1 audit N3: skip (not stop at) an item that does not fit.
+        for raw in head.envelopes {
+            let cost = envelope_wire_cost(&raw);
+            if bytes.saturating_add(cost) <= MAX_RESPONSE_ENVELOPE_BYTES {
+                bytes += cost;
+                envelopes.push(raw);
+            }
+        }
+    }
 
     if conv_ids.is_empty() {
-        return (empty, scanned_all, work);
+        return (empty_response(envelopes), scanned_all, work);
     }
 
     // 2. Resume point: the cursor's conversation (or its insertion slot if that
@@ -425,15 +745,17 @@ pub fn build_response(
         None => (0, None),
     };
 
-    let mut envelopes: Vec<Vec<u8>> = Vec::new();
     let mut next_cursor: Option<DmCursor> = None;
     let mut has_more = false;
-    // Wire bytes of the page so far, and whether they filled it (W5).
-    let mut bytes: usize = 0;
     let mut byte_full = false;
+    // PRIMARY (`DM_MESSAGES`) rows served on this page — what
+    // `max_envelopes` bounds and what guarantees progress: at least one is
+    // always served whatever the head extras took (they stay far below the
+    // byte budget), so `has_more` never comes without a cursor.
+    let mut primaries: usize = 0;
 
     for (ci, cid) in conv_ids.iter().enumerate().skip(start_idx) {
-        if envelopes.len() >= max_envelopes {
+        if primaries >= max_envelopes {
             has_more = true;
             break;
         }
@@ -445,7 +767,7 @@ pub fn build_response(
             }
             _ => schema::encode_dm_msg_key(cid, min_ts, &[0u8; 32]),
         };
-        let budget = max_envelopes - envelopes.len();
+        let budget = max_envelopes - primaries;
         // budget + 1 detects whether this conversation has more beyond the page.
         let rows = match storage.prefix_iter_cf_after(
             schema::cf::DM_MESSAGES,
@@ -481,7 +803,7 @@ pub fn build_response(
             // W5 (l2-node 0.151.0): page full by BYTES — stop before this row
             // (the cursor stays on the previous one).
             if let Some(r) = raw.as_ref() {
-                if !envelopes.is_empty() && bytes.saturating_add(envelope_wire_cost(r)) > MAX_RESPONSE_ENVELOPE_BYTES {
+                if primaries > 0 && bytes.saturating_add(envelope_wire_cost(r)) > MAX_RESPONSE_ENVELOPE_BYTES {
                     byte_full = true;
                     break;
                 }
@@ -496,6 +818,7 @@ pub fn build_response(
             if let Some(r) = raw {
                 bytes = bytes.saturating_add(envelope_wire_cost(&r));
                 envelopes.push(r);
+                primaries += 1;
             }
         }
         if byte_full {
@@ -520,7 +843,15 @@ pub fn build_response(
         let (ed, ed_work) = dm_edit_delete_envelopes(storage, &conv_ids, min_ts);
         work += ed_work;
         // W5: within the response byte budget.
-        append_within_byte_budget(&mut envelopes, ed, bytes);
+        bytes = append_within_byte_budget(&mut envelopes, ed, bytes);
+        // Revision 1 (G4): the DM reactions, after the edits/deletes — the
+        // same last-page ordering argument (`authorize_dm_reaction` needs
+        // the target DM stored).
+        if v1 {
+            let (re, re_work) = dm_reaction_envelopes(storage, &conv_recent, min_ts);
+            work += re_work;
+            append_within_byte_budget(&mut envelopes, re, bytes);
+        }
     }
 
     (
@@ -534,6 +865,291 @@ pub fn build_response(
         scanned_all,
         work,
     )
+}
+
+/// A final (`has_more = false`) response carrying `envelopes`.
+fn empty_response(envelopes: Vec<Vec<u8>>) -> DmSyncResponse {
+    DmSyncResponse {
+        envelopes,
+        has_more: false,
+        next_cursor: None,
+        server_capped: false,
+        auth_failed: false,
+    }
+}
+
+/// The revision-1 first-page extras ([`dm_sync_head_envelopes`]).
+pub(crate) struct DmSyncHead {
+    /// Delegations, vault, settings, then key envelopes — in priority
+    /// order (an item that does not fit the byte budget is skipped).
+    pub envelopes: Vec<Vec<u8>>,
+    /// Storage work (seeks + rows examined).
+    pub work: u64,
+    /// Wire bytes of the vault + settings envelopes.
+    pub blob_wire_bytes: usize,
+}
+
+/// The wallet's `DeviceDelegation` envelope for `device` (newest first
+/// among the wallet's last 64 delegations in `IDENTITY_ENVELOPES`), and the
+/// work spent finding it.
+fn device_delegation_envelope(storage: &Storage, wallet: &str, device: &str) -> (Option<Vec<u8>>, u64) {
+    use crate::messages::envelope::Envelope;
+    use crate::messages::types::{DeviceDelegationPayload, MessageType};
+    let mut prefix = Vec::with_capacity(wallet.len() + 2);
+    prefix.extend_from_slice(wallet.as_bytes());
+    prefix.push(0xFF);
+    prefix.push(MessageType::DeviceDelegation as u8);
+    let mut upper = prefix.clone();
+    upper.extend_from_slice(&[0xFF; 40]);
+    let Ok(rows) = storage.reverse_iter_cf(schema::cf::IDENTITY_ENVELOPES, &upper, &prefix, 64) else {
+        return (None, 1);
+    };
+    let mut work = 1 + rows.len() as u64;
+    for (key, _) in rows {
+        if key.len() < 32 {
+            continue;
+        }
+        let Ok(msg_id) = <[u8; 32]>::try_from(&key[key.len() - 32..]) else {
+            continue;
+        };
+        work += 1;
+        let Some(raw) = storage.get_cf(schema::cf::MESSAGES, &msg_id).ok().flatten() else {
+            continue;
+        };
+        let matches = rmp_serde::from_slice::<Envelope>(&raw)
+            .ok()
+            .filter(|e| e.msg_type == MessageType::DeviceDelegation && e.author == wallet)
+            .and_then(|e| rmp_serde::from_slice::<DeviceDelegationPayload>(&e.payload).ok())
+            .and_then(|p| crate::storage::identity::device_address_from_hex_key(&p.device_pub_key.to_ascii_lowercase()))
+            .is_some_and(|addr| addr == device);
+        if matches {
+            return (Some(raw), work);
+        }
+    }
+    (None, work)
+}
+
+/// The wallet's own revision-1 first-page envelopes (l2-node 0.153.0, G4),
+/// all re-served as the ORIGINAL signed envelopes from `MESSAGES`:
+///  1. the `KeyVaultSync` and 2. the `SettingsSync` that produced the
+///     wallet's CURRENT `key_vault` / `settings_sync` rows (their recorded
+///     origin, `Storage::get_key_vault_origin` / `get_settings_origin`; a
+///     row with no recorded origin — written before 0.153.0 and not yet
+///     reached by the `DM_SYNC_V11_INDEXED` migration — or a tombstone is
+///     not served). When a delegated DEVICE signed it (round-1 audit W2),
+///     the device's `DeviceDelegation` is served right before it, so a
+///     fresh node can verify and attribute it in the same page; a copy
+///     signed by a device that is revoked, or no longer maps to the wallet,
+///     is not served at all;
+///  3. the DM-scope `ChannelKeyEnvelope`s wrapped FOR the wallet in its
+///     conversations (key layout `key_scope ‖ target ‖ 0xFF ‖ author ‖ 0xFF
+///     ‖ device ‖ epoch`). Per conversation (most recently active first)
+///     the scan is per AUTHOR (round-1 audit W4): the wallet's own wraps
+///     first, then the counterpart's, each ≤ [`DM_KEYS_PER_AUTHOR`];
+///     within an author, devices are visited one seek each (≤
+///     [`DM_KEY_DEVICES_PER_AUTHOR`]) taking each device's newest ≤
+///     [`DM_KEYS_PER_DEVICE`] epochs; ≤ [`DM_KEY_ENVELOPE_CAP`] in total.
+///     Each record's stored `msg_id` locates the original (rows without
+///     one are skipped).
+///
+/// Every served envelope is checked to decode as its expected type.
+pub(crate) fn dm_sync_head_envelopes(
+    storage: &Storage,
+    wallet: &str,
+    convs: &[([u8; 32], Option<String>)],
+) -> DmSyncHead {
+    use crate::messages::envelope::Envelope;
+    use crate::messages::types::MessageType;
+    let mut head = DmSyncHead { envelopes: Vec::new(), work: 0, blob_wire_bytes: 0 };
+    let original = |msg_id: &[u8; 32], want: MessageType| -> Option<(Vec<u8>, Envelope)> {
+        let raw = storage.get_cf(schema::cf::MESSAGES, msg_id).ok().flatten()?;
+        let env = rmp_serde::from_slice::<Envelope>(&raw).ok()?;
+        (env.msg_type == want).then_some((raw, env))
+    };
+    let mut delegated: Vec<String> = Vec::new();
+    for (origin, want) in [
+        (storage.get_key_vault_origin(wallet), MessageType::KeyVaultSync),
+        (storage.get_settings_origin(wallet), MessageType::SettingsSync),
+    ] {
+        head.work += 1;
+        let Ok(Some(o)) = origin else {
+            continue;
+        };
+        head.work += 1;
+        let Some((raw, env)) = original(&o.msg_id, want) else {
+            continue;
+        };
+        if env.author != wallet {
+            // Device-signed: only while the device is unrevoked and still
+            // maps to this wallet; its delegation goes first.
+            head.work += 2;
+            // Revoked = signed at or before the device's revocation
+            // tombstone (the router's delegation rule); a vault signed
+            // after a later re-delegation is served (round-2 audit N1).
+            // Global or scoped to this wallet (round-3 audit B1).
+            let revoked = match storage.get_device_revoked_at_for(&env.author, wallet) {
+                Ok(Some(revoked_at)) => env.timestamp <= revoked_at,
+                Ok(None) => false,
+                Err(_) => true,
+            };
+            let mapped = matches!(storage.resolve_wallet(&env.author), Ok(Some(ref w)) if w == wallet);
+            if revoked || !mapped {
+                continue;
+            }
+            if !delegated.contains(&env.author) {
+                let (deleg, w) = device_delegation_envelope(storage, wallet, &env.author);
+                head.work += w;
+                if let Some(d) = deleg {
+                    head.envelopes.push(d);
+                }
+                delegated.push(env.author.clone());
+            }
+        }
+        head.blob_wire_bytes = head.blob_wire_bytes.saturating_add(envelope_wire_cost(&raw));
+        head.envelopes.push(raw);
+    }
+    let mut keys = 0usize;
+    'convs: for (cid, peer) in convs {
+        let authors: Vec<&str> = std::iter::once(wallet).chain(peer.as_deref()).collect();
+        for author in authors {
+            // Prefix of one author's wraps for the wallet in this scope.
+            let mut ap = Vec::with_capacity(32 + wallet.len() + author.len() + 2);
+            ap.extend_from_slice(cid);
+            ap.extend_from_slice(wallet.as_bytes());
+            ap.push(0xFF);
+            ap.extend_from_slice(author.as_bytes());
+            ap.push(0xFF);
+            // Sorts after every key under `ap` (device id 64 + epoch 8).
+            let mut start = ap.clone();
+            start.extend_from_slice(&[0xFF; 80]);
+            let mut author_taken = 0usize;
+            for _ in 0..DM_KEY_DEVICES_PER_AUTHOR {
+                if keys >= DM_KEY_ENVELOPE_CAP {
+                    break 'convs;
+                }
+                if author_taken >= DM_KEYS_PER_AUTHOR {
+                    break;
+                }
+                let limit = DM_KEYS_PER_DEVICE
+                    .min(DM_KEYS_PER_AUTHOR - author_taken)
+                    .min(DM_KEY_ENVELOPE_CAP - keys);
+                let rows = match storage.reverse_iter_cf(schema::cf::CHANNEL_KEYS, &start, &ap, limit) {
+                    Ok(r) => r,
+                    Err(_) => break,
+                };
+                head.work += 1 + rows.len() as u64;
+                let Some(device) = rows
+                    .first()
+                    .filter(|(k, _)| k.len() >= ap.len() + 8)
+                    .map(|(k, _)| k[ap.len()..k.len() - 8].to_vec())
+                else {
+                    break;
+                };
+                for (key, value) in &rows {
+                    if key.len() < ap.len() + 8 || key[ap.len()..key.len() - 8] != device[..] {
+                        break; // the next (lower) device: visited by its own seek
+                    }
+                    let Ok(rec) = serde_json::from_slice::<serde_json::Value>(value) else {
+                        continue;
+                    };
+                    if rec.get("scope_kind").and_then(|v| v.as_u64())
+                        != Some(u64::from(crate::messages::types::key_scope_kind::DM))
+                    {
+                        continue;
+                    }
+                    let Some(msg_id) = rec
+                        .get("msg_id")
+                        .and_then(|v| v.as_str())
+                        .and_then(|h| hex::decode(h).ok())
+                        .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                    else {
+                        continue;
+                    };
+                    head.work += 1;
+                    if let Some((raw, _)) = original(&msg_id, MessageType::ChannelKeyEnvelope) {
+                        head.envelopes.push(raw);
+                        keys += 1;
+                        author_taken += 1;
+                    }
+                }
+                // Continue strictly below this device: `ap ‖ device` sorts
+                // before all of its rows and after every lower device's.
+                start = ap.clone();
+                start.extend_from_slice(&device);
+            }
+        }
+    }
+    head
+}
+
+/// The wallet's `DirectMessageReaction`s for the revision-1 last page
+/// (l2-node 0.153.0, G4): `DM_REACTION_MSGS` reverse-scanned per
+/// conversation (newest first; conversations most recently active first),
+/// at most [`DM_REACTION_CAP`] in total and [`DM_REACTION_SCAN_CAP`] rows
+/// examined, inside the window (`ts ≥
+/// min_ts`). A reaction is withheld when its target DM is GDPR-erased (D4),
+/// no longer stored, or older than the window (the requester cannot hold
+/// it, so its router would refuse the reaction). Returns `(envelopes,
+/// work)`.
+pub(crate) fn dm_reaction_envelopes(storage: &Storage, conv_recent: &[[u8; 32]], min_ts: u64) -> (Vec<Vec<u8>>, u64) {
+    use crate::messages::envelope::Envelope;
+    use crate::messages::types::{MessageType, ReactionPayload};
+    let mut out = Vec::new();
+    let mut work: u64 = 0;
+    // Round-2 audit N3: bound the rows EXAMINED, not only those served — a
+    // window full of reactions to erased / missing targets would otherwise
+    // make every conversation read up to the cap.
+    let mut examined: usize = 0;
+    for cid in conv_recent {
+        if out.len() >= DM_REACTION_CAP || examined >= DM_REACTION_SCAN_CAP {
+            break;
+        }
+        let budget = (DM_REACTION_CAP - out.len()).min(DM_REACTION_SCAN_CAP - examined);
+        let rows = match storage.reverse_iter_cf(
+            schema::cf::DM_REACTION_MSGS,
+            &schema::message_key_upper_bound(&cid[..]),
+            &cid[..],
+            budget,
+        ) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        work += 1 + rows.len() as u64;
+        examined += rows.len();
+        for (key, _) in rows {
+            if key.len() < 72 {
+                continue;
+            }
+            let ts = u64::from_be_bytes(match key[32..40].try_into() {
+                Ok(b) => b,
+                Err(_) => continue,
+            });
+            if ts < min_ts {
+                break; // newest first: the rest of this conversation is older
+            }
+            let mut msg_id = [0u8; 32];
+            msg_id.copy_from_slice(&key[40..72]);
+            work += 2;
+            let Some(raw) = storage.get_cf(schema::cf::MESSAGES, &msg_id).ok().flatten() else {
+                continue;
+            };
+            let Some(p) = rmp_serde::from_slice::<Envelope>(&raw)
+                .ok()
+                .filter(|e| e.msg_type == MessageType::DirectMessageReaction)
+                .and_then(|e| rmp_serde::from_slice::<ReactionPayload>(&e.payload).ok())
+            else {
+                continue;
+            };
+            if storage.is_gdpr_erased(&p.target_id) {
+                continue;
+            }
+            match storage.dm_message_target(&p.target_id) {
+                Some(t) if t.conversation_id == *cid && t.timestamp >= min_ts => out.push(raw),
+                _ => {}
+            }
+        }
+    }
+    (out, work)
 }
 
 /// Gather the wallet's `DirectMessageEdit`/`DirectMessageDelete` envelopes
@@ -841,6 +1457,7 @@ mod tests {
                 max_age_secs: u64::MAX,
                 cursor: cursor.clone(),
                 wallet_claim: None,
+                revision: 0,
             };
             let (resp, scanned_all, _) = build_response(&storage, wallet, &req, 2, now, u64::MAX);
             assert!(scanned_all);
@@ -901,6 +1518,7 @@ mod tests {
             max_age_secs: 24 * 3600,
             cursor: None,
             wallet_claim: None,
+            revision: 0,
         };
         let (resp, _, _) = build_response(&storage, wallet, &req, 200, now, u64::MAX);
         assert_eq!(resp.envelopes.len(), 1);
@@ -1055,6 +1673,7 @@ mod edit_delete_ride_along_tests {
             max_age_secs: u64::MAX,
             cursor: None,
             wallet_claim: None,
+            revision: 0,
         };
         let (resp1, _, _) = build_response(&storage, wallet, &req1, 2, base_ts + 1000, u64::MAX);
         assert!(resp1.has_more, "page 1 should be capped (2 of 3 DMs)");
@@ -1072,6 +1691,7 @@ mod edit_delete_ride_along_tests {
             max_age_secs: u64::MAX,
             cursor: resp1.next_cursor,
             wallet_claim: None,
+            revision: 0,
         };
         let (resp2, _, _) = build_response(&storage, wallet, &req2, 2, base_ts + 1000, u64::MAX);
         assert!(!resp2.has_more, "page 2 should be the final page");
@@ -1120,6 +1740,7 @@ mod edit_delete_ride_along_tests {
             max_age_secs: u64::MAX,
             cursor: None,
             wallet_claim: None,
+            revision: 0,
         };
         let (resp, _, work) = build_response(&storage, wallet, &req, 10, base_ts + 1000, u64::MAX);
         let ids: Vec<[u8; 32]> = resp

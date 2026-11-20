@@ -1227,6 +1227,37 @@ pub fn validate_settings_sync(p: &SettingsSyncPayload) -> Result<(), ValidationE
     Ok(())
 }
 
+/// How far a `KeyVaultSync`'s cleartext `updated_at` may lie beyond its
+/// envelope timestamp (l2-node 0.153.0): the drift window. The vault is
+/// sealed and published by one device, so its `updated_at` is that
+/// device's clock.
+pub const KEY_VAULT_UPDATED_AT_MAX_AHEAD_MS: u64 = crate::messages::envelope::MAX_TIMESTAMP_DRIFT_MS;
+/// How far a `SettingsSync`'s `updated_at` may lie beyond its envelope
+/// timestamp (l2-node 0.153.0 round-2 audit W1): TWICE the drift window.
+/// Settings `updated_at` is the max `updatedAt` across items merged from
+/// several devices, so it can carry another device's clock skew on top of
+/// the publishing device's.
+pub const SETTINGS_UPDATED_AT_MAX_AHEAD_MS: u64 = 2 * crate::messages::envelope::MAX_TIMESTAMP_DRIFT_MS;
+
+/// Reject a `SettingsSync` / `KeyVaultSync` whose cleartext `updated_at` (the
+/// node's last-write-wins key) lies more than `max_ahead_ms` beyond the
+/// envelope's own signed timestamp (l2-node 0.153.0; pass
+/// [`SETTINGS_UPDATED_AT_MAX_AHEAD_MS`] / [`KEY_VAULT_UPDATED_AT_MAX_AHEAD_MS`]).
+/// Without it a stolen-but-not-yet-revoked device, or a client with a broken
+/// clock, could sign `updated_at = u64::MAX` and pin the wallet's row forever
+/// on every node — and dm-sync would now spread it to fresh nodes too.
+/// Applied on every ingress path (local, gossip, sync); `0` (older clients)
+/// always passes.
+pub fn validate_synced_updated_at(updated_at: u64, envelope_ts: u64, max_ahead_ms: u64) -> Result<(), ValidationError> {
+    let bound = envelope_ts.saturating_add(max_ahead_ms);
+    if updated_at > bound {
+        return Err(ValidationError(format!(
+            "updated_at {updated_at} is beyond the envelope timestamp plus {max_ahead_ms} ms ({bound})"
+        )));
+    }
+    Ok(())
+}
+
 /// Maximum encrypted key-vault size: 2 MB. The vault holds one symmetric key per
 /// (channel, epoch) and per DM conversation; 2 MB accommodates tens of thousands of
 /// keys (~48 bytes each pre-encryption) while bounding storage/DoS amplification.

@@ -564,6 +564,18 @@ pub mod cf {
     /// `CHAT_REACTIONS_INDEXED`.
     pub const CHAT_REACTION_MSGS: &str = "chat_reaction_msgs";
 
+    /// (conversation_id:32, timestamp:8 BE, msg_id:32) → () — same key shape
+    /// as `DM_MESSAGES`, but for `DirectMessageReaction` (0x08) envelopes only
+    /// (l2-node 0.153.0, G4). The conversation is the one of the reaction's
+    /// stored TARGET `DirectMessage` (its own validated `conversation_id`),
+    /// never anything the reactor supplies. A reaction whose target is not
+    /// stored when it is applied is not indexed (the router refuses it
+    /// anyway: `authorize_dm_reaction` needs the target). Consulted only by
+    /// the dm-sync last-page ride-along (revision ≥ 1) and reaped by the DM
+    /// retention reaper (its own pass); never by a read path. Written in
+    /// `router::update_indexes`; one-time backfilled via `DM_SYNC_V11_INDEXED`.
+    pub const DM_REACTION_MSGS: &str = "dm_reaction_msgs";
+
     /// All column family names for database initialization.
     pub const ALL: &[&str] = &[
         MESSAGES,
@@ -639,6 +651,7 @@ pub mod cf {
         NEWS_EDIT_DELETE,
         NEWS_REACTION_MSGS,
         CHAT_REACTION_MSGS,
+        DM_REACTION_MSGS,
         DM_RECIPIENT_MSG_COUNTS,
         STATE_CHECKPOINTS,
         ANCHORED_STATE,
@@ -755,6 +768,17 @@ pub mod state_keys {
     /// Last `MESSAGES` key examined by the `CHAT_REACTIONS_INDEXED`
     /// migration (resume point across boots).
     pub const CHAT_REACTIONS_INDEX_CURSOR: &[u8] = b"migration_chat_reactions_index_cursor";
+    /// Sentinel: set to 1 once the dm-sync revision-1 migration (l2-node
+    /// 0.153.0, G4) has scanned every stored `MESSAGES` row: stored
+    /// `DirectMessageReaction`s are indexed into `DM_REACTION_MSGS`, and the
+    /// `SettingsSync` / `KeyVaultSync` envelope that produced each wallet's
+    /// CURRENT `settings_sync` / `key_vault` row has its `msg_id` recorded in
+    /// that row (so dm-sync can serve it). Budget-capped per boot; resumes
+    /// from `DM_SYNC_V11_INDEX_CURSOR`.
+    pub const DM_SYNC_V11_INDEXED: &[u8] = b"migration_dm_sync_v11_indexed";
+    /// Last `MESSAGES` key examined by the `DM_SYNC_V11_INDEXED` migration
+    /// (resume point across boots).
+    pub const DM_SYNC_V11_INDEX_CURSOR: &[u8] = b"migration_dm_sync_v11_index_cursor";
     /// Sentinel: set to 1 after `NEWS_REACTION_MSGS` is backfilled from existing
     /// `MESSAGES`, making the reaction ride-along retroactive rather than only
     /// covering reactions made after the upgrade (l2-node 0.121.0+).
@@ -807,6 +831,9 @@ pub mod state_keys {
     pub const DM_REAP_CURSOR_CONVERSATIONS: &[u8] = b"dm_reap_cursor_conversations";
     /// DM retention reaper: persisted cursor for the `DM_EDIT_DELETE_MSGS` sweep.
     pub const DM_REAP_CURSOR_EDIT_DELETE: &[u8] = b"dm_reap_cursor_edit_delete";
+    /// DM retention reaper: persisted cursor for the `DM_REACTION_MSGS` sweep
+    /// (l2-node 0.153.0).
+    pub const DM_REAP_CURSOR_REACTIONS: &[u8] = b"dm_reap_cursor_reactions";
     /// Notification retention reaper (audit final pre-mainnet W31, l2-node
     /// 0.104.0+): persisted cursor for the `NOTIFICATIONS` sweep. Same
     /// resume-across-restarts rationale as the DM reaper cursors above.

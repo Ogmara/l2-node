@@ -1440,7 +1440,7 @@ impl ChainScanner {
                     let ts_ms = timestamp.saturating_mul(1000);
                     let revoked = self
                         .storage
-                        .get_device_revoked_at(&device_address)?
+                        .get_device_revoked_at_for(&device_address, &user)?
                         // Strictly newer: a revoke and a re-delegation in the
                         // same second (same block) apply in order, and the
                         // revoke's tombstone (ts × 1000) must not drop the

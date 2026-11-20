@@ -2382,10 +2382,20 @@ impl MessageRouter {
                     validation::validate_direct_message(resolved_author, p)
                 }
                 DeserializedPayload::SettingsSync(ref p) => {
-                    validation::validate_settings_sync(p)
+                    validation::validate_settings_sync(p)?;
+                    validation::validate_synced_updated_at(
+                        p.updated_at,
+                        envelope.timestamp,
+                        validation::SETTINGS_UPDATED_AT_MAX_AHEAD_MS,
+                    )
                 }
                 DeserializedPayload::KeyVaultSync(ref p) => {
-                    validation::validate_key_vault_sync(p)
+                    validation::validate_key_vault_sync(p)?;
+                    validation::validate_synced_updated_at(
+                        p.updated_at,
+                        envelope.timestamp,
+                        validation::KEY_VAULT_UPDATED_AT_MAX_AHEAD_MS,
+                    )
                 }
                 DeserializedPayload::DeviceRevocation(ref p) => {
                     validation::validate_device_revocation(p)
@@ -5707,6 +5717,15 @@ impl MessageRouter {
                         envelope.timestamp,
                         &envelope.msg_id,
                     )?;
+                    // G4 (l2-node 0.153.0): index the envelope under the
+                    // conversation of its stored TARGET DM (Step 7d2 already
+                    // required the target and the reactor's participation)
+                    // so the dm-sync last-page ride-along can serve it.
+                    self.storage.index_dm_reaction(
+                        &payload.target_id,
+                        envelope.timestamp,
+                        &envelope.msg_id,
+                    )?;
                 }
             }
             MessageType::NewsEdit => {
@@ -5806,26 +5825,25 @@ impl MessageRouter {
                 {
                     // Store the full payload as JSON so the client can retrieve
                     // encrypted_settings, nonce, and key_epoch for decryption.
-                    let json = serde_json::json!({
-                        "encrypted_settings": payload.encrypted_settings,
-                        "nonce": payload.nonce,
-                        "key_epoch": payload.key_epoch,
-                    });
                     // LWW key: the client's cleartext content timestamp, or the
                     // signed envelope time for an older client that omits it.
                     // This blob is gossiped on `topic_profile`, so the SAME
                     // envelope is applied again on every peer node — the LWW
                     // guard makes that idempotent and stops an out-of-order
-                    // relay (or a stale re-seed of a fresh node) rolling it back.
-                    let ts = if payload.updated_at > 0 {
-                        payload.updated_at
-                    } else {
-                        envelope.timestamp
-                    };
+                    // relay, a stale re-seed of a fresh node, or (l2-node
+                    // 0.153.0) a dm-sync responder's older copy rolling it
+                    // back. The same rule on every ingress path.
+                    let ts = crate::storage::rocks::synced_lww_ts(payload.updated_at, envelope.timestamp);
+                    // l2-node 0.153.0 (G4): record the producing envelope so
+                    // dm-sync can re-serve the current row.
                     let applied = self.storage.store_settings(
                         resolved_author,
-                        json.to_string().as_bytes(),
                         ts,
+                        Some(crate::storage::rocks::SyncedOrigin {
+                            msg_id: envelope.msg_id,
+                            envelope_ts: envelope.timestamp,
+                        }),
+                        || crate::storage::rocks::settings_sync_blob(&payload),
                     )?;
                     debug!(author = %resolved_author, applied, ts, "Settings synced");
                 }
@@ -5840,20 +5858,18 @@ impl MessageRouter {
                 if let Ok(payload) =
                     rmp_serde::from_slice::<KeyVaultSyncPayload>(&envelope.payload)
                 {
-                    let json = serde_json::json!({
-                        "encrypted_vault": payload.encrypted_vault,
-                        "nonce": payload.nonce,
-                        "format_version": payload.format_version,
-                    });
-                    let ts = if payload.updated_at > 0 {
-                        payload.updated_at
-                    } else {
-                        envelope.timestamp
-                    };
+                    // LWW on every ingress path (live, gossip, dm-sync): an
+                    // older vault never replaces a newer one (the vault is
+                    // the user's key backup — a rollback loses keys).
+                    let ts = crate::storage::rocks::synced_lww_ts(payload.updated_at, envelope.timestamp);
                     let applied = self.storage.store_key_vault(
                         resolved_author,
-                        json.to_string().as_bytes(),
                         ts,
+                        Some(crate::storage::rocks::SyncedOrigin {
+                            msg_id: envelope.msg_id,
+                            envelope_ts: envelope.timestamp,
+                        }),
+                        || crate::storage::rocks::key_vault_sync_blob(&payload),
                     )?;
                     debug!(author = %resolved_author, applied, ts, "Key vault synced");
                 }
@@ -6047,9 +6063,13 @@ impl MessageRouter {
                     // genuine re-delegation carries a newer timestamp. Closes
                     // the resurrection/auth-bypass vector on every path (gossip
                     // and identity-sync backfill).
+                    // l2-node 0.153.0: also a tombstone THIS wallet wrote
+                    // while the device was not mapped to it (revocation
+                    // processed before the delegation); scoped to the
+                    // wallet, so it never blocks another wallet.
                     if let Some(revoked_at) = self
                         .identity
-                        .get_device_revoked_at(&device_address)
+                        .get_device_revoked_at_for(&device_address, resolved_author)
                         .context("checking device revocation tombstone")?
                     {
                         if envelope.timestamp <= revoked_at {
@@ -6347,8 +6367,11 @@ impl MessageRouter {
                             // and the encrypted settings blob. Local to this node;
                             // other nodes purge as the DeletionRequest reaches them.
                             // (Security audit 2026-06-14, Sec-W1.)
-                            self.storage.delete_key_vault(resolved_author)?;
-                            self.storage.delete_settings(resolved_author)?;
+                            // l2-node 0.153.0 (round-1 audit W1): a tombstone,
+                            // not a delete — an old signed vault / settings
+                            // envelope (gossip relay, dm-sync) can no longer
+                            // resurrect them.
+                            self.storage.tombstone_synced_blobs(resolved_author, envelope.timestamp)?;
                             warn!(
                                 author = %resolved_author,
                                 news_posts_marked = deleted_count,

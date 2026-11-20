@@ -372,8 +372,11 @@ pub fn verify_wallet_claim(
 /// wallet-direct claim (or none), and for a device claim whose device has
 /// no revocation tombstone at or after the delegation it presents. A
 /// storage error fails CLOSED. Run by a responder only after the per-peer
-/// slot was granted (it touches storage).
-pub fn device_claim_unrevoked(storage: &Storage, claim: Option<&WalletAuthClaim>) -> bool {
+/// slot was granted (it touches storage). Since l2-node 0.153.0 (round-3
+/// audit B1) the tombstone is the one applying to `wallet`'s delegation of
+/// the device — global or scoped to `wallet`
+/// (`Storage::get_device_revoked_at_for`).
+pub fn device_claim_unrevoked(storage: &Storage, wallet: &str, claim: Option<&WalletAuthClaim>) -> bool {
     let Some(device) = claim.and_then(|c| c.device.as_ref()) else {
         return true;
     };
@@ -384,7 +387,7 @@ pub fn device_claim_unrevoked(storage: &Storage, claim: Option<&WalletAuthClaim>
     else {
         return false;
     };
-    match storage.get_device_revoked_at(&device_address) {
+    match storage.get_device_revoked_at_for(&device_address, wallet) {
         Ok(Some(revoked_at)) => revoked_at < device.delegation_timestamp,
         Ok(None) => true,
         Err(_) => false,
@@ -540,9 +543,10 @@ pub fn lookup_device_revocations(storage: &Storage, device_address: &str, wallet
 /// `at_ts`: a proof-of-possession delegation with `ts <= at_ts` exists and
 /// the device's revocation tombstone does not fall in `[ts, at_ts]`
 /// (l2-node 0.142.0 W4 — a member whose join was signed by a since-revoked
-/// device stays verifiable).
+/// device stays verifiable). The tombstone is global or scoped to `wallet`
+/// (l2-node 0.153.0, round-3 audit B1).
 pub fn device_delegated_at(storage: &Storage, network: &str, device_address: &str, wallet: &str, at_ts: u64) -> bool {
-    let revoked_at = match storage.get_device_revoked_at(device_address) {
+    let revoked_at = match storage.get_device_revoked_at_for(device_address, wallet) {
         Ok(r) => r,
         Err(_) => return false,
     };
@@ -577,7 +581,10 @@ pub fn lookup_device_delegation_proof(
     let device_pk = crate::crypto::address_to_pubkey_bytes(device_address).ok()?;
     let wallet_vk = crate::crypto::address_to_verifying_key(wallet).ok()?;
     let device_hex = hex::encode(device_pk);
-    let revoked_at = storage.get_device_revoked_at(device_address).ok()?;
+    // Global or scoped to `wallet` (l2-node 0.153.0, round-3 audit B1): a
+    // stale delegation refused by the router is still stored and indexed,
+    // so the scoped tombstone must disqualify it here too.
+    let revoked_at = storage.get_device_revoked_at_for(device_address, wallet).ok()?;
     // A row dated beyond the drift window (stored before l2-node 0.148.1,
     // when sync did not bound it) would outlast every revoke; never use it.
     let now_ms = std::time::SystemTime::now()
@@ -4838,7 +4845,7 @@ mod device_claim_tests {
             ClientClaimOutcome::Verified(c) => {
                 let p = c.device.as_ref().expect("device proof attached");
                 assert_eq!(p.delegation_timestamp, ts - 60_000);
-                assert!(device_claim_unrevoked(&s, Some(&c)));
+                assert!(device_claim_unrevoked(&s, &w.addr, Some(&c)));
             }
             other => panic!("expected Verified, got {other:?}"),
         }
@@ -4895,17 +4902,17 @@ mod device_claim_tests {
         let (w, d) = (wallet(31), device(32));
         let dts = 1_000_000u64;
         let claim = WalletAuthClaim { timestamp: dts, signature: vec![0; 64], device: Some(proof(&d, &w, &w, dts)) };
-        assert!(device_claim_unrevoked(&s, Some(&claim)), "no tombstone");
-        assert!(device_claim_unrevoked(&s, None), "no claim");
+        assert!(device_claim_unrevoked(&s, &w.addr, Some(&claim)), "no tombstone");
+        assert!(device_claim_unrevoked(&s, &w.addr, None), "no claim");
         let direct = WalletAuthClaim { device: None, ..claim.clone() };
         let tomb = |at: u64| s.put_cf(schema::cf::DEVICE_REVOCATIONS, d.addr.as_bytes(), &at.to_be_bytes()).unwrap();
         tomb(dts - 1);
-        assert!(device_claim_unrevoked(&s, Some(&claim)), "revoked before the delegation (re-delegated)");
+        assert!(device_claim_unrevoked(&s, &w.addr, Some(&claim)), "revoked before the delegation (re-delegated)");
         tomb(dts);
-        assert!(!device_claim_unrevoked(&s, Some(&claim)), "revoked AT the delegation ts");
+        assert!(!device_claim_unrevoked(&s, &w.addr, Some(&claim)), "revoked AT the delegation ts");
         tomb(dts + 1);
-        assert!(!device_claim_unrevoked(&s, Some(&claim)), "revoked after the delegation");
-        assert!(device_claim_unrevoked(&s, Some(&direct)), "wallet-direct claims are unaffected");
+        assert!(!device_claim_unrevoked(&s, &w.addr, Some(&claim)), "revoked after the delegation");
+        assert!(device_claim_unrevoked(&s, &w.addr, Some(&direct)), "wallet-direct claims are unaffected");
     }
 
     #[test]

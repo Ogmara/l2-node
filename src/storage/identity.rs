@@ -191,7 +191,17 @@ impl IdentityResolver {
         self.revoke_device(device_address, wallet_address, revoked_at)
     }
 
-    /// Revocation-tombstone timestamp for a device, if any (P-2).
+    /// Revocation tombstone applying to `wallet_address`'s delegation of
+    /// `device_address` (global or wallet-scoped, l2-node 0.153.0; see
+    /// `Storage::get_device_revoked_at_for`).
+    pub fn get_device_revoked_at_for(&self, device_address: &str, wallet_address: &str) -> Result<Option<u64>> {
+        self.storage.get_device_revoked_at_for(device_address, wallet_address)
+    }
+
+    /// Global revocation-tombstone timestamp for a device, if any (P-2).
+    /// Production paths use [`Self::get_device_revoked_at_for`] (l2-node
+    /// 0.153.0); kept for tests.
+    #[cfg(test)]
     pub fn get_device_revoked_at(&self, device_address: &str) -> Result<Option<u64>> {
         self.storage.get_device_revoked_at(device_address)
     }

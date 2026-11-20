@@ -774,6 +774,16 @@ pub struct NetworkService {
         libp2p::request_response::OutboundRequestId,
         DmSyncPending,
     >,
+    /// Fanout siblings of a dm-sync session cancelled when another peer
+    /// answered first (l2-node 0.153.0, G4) → the wallet they were sent for.
+    /// Their FIRST pages still arrive; only the order-independent head
+    /// envelopes of those pages (`dm_sync::is_dm_sync_head_type`:
+    /// `DeviceDelegation`, `KeyVaultSync`, `SettingsSync`, DM-scope
+    /// `ChannelKeyEnvelope`) are applied — last-write-wins keeps the newest
+    /// vault, so a fresh node ends up with the newest vault any of the
+    /// fanout peers holds, not just the first responder's. Removed
+    /// on response / failure; bounded by `MAX_DM_SYNC_CANCELLED_SIBLINGS`.
+    dm_sync_cancelled_siblings: HashMap<libp2p::request_response::OutboundRequestId, String>,
     /// Wallets this node has triggered a dm-sync backfill for at least once this
     /// process lifetime — dedups repeated first-seen triggers (per auth).
     dm_backfill_triggered: HashSet<String>,
@@ -2339,18 +2349,107 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Smuggling defense for dm-sync responses (Phase 2): accept only DM content
-/// types (`dm_sync::is_dm_type` — `DirectMessage`/`DirectMessageEdit`/
-/// `DirectMessageDelete` as of audit final pre-mainnet W6), so a responder
-/// can't inject another type through this path. Every envelope is still
-/// signature-validated by `process_synced_message`.
-fn envelope_targets_dm(env_bytes: &[u8]) -> bool {
+/// Upper bound on `NetworkService::dm_sync_cancelled_siblings` (l2-node
+/// 0.153.0). Each dm-sync trigger cancels at most `FANOUT - 1` siblings and
+/// every entry is removed when its response or failure arrives; the bound
+/// only matters if responses never come. When full, new siblings are simply
+/// not remembered (their responses are ignored, as before 0.153.0).
+const MAX_DM_SYNC_CANCELLED_SIBLINGS: usize = 10_000;
+
+/// What applying one dm-sync page did (l2-node 0.153.0).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DmSyncTally {
+    /// `Accepted` (or `Duplicate`) by the router — the session's progress.
+    pub admitted: usize,
+    /// Refused before routing as foreign / undecodable (taint), or a
+    /// malformed deletion request.
+    pub dropped: usize,
+    /// Skipped or refused for a reason an honest responder can cause
+    /// (`dm_sync::DmSyncFit::Neutral`, a neutral router refusal of a
+    /// revision-1 type, a neutral deletion request): neither progress nor a
+    /// fault.
+    pub neutral: usize,
+}
+
+/// Validate and apply one dm-sync page for `wallet` (Phase 2; factored out
+/// of `handle_dm_sync_event` in l2-node 0.153.0). Every envelope is bound to
+/// the wallet's scope first (`dm_sync::dm_envelope_fit` — the type
+/// allow-list `dm_sync::is_dm_type` plus, for the revision-1 types, the
+/// wallet binding), deletion requests to a DM target
+/// (`deletion_request_fit`), and is then re-validated by the router's SYNC
+/// pipeline (`process_synced_message`), so a relaying peer is never
+/// trusted. `head_only` applies just the revision-1 head types
+/// (`dm_sync::is_dm_sync_head_type`: delegation, vault, settings, DM key
+/// envelopes — all order-independent; a cancelled fanout sibling's first
+/// page, round-1 audit N7) and skips the rest uncounted. Logs carry the
+/// peer and message type, never a conversation.
+pub(crate) fn tally_dm_sync_envelopes(
+    router: &MessageRouter,
+    storage: &Storage,
+    wallet: &str,
+    envelopes: Vec<Vec<u8>>,
+    deletion_min_ts: u64,
+    head_only: bool,
+    peer: &PeerId,
+) -> DmSyncTally {
     use crate::messages::envelope::Envelope;
-    let envelope: Envelope = match rmp_serde::from_slice(env_bytes) {
-        Ok(e) => e,
-        Err(_) => return false,
-    };
-    dm_sync::is_dm_type(envelope.msg_type_u8())
+    let mut t = DmSyncTally::default();
+    for env_bytes in envelopes {
+        let msg_type = rmp_serde::from_slice::<Envelope>(&env_bytes).ok().map(|e| e.msg_type);
+        if head_only && !msg_type.is_some_and(|m| dm_sync::is_dm_sync_head_type(m as u8)) {
+            continue;
+        }
+        match dm_sync::dm_envelope_fit(storage, wallet, &env_bytes) {
+            dm_sync::DmSyncFit::Fits => {}
+            dm_sync::DmSyncFit::Neutral => {
+                t.neutral += 1;
+                continue;
+            }
+            dm_sync::DmSyncFit::Foreign => {
+                if msg_type.is_some_and(|m| dm_sync::is_dm_sync_v1_type(m as u8)) {
+                    warn!(peer = %peer, msg_type = ?msg_type, "dm-sync: envelope outside the requested wallet's scope dropped");
+                }
+                t.dropped += 1;
+                continue;
+            }
+        }
+        let is_deletion = is_deletion_request(&env_bytes);
+        match deletion_request_fit(storage, &env_bytes, DeletionScope::Dm, deletion_min_ts) {
+            DeletionFit::Fits => {}
+            DeletionFit::Neutral => {
+                t.neutral += 1;
+                continue;
+            }
+            DeletionFit::Malformed => {
+                warn!(peer = %peer, "dm-sync: malformed deletion request dropped");
+                t.dropped += 1;
+                continue;
+            }
+        }
+        match router.process_synced_message(&env_bytes) {
+            // Pending-only / policy-refused DeletionRequest:
+            // neither progress nor a fault (W1/W4); an Invalid
+            // one is warned below.
+            RouteResult::Accepted { .. } if is_deletion && pending_only_deletion(storage, &env_bytes) => t.neutral += 1,
+            RouteResult::Rejected(_) if is_deletion => t.neutral += 1,
+            RouteResult::Accepted { .. } | RouteResult::Duplicate => t.admitted += 1,
+            // G4 (l2-node 0.153.0, round-1 audit N1): only the refusals an
+            // honest responder can cause on a fresh node are neutral (see
+            // `dm_sync::is_neutral_dm_sync_refusal`); every other warns.
+            RouteResult::Rejected(reason) if dm_sync::is_neutral_dm_sync_refusal(storage, &env_bytes, &reason) => {
+                debug!(peer = %peer, msg_type = ?msg_type, reason = %reason, "dm-sync: envelope refused by router (neutral)");
+                t.neutral += 1;
+            }
+            RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
+                warn!(peer = %peer, reason = %reason, "dm-sync: envelope rejected by router");
+            }
+            // Key-epoch arbitration loss (0.143.0): a sync-path rejection
+            // (channel scope only — dm-sync carries DM scope).
+            RouteResult::KeyConflict(_) => {}
+            RouteResult::PowRequired { .. } => {}
+        }
+    }
+    t
 }
 
 /// How often `NetworkService` refreshes the shared `MeshStatsSnapshot`.
@@ -2788,6 +2887,7 @@ impl NetworkService {
             dm_sync_limits: Arc::new(dm_sync::DmResponderLimits::new(budget::MAX_TRACKED_RESPONDER_KEYS)),
             dm_sync_budget,
             pending_dm_sync_requests: HashMap::new(),
+            dm_sync_cancelled_siblings: HashMap::new(),
             dm_backfill_triggered: HashSet::new(),
             wallet_claims: HashMap::new(),
             local_dm_users_seen: HashMap::new(),
@@ -3292,14 +3392,14 @@ impl NetworkService {
         }
     }
 
-    /// DM retention reaper entry point (audit final pre-mainnet W11). Runs 3
-    /// independent, self-contained sweeps, each keyed off timestamp bytes
+    /// DM retention reaper entry point (audit final pre-mainnet W11). Runs 4
+    /// (3 before l2-node 0.153.0) independent, self-contained sweeps, each keyed off timestamp bytes
     /// already present verbatim in the row being examined — never by
     /// re-deriving one CF's delete-key from another CF's decoded content
     /// (identity resolution can change over the retention window; that class
     /// of bug has bitten this campaign before, e.g. W6's
     /// channel_id-from-untrusted-field). `retention_days == 0` means
-    /// "unlimited" — disables all three passes, matching the pre-existing
+    /// "unlimited" — disables all passes, matching the pre-existing
     /// documented config semantic.
     fn reap_expired_dms(&mut self) {
         if self.dm_config.retention_days == 0 {
@@ -3326,6 +3426,15 @@ impl NetworkService {
             schema::state_keys::DM_REAP_CURSOR_EDIT_DELETE,
             cutoff_ms,
             false, // Pass C: edit/delete envelopes were never counted, don't decrement
+        );
+        // Pass D (l2-node 0.153.0, G4): DM reaction index rows and their
+        // reaction envelopes (same key shape, keyed by the REACTION's ts).
+        // The derived `CHAT_REACTIONS` rows stay (unchanged limitation).
+        self.reap_dm_msg_shaped_cf(
+            schema::cf::DM_REACTION_MSGS,
+            schema::state_keys::DM_REAP_CURSOR_REACTIONS,
+            cutoff_ms,
+            false,
         );
     }
 
@@ -5593,7 +5702,6 @@ impl NetworkService {
             dm_sync::DmSyncResponse,
         >,
     ) {
-        use crate::messages::router::RouteResult;
         use libp2p::request_response::{Event, Message};
 
         // Responder retention window: serve DMs no older than this. 0 = unlimited.
@@ -5692,7 +5800,30 @@ impl NetworkService {
             } => {
                 let pending = match self.pending_dm_sync_requests.remove(&request_id) {
                     Some(p) => p,
-                    None => return,
+                    None => {
+                        // A cancelled fanout sibling (l2-node 0.153.0): apply
+                        // only its order-independent head envelopes
+                        // (delegation, vault, settings, DM keys), no paging.
+                        if let Some(wallet) = self.dm_sync_cancelled_siblings.remove(&request_id) {
+                            if !response.auth_failed
+                                && !response.server_capped
+                                && response.envelopes.len()
+                                    <= dm_sync::max_page_envelopes(true, !response.has_more)
+                            {
+                                let t = tally_dm_sync_envelopes(
+                                    &self.router,
+                                    &self.storage,
+                                    &wallet,
+                                    response.envelopes,
+                                    0,
+                                    true,
+                                    &peer,
+                                );
+                                debug!(peer = %peer, admitted = t.admitted, dropped = t.dropped, "dm-sync: applied a cancelled sibling's head envelopes");
+                            }
+                        }
+                        return;
+                    }
                 };
                 if response.auth_failed {
                     // Our own request was rejected — a bug or clock skew. Don't
@@ -5707,59 +5838,59 @@ impl NetworkService {
                     return;
                 }
                 // Race-winner: cancel sibling requests for this wallet to others.
+                // Their first pages still arrive (l2-node 0.153.0): remember
+                // them so their head envelopes are applied too.
                 let wallet = pending.wallet.clone();
-                self.pending_dm_sync_requests
-                    .retain(|_, p| p.peer_id == peer || p.wallet != wallet);
+                let cancelled: Vec<libp2p::request_response::OutboundRequestId> = self
+                    .pending_dm_sync_requests
+                    .iter()
+                    .filter(|(_, p)| p.peer_id != peer && p.wallet == wallet)
+                    .map(|(id, _)| *id)
+                    .collect();
+                for id in cancelled {
+                    if let Some(p) = self.pending_dm_sync_requests.remove(&id) {
+                        // Only a session's first request can be cancelled
+                        // (continuations are sent after the race is decided).
+                        if p.pages_fetched == 0
+                            && self.dm_sync_cancelled_siblings.len() < MAX_DM_SYNC_CANCELLED_SIBLINGS
+                        {
+                            self.dm_sync_cancelled_siblings.insert(id, p.wallet);
+                        }
+                    }
+                }
 
                 let count = response.envelopes.len();
-                let mut admitted = 0usize;
-                let mut dropped = 0usize;
+                let mut tally = DmSyncTally::default();
                 // Security-audit follow-up on W9: see identity-sync's arm
                 // above for the full rationale — refuse to verify ANY
                 // envelope in a page that exceeds this protocol's own max
                 // page size, treating it as unproductive rather than
-                // paying the verification cost.
-                if count > dm_sync::MAX_ENVELOPES_PER_PAGE_WITH_RIDE_ALONGS {
+                // paying the verification cost. We always request revision
+                // 1 (l2-node 0.153.0): the head is allowed only on the first
+                // page (no cursor sent), the ride-alongs only on the final
+                // page (round-1 audit N2).
+                let page_bound = dm_sync::max_page_envelopes(pending.pages_fetched == 0, !response.has_more);
+                if count > page_bound {
                     warn!(
                         peer = %peer, wallet = %wallet, received = count,
-                        expected_max = dm_sync::MAX_ENVELOPES_PER_PAGE_WITH_RIDE_ALONGS,
+                        expected_max = page_bound,
                         "dm-sync: response exceeds this protocol's own max page size; refusing to verify, treating as unproductive"
                     );
                 } else {
                     let deletion_min_ts =
                         window_start_ms(days_window_secs_zero_unlimited(self.dm_config.backfill_max_age_days));
-                    for env_bytes in response.envelopes {
-                        if !envelope_targets_dm(&env_bytes) {
-                            dropped += 1;
-                            continue;
-                        }
-                        let is_deletion = is_deletion_request(&env_bytes);
-                        match deletion_request_fit(&self.storage, &env_bytes, DeletionScope::Dm, deletion_min_ts) {
-                            DeletionFit::Fits => {}
-                            DeletionFit::Neutral => continue,
-                            DeletionFit::Malformed => {
-                                warn!(peer = %peer, "dm-sync: malformed deletion request dropped");
-                                dropped += 1;
-                                continue;
-                            }
-                        }
-                        match self.router.process_synced_message(&env_bytes) {
-                            // Pending-only / policy-refused DeletionRequest:
-                            // neither progress nor a fault (W1/W4); an Invalid
-                            // one is warned below.
-                            RouteResult::Accepted { .. } if is_deletion && pending_only_deletion(&self.storage, &env_bytes) => {}
-                            RouteResult::Rejected(_) if is_deletion => {}
-                            RouteResult::Accepted { .. } | RouteResult::Duplicate => admitted += 1,
-                            RouteResult::Rejected(reason) | RouteResult::Invalid(reason) => {
-                                warn!(peer = %peer, reason = %reason, "dm-sync: envelope rejected by router");
-                            }
-                            // Key-epoch arbitration loss (0.143.0): a sync-path rejection.
-                            RouteResult::KeyConflict(_) => {}
-                            RouteResult::PowRequired { .. } => {}
-                        }
-                    }
+                    tally = tally_dm_sync_envelopes(
+                        &self.router,
+                        &self.storage,
+                        &wallet,
+                        response.envelopes,
+                        deletion_min_ts,
+                        false,
+                        &peer,
+                    );
                 }
-                info!(peer = %peer, wallet = %wallet, received = count, admitted, dropped, has_more = response.has_more, "dm-sync: applied batch");
+                let DmSyncTally { admitted, dropped, neutral } = tally;
+                info!(peer = %peer, wallet = %wallet, received = count, admitted, dropped, neutral, has_more = response.has_more, "dm-sync: applied batch");
 
                 // Audit final pre-mainnet W9: requester-side paging budget.
                 let pages_fetched = pending.pages_fetched + 1;
@@ -5815,6 +5946,7 @@ impl NetworkService {
                 if let Some(p) = self.pending_dm_sync_requests.remove(&request_id) {
                     debug!(peer = %peer, wallet = %p.wallet, error = ?error, "dm-sync: outbound failed; siblings may succeed");
                 }
+                self.dm_sync_cancelled_siblings.remove(&request_id);
             }
             _ => {}
         }
@@ -5872,10 +6004,10 @@ impl NetworkService {
     /// `true` when `claim` is still usable now: inside the freshness window
     /// and (for a device-signed claim) its device not revoked at or after
     /// the presented delegation (N5).
-    fn private_channel_sync_claim_usable(&self, claim: &private_channel_sync::WalletAuthClaim) -> bool {
+    fn private_channel_sync_claim_usable(&self, wallet: &str, claim: &private_channel_sync::WalletAuthClaim) -> bool {
         now_ms().abs_diff(claim.timestamp)
             <= private_channel_sync::WALLET_AUTH_MAX_AGE_SECS.saturating_mul(1000)
-            && private_channel_sync::device_claim_unrevoked(&self.storage, Some(claim))
+            && private_channel_sync::device_claim_unrevoked(&self.storage, wallet, Some(claim))
     }
 
     /// A wallet presented a fresh, verified pchansync claim on an
@@ -6126,11 +6258,11 @@ impl NetworkService {
         // claim must not shadow a newer cached one.)
         // N5: only USABLE claims compete (fresh, device not revoked), so a
         // fresher claim of a since-revoked device never shadows a valid one.
-        let attached = wallet_claim.filter(|c| self.private_channel_sync_claim_usable(c));
+        let attached = wallet_claim.filter(|c| self.private_channel_sync_claim_usable(wallet, c));
         let cached = self
             .private_channel_sync_wallet_claims
             .get(wallet)
-            .filter(|c| self.private_channel_sync_claim_usable(c))
+            .filter(|c| self.private_channel_sync_claim_usable(wallet, c))
             .cloned();
         let Some(claim) = private_channel_sync::freshest_claim(attached, cached) else {
             self.private_channel_sync_triggered.remove(&key);
@@ -6598,6 +6730,7 @@ impl NetworkService {
                     &request.wallet,
                 ) || !private_channel_sync::device_claim_unrevoked(
                     &self.storage,
+                    &request.wallet,
                     request.wallet_claim.as_ref(),
                 ) {
                     warn!(peer = %peer, channel_id = request.channel_id, wallet = %request.wallet, "private-channel-sync: membership check failed");
@@ -11077,14 +11210,14 @@ mod backfill_throttle_tests {
             }),
         };
         let direct = private_channel_sync::WalletAuthClaim { device: None, ..device_claim.clone() };
-        assert!(svc.private_channel_sync_claim_usable(&device_claim));
+        assert!(svc.private_channel_sync_claim_usable("klv1test", &device_claim));
         svc.storage
             .put_cf(schema::cf::DEVICE_REVOCATIONS, dev_addr.as_bytes(), &(now - 5_000).to_be_bytes())
             .unwrap();
-        assert!(!svc.private_channel_sync_claim_usable(&device_claim), "device revoked after its delegation");
-        assert!(svc.private_channel_sync_claim_usable(&direct));
+        assert!(!svc.private_channel_sync_claim_usable("klv1test", &device_claim), "device revoked after its delegation");
+        assert!(svc.private_channel_sync_claim_usable("klv1test", &direct));
         let stale = private_channel_sync::WalletAuthClaim { timestamp: now - 400_000, ..direct };
-        assert!(!svc.private_channel_sync_claim_usable(&stale), "expired");
+        assert!(!svc.private_channel_sync_claim_usable("klv1test", &stale), "expired");
     }
 
     #[tokio::test]
@@ -11967,6 +12100,9 @@ mod backfill_throttle_tests {
 
 #[cfg(test)]
 mod backfill_0152_tests;
+
+#[cfg(test)]
+mod backfill_0153_tests;
 
 #[cfg(test)]
 mod backfill_0151_tests {

@@ -5,6 +5,247 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.153.0] - 2026-11-20
+
+Fresh-node backfill gaps, part 3 (plan
+`docs/planning/fresh-node-backfill-gaps-plan.md`, item G4, owner decision
+D2): dm-sync revision 1 backfills the authorizing wallet's key vault,
+settings, DM-scope key envelopes and DM reactions. All changes are runtime
+code; no dependency changed. The wire change is one additive
+`#[serde(default)]` request field (compatible with 0.152 peers both ways);
+one new node-local column family.
+
+### Added
+
+- **dm-sync revision 1 (G4, D2).** `DmSyncRequest` gains `revision: u8`
+  (`DM_SYNC_REVISION = 1`, sent by every 0.153 requester; not part of the
+  signed auth string). For a revision-1 requester the responder adds, for
+  the WALLET-AUTHORIZED session only (never identity-sync, which is
+  unauthenticated — protocol §8.4.3 stays true):
+  - on the session's FIRST page (no cursor), ahead of the DMs: the
+    `KeyVaultSync` (0x38) and `SettingsSync` (0x33) envelopes that produced
+    the wallet's CURRENT `key_vault` / `settings_sync` rows — each preceded
+    by the signing device's wallet-signed `DeviceDelegation` (0x31) when a
+    delegated device signed it, and not served at all when that device is
+    revoked or no longer maps to the wallet (round-1 audit W2) — and the
+    DM-scope `ChannelKeyEnvelope`s (0x61) wrapped FOR the wallet
+    (`target == wallet`) in its conversations, scanned per AUTHOR (round-1
+    audit W4): per conversation the wallet's own wraps first, then the
+    counterpart's, ≤ 32 per author (`DM_KEYS_PER_AUTHOR`), devices visited
+    one seek each (≤ 16 per author), each device's newest ≤ 8 epochs, ≤
+    1,000 in total (`DM_KEY_ENVELOPE_CAP`), conversations most recently
+    active first, each served from `MESSAGES` via the record's stored
+    `msg_id`. Served even when the wallet has no conversation. They fit the
+    8 MiB page when the ciphertext is MessagePack `bin`-encoded (as the SDK
+    does); an item that does not fit is skipped and the next one still
+    tried (round-1 audit N3);
+  - on the LAST page, after the edit/delete ride-along: the wallet's
+    `DirectMessageReaction`s (0x08), newest first per conversation, ≤ 2,000
+    (`DM_REACTION_CAP`), inside the window, withheld when the target DM is
+    GDPR-erased (D4), no longer stored, or older than the window.
+  Before, a fresh node answered vault restore with 404 for anyone whose
+  last upload predated it, and backfilled DMs could not be decrypted on a
+  new device.
+- **`DM_REACTION_MSGS` (new node-local CF).** `conversation_id ‖ ts ‖ msg_id`,
+  written when a `DirectMessageReaction` is applied, under the conversation
+  of its stored TARGET DM (`Storage::dm_message_target`). Reaped by a fourth
+  DM retention reaper pass (index row plus the reaction envelope, by the
+  reaction's own timestamp; cursor `dm_reap_cursor_reactions`).
+- **Settings / key-vault rows record their producing envelope.** The
+  `{"_sv":1,…}` wrapper gains `msg_id` (hex) and `env_ts`;
+  `GET /api/v1/settings` / `GET /api/v1/key-vault` still return only the
+  inner blob.
+- **Migration `migration_dm_sync_v11_indexed`** (≤ 5,000,000 `MESSAGES`
+  rows per boot, resumable via `migration_dm_sync_v11_index_cursor`,
+  idempotent): indexes stored DM reactions into `DM_REACTION_MSGS`; records
+  the producing envelope in a settings / key-vault row only when that row
+  has no origin and holds exactly the envelope's blob and LWW `ts` (the row
+  is otherwise rewritten unchanged — never a recomputed blob); records the
+  `msg_id` of DM-scope key-envelope rows stored before 0.143.0 when the row
+  holds exactly that envelope's wrap.
+- **Fanout siblings contribute their head.** The fanout race still
+  cancels sibling sessions, but the first pages they already answered now
+  have their order-independent head envelopes applied — delegation, vault,
+  settings and DM key envelopes (round-1 audit N7; ≤ 10,000 remembered
+  siblings) — so a fresh node keeps the newest vault any of the ≤ 3 peers
+  holds, not just the first responder's.
+- **Account-deletion tombstones (round-1 audit W1).** `AllUserContent`
+  replaces the `key_vault` / `settings_sync` rows with a tombstone
+  (`"deleted": true`, `ts` = the request's timestamp, null blob) instead of
+  deleting them: reads see no row (404), dm-sync serves nothing, and any
+  vault / settings whose LWW `ts` is not strictly newer than the deletion
+  is refused on every path. Before, an old signed vault relayed by gossip
+  or served by dm-sync resurrected the erased vault. A row strictly newer
+  than the deletion is kept.
+
+### Changed
+
+- **Receiver scope binding (`dm_sync::dm_envelope_fit`).** `is_dm_type`
+  accepts the four revision-1 types; each is bound to the requested wallet
+  before routing: a key envelope must be DM scope, `target == wallet`, and
+  in one of the wallet's conversations (authored by the wallet with
+  `key_scope == conversation_id(wallet, peer)`, or naming the wallet as
+  `peer`, which the router then binds to the resolved author); a vault /
+  settings envelope must be signed by the wallet or by a device this node
+  maps to it; a reaction's stored target must be a DM of the wallet.
+  A `DeviceDelegation` must be authored by the wallet. Refusals: out of
+  scope / another wallet / undecodable → dropped and counted (taint,
+  warned with peer and type only); a reaction whose target is not stored
+  here, or a vault signed by a device this node cannot resolve → neutral
+  (skipped). Router refusals (round-1 audit N1) are neutral ONLY for the
+  registration requirement, a full key scope, "target message not found",
+  or an envelope (or a reacted-to DM) authored by an `ogd1…` device this
+  node cannot resolve; every other `Rejected`, and every `Invalid`, warns.
+  The apply loop is factored into `network::tally_dm_sync_envelopes`.
+- **Requester page bound per page (round-1 audit N2,
+  `dm_sync::max_page_envelopes`):** 200 primary rows; plus the head (4 +
+  1,000) only on the first page (no cursor sent); plus the edit/delete
+  (1,000) and reaction (2,000) ride-alongs only on the final page
+  (`has_more = false`).
+- **Responder budget charges blob bytes.** The vault / settings wire bytes
+  add one unit per 16 KiB (`BLOB_WIRE_BYTES_PER_BUDGET_UNIT`) to the
+  rolling dm-sync budget, so an authorized node cannot re-fetch a 2 MiB
+  vault for one unit.
+- **Page progress guard.** The primary scan's byte check now counts only
+  primary rows already on the page, so a first page whose extras took most
+  of the 8 MiB still serves at least one DM (never `has_more` without a
+  cursor).
+- **Settings / vault last-write-wins tie-break.** Two DIFFERENT envelopes
+  with the same LWW `ts` now resolve to the one signed later (`(env_ts,
+  msg_id)`) on every path, so nodes converge whatever the arrival order
+  (before: the last arrival won). Rows without a recorded origin keep the
+  old behaviour. Strictly older `ts` is still dropped on every path —
+  live, gossip and dm-sync (tested in both orders).
+- **Settings / vault writes are serialized** (round-1 audit W3,
+  `Storage::synced_blob_lock`): the swarm loop (gossip, dm-sync) and the
+  API tasks no longer race the read-modify-write, which could leave an
+  older synced vault over a newer upload. The row header is parsed without
+  materialising the blob, and the blob is built only once a write is
+  decided (round-1 audit N4).
+
+### Security
+
+- **Step 7h review (DM scope on the sync path): safe, unchanged.** Key-epoch
+  arbitration (Step 7h) applies to channel scope only; a DM-scope envelope
+  takes the generic path on every ingress. Its authorization (Step 7c)
+  runs on the sync path too: `key_scope == conversation_id(resolved author,
+  peer)` and `target ∈ {author, peer}`, after the signature check. The
+  `CHANNEL_KEYS` row key contains the resolved AUTHOR and is
+  first-write-wins per `(scope, target, author, device, epoch)`, so no
+  envelope can occupy another sender's slot, and nobody outside a
+  conversation can write into its scope (that would need a keccak
+  collision). Wrapped keys stay opaque; no commitment or arbitration state
+  exists for DM scope. The receiver additionally refuses channel-scope
+  envelopes through dm-sync.
+- **Far-future `updated_at` refused and healed (round-1 audit blocker).**
+  The settings / vault LWW key is the client's cleartext `updated_at`; it
+  was unbounded, so a stolen-but-unrevoked device or a broken clock could
+  sign `updated_at = u64::MAX` and pin the wallet's row on every node
+  forever — and dm-sync would now spread it. A `KeyVaultSync` whose
+  `updated_at` is more than the 5-min drift window past its envelope
+  timestamp, or a `SettingsSync` more than TWICE that window (round-2
+  audit W1: settings `updated_at` is the max across items merged from
+  devices with skewed clocks), is now refused on every ingress path
+  (`validation::validate_synced_updated_at`,
+  `KEY_VAULT_UPDATED_AT_MAX_AHEAD_MS` / `SETTINGS_UPDATED_AT_MAX_AHEAD_MS`).
+  Stored rows compete with `min(ts, env_ts + bound)` (same per-type bound);
+  a row an older node wrote without `env_ts` whose `ts` lies beyond now +
+  bound competes as 0. So an already-poisoned row heals with the next
+  upload signed after its own envelope time + bound (rows from older
+  nodes: the next upload). The migration never records an origin for such
+  an envelope.
+- **Revocation before delegation now leaves a tombstone (pre-existing,
+  key-exposure class; round-2 audit).** `Storage::revoke_device` returned
+  early when the device was not mapped to the revoking wallet, writing NO
+  `DEVICE_REVOCATIONS` tombstone — on a fresh / catching-up node an L2
+  `DeviceRevocation` or on-chain `revokeDevice` processed before the
+  delegation let a later replay of a stale delegation re-map the revoked
+  (possibly compromised) device. It now writes a tombstone SCOPED to
+  (device, revoking wallet) (`DEVICE_REVOCATIONS` key `device ‖ 0xFF ‖
+  wallet`), consulted with the global one by
+  `Storage::get_device_revoked_at_for` on EVERY path that maps or
+  authorizes a device for a wallet (round-3 audit B1): the router's L2
+  delegation path, the chain scanner's delegation path,
+  `POST /api/v1/devices/register` (now refuses a claim at or before the
+  tombstone; before it checked no tombstone at all), the private-channel
+  sync device-claim gate (`device_claim_unrevoked`, now per wallet),
+  the delegation-proof lookup (`lookup_device_delegation_proof` — a stale
+  delegation the router refused is still stored and indexed, and was
+  treated as live), the member-proof join attribution
+  (`device_delegated_at`) and the dm-sync head. The global lookup is now
+  private to storage. A delegation of that device BY THAT WALLET with
+  `timestamp ≤ revoked_at` is refused, a newer one maps it (legitimate
+  re-delegation). Cross-wallet: the revocation proves nothing
+  about the device (it is unmapped, so nothing binds it to the revoking
+  wallet), so the scoped tombstone never affects any OTHER wallet's
+  delegation of the same key — a wallet can only block its own future
+  delegations (the cross-wallet DoS that kept this path a no-op). Closes
+  the "revoke-before-delegate" limitation recorded in earlier releases for
+  both the mapping and the authorization paths.
+- **Re-delegated devices (round-2 audit N1).** The dm-sync head treats a
+  device-signed vault / settings as revoked only when it was signed at or
+  before the device's revocation tombstone (the router's rule); one signed
+  after a later re-delegation is served.
+- **Reaction ride-along work bound (round-2 audit N3).** At most 8,000
+  `DM_REACTION_MSGS` rows are examined per page (`DM_REACTION_SCAN_CAP`),
+  served or skipped.
+- **Privacy.** dm-sync still answers only a node the wallet authorized
+  (wallet claim, host-bound node signature); a revision-0 or unauthorized
+  request gets nothing new. The new data is the wallet's own (its
+  encrypted vault and settings, keys wrapped for its devices, reactions in
+  its own conversations). New logs carry peer and message type, never a
+  conversation id.
+
+### Known limitations
+
+- `POST /devices/register` stamps a REST revocation with the node's clock, so
+  a client whose clock runs behind can get a 409 if it re-registers the same
+  device key within that skew (clients normally create a fresh device key).
+
+- A vault / settings envelope signed by a delegated DEVICE arrives with
+  the device's delegation (served first on the same page). It is still
+  skipped (neutral) if the responder no longer holds that delegation
+  envelope — it is searched only among the wallet's 64 newest
+  `DeviceDelegation`s (round-2 audit N2) — or the byte budget cut the
+  delegation; dm-sync runs once per wallet per process, so it then
+  arrives only by live gossip or after a restart of the requester.
+- DM reactions, the key vault and settings are not `DeletionRequest`
+  `SingleMessage` targets (deliberate, same as 0.152 chat reactions):
+  account deletion covers vault / settings through the tombstone; a DM
+  reaction is withheld when its target DM is erased.
+- Settings / vault rows written before 0.125.0 (unwrapped) are never served;
+  rows whose origin envelope is no longer stored, or whose device no
+  longer resolves, stay unservable until the next upload.
+- DM key envelopes are served only for conversations listed in
+  `DM_CONVERSATIONS` (≥ 1 DM within retention); keys published for a
+  conversation with no stored DM are not backfilled. Pre-existing: the
+  conversation scan reads at most 2,001 `DM_CONVERSATIONS` rows, one per
+  DM, so a wallet with more DMs than that in the window only backfills the
+  conversations of its most recent DMs.
+- Key envelopes are those wrapped for the wallet's EXISTING devices; a
+  brand-new device decrypts through the restored vault, not these wraps.
+- A conversation participant can still flood its own conversation's key
+  scope (4,096 rows, lowest epoch evicted) through gossip or a hostile
+  responder (no rate limit on either path) — it only affects conversations
+  that participant is in (unchanged).
+- Reaction derived rows (`CHAT_REACTIONS`) of reaped DMs are still not
+  removed (unchanged).
+- A sibling's head is applied only from the first page a cancelled
+  sibling already answered; siblings do not page.
+- A migration row that keeps failing is logged and skipped (round-1 audit
+  N5) PERMANENTLY (round-2 audit N7): the cursor moves past it and the
+  completed migration never revisits it, so that one reaction / settings /
+  vault / key row stays unindexed (unservable) until the next live write.
+- Wallet-scoped revocation tombstones are never reaped (about 130 bytes
+  each — a ~125-byte `device ‖ 0xFF ‖ wallet` key plus an 8-byte value —
+  one per accepted revocation of an unmapped device; the revocation
+  envelope itself is stored anyway).
+- **Do not downgrade below 0.153.0**: older nodes ignore `msg_id` /
+  `env_ts` (equal-`ts` falls back to last arrival), read an account-deletion
+  tombstone as a present row with a `null` blob, accept far-future
+  `updated_at` again, and ignore wallet-scoped revocation tombstones. Older binaries open the DB with `dm_reaction_msgs` as
+  an unknown CF.
+
 ## [0.152.0] - 2026-11-19
 
 Fresh-node backfill gaps, part 2 (plan

@@ -870,9 +870,10 @@ const KEY_COMMITS_MIGRATION_BUDGET: usize = 5_000_000;
 /// migration — one top-level envelope decode per row.
 const DELETION_REQUESTS_INDEX_BUDGET_PER_BOOT: usize = 5_000_000;
 
-/// Max `MESSAGES` rows EACH of the two l2-node 0.152.0 (G6) indexing
+/// Max `MESSAGES` rows EACH of the l2-node 0.152.0 (G6) indexing
 /// migrations (`Storage::backfill_channel_meta_v4`,
-/// `Storage::backfill_chat_reaction_index`) examines per boot; larger
+/// `Storage::backfill_chat_reaction_index`, and since 0.153.0
+/// `Storage::backfill_dm_sync_v11`) examines per boot; larger
 /// databases resume on the next start. Same order as the other
 /// `MESSAGES`-scan migrations.
 const G6_INDEX_BUDGET_PER_BOOT: usize = 5_000_000;
@@ -1239,6 +1240,25 @@ impl Node {
                     "Chat-reaction indexing paused at its per-boot budget; resumes next start"
                 ),
                 Err(e) => warn!(error = %e, "Failed to index stored chat reactions; will retry next start"),
+            }
+        }
+
+        // dm-sync revision 1 (l2-node 0.153.0, G4): index stored DM reactions
+        // into DM_REACTION_MSGS and record the producing envelope of every
+        // current settings / key-vault row, so dm-sync can serve what predates
+        // the upgrade. Budget-capped per boot, resumable, never fatal.
+        if storage.get_stat(state_keys::DM_SYNC_V11_INDEXED)? == 0 {
+            match storage.backfill_dm_sync_v11(G6_INDEX_BUDGET_PER_BOOT) {
+                Ok((n, true)) => {
+                    if n > 0 {
+                        info!(updated = n, "Indexed stored DM reactions and settings/key-vault origins for dm-sync");
+                    }
+                }
+                Ok((n, false)) => info!(
+                    updated = n,
+                    "dm-sync revision-1 indexing paused at its per-boot budget; resumes next start"
+                ),
+                Err(e) => warn!(error = %e, "Failed to index DM reactions / settings origins; will retry next start"),
             }
         }
 

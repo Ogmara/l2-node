@@ -195,15 +195,156 @@ fn stat_counter_merge(
     Some(total.to_be_bytes().to_vec())
 }
 
+/// The signed envelope that produced a stored `settings_sync` / `key_vault`
+/// row (l2-node 0.153.0, G4): its `msg_id` (dm-sync serves the row by
+/// re-serving that original envelope from `MESSAGES`) and its signed
+/// envelope timestamp (bounds the row's LWW `ts` and breaks ties between
+/// two different envelopes carrying the SAME `ts`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SyncedOrigin {
+    /// `msg_id` of the `SettingsSync` / `KeyVaultSync` envelope.
+    pub msg_id: [u8; 32],
+    /// That envelope's signed timestamp (ms).
+    pub envelope_ts: u64,
+}
+
 /// Wrap an opaque per-wallet blob (`settings_sync` / `key_vault`) with the node's
-/// LWW ordering timestamp: `{"_sv":1,"ts":<ts>,"blob":<inner>}`. `inner` is the
-/// exact JSON the API returns, so unwrapping is a field read.
-fn wrap_synced(inner: &[u8], ts: u64) -> Vec<u8> {
-    let blob: serde_json::Value =
-        serde_json::from_slice(inner).unwrap_or_else(|_| serde_json::Value::Null);
-    serde_json::json!({ "_sv": 1, "ts": ts, "blob": blob })
-        .to_string()
-        .into_bytes()
+/// LWW ordering timestamp: `{"_sv":1,"ts":<ts>,"blob":<inner>}`. `blob` is the
+/// exact JSON the API returns, so unwrapping is a field read. Since l2-node
+/// 0.153.0 the wrapper also records the producing envelope (`"msg_id"` hex,
+/// `"env_ts"`) when known; readers that predate it ignore the extra fields.
+fn wrap_synced(blob: serde_json::Value, ts: u64, origin: Option<SyncedOrigin>) -> Vec<u8> {
+    let mut v = serde_json::json!({ "_sv": 1, "ts": ts, "blob": blob });
+    if let (Some(o), Some(obj)) = (origin, v.as_object_mut()) {
+        obj.insert("msg_id".into(), serde_json::json!(hex::encode(o.msg_id)));
+        obj.insert("env_ts".into(), serde_json::json!(o.envelope_ts));
+    }
+    v.to_string().into_bytes()
+}
+
+/// The wrapper fields of a `settings_sync` / `key_vault` row, parsed WITHOUT
+/// materialising the (up to 2 MiB) blob (l2-node 0.153.0 round-1 audit
+/// N4): `blob` is skipped as `IgnoredAny`.
+#[derive(Debug, serde::Deserialize)]
+struct SyncedHeader {
+    #[serde(rename = "_sv", default)]
+    sv: Option<u64>,
+    #[serde(default)]
+    ts: Option<u64>,
+    #[serde(default)]
+    msg_id: Option<String>,
+    #[serde(default)]
+    env_ts: Option<u64>,
+    /// An account-deletion tombstone (`Storage::tombstone_synced_blobs`).
+    #[serde(default)]
+    deleted: bool,
+    #[serde(rename = "blob", default)]
+    _blob: serde::de::IgnoredAny,
+}
+
+/// The header of a wrapped row, or `None` for a legacy unwrapped / malformed
+/// row (which every timestamped write supersedes).
+fn synced_header(raw: &[u8]) -> Option<SyncedHeader> {
+    serde_json::from_slice::<SyncedHeader>(raw).ok().filter(|h| h.sv == Some(1))
+}
+
+impl SyncedHeader {
+    /// The producing envelope, if recorded (never for a tombstone).
+    fn origin(&self) -> Option<SyncedOrigin> {
+        if self.deleted {
+            return None;
+        }
+        let msg_id: [u8; 32] = hex::decode(self.msg_id.as_deref()?).ok()?.try_into().ok()?;
+        Some(SyncedOrigin { msg_id, envelope_ts: self.env_ts.unwrap_or(0) })
+    }
+
+    /// The LWW `ts` this row competes with (l2-node 0.153.0 round-1 audit
+    /// blocker). The stored `ts` is the client's cleartext `updated_at`, so
+    /// it is capped at the producing envelope's signed time plus the drift
+    /// window when that time is recorded (`env_ts`) — a row an older node
+    /// wrote with a far-future `updated_at` (stolen device, broken clock)
+    /// heals with the next honest write. A row without a recorded `env_ts`
+    /// whose `ts` lies beyond `now + drift` cannot be honest and competes
+    /// as `0`; below that it competes with its `ts` as before.
+    ///
+    /// `max_ahead_ms` is the row type's `updated_at` bound
+    /// ([`synced_max_ahead_ms`]): the drift window for the vault, twice it
+    /// for settings (round-2 audit W1) — the same bound the router enforces.
+    fn effective_ts(&self, now_ms: u64, max_ahead_ms: u64) -> u64 {
+        let ts = self.ts.unwrap_or(0);
+        match self.env_ts {
+            Some(env_ts) => ts.min(env_ts.saturating_add(max_ahead_ms)),
+            None if ts > now_ms.saturating_add(max_ahead_ms) => 0,
+            None => ts,
+        }
+    }
+}
+
+/// The `updated_at` bound (ahead of the envelope timestamp) of the rows in
+/// `cf`: `SETTINGS_SYNC` → twice the drift window, `KEY_VAULT` (and anything
+/// else) → the drift window. Mirrors the router's
+/// `validation::validate_synced_updated_at` per type.
+fn synced_max_ahead_ms(cf_name: &str) -> u64 {
+    if cf_name == cf::SETTINGS_SYNC {
+        crate::messages::validation::SETTINGS_UPDATED_AT_MAX_AHEAD_MS
+    } else {
+        crate::messages::validation::KEY_VAULT_UPDATED_AT_MAX_AHEAD_MS
+    }
+}
+
+/// Read a row's inner blob: `None` for an account-deletion tombstone, the
+/// blob for a wrapped row, the raw bytes for a legacy unwrapped row.
+fn read_synced_blob(raw: &[u8]) -> Option<Vec<u8>> {
+    match synced_header(raw) {
+        Some(h) if h.deleted => None,
+        Some(_) => Some(unwrap_synced(raw).0),
+        None => Some(raw.to_vec()),
+    }
+}
+
+/// The inner JSON the node stores for a `SettingsSync` (0x33) payload — the
+/// single definition shared by the router's apply arm and the
+/// `DM_SYNC_V11_INDEXED` migration (which matches a stored row against the
+/// envelopes in `MESSAGES`).
+pub fn settings_sync_blob(p: &crate::messages::types::SettingsSyncPayload) -> serde_json::Value {
+    serde_json::json!({
+        "encrypted_settings": p.encrypted_settings,
+        "nonce": p.nonce,
+        "key_epoch": p.key_epoch,
+    })
+}
+
+/// The inner JSON the node stores for a `KeyVaultSync` (0x38) payload (see
+/// [`settings_sync_blob`]).
+pub fn key_vault_sync_blob(p: &crate::messages::types::KeyVaultSyncPayload) -> serde_json::Value {
+    serde_json::json!({
+        "encrypted_vault": p.encrypted_vault,
+        "nonce": p.nonce,
+        "format_version": p.format_version,
+    })
+}
+
+/// The last-write-wins key of a settings / key-vault blob: the client's
+/// cleartext `updated_at`, or the signed envelope timestamp for an older
+/// client that omits it (`0`).
+pub fn synced_lww_ts(updated_at: u64, envelope_ts: u64) -> u64 {
+    if updated_at > 0 {
+        updated_at
+    } else {
+        envelope_ts
+    }
+}
+
+/// A stored `DirectMessage` target as the DM-reaction index and the dm-sync
+/// responder / receiver see it (l2-node 0.153.0).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DmTarget {
+    /// The DM's own (validated) `conversation_id`.
+    pub conversation_id: [u8; 32],
+    /// The DM envelope's signed timestamp (ms).
+    pub timestamp: u64,
+    /// The DM's recipient wallet.
+    pub recipient: String,
 }
 
 /// Inverse of [`wrap_synced`]. Returns `(inner_blob_bytes, ts)`. A value that is
@@ -432,6 +573,13 @@ pub struct Storage {
     /// are low-frequency relative to message sends (drift-only if raced,
     /// not a security bypass — contrast `channel_key_envelope_lock` above).
     social_counters_lock: Arc<std::sync::Mutex<()>>,
+    /// Serializes the read-modify-write of the per-wallet `settings_sync` /
+    /// `key_vault` rows (`store_synced_lww`, `tombstone_synced_blobs`,
+    /// l2-node 0.153.0 round-1 audit W3). Writers run on the swarm loop
+    /// (gossip, dm-sync) AND on API tasks (`POST /messages`); without the
+    /// lock an older synced vault read-before/written-after a newer API
+    /// upload could overwrite it — the vault is the user's key backup.
+    synced_blob_lock: Arc<std::sync::Mutex<()>>,
     /// Serializes `put_pending_channel_member_removal`/
     /// `take_pending_channel_member_removals` (W18 residual, found+fixed
     /// 2026-08-19) — same TOCTOU rationale as `pending_channel_delete_lock`,
@@ -518,6 +666,7 @@ impl Storage {
         if name == cf::DM_MESSAGES
             || name == cf::NEWS_COMMENTS
             || name == cf::DM_EDIT_DELETE_MSGS
+            || name == cf::DM_REACTION_MSGS
         {
             // DM_MESSAGES key: (conversation_id:32, timestamp:8, msg_id:32)
             // NEWS_COMMENTS key: (post_id:32, timestamp:8, msg_id:32)
@@ -623,6 +772,7 @@ impl Storage {
             channel_membership_lock: Arc::new(std::sync::Mutex::new(())),
             channel_key_envelope_lock: Arc::new(std::sync::Mutex::new(())),
             social_counters_lock: Arc::new(std::sync::Mutex::new(())),
+            synced_blob_lock: Arc::new(std::sync::Mutex::new(())),
             pending_channel_member_removal_lock: Arc::new(std::sync::Mutex::new(())),
             key_commit_legacy_rows_done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             lifecycle: Arc::new(super::channel_lifecycle::LifecycleShared::default()),
@@ -5146,6 +5296,36 @@ impl Storage {
         Ok(true)
     }
 
+    /// A stored `DirectMessage` `target` (l2-node 0.153.0): its own
+    /// validated `conversation_id`, signed timestamp and recipient, or
+    /// `None` when the target is not stored, is not a `DirectMessage`, or
+    /// does not decode. The ONLY source of the conversation a
+    /// `DirectMessageReaction` is indexed under (`DM_REACTION_MSGS`).
+    pub fn dm_message_target(&self, target: &[u8; 32]) -> Option<DmTarget> {
+        use crate::messages::envelope::Envelope;
+        use crate::messages::types::{DirectMessagePayload, MessageType};
+        let raw = self.get_cf(cf::MESSAGES, target).ok().flatten()?;
+        let env: Envelope = rmp_serde::from_slice(&raw).ok()?;
+        if env.msg_type != MessageType::DirectMessage {
+            return None;
+        }
+        let p = rmp_serde::from_slice::<DirectMessagePayload>(&env.payload).ok()?;
+        Some(DmTarget { conversation_id: p.conversation_id, timestamp: env.timestamp, recipient: p.recipient })
+    }
+
+    /// Write the `DM_REACTION_MSGS` row of a `DirectMessageReaction`
+    /// envelope (`reaction_ts`, `reaction_id`) whose target is `target` —
+    /// under the TARGET DM's conversation (`dm_message_target`). Returns
+    /// whether a row was written (`false`: target unknown or not a DM).
+    pub fn index_dm_reaction(&self, target: &[u8; 32], reaction_ts: u64, reaction_id: &[u8; 32]) -> Result<bool> {
+        let Some(t) = self.dm_message_target(target) else {
+            return Ok(false);
+        };
+        let key = super::schema::encode_dm_msg_key(&t.conversation_id, reaction_ts, reaction_id);
+        self.put_cf(cf::DM_REACTION_MSGS, &key, &[])?;
+        Ok(true)
+    }
+
     /// Shared driver of the budget-capped, resumable `MESSAGES` scans
     /// (l2-node 0.152.0 migrations): examines at most `budget` rows after
     /// the key stored under `cursor_key`, calls `f` for every envelope that
@@ -5282,6 +5462,156 @@ impl Storage {
                 self.index_chat_reaction(&p.target_id, env.timestamp, &env.msg_id)
             },
         )
+    }
+
+    /// Migration helper (`backfill_dm_sync_v11`): record `env`'s `msg_id` in
+    /// its DM-scope `CHANNEL_KEYS` row when that row was stored before
+    /// l2-node 0.143.0 (no `msg_id`) and holds exactly this envelope's wrap
+    /// (`eph_pub`, `nonce`, `wrapped`, `epoch`). Rows are keyed by the
+    /// RESOLVED author; an author that no longer resolves is skipped.
+    /// Channel-scope rows are not touched (arbitration owns them).
+    fn record_dm_key_envelope_origin(&self, env: &crate::messages::envelope::Envelope) -> Result<bool> {
+        use crate::messages::types::{key_scope_kind, ChannelKeyEnvelopePayload};
+        let Ok(p) = rmp_serde::from_slice::<ChannelKeyEnvelopePayload>(&env.payload) else {
+            return Ok(false);
+        };
+        if p.scope_kind != key_scope_kind::DM {
+            return Ok(false);
+        }
+        let author = self.resolve_wallet(&env.author)?.unwrap_or_else(|| env.author.clone());
+        let key = super::schema::encode_channel_key(&p.key_scope, &p.target, &author, &p.device_id, p.epoch);
+        // Same lock as the first-write-wins writer, so a concurrent store
+        // can never be overwritten by this read-modify-write.
+        let _guard = self
+            .channel_key_envelope_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(raw) = self.get_cf(cf::CHANNEL_KEYS, &key)? else {
+            return Ok(false);
+        };
+        let Ok(mut rec) = serde_json::from_slice::<serde_json::Value>(&raw) else {
+            return Ok(false);
+        };
+        let field = |name: &str| rec.get(name).and_then(|v| v.as_str()).map(str::to_owned);
+        let matches = rec.get("msg_id").is_none()
+            && field("eph_pub").as_deref() == Some(hex::encode(p.eph_pub).as_str())
+            && field("nonce").as_deref() == Some(hex::encode(p.nonce).as_str())
+            && field("wrapped").as_deref() == Some(hex::encode(&p.wrapped).as_str())
+            && rec.get("epoch").and_then(|v| v.as_u64()) == Some(p.epoch);
+        let Some(obj) = rec.as_object_mut().filter(|_| matches) else {
+            return Ok(false);
+        };
+        obj.insert("msg_id".into(), serde_json::json!(hex::encode(env.msg_id)));
+        self.put_cf(cf::CHANNEL_KEYS, &key, &serde_json::to_vec(&rec)?)?;
+        Ok(true)
+    }
+
+    /// One-time, resumable dm-sync revision-1 migration (l2-node 0.153.0,
+    /// G4, `DM_SYNC_V11_INDEXED`), one `MESSAGES` scan for three jobs:
+    ///
+    /// * stored `DirectMessageReaction`s are indexed into `DM_REACTION_MSGS`
+    ///   under their stored target DM's conversation (`index_dm_reaction`;
+    ///   index only — the derived `CHAT_REACTIONS` rows are not re-applied);
+    /// * for a stored `SettingsSync` / `KeyVaultSync`, if the author's
+    ///   CURRENT `settings_sync` / `key_vault` row has no recorded origin
+    ///   and holds exactly this envelope's blob and LWW `ts`, the envelope's
+    ///   `msg_id` / timestamp are recorded in that row (the row itself is
+    ///   rewritten unchanged otherwise — never a recomputed blob). Older
+    ///   envelopes of the same wallet never match (different blob or `ts`),
+    ///   so the row can only ever point at an envelope that produces it.
+    ///   Legacy unwrapped rows are skipped;
+    /// * a DM-scope `ChannelKeyEnvelope` stored before l2-node 0.143.0 gets
+    ///   its `msg_id` recorded in its `CHANNEL_KEYS` row
+    ///   (`record_dm_key_envelope_origin`) so dm-sync can serve it.
+    ///
+    /// A settings / vault envelope whose `updated_at` today's router would
+    /// refuse is never recorded. A row that fails to process is logged and
+    /// skipped. Examines at most `budget` rows per call. Returns
+    /// `(indexed, done)`.
+    pub fn backfill_dm_sync_v11(&self, budget: usize) -> Result<(u64, bool)> {
+        self.scan_messages_resumable(
+            super::schema::state_keys::DM_SYNC_V11_INDEX_CURSOR,
+            super::schema::state_keys::DM_SYNC_V11_INDEXED,
+            budget,
+            // Round-1 audit N5: a row whose processing keeps failing is
+            // logged and skipped, so one bad row cannot stall the migration
+            // at the same cursor on every boot.
+            |env| match self.dm_sync_v11_row(env) {
+                Ok(done) => Ok(done),
+                Err(e) => {
+                    tracing::warn!(
+                        msg_id = %hex::encode(env.msg_id),
+                        error = %e,
+                        "dm-sync revision-1 migration: skipped a row it could not process"
+                    );
+                    Ok(false)
+                }
+            },
+        )
+    }
+
+    /// One `MESSAGES` row of [`Self::backfill_dm_sync_v11`].
+    fn dm_sync_v11_row(&self, env: &crate::messages::envelope::Envelope) -> Result<bool> {
+        use crate::messages::types::{KeyVaultSyncPayload, MessageType, ReactionPayload, SettingsSyncPayload};
+        let (cf_name, updated_at) = match env.msg_type {
+            MessageType::DirectMessageReaction => {
+                let Ok(p) = rmp_serde::from_slice::<ReactionPayload>(&env.payload) else {
+                    return Ok(false);
+                };
+                return self.index_dm_reaction(&p.target_id, env.timestamp, &env.msg_id);
+            }
+            MessageType::ChannelKeyEnvelope => return self.record_dm_key_envelope_origin(env),
+            MessageType::SettingsSync => match rmp_serde::from_slice::<SettingsSyncPayload>(&env.payload) {
+                Ok(p) => (cf::SETTINGS_SYNC, p.updated_at),
+                Err(_) => return Ok(false),
+            },
+            MessageType::KeyVaultSync => match rmp_serde::from_slice::<KeyVaultSyncPayload>(&env.payload) {
+                Ok(p) => (cf::KEY_VAULT, p.updated_at),
+                Err(_) => return Ok(false),
+            },
+            _ => return Ok(false),
+        };
+        // An envelope today's router refuses (`updated_at` beyond its own
+        // timestamp plus drift) is never recorded as servable.
+        if crate::messages::validation::validate_synced_updated_at(updated_at, env.timestamp, synced_max_ahead_ms(cf_name))
+            .is_err()
+        {
+            return Ok(false);
+        }
+        let lww_ts = synced_lww_ts(updated_at, env.timestamp);
+        // The row is keyed by the resolved WALLET; a device-signed envelope
+        // whose delegation is gone no longer resolves and is skipped (its
+        // row, if any, stays without an origin).
+        let wallet = self.resolve_wallet(&env.author)?.unwrap_or_else(|| env.author.clone());
+        let _guard = self.synced_blob_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(raw) = self.get_cf(cf_name, wallet.as_bytes())? else {
+            return Ok(false);
+        };
+        // Header first (N4): only a wrapped, live, origin-less row with this
+        // exact `ts` is worth comparing blobs for.
+        match synced_header(&raw) {
+            Some(h) if !h.deleted && h.msg_id.is_none() && h.ts == Some(lww_ts) => {}
+            _ => return Ok(false),
+        }
+        let blob = match env.msg_type {
+            MessageType::SettingsSync => rmp_serde::from_slice::<SettingsSyncPayload>(&env.payload)
+                .map(|p| settings_sync_blob(&p))
+                .ok(),
+            _ => rmp_serde::from_slice::<KeyVaultSyncPayload>(&env.payload)
+                .map(|p| key_vault_sync_blob(&p))
+                .ok(),
+        };
+        let Ok(mut row) = serde_json::from_slice::<serde_json::Value>(&raw) else {
+            return Ok(false);
+        };
+        let matches = blob.is_some() && row.get("blob") == blob.as_ref();
+        let Some(obj) = row.as_object_mut().filter(|_| matches) else {
+            return Ok(false);
+        };
+        obj.insert("msg_id".into(), serde_json::json!(hex::encode(env.msg_id)));
+        obj.insert("env_ts".into(), serde_json::json!(env.timestamp));
+        self.put_cf(cf_name, wallet.as_bytes(), row.to_string().as_bytes())?;
+        Ok(true)
     }
 
     // --- Edit History ---
@@ -5611,21 +5941,41 @@ impl Storage {
     /// `ts` — the client's cleartext "content last-edited at" — is the only
     /// ordering key the node has when the same wallet's blob arrives from two
     /// devices: once via `POST /api/v1/messages` on the home node, again via the
-    /// `topic_profile` gossip relay on every other node. A write whose `ts` is
-    /// strictly older than what is already stored is dropped, so a device
-    /// re-uploading an old copy to seed a fresh node can never roll back newer
-    /// content that reached this node first. Returns `true` if the write was
-    /// applied, `false` if it was dropped as stale.
-    pub fn store_settings(&self, wallet_address: &str, data: &[u8], ts: u64) -> Result<bool> {
-        self.store_synced_lww(cf::SETTINGS_SYNC, wallet_address, data, ts)
+    /// `topic_profile` gossip relay on every other node, and (l2-node 0.153.0)
+    /// via dm-sync. A write whose `ts` is strictly older than what is already
+    /// stored is dropped, so a device re-uploading an old copy to seed a fresh
+    /// node can never roll back newer content that reached this node first.
+    /// Returns `true` if the write was applied, `false` if it was dropped.
+    ///
+    /// `origin` (l2-node 0.153.0) records the producing envelope so dm-sync
+    /// can re-serve the row; `blob` is only built when the write is applied.
+    /// See `store_synced_lww` for the exact rule.
+    pub fn store_settings(
+        &self,
+        wallet_address: &str,
+        ts: u64,
+        origin: Option<SyncedOrigin>,
+        blob: impl FnOnce() -> serde_json::Value,
+    ) -> Result<bool> {
+        self.store_synced_lww(cf::SETTINGS_SYNC, wallet_address, ts, origin, blob)
+    }
+
+    /// The envelope that produced the wallet's current settings row
+    /// (l2-node 0.153.0), if recorded.
+    pub fn get_settings_origin(&self, wallet_address: &str) -> Result<Option<SyncedOrigin>> {
+        Ok(self
+            .get_cf(cf::SETTINGS_SYNC, wallet_address.as_bytes())?
+            .and_then(|raw| synced_header(&raw))
+            .and_then(|h| h.origin()))
     }
 
     /// Get encrypted settings blob for a user (the inner client blob, with the
-    /// node's LWW wrapper stripped; legacy unwrapped values pass through).
+    /// node's LWW wrapper stripped; legacy unwrapped values pass through; an
+    /// account-deletion tombstone reads as absent).
     pub fn get_settings(&self, wallet_address: &str) -> Result<Option<Vec<u8>>> {
         Ok(self
             .get_cf(cf::SETTINGS_SYNC, wallet_address.as_bytes())?
-            .map(|raw| unwrap_synced(&raw).0))
+            .and_then(|raw| read_synced_blob(&raw)))
     }
 
     /// The stored LWW timestamp for a user's settings blob (`0` if none / legacy).
@@ -5640,18 +5990,35 @@ impl Storage {
 
     /// Store the encrypted E2E key-recovery vault for a user, LWW by `ts`.
     ///
-    /// Same rationale as [`store_settings`]: the blob is opaque, so the client's
-    /// cleartext write time orders concurrent copies from multiple devices and
-    /// the `topic_profile` gossip relay. Returns `true` if applied.
-    pub fn store_key_vault(&self, wallet_address: &str, data: &[u8], ts: u64) -> Result<bool> {
-        self.store_synced_lww(cf::KEY_VAULT, wallet_address, data, ts)
+    /// Same rationale and rule as [`store_settings`]: the blob is opaque, so
+    /// the client's cleartext write time orders concurrent copies from
+    /// multiple devices, the `topic_profile` gossip relay and dm-sync.
+    /// Returns `true` if applied.
+    pub fn store_key_vault(
+        &self,
+        wallet_address: &str,
+        ts: u64,
+        origin: Option<SyncedOrigin>,
+        blob: impl FnOnce() -> serde_json::Value,
+    ) -> Result<bool> {
+        self.store_synced_lww(cf::KEY_VAULT, wallet_address, ts, origin, blob)
     }
 
-    /// Get the encrypted E2E key-recovery vault for a user (inner blob).
+    /// The envelope that produced the wallet's current key-vault row
+    /// (l2-node 0.153.0), if recorded.
+    pub fn get_key_vault_origin(&self, wallet_address: &str) -> Result<Option<SyncedOrigin>> {
+        Ok(self
+            .get_cf(cf::KEY_VAULT, wallet_address.as_bytes())?
+            .and_then(|raw| synced_header(&raw))
+            .and_then(|h| h.origin()))
+    }
+
+    /// Get the encrypted E2E key-recovery vault for a user (inner blob; an
+    /// account-deletion tombstone reads as absent).
     pub fn get_key_vault(&self, wallet_address: &str) -> Result<Option<Vec<u8>>> {
         Ok(self
             .get_cf(cf::KEY_VAULT, wallet_address.as_bytes())?
-            .map(|raw| unwrap_synced(&raw).0))
+            .and_then(|raw| read_synced_blob(&raw)))
     }
 
     /// The stored LWW timestamp for a user's key-vault blob (`0` if none / legacy).
@@ -5664,41 +6031,94 @@ impl Storage {
     }
 
     /// Shared LWW read-modify-write for the two per-wallet opaque blobs
-    /// (`settings_sync`, `key_vault`). Stores `{"_sv":1,"ts":<ts>,"blob":<inner>}`;
-    /// drops a write whose `ts` is strictly older than the stored one.
+    /// (`settings_sync`, `key_vault`). Stores `{"_sv":1,"ts":<ts>,"blob":<inner>,
+    /// "msg_id"?,"env_ts"?}`. The rule, identical on every ingress path:
     ///
-    /// The read-then-write is not transactional. The gossip-relay path runs on
-    /// the single-threaded swarm loop, so the only race is two `POST
-    /// /api/v1/messages` for the *same wallet* landing on the *same node* within
-    /// the RMW window (microseconds) — one human, two devices, near-simultaneous.
-    /// The worst outcome is the older of the two racing writes persisting, i.e.
-    /// exactly the pre-0.125.0 blind-`put` semantics; the client's own
-    /// `updatedAt` LWW on apply is the backstop. A per-wallet lock would close it
-    /// but is not worth the contention for a setting a user changes by hand.
-    fn store_synced_lww(&self, cf: &str, wallet_address: &str, inner: &[u8], ts: u64) -> Result<bool> {
+    /// * the incoming `ts` is capped at `origin.envelope_ts + max_ahead`
+    ///   (`synced_max_ahead_ms`: drift for the vault, 2 × drift for
+    ///   settings — the router already refuses `updated_at` beyond that,
+    ///   l2-node 0.153.0 audit rounds 1/2); the stored row competes with its
+    ///   [`SyncedHeader::effective_ts`] (capped the same way, so a row an
+    ///   older node pinned with a far-future `updated_at` heals);
+    /// * strictly older → dropped; against an account-deletion tombstone,
+    ///   older OR EQUAL → dropped (a vault signed up to the deletion never
+    ///   comes back through gossip or dm-sync);
+    /// * equal `ts` with both producing envelopes known → the one signed
+    ///   later (`(env_ts, msg_id)`) wins, so nodes converge whatever the
+    ///   arrival order; otherwise the write is applied (a re-broadcast of the
+    ///   same envelope is idempotent).
+    ///
+    /// The read-modify-write runs under `synced_blob_lock` (round-1 audit
+    /// W3): the swarm loop (gossip, dm-sync) and the API tasks both write
+    /// these rows. `blob` is built only once the write is decided.
+    fn store_synced_lww(
+        &self,
+        cf: &str,
+        wallet_address: &str,
+        ts: u64,
+        origin: Option<SyncedOrigin>,
+        blob: impl FnOnce() -> serde_json::Value,
+    ) -> Result<bool> {
+        let max_ahead = synced_max_ahead_ms(cf);
+        let ts = match origin {
+            Some(o) => ts.min(o.envelope_ts.saturating_add(max_ahead)),
+            None => ts,
+        };
+        let _guard = self.synced_blob_lock.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(existing) = self.get_cf(cf, wallet_address.as_bytes())? {
-            let (_, existing_ts) = unwrap_synced(&existing);
-            // Legacy unwrapped rows report existing_ts = 0, so the first
-            // timestamped write always upgrades them.
-            if existing_ts > ts {
-                return Ok(false);
+            // Legacy unwrapped rows have no header: every timestamped write
+            // supersedes them.
+            if let Some(h) = synced_header(&existing) {
+                let existing_ts = h.effective_ts(crate::util::now_ms(), max_ahead);
+                if h.deleted {
+                    if ts <= existing_ts {
+                        return Ok(false);
+                    }
+                } else if existing_ts > ts {
+                    return Ok(false);
+                } else if existing_ts == ts {
+                    if let (Some(old), Some(new)) = (h.origin(), origin) {
+                        if (new.envelope_ts, new.msg_id) < (old.envelope_ts, old.msg_id) {
+                            return Ok(false);
+                        }
+                    }
+                }
             }
         }
-        let wrapped = wrap_synced(inner, ts);
+        let wrapped = wrap_synced(blob(), ts, origin);
         self.put_cf(cf, wallet_address.as_bytes(), &wrapped)?;
         Ok(true)
     }
 
-    /// Delete a user's encrypted key-recovery vault + settings blob (account
-    /// deletion). These are the most sensitive per-account artifacts, so a
-    /// "delete all my content" request must purge them, not just news rows.
-    pub fn delete_key_vault(&self, wallet_address: &str) -> Result<()> {
-        self.delete_cf(cf::KEY_VAULT, wallet_address.as_bytes())
-    }
-
-    /// Delete a user's encrypted settings blob (account deletion).
-    pub fn delete_settings(&self, wallet_address: &str) -> Result<()> {
-        self.delete_cf(cf::SETTINGS_SYNC, wallet_address.as_bytes())
+    /// Account deletion (`DeletionRequest` `AllUserContent`, l2-node 0.153.0
+    /// round-1 audit W1): replace the wallet's `key_vault` and
+    /// `settings_sync` rows with a TOMBSTONE `{"_sv":1,"ts":<deleted_at>,
+    /// "env_ts":<deleted_at>,"deleted":true,"blob":null}` instead of
+    /// deleting them. Reads see no row (`GET` → 404), dm-sync serves
+    /// nothing (no origin), and `store_synced_lww` refuses any vault /
+    /// settings whose `ts` is not strictly newer than the deletion — before,
+    /// a plain delete let an old signed envelope (gossip relay, dm-sync)
+    /// resurrect the erased vault. A row strictly newer than `deleted_at`
+    /// (an upload after the request) is kept. Under `synced_blob_lock`.
+    pub fn tombstone_synced_blobs(&self, wallet_address: &str, deleted_at: u64) -> Result<()> {
+        let _guard = self.synced_blob_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let now = crate::util::now_ms();
+        let tomb = serde_json::json!({
+            "_sv": 1, "ts": deleted_at, "env_ts": deleted_at, "deleted": true, "blob": null,
+        })
+        .to_string()
+        .into_bytes();
+        for c in [cf::KEY_VAULT, cf::SETTINGS_SYNC] {
+            if let Some(existing) = self.get_cf(c, wallet_address.as_bytes())? {
+                if let Some(h) = synced_header(&existing) {
+                    if h.effective_ts(now, synced_max_ahead_ms(c)) > deleted_at {
+                        continue;
+                    }
+                }
+            }
+            self.put_cf(c, wallet_address.as_bytes(), &tomb)?;
+        }
+        Ok(())
     }
 
     // --- Notifications ---
@@ -6089,6 +6509,9 @@ impl Storage {
     ///
     /// Removes both the forward and reverse mappings. Returns `true` if the
     /// device was registered (and is now removed), `false` if it wasn't found.
+    /// Since l2-node 0.153.0 a revocation of a device that is NOT mapped to
+    /// `wallet_address` still records a tombstone scoped to (device, that
+    /// wallet) — see [`Self::get_device_revoked_at_for`].
     ///
     /// Note: the read-then-delete is not fully atomic (TOCTOU). The API layer
     /// (Phase 3) serializes revocations per wallet via auth, making concurrent
@@ -6105,12 +6528,19 @@ impl Storage {
         // could tombstone a device it doesn't own and DoS the real owner's
         // delegation.
         match self.get_cf(cf::DEVICE_WALLET_MAP, device_key)? {
-            Some(stored_wallet) => {
-                if stored_wallet != wallet_address.as_bytes() {
-                    return Ok(false); // device belongs to a different wallet
-                }
+            Some(stored_wallet) if stored_wallet == wallet_address.as_bytes() => {}
+            // Not mapped to this wallet — unmapped (a revocation that arrives
+            // before the delegation: catching-up node, reordered sync) or
+            // mapped to ANOTHER wallet. l2-node 0.153.0: record a tombstone
+            // SCOPED to (device, this wallet) so this wallet's own older
+            // delegation of the device can never map it later. Scoped, not
+            // global: the revoking wallet proved nothing about the device, so
+            // its say-so must never block another wallet's delegation of the
+            // same key (the cross-wallet DoS that kept this path a no-op).
+            _ => {
+                self.put_scoped_device_revocation(device_address, wallet_address, revoked_at)?;
+                return Ok(false);
             }
-            None => return Ok(false), // device not registered
         }
 
         let wallet_device_key = encode_wallet_device_key(wallet_address, device_address);
@@ -6136,14 +6566,66 @@ impl Storage {
         Ok(true)
     }
 
-    /// Revocation-tombstone timestamp for a device, if it was ever revoked
-    /// (P-2). A `DeviceDelegation` with `timestamp <= revoked_at` must be
-    /// rejected to prevent resurrecting a revoked device via stale replay.
-    pub fn get_device_revoked_at(&self, device_address: &str) -> Result<Option<u64>> {
+    /// The GLOBAL revocation-tombstone timestamp for a device (P-2), written
+    /// when the device was revoked while mapped. Private since l2-node
+    /// 0.153.0 (round-3 audit B1): every production reader must use
+    /// [`Self::get_device_revoked_at_for`], which also applies the
+    /// wallet-scoped tombstone.
+    fn global_device_revoked_at(&self, device_address: &str) -> Result<Option<u64>> {
         Ok(self
             .get_cf(cf::DEVICE_REVOCATIONS, device_address.as_bytes())?
             .and_then(|b| <[u8; 8]>::try_from(b.as_slice()).ok())
             .map(u64::from_be_bytes))
+    }
+
+    /// Test-only view of the GLOBAL tombstone ([`Self::global_device_revoked_at`]).
+    #[cfg(test)]
+    pub fn get_device_revoked_at(&self, device_address: &str) -> Result<Option<u64>> {
+        self.global_device_revoked_at(device_address)
+    }
+
+    /// `DEVICE_REVOCATIONS` key of a revocation scoped to one wallet
+    /// (l2-node 0.153.0): `device ‖ 0xFF ‖ wallet`. Disjoint from the global
+    /// `device` key (bech32 addresses never contain `0xFF`), so
+    /// `global_device_revoked_at` never sees it.
+    fn scoped_device_revocation_key(device_address: &str, wallet_address: &str) -> Vec<u8> {
+        let mut k = Vec::with_capacity(device_address.len() + 1 + wallet_address.len());
+        k.extend_from_slice(device_address.as_bytes());
+        k.push(0xFF);
+        k.extend_from_slice(wallet_address.as_bytes());
+        k
+    }
+
+    /// Record (max-merge) a revocation of `device_address` by
+    /// `wallet_address` at `revoked_at` that applies ONLY to that wallet's
+    /// delegations of the device (see `revoke_device`).
+    fn put_scoped_device_revocation(&self, device_address: &str, wallet_address: &str, revoked_at: u64) -> Result<()> {
+        let key = Self::scoped_device_revocation_key(device_address, wallet_address);
+        let prev = self
+            .get_cf(cf::DEVICE_REVOCATIONS, &key)?
+            .and_then(|b| <[u8; 8]>::try_from(b.as_slice()).ok())
+            .map(u64::from_be_bytes)
+            .unwrap_or(0);
+        self.put_cf(cf::DEVICE_REVOCATIONS, &key, &revoked_at.max(prev).to_be_bytes())
+    }
+
+    /// The revocation tombstone that applies to a delegation of
+    /// `device_address` BY `wallet_address` (l2-node 0.153.0): the later of
+    /// the device's global tombstone (written when the device was revoked
+    /// while mapped) and a tombstone that wallet wrote while the device was
+    /// not mapped to it. A `DeviceDelegation` by that wallet with
+    /// `timestamp <= revoked_at` is refused; another wallet's delegation of
+    /// the same key only sees the global tombstone.
+    pub fn get_device_revoked_at_for(&self, device_address: &str, wallet_address: &str) -> Result<Option<u64>> {
+        let scoped = self
+            .get_cf(cf::DEVICE_REVOCATIONS, &Self::scoped_device_revocation_key(device_address, wallet_address))?
+            .and_then(|b| <[u8; 8]>::try_from(b.as_slice()).ok())
+            .map(u64::from_be_bytes);
+        let global = self.global_device_revoked_at(device_address)?;
+        Ok(match (global, scoped) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        })
     }
 
     /// Resolve a device address to its owning wallet address.
@@ -8165,10 +8647,12 @@ mod synced_blob_lww_tests {
         (Storage::open(dir.path()).unwrap(), dir)
     }
 
-    fn blob(tag: &str) -> Vec<u8> {
+    fn bv(tag: &str) -> serde_json::Value {
         serde_json::json!({ "encrypted_settings": tag, "nonce": [], "key_epoch": 0 })
-            .to_string()
-            .into_bytes()
+    }
+
+    fn blob(tag: &str) -> Vec<u8> {
+        bv(tag).to_string().into_bytes()
     }
 
     #[test]
@@ -8176,23 +8660,23 @@ mod synced_blob_lww_tests {
         let (s, _d) = db();
         let w = "klv1wallet";
 
-        assert!(s.store_settings(w, &blob("v2"), 200).unwrap());
+        assert!(s.store_settings(w, 200, None, || bv("v2")).unwrap());
         assert_eq!(s.get_settings_ts(w).unwrap(), 200);
         // get_settings strips the LWW wrapper — the client sees exactly what it stored.
         assert_eq!(s.get_settings(w).unwrap().unwrap(), blob("v2"));
 
         // An out-of-order relay of an older copy is dropped, content unchanged.
-        assert!(!s.store_settings(w, &blob("v1"), 100).unwrap());
+        assert!(!s.store_settings(w, 100, None, || bv("v1")).unwrap());
         assert_eq!(s.get_settings(w).unwrap().unwrap(), blob("v2"));
         assert_eq!(s.get_settings_ts(w).unwrap(), 200);
 
         // A strictly newer copy replaces it.
-        assert!(s.store_settings(w, &blob("v3"), 300).unwrap());
+        assert!(s.store_settings(w, 300, None, || bv("v3")).unwrap());
         assert_eq!(s.get_settings(w).unwrap().unwrap(), blob("v3"));
 
         // Equal ts (a re-broadcast of the same envelope) is idempotent — applied,
         // same content.
-        assert!(s.store_settings(w, &blob("v3"), 300).unwrap());
+        assert!(s.store_settings(w, 300, None, || bv("v3")).unwrap());
         assert_eq!(s.get_settings(w).unwrap().unwrap(), blob("v3"));
     }
 
@@ -8206,7 +8690,7 @@ mod synced_blob_lww_tests {
         assert_eq!(s.get_settings(w).unwrap().unwrap(), blob("legacy"));
 
         // First timestamped write supersedes it (0 is never > ts).
-        assert!(s.store_settings(w, &blob("new"), 1).unwrap());
+        assert!(s.store_settings(w, 1, None, || bv("new")).unwrap());
         assert_eq!(s.get_settings(w).unwrap().unwrap(), blob("new"));
         assert_eq!(s.get_settings_ts(w).unwrap(), 1);
     }
@@ -8215,10 +8699,102 @@ mod synced_blob_lww_tests {
     fn key_vault_uses_the_same_lww_path() {
         let (s, _d) = db();
         let w = "klv1kv";
-        assert!(s.store_key_vault(w, &blob("kv2"), 20).unwrap());
-        assert!(!s.store_key_vault(w, &blob("kv1"), 10).unwrap());
+        assert!(s.store_key_vault(w, 20, None, || bv("kv2")).unwrap());
+        assert!(!s.store_key_vault(w, 10, None, || bv("kv1")).unwrap());
         assert_eq!(s.get_key_vault(w).unwrap().unwrap(), blob("kv2"));
         assert_eq!(s.get_key_vault_ts(w).unwrap(), 20);
+    }
+
+    fn origin(id: u8, env_ts: u64) -> Option<SyncedOrigin> {
+        Some(SyncedOrigin { msg_id: [id; 32], envelope_ts: env_ts })
+    }
+
+    /// Round-1 audit blocker: a row pinned with a far-future `ts` heals —
+    /// with a recorded `env_ts` it competes as `env_ts + drift`, without one
+    /// (written by an older node) a `ts` beyond `now + drift` competes as 0.
+    #[test]
+    fn far_future_rows_heal() {
+        let (s, _d) = db();
+        let now = crate::util::now_ms();
+        let drift = crate::messages::envelope::MAX_TIMESTAMP_DRIFT_MS;
+        // Pre-0.153 poisoned row: ts = u64::MAX, no env_ts.
+        let w = "klv1poisoned";
+        s.put_cf(cf::KEY_VAULT, w.as_bytes(), serde_json::json!({"_sv":1,"ts":u64::MAX,"blob":bv("bad")}).to_string().as_bytes())
+            .unwrap();
+        assert!(s.store_key_vault(w, now, origin(1, now), || bv("good")).unwrap());
+        assert_eq!(s.get_key_vault(w).unwrap().unwrap(), blob("good"));
+        // Poisoned row WITH a recorded env_ts.
+        let w2 = "klv1poisoned2";
+        s.put_cf(
+            cf::KEY_VAULT,
+            w2.as_bytes(),
+            serde_json::json!({"_sv":1,"ts":u64::MAX,"env_ts":now - 10_000,"msg_id":hex::encode([9u8;32]),"blob":bv("bad")})
+                .to_string()
+                .as_bytes(),
+        )
+        .unwrap();
+        // It competes as env_ts + drift: anything signed after that wins
+        // (bounded at 5 minutes, instead of never).
+        assert!(!s.store_key_vault(w2, now - 20_000, origin(2, now - 20_000), || bv("older")).unwrap());
+        let after = now - 10_000 + drift + 1;
+        assert!(s.store_key_vault(w2, after, origin(3, after), || bv("good")).unwrap());
+        assert_eq!(s.get_key_vault(w2).unwrap().unwrap(), blob("good"));
+        // An incoming far-future ts is capped at its own env_ts + drift.
+        let w3 = "klv1capped";
+        assert!(s.store_key_vault(w3, u64::MAX, origin(4, now), || bv("x")).unwrap());
+        assert_eq!(s.get_key_vault_ts(w3).unwrap(), now + drift);
+        // A plausible legacy-shaped row (no env_ts, ts <= now) still wins
+        // against an older write.
+        let w4 = "klv1plausible";
+        s.put_cf(cf::KEY_VAULT, w4.as_bytes(), serde_json::json!({"_sv":1,"ts":now,"blob":bv("keep")}).to_string().as_bytes())
+            .unwrap();
+        assert!(!s.store_key_vault(w4, now - 1, origin(5, now - 1), || bv("old")).unwrap());
+    }
+
+    /// Round-1 audit W1: account deletion leaves a tombstone that hides the
+    /// rows and refuses any copy signed up to the deletion; a strictly newer
+    /// upload is accepted, and an upload newer than the deletion survives it.
+    #[test]
+    fn tombstone_refuses_resurrection() {
+        let (s, _d) = db();
+        let w = "klv1gone";
+        assert!(s.store_key_vault(w, 100, origin(1, 100), || bv("v")).unwrap());
+        assert!(s.store_settings(w, 100, origin(2, 100), || bv("s")).unwrap());
+        s.tombstone_synced_blobs(w, 150).unwrap();
+        assert!(s.get_key_vault(w).unwrap().is_none());
+        assert!(s.get_settings(w).unwrap().is_none());
+        assert!(s.get_key_vault_origin(w).unwrap().is_none());
+        assert!(!s.store_key_vault(w, 100, origin(1, 100), || bv("v")).unwrap());
+        assert!(!s.store_key_vault(w, 150, origin(3, 150), || bv("v")).unwrap());
+        assert!(s.store_key_vault(w, 151, origin(4, 151), || bv("new")).unwrap());
+        assert_eq!(s.get_key_vault(w).unwrap().unwrap(), blob("new"));
+        // A deletion older than the stored row keeps the row.
+        s.tombstone_synced_blobs(w, 120).unwrap();
+        assert_eq!(s.get_key_vault(w).unwrap().unwrap(), blob("new"));
+    }
+
+    /// Round-1 audit W3: concurrent writers (swarm loop vs API tasks) never
+    /// leave an older vault in place.
+    #[test]
+    fn concurrent_writers_keep_the_newest() {
+        let (s, _d) = db();
+        let w = "klv1race";
+        let handles: Vec<_> = (1..=16u64)
+            .map(|i| {
+                let s = s.clone();
+                std::thread::spawn(move || {
+                    for k in 0..50u64 {
+                        let ts = k * 100 + i;
+                        s.store_key_vault(w, ts, origin(i as u8, ts), || bv(&format!("t{ts}"))).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(s.get_key_vault_ts(w).unwrap(), 49 * 100 + 16);
+        assert_eq!(s.get_key_vault(w).unwrap().unwrap(), blob(&format!("t{}", 49 * 100 + 16)));
     }
 }
 

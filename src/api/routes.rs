@@ -7734,6 +7734,21 @@ pub struct RegisterDeviceRequest {
     pub device_signature: Option<String>,
 }
 
+/// `true` when `POST /api/v1/devices/register` must refuse a claim of
+/// `device` by `wallet` at `ts` (l2-node 0.153.0, round-3 audit B1): the
+/// device's revocation tombstone applying to that wallet — global, or
+/// scoped to the wallet (a revocation processed before the device was
+/// mapped) — is at or after `ts`. A newer claim is a legitimate
+/// re-registration.
+pub(crate) fn device_registration_revoked(
+    storage: &crate::storage::rocks::Storage,
+    device: &str,
+    wallet: &str,
+    ts: u64,
+) -> anyhow::Result<bool> {
+    Ok(storage.get_device_revoked_at_for(device, wallet)?.is_some_and(|r| ts <= r))
+}
+
 /// POST /api/v1/devices/register — register a device key under a wallet.
 ///
 /// Verifies the wallet-signed claim:
@@ -7875,6 +7890,21 @@ pub async fn register_device(
         wallet_signature: body.wallet_signature.clone(),
         registered_at: body.timestamp,
     };
+
+    // l2-node 0.153.0 (round-3 audit B1): never re-map a device whose
+    // revocation tombstone — global, or scoped to THIS wallet (a revocation
+    // processed before the device was mapped) — is at or after the claim.
+    // A newer claim is a legitimate re-registration.
+    match device_registration_revoked(&state.storage, &device_address, &body.wallet_address, body.timestamp) {
+        Ok(true) => {
+            return (StatusCode::CONFLICT, "device revoked at or after this registration timestamp").into_response();
+        }
+        Ok(false) => {}
+        Err(e) => {
+            tracing::warn!(error = %e, "Device registration: revocation lookup failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "storage error").into_response();
+        }
+    }
 
     // If this device key is already linked to a DIFFERENT wallet, refuse with
     // 409 Conflict (not an opaque 500) so the client knows to mint a FRESH
