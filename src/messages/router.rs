@@ -597,6 +597,26 @@ fn internal_error(context: &str, e: impl std::fmt::Display) -> String {
     INTERNAL_ERROR_REASON.to_string()
 }
 
+/// `true` for a router rejection caused by the author being banned or muted
+/// in the channel (Steps 7b / 7b2; the `wrap_rejection` prefixes). On the
+/// sync path such a refusal is NEUTRAL for a requester's session evidence
+/// (l2-node 0.152.0, round-1 audit B1): an honest responder legitimately
+/// holds the pre-ban / pre-mute history this node refuses.
+pub fn is_moderation_refusal(reason: &str) -> bool {
+    reason.starts_with("banned: ") || reason.starts_with("muted: ")
+}
+
+/// Rejection-reason prefix of a sync-path `ChatReaction` whose target is not
+/// stored (Step 7b3, l2-node 0.152.0).
+pub const REACTION_TARGET_UNKNOWN_PREFIX: &str = "reaction_target_unknown: ";
+
+/// `true` for every sync-path refusal that is NEUTRAL for a requester's
+/// session evidence (neither progress nor taint): a ban / mute refusal
+/// (`is_moderation_refusal`) or a reaction to an unknown target.
+pub fn is_neutral_sync_refusal(reason: &str) -> bool {
+    is_moderation_refusal(reason) || reason.starts_with(REACTION_TARGET_UNKNOWN_PREFIX)
+}
+
 /// Prefix a step-7 rejection reason with its step label — except the
 /// internal-error reason, which stays exact so the API can classify it.
 fn wrap_rejection(prefix: &str, e: String) -> String {
@@ -1117,6 +1137,25 @@ impl MessageRouter {
         // Step 7b2: Check mute enforcement — muted users cannot send messages/reactions
         if let Err(e) = self.check_channel_mute(&envelope, &resolved_author) {
             return RouteResult::Rejected(wrap_rejection("muted", e));
+        }
+
+        // Step 7b3 (l2-node 0.152.0, round-2 audit N1): on the sync path a
+        // `ChatReaction` whose target is not stored is refused — it cannot
+        // be checked against its channel's bans / mutes, indexed or served.
+        // Neutral for the requester's session (`is_neutral_sync_refusal`):
+        // a backfill legitimately carries reactions to targets outside the
+        // requester's window. Live paths keep accepting them (out-of-order
+        // gossip; recorded limitation: such a reaction is never indexed).
+        if is_sync && envelope.msg_type == MessageType::ChatReaction {
+            let target_known = rmp_serde::from_slice::<ReactionPayload>(&envelope.payload)
+                .ok()
+                .and_then(|p| self.storage.chat_message_channel(&p.target_id))
+                .is_some();
+            if !target_known {
+                return RouteResult::Rejected(format!(
+                    "{REACTION_TARGET_UNKNOWN_PREFIX}the reacted-to chat message is not stored"
+                ));
+            }
         }
 
         // Step 7c: Authorize channel admin operations
@@ -2374,7 +2413,7 @@ impl MessageRouter {
     /// Rejects channel-scoped messages from banned users.
     /// Also enforces ban expiration: expired bans are cleaned up on read.
     fn check_channel_ban(&self, envelope: &Envelope, resolved_author: &str) -> Result<(), String> {
-        let channel_id = match self.extract_channel_id(envelope) {
+        let channel_id = match self.moderation_channel_id(envelope) {
             Some(id) => id,
             None => return Ok(()), // not a channel-scoped message
         };
@@ -2411,13 +2450,25 @@ impl MessageRouter {
 
     /// Check if user is muted in the channel. Muted users cannot send ChatMessage
     /// or ChatReaction to the channel. Other message types (edits, deletes, leaves) are allowed.
+    ///
+    /// Refused on EVERY path, the sync path included, whatever the envelope's
+    /// timestamp (l2-node 0.152.0 round-2 audit: a sync-path exemption for
+    /// envelopes signed before the mute let a muted user back-date new posts
+    /// and spread them over sync — no local signal reliably tells a fresh
+    /// node from an established one). On the sync path the refusal is
+    /// NEUTRAL for the requester's session evidence (`is_moderation_refusal`).
+    /// Recorded limitation: a node that learns the mute before the history
+    /// (every fresh backfill: mutes ride the metadata, which replays first)
+    /// misses the muted user's legitimate pre-mute posts; a pre-mute /
+    /// pre-ban exemption is a future item. A `ChatReaction` is checked
+    /// against its target's channel (`moderation_channel_id`).
     fn check_channel_mute(&self, envelope: &Envelope, resolved_author: &str) -> Result<(), String> {
         // Only enforce mute on ChatMessage and ChatReaction
         match envelope.msg_type {
             MessageType::ChatMessage | MessageType::ChatReaction => {}
             _ => return Ok(()),
         }
-        let channel_id = match self.extract_channel_id(envelope) {
+        let channel_id = match self.moderation_channel_id(envelope) {
             Some(id) => id,
             None => return Ok(()),
         };
@@ -3352,7 +3403,7 @@ impl MessageRouter {
             MessageType::ChannelLeave => rmp_serde::from_slice::<ChannelLeavePayload>(&envelope.payload)
                 .ok()
                 .map(|p| p.channel_id),
-            _ => self.extract_channel_id(envelope),
+            _ => self.moderation_channel_id(envelope),
         }
     }
 
@@ -3373,6 +3424,24 @@ impl MessageRouter {
                 self.storage.purging_channel_creator(channel_id),
                 Ok(Some(ref creator)) if creator == author
             )
+    }
+
+    /// The channel a ban / mute / purge guard is checked against (l2-node
+    /// 0.152.0, round-1 audit W3). For a `ChatReaction` it is the channel of
+    /// the stored TARGET chat message — `ReactionPayload.channel_id` is
+    /// author-controlled, so a muted or banned user could otherwise omit it
+    /// or name another channel and react anyway; only when the target is not
+    /// stored does the payload's value apply. Every other type: its own
+    /// payload channel (`extract_channel_id`).
+    fn moderation_channel_id(&self, envelope: &Envelope) -> Option<u64> {
+        if envelope.msg_type == MessageType::ChatReaction {
+            if let Ok(p) = rmp_serde::from_slice::<ReactionPayload>(&envelope.payload) {
+                if let Some(cid) = self.storage.chat_message_channel(&p.target_id) {
+                    return Some(cid);
+                }
+            }
+        }
+        self.extract_channel_id(envelope)
     }
 
     /// Extract the channel_id from channel-scoped message payloads.
@@ -4457,6 +4526,17 @@ impl MessageRouter {
                 // record's own `grant_msg_id`.)
                 | MessageType::ChannelAddModerator
                 | MessageType::ChannelRemoveModerator
+                // Pins and mutes (l2-node 0.152.0, G6): before, their apply
+                // wrote only state (`CHANNEL_PINS`, `CHANNEL_MUTES`), so no
+                // backfill ever served them — pins were missing on a fresh
+                // node and a muted user could post through it. Indexed here
+                // they ride the metadata backfill (tier 1, chronological, so
+                // each replays after the moderator grant that authorised it
+                // and before any later demotion).
+                | MessageType::ChannelPinMessage
+                | MessageType::ChannelUnpinMessage
+                | MessageType::ChannelMute
+                | MessageType::ChannelUnmute
         ) {
             // Code-audit finding (2026-10-01, round 3): this used to
             // deserialize into `serde_json::Value` to read just
@@ -4500,6 +4580,10 @@ impl MessageRouter {
                     DeserializedPayload::ChannelUnban(p) => (Some(p.channel_id), None),
                     DeserializedPayload::ChannelAddModerator(p) => (Some(p.channel_id), None),
                     DeserializedPayload::ChannelRemoveModerator(p) => (Some(p.channel_id), None),
+                    DeserializedPayload::ChannelPinMessage(p) => (Some(p.channel_id), None),
+                    DeserializedPayload::ChannelUnpinMessage(p) => (Some(p.channel_id), None),
+                    DeserializedPayload::ChannelMute(p) => (Some(p.channel_id), None),
+                    DeserializedPayload::ChannelUnmute(p) => (Some(p.channel_id), None),
                     other => {
                         tracing::debug!(
                             msg_type = ?envelope.msg_type,
@@ -5527,11 +5611,28 @@ impl MessageRouter {
                 if let Ok(payload) =
                     rmp_serde::from_slice::<ReactionPayload>(&envelope.payload)
                 {
+                    // Last-write-wins by the envelope's `(timestamp, msg_id)`
+                    // (l2-node 0.152.0): add/remove converge in any order.
                     self.storage.toggle_chat_reaction(
                         &payload.target_id,
                         &payload.emoji,
                         resolved_author,
                         payload.remove,
+                        envelope.timestamp,
+                        &envelope.msg_id,
+                    )?;
+                    // G6 (l2-node 0.152.0): index the envelope under the
+                    // channel of its TARGET (never the author-controlled
+                    // `payload.channel_id`) so the reconcile / private-sync
+                    // ride-alongs can serve it. A target not stored yet is
+                    // not indexed (recorded limitation). During a private
+                    // purge the targets are deleted first (phase 1), so no
+                    // row can be written behind the purge cursor of the
+                    // later `CHAT_REACTION_MSGS` phase.
+                    self.storage.index_chat_reaction(
+                        &payload.target_id,
+                        envelope.timestamp,
+                        &envelope.msg_id,
                     )?;
                 }
             }
@@ -5603,6 +5704,8 @@ impl MessageRouter {
                         &payload.emoji,
                         resolved_author,
                         payload.remove,
+                        envelope.timestamp,
+                        &envelope.msg_id,
                     )?;
                 }
             }
@@ -10313,6 +10416,8 @@ mod deletion_request_authorization_tests {
             fingerprint: Vec::new(),
             epoch_root_known: None,
             round: 0,
+            meta_cursor: None,
+            revision: 0,
         };
         let resp = crate::network::reconcile::build_response(&responder.storage, &req, 1_000, ts / 1000 + 10);
         let served: Vec<[u8; 32]> = resp.envelopes.iter().map(|e| msg_id_of(e)).collect();

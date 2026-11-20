@@ -50,15 +50,18 @@
 //! deleted channel `tombstone_channel` has already cleared bans and
 //! watermarks, and the tombstone keeps the id from ever coming back.
 //!
-//! **Known residual (orphans).** `MESSAGES` rows of `ChatReaction`,
-//! Pin/Unpin, Mute and Invite envelopes of the channel are stored but not
-//! indexed by channel (the router indexes them by target message or not at
-//! all), so the purge cannot find them and they stay behind (small, opaque,
-//! unreachable through any channel read). Because they stay in `MESSAGES`,
-//! after a re-federation the same reaction / pin envelopes, re-delivered by
-//! sync or gossip, are `Duplicate`s: the derived rows the purge deleted
-//! (`CHAT_REACTIONS` / `CHAT_REACTION_COUNTS`, `CHANNEL_PINS`) are NOT
-//! rebuilt from them on this node. Likewise `CHANNEL_READ_STATE` rows
+//! **Known residual (orphans).** Since l2-node 0.152.0 (G6) Pin/Unpin and
+//! Mute/Unmute envelopes are indexed into `CHANNEL_META_MSGS` and chat
+//! reactions into `CHAT_REACTION_MSGS` (step [`purge_phase::
+//! CHAT_REACTION_MSGS`]), so their `MESSAGES` rows are purged too — a
+//! re-delivered reaction or pin after a re-federation is then stored and
+//! applied again instead of being a `Duplicate`. What remains: `ChatReaction`
+//! envelopes whose target was not stored when they arrived (never indexed),
+//! envelopes stored before the upgrade on a node whose indexing migrations
+//! (`CHANNEL_META_INDEXED_V4`, `CHAT_REACTIONS_INDEXED`) had not finished
+//! when the purge ran, and `ChannelInvite` envelopes (indexed by nothing):
+//! they stay behind (small, opaque, unreachable through any channel read).
+//! Likewise `CHANNEL_READ_STATE` rows
 //! of wallets that were neither a local home nor a member (mark-read does
 //! not check membership), per-wallet rows beyond [`WALLET_CAPTURE_CAP`], and
 //! superseded `CHANNEL_KEYS` envelopes whose rows were already evicted
@@ -128,6 +131,18 @@ pub mod purge_phase {
     /// `LOCAL_CHANNEL_HOMES` (prefix cid) — last, so the local evidence
     /// outlives every other row of the channel.
     pub const LOCAL_CHANNEL_HOMES: u8 = 16;
+    /// `CHAT_REACTION_MSGS` (prefix cid) → `MESSAGES` (the `ChatReaction`
+    /// envelopes, l2-node 0.152.0, G6). A new number (the 0.149 numbers are
+    /// unchanged), placed in [`ORDER`] after `WALLETS` and before
+    /// `LOCAL_CHANNEL_HOMES`: a purge that was in progress when the node
+    /// upgraded runs it unless it had already reached `LOCAL_CHANNEL_HOMES`
+    /// (its reaction rows then stay behind as recorded orphans). While the
+    /// channel is `purging` the router refuses every envelope targeting it
+    /// (Step 7f; a reaction is matched by its TARGET's channel), and a
+    /// reaction is only indexed while its target is stored — step
+    /// `CHANNEL_MSGS` has deleted every target before this step — so no row
+    /// is written behind its cursor.
+    pub const CHAT_REACTION_MSGS: u8 = 17;
 
     /// Execution order. After the last step the lifecycle row is deleted.
     pub const ORDER: &[u8] = &[
@@ -146,6 +161,7 @@ pub mod purge_phase {
         PENDING_CHANNEL_MEMBER_REMOVALS,
         EXACT_KEYS,
         WALLETS,
+        CHAT_REACTION_MSGS,
         LOCAL_CHANNEL_HOMES,
     ];
 }
@@ -708,11 +724,11 @@ impl Storage {
         let page = usize::try_from(budget).unwrap_or(usize::MAX).max(1);
         match row.phase {
             p::CHANNEL_MSGS => self.stage_purge_channel_msgs(batch, acc, &cid, cursor, page, budget),
-            p::CHANNEL_EDIT_DELETE_MSGS | p::CHANNEL_META_MSGS => {
-                let cf_name = if row.phase == p::CHANNEL_META_MSGS {
-                    cf::CHANNEL_META_MSGS
-                } else {
-                    cf::CHANNEL_EDIT_DELETE_MSGS
+            p::CHANNEL_EDIT_DELETE_MSGS | p::CHANNEL_META_MSGS | p::CHAT_REACTION_MSGS => {
+                let cf_name = match row.phase {
+                    p::CHANNEL_META_MSGS => cf::CHANNEL_META_MSGS,
+                    p::CHAT_REACTION_MSGS => cf::CHAT_REACTION_MSGS,
+                    _ => cf::CHANNEL_EDIT_DELETE_MSGS,
                 };
                 let rows = self.purge_scan(cf_name, &cid, cursor, page)?;
                 for (k, _) in &rows {
@@ -1006,6 +1022,8 @@ mod tests {
         out.push(id(tag, 3, 0)); // channel meta (join)
         out.push(id(tag, 4, 0)); // channel key envelope
         out.push(id(tag, 5, 0)); // key commit winner
+        out.push(id(tag, 6, 0)); // chat reaction envelope (0.152.0)
+        out.push(id(tag, 7, 0)); // pin envelope (0.152.0, in CHANNEL_META_MSGS)
         out
     }
 
@@ -1037,6 +1055,14 @@ mod tests {
         let meta = id(tag, 3, 0);
         s.store_message(&meta, b"env").unwrap();
         put(s, cf::CHANNEL_META_MSGS, &schema::encode_channel_meta_key(cid, 0x12, 5, &meta), &[]);
+        // l2-node 0.152.0 (G6): a chat reaction indexed under the channel,
+        // and a pin in the metadata index.
+        let react = id(tag, 6, 0);
+        s.store_message(&react, b"env").unwrap();
+        put(s, cf::CHAT_REACTION_MSGS, &schema::encode_channel_msg_key(cid, 300, &react), &[]);
+        let pin = id(tag, 7, 0);
+        s.store_message(&pin, b"env").unwrap();
+        put(s, cf::CHANNEL_META_MSGS, &schema::encode_channel_meta_key(cid, 0x19, 6, &pin), &[]);
         let scope = crate::crypto::compute_channel_scope(cid);
         let key_env = id(tag, 4, 0);
         s.store_message(&key_env, b"env").unwrap();
@@ -1076,6 +1102,7 @@ mod tests {
             n(cf::CHANNEL_MSGS, &p),
             n(cf::CHANNEL_EDIT_DELETE_MSGS, &p),
             n(cf::CHANNEL_META_MSGS, &p),
+            n(cf::CHAT_REACTION_MSGS, &p),
             n(cf::CHANNEL_KEYS, &scope),
             n(cf::CHANNEL_KEY_COMMITS, &scope),
             n(cf::CHANNEL_MEMBERS, &p),

@@ -653,6 +653,19 @@ pub struct NetworkService {
     /// every candidate has answered or `reconcile_compare_interval` finds
     /// its deadline has passed. See `finalize_reconcile_comparison`.
     pending_reconcile_comparisons: HashMap<u64, ReconcileComparison>,
+    /// When each channel last got a metadata FOLLOW-UP walk (l2-node
+    /// 0.152.0, G7 — `finalize_reconcile_comparison`): at most one per
+    /// `RECONCILE_META_FOLLOWUP_INTERVAL` per channel, so a large channel
+    /// whose chat is in sync does not re-page its whole metadata on every
+    /// hourly in-sync recheck. Bounded (`MAX_RECONCILE_META_FOLLOWUP_KEYS`).
+    reconcile_meta_followup_at: HashMap<u64, Instant>,
+    /// Where an unfinished metadata walk with a peer stopped (l2-node
+    /// 0.152.0, round-1 audit W2), keyed `(channel, peer)`: the next walk
+    /// with that peer continues there instead of from the start, so a
+    /// channel whose metadata exceeds one session's budget still converges.
+    /// In-memory, `RECONCILE_META_RESUME_TTL`, bounded
+    /// (`MAX_RECONCILE_META_RESUME_KEYS`); removed when a walk reaches its end.
+    reconcile_meta_resume: HashMap<(u64, PeerId), (reconcile::MetaCursor, Instant)>,
     /// Per-peer reconcile completeness tracking (l2-node 0.137.0) —
     /// in-memory only, never persisted, since completeness is a live
     /// property a peer can regain at any time. Updated by
@@ -1047,7 +1060,75 @@ struct ReconcilePending {
     /// can still win and assert completion. Recorded here so neither gap
     /// is mistaken for fully closed.
     total_accepted: u64,
+    /// Metadata paging of this session (l2-node 0.152.0, G7).
+    meta: ReconcileMetaState,
 }
+
+/// Metadata paging state of one reconcile session (l2-node 0.152.0, G7).
+///
+/// **When a channel counts COMPLETE** (`mark_channel_backfill_complete`):
+/// its chat pages ended naturally (`has_more == false`) AND — when the
+/// session's first page reported `meta_truncated` — the metadata walk with
+/// the same peer reached its end too (a metadata page with
+/// `meta_truncated == false`), AND the session accepted at least one
+/// genuinely new envelope (chat or metadata, strictly `Accepted`). A walk
+/// that stops early (capped, failed, a non-advancing cursor, the page
+/// backstop) never marks complete; it reports "accepted but incomplete"
+/// (retry soon) since its chat phase admitted something.
+///
+/// A metadata FOLLOW-UP walk (`MetaWalk::followup`, started after a
+/// comparison with no winner whose candidate offered only verified
+/// duplicates) is purely additive: it NEVER marks the channel complete and
+/// never moves the attempt throttle — the comparison's own verdict
+/// (in-sync recheck, or the dispatch backoff) stands. So metadata paging
+/// can neither turn an in-sync channel into a retry loop nor fake
+/// completion; its cost is bounded per channel by
+/// `RECONCILE_META_FOLLOWUP_INTERVAL`.
+#[derive(Debug, Clone, Default)]
+struct ReconcileMetaState {
+    /// The session's first page reported `meta_truncated`.
+    truncated: bool,
+    /// Where the first page's chronological metadata prefix ended (its
+    /// `meta_next_cursor`, round-1 audit B2): the in-session walk continues
+    /// from here, never from the start.
+    prefix_end: Option<reconcile::MetaCursor>,
+    /// `Some` while the session walks metadata pages.
+    walk: Option<MetaWalk>,
+}
+
+/// An in-progress metadata walk (G7).
+#[derive(Debug, Clone)]
+struct MetaWalk {
+    /// The cursor of the last metadata request; the next must be strictly
+    /// greater (a hostile responder cannot loop the walk).
+    last_cursor: reconcile::MetaCursor,
+    /// Metadata pages received so far (`MAX_RECONCILE_META_PAGES`).
+    pages: u32,
+    /// A follow-up walk (see `ReconcileMetaState`).
+    followup: bool,
+}
+
+/// Max metadata pages one reconcile metadata walk follows (l2-node
+/// 0.152.0) — same bound as private-channel sync's metadata phase.
+const MAX_RECONCILE_META_PAGES: u32 = private_channel_sync::MAX_META_PAGES_PER_SESSION;
+
+/// Minimum spacing of metadata FOLLOW-UP walks per channel (l2-node
+/// 0.152.0, G7) — the default `channel_catchup_interval_hours`.
+const RECONCILE_META_FOLLOWUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+
+/// Bound on `NetworkService::reconcile_meta_followup_at`. When full (after
+/// dropping expired entries) no new follow-up is started (fail closed: the
+/// metadata is still delivered by any session that admits chat).
+const MAX_RECONCILE_META_FOLLOWUP_KEYS: usize = 100_000;
+
+/// How long an unfinished walk's resume position is kept (l2-node 0.152.0,
+/// round-1 audit W2).
+const RECONCILE_META_RESUME_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+
+/// Bound on `NetworkService::reconcile_meta_resume`; at the cap expired
+/// entries are dropped first, and if still full the position is not kept
+/// (the next walk restarts from its usual start — slower, never wrong).
+const MAX_RECONCILE_META_RESUME_KEYS: usize = 100_000;
 
 /// A live comparison window for one channel's freshly-triggered (`cursor:
 /// None`) fanout — l2-node 0.137.0. Exists only between
@@ -1134,9 +1215,15 @@ struct PeerReconcileHealth {
 /// (`ReconcileTally::is_verified_in_sync_page`) — evidence that THIS peer
 /// offered nothing new, used only for the attempt throttle
 /// (`comparison_in_sync`), never for completion.
+///
+/// `meta_followup` (l2-node 0.152.0, G7): `true` only for a comparison
+/// trial's first page that reported `meta_truncated` and carried nothing
+/// but byte-verified duplicates (`ReconcileTally::is_verified_dup_page`,
+/// `has_more` not considered) — this peer demonstrably holds what we hold,
+/// so after a no-winner comparison it may serve a metadata follow-up walk.
 enum ReconcileApplyOutcome {
     Handled,
-    NoProgress { verified_in_sync: bool },
+    NoProgress { verified_in_sync: bool, meta_followup: bool },
 }
 
 /// How one reconcile page fared when routed by the requester (l2-node
@@ -1162,6 +1249,12 @@ struct ReconcileTally {
     /// is withheld), or one this node refused (outside its window, wrong
     /// scope, author skew, at capacity). Neither progress nor taint.
     ignored_deletions: usize,
+    /// Envelopes refused because their author is banned / muted in the
+    /// channel, or reactions whose target is not stored (l2-node 0.152.0,
+    /// `router::is_neutral_sync_refusal`): an honest responder legitimately
+    /// holds pre-ban / pre-mute history this node refuses, and reactions to
+    /// targets outside this node's window. Neither progress nor taint.
+    ignored_moderation: usize,
 }
 
 impl ReconcileTally {
@@ -1169,12 +1262,18 @@ impl ReconcileTally {
     /// session (`has_more == false`), non-empty, untainted, and every
     /// envelope on it is a byte-verified duplicate.
     fn is_verified_in_sync_page(&self, env_count: usize, has_more: bool) -> bool {
-        !has_more
-            && env_count > 0
+        !has_more && self.is_verified_dup_page(env_count)
+    }
+
+    /// The page is non-empty, untainted, and every envelope on it is a
+    /// byte-verified duplicate (or an ignorable deletion request) — whether
+    /// or not more pages follow (l2-node 0.152.0, G7 follow-up gate).
+    fn is_verified_dup_page(&self, env_count: usize) -> bool {
+        env_count > 0
             && !self.tainted
             && self.newly_accepted == 0
             && self.verified_dups > 0
-            && self.verified_dups + self.ignored_deletions == env_count
+            && self.verified_dups + self.ignored_deletions + self.ignored_moderation == env_count
     }
 }
 
@@ -1246,6 +1345,11 @@ fn tally_reconcile_envelopes(
                 // too old, pending capacity) must not taint the page forever.
                 // An `Invalid` one (bad signature / msg_id) still taints.
                 t.ignored_deletions += 1;
+            }
+            RouteResult::Rejected(ref reason) if crate::messages::router::is_neutral_sync_refusal(reason) => {
+                // l2-node 0.152.0 (B1): a banned / muted author's envelope
+                // this node refuses is not evidence against the peer.
+                t.ignored_moderation += 1;
             }
             RouteResult::Accepted { author, msg_type, .. } => {
                 t.admitted += 1;
@@ -1640,7 +1744,11 @@ fn envelope_targets_channel(env_bytes: &[u8], expected_channel: u64) -> bool {
         // Moderator propagation (l2-node 0.140.0): indexed into
         // CHANNEL_META_MSGS and served on the same page, so bound the same way.
         | MessageType::ChannelAddModerator
-        | MessageType::ChannelRemoveModerator => {
+        | MessageType::ChannelRemoveModerator
+        // Mutes (l2-node 0.152.0, G6): indexed into CHANNEL_META_MSGS and
+        // served on the metadata pages like the pins above.
+        | MessageType::ChannelMute
+        | MessageType::ChannelUnmute => {
             match deserialize_payload(envelope.msg_type, &envelope.payload) {
                 Ok(DeserializedPayload::ChatMessage(p)) => p.channel_id == expected_channel,
                 Ok(DeserializedPayload::ChannelPinMessage(p)) => p.channel_id == expected_channel,
@@ -1657,6 +1765,8 @@ fn envelope_targets_channel(env_bytes: &[u8], expected_channel: u64) -> bool {
                 Ok(DeserializedPayload::ChannelRemoveModerator(p)) => {
                     p.channel_id == expected_channel
                 }
+                Ok(DeserializedPayload::ChannelMute(p)) => p.channel_id == expected_channel,
+                Ok(DeserializedPayload::ChannelUnmute(p)) => p.channel_id == expected_channel,
                 // A decode failure is conservatively rejected. An `Ok` of
                 // some OTHER variant should be unreachable (it would mean
                 // this match arm's type list and the inner one have drifted
@@ -2655,6 +2765,8 @@ impl NetworkService {
             pending_reconcile_requests: HashMap::new(),
             reconcile_triggered: HashSet::new(),
             pending_reconcile_comparisons: HashMap::new(),
+            reconcile_meta_followup_at: HashMap::new(),
+            reconcile_meta_resume: HashMap::new(),
             peer_reconcile_health: HashMap::new(),
             sync_limits: Arc::new(reconcile::ResponderLimits::default()),
             pending_sync_requests: HashMap::new(),
@@ -6673,6 +6785,9 @@ impl NetworkService {
                             RouteResult::Accepted { .. } if is_deletion && pending_only_deletion(&self.storage, env_bytes) => {}
                             // Policy refusal: neutral. `Invalid` taints below.
                             RouteResult::Rejected(_) if is_deletion => {}
+                            // Banned / muted author (0.152.0, B1): neutral.
+                            RouteResult::Rejected(ref reason)
+                                if crate::messages::router::is_neutral_sync_refusal(reason) => {}
                             RouteResult::Accepted { .. } => {
                                 admitted += 1;
                                 accepted += 1;
@@ -7234,6 +7349,8 @@ impl NetworkService {
             fingerprint: Vec::new(),
             epoch_root_known: None,
             round: 0,
+            meta_cursor: None,
+            revision: reconcile::RECONCILE_REVISION,
         };
 
         info!(
@@ -7268,6 +7385,7 @@ impl NetworkService {
                     pages_fetched: 0,
                     consecutive_unproductive_pages: 0,
                     total_accepted: 0,
+                    meta: ReconcileMetaState::default(),
                 },
             );
             outstanding.insert(id);
@@ -7611,6 +7729,16 @@ impl NetworkService {
                         self.record_reconcile_comparison_failure(pending.channel_id, request_id);
                         return;
                     }
+                    // G7 (l2-node 0.152.0): an in-session metadata walk
+                    // that fails is "accepted but incomplete" (its chat
+                    // phase admitted new content) — retry soon.
+                    if let Some(walk) = pending.meta.walk.as_ref() {
+                        // W2: the next walk with this peer continues here.
+                        self.remember_reconcile_meta_resume(pending.channel_id, pending.peer_id, walk.last_cursor.clone());
+                        if !walk.followup {
+                            self.note_reconcile_accepted_incomplete(pending.channel_id, pending.total_accepted);
+                        }
+                    }
                     // Only give up once every sibling for this channel has
                     // failed — otherwise a still-pending sibling might
                     // yet complete it, and releasing the dedup entry here
@@ -7815,14 +7943,20 @@ impl NetworkService {
         // the in-sync evidence for `comparison_in_sync`; never used for
         // peer health.
         let mut in_sync_trials: Vec<(PeerId, bool)> = Vec::new();
+        // G7 (l2-node 0.152.0): tried candidates that may serve a metadata
+        // follow-up walk, in try (rank) order.
+        let mut meta_followup_peers: Vec<(PeerId, Option<reconcile::MetaCursor>)> = Vec::new();
         for idx in order {
             let (peer, response) = slots[idx].take().expect("each index visited exactly once");
+            // Where this candidate's first-page metadata prefix ended (N2).
+            let trial_prefix_end = response.meta_next_cursor.clone();
             let trial_pending = ReconcilePending {
                 peer_id: peer,
                 channel_id,
                 pages_fetched: 0,
                 consecutive_unproductive_pages: 0,
                 total_accepted: 0,
+                meta: ReconcileMetaState::default(),
             };
             match self.apply_reconcile_response(trial_pending, peer, response, false) {
                 ReconcileApplyOutcome::Handled => {
@@ -7836,9 +7970,12 @@ impl NetworkService {
                     }
                     return;
                 }
-                ReconcileApplyOutcome::NoProgress { verified_in_sync } => {
+                ReconcileApplyOutcome::NoProgress { verified_in_sync, meta_followup } => {
                     trials.push((peer, false));
                     in_sync_trials.push((peer, verified_in_sync));
+                    if meta_followup {
+                        meta_followup_peers.push((peer, trial_prefix_end));
+                    }
                     continue;
                 }
             }
@@ -7871,7 +8008,57 @@ impl NetworkService {
             self.counters.inc_reconcile_in_sync_outcomes();
             debug!(channel_id, candidates = in_sync_trials.len(), "reconcile: comparison verified in sync (nothing new); rechecking later");
         }
+        // G7 (l2-node 0.152.0): our chat matches a candidate's, but its first
+        // page said the metadata ride-along was truncated — rows beyond it
+        // (members, bans, mutes, pins of a large channel) may be missing
+        // here, and a later session would never page them (it admits no
+        // chat). Walk the metadata once with the best such candidate (a
+        // non-stale one first), at most once per channel per
+        // `RECONCILE_META_FOLLOWUP_INTERVAL`. The walk never marks the
+        // channel complete and never moves the throttle (see
+        // `ReconcileMetaState`); it keeps the trigger in flight until done.
+        // The walk starts after the candidate's first-page prefix (round-2
+        // audit N2): this node verified it holds exactly those rows.
+        let pick = meta_followup_peers
+            .iter()
+            .find(|(p, _)| {
+                !is_peer_stale(
+                    self.peer_reconcile_health.get(p).map(|h| h.consecutive_losses).unwrap_or(0),
+                    threshold,
+                )
+            })
+            .or(meta_followup_peers.first())
+            .cloned();
+        if let Some((peer, prefix_end)) = pick {
+            // An unfinished walk with this peer (W2) continues regardless of
+            // the follow-up spacing; a new one is spaced.
+            let now = Instant::now();
+            let resumable = self.reconcile_meta_resume_cursor(channel_id, peer, now).is_some();
+            if resumable || self.reconcile_meta_followup_due(channel_id, now) {
+                self.start_reconcile_meta_walk(peer, channel_id, 0, 0, prefix_end, true);
+            }
+        }
         self.release_reconcile_trigger_if_no_siblings(channel_id);
+    }
+
+    /// Whether a metadata follow-up walk for `channel_id` may start now; if
+    /// so, records `now` (G7). The map is bounded: at the cap, expired
+    /// entries are dropped first, and if it is still full no follow-up is
+    /// started.
+    fn reconcile_meta_followup_due(&mut self, channel_id: u64, now: Instant) -> bool {
+        if let Some(last) = self.reconcile_meta_followup_at.get(&channel_id) {
+            if now.saturating_duration_since(*last) < RECONCILE_META_FOLLOWUP_INTERVAL {
+                return false;
+            }
+        } else if self.reconcile_meta_followup_at.len() >= MAX_RECONCILE_META_FOLLOWUP_KEYS {
+            self.reconcile_meta_followup_at
+                .retain(|_, at| now.saturating_duration_since(*at) < RECONCILE_META_FOLLOWUP_INTERVAL);
+            if self.reconcile_meta_followup_at.len() >= MAX_RECONCILE_META_FOLLOWUP_KEYS {
+                return false;
+            }
+        }
+        self.reconcile_meta_followup_at.insert(channel_id, now);
+        true
     }
 
     /// Updates `peer_reconcile_health` for one comparison candidate based
@@ -7948,6 +8135,11 @@ impl NetworkService {
         response: reconcile::ReconcileResponse,
         release_on_no_progress: bool,
     ) -> ReconcileApplyOutcome {
+        // G7 (l2-node 0.152.0): a metadata page of this session's walk.
+        if pending.meta.walk.is_some() {
+            self.apply_reconcile_meta_page(pending, peer, response);
+            return ReconcileApplyOutcome::Handled;
+        }
         if response.server_capped {
             debug!(
                 peer = %peer,
@@ -7957,7 +8149,7 @@ impl NetworkService {
             if release_on_no_progress {
                 self.release_reconcile_trigger_if_no_siblings(pending.channel_id);
             }
-            return ReconcileApplyOutcome::NoProgress { verified_in_sync: false };
+            return ReconcileApplyOutcome::NoProgress { verified_in_sync: false, meta_followup: false };
         }
         if response.envelopes.is_empty() && !response.has_more {
             debug!(
@@ -7976,7 +8168,7 @@ impl NetworkService {
             if release_on_no_progress {
                 self.release_reconcile_trigger_if_no_siblings(pending.channel_id);
             }
-            return ReconcileApplyOutcome::NoProgress { verified_in_sync: false };
+            return ReconcileApplyOutcome::NoProgress { verified_in_sync: false, meta_followup: false };
         }
 
         let env_count = response.envelopes.len();
@@ -7993,6 +8185,21 @@ impl NetworkService {
         );
         self.observe_backfilled_authors(&accepted_authors);
         let ReconcileTally { admitted, newly_accepted, cross_channel_dropped, .. } = tally;
+        // G7 (l2-node 0.152.0): only the FIRST page carries the metadata
+        // ride-along, so only it can report the ride-along as truncated.
+        let meta_truncated = pending.meta.truncated || (pending.pages_fetched == 0 && response.meta_truncated);
+        let prefix_end = if pending.pages_fetched == 0 {
+            response.meta_next_cursor.clone()
+        } else {
+            pending.meta.prefix_end.clone()
+        };
+        // A comparison trial whose first page offered only verified
+        // duplicates may serve a metadata follow-up walk (see
+        // `ReconcileApplyOutcome`).
+        let meta_followup = !release_on_no_progress
+            && pending.pages_fetched == 0
+            && response.meta_truncated
+            && tally.is_verified_dup_page(env_count);
         info!(
             peer = %peer,
             channel_id = pending.channel_id,
@@ -8066,7 +8273,7 @@ impl NetworkService {
             if release_on_no_progress {
                 self.release_reconcile_trigger_if_no_siblings(pending.channel_id);
             }
-            return ReconcileApplyOutcome::NoProgress { verified_in_sync: false };
+            return ReconcileApplyOutcome::NoProgress { verified_in_sync: false, meta_followup: false };
         }
         if consecutive_unproductive_pages >= MAX_CONSECUTIVE_UNPRODUCTIVE_PAGES {
             warn!(peer = %peer, channel_id = pending.channel_id, consecutive_unproductive_pages, "reconcile: peer made no progress for too many consecutive pages; stopping this session");
@@ -8074,7 +8281,7 @@ impl NetworkService {
             if release_on_no_progress {
                 self.release_reconcile_trigger_if_no_siblings(pending.channel_id);
             }
-            return ReconcileApplyOutcome::NoProgress { verified_in_sync: false };
+            return ReconcileApplyOutcome::NoProgress { verified_in_sync: false, meta_followup: false };
         }
 
         // Security-audit finding (2026-09-30, round 2, CRITICAL): in a
@@ -8148,7 +8355,7 @@ impl NetworkService {
                 "reconcile: comparison trial claimed has_more with zero verified \
                  progress on its first page; treating as no-progress, not a win"
             );
-            return ReconcileApplyOutcome::NoProgress { verified_in_sync: false };
+            return ReconcileApplyOutcome::NoProgress { verified_in_sync: false, meta_followup };
         }
 
         // Continue paging from the winning peer if the
@@ -8169,6 +8376,8 @@ impl NetworkService {
                     fingerprint: Vec::new(),
                     epoch_root_known: None,
                     round: 0,
+                    meta_cursor: None,
+                    revision: reconcile::RECONCILE_REVISION,
                 };
                 let next_id = self
                     .swarm
@@ -8183,6 +8392,7 @@ impl NetworkService {
                         pages_fetched,
                         consecutive_unproductive_pages,
                         total_accepted,
+                        meta: ReconcileMetaState { truncated: meta_truncated, prefix_end: prefix_end.clone(), walk: None },
                     },
                 );
                 ReconcileApplyOutcome::Handled
@@ -8202,7 +8412,7 @@ impl NetworkService {
                 if release_on_no_progress {
                     self.release_reconcile_trigger_if_no_siblings(pending.channel_id);
                 }
-                ReconcileApplyOutcome::NoProgress { verified_in_sync: false }
+                ReconcileApplyOutcome::NoProgress { verified_in_sync: false, meta_followup: false }
             }
         } else if total_accepted > 0 {
             // Natural completion: this session got at least one
@@ -8219,6 +8429,22 @@ impl NetworkService {
             // happen to have at least one local row" or "the
             // response merely wasn't shaped like the
             // empty-and-no-more case."
+            //
+            // G7 (l2-node 0.152.0): when the first page's metadata
+            // ride-along was truncated, the channel is not complete until
+            // the metadata walk with this same peer reached its end too —
+            // the walk marks completion itself (`apply_reconcile_meta_page`).
+            if meta_truncated {
+                self.start_reconcile_meta_walk(
+                    pending.peer_id,
+                    pending.channel_id,
+                    pages_fetched,
+                    total_accepted,
+                    prefix_end,
+                    false,
+                );
+                return ReconcileApplyOutcome::Handled;
+            }
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
@@ -8286,8 +8512,238 @@ impl NetworkService {
             if release_on_no_progress {
                 self.release_reconcile_trigger_if_no_siblings(pending.channel_id);
             }
-            ReconcileApplyOutcome::NoProgress { verified_in_sync }
+            ReconcileApplyOutcome::NoProgress { verified_in_sync, meta_followup }
         }
+    }
+
+    /// `[backfill] max_age_days` as the reconcile request's `max_age_secs`
+    /// (`u64::MAX` = archive mode).
+    fn reconcile_max_age_secs(&self) -> u64 {
+        if self.backfill_config.max_age_days == u64::MAX {
+            u64::MAX
+        } else {
+            self.backfill_config.max_age_days.saturating_mul(24 * 3600)
+        }
+    }
+
+    /// Ask `peer` for the first metadata page of `channel_id` (l2-node
+    /// 0.152.0, G7) and register the walk as a pending session page.
+    /// `followup` = a walk after a no-winner comparison (never completes the
+    /// channel, see `ReconcileMetaState`).
+    ///
+    /// Start position (round-1 audits B2, W2): the larger of the first page's
+    /// prefix end (`prefix_end`) and an unfinished earlier walk's position
+    /// with this peer (`reconcile_meta_resume`), else `MetaCursor::START`.
+    /// Every row before it was already applied in order, so the walk never
+    /// replays an older row after a newer one of the same session.
+    fn start_reconcile_meta_walk(
+        &mut self,
+        peer: PeerId,
+        channel_id: u64,
+        pages_fetched: u32,
+        total_accepted: u64,
+        prefix_end: Option<reconcile::MetaCursor>,
+        followup: bool,
+    ) {
+        let resume = self.reconcile_meta_resume_cursor(channel_id, peer, Instant::now());
+        let start = std::cmp::max(prefix_end, resume).unwrap_or(reconcile::MetaCursor::START);
+        let req = reconcile::ReconcileRequest {
+            channel_id,
+            max_age_secs: self.reconcile_max_age_secs(),
+            cursor: None,
+            fingerprint: Vec::new(),
+            epoch_root_known: None,
+            round: 0,
+            meta_cursor: Some(start.clone()),
+            revision: reconcile::RECONCILE_REVISION,
+        };
+        debug!(peer = %peer, channel_id, followup, "reconcile: paging channel metadata");
+        let id = self.swarm.behaviour_mut().reconcile.send_request(&peer, req);
+        self.pending_reconcile_requests.insert(
+            id,
+            ReconcilePending {
+                peer_id: peer,
+                channel_id,
+                pages_fetched,
+                consecutive_unproductive_pages: 0,
+                total_accepted,
+                meta: ReconcileMetaState {
+                    truncated: true,
+                    prefix_end: None,
+                    walk: Some(MetaWalk { last_cursor: start, pages: 0, followup }),
+                },
+            },
+        );
+    }
+
+    /// The live (not expired) resume position of an unfinished metadata
+    /// walk of `channel_id` with `peer` (W2).
+    fn reconcile_meta_resume_cursor(&self, channel_id: u64, peer: PeerId, now: Instant) -> Option<reconcile::MetaCursor> {
+        self.reconcile_meta_resume
+            .get(&(channel_id, peer))
+            .filter(|(_, at)| now.saturating_duration_since(*at) < RECONCILE_META_RESUME_TTL)
+            .map(|(c, _)| c.clone())
+    }
+
+    /// Remember where an unfinished walk with `peer` must continue (W2).
+    /// Bounded: at the cap expired entries are dropped first; if still full
+    /// the position is not kept.
+    fn remember_reconcile_meta_resume(&mut self, channel_id: u64, peer: PeerId, cursor: reconcile::MetaCursor) {
+        let now = Instant::now();
+        let key = (channel_id, peer);
+        if !self.reconcile_meta_resume.contains_key(&key) && self.reconcile_meta_resume.len() >= MAX_RECONCILE_META_RESUME_KEYS {
+            self.reconcile_meta_resume
+                .retain(|_, (_, at)| now.saturating_duration_since(*at) < RECONCILE_META_RESUME_TTL);
+            if self.reconcile_meta_resume.len() >= MAX_RECONCILE_META_RESUME_KEYS {
+                return;
+            }
+        }
+        self.reconcile_meta_resume.insert(key, (cursor, now));
+    }
+
+    /// Apply one metadata page of a reconcile metadata walk (l2-node
+    /// 0.152.0, G7) and decide: next page, completion, or stop. Pages are
+    /// verified like chat pages (`tally_reconcile_envelopes`: channel
+    /// binding, router re-validation, in replay order) and may carry only
+    /// metadata types. A page with any non-metadata envelope, or with more
+    /// than `CHANNEL_META_PAGE_MAX` envelopes, is not applied and STOPS the
+    /// walk unfinished (round-1 audit W1: it can never complete the
+    /// channel). A walk stopped by a capped / failed / non-metadata answer or
+    /// the page backstop keeps its position for the next walk with this
+    /// peer (W2); a non-advancing cursor does not. Metadata pages
+    /// are never "unproductive" (a re-walk legitimately re-serves rows as
+    /// duplicates); they are bounded by the strictly advancing cursor and
+    /// `MAX_RECONCILE_META_PAGES`. See `ReconcileMetaState` for when the
+    /// channel counts complete.
+    fn apply_reconcile_meta_page(
+        &mut self,
+        pending: ReconcilePending,
+        peer: PeerId,
+        response: reconcile::ReconcileResponse,
+    ) {
+        let channel_id = pending.channel_id;
+        let Some(walk) = pending.meta.walk.clone() else {
+            return;
+        };
+        let mut total_accepted = pending.total_accepted;
+        // `Some(true)` = walked to the end, `Some(false)` = stopped early,
+        // `None` = continue with `next`.
+        let mut finished: Option<bool> = None;
+        let mut next: Option<reconcile::MetaCursor> = None;
+        // Position to continue from if the walk stops here (W2).
+        let mut resume_at: Option<reconcile::MetaCursor> = None;
+        if response.server_capped || !response.meta_page {
+            // Capped, or not a metadata page at all (e.g. the responder was
+            // downgraded mid-session): stop, never guess.
+            debug!(peer = %peer, channel_id, capped = response.server_capped, "reconcile: metadata walk stopped (capped or not a metadata page)");
+            finished = Some(false);
+            resume_at = Some(walk.last_cursor.clone());
+        } else if response.envelopes.len() > reconcile::CHANNEL_META_PAGE_MAX
+            || !response.envelopes.iter().all(|e| reconcile::envelope_is_meta_type(e))
+        {
+            warn!(
+                peer = %peer,
+                channel_id,
+                received = response.envelopes.len(),
+                "reconcile: metadata page oversized or carrying non-metadata envelopes; not applied, walk stopped"
+            );
+            finished = Some(false);
+        } else {
+            let received = response.envelopes.len();
+            let mut accepted_authors: Vec<(String, u8)> = Vec::new();
+            let tally = tally_reconcile_envelopes(
+                &self.router,
+                &self.storage,
+                &peer,
+                channel_id,
+                &response.envelopes,
+                reconcile::CHANNEL_META_PAGE_MAX,
+                0,
+                &mut accepted_authors,
+            );
+            self.observe_backfilled_authors(&accepted_authors);
+            total_accepted = total_accepted.saturating_add(tally.newly_accepted as u64);
+            info!(
+                peer = %peer,
+                channel_id,
+                received,
+                newly_accepted = tally.newly_accepted,
+                meta_truncated = response.meta_truncated,
+                "reconcile: applied metadata page"
+            );
+            let pages = walk.pages.saturating_add(1);
+            if !response.meta_truncated {
+                finished = Some(true);
+            } else {
+                match response.meta_next_cursor {
+                    Some(c) if c > walk.last_cursor && pages < MAX_RECONCILE_META_PAGES => next = Some(c),
+                    Some(c) if c > walk.last_cursor => {
+                        // Page backstop: keep the position for the next walk.
+                        warn!(peer = %peer, channel_id, pages, "reconcile: metadata walk stopped at the page backstop; resumes next session");
+                        finished = Some(false);
+                        resume_at = Some(c);
+                    }
+                    _ => {
+                        warn!(peer = %peer, channel_id, pages, "reconcile: metadata walk stopped (no advancing cursor)");
+                        finished = Some(false);
+                    }
+                }
+            }
+        }
+
+        if let Some(cursor) = next {
+            let req = reconcile::ReconcileRequest {
+                channel_id,
+                max_age_secs: self.reconcile_max_age_secs(),
+                cursor: None,
+                fingerprint: Vec::new(),
+                epoch_root_known: None,
+                round: 0,
+                meta_cursor: Some(cursor.clone()),
+                revision: reconcile::RECONCILE_REVISION,
+            };
+            let id = self.swarm.behaviour_mut().reconcile.send_request(&peer, req);
+            self.pending_reconcile_requests.insert(
+                id,
+                ReconcilePending {
+                    total_accepted,
+                    meta: ReconcileMetaState {
+                        truncated: true,
+                        prefix_end: None,
+                        walk: Some(MetaWalk { last_cursor: cursor, pages: walk.pages.saturating_add(1), followup: walk.followup }),
+                    },
+                    ..pending
+                },
+            );
+            return;
+        }
+
+        if finished == Some(true) {
+            self.reconcile_meta_resume.remove(&(channel_id, peer));
+        } else if let Some(c) = resume_at {
+            self.remember_reconcile_meta_resume(channel_id, peer, c);
+        }
+        match (finished, walk.followup) {
+            // In-session walk reached the end: the chat phase admitted new
+            // content (that is the only way an in-session walk starts), so
+            // the channel is complete.
+            (Some(true), false) if total_accepted > 0 => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                if let Err(e) = self.storage.mark_channel_backfill_complete(channel_id, now) {
+                    warn!(channel_id, error = %e, "reconcile: failed to persist backfill completion");
+                }
+                self.reconcile_throttle.on_complete(&channel_id);
+            }
+            // In-session walk stopped early: not complete; retry soon (new
+            // content was admitted).
+            (_, false) => self.note_reconcile_accepted_incomplete(channel_id, total_accepted),
+            // Follow-up: purely additive, the comparison's verdict stands.
+            (_, true) => {}
+        }
+        self.release_reconcile_trigger_if_no_siblings(channel_id);
     }
 
     /// Throttle outcome for a session that admitted new content
@@ -9866,12 +10322,8 @@ mod reconcile_comparison_tests {
 
     fn response_with_envelope_count(n: usize) -> reconcile::ReconcileResponse {
         reconcile::ReconcileResponse {
-            channel_id: 1,
             envelopes: (0..n).map(|_| Vec::new()).collect(),
-            has_more: false,
-            next_cursor: None,
-            server_capped: false,
-            epoch_root: None,
+            ..reconcile::ReconcileResponse::empty(1)
         }
     }
 
@@ -10037,6 +10489,8 @@ mod responder_build_slot_tests {
             fingerprint: Vec::new(),
             epoch_root_known: None,
             round: 0,
+            meta_cursor: None,
+            revision: 0,
         }
     }
 
@@ -10261,6 +10715,8 @@ mod backfill_throttle_tests {
             fingerprint: Vec::new(),
             epoch_root_known: None,
             round: 0,
+            meta_cursor: None,
+            revision: 0,
         };
         reconcile::build_response(s, &req, cap, T0 / 1000 + 1_000)
     }
@@ -10307,6 +10763,8 @@ mod backfill_throttle_tests {
                     fingerprint: Vec::new(),
                     epoch_root_known: None,
                     round: 0,
+                    meta_cursor: None,
+                    revision: 0,
                 },
             );
             outstanding.insert(id);
@@ -10458,6 +10916,8 @@ mod backfill_throttle_tests {
                 fingerprint: Vec::new(),
                 epoch_root_known: None,
                 round: 0,
+                meta_cursor: None,
+                revision: 0,
             });
             answer.server_capped = capped;
             svc.record_reconcile_comparison_response(CID, id, PeerId::random(), answer);
@@ -10668,14 +11128,15 @@ mod backfill_throttle_tests {
             pages_fetched,
             consecutive_unproductive_pages: 0,
             total_accepted: 0,
+            meta: ReconcileMetaState::default(),
         };
         // Positive control: a comparison trial's first page.
         let out = svc.apply_reconcile_response(pending(0), peer, pages[0].clone(), false);
-        assert!(matches!(out, ReconcileApplyOutcome::NoProgress { verified_in_sync: true }));
+        assert!(matches!(out, ReconcileApplyOutcome::NoProgress { verified_in_sync: true, .. }));
         // The same page on the direct (continuation) path is not evidence.
         svc.reconcile_triggered.insert(CID);
         let out = svc.apply_reconcile_response(pending(3), peer, pages[0].clone(), true);
-        assert!(matches!(out, ReconcileApplyOutcome::NoProgress { verified_in_sync: false }));
+        assert!(matches!(out, ReconcileApplyOutcome::NoProgress { verified_in_sync: false, meta_followup: false }));
     }
 
     #[tokio::test]
@@ -10696,9 +11157,10 @@ mod backfill_throttle_tests {
             pages_fetched: MAX_PAGES_PER_SESSION - 1,
             consecutive_unproductive_pages: 0,
             total_accepted: 0,
+            meta: ReconcileMetaState::default(),
         };
         let out = svc.apply_reconcile_response(pending, peer, pages[0].clone(), true);
-        assert!(matches!(out, ReconcileApplyOutcome::NoProgress { verified_in_sync: false }));
+        assert!(matches!(out, ReconcileApplyOutcome::NoProgress { verified_in_sync: false, meta_followup: false }));
         let e = svc.reconcile_throttle.entry(&CID).unwrap();
         assert_eq!(e.failures, 0, "backoff reset");
         assert!(e.next_due.saturating_duration_since(Instant::now()) <= budget::BASE_RETRY);
@@ -10717,6 +11179,7 @@ mod backfill_throttle_tests {
             pages_fetched: MAX_PAGES_PER_SESSION - 1,
             consecutive_unproductive_pages: 0,
             total_accepted: 0,
+            meta: ReconcileMetaState::default(),
         };
         svc.apply_reconcile_response(pending, peer, pages[0].clone(), true);
         assert_eq!(svc.reconcile_throttle.entry(&CID).unwrap().failures, 3);
@@ -11501,6 +11964,9 @@ mod backfill_throttle_tests {
     }
 
 }
+
+#[cfg(test)]
+mod backfill_0152_tests;
 
 #[cfg(test)]
 mod backfill_0151_tests {

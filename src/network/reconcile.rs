@@ -137,17 +137,43 @@ pub struct ReconcileRequest {
     /// fingerprint exchange; v0.47.0 always 0.
     #[serde(default)]
     pub round: u8,
+    /// Metadata paging (l2-node 0.152.0, G7). `Some` makes this a METADATA
+    /// page request: the responder answers with the channel's
+    /// `CHANNEL_META_MSGS` rows in replay order strictly after this keyset
+    /// position (`channel_meta_page`; [`MetaCursor::START`] = from the
+    /// beginning) and no chat. Sent only after a first page reported
+    /// `meta_truncated`, i.e. only to a 0.152+ responder. Absent (`None`)
+    /// on every request of an older requester. Additive, `#[serde(default)]`.
+    #[serde(default)]
+    pub meta_cursor: Option<MetaCursor>,
+    /// Requester protocol revision (l2-node 0.152.0): `0` (absent) = a
+    /// 0.151-or-older requester, [`RECONCILE_REVISION`] = 0.152+. A
+    /// revision-0 requester is served exactly the 0.151 page shape: no
+    /// `ChannelMute`/`ChannelUnmute` in the metadata ride-along (it applies
+    /// the mute before the chat pages and would count every refused message
+    /// of the muted user as page taint — its tally predates the neutral
+    /// moderation refusal) and no chat-reaction ride-along (its page-size
+    /// guard predates `CHANNEL_REACTION_CAP` and would discard the whole
+    /// last page). Additive, `#[serde(default)]`.
+    #[serde(default)]
+    pub revision: u8,
 }
+
+/// The reconcile revision this node speaks (l2-node 0.152.0): pins and
+/// mutes in the metadata, the chat-reaction ride-along, and metadata
+/// paging (`ReconcileRequest::meta_cursor`).
+pub const RECONCILE_REVISION: u8 = 1;
 
 impl ReconcileRequest {
     /// A page AFTER the first of its session (round-5 C-W1): it carries the
-    /// responder's `next_cursor`. Only a non-continuation (first-page)
+    /// responder's `next_cursor`, or it is a metadata page (G7 — those
+    /// only follow a first page). Only a non-continuation (first-page)
     /// request is refused outright when every responder build slot is
     /// busy. The claim is the requester's own (cursors are not
     /// authenticated) — the wait it earns is bounded separately
     /// (`network::MAX_CONTINUATION_BUILD_WAITERS`).
     pub fn is_continuation(&self) -> bool {
-        self.cursor.is_some()
+        self.cursor.is_some() || self.meta_cursor.is_some()
     }
 }
 
@@ -177,6 +203,23 @@ pub struct ReconcileResponse {
     /// the same Merkle structure and compare for completeness.
     #[serde(default)]
     pub epoch_root: Option<[u8; 32]>,
+    /// This is a METADATA page (the answer to a request with
+    /// `meta_cursor`; l2-node 0.152.0, G7). Older responders never set it,
+    /// so a requester can tell a metadata page from a chat page.
+    #[serde(default)]
+    pub meta_page: bool,
+    /// More metadata exists than this response carried (G7). On a FIRST
+    /// chat page: the bounded metadata ride-along (`CHANNEL_META_CAP` rows,
+    /// byte budget) did not include every `CHANNEL_META_MSGS` row of the
+    /// channel — the requester then pages the metadata once the chat
+    /// session ends. On a metadata page: another metadata page follows
+    /// `meta_next_cursor`. Older responders never set it.
+    #[serde(default)]
+    pub meta_truncated: bool,
+    /// Keyset position of the last row of this metadata page (G7) — the
+    /// next metadata request's `meta_cursor`. `None` on chat pages.
+    #[serde(default)]
+    pub meta_next_cursor: Option<MetaCursor>,
 }
 
 /// Opaque-to-the-wire cursor for paging within a single
@@ -392,20 +435,49 @@ pub fn build_response_metered(
         );
         return (
             ReconcileResponse {
-                channel_id: request.channel_id,
-                envelopes: Vec::new(),
-                has_more: false,
-                next_cursor: None,
                 // Use server_capped to signal "go away" without
                 // disclosing whether the channel exists or not.
                 server_capped: true,
-                epoch_root: None,
+                ..ReconcileResponse::empty(request.channel_id)
             },
             1,
         );
     }
 
     let cap = max_envelopes.min(MAX_ENVELOPES_PER_RESPONSE_CEILING);
+    // A 0.151-or-older requester gets exactly the 0.151 page shape (see
+    // `ReconcileRequest::revision`).
+    let legacy = request.revision < RECONCILE_REVISION;
+
+    // --- Metadata page (l2-node 0.152.0, G7) ---
+    // ALL of the channel's metadata rows in replay order, keyset-paged and
+    // byte-bounded — the same walk private-channel sync's metadata phase
+    // does (`channel_meta_page`). No chat on these pages. Charged to the
+    // same (peer, channel) rolling budget as chat pages (the caller).
+    if let Some(after) = request.meta_cursor.as_ref() {
+        let tiers: &[&[u8]] = if legacy { &META_REPLAY_TIERS_NO_MUTES } else { &META_REPLAY_TIERS };
+        let page = channel_meta_page_with(
+            storage,
+            request.channel_id,
+            tiers,
+            Some(after),
+            // Round-1 audit W1: a FIXED page size, independent of this
+            // node's `max_envelopes_per_response`, so a requester with a
+            // smaller configured cap never refuses a metadata page.
+            CHANNEL_META_PAGE_MAX,
+            MAX_RESPONSE_ENVELOPE_BYTES,
+        );
+        return (
+            ReconcileResponse {
+                envelopes: page.envelopes,
+                meta_page: true,
+                meta_truncated: page.has_more,
+                meta_next_cursor: page.next_cursor,
+                ..ReconcileResponse::empty(request.channel_id)
+            },
+            page.work,
+        );
+    }
 
     // Window-filter cutoff in unix seconds. `u64::MAX` request value
     // means "archive mode — no filter"; we represent that by setting
@@ -482,17 +554,7 @@ pub fn build_response_metered(
                 error = %e,
                 "reconcile: CHANNEL_MSGS iteration failed"
             );
-            return (
-                ReconcileResponse {
-                    channel_id: request.channel_id,
-                    envelopes: Vec::new(),
-                    has_more: false,
-                    next_cursor: None,
-                    server_capped: false,
-                    epoch_root: None,
-                },
-                1,
-            );
+            return (ReconcileResponse::empty(request.channel_id), 1);
         }
     };
     // Budget (one unit per seek and per index row examined, its MESSAGES
@@ -511,11 +573,47 @@ pub fn build_response_metered(
     // These are re-validated + applied by the requester like any synced
     // envelope (ChannelCreate apply is now merge-safe). Counted separately so
     // the chat `cap` below is unaffected.
+    //
+    // G7 (l2-node 0.152.0): for a 0.152+ requester the ride-along is the
+    // CHRONOLOGICAL PREFIX of the metadata — page 1 of the metadata walk
+    // (`channel_meta_page_with` from `MetaCursor::START`, ≤ `CHANNEL_META_CAP`
+    // rows, byte-bounded). When rows remain, the response says so
+    // (`meta_truncated`) and carries the walk position (`meta_next_cursor`),
+    // and the requester continues the walk from THERE after the chat pages.
+    // Round-1 audit B2: the earlier priority selection (newest-first per
+    // type) followed by a walk from the start replayed the cut, OLDER rows
+    // after newer ones; mute/unmute, ban/unban and pin/unpin are applied
+    // literally (not last-write-wins), so a re-muted / re-banned user ended
+    // unmuted / unbanned and pins duplicated. A chronological prefix plus
+    // its continuation replays every row exactly once, in order.
+    // A 0.151 requester (revision 0) keeps the priority selection (its own
+    // pre-existing limitation; it never pages).
+    let mut meta_truncated = false;
+    let mut first_meta_cursor: Option<MetaCursor> = None;
     if request.cursor.is_none() {
-        let (meta, meta_work) =
-            channel_meta_envelopes_metered(storage, request.channel_id, CHANNEL_META_CAP);
-        work += meta_work;
-        bytes = append_within_byte_budget(&mut envelopes, meta, bytes);
+        if legacy {
+            let ride = channel_meta_ride_along(storage, request.channel_id, CHANNEL_META_CAP, true);
+            work += ride.work;
+            bytes = append_within_byte_budget(&mut envelopes, ride.envelopes, bytes);
+        } else {
+            let page = channel_meta_page_with(
+                storage,
+                request.channel_id,
+                &META_REPLAY_TIERS,
+                Some(&MetaCursor::START),
+                CHANNEL_META_CAP,
+                MAX_RESPONSE_ENVELOPE_BYTES,
+            );
+            work += page.work;
+            for raw in &page.envelopes {
+                bytes = bytes.saturating_add(envelope_wire_cost(raw));
+            }
+            envelopes.extend(page.envelopes);
+            meta_truncated = page.has_more;
+            if meta_truncated {
+                first_meta_cursor = page.next_cursor;
+            }
+        }
     }
 
     let mut last_cursor: Option<ReconcileCursor> = None;
@@ -650,20 +748,53 @@ pub fn build_response_metered(
         work += ed_work;
         // W5: newest markers first; whatever does not fit the byte budget
         // is not shipped this session (recorded limitation).
-        append_within_byte_budget(&mut envelopes, ed, bytes);
+        let bytes = append_within_byte_budget(&mut envelopes, ed, bytes);
+        // G6 (l2-node 0.152.0): chat reactions ride along after the
+        // edit/delete markers (their targets are applied by now, like the
+        // markers'), newest first, with their OWN cap and inside the same
+        // byte budget. Only for a 0.152+ requester (`revision`): an older
+        // one's page-size guard would refuse the whole page.
+        if !legacy {
+            let (re, re_work) = channel_reaction_envelopes_metered(
+                storage,
+                request.channel_id,
+                min_timestamp,
+                CHANNEL_REACTION_CAP,
+            );
+            work += re_work;
+            append_within_byte_budget(&mut envelopes, re, bytes);
+        }
     }
 
     (
         ReconcileResponse {
-            channel_id: request.channel_id,
             envelopes,
             has_more: hit_cap,
             next_cursor: if hit_cap { last_cursor } else { None },
-            server_capped: false,
-            epoch_root: None,
+            meta_truncated,
+            meta_next_cursor: first_meta_cursor,
+            ..ReconcileResponse::empty(request.channel_id)
         },
         work,
     )
+}
+
+impl ReconcileResponse {
+    /// An empty, finished, uncapped response for `channel_id` (every
+    /// optional field at its default) — the base the builders override.
+    pub fn empty(channel_id: u64) -> Self {
+        ReconcileResponse {
+            channel_id,
+            envelopes: Vec::new(),
+            has_more: false,
+            next_cursor: None,
+            server_capped: false,
+            epoch_root: None,
+            meta_page: false,
+            meta_truncated: false,
+            meta_next_cursor: None,
+        }
+    }
 }
 
 /// Upper bound on the summed envelope bytes of one backfill response page
@@ -704,8 +835,16 @@ pub(crate) fn append_within_byte_budget(envelopes: &mut Vec<Vec<u8>>, items: Vec
     bytes
 }
 
-/// Upper bound on metadata envelopes `channel_meta_envelopes` returns.
+/// Upper bound on metadata envelopes `channel_meta_envelopes` returns, and
+/// on the first-page metadata prefix (l2-node 0.152.0).
 pub(crate) const CHANNEL_META_CAP: usize = 256;
+
+/// Rows per public-reconcile METADATA page (l2-node 0.152.0, round-1 audit
+/// W1) — a protocol constant, independent of `[backfill]
+/// max_envelopes_per_response`, so responder and requester agree whatever
+/// their configs. The requester refuses (and stops the walk on) a larger
+/// metadata page.
+pub const CHANNEL_META_PAGE_MAX: usize = 500;
 
 /// The largest reconcile page an honest responder with a primary page cap of
 /// `max_envelopes` sends: the chat page plus the first-page metadata
@@ -714,11 +853,17 @@ pub(crate) const CHANNEL_META_CAP: usize = 256;
 /// 0.151.0 it compared against `max_envelopes` alone, so a first page of a
 /// channel with a full chat page (plus its `ChannelCreate`) — or any last
 /// page whose markers pushed it past the cap — was discarded whole.
+///
+/// l2-node 0.152.0: plus the chat-reaction ride-along
+/// (`CHANNEL_REACTION_CAP`), which a 0.152+ responder sends only to a
+/// requester that announced `RECONCILE_REVISION` — so this bound is never
+/// exceeded towards an older requester, whose own bound lacks it.
 pub fn max_page_with_ride_alongs(max_envelopes: usize) -> usize {
     max_envelopes
         .min(MAX_ENVELOPES_PER_RESPONSE_CEILING)
         .saturating_add(CHANNEL_META_CAP)
         .saturating_add(CHANNEL_EDIT_DELETE_CAP)
+        .saturating_add(CHANNEL_REACTION_CAP)
 }
 
 /// Replay tiers of a channel's `CHANNEL_META_MSGS` rows (round-4, l2-node
@@ -750,6 +895,13 @@ pub fn max_page_with_ride_alongs(max_envelopes: usize) -> usize {
 /// drift-check, so a backfilled far-future envelope sorts last on every
 /// serve. Every affected type is still authorised against the RECEIVING
 /// node's state at replay, so this is ordering, not privilege.
+///
+/// l2-node 0.152.0 (G6): `ChannelPinMessage`/`ChannelUnpinMessage`
+/// (`can_pin`) and `ChannelMute`/`ChannelUnmute` (`can_mute`) join tier 1.
+/// They are authorised against the moderator record at replay time like a
+/// kick, so chronological replay is what makes a pin/mute signed after a
+/// grant succeed and one signed after a demotion fail; and pin/unpin and
+/// mute/unmute pairs settle on the newest.
 pub(crate) const META_REPLAY_TIERS: [&[u8]; 2] = [
     &[MessageType::ChannelCreate as u8],
     &[
@@ -762,8 +914,53 @@ pub(crate) const META_REPLAY_TIERS: [&[u8]; 2] = [
         MessageType::ChannelBan as u8,
         MessageType::ChannelUnban as u8,
         MessageType::ChannelDelete as u8,
+        MessageType::ChannelPinMessage as u8,
+        MessageType::ChannelUnpinMessage as u8,
+        MessageType::ChannelMute as u8,
+        MessageType::ChannelUnmute as u8,
     ],
 ];
+
+/// `META_REPLAY_TIERS` without `ChannelMute`/`ChannelUnmute` — what a
+/// requester older than 0.152.0 is served (public reconcile
+/// `ReconcileRequest::revision` 0, private-channel sync
+/// `PrivateChannelSyncRequest::revision` 0). Such a requester applies a
+/// mute before the chat pages, so it would refuse every message the muted
+/// user posted before the mute and — its tally predating the neutral
+/// moderation refusal (`router::is_moderation_refusal`) — count each as
+/// page taint; its private-sync allow-list also lacks the mute types. Pins are harmless to
+/// it and are served.
+pub(crate) const META_REPLAY_TIERS_NO_MUTES: [&[u8]; 2] = [
+    &[MessageType::ChannelCreate as u8],
+    &[
+        MessageType::ChannelUpdate as u8,
+        MessageType::ChannelJoin as u8,
+        MessageType::ChannelLeave as u8,
+        MessageType::ChannelAddModerator as u8,
+        MessageType::ChannelRemoveModerator as u8,
+        MessageType::ChannelKick as u8,
+        MessageType::ChannelBan as u8,
+        MessageType::ChannelUnban as u8,
+        MessageType::ChannelDelete as u8,
+        MessageType::ChannelPinMessage as u8,
+        MessageType::ChannelUnpinMessage as u8,
+    ],
+];
+
+/// `true` iff `raw` decodes (top-level `Envelope` only, never the payload)
+/// to a type `CHANNEL_META_MSGS` holds (`META_REPLAY_TIERS`) — what a
+/// metadata page may carry (l2-node 0.152.0, G7).
+pub(crate) fn envelope_is_meta_type(raw: &[u8]) -> bool {
+    rmp_serde::from_slice::<Envelope>(raw)
+        .map(|env| META_REPLAY_TIERS.iter().any(|t| t.contains(&env.msg_type_u8())))
+        .unwrap_or(false)
+}
+
+/// `true` for the two mute types withheld from requesters older than
+/// 0.152.0 (`META_REPLAY_TIERS_NO_MUTES`).
+pub(crate) fn is_mute_type(msg_type: MessageType) -> bool {
+    matches!(msg_type, MessageType::ChannelMute | MessageType::ChannelUnmute)
+}
 
 /// Selection priority of the BOUNDED metadata ride-along
 /// (`channel_meta_envelopes`: public reconcile's first page and the legacy
@@ -776,7 +973,15 @@ pub(crate) const META_REPLAY_TIERS: [&[u8]; 2] = [
 /// access, so when the cap is hit the requester must learn who left before
 /// learning who joined — the reverse order let a join flood push every leave
 /// out and a requester then kept leavers as members.
-const RIDE_ALONG_PRIORITY: [MessageType; 10] = [
+///
+/// l2-node 0.152.0 (G6): mutes and pins come after `ChannelUnban` and before
+/// `ChannelUpdate` — moderation state ahead of the cosmetic and high-volume
+/// rows. `ChannelMute` first (a missing mute lets a muted user post through
+/// the requester), its `ChannelUnmute` next, then `ChannelUnpinMessage`
+/// before `ChannelPinMessage` (an unpin without its pin is a no-op, a pin
+/// without its later unpin resurrects it). Whatever the cap leaves out is
+/// reported as `meta_truncated` and paged by a 0.152+ requester (G7).
+const RIDE_ALONG_PRIORITY: [MessageType; 14] = [
     MessageType::ChannelCreate,
     MessageType::ChannelDelete,
     MessageType::ChannelRemoveModerator,
@@ -784,6 +989,10 @@ const RIDE_ALONG_PRIORITY: [MessageType; 10] = [
     MessageType::ChannelKick,
     MessageType::ChannelBan,
     MessageType::ChannelUnban,
+    MessageType::ChannelMute,
+    MessageType::ChannelUnmute,
+    MessageType::ChannelUnpinMessage,
+    MessageType::ChannelPinMessage,
     MessageType::ChannelUpdate,
     MessageType::ChannelLeave,
     MessageType::ChannelJoin,
@@ -828,8 +1037,8 @@ fn parse_meta_key(key: &[u8]) -> Option<(u8, u64, [u8; 32])> {
 /// skipped; undecodable stored bytes are forwarded as-is for the requester
 /// to validate.
 ///
-/// (Test convenience wrapper — production calls the `_metered` variant,
-/// which also returns the work done.)
+/// (Test convenience wrapper — production builds the first-page ride-along
+/// with `channel_meta_ride_along`.)
 #[cfg(test)]
 pub(crate) fn channel_meta_envelopes(storage: &Storage, channel_id: u64, cap: usize) -> Vec<Vec<u8>> {
     channel_meta_envelopes_metered(storage, channel_id, cap).0
@@ -837,16 +1046,41 @@ pub(crate) fn channel_meta_envelopes(storage: &Storage, channel_id: u64, cap: us
 
 /// `channel_meta_envelopes` plus the storage work it did (one unit per seek
 /// and per index row read, its `MESSAGES` read included), for the
-/// responder budget.
+/// responder budget. The full (0.152) type set. (Tests; production calls
+/// `channel_meta_ride_along`.)
+#[cfg(test)]
 pub(crate) fn channel_meta_envelopes_metered(
     storage: &Storage,
     channel_id: u64,
     cap: usize,
 ) -> (Vec<Vec<u8>>, u64) {
+    let ride = channel_meta_ride_along(storage, channel_id, cap, false);
+    (ride.envelopes, ride.work)
+}
+
+/// One bounded metadata ride-along (`channel_meta_ride_along`).
+#[derive(Debug, Default)]
+pub(crate) struct MetaRideAlong {
+    /// Stored envelope bytes in replay order.
+    pub envelopes: Vec<Vec<u8>>,
+    /// Storage work done (seeks and rows read).
+    pub work: u64,
+}
+
+/// The selection behind `channel_meta_envelopes` (see its doc) — used only
+/// for requesters older than 0.152.0 (the public first page of a revision-0
+/// requester and the legacy private first page). `no_mutes` skips
+/// `ChannelMute`/`ChannelUnmute` (`META_REPLAY_TIERS_NO_MUTES`). A 0.152+
+/// public requester instead gets the chronological prefix
+/// (`channel_meta_page_with`, round-1 audit B2).
+pub(crate) fn channel_meta_ride_along(storage: &Storage, channel_id: u64, cap: usize, no_mutes: bool) -> MetaRideAlong {
     let cap = cap.min(CHANNEL_META_CAP);
     let mut work: u64 = 0;
     let mut chosen: Vec<(u8, u64, [u8; 32])> = Vec::with_capacity(cap);
     for msg_type in RIDE_ALONG_PRIORITY {
+        if no_mutes && is_mute_type(msg_type) {
+            continue;
+        }
         let room = cap.saturating_sub(chosen.len());
         if room == 0 {
             break;
@@ -870,7 +1104,7 @@ pub(crate) fn channel_meta_envelopes_metered(
         .into_iter()
         .filter_map(|(_, _, id)| storage.get_message(&id).ok().flatten())
         .collect();
-    (envelopes, work)
+    MetaRideAlong { envelopes, work }
 }
 
 /// Keyset cursor into a channel's metadata in replay order — the position
@@ -888,6 +1122,15 @@ pub struct MetaCursor {
     pub ts: u64,
     /// `msg_id` of the last served row (tie-breaker for equal `ts`).
     pub msg_id: [u8; 32],
+}
+
+impl MetaCursor {
+    /// The keyset position before every real row (l2-node 0.152.0, G7):
+    /// "strictly after `(tier 0, ts 0, msg_id 0…0)`" includes every row,
+    /// because no real envelope has an all-zero `msg_id` (it is a hash).
+    /// The first metadata page request of a public reconcile session
+    /// carries it (`None` there means "no metadata page").
+    pub const START: MetaCursor = MetaCursor { tier: 0, ts: 0, msg_id: [0u8; 32] };
 }
 
 /// One metadata page (`channel_meta_page`).
@@ -917,29 +1160,62 @@ pub(crate) struct MetaPage {
 /// `tier` above 1 (e.g. a tampered `tier = 255`) is past the end → an
 /// empty, finished page, for one unit of work and no I/O. A row whose
 /// `MESSAGES` entry is gone is skipped but still advances the cursor.
+///
+/// (Test convenience wrapper over the full tier set and the standard byte
+/// budget — production calls `channel_meta_page_with`.)
+#[cfg(test)]
 pub(crate) fn channel_meta_page(
     storage: &Storage,
     channel_id: u64,
     after: Option<&MetaCursor>,
     cap: usize,
 ) -> MetaPage {
+    channel_meta_page_with(storage, channel_id, &META_REPLAY_TIERS, after, cap, MAX_RESPONSE_ENVELOPE_BYTES)
+}
+
+/// `channel_meta_page` over an explicit tier set (`META_REPLAY_TIERS` or,
+/// for a requester older than 0.152.0, `META_REPLAY_TIERS_NO_MUTES`) and
+/// byte budget (l2-node 0.152.0): the page also stops once the summed
+/// worst-case wire cost of its envelopes would pass `max_bytes` (at least
+/// one envelope is always served); `next_cursor` is then the last row
+/// served and `has_more` is set, so nothing is skipped.
+pub(crate) fn channel_meta_page_with(
+    storage: &Storage,
+    channel_id: u64,
+    tiers: &[&[u8]],
+    after: Option<&MetaCursor>,
+    cap: usize,
+    max_bytes: usize,
+) -> MetaPage {
     let cap = cap.max(1);
     let after = after.map(|c| (c.tier, c.ts, c.msg_id));
-    let (rows, has_more, work) =
-        match storage.channel_meta_replay_page(channel_id, &META_REPLAY_TIERS, after, cap) {
+    let (rows, mut has_more, work) =
+        match storage.channel_meta_replay_page(channel_id, tiers, after, cap) {
             Ok(r) => r,
             Err(e) => {
                 warn!(channel_id, error = %e, "metadata page: CHANNEL_META_MSGS iteration failed");
                 return MetaPage { work: 1, ..Default::default() };
             }
         };
-    let next_cursor = rows
-        .last()
-        .map(|r| MetaCursor { tier: r.tier, ts: r.ts, msg_id: r.msg_id });
-    let envelopes = rows
-        .iter()
-        .filter_map(|r| storage.get_message(&r.msg_id).ok().flatten())
-        .collect();
+    let mut envelopes = Vec::with_capacity(rows.len());
+    let mut bytes = 0usize;
+    let mut last: Option<&crate::storage::rocks::MetaIndexRow> = None;
+    for r in &rows {
+        if let Some(raw) = storage.get_message(&r.msg_id).ok().flatten() {
+            let cost = envelope_wire_cost(&raw);
+            if !envelopes.is_empty() && bytes.saturating_add(cost) > max_bytes {
+                // Full by bytes: this row and the rest follow on the next
+                // page (the cursor stays at the last row served).
+                has_more = true;
+                break;
+            }
+            bytes = bytes.saturating_add(cost);
+            envelopes.push(raw);
+        }
+        // A row whose `MESSAGES` entry is gone still advances the cursor.
+        last = Some(r);
+    }
+    let next_cursor = last.map(|r| MetaCursor { tier: r.tier, ts: r.ts, msg_id: r.msg_id });
     MetaPage { envelopes, next_cursor, has_more, work }
 }
 
@@ -1246,6 +1522,69 @@ pub(crate) fn channel_edit_delete_envelopes_metered(
     (out, work)
 }
 
+/// Max chat reactions one ride-along carries (public reconcile, l2-node
+/// 0.152.0, G6) — like news-sync's reaction ride-along.
+pub(crate) const CHANNEL_REACTION_CAP: usize = 4_000;
+
+/// Gather a channel's `ChatReaction` envelopes (`CHAT_REACTION_MSGS`,
+/// l2-node 0.152.0, G6) to ride along on the LAST page of a reconcile
+/// session, after the edit/delete markers — same rule as those: by the
+/// last page every original the session could deliver is applied. Before
+/// 0.152.0 chat reactions reached a backfilling node by no mechanism, so
+/// its counts were 0 or different.
+///
+/// The NEWEST `limit` (≤ `CHANNEL_REACTION_CAP`) rows signed inside the
+/// window (`min_timestamp`, unix seconds), newest first; under overflow the
+/// OLDEST are not shipped this session. Order does not matter to the
+/// requester: `Storage::toggle_chat_reaction` is last-write-wins. A reaction
+/// to a GDPR-erased message is withheld (D4, `ride_along_target_erased`).
+/// The index only holds rows keyed by the TARGET's own channel, so nothing
+/// of another channel can be served here. Returns the envelopes plus the
+/// storage work done. Private-channel sync passes the room left on its
+/// page.
+pub(crate) fn channel_reaction_envelopes_metered(
+    storage: &Storage,
+    channel_id: u64,
+    min_timestamp: u64,
+    limit: usize,
+) -> (Vec<Vec<u8>>, u64) {
+    let limit = limit.min(CHANNEL_REACTION_CAP);
+    if limit == 0 {
+        return (Vec::new(), 0);
+    }
+    let prefix = channel_id.to_be_bytes();
+    let rows = match storage.reverse_iter_cf(
+        schema::cf::CHAT_REACTION_MSGS,
+        &schema::message_key_upper_bound(&prefix),
+        &prefix,
+        limit,
+    ) {
+        Ok(r) => r,
+        Err(_) => return (Vec::new(), 1),
+    };
+    let work: u64 = 1 + rows.len() as u64;
+    let mut out = Vec::with_capacity(rows.len());
+    for (key, _) in rows {
+        // Key shape matches CHANNEL_MSGS: channel_id:8 ++ timestamp:8 ++ msg_id:32.
+        if key.len() != 48 {
+            continue;
+        }
+        let Ok(ts_bytes) = <[u8; 8]>::try_from(&key[8..16]) else { continue };
+        if u64::from_be_bytes(ts_bytes) / 1000 < min_timestamp {
+            // Reverse scan: every further row is older still.
+            break;
+        }
+        let Ok(msg_id) = <[u8; 32]>::try_from(&key[16..48]) else { continue };
+        if let Ok(Some(raw)) = storage.get_message(&msg_id) {
+            if ride_along_target_erased(storage, &raw) {
+                continue;
+            }
+            out.push(raw);
+        }
+    }
+    (out, work)
+}
+
 /// `true` iff `raw` is an edit / delete / reaction whose TARGET carries a
 /// verified GDPR `DeletionRequest` record (l2-node 0.151.0, decision D4) —
 /// such a ride-along is never served: an edit would re-serve erased
@@ -1368,14 +1707,7 @@ pub(crate) fn member_joined_at(storage: &Storage, channel_id: u64, wallet: &str)
 /// Construct a `server_capped` response (no envelopes) — used when the
 /// per-peer or per-channel rate limit denies the request.
 pub fn capped_response(request: &ReconcileRequest) -> ReconcileResponse {
-    ReconcileResponse {
-        channel_id: request.channel_id,
-        envelopes: Vec::new(),
-        has_more: false,
-        next_cursor: None,
-        server_capped: true,
-        epoch_root: None,
-    }
+    ReconcileResponse { server_capped: true, ..ReconcileResponse::empty(request.channel_id) }
 }
 
 #[cfg(test)]
@@ -1484,6 +1816,8 @@ mod edit_delete_ride_along_tests {
             fingerprint: Vec::new(),
             epoch_root_known: None,
             round: 0,
+            meta_cursor: None,
+            revision: 0,
         };
         let resp1 = build_response(&s, &req1, 2, 5_000);
         assert!(resp1.has_more, "page 1 should be capped (2 of 3 messages)");
@@ -1500,6 +1834,8 @@ mod edit_delete_ride_along_tests {
             fingerprint: Vec::new(),
             epoch_root_known: None,
             round: 0,
+            meta_cursor: None,
+            revision: 0,
         };
         let resp2 = build_response(&s, &req2, 2, 5_000);
         assert!(!resp2.has_more, "page 2 should be the final page");
@@ -1533,6 +1869,8 @@ mod edit_delete_ride_along_tests {
             fingerprint: Vec::new(),
             epoch_root_known: None,
             round: 0,
+            meta_cursor: None,
+            revision: 0,
         };
         // cap == the exact number of eligible messages.
         let resp = build_response(&s, &req, 3, 5_000);
@@ -1562,6 +1900,8 @@ mod edit_delete_ride_along_tests {
             fingerprint: Vec::new(),
             epoch_root_known: None,
             round: 0,
+            meta_cursor: None,
+            revision: 0,
         };
         let resp = build_response(&s, &req, 3, 5_000);
         assert_eq!(resp.envelopes.len(), 3, "must still cap at exactly `cap` rows");
@@ -1589,6 +1929,8 @@ mod edit_delete_ride_along_tests {
             fingerprint: Vec::new(),
             epoch_root_known: None,
             round: 0,
+            meta_cursor: None,
+            revision: 0,
         };
         let resp = build_response(&s, &req, 500, 5_000);
         assert!(!resp.has_more);
@@ -1618,6 +1960,8 @@ mod edit_delete_ride_along_tests {
             fingerprint: Vec::new(),
             epoch_root_known: None,
             round: 0,
+            meta_cursor: None,
+            revision: 0,
         }
     }
 
@@ -1758,10 +2102,13 @@ mod edit_delete_ride_along_tests {
 
     #[test]
     fn requester_page_bound_includes_the_ride_alongs() {
-        assert_eq!(max_page_with_ride_alongs(1_000), 1_000 + CHANNEL_META_CAP + CHANNEL_EDIT_DELETE_CAP);
+        assert_eq!(
+            max_page_with_ride_alongs(1_000),
+            1_000 + CHANNEL_META_CAP + CHANNEL_EDIT_DELETE_CAP + CHANNEL_REACTION_CAP
+        );
         assert_eq!(
             max_page_with_ride_alongs(usize::MAX),
-            MAX_ENVELOPES_PER_RESPONSE_CEILING + CHANNEL_META_CAP + CHANNEL_EDIT_DELETE_CAP
+            MAX_ENVELOPES_PER_RESPONSE_CEILING + CHANNEL_META_CAP + CHANNEL_EDIT_DELETE_CAP + CHANNEL_REACTION_CAP
         );
     }
 }
@@ -2400,6 +2747,8 @@ mod tests {
             fingerprint: Vec::new(),
             epoch_root_known: None,
             round: 0,
+            meta_cursor: None,
+            revision: 0,
         };
         let resp = capped_response(&req);
         assert_eq!(resp.channel_id, 7);
@@ -2430,6 +2779,8 @@ mod tests {
             fingerprint: Vec::new(),
             epoch_root_known: None,
             round: 0,
+            meta_cursor: None,
+            revision: 0,
         };
         assert_eq!(req.round, 0);
         assert!(req.fingerprint.is_empty());

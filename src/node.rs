@@ -870,6 +870,13 @@ const KEY_COMMITS_MIGRATION_BUDGET: usize = 5_000_000;
 /// migration — one top-level envelope decode per row.
 const DELETION_REQUESTS_INDEX_BUDGET_PER_BOOT: usize = 5_000_000;
 
+/// Max `MESSAGES` rows EACH of the two l2-node 0.152.0 (G6) indexing
+/// migrations (`Storage::backfill_channel_meta_v4`,
+/// `Storage::backfill_chat_reaction_index`) examines per boot; larger
+/// databases resume on the next start. Same order as the other
+/// `MESSAGES`-scan migrations.
+const G6_INDEX_BUDGET_PER_BOOT: usize = 5_000_000;
+
 /// Pending GDPR deletion-request reaper cadence and per-pass bound (l2-node
 /// 0.151.0, audit W1).
 const PENDING_DELETION_REAP_INTERVAL_SECS: u64 = 900;
@@ -1197,6 +1204,41 @@ impl Node {
                     "Deletion-request indexing paused at its per-boot budget; resumes next start"
                 ),
                 Err(e) => warn!(error = %e, "Failed to index stored deletion requests; will retry next start"),
+            }
+        }
+
+        // Index stored pins / mutes into CHANNEL_META_MSGS and stored chat
+        // reactions into CHAT_REACTION_MSGS (l2-node 0.152.0, G6) so the
+        // metadata and reaction backfill ride-alongs also carry what predates
+        // the upgrade. Each is budget-capped per boot and resumable (cursor in
+        // NODE_STATE); its sentinel is written once its MESSAGES scan reaches
+        // the end. Never fatal.
+        if storage.get_stat(state_keys::CHANNEL_META_INDEXED_V4)? == 0 {
+            match storage.backfill_channel_meta_v4(G6_INDEX_BUDGET_PER_BOOT) {
+                Ok((n, true)) => {
+                    if n > 0 {
+                        info!(indexed = n, "Indexed stored pin/mute envelopes into CHANNEL_META_MSGS (v4)");
+                    }
+                }
+                Ok((n, false)) => info!(
+                    indexed = n,
+                    "Pin/mute metadata indexing paused at its per-boot budget; resumes next start"
+                ),
+                Err(e) => warn!(error = %e, "Failed to index stored pin/mute envelopes; will retry next start"),
+            }
+        }
+        if storage.get_stat(state_keys::CHAT_REACTIONS_INDEXED)? == 0 {
+            match storage.backfill_chat_reaction_index(G6_INDEX_BUDGET_PER_BOOT) {
+                Ok((n, true)) => {
+                    if n > 0 {
+                        info!(indexed = n, "Indexed stored chat reactions into CHAT_REACTION_MSGS");
+                    }
+                }
+                Ok((n, false)) => info!(
+                    indexed = n,
+                    "Chat-reaction indexing paused at its per-boot budget; resumes next start"
+                ),
+                Err(e) => warn!(error = %e, "Failed to index stored chat reactions; will retry next start"),
             }
         }
 

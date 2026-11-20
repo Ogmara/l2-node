@@ -551,6 +551,19 @@ pub mod cf {
     /// `NEWS_EDIT_DELETE`; never by the feed read path.
     pub const NEWS_REACTION_MSGS: &str = "news_reaction_msgs";
 
+    /// (channel_id:8 BE, timestamp:8 BE, msg_id:32) → () — same key shape as
+    /// `CHANNEL_MSGS`, but for `ChatReaction` (0x04) envelopes only
+    /// (l2-node 0.152.0, G6). The channel is the one of the reaction's
+    /// TARGET `ChatMessage` (`router::resolve_chat_channel_id`), never the
+    /// author-controlled `ReactionPayload::channel_id`, so a reaction can
+    /// only ever be served with the channel its target belongs to. A
+    /// reaction whose target is not stored when it is applied is not
+    /// indexed. Consulted only by the channel-reconcile and private-channel
+    /// sync ride-alongs and by the private-channel purge; never by a read
+    /// path. Written in `router::update_indexes`; one-time backfilled via
+    /// `CHAT_REACTIONS_INDEXED`.
+    pub const CHAT_REACTION_MSGS: &str = "chat_reaction_msgs";
+
     /// All column family names for database initialization.
     pub const ALL: &[&str] = &[
         MESSAGES,
@@ -625,6 +638,7 @@ pub mod cf {
         DM_EDIT_DELETE_MSGS,
         NEWS_EDIT_DELETE,
         NEWS_REACTION_MSGS,
+        CHAT_REACTION_MSGS,
         DM_RECIPIENT_MSG_COUNTS,
         STATE_CHECKPOINTS,
         ANCHORED_STATE,
@@ -723,6 +737,24 @@ pub mod state_keys {
     /// Last `MESSAGES` key examined by the `DELETION_REQUESTS_INDEXED`
     /// migration (resume point across boots).
     pub const DELETION_REQUESTS_INDEX_CURSOR: &[u8] = b"migration_deletion_requests_index_cursor";
+    /// Sentinel: set to 1 once every stored `ChannelPinMessage`/
+    /// `ChannelUnpinMessage`/`ChannelMute`/`ChannelUnmute` envelope (0x19,
+    /// 0x1A, 0x42, 0x43) has been indexed into `CHANNEL_META_MSGS`
+    /// (l2-node 0.152.0, G6), so pins and mutes made before the upgrade
+    /// ride the metadata backfill too. Budget-capped per boot; resumes from
+    /// `CHANNEL_META_INDEX_V4_CURSOR`.
+    pub const CHANNEL_META_INDEXED_V4: &[u8] = b"migration_channel_meta_indexed_v4";
+    /// Last `MESSAGES` key examined by the `CHANNEL_META_INDEXED_V4`
+    /// migration (resume point across boots).
+    pub const CHANNEL_META_INDEX_V4_CURSOR: &[u8] = b"migration_channel_meta_index_v4_cursor";
+    /// Sentinel: set to 1 once every stored `ChatReaction` (0x04) whose
+    /// target chat message is stored has been indexed into
+    /// `CHAT_REACTION_MSGS` (l2-node 0.152.0, G6). Budget-capped per boot;
+    /// resumes from `CHAT_REACTIONS_INDEX_CURSOR`.
+    pub const CHAT_REACTIONS_INDEXED: &[u8] = b"migration_chat_reactions_indexed";
+    /// Last `MESSAGES` key examined by the `CHAT_REACTIONS_INDEXED`
+    /// migration (resume point across boots).
+    pub const CHAT_REACTIONS_INDEX_CURSOR: &[u8] = b"migration_chat_reactions_index_cursor";
     /// Sentinel: set to 1 after `NEWS_REACTION_MSGS` is backfilled from existing
     /// `MESSAGES`, making the reaction ride-along retroactive rather than only
     /// covering reactions made after the upgrade (l2-node 0.121.0+).

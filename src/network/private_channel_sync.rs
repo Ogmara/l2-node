@@ -150,6 +150,13 @@ pub fn is_private_channel_sync_type(msg_type: u8) -> bool {
                 // the edit/delete ride-along carries it. The receiver binds it
                 // to the synced channel (`network::deletion_request_fit`).
                 | MessageType::DeletionRequest
+                // Mutes (l2-node 0.152.0, G6): now indexed into
+                // CHANNEL_META_MSGS and served by the metadata phase (only to
+                // a requester announcing `PRIVATE_SYNC_REVISION`). Pins and
+                // reactions were already allowed; they are served since
+                // 0.152.0 too.
+                | MessageType::ChannelMute
+                | MessageType::ChannelUnmute
         )
     )
 }
@@ -778,7 +785,20 @@ pub struct PrivateChannelSyncRequest {
     /// The requester finished the metadata phase; serve chat pages only.
     #[serde(default)]
     pub meta_done: bool,
+    /// Requester protocol revision (l2-node 0.152.0): `0` (absent) = older
+    /// than 0.152.0, [`PRIVATE_SYNC_REVISION`] = 0.152+. A revision-0
+    /// requester is never served `ChannelMute`/`ChannelUnmute` (its
+    /// allow-list lacks them, and it would count the muted member's refused
+    /// history as taint — see `reconcile::META_REPLAY_TIERS_NO_MUTES`). Not part of
+    /// the signed auth string: it only narrows what an authenticated member
+    /// is served. Additive, `#[serde(default)]`.
+    #[serde(default)]
+    pub revision: u8,
 }
+
+/// The private-channel-sync revision this node speaks (l2-node 0.152.0):
+/// mutes in the metadata phase.
+pub const PRIVATE_SYNC_REVISION: u8 = 1;
 
 impl PrivateChannelSyncRequest {
     /// A page AFTER the first of its session (round-5 C-W1): a chat cursor,
@@ -1177,7 +1197,13 @@ pub fn finished_naturally(resp: &PrivateChannelSyncResponse) -> bool {
 
 /// On-disk format version of [`ResumeRow`]. A row with another version is
 /// treated as absent.
-pub const RESUME_ROW_VERSION: u8 = 1;
+///
+/// `2` since l2-node 0.152.0 (round-1 audit W4): the row format is
+/// unchanged, but version-1 rows carry metadata high-water marks computed
+/// before pins and mutes were indexed, so a catch-up from them would skip
+/// the migrated older pin/mute rows. Reading them as absent forces ONE
+/// fresh walk per (wallet, channel) pair after the upgrade.
+pub const RESUME_ROW_VERSION: u8 = 2;
 /// Sessions per walk after which a resume row is ignored and a fresh walk
 /// starts (plan §6).
 pub const MAX_RESUME_SESSIONS: u32 = 50;
@@ -1688,6 +1714,7 @@ pub fn sign_request(
         meta_paging: false,
         meta_cursor: None,
         meta_done: false,
+        revision: PRIVATE_SYNC_REVISION,
     }
 }
 
@@ -1869,8 +1896,23 @@ pub fn build_response_metered(
     // channel_meta_page`). `has_more` stays true (the chat phase is still
     // to come); the requester switches to chat with `meta_done` once
     // `meta_has_more` is false.
+    // l2-node 0.152.0: mutes only for a 0.152+ requester (`revision`), and
+    // the page is byte-bounded like the public reconcile pages.
+    let no_mutes = request.revision < PRIVATE_SYNC_REVISION;
     if request.meta_paging && !request.meta_done {
-        let page = reconcile::channel_meta_page(storage, request.channel_id, request.meta_cursor.as_ref(), cap);
+        let tiers: &[&[u8]] = if no_mutes {
+            &reconcile::META_REPLAY_TIERS_NO_MUTES
+        } else {
+            &reconcile::META_REPLAY_TIERS
+        };
+        let page = reconcile::channel_meta_page_with(
+            storage,
+            request.channel_id,
+            tiers,
+            request.meta_cursor.as_ref(),
+            cap,
+            reconcile::MAX_RESPONSE_ENVELOPE_BYTES,
+        );
         return (
             PrivateChannelSyncResponse {
                 channel_id: request.channel_id,
@@ -2019,13 +2061,14 @@ pub fn build_response_metered(
     let hit_cap = probed_count > chat_cap;
 
     let meta: Vec<Vec<u8>> = if legacy_first_page {
-        let (meta, meta_work) = reconcile::channel_meta_envelopes_metered(
+        let ride = reconcile::channel_meta_ride_along(
             storage,
             request.channel_id,
             cap.saturating_sub(chat_envelopes.len()),
+            no_mutes,
         );
-        work += meta_work;
-        meta
+        work += ride.work;
+        ride.envelopes
     } else {
         Vec::new()
     };
@@ -2045,6 +2088,22 @@ pub fn build_response_metered(
             );
             work += ed_work;
             envelopes.extend(ed);
+        }
+        // G6 (l2-node 0.152.0): chat reactions in whatever room the page
+        // has left after the markers (newest first; withheld for a
+        // GDPR-erased target). Every requester's allow-list has
+        // `ChatReaction`, and the room keeps the page within
+        // `MAX_ENVELOPES_PER_RESPONSE`.
+        let room = cap.saturating_sub(envelopes.len());
+        if room > 0 {
+            let (re, re_work) = reconcile::channel_reaction_envelopes_metered(
+                storage,
+                request.channel_id,
+                min_timestamp,
+                room,
+            );
+            work += re_work;
+            envelopes.extend(re);
         }
     }
 
@@ -2465,6 +2524,7 @@ mod tests {
             meta_paging: false,
             meta_cursor: None,
             meta_done: false,
+            revision: 0,
         }
     }
 
@@ -2805,6 +2865,7 @@ mod meta_reserve_tests {
             meta_paging: false,
             meta_cursor: None,
             meta_done: false,
+            revision: 0,
         }
     }
 
@@ -3115,6 +3176,7 @@ mod meta_paging_tests {
             meta_paging: paging,
             meta_cursor: None,
             meta_done: false,
+            revision: 0,
         };
         let mut session = SyncSession::default();
         let mut meta_served = Vec::new();
@@ -3439,6 +3501,7 @@ mod meta_paging_tests {
             meta_paging: true,
             meta_cursor: cursor,
             meta_done: false,
+            revision: 0,
         };
         // Past the end (tier 255): empty, finished, ONE unit of work.
         let (r, work) = build_response_metered(&rs, &req(Some(MetaCursor { tier: 255, ts: u64::MAX, msg_id: [0xFF; 32] })), MAX_ENVELOPES_PER_RESPONSE, T0 / 1000, u64::MAX);
@@ -3839,6 +3902,7 @@ mod meta_paging_tests {
             meta_paging: false,
             meta_cursor: None,
             meta_done: false,
+            revision: 0,
         };
         let r = build_response(&rs, &req, MAX_ENVELOPES_PER_RESPONSE, T0 / 1000 + 10_000_000, u64::MAX);
         assert!(!r.meta_phase && r.meta_next_cursor.is_none());
@@ -3941,6 +4005,7 @@ mod meta_paging_tests {
             meta_paging: true,
             meta_cursor,
             meta_done,
+            revision: 0,
         };
         let mut first_chat_cursor = meta_done.then(|| req.cursor.clone());
         for _ in 0..2000 {
@@ -4224,7 +4289,7 @@ mod meta_paging_tests {
             b"not json".to_vec(),
             b"{}".to_vec(),
             vec![b' '; MAX_RESUME_ROW_BYTES + 1],
-            enc(&ResumeRow { v: 2, ..good.clone() }),
+            enc(&ResumeRow { v: RESUME_ROW_VERSION + 1, ..good.clone() }),
             enc(&ResumeRow { peer: "not-a-peer".into(), ..good.clone() }),
             enc(&ResumeRow { updated_at: future, ..good.clone() }),
             enc(&ResumeRow {

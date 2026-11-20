@@ -5,6 +5,180 @@ All notable changes to the Ogmara L2 node will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.152.0] - 2026-11-19
+
+Fresh-node backfill gaps, part 2 (plan
+`docs/planning/fresh-node-backfill-gaps-plan.md`, items G6 and G7). All
+changes are runtime code; no dependency changed. Wire changes are additive
+`#[serde(default)]` fields (compatible with 0.151 peers both ways); one new
+node-local column family.
+
+### Added
+
+- **Pins and mutes ride the channel metadata backfill (G6).**
+  `ChannelPinMessage`/`ChannelUnpinMessage` (0x19/0x1A) and
+  `ChannelMute`/`ChannelUnmute` (0x42/0x43) are indexed into
+  `CHANNEL_META_MSGS` (keyed by their own payload's channel) and replay in
+  tier 1 (`META_REPLAY_TIERS`, chronological by `(ts, msg_id)`), so a
+  moderator's pin/mute replays after the grant that authorised it and one
+  signed after a demotion is refused — on the public first-page ride-along,
+  public metadata pages and private-sync metadata pages alike. Ride-along
+  priority after `ChannelUnban`: Mute, Unmute, Unpin, Pin, then Update.
+  `envelope_targets_channel` binds Mute/Unmute to the reconciled channel;
+  the private-sync type allow-list gains them. Before, pins were missing on
+  a fresh node and a muted user could post through it.
+- **Chat reactions ride along (G6).** New CF `CHAT_REACTION_MSGS`
+  (`channel_id ‖ ts ‖ msg_id`), written when a `ChatReaction` is applied,
+  under the channel of its stored TARGET chat message
+  (`Storage::chat_message_channel`; never the author-controlled
+  `ReactionPayload.channel_id`). Public reconcile serves the newest ≤ 4,000
+  (`CHANNEL_REACTION_CAP`) in-window reactions on the LAST page after the
+  edit/delete markers, inside the byte budget; private-channel sync serves
+  them in the room its page has left. A reaction to a GDPR-erased message is
+  withheld (D4).
+- **Public-channel metadata paging (G7).** `ReconcileRequest` gains
+  `meta_cursor: Option<MetaCursor>` (metadata page request,
+  `MetaCursor::START` = from the beginning) and `revision: u8`;
+  `ReconcileResponse` gains `meta_page`, `meta_truncated` and
+  `meta_next_cursor`. For a 0.152 requester the first page's metadata is the
+  CHRONOLOGICAL PREFIX (the first ≤ 256 rows in replay order, byte-bounded);
+  when rows remain it reports `meta_truncated` plus the prefix end, and the
+  requester continues the walk from there with the same peer after the chat
+  pages (keyset paging in replay order, fixed `CHANNEL_META_PAGE_MAX` = 500
+  rows per page whatever either side's config, byte-bounded, ≤ 500 pages,
+  strictly advancing cursor, metadata types only, same (peer, channel)
+  rolling budget). Every row replays exactly once, in order (round-1 audit
+  B2: the earlier priority selection followed by a walk from the start
+  replayed cut OLDER rows after newer ones — mute/unmute, ban/unban and
+  pin/unpin are applied literally, so re-muted / re-banned users ended
+  unmuted / unbanned and pins duplicated). A walk cut short keeps its
+  position per (channel, peer) in memory (24 h, ≤ 100,000 entries) and the
+  next walk with that peer continues there, so a channel whose metadata
+  exceeds one session's budget still converges (W2). Before, a large public
+  channel's member list, counts and "my channels" stopped at 256 rows on a
+  fresh node.
+- **Metadata follow-up walk (G7).** After a comparison with no winner whose
+  tried candidate offered only byte-verified duplicates and reported
+  `meta_truncated`, the requester walks the metadata once with it — at most
+  once per channel per 6 h (bounded map, 100,000 channels; an unfinished
+  walk with that peer continues regardless). A follow-up never marks the
+  channel complete and never moves the attempt throttle.
+- **Migrations** (each ≤ 5,000,000 `MESSAGES` rows per boot, resumable,
+  idempotent): `migration_channel_meta_indexed_v4` (stored pins/mutes into
+  `CHANNEL_META_MSGS`, skipping channels without a `CHANNELS` row or with a
+  private-channel lifecycle row — cleanup pending or purging) and
+  `migration_chat_reactions_indexed` (stored chat reactions into
+  `CHAT_REACTION_MSGS`; index only, nothing re-applied).
+- **Private-channel purge step 17 `CHAT_REACTION_MSGS`** (index rows and the
+  reaction envelopes). Existing step numbers unchanged; it runs before
+  `LOCAL_CHANNEL_HOMES` so a purge in progress at the upgrade reaches it.
+  Pin/mute envelopes are now purged through `CHANNEL_META_MSGS`.
+
+### Changed
+
+- **Chat/DM reaction apply is last-write-wins.** `toggle_chat_reaction`
+  stores the deciding envelope's `(timestamp, msg_id)` in the
+  `CHAT_REACTIONS` value (41 bytes; a removal leaves a tombstone) and ignores
+  any envelope that is not newer, so add/remove envelopes converge in any
+  arrival order and with duplicates. Before, remove@2 then add@1 left the
+  reaction in place on one node and absent on another. Empty (pre-0.152)
+  values read as present with the oldest stamp; the reaction-count rebuild
+  skips tombstones.
+- **Mute rule unchanged: refused on every path.** A muted author's message
+  or reaction is refused on gossip, local submit AND sync, whatever its
+  timestamp, exactly as in 0.151. (A sync-path exemption for envelopes
+  signed before the mute was tried during this release's audit and
+  removed — rounds 1/2: no local signal reliably distinguishes a fresh node
+  from an established one, so it let a muted user back-date new posts and
+  spread them over sync.)
+- **Sync-path reactions to unknown targets are refused** (round-2 N1): a
+  `ChatReaction` whose target chat message is not stored cannot be checked
+  against its channel's bans/mutes, indexed or served; on the sync path it
+  is `Rejected` (neutral for the session). Live paths still accept it.
+- **Ban / mute refusals are neutral on sync.** In the reconcile and
+  private-sync tallies a router refusal because the author is banned or
+  muted (`router::is_moderation_refusal`), or a reaction to an unknown
+  target (`router::is_neutral_sync_refusal`), is neither progress nor taint
+  (`ReconcileTally::ignored_moderation`), so a responder holding legitimate
+  pre-ban / pre-mute history is not penalised and in-sync evidence still
+  works.
+- **Reaction moderation checks use the target's channel** (round-1 audit
+  W3). The ban, mute and purge-guard checks of a `ChatReaction` resolve the
+  channel from its stored target (`moderation_channel_id`), not the
+  author-controlled `ReactionPayload.channel_id` — a muted or banned user
+  could omit it or name another channel and react anyway (live paths too).
+- **Metadata walks stop on bad pages** (round-1 audit W1). A metadata page
+  with more than `CHANNEL_META_PAGE_MAX` envelopes or any non-metadata
+  envelope is not applied and stops the walk unfinished — it can never
+  complete the channel.
+- **Private-sync resume rows: version 2** (round-1 audit W4). Version-1 rows
+  carry metadata high-water marks from before pins/mutes were indexed;
+  they now read as absent, forcing one fresh walk per (wallet, channel).
+- **When a channel counts complete (G7).** Chat pages ended
+  (`has_more = false`) AND, when the first page reported `meta_truncated`,
+  the metadata walk with the same peer reached its end, AND ≥ 1 envelope
+  was `Accepted` in the session. A walk that stops early is "accepted but
+  incomplete" (30 s retry), never complete.
+- **Requester page bound** (`max_page_with_ride_alongs`) adds the reaction
+  cap: primary + 256 + 2,000 + 4,000.
+- **Private-sync metadata pages are byte-bounded** (`channel_meta_page_with`,
+  `MAX_RESPONSE_ENVELOPE_BYTES`).
+
+### Compatibility
+
+- Revision gating: a requester that does not send `revision` (0.151 and
+  older) is served exactly the 0.151 shape — no `ChannelMute`/
+  `ChannelUnmute` (it would count the muted user's refused history as page
+  taint; its private allow-list lacks the types) and, on public reconcile, no reaction
+  ride-along (its page guard lacks the reaction cap). `PrivateChannelSyncRequest`
+  gains `revision` likewise (not in the signed auth string).
+- A 0.151 responder never sets `meta_truncated`, so a 0.152 requester
+  completes on the chat pages as before. CBOR round-trips old ↔ new are
+  covered by tests.
+
+### Known limitations
+
+- Private-channel sync carries reactions only in the room left on its last
+  page (at most 200 envelopes), so in an active private channel most
+  reactions are not backfilled.
+- Fresh nodes now learn mutes before chat, so they refuse the whole history
+  of a currently muted user (a pre-0.152 fresh node never learned the mute
+  and accepted it). The history is not lost: established nodes keep it, and
+  catch-up after an unmute or expiry brings it back.
+- A reaction whose target was not stored when it arrived (live, out of
+  order) is never indexed (not backfilled); on sync it is refused.
+- Fresh nodes miss a muted / banned user's LEGITIMATE pre-mute / pre-ban
+  posts and reactions: mutes and bans replay with the metadata before the
+  chat pages, and the router refuses the author on every path. Future
+  item: a pre-mute / pre-ban history exemption for fresh nodes, which needs
+  a gate on how the mute arrived (e.g. a `synced_at_local` field on the
+  mute/ban record plus a short window) — a timestamp-only exemption lets
+  muted users back-date new posts.
+- A single hostile responder can mark a channel complete by answering the
+  first metadata request with an empty page and `meta_truncated = false`
+  (the existing single-peer completion trust model, §8.3.6).
+- The metadata resume and follow-up maps do a full `retain` scan when full
+  (≤ 100,000 entries each; bounded, acceptable).
+- Mute/unmute, ban/unban and pin/unpin are still applied literally, not
+  last-write-wins per (channel, target): a node that learned a NEWER row
+  first (gossip reordering, or a follow-up walk delivering an older row it
+  never saw) can end in the older state. Future item (option c): LWW per
+  (channel, target) for mute/ban/pin, which also fixes gossip reordering.
+- Pre-existing hole: chronological replay authorises each moderator action
+  against the moderator record at replay time, so a demoted moderator can
+  back-date kicks/bans/mutes/pins to before the demotion and get them
+  applied on FRESH nodes through a hostile responder (the sync path does
+  not check the age of a signed timestamp).
+- A follow-up walk of an in-sync large channel re-reads all its metadata
+  rows (as duplicates) at most once per 6 h per channel.
+- **Do not downgrade below 0.152.0** (reaction tombstones are read as
+  present by 0.151). Details: `CHAT_REACTIONS` tombstones read as "reacted" there,
+  so a later remove/add on such a row can skew that node's count; the
+  `CHAT_REACTION_MSGS` CF is ignored; a purge persisted at step 17 is left
+  untouched.
+- `CHAT_REACTIONS` tombstones of DM reactions are not removed by the DM
+  reaper (the reaction rows were not either).
+
 ## [0.151.0] - 2026-11-19
 
 Fresh-node backfill gaps, part 1 (plan

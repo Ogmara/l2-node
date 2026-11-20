@@ -37,6 +37,52 @@ pub enum MembershipEvent {
     Removal,
 }
 
+/// Decision stamp of one `CHAT_REACTIONS` row (l2-node 0.152.0, G6) — the
+/// row's VALUE. `Storage::toggle_chat_reaction` applies an envelope only
+/// when its `(ts, msg_id)` is newer than the stored stamp, so reaction
+/// add/remove envelopes converge in any arrival order. Encoded as
+/// `ts:8 BE ++ msg_id:32 ++ present:1` (41 bytes); `present == 0` is a
+/// tombstone (a removed reaction, kept so an older add cannot resurrect
+/// it). An EMPTY value is a legacy row from before 0.152.0: present, with
+/// the oldest possible stamp.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChatReactionState {
+    /// Signed timestamp (unix ms) of the deciding envelope.
+    pub ts: u64,
+    /// `msg_id` of the deciding envelope (tie-breaker).
+    pub msg_id: [u8; 32],
+    /// `true` = reacted, `false` = tombstone.
+    pub present: bool,
+}
+
+impl ChatReactionState {
+    /// Encoded length of a stamped row.
+    pub const LEN: usize = 8 + 32 + 1;
+
+    /// Decode a stored value; `None` for a malformed one. An empty value
+    /// (legacy row) decodes as present with stamp `(0, [0; 32])`.
+    pub fn decode(value: &[u8]) -> Option<Self> {
+        if value.is_empty() {
+            return Some(Self { ts: 0, msg_id: [0; 32], present: true });
+        }
+        if value.len() != Self::LEN {
+            return None;
+        }
+        let ts = u64::from_be_bytes(value[0..8].try_into().ok()?);
+        let msg_id: [u8; 32] = value[8..40].try_into().ok()?;
+        Some(Self { ts, msg_id, present: value[40] != 0 })
+    }
+
+    /// Encode as the stored value.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(Self::LEN);
+        v.extend_from_slice(&self.ts.to_be_bytes());
+        v.extend_from_slice(&self.msg_id);
+        v.push(u8::from(self.present));
+        v
+    }
+}
+
 /// Per-(channel, wallet) `CHANNEL_MEMBERSHIP_INDEX` bookkeeping.
 #[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MembershipIndexState {
@@ -465,7 +511,7 @@ impl Storage {
     pub(crate) fn cf_options(name: &str) -> Options {
         let mut cf_opts = Options::default();
         // Use prefix bloom filters for index CFs
-        if name == cf::CHANNEL_MSGS || name == cf::CHANNEL_EDIT_DELETE_MSGS {
+        if name == cf::CHANNEL_MSGS || name == cf::CHANNEL_EDIT_DELETE_MSGS || name == cf::CHAT_REACTION_MSGS {
             // Key: (channel_id:8, lamport_ts:8, msg_id:32) — prefix by channel_id
             cf_opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(8));
         }
@@ -4466,8 +4512,13 @@ impl Storage {
                 "reaction-count rebuild hit the scan cap — counts may be undercounted"
             );
         }
-        for (key, _val) in reaction_entries {
+        for (key, val) in reaction_entries {
             if key.len() < 34 {
+                continue;
+            }
+            // A CHAT_REACTIONS tombstone (l2-node 0.152.0) is a removed
+            // reaction, not a reactor. (NEWS_REACTIONS values stay empty.)
+            if val.len() == ChatReactionState::LEN && val[ChatReactionState::LEN - 1] == 0 {
                 continue;
             }
             let mut msg_id = [0u8; 32];
@@ -5065,6 +5116,174 @@ impl Storage {
         Ok((indexed, done))
     }
 
+    /// Channel of a stored `ChatMessage` `target` (its own payload's
+    /// `channel_id`), or `None` when the target is not stored, is not a
+    /// `ChatMessage`, or does not decode. The ONLY source of the channel a
+    /// `ChatReaction` is indexed under (`CHAT_REACTION_MSGS`, l2-node
+    /// 0.152.0): the reaction's own `channel_id` is author-controlled and
+    /// never trusted.
+    pub fn chat_message_channel(&self, target: &[u8; 32]) -> Option<u64> {
+        use crate::messages::envelope::Envelope;
+        use crate::messages::types::{ChatMessagePayload, MessageType};
+        let raw = self.get_cf(cf::MESSAGES, target).ok().flatten()?;
+        let env: Envelope = rmp_serde::from_slice(&raw).ok()?;
+        if env.msg_type != MessageType::ChatMessage {
+            return None;
+        }
+        rmp_serde::from_slice::<ChatMessagePayload>(&env.payload).ok().map(|p| p.channel_id)
+    }
+
+    /// Write the `CHAT_REACTION_MSGS` row of a `ChatReaction` envelope
+    /// (`reaction_ts`, `reaction_id`) whose target is `target` — under the
+    /// TARGET's channel (`chat_message_channel`). Returns whether a row was
+    /// written (`false`: target unknown or not a chat message).
+    pub fn index_chat_reaction(&self, target: &[u8; 32], reaction_ts: u64, reaction_id: &[u8; 32]) -> Result<bool> {
+        let Some(cid) = self.chat_message_channel(target) else {
+            return Ok(false);
+        };
+        let key = super::schema::encode_channel_msg_key(cid, reaction_ts, reaction_id);
+        self.put_cf(cf::CHAT_REACTION_MSGS, &key, &[])?;
+        Ok(true)
+    }
+
+    /// Shared driver of the budget-capped, resumable `MESSAGES` scans
+    /// (l2-node 0.152.0 migrations): examines at most `budget` rows after
+    /// the key stored under `cursor_key`, calls `f` for every envelope that
+    /// decodes (it returns whether it indexed something), persists the last
+    /// examined key, and writes the `sentinel_key` once the scan reached the
+    /// end. Returns `(indexed, done)`. `f` must be idempotent (keyed
+    /// overwrites): a crash between its writes and the cursor write
+    /// re-examines those rows.
+    fn scan_messages_resumable(
+        &self,
+        cursor_key: &[u8],
+        sentinel_key: &[u8],
+        budget: usize,
+        mut f: impl FnMut(&crate::messages::envelope::Envelope) -> Result<bool>,
+    ) -> Result<(u64, bool)> {
+        use crate::messages::envelope::Envelope;
+        let cursor = self.get_cf(cf::NODE_STATE, cursor_key)?;
+        let handle = self
+            .db
+            .cf_handle(cf::MESSAGES)
+            .with_context(|| "column family 'messages' not found")?;
+        let mut iter = self.db.raw_iterator_cf(&handle);
+        match &cursor {
+            Some(c) => {
+                iter.seek(c);
+                if iter.valid() && iter.key() == Some(c.as_slice()) {
+                    iter.next();
+                }
+            }
+            None => iter.seek_to_first(),
+        }
+        let mut indexed = 0u64;
+        let mut examined = 0usize;
+        let mut last_key: Option<Vec<u8>> = None;
+        while iter.valid() && examined < budget {
+            examined += 1;
+            if let (Some(key), Some(raw)) = (iter.key(), iter.value()) {
+                last_key = Some(key.to_vec());
+                if let Ok(env) = rmp_serde::from_slice::<Envelope>(raw) {
+                    if f(&env)? {
+                        indexed += 1;
+                    }
+                }
+            }
+            iter.next();
+        }
+        let done = !iter.valid();
+        iter.status().with_context(|| "MESSAGES scan failed")?;
+        drop(iter);
+        if let Some(k) = last_key {
+            self.put_cf(cf::NODE_STATE, cursor_key, &k)?;
+        }
+        if done {
+            self.put_cf(cf::NODE_STATE, sentinel_key, &1u64.to_be_bytes())?;
+        }
+        Ok((indexed, done))
+    }
+
+    /// One-time, resumable indexing of the pin / mute envelopes already in
+    /// `MESSAGES` into `CHANNEL_META_MSGS` (l2-node 0.152.0, G6,
+    /// `CHANNEL_META_INDEXED_V4`): `ChannelPinMessage`,
+    /// `ChannelUnpinMessage`, `ChannelMute`, `ChannelUnmute` (0x19, 0x1A,
+    /// 0x42, 0x43), keyed by their own payload's `channel_id` exactly like
+    /// `router::update_indexes` does live. Every stored copy was accepted
+    /// (and so authorized) at ingest; one whose channel has no `CHANNELS`
+    /// row any more (purged) or has a private-channel lifecycle row (cleanup
+    /// pending / purging) is skipped. The other metadata types were
+    /// backfilled by `_V3`. Examines at most `budget` rows per call.
+    /// Returns `(indexed, done)`.
+    pub fn backfill_channel_meta_v4(&self, budget: usize) -> Result<(u64, bool)> {
+        use crate::messages::types::{deserialize_payload, DeserializedPayload, MessageType};
+        self.scan_messages_resumable(
+            super::schema::state_keys::CHANNEL_META_INDEX_V4_CURSOR,
+            super::schema::state_keys::CHANNEL_META_INDEXED_V4,
+            budget,
+            |env| {
+                if !matches!(
+                    env.msg_type,
+                    MessageType::ChannelPinMessage
+                        | MessageType::ChannelUnpinMessage
+                        | MessageType::ChannelMute
+                        | MessageType::ChannelUnmute
+                ) {
+                    return Ok(false);
+                }
+                let cid = match deserialize_payload(env.msg_type, &env.payload) {
+                    Ok(DeserializedPayload::ChannelPinMessage(p)) => p.channel_id,
+                    Ok(DeserializedPayload::ChannelUnpinMessage(p)) => p.channel_id,
+                    Ok(DeserializedPayload::ChannelMute(p)) => p.channel_id,
+                    Ok(DeserializedPayload::ChannelUnmute(p)) => p.channel_id,
+                    _ => return Ok(false),
+                };
+                // Accepted only while the channel existed (moderator check);
+                // a channel whose `CHANNELS` row is gone was purged or never
+                // kept here — indexing would only leave an orphan row.
+                if !self.exists_cf(cf::CHANNELS, &cid.to_be_bytes())? {
+                    return Ok(false);
+                }
+                // Nor a private channel with a lifecycle row (cleanup
+                // pending or a purge running, round-1 audit N3): a row
+                // written behind a purge cursor would be an orphan.
+                if self.exists_cf(cf::PRIVATE_CHANNEL_LIFECYCLE, &cid.to_be_bytes())? {
+                    return Ok(false);
+                }
+                let key = super::schema::encode_channel_meta_key(cid, env.msg_type_u8(), env.timestamp, &env.msg_id);
+                self.put_cf(cf::CHANNEL_META_MSGS, &key, &[])?;
+                Ok(true)
+            },
+        )
+    }
+
+    /// One-time, resumable indexing of the `ChatReaction` envelopes already
+    /// in `MESSAGES` into `CHAT_REACTION_MSGS` (l2-node 0.152.0, G6,
+    /// `CHAT_REACTIONS_INDEXED`), under the channel of the reaction's
+    /// stored TARGET chat message (`index_chat_reaction`; a reaction whose
+    /// target is not stored is skipped, as live). Indexing only: the
+    /// derived `CHAT_REACTIONS` rows are NOT re-applied — they were applied
+    /// at ingest with the author resolution of that moment, and
+    /// re-resolving now could count one reactor twice. Examines at most
+    /// `budget` rows per call. Returns `(indexed, done)`.
+    pub fn backfill_chat_reaction_index(&self, budget: usize) -> Result<(u64, bool)> {
+        use crate::messages::types::{MessageType, ReactionPayload};
+        self.scan_messages_resumable(
+            super::schema::state_keys::CHAT_REACTIONS_INDEX_CURSOR,
+            super::schema::state_keys::CHAT_REACTIONS_INDEXED,
+            budget,
+            |env| {
+                if env.msg_type != MessageType::ChatReaction {
+                    return Ok(false);
+                }
+                let Ok(p) = rmp_serde::from_slice::<ReactionPayload>(&env.payload) else {
+                    return Ok(false);
+                };
+                self.index_chat_reaction(&p.target_id, env.timestamp, &env.msg_id)
+            },
+        )
+    }
+
     // --- Edit History ---
 
     /// Store an edit record linking an original message to its replacement.
@@ -5166,17 +5385,39 @@ impl Storage {
 
     // --- Chat Reactions ---
 
-    /// Add or remove a reaction on a channel chat message, updating cached counts atomically.
+    /// Add or remove a reaction on a channel chat (or DM) message, updating
+    /// cached counts atomically — LAST-WRITE-WINS per `(target, emoji,
+    /// author)` (l2-node 0.152.0, G6).
     ///
     /// Mirrors [`toggle_news_reaction`] but operates on the CHAT_REACTIONS
     /// and CHAT_REACTION_COUNTS column families. Audit final pre-mainnet
     /// W19b: guarded by `social_counters_lock`, same rationale.
+    ///
+    /// **Why last-write-wins.** Before 0.152.0 this applied `remove`
+    /// literally against the current row: add@1 then remove@2 left no
+    /// reaction, but the SAME two signed envelopes applied as remove@2 then
+    /// add@1 (gossip reordering, or a backfill ride-along served newest
+    /// first) left the reaction in place — two nodes holding identical
+    /// envelopes disagreed forever. Each `(target, emoji, author)` row now
+    /// carries the stamp `(stamp_ts, stamp_id)` of the envelope that last
+    /// decided it ([`ChatReactionState`]), and a `remove` leaves a
+    /// TOMBSTONE row instead of deleting it. An envelope whose stamp is not
+    /// newer than the row's is ignored, so any arrival order (and any
+    /// duplicate) converges to the state of the newest envelope by
+    /// `(timestamp, msg_id)`. The count only moves on a present↔absent
+    /// change. A legacy row (empty value, written before 0.152.0) counts as
+    /// present with the oldest possible stamp: any real envelope decides it.
+    ///
+    /// `stamp_ts` / `stamp_id` are the deciding envelope's signed
+    /// `timestamp` and `msg_id`.
     pub fn toggle_chat_reaction(
         &self,
         msg_id: &[u8; 32],
         emoji: &str,
         author: &str,
         remove: bool,
+        stamp_ts: u64,
+        stamp_id: &[u8; 32],
     ) -> Result<()> {
         let _guard = self
             .social_counters_lock
@@ -5186,26 +5427,26 @@ impl Storage {
         let reaction_key = schema::encode_chat_reaction_key(msg_id, emoji, author);
         let count_key = schema::encode_chat_reaction_count_key(msg_id, emoji);
 
-        let exists = self.exists_cf(cf::CHAT_REACTIONS, &reaction_key)?;
+        let existing = self
+            .get_cf(cf::CHAT_REACTIONS, &reaction_key)?
+            .map(|v| ChatReactionState::decode(&v));
+        let incoming = ChatReactionState { ts: stamp_ts, msg_id: *stamp_id, present: !remove };
+        if let Some(Some(cur)) = &existing {
+            if (cur.ts, cur.msg_id) >= (incoming.ts, incoming.msg_id) {
+                return Ok(()); // an equal or newer envelope already decided this row
+            }
+        }
+        // An undecodable stored value is treated as absent and overwritten.
+        let was_present = matches!(existing, Some(Some(ChatReactionState { present: true, .. })));
 
         let mut batch = WriteBatch::default();
         let reactions_cf = self.cf_handle(cf::CHAT_REACTIONS)?;
         let counts_cf = self.cf_handle(cf::CHAT_REACTION_COUNTS)?;
-
-        if remove {
-            if !exists {
-                return Ok(());
-            }
-            batch.delete_cf(&reactions_cf, &reaction_key);
-            let count = self.get_chat_reaction_count(msg_id, emoji)?.saturating_sub(1);
-            batch.put_cf(&counts_cf, &count_key, &count.to_be_bytes());
-        } else {
-            if exists {
-                return Ok(()); // already reacted
-            }
-            batch.put_cf(&reactions_cf, &reaction_key, &[]);
-            let count = self.get_chat_reaction_count(msg_id, emoji)? + 1;
-            batch.put_cf(&counts_cf, &count_key, &count.to_be_bytes());
+        batch.put_cf(&reactions_cf, &reaction_key, incoming.encode());
+        if was_present != incoming.present {
+            let current = self.get_chat_reaction_count(msg_id, emoji)?;
+            let count = if incoming.present { current.saturating_add(1) } else { current.saturating_sub(1) };
+            batch.put_cf(&counts_cf, &count_key, count.to_be_bytes());
         }
         self.write_batch(batch)
     }
